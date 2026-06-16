@@ -2346,11 +2346,48 @@ impl Tree {
     #[doc(hidden)]
     #[must_use]
     pub fn append_entry(&self, value: InternalValue) -> (u64, u64) {
+        use crate::runtime_config::{KvChecksumComputePoint, KvChecksumPolicy};
+
+        // Per-KV residence digest (KvChecksumComputePoint::AtInsert): compute
+        // the entry's 4-byte logical-content digest now, so a RAM bit-flip
+        // while it sits in the memtable is caught at flush. The digest covers
+        // the OWNED `value` and is independent of which active memtable
+        // receives it, so computing it before taking the version-history guard
+        // is correct (a concurrent rotation just routes the same value+digest
+        // into the new active memtable) AND keeps the hash out of the read-lock
+        // critical section. Reading the live snapshot is a cheap arc-swap load;
+        // under the default `AtBlockCompile` (or `Off`) the two `matches!`
+        // checks short-circuit and no digest is computed, so the hot insert
+        // path is unchanged.
+        let kv_digest = {
+            let rc = self.0.runtime_config.load();
+            if matches!(
+                rc.kv_checksum_compute_point,
+                KvChecksumComputePoint::AtInsert
+            ) && !matches!(rc.kv_checksums, KvChecksumPolicy::Off)
+            {
+                crate::table::block::kv_checksum::kv_digest(&value, rc.kv_checksum_algo).map(|d| {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "AtInsert is config-validated to a 4-byte algorithm; the digest fits u32"
+                    )]
+                    let lo = d as u32;
+                    (lo, rc.kv_checksum_algo)
+                })
+            } else {
+                None
+            }
+        };
+
+        // The `.read()` guard is a temporary that lives until the end of this
+        // statement, so the insert runs under the version-history read lock:
+        // `value` + its digest land in the current active memtable atomically,
+        // and a concurrent `rotate_memtable()` cannot seal it mid-insert.
         self.version_history
             .read()
             .latest_version()
             .active_memtable
-            .insert(value)
+            .insert_with_kv_digest(value, kv_digest)
     }
 
     /// Adds multiple items to the active memtable in bulk.
@@ -2362,6 +2399,24 @@ impl Tree {
     #[doc(hidden)]
     #[must_use]
     pub(crate) fn append_batch(&self, items: Vec<InternalValue>) -> (u64, u64) {
+        use crate::runtime_config::{KvChecksumComputePoint, KvChecksumPolicy};
+
+        // Per-KV residence digest under AtInsert (see `append_entry`): pass the
+        // algorithm so the bulk path fixes each entry's digest at insert. The
+        // default path passes `None` and is unchanged.
+        let kv_algo = {
+            let rc = self.0.runtime_config.load();
+            if matches!(
+                rc.kv_checksum_compute_point,
+                KvChecksumComputePoint::AtInsert
+            ) && !matches!(rc.kv_checksums, KvChecksumPolicy::Off)
+            {
+                Some(rc.kv_checksum_algo)
+            } else {
+                None
+            }
+        };
+
         // Hold the read guard for the entire insert to prevent rotate_memtable()
         // from sealing this memtable mid-batch (which could cause data loss if
         // a concurrent flush persists only a prefix of the batch).
@@ -2369,7 +2424,7 @@ impl Tree {
             .read()
             .latest_version()
             .active_memtable
-            .insert_batch(items)
+            .insert_batch_with_kv_algo(items, kv_algo)
     }
 
     /// Recovers previous state, by loading the level manifest, tables and blob files.

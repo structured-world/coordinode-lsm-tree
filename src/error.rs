@@ -31,6 +31,46 @@ pub enum Error {
         expected: Checksum,
     },
 
+    /// A memtable entry's per-KV digest, computed at insert under
+    /// [`KvChecksumComputePoint::AtInsert`](crate::runtime_config::KvChecksumComputePoint::AtInsert),
+    /// did not match a recompute over the entry's current bytes at flush.
+    ///
+    /// This is the memtable-residence RAM-corruption signal: the entry's
+    /// logical content (`value_type`, `seqno`, key, or value) changed while it
+    /// sat in the memtable, between insert and flush. Distinct from
+    /// [`Self::ChecksumMismatch`] (on-disk block bytes) — this catches a flip
+    /// that happens entirely in RAM, before any block is written.
+    MemtableKvChecksumMismatch {
+        /// Sequence number of the entry whose digest diverged (locates it).
+        seqno: u64,
+
+        /// Digest recomputed over the entry's current memtable bytes at flush.
+        got: u64,
+
+        /// Digest computed and stored when the entry was inserted.
+        expected: u64,
+    },
+
+    /// A memtable entry carried an insert-time per-KV digest
+    /// ([`KvChecksumComputePoint::AtInsert`](crate::runtime_config::KvChecksumComputePoint::AtInsert))
+    /// tagged with an algorithm `AtInsert` never stores: a non-4-byte or
+    /// unknown algorithm wire tag.
+    ///
+    /// `AtInsert` only ever writes a 4-byte algorithm tag (`Xxh3Low32` /
+    /// `Crc32c`), so a digest-bearing node tagged otherwise means the node's
+    /// algorithm metadata was corrupted in RAM during memtable residence.
+    /// Distinct from [`Self::MemtableKvChecksumMismatch`] (the digest value
+    /// diverged): here the algorithm itself is unusable, so the engine refuses
+    /// to "verify" the entry under the wrong algorithm rather than risk a
+    /// flipped tag passing the residence check.
+    MemtableKvChecksumCorruptAlgorithm {
+        /// Sequence number of the entry whose algorithm tag is invalid.
+        seqno: u64,
+
+        /// The invalid algorithm wire tag read from the node.
+        tag: u8,
+    },
+
     /// Blob frame header CRC mismatch (V4 format).
     /// Distinct from `ChecksumMismatch` which covers data payload checksums.
     HeaderCrcMismatch {

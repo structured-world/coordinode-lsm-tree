@@ -72,6 +72,14 @@ pub struct Memtable {
     pub(crate) highest_seqno: AtomicU64,
 
     pub(crate) requested_rotation: AtomicBool,
+
+    /// Whether any insert-time per-KV digest (`KvChecksumComputePoint::AtInsert`)
+    /// has been stored in this memtable. Set on the first digest-bearing insert
+    /// and read once at flush by [`Self::verify_kv_residence`] to skip walking
+    /// the nodes entirely when there is nothing to verify (the default `Off` /
+    /// `AtBlockCompile` path). The per-node digest carries its own algorithm, so
+    /// no memtable-wide algorithm is tracked here.
+    has_at_insert_digests: AtomicBool,
 }
 
 impl Memtable {
@@ -113,6 +121,7 @@ impl Memtable {
             approximate_size: AtomicU64::default(),
             highest_seqno: AtomicU64::default(),
             requested_rotation: AtomicBool::default(),
+            has_at_insert_digests: AtomicBool::default(),
         }
     }
 
@@ -203,6 +212,22 @@ impl Memtable {
     /// Returns `(total_bytes_added, new_memtable_size)`.
     #[doc(hidden)]
     pub fn insert_batch(&self, items: Vec<InternalValue>) -> (u64, u64) {
+        self.insert_batch_with_kv_algo(items, None)
+    }
+
+    /// Bulk insert, optionally computing an insert-time per-KV digest per item
+    /// under `kv_algo` (`KvChecksumComputePoint::AtInsert`).
+    ///
+    /// `kv_algo` is `Some(algo)` (a 4-byte algorithm) to fix each entry's
+    /// digest at insert for the flush-time residence check, or `None` for the
+    /// plain bulk path. Same single-`fetch_add` / single-`fetch_max` accounting
+    /// as [`Self::insert_batch`].
+    #[doc(hidden)]
+    pub fn insert_batch_with_kv_algo(
+        &self,
+        items: Vec<InternalValue>,
+        kv_algo: Option<crate::runtime_config::ChecksumAlgorithm>,
+    ) -> (u64, u64) {
         if items.is_empty() {
             let size = self
                 .approximate_size
@@ -236,9 +261,26 @@ impl Memtable {
             .approximate_size
             .fetch_add(total_size, core::sync::atomic::Ordering::AcqRel);
 
+        if kv_algo.is_some() {
+            // Flag that this memtable carries residence digests for the
+            // flush-time verify. The algorithm lives per node.
+            self.has_at_insert_digests
+                .store(true, core::sync::atomic::Ordering::Relaxed);
+        }
+
         for item in items {
+            let digest = kv_algo.and_then(|algo| {
+                crate::table::block::kv_checksum::kv_digest(&item, algo).map(|d| {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "AtInsert is config-validated to a 4-byte algorithm; the digest fits u32"
+                    )]
+                    let lo = d as u32;
+                    (lo, algo)
+                })
+            });
             let key = InternalKey::new(item.key.user_key, item.key.seqno, item.key.value_type);
-            self.items.insert(&key, &item.value);
+            self.items.insert_with_kv_digest(&key, &item.value, digest);
         }
 
         self.highest_seqno
@@ -275,6 +317,80 @@ impl Memtable {
             .fetch_max(item.key.seqno, core::sync::atomic::Ordering::AcqRel);
 
         (item_size, size_before + item_size)
+    }
+
+    /// Inserts an item, optionally carrying a precomputed insert-time per-KV
+    /// digest (`KvChecksumComputePoint::AtInsert`).
+    ///
+    /// `kv_digest` is `Some((digest, algo))` when the caller computed the
+    /// entry's 4-byte logical-content digest at insert (under `AtInsert` with a
+    /// 4-byte algorithm), or `None` for the plain path. When present, the digest
+    /// and its algorithm are stored in the skiplist node (per node, so a later
+    /// config change cannot misverify it) and the memtable flags that it carries
+    /// at least one digest so [`Self::verify_kv_residence`] knows to walk at
+    /// flush. Mixed inserts (some with, some without a digest) are supported for
+    /// the `Off` -> `AtInsert` live toggle.
+    #[doc(hidden)]
+    pub fn insert_with_kv_digest(
+        &self,
+        item: InternalValue,
+        kv_digest: Option<(u32, crate::runtime_config::ChecksumAlgorithm)>,
+    ) -> (u64, u64) {
+        #[expect(
+            clippy::expect_used,
+            reason = "keys are limited to 16-bit length + values are limited to 32-bit length"
+        )]
+        let item_size = (item.key.user_key.len()
+            + item.value.len()
+            + core::mem::size_of::<InternalValue>()
+            + core::mem::size_of::<SharedComparator>())
+        .try_into()
+        .expect("should fit into u64");
+
+        let size_before = self
+            .approximate_size
+            .fetch_add(item_size, core::sync::atomic::Ordering::AcqRel);
+
+        if kv_digest.is_some() {
+            // Flag that this memtable carries at least one residence digest so
+            // the flush-time verify walks the nodes. The algorithm lives per
+            // node, not here.
+            self.has_at_insert_digests
+                .store(true, core::sync::atomic::Ordering::Relaxed);
+        }
+
+        let key = InternalKey::new(item.key.user_key, item.key.seqno, item.key.value_type);
+        self.items
+            .insert_with_kv_digest(&key, &item.value, kv_digest);
+
+        self.highest_seqno
+            .fetch_max(item.key.seqno, core::sync::atomic::Ordering::AcqRel);
+
+        (item_size, size_before + item_size)
+    }
+
+    /// Verifies every insert-time per-KV digest in this memtable against a
+    /// recompute over the entry's current bytes (the
+    /// [`KvChecksumComputePoint::AtInsert`](crate::runtime_config::KvChecksumComputePoint::AtInsert)
+    /// residence check), called once at flush.
+    ///
+    /// Returns `Ok` immediately when no `AtInsert` digest was ever inserted, so
+    /// the default path pays nothing.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::Error::MemtableKvChecksumMismatch`] when an entry's stored
+    ///   digest diverges from the recompute (a RAM bit-flip during residence).
+    /// - [`crate::Error::FeatureUnsupported`] when a node's algorithm is not
+    ///   compiled into this build.
+    pub fn verify_kv_residence(&self) -> crate::Result<()> {
+        if !self
+            .has_at_insert_digests
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(());
+        }
+        self.items.verify_kv_digests()
     }
 
     /// Inserts a range tombstone covering `[start, end)` at the given seqno.
@@ -380,6 +496,110 @@ mod tests {
 
     fn new_memtable(id: MemtableId) -> Memtable {
         Memtable::new(id, default_comparator())
+    }
+
+    /// Low-32 logical digest of an entry under `algo`.
+    fn at_insert_digest(
+        item: &InternalValue,
+        algo: crate::runtime_config::ChecksumAlgorithm,
+    ) -> u32 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::expect_used,
+            reason = "4-byte algo fits u32; test helper"
+        )]
+        let d = crate::table::block::kv_checksum::kv_digest(item, algo)
+            .expect("xxh3 always available") as u32;
+        d
+    }
+
+    #[test]
+    fn verify_kv_residence_ok_when_intact() {
+        // AtInsert path: every entry carries the digest of its own bytes, so
+        // the flush-time residence check passes.
+        let algo = crate::runtime_config::ChecksumAlgorithm::Xxh3Low32;
+        let mt = new_memtable(0);
+        for i in 0..5u8 {
+            let item = InternalValue::from_components(
+                [b'k', i],
+                [b'v', i],
+                u64::from(i) + 1,
+                ValueType::Value,
+            );
+            let d = at_insert_digest(&item, algo);
+            mt.insert_with_kv_digest(item, Some((d, algo)));
+        }
+        assert!(mt.verify_kv_residence().is_ok());
+    }
+
+    #[test]
+    fn verify_kv_residence_ok_without_any_digest() {
+        // Default path (no AtInsert digest recorded): nothing to verify, so the
+        // residence check returns immediately even with data present.
+        let mt = new_memtable(0);
+        for i in 0..5u8 {
+            mt.insert(InternalValue::from_components(
+                [b'k', i],
+                [b'v', i],
+                u64::from(i) + 1,
+                ValueType::Value,
+            ));
+        }
+        assert!(mt.verify_kv_residence().is_ok());
+    }
+
+    #[cfg(feature = "crc32c")]
+    #[test]
+    fn verify_kv_residence_uses_per_node_algorithm_no_drift() {
+        // Algorithm drift regression: insert one entry under Xxh3Low32, then a
+        // second under Crc32c (as if kv_checksum_algo changed mid-memtable).
+        // Both entries are intact, so the residence check must pass. It only
+        // passes if each node is verified under the algorithm it was stored
+        // with; a single per-memtable algorithm would recompute the first
+        // entry under Crc32c and falsely flag it.
+        let mt = new_memtable(0);
+
+        let a = InternalValue::from_components(b"aaa", b"va", 1, ValueType::Value);
+        let da = at_insert_digest(&a, crate::runtime_config::ChecksumAlgorithm::Xxh3Low32);
+        mt.insert_with_kv_digest(
+            a,
+            Some((da, crate::runtime_config::ChecksumAlgorithm::Xxh3Low32)),
+        );
+
+        let b = InternalValue::from_components(b"bbb", b"vb", 2, ValueType::Value);
+        let db = at_insert_digest(&b, crate::runtime_config::ChecksumAlgorithm::Crc32c);
+        mt.insert_with_kv_digest(
+            b,
+            Some((db, crate::runtime_config::ChecksumAlgorithm::Crc32c)),
+        );
+
+        assert!(
+            mt.verify_kv_residence().is_ok(),
+            "per-node algorithm must prevent drift across a mid-memtable algo change"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "test asserts the error via expect_err")]
+    fn verify_kv_residence_detects_corruption_end_to_end() {
+        // Insert under AtInsert, then simulate a RAM bit-flip on the resident
+        // entry's key. The flush-time residence check recomputes and reports
+        // a MemtableKvChecksumMismatch.
+        let algo = crate::runtime_config::ChecksumAlgorithm::Xxh3Low32;
+        let mt = new_memtable(0);
+        let item = InternalValue::from_components(b"victim", b"payload", 7, ValueType::Value);
+        let d = at_insert_digest(&item, algo);
+        mt.insert_with_kv_digest(item, Some((d, algo)));
+
+        mt.items.test_flip_first_key_byte();
+
+        let err = mt
+            .verify_kv_residence()
+            .expect_err("residence corruption must be detected at flush");
+        assert!(
+            matches!(err, crate::Error::MemtableKvChecksumMismatch { .. }),
+            "expected MemtableKvChecksumMismatch, got {err:?}"
+        );
     }
 
     #[test]

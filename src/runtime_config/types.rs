@@ -75,6 +75,24 @@ impl ChecksumAlgorithm {
         }
     }
 
+    /// Whether this algorithm can actually compute a digest in this build.
+    ///
+    /// [`Self::Xxh3_64`] / [`Self::Xxh3Low32`] are always available;
+    /// [`Self::Crc32c`] only when the `crc32c` cargo feature is enabled (its
+    /// [`Self::compute`] returns `None` otherwise). Config validation uses this
+    /// to reject selecting an uncompiled algorithm up front, rather than
+    /// silently skipping digests or failing later at flush.
+    #[must_use]
+    pub const fn is_available(self) -> bool {
+        match self {
+            Self::Xxh3_64 | Self::Xxh3Low32 => true,
+            #[cfg(feature = "crc32c")]
+            Self::Crc32c => true,
+            #[cfg(not(feature = "crc32c"))]
+            Self::Crc32c => false,
+        }
+    }
+
     /// Compute the digest of `bytes` under this algorithm, returned as a
     /// `u64` (the low [`Self::digest_size`] bytes are the meaningful
     /// digest; wider algorithms fill more of the word).
@@ -187,9 +205,10 @@ impl ChecksumAlgorithm {
 /// a scrub localise which entry diverged. Catching a RAM bit-flip that
 /// corrupts an entry WHILE it sits in the memtable, before the block
 /// is compiled, additionally requires
-/// [`KvChecksumComputePoint::AtInsert`] (not yet implemented — see its
-/// docs); the digests in this implementation are computed when the
-/// block is compiled. Default [`Self::Off`] emits no per-KV footer (the
+/// [`KvChecksumComputePoint::AtInsert`], which computes the digest at
+/// insert and verifies it at flush; the default
+/// [`KvChecksumComputePoint::AtBlockCompile`] computes the digests when
+/// the block is compiled. Default [`Self::Off`] emits no per-KV footer (the
 /// `KV_CHECKSUM_FOOTER` bit clear), zero per-KV overhead.
 ///
 /// Selection granularity:
@@ -255,17 +274,20 @@ impl KvChecksumPolicy {
 /// corrupts an entry while it sits in the memtable before the block is
 /// compiled.
 ///
-/// [`Self::AtInsert`] computes the digest at memtable insert and carries it
-/// to the block, closing the memtable-residence window (the entry's digest
-/// is fixed the moment it enters RAM) at the cost of storing the digest in
-/// the memtable node.
+/// [`Self::AtInsert`] computes the digest at memtable insert and stores it in
+/// the skiplist node's 4-byte reserved slot, fixing the entry's digest the
+/// moment it enters RAM. At flush, the digest is re-derived over the entry's
+/// current bytes and compared against the stored value: a divergence means the
+/// entry was corrupted while it sat in the memtable (a RAM bit-flip during
+/// residence), surfaced as [`crate::Error::MemtableKvChecksumMismatch`]. The
+/// digest domain is logical, so the re-derivation at flush (and the digest the
+/// block writer emits) equals the carried value when the bytes are intact.
 ///
-/// **Not yet implemented:** the memtable / writer carry path is not wired,
-/// so selecting `AtInsert` via `update_runtime_config` is rejected with a
-/// typed error rather than silently behaving as `AtBlockCompile`. When the
-/// carry path lands, `AtInsert` will additionally require a 4-byte algorithm
-/// ([`ChecksumAlgorithm::Xxh3Low32`] / [`ChecksumAlgorithm::Crc32c`]) so the
-/// digest fits the node's reserved slot.
+/// `AtInsert` requires a 4-byte algorithm ([`ChecksumAlgorithm::Xxh3Low32`] /
+/// [`ChecksumAlgorithm::Crc32c`]) so the digest fits the node's reserved slot
+/// with zero size growth; selecting it with the 8-byte [`ChecksumAlgorithm::Xxh3_64`]
+/// is rejected at config-validation time. Off-by-default `AtBlockCompile`
+/// leaves the memtable node untouched (zero overhead).
 //
 // no-std: pure data — compiles under `--no-default-features --features alloc`.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
@@ -275,8 +297,9 @@ pub enum KvChecksumComputePoint {
     #[default]
     AtBlockCompile,
 
-    /// Compute at memtable insert and carry (covers the full RAM lifecycle).
-    /// Not yet implemented — rejected at config-validation time.
+    /// Compute at memtable insert and verify at flush (covers the RAM-residence
+    /// window). Requires a 4-byte algorithm; the digest lives in the node's
+    /// reserved slot, so enabling it adds no per-entry memtable bytes.
     AtInsert,
 }
 
@@ -632,13 +655,12 @@ pub struct RuntimeConfig {
     /// When the per-KV digest is computed:
     /// [`KvChecksumComputePoint::AtBlockCompile`] (default) at flush /
     /// compaction, or [`KvChecksumComputePoint::AtInsert`] at memtable
-    /// insert (the future memtable-residence-window mode). `AtInsert` is
-    /// NOT yet implemented: `RuntimeConfigHandle::try_update` (behind
-    /// [`crate::Tree::update_runtime_config`]) currently rejects EVERY
-    /// `AtInsert` setting with a typed error, regardless of
-    /// [`Self::kv_checksum_algo`] (both `Xxh3_64` and `Xxh3Low32`), so it
-    /// cannot be applied today. Default `AtBlockCompile` is always
-    /// accepted.
+    /// insert (the memtable-residence-window mode that catches a RAM
+    /// bit-flip while a record sits in the memtable). `AtInsert` requires a
+    /// 4-byte [`Self::kv_checksum_algo`] (`Xxh3Low32` / `Crc32c`) that is
+    /// compiled into the build; `RuntimeConfigHandle::try_update` (behind
+    /// [`crate::Tree::update_runtime_config`]) rejects `AtInsert` with the
+    /// 8-byte `Xxh3_64`, or with an uncompiled algorithm, via a typed error.
     pub kv_checksum_compute_point: KvChecksumComputePoint,
 
     /// When `true`, every manifest write reserves a 4 KiB region at

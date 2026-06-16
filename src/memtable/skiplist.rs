@@ -18,7 +18,8 @@ use super::arena::Arena;
 use super::value_store::ValueStore;
 use crate::comparator::SharedComparator;
 use crate::key::InternalKey;
-use crate::value::{SeqNo, UserValue};
+use crate::runtime_config::ChecksumAlgorithm;
+use crate::value::{InternalValue, SeqNo, UserValue};
 use crate::{UserKey, ValueType};
 
 use core::cmp::Ordering as CmpOrdering;
@@ -61,6 +62,23 @@ const UNSET: u32 = 0;
 const OFF_HEIGHT: u32 = 11;
 const OFF_TOWER: u32 = 24;
 
+// Per-KV insert-time digest (KvChecksumComputePoint::AtInsert): the 4-byte
+// reserved slot at +12 (otherwise alignment padding) holds the entry's 4-byte
+// digest, fixed at insert and re-checked at flush. The value_type byte (+10)
+// packs three fields, since ValueType discriminants are only 0..=2:
+//   bits 0..=2  ValueType discriminant
+//   bits 5..=6  wire_tag of the 4-byte algorithm the digest was computed with
+//   bit  7      "this node carries an insert digest"
+// Storing the algorithm PER NODE (not once per memtable) is what makes the
+// residence check immune to a mid-memtable `kv_checksum_algo` change: each
+// node is verified under the algorithm it was stored with. A node without the
+// presence bit has the slot zeroed and is never verified (covers the
+// mixed-variant memtable after an Off -> AtInsert toggle).
+const KV_DIGEST_PRESENT: u8 = 0x80;
+const VALUE_TYPE_MASK: u8 = 0x07;
+const KV_ALGO_SHIFT: u8 = 5;
+const KV_ALGO_MASK: u8 = 0x60;
+
 /// Byte size of a node with the given tower `height`.
 #[expect(
     clippy::cast_possible_truncation,
@@ -68,6 +86,19 @@ const OFF_TOWER: u32 = 24;
 )]
 const fn node_size(height: usize) -> u32 {
     OFF_TOWER + (height as u32) * 4
+}
+
+/// Outcome of reading a node's insert-time per-KV digest slot
+/// (`KvChecksumComputePoint::AtInsert`).
+enum NodeKvDigest {
+    /// No digest stored (the `KV_DIGEST_PRESENT` flag is clear).
+    Absent,
+    /// A valid 4-byte digest under the recovered algorithm.
+    Present(u32, ChecksumAlgorithm),
+    /// The presence bit is set but the algorithm tag is not a 4-byte algorithm
+    /// `AtInsert` would store (corruption of the algorithm or presence bits).
+    /// Carries the offending wire tag for diagnostics.
+    CorruptAlgorithm(u8),
 }
 
 // ---------------------------------------------------------------------------
@@ -172,13 +203,32 @@ impl SkipMap {
     ///
     /// Multiple entries with the same `user_key` but different `seqno` are
     /// expected (MVCC).  No deduplication is performed.
+    pub fn insert(&self, key: &InternalKey, value: &UserValue) {
+        self.insert_with_kv_digest(key, value, None);
+    }
+
+    /// Inserts a key-value pair, optionally storing a 4-byte per-KV digest
+    /// computed at insert (`KvChecksumComputePoint::AtInsert`).
+    ///
+    /// `kv_digest` is `Some((digest, algo))` where `digest` is the low 32 bits
+    /// of the entry's logical-content digest under the 4-byte `algo` (the
+    /// algorithm is stored per node so a later config change cannot misverify
+    /// this entry), or `None` for a plain insert. When present the digest and
+    /// algorithm tag are stored in the node and it is flagged for flush-time
+    /// verification via [`Self::verify_kv_digests`]; when absent the node is
+    /// byte-identical to a plain insert.
     #[expect(
         clippy::indexing_slicing,
         reason = "preds/succs are [u32; MAX_HEIGHT]; level < height <= MAX_HEIGHT"
     )]
-    pub fn insert(&self, key: &InternalKey, value: &UserValue) {
+    pub fn insert_with_kv_digest(
+        &self,
+        key: &InternalKey,
+        value: &UserValue,
+        kv_digest: Option<(u32, ChecksumAlgorithm)>,
+    ) {
         let height = self.random_height();
-        let node = self.alloc_node(key, value, height);
+        let node = self.alloc_node(key, value, height, kv_digest);
 
         // Raise the list height if needed.
         let mut list_h = self.height.load(Ordering::Relaxed);
@@ -238,9 +288,108 @@ impl SkipMap {
         self.len.load(Ordering::Relaxed)
     }
 
+    /// Test-only: flips a bit in the first node's user-key bytes, simulating a
+    /// RAM bit-flip during memtable residence. Used to exercise
+    /// [`Self::verify_kv_digests`] end-to-end through the flush path.
+    #[cfg(test)]
+    pub(crate) fn test_flip_first_key_byte(&self) {
+        let node = self.first_node();
+        assert_ne!(node, UNSET, "skiplist must be non-empty to corrupt");
+        let off = self.node_key_offset(node);
+        // SAFETY: `off` is the first node's just-allocated key region (len >= 1).
+        unsafe {
+            if let Some(b) = self.arena.get_bytes_mut(off, 1).first_mut() {
+                *b ^= 0xFF;
+            }
+        }
+    }
+
+    /// Test-only: corrupts the first node's `value_type` low bits to an invalid
+    /// discriminant (0b111), keeping the presence + algorithm bits intact.
+    /// Simulates a RAM bit-flip in the `value_type` byte so the residence
+    /// verifier can be checked to fail closed instead of panicking.
+    #[cfg(test)]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "node metadata is exactly OFF_TOWER bytes; index 10 is the value_type byte"
+    )]
+    pub(crate) fn test_corrupt_first_node_value_type(&self) {
+        let node = self.first_node();
+        assert_ne!(node, UNSET, "skiplist must be non-empty to corrupt");
+        // SAFETY: `node` is a valid allocated node; its metadata is OFF_TOWER
+        // bytes, so index 10 (the value_type byte) is in bounds.
+        unsafe {
+            let m = self.arena.get_bytes_mut(node, OFF_TOWER);
+            m[10] = (m[10] & !VALUE_TYPE_MASK) | VALUE_TYPE_MASK; // low bits = 0b111 (invalid)
+        }
+    }
+
     /// Returns `true` if the skiplist is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Verifies every node carrying an insert-time per-KV digest
+    /// (`KvChecksumComputePoint::AtInsert`) against a recompute over its
+    /// current bytes, each under the algorithm the node was stored with.
+    ///
+    /// A divergence means the entry's logical content changed while it sat in
+    /// the memtable, i.e. a RAM bit-flip during residence; it is reported as
+    /// [`crate::Error::MemtableKvChecksumMismatch`] with the diverging entry's
+    /// seqno. Nodes without a stored digest (inserted under `Off` /
+    /// `AtBlockCompile`, including those before an `Off -> AtInsert` toggle in
+    /// the same memtable) are skipped. A skiplist with no insert digests at all
+    /// walks the nodes and returns `Ok` immediately.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::Error::MemtableKvChecksumMismatch`] when a stored digest does
+    ///   not match the recompute.
+    /// - [`crate::Error::FeatureUnsupported`] when a node's algorithm is not
+    ///   compiled into this build (cannot recompute). Config validation rejects
+    ///   selecting an uncompiled algorithm, so this is a defensive guard.
+    pub fn verify_kv_digests(&self) -> crate::Result<()> {
+        let mut node = self.first_node();
+        while node != UNSET {
+            match self.node_kv_digest(node) {
+                NodeKvDigest::Absent => {}
+                NodeKvDigest::Present(stored, algo) => {
+                    // Decode the key fallibly: a corrupt value_type on a
+                    // digest-bearing node must fail closed here, not panic.
+                    let item = InternalValue::new(
+                        self.node_internal_key_checked(node)?,
+                        self.node_value(node),
+                    );
+                    let recomputed = crate::table::block::kv_checksum::kv_digest(&item, algo)
+                        .ok_or(crate::Error::FeatureUnsupported("kv-checksum-algorithm"))?;
+                    // AtInsert stores the low 32 bits; truncate the recompute the
+                    // same way so the comparison is width-consistent.
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "AtInsert uses a 4-byte algorithm; only the low 32 bits are stored"
+                    )]
+                    let got = recomputed as u32;
+                    if got != stored {
+                        return Err(crate::Error::MemtableKvChecksumMismatch {
+                            seqno: item.key.seqno,
+                            got: u64::from(got),
+                            expected: u64::from(stored),
+                        });
+                    }
+                }
+                NodeKvDigest::CorruptAlgorithm(tag) => {
+                    // A present digest under an algorithm AtInsert never stores:
+                    // the algorithm metadata was corrupted in RAM. Refuse to
+                    // verify under it instead of risking a flipped tag passing.
+                    return Err(crate::Error::MemtableKvChecksumCorruptAlgorithm {
+                        seqno: self.node_seqno(node),
+                        tag,
+                    });
+                }
+            }
+            node = self.next_at(node, 0);
+        }
+        Ok(())
     }
 
     /// Returns an iterator over all entries in order.
@@ -290,7 +439,13 @@ impl SkipMap {
         clippy::cast_possible_truncation,
         reason = "key_bytes.len() <= u16::MAX, value idx <= u32::MAX, height <= MAX_HEIGHT (20)"
     )]
-    fn alloc_node(&self, key: &InternalKey, value: &UserValue, height: usize) -> u32 {
+    fn alloc_node(
+        &self,
+        key: &InternalKey,
+        value: &UserValue,
+        height: usize,
+        kv_digest: Option<(u32, ChecksumAlgorithm)>,
+    ) -> u32 {
         let key_bytes: &[u8] = &key.user_key;
 
         // Allocate key data in the arena.
@@ -336,11 +491,22 @@ impl SkipMap {
             meta[4..8].copy_from_slice(&value_idx.to_ne_bytes());
             // Cast is safe: InternalKey::new() asserts key.len() <= u16::MAX.
             meta[8..10].copy_from_slice(&(key_bytes.len() as u16).to_ne_bytes());
-            meta[10] = u8::from(key.value_type);
+            // ValueType discriminant in the low bits; high bit (KV_DIGEST_PRESENT)
+            // flags an insert-time per-KV digest in the reserved slot below.
+            let vt_byte = u8::from(key.value_type);
+            // Arena memory is uninitialized — the reserved padding at +12 is
+            // either the digest (when present) or zeroed, so the whole header
+            // is fully written before the node is published. The algorithm's
+            // wire_tag is packed into bits 5..=6 of the value_type byte so the
+            // digest is verified per node under its own algorithm.
+            if let Some((d, algo)) = kv_digest {
+                meta[10] = vt_byte | KV_DIGEST_PRESENT | (algo.wire_tag() << KV_ALGO_SHIFT);
+                meta[12..16].copy_from_slice(&d.to_ne_bytes());
+            } else {
+                meta[10] = vt_byte;
+                meta[12..16].copy_from_slice(&[0u8; 4]);
+            }
             meta[11] = height as u8;
-            // Arena memory is uninitialized — zero the reserved padding so the
-            // whole header is fully written before the node is published.
-            meta[12..16].copy_from_slice(&[0u8; 4]);
             meta[16..24].copy_from_slice(&key.seqno.to_ne_bytes());
             // Tower slots [0, height) are NOT initialized here: `insert` writes
             // every one of them (release store) before linking the node at that
@@ -400,12 +566,55 @@ impl SkipMap {
     )]
     fn node_value_type(&self, node: u32) -> ValueType {
         let m = unsafe { self.meta(node) };
-        let byte = m[10];
+        // Mask off the KV_DIGEST_PRESENT flag (high bit): the low bits hold the
+        // ValueType discriminant, the high bit is the insert-digest presence
+        // flag and is not part of the type.
+        let byte = m[10] & VALUE_TYPE_MASK;
         debug_assert!(
             byte <= 4,
             "invalid ValueType byte {byte} at node offset {node}, meta={m:?}",
         );
         ValueType::try_from(byte).expect("valid ValueType discriminant")
+    }
+
+    /// Reads a node's insert-time per-KV digest slot, distinguishing "no
+    /// digest" from "digest present but its algorithm metadata is corrupt".
+    ///
+    /// The algorithm is recovered from the `wire_tag` packed in bits 5..=6 of
+    /// the `value_type` byte, so each node verifies under its own algorithm
+    /// regardless of later config changes. `AtInsert` only ever stores a 4-byte
+    /// algorithm tag, so a present-digest node tagged with a non-4-byte or
+    /// unknown algorithm is metadata corruption (e.g. a single-bit flip in the
+    /// algorithm bits): reported as [`NodeKvDigest::CorruptAlgorithm`] rather
+    /// than silently verified under the wrong algorithm, which could let a
+    /// flipped tag pass the residence check.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "metadata is exactly OFF_TOWER (24) bytes by construction"
+    )]
+    #[expect(
+        clippy::expect_used,
+        reason = "infallible: 4-byte slice always converts to [u8; 4]"
+    )]
+    fn node_kv_digest(&self, node: u32) -> NodeKvDigest {
+        // SAFETY: `node` is a published skiplist node; its metadata header
+        // [0..OFF_TOWER) was fully written in `alloc_node` before the node was
+        // linked (CAS with Release), so the read is valid for the map's lifetime.
+        let m = unsafe { self.meta(node) };
+        if m[10] & KV_DIGEST_PRESENT == 0 {
+            return NodeKvDigest::Absent;
+        }
+        let algo_tag = (m[10] & KV_ALGO_MASK) >> KV_ALGO_SHIFT;
+        match ChecksumAlgorithm::from_wire_tag(algo_tag) {
+            Some(algo) if algo.digest_size() == 4 => {
+                let digest = u32::from_ne_bytes(m[12..16].try_into().expect("4 bytes"));
+                NodeKvDigest::Present(digest, algo)
+            }
+            // Unknown tag, or a known-but-non-4-byte algorithm (Xxh3_64): a
+            // present-digest node never legitimately carries one, so this is
+            // corruption of the algorithm bits or the presence bit.
+            _ => NodeKvDigest::CorruptAlgorithm(algo_tag),
+        }
     }
 
     #[expect(
@@ -455,6 +664,31 @@ impl SkipMap {
             seqno,
             value_type: vt,
         }
+    }
+
+    /// Like [`Self::node_internal_key`] but returns a typed error instead of
+    /// panicking when the node's `value_type` bits are not a valid discriminant.
+    ///
+    /// Used on the residence-verify path ([`Self::verify_kv_digests`]) so a node
+    /// whose metadata was corrupted in RAM fails closed with
+    /// [`crate::Error::InvalidTag`] rather than aborting the process via the
+    /// `expect` in [`Self::node_value_type`].
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "metadata is exactly OFF_TOWER (24) bytes by construction"
+    )]
+    fn node_internal_key_checked(&self, node: u32) -> crate::Result<InternalKey> {
+        // SAFETY: `node` is reached via skiplist links only after publication,
+        // so its metadata header is fully initialized; reading the value_type
+        // byte (index 10, within [0..OFF_TOWER)) is valid.
+        let vt_byte = unsafe { self.meta(node) }[10] & VALUE_TYPE_MASK;
+        let value_type = ValueType::try_from(vt_byte)
+            .map_err(|()| crate::Error::InvalidTag(("memtable-value-type", vt_byte)))?;
+        Ok(InternalKey {
+            user_key: self.node_user_key_bytes(node).into(),
+            seqno: self.node_seqno(node),
+            value_type,
+        })
     }
 
     /// Reads the value for `node` from the lock-free value store (wait-free).
@@ -1024,6 +1258,145 @@ mod tests {
 
     fn make_value(data: &[u8]) -> UserValue {
         UserValue::from(data)
+    }
+
+    use crate::runtime_config::ChecksumAlgorithm;
+
+    /// Low-32 logical digest of an entry under `algo` (the value stored at
+    /// insert under `KvChecksumComputePoint::AtInsert`).
+    fn digest4(key: &InternalKey, val: &UserValue, algo: ChecksumAlgorithm) -> u32 {
+        let item = InternalValue::new(key.clone(), val.clone());
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::expect_used,
+            reason = "4-byte algo fits u32; test helper"
+        )]
+        let d = crate::table::block::kv_checksum::kv_digest(&item, algo)
+            .expect("xxh3 always available") as u32;
+        d
+    }
+
+    #[test]
+    fn verify_kv_digests_passes_when_uncorrupted() {
+        // Every node carries the digest computed over its own bytes, so a
+        // recompute at flush matches and verify succeeds.
+        let algo = ChecksumAlgorithm::Xxh3Low32;
+        let map = new_map();
+        for i in 0..8u8 {
+            let key = make_key(&[b'k', i], u64::from(i) + 1);
+            let val = make_value(&[b'v', i, i, i]);
+            map.insert_with_kv_digest(&key, &val, Some((digest4(&key, &val, algo), algo)));
+        }
+        assert!(map.verify_kv_digests().is_ok());
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "test asserts the error via expect_err")]
+    fn verify_kv_digests_detects_residence_corruption() {
+        // Simulate a RAM bit-flip during residence: store the correct digest at
+        // insert, then corrupt the entry's key bytes in the arena. The recompute
+        // over the corrupted bytes diverges from the stored digest, so verify
+        // reports a MemtableKvChecksumMismatch.
+        let algo = ChecksumAlgorithm::Xxh3Low32;
+        let map = new_map();
+        let key = make_key(b"victim", 42);
+        let val = make_value(b"payload");
+        map.insert_with_kv_digest(&key, &val, Some((digest4(&key, &val, algo), algo)));
+
+        // Flip a bit in the (only) node's user-key bytes, simulating residence
+        // corruption.
+        map.test_flip_first_key_byte();
+
+        let err = map
+            .verify_kv_digests()
+            .expect_err("corruption must be detected");
+        assert!(
+            matches!(err, crate::Error::MemtableKvChecksumMismatch { .. }),
+            "expected MemtableKvChecksumMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_kv_digests_skips_nodes_without_a_digest() {
+        // Mixed-variant memtable (Off -> AtInsert toggle): nodes inserted
+        // without a digest are never verified, even if their bytes are
+        // corrupted. Only digest-bearing nodes are checked.
+        let algo = ChecksumAlgorithm::Xxh3Low32;
+        let map = new_map();
+
+        // No-digest node (pre-toggle): corrupt it later; must be skipped.
+        let k0 = make_key(b"aaa", 1);
+        let v0 = make_value(b"no-digest");
+        map.insert_with_kv_digest(&k0, &v0, None);
+
+        // Digest-bearing node (post-toggle): left intact.
+        let k1 = make_key(b"bbb", 2);
+        let v1 = make_value(b"has-digest");
+        map.insert_with_kv_digest(&k1, &v1, Some((digest4(&k1, &v1, algo), algo)));
+
+        // Corrupt the FIRST node's key (the no-digest "aaa" entry sorts first).
+        map.test_flip_first_key_byte();
+
+        // The corrupted node has no digest, so verify skips it and passes.
+        assert!(
+            map.verify_kv_digests().is_ok(),
+            "nodes without a stored digest must not be verified"
+        );
+    }
+
+    #[test]
+    fn verify_kv_digests_no_digests_is_ok() {
+        // A memtable with only plain inserts has nothing to verify.
+        let map = new_map();
+        for i in 0..4u8 {
+            let key = make_key(&[b'x', i], u64::from(i) + 1);
+            map.insert(&key, &make_value(b"plain"));
+        }
+        assert!(map.verify_kv_digests().is_ok());
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "test helper computes a known digest")]
+    fn verify_kv_digests_rejects_non_4_byte_algorithm_tag() {
+        // AtInsert only ever stores a 4-byte algorithm. A present-digest node
+        // whose algorithm bits decode to a non-4-byte algorithm (e.g. Xxh3_64
+        // after a single-bit flip from Xxh3Low32's tag 1 to tag 0) is metadata
+        // corruption. Store the Xxh3_64 digest truncated to u32 under the
+        // 8-byte Xxh3_64 tag: the worst case where comparing the digest alone
+        // would pass. Verification must reject it on the algorithm tag instead.
+        let map = new_map();
+        let key = make_key(b"k", 1);
+        let val = make_value(b"v");
+        let item = InternalValue::new(key.clone(), val.clone());
+        #[expect(clippy::cast_possible_truncation, reason = "low 32 bits on purpose")]
+        let d64 = crate::table::block::kv_checksum::kv_digest(&item, ChecksumAlgorithm::Xxh3_64)
+            .expect("xxh3 always available") as u32;
+        map.insert_with_kv_digest(&key, &val, Some((d64, ChecksumAlgorithm::Xxh3_64)));
+
+        assert!(
+            map.verify_kv_digests().is_err(),
+            "a present digest under a non-4-byte algorithm must be rejected, not verified"
+        );
+    }
+
+    #[test]
+    fn verify_kv_digests_fails_closed_on_corrupt_value_type() {
+        // A digest-bearing node whose value_type bits were corrupted to an
+        // invalid discriminant must surface a typed error from the residence
+        // verifier, not panic (the verifier reconstructs the key, which decodes
+        // value_type). Fail closed.
+        let algo = ChecksumAlgorithm::Xxh3Low32;
+        let map = new_map();
+        let key = make_key(b"k", 1);
+        let val = make_value(b"v");
+        map.insert_with_kv_digest(&key, &val, Some((digest4(&key, &val, algo), algo)));
+
+        map.test_corrupt_first_node_value_type();
+
+        assert!(
+            map.verify_kv_digests().is_err(),
+            "corrupt value_type on a digest-bearing node must fail closed, not panic"
+        );
     }
 
     #[test]

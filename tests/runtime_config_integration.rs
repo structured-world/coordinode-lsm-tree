@@ -251,6 +251,102 @@ fn seqno_in_index_round_trips_through_disk_and_reopen() -> lsm_tree::Result<()> 
     Ok(())
 }
 
+#[test]
+fn at_insert_kv_checksum_round_trips_through_flush_and_reopen() -> lsm_tree::Result<()> {
+    // KvChecksumComputePoint::AtInsert with a 4-byte algorithm: each entry's
+    // digest is computed at insert and verified at flush against a recompute.
+    // With no corruption the residence check passes and the data reads back
+    // intact through flush and reopen.
+    let folder = get_tmp_folder();
+    {
+        let tree = open_tree(folder.path());
+        tree.update_runtime_config(|cfg| {
+            cfg.kv_checksums = KvChecksumPolicy::AllLevels;
+            cfg.kv_checksum_algo = ChecksumAlgorithm::Xxh3Low32;
+            cfg.kv_checksum_compute_point =
+                lsm_tree::runtime_config::KvChecksumComputePoint::AtInsert;
+        })?;
+
+        for i in 0..500u64 {
+            let key = format!("key{i:05}");
+            let value = format!("value{i:05}");
+            tree.insert(key.as_bytes(), value.as_bytes(), i);
+        }
+        // Flush runs the AtInsert residence verify over the sealed memtable;
+        // it must succeed (no corruption) and produce the SST.
+        tree.flush_active_memtable(0)?;
+
+        for i in 0..500u64 {
+            let key = format!("key{i:05}");
+            let got = tree.get(key.as_bytes(), SeqNo::MAX)?;
+            assert_eq!(
+                got.as_deref(),
+                Some(format!("value{i:05}").as_bytes()),
+                "post-flush read of {key} under AtInsert must return its value"
+            );
+        }
+    }
+
+    // Reopen: data must read back identically (AtInsert is a residence check,
+    // not an on-disk format change beyond the per-KV footer).
+    let tree = open_tree(folder.path());
+    for i in 0..500u64 {
+        let key = format!("key{i:05}");
+        let got = tree.get(key.as_bytes(), SeqNo::MAX)?;
+        assert_eq!(
+            got.as_deref(),
+            Some(format!("value{i:05}").as_bytes()),
+            "post-reopen read of {key} must return its value"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn at_insert_handles_off_to_at_insert_toggle_mid_memtable() -> lsm_tree::Result<()> {
+    // Live toggle Off -> AtInsert within one memtable's lifetime: entries
+    // inserted before the toggle carry no digest, entries after do. The
+    // flush-time residence check must verify only the digest-bearing entries
+    // and flush the mixed-variant memtable successfully, with all data intact.
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path());
+
+    // Pre-toggle: default (no AtInsert digest).
+    for i in 0..200u64 {
+        let key = format!("key{i:05}");
+        let value = format!("value{i:05}");
+        tree.insert(key.as_bytes(), value.as_bytes(), i);
+    }
+
+    // Toggle AtInsert on with a 4-byte algorithm.
+    tree.update_runtime_config(|cfg| {
+        cfg.kv_checksums = KvChecksumPolicy::AllLevels;
+        cfg.kv_checksum_algo = ChecksumAlgorithm::Xxh3Low32;
+        cfg.kv_checksum_compute_point = lsm_tree::runtime_config::KvChecksumComputePoint::AtInsert;
+    })?;
+
+    // Post-toggle: same active memtable now also holds digest-bearing nodes.
+    for i in 200..400u64 {
+        let key = format!("key{i:05}");
+        let value = format!("value{i:05}");
+        tree.insert(key.as_bytes(), value.as_bytes(), i);
+    }
+
+    // Flush the mixed-variant memtable: verify checks only post-toggle nodes.
+    tree.flush_active_memtable(0)?;
+
+    for i in 0..400u64 {
+        let key = format!("key{i:05}");
+        let got = tree.get(key.as_bytes(), SeqNo::MAX)?;
+        assert_eq!(
+            got.as_deref(),
+            Some(format!("value{i:05}").as_bytes()),
+            "mixed-variant flush must preserve {key}"
+        );
+    }
+    Ok(())
+}
+
 /// Locks the public contract of `Tree::update_runtime_config` when
 /// the build does NOT enable the `page_ecc` cargo feature:
 /// flipping `page_ecc = true` must return the typed error AND
