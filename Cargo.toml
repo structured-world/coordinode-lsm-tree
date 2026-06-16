@@ -134,7 +134,7 @@ ribbon-serde = ["dep:serde"]
 #     cd tools/compare-rocksdb && cargo bench
 
 [dependencies]
-bytes = { version = "1", optional = true }
+bytes = { version = "1.11.1", optional = true }
 # Lockless atomic snapshot for RuntimeConfig (see src/runtime_config/).
 # Lock-free atomic Arc swap. `arc-swap` 1.x is NOT `#![no_std]` (it requires
 # `std`), so it stays an optional dependency enabled only by the `std`
@@ -152,7 +152,7 @@ spin = { version = "0.12", default-features = false, features = ["mutex", "spin_
 # backing each shard (alloc-only, no std dependency), replacing quick_cache's
 # std-bound map. `parking_lot::RwLock` is the per-shard lock under `std` (small,
 # userspace fast-path, concurrent readers); `spin::RwLock` is the no_std lock.
-hashbrown = { version = "0.16", default-features = false, features = ["default-hasher"] }
+hashbrown = { version = "0.17", default-features = false, features = ["default-hasher"] }
 parking_lot = { version = "0.12", optional = true }
 lz4_flex = { version = "0.13.0", optional = true, default-features = false }
 structured-zstd = { version = "0.0.40", optional = true, default-features = false, features = ["std", "lsm"] }
