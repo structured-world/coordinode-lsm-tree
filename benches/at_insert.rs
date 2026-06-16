@@ -101,14 +101,30 @@ fn bench_at_insert_write(c: &mut Criterion) {
     for &(label, policy, algo, cp) in arms {
         group.bench_function(label, |b| {
             b.iter_custom(|iters| {
-                use std::time::Instant;
-                let started = Instant::now();
+                use std::time::{Duration, Instant};
+                // Time each insert+flush separately so the per-operation tail
+                // (P99/P999) is observable, not only Criterion's aggregate
+                // throughput. The sum of the per-op durations is returned as
+                // the total Criterion needs.
+                let mut samples = Vec::with_capacity(iters as usize);
                 for _ in 0..iters {
+                    let op_start = Instant::now();
                     let (dir, tree) = open_tree(policy, algo, cp);
                     insert_and_flush(&tree, n);
                     std::hint::black_box(&dir);
+                    samples.push(op_start.elapsed());
                 }
-                started.elapsed()
+                samples.sort_unstable();
+                let pct = |per_mille: usize| {
+                    samples[(samples.len() * per_mille / 1000).min(samples.len() - 1)]
+                };
+                eprintln!(
+                    "{label}: p50={:?} p99={:?} p999={:?}",
+                    pct(500),
+                    pct(990),
+                    pct(999),
+                );
+                samples.into_iter().fold(Duration::ZERO, |acc, d| acc + d)
             });
         });
     }
