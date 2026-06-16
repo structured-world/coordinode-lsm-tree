@@ -31,6 +31,26 @@ pub enum Error {
         expected: Checksum,
     },
 
+    /// A memtable entry's per-KV digest, computed at insert under
+    /// [`KvChecksumComputePoint::AtInsert`](crate::runtime_config::KvChecksumComputePoint::AtInsert),
+    /// did not match a recompute over the entry's current bytes at flush.
+    ///
+    /// This is the memtable-residence RAM-corruption signal: the entry's
+    /// logical content (`value_type`, `seqno`, key, or value) changed while it
+    /// sat in the memtable, between insert and flush. Distinct from
+    /// [`Self::ChecksumMismatch`] (on-disk block bytes) — this catches a flip
+    /// that happens entirely in RAM, before any block is written.
+    MemtableKvChecksumMismatch {
+        /// Sequence number of the entry whose digest diverged (locates it).
+        seqno: u64,
+
+        /// Digest recomputed over the entry's current memtable bytes at flush.
+        got: u64,
+
+        /// Digest computed and stored when the entry was inserted.
+        expected: u64,
+    },
+
     /// Blob frame header CRC mismatch (V4 format).
     /// Distinct from `ChecksumMismatch` which covers data payload checksums.
     HeaderCrcMismatch {

@@ -359,3 +359,9 @@ name = "scan_since"
 harness = false
 path = "benches/scan_since.rs"
 required-features = []
+
+[[bench]]
+name = "at_insert"
+harness = false
+path = "benches/at_insert.rs"
+required-features = []

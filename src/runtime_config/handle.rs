@@ -126,9 +126,10 @@ impl RuntimeConfigHandle {
     /// `Block` granularity, `Page` granularity is rejected (only `Block` is
     /// wired), a zero shard count is rejected (no implicit RS(4,2) fallback),
     /// and `ReedSolomon` needs >= 2 parity shards (single parity is expressed
-    /// as `Xor`); (3) `kv_checksum_compute_point = AtInsert`, which is not yet
-    /// wired into the memtable / writer path — accepting it would silently
-    /// behave as `AtBlockCompile`.
+    /// as `Xor`); (3) `kv_checksum_compute_point = AtInsert` with an 8-byte
+    /// algorithm: `AtInsert` stores the digest in the skiplist node's 4-byte
+    /// reserved slot, so it requires a 4-byte algorithm (`Xxh3Low32` /
+    /// `Crc32c`); `Xxh3_64` would grow every node and is rejected.
     ///
     /// # Errors
     ///
@@ -137,7 +138,7 @@ impl RuntimeConfigHandle {
     /// - [`crate::Error::FeatureUnsupported`] when the mutator enables ECC
     ///   with an unwired / invalid scheme or granularity (`Page`, a zero shard
     ///   count, single-parity `ReedSolomon`), or sets
-    ///   `kv_checksum_compute_point = AtInsert`.
+    ///   `kv_checksum_compute_point = AtInsert` with an 8-byte algorithm.
     pub fn try_update<F>(&self, mutator: F) -> crate::Result<()>
     where
         F: FnOnce(&mut RuntimeConfig),
@@ -185,22 +186,22 @@ impl RuntimeConfigHandle {
                 _ => {}
             }
         }
-        // AtInsert (compute the per-KV digest at memtable insert and carry
-        // it through flush) is not yet wired into the memtable / writer
-        // path: accepting it would silently behave as AtBlockCompile,
-        // downgrading the caller's intent without notice. Reject it with a
-        // typed error until the carry path lands. (When wired, AtInsert
-        // will additionally require a 4-byte algorithm so the digest fits
-        // the memtable node's reserved slot.)
+        // AtInsert (compute the per-KV digest at memtable insert, then verify
+        // it against a recompute at flush to catch a RAM bit-flip during
+        // memtable residence) stores the digest in the skiplist node's 4-byte
+        // reserved slot. That slot only fits a 4-byte digest, so AtInsert
+        // requires a 4-byte algorithm (`Xxh3Low32` / `Crc32c`); the 8-byte
+        // `Xxh3_64` would grow every memtable node and is rejected. This keeps
+        // AtInsert zero-size-overhead in the memtable.
         if matches!(
             next.kv_checksum_compute_point,
             crate::runtime_config::KvChecksumComputePoint::AtInsert
-        ) {
+        ) && next.kv_checksum_algo.digest_size() != 4
+        {
             // Short, machine-matchable marker per the FeatureUnsupported
-            // contract; the "not yet wired, use AtBlockCompile" rationale lives
-            // in the comment above rather than in the error payload.
+            // contract; the 4-byte-slot rationale lives in the comment above.
             return Err(crate::Error::FeatureUnsupported(
-                "kv_checksum_compute_point=AtInsert",
+                "kv_checksum_compute_point=AtInsert requires a 4-byte algorithm",
             ));
         }
         #[cfg(feature = "std")]
@@ -362,20 +363,24 @@ mod tests {
     }
 
     #[test]
-    fn try_update_rejects_at_insert_as_not_implemented() {
+    fn try_update_rejects_at_insert_with_8_byte_algorithm() {
         use super::super::types::KvChecksumComputePoint;
 
-        // AtInsert is not yet wired into the memtable / writer path.
-        // Accepting it would silently behave as AtBlockCompile, so it must
-        // be rejected with a typed error and leave the live snapshot
-        // unchanged — regardless of the algorithm width.
+        // AtInsert stores the digest in the node's 4-byte reserved slot, so
+        // the 8-byte Xxh3_64 (the default algo) does not fit and must be
+        // rejected with a typed error, leaving the live snapshot unchanged.
         let handle = RuntimeConfigHandle::new(RuntimeConfig::default());
+        assert_eq!(
+            handle.load().kv_checksum_algo,
+            ChecksumAlgorithm::Xxh3_64,
+            "precondition: default algo is the 8-byte Xxh3_64"
+        );
         let result = handle.try_update(|c| {
             c.kv_checksum_compute_point = KvChecksumComputePoint::AtInsert;
         });
         assert!(
             matches!(result, Err(crate::Error::FeatureUnsupported(_))),
-            "AtInsert must be rejected as not-yet-implemented, got {result:?}"
+            "AtInsert + 8-byte algo must be rejected, got {result:?}"
         );
         assert_eq!(
             handle.load().kv_checksum_compute_point,
@@ -385,21 +390,30 @@ mod tests {
     }
 
     #[test]
-    fn try_update_rejects_at_insert_even_with_4_byte_algorithm() {
+    fn try_update_accepts_at_insert_with_4_byte_algorithm() {
         use super::super::types::KvChecksumComputePoint;
 
-        // Even with a 4-byte algorithm (the eventual requirement), AtInsert
-        // is rejected until the carry path is implemented — the not-yet-
-        // wired gate fires before the algorithm-width check.
-        let handle = RuntimeConfigHandle::new(RuntimeConfig::default());
-        let result = handle.try_update(|c| {
-            c.kv_checksum_algo = ChecksumAlgorithm::Xxh3Low32;
-            c.kv_checksum_compute_point = KvChecksumComputePoint::AtInsert;
-        });
-        assert!(
-            matches!(result, Err(crate::Error::FeatureUnsupported(_))),
-            "AtInsert must be rejected even with a 4-byte algorithm, got {result:?}"
-        );
+        // A 4-byte algorithm fits the node's reserved slot, so AtInsert is
+        // accepted and becomes visible on the next load.
+        for algo in [ChecksumAlgorithm::Xxh3Low32, ChecksumAlgorithm::Crc32c] {
+            // Crc32c needs the cargo feature to be a usable runtime algo, but
+            // its digest width is 4 regardless, so the config-level acceptance
+            // check is independent of the feature.
+            let handle = RuntimeConfigHandle::new(RuntimeConfig::default());
+            let result = handle.try_update(|c| {
+                c.kv_checksum_algo = algo;
+                c.kv_checksum_compute_point = KvChecksumComputePoint::AtInsert;
+            });
+            assert!(
+                result.is_ok(),
+                "AtInsert + 4-byte {algo:?} must be accepted, got {result:?}"
+            );
+            assert_eq!(
+                handle.load().kv_checksum_compute_point,
+                KvChecksumComputePoint::AtInsert,
+                "accepted AtInsert must be visible on next load for {algo:?}"
+            );
+        }
     }
 
     #[test]

@@ -239,6 +239,25 @@ pub trait AbstractTree: sealed::Sealed {
 
         let flushed_size = latest.sealed_memtables.iter().map(|mt| mt.size()).sum();
 
+        // AtInsert residence check: verify each sealed memtable's insert-time
+        // per-KV digests against a recompute over the entries' current bytes
+        // before writing them out. A divergence means an entry was corrupted
+        // (a RAM bit-flip) while it sat in the memtable. Memtables with no
+        // insert digests (the default) return immediately without walking.
+        //
+        // This is a SEPARATE pass over the as-inserted memtable entries, not
+        // fused into the writer's per-KV footer encode, and deliberately so:
+        // the footer digest is computed over POST-merge / post-seqno-filter
+        // bytes (the CompactionStream below applies the merge operator), so a
+        // merge operator's combined value differs from any single inserted
+        // value. Comparing the carried insert digest against the footer digest
+        // would false-positive on every legitimate merge. Residence corruption
+        // is a property of what was inserted (pre-merge); it must be checked
+        // here, against the raw memtable entries.
+        for mt in latest.sealed_memtables.iter() {
+            mt.verify_kv_residence()?;
+        }
+
         // Collect range tombstones from sealed memtables
         let mut range_tombstones: Vec<RangeTombstone> = Vec::new();
         for mt in latest.sealed_memtables.iter() {
