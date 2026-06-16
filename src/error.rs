@@ -51,6 +51,26 @@ pub enum Error {
         expected: u64,
     },
 
+    /// A memtable entry carried an insert-time per-KV digest
+    /// ([`KvChecksumComputePoint::AtInsert`](crate::runtime_config::KvChecksumComputePoint::AtInsert))
+    /// tagged with an algorithm `AtInsert` never stores: a non-4-byte or
+    /// unknown algorithm wire tag.
+    ///
+    /// `AtInsert` only ever writes a 4-byte algorithm tag (`Xxh3Low32` /
+    /// `Crc32c`), so a digest-bearing node tagged otherwise means the node's
+    /// algorithm metadata was corrupted in RAM during memtable residence.
+    /// Distinct from [`Self::MemtableKvChecksumMismatch`] (the digest value
+    /// diverged): here the algorithm itself is unusable, so the engine refuses
+    /// to "verify" the entry under the wrong algorithm rather than risk a
+    /// flipped tag passing the residence check.
+    MemtableKvChecksumCorruptAlgorithm {
+        /// Sequence number of the entry whose algorithm tag is invalid.
+        seqno: u64,
+
+        /// The invalid algorithm wire tag read from the node.
+        tag: u8,
+    },
+
     /// Blob frame header CRC mismatch (V4 format).
     /// Distinct from `ChecksumMismatch` which covers data payload checksums.
     HeaderCrcMismatch {
