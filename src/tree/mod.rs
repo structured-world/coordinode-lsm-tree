@@ -2350,10 +2350,15 @@ impl Tree {
 
         // Per-KV residence digest (KvChecksumComputePoint::AtInsert): compute
         // the entry's 4-byte logical-content digest now, so a RAM bit-flip
-        // while it sits in the memtable is caught at flush. Reading the live
-        // snapshot is a cheap arc-swap load; under the default
-        // `AtBlockCompile` (or `Off`) the two `matches!` checks short-circuit
-        // and no digest is computed, so the hot insert path is unchanged.
+        // while it sits in the memtable is caught at flush. The digest covers
+        // the OWNED `value` and is independent of which active memtable
+        // receives it, so computing it before taking the version-history guard
+        // is correct (a concurrent rotation just routes the same value+digest
+        // into the new active memtable) AND keeps the hash out of the read-lock
+        // critical section. Reading the live snapshot is a cheap arc-swap load;
+        // under the default `AtBlockCompile` (or `Off`) the two `matches!`
+        // checks short-circuit and no digest is computed, so the hot insert
+        // path is unchanged.
         let kv_digest = {
             let rc = self.0.runtime_config.load();
             if matches!(
@@ -2374,6 +2379,10 @@ impl Tree {
             }
         };
 
+        // The `.read()` guard is a temporary that lives until the end of this
+        // statement, so the insert runs under the version-history read lock:
+        // `value` + its digest land in the current active memtable atomically,
+        // and a concurrent `rotate_memtable()` cannot seal it mid-insert.
         self.version_history
             .read()
             .latest_version()

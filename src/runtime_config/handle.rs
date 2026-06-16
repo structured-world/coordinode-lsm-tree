@@ -126,10 +126,13 @@ impl RuntimeConfigHandle {
     /// `Block` granularity, `Page` granularity is rejected (only `Block` is
     /// wired), a zero shard count is rejected (no implicit RS(4,2) fallback),
     /// and `ReedSolomon` needs >= 2 parity shards (single parity is expressed
-    /// as `Xor`); (3) `kv_checksum_compute_point = AtInsert` with an 8-byte
-    /// algorithm: `AtInsert` stores the digest in the skiplist node's 4-byte
-    /// reserved slot, so it requires a 4-byte algorithm (`Xxh3Low32` /
-    /// `Crc32c`); `Xxh3_64` would grow every node and is rejected.
+    /// as `Xor`); (3) `kv_checksum_compute_point = AtInsert` with an algorithm
+    /// that is not a compiled-in 4-byte one. `AtInsert` stores the digest in
+    /// the skiplist node's 4-byte reserved slot, so it requires a 4-byte
+    /// algorithm (`Xxh3Low32` / `Crc32c`): the 8-byte `Xxh3_64` would grow
+    /// every node, and a 4-byte algorithm not compiled into the build (e.g.
+    /// `Crc32c` without the `crc32c` feature) cannot produce a digest. Both
+    /// are rejected.
     ///
     /// # Errors
     ///
@@ -138,7 +141,8 @@ impl RuntimeConfigHandle {
     /// - [`crate::Error::FeatureUnsupported`] when the mutator enables ECC
     ///   with an unwired / invalid scheme or granularity (`Page`, a zero shard
     ///   count, single-parity `ReedSolomon`), or sets
-    ///   `kv_checksum_compute_point = AtInsert` with an 8-byte algorithm.
+    ///   `kv_checksum_compute_point = AtInsert` with an 8-byte or
+    ///   not-compiled-in algorithm.
     pub fn try_update<F>(&self, mutator: F) -> crate::Result<()>
     where
         F: FnOnce(&mut RuntimeConfig),

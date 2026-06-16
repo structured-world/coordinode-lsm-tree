@@ -597,6 +597,9 @@ impl SkipMap {
         reason = "infallible: 4-byte slice always converts to [u8; 4]"
     )]
     fn node_kv_digest(&self, node: u32) -> NodeKvDigest {
+        // SAFETY: `node` is a published skiplist node; its metadata header
+        // [0..OFF_TOWER) was fully written in `alloc_node` before the node was
+        // linked (CAS with Release), so the read is valid for the map's lifetime.
         let m = unsafe { self.meta(node) };
         if m[10] & KV_DIGEST_PRESENT == 0 {
             return NodeKvDigest::Absent;
@@ -675,6 +678,9 @@ impl SkipMap {
         reason = "metadata is exactly OFF_TOWER (24) bytes by construction"
     )]
     fn node_internal_key_checked(&self, node: u32) -> crate::Result<InternalKey> {
+        // SAFETY: `node` is reached via skiplist links only after publication,
+        // so its metadata header is fully initialized; reading the value_type
+        // byte (index 10, within [0..OFF_TOWER)) is valid.
         let vt_byte = unsafe { self.meta(node) }[10] & VALUE_TYPE_MASK;
         let value_type = ValueType::try_from(vt_byte)
             .map_err(|()| crate::Error::InvalidTag(("memtable-value-type", vt_byte)))?;

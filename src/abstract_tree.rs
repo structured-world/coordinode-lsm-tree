@@ -218,7 +218,12 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// # Errors
     ///
-    /// Will return `Err` if an IO error occurs.
+    /// Returns `Err` on an I/O error, or on a memtable residence-verification
+    /// failure under [`KvChecksumComputePoint::AtInsert`](crate::runtime_config::KvChecksumComputePoint::AtInsert):
+    /// a sealed memtable whose insert-time per-KV digests do not verify before
+    /// flush surfaces [`crate::Error::MemtableKvChecksumMismatch`],
+    /// [`crate::Error::MemtableKvChecksumCorruptAlgorithm`], or
+    /// [`crate::Error::InvalidTag`] (corrupt `value_type`).
     fn flush(&self, _lock: &FlushGuard<'_>, seqno_threshold: SeqNo) -> crate::Result<Option<u64>> {
         use crate::{
             compaction::stream::CompactionStream, merge::Merger, range_tombstone::RangeTombstone,
