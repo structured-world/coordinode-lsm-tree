@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781618298095,
+  "lastUpdate": 1781624166914,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -17160,6 +17160,84 @@ window.BENCHMARK_DATA = {
             "value": 712422.487765435,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.5us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "61425cbda00d13579a62a49644bbb4e487ece533",
+          "message": "feat(storage): storage introspection API (capacity, K/V shape, remaining estimate) (#488)\n\n## Summary\n\nAdds a read-only `AbstractTree::storage_stats() -> Result<StorageStats>`\nso operators and embedded callers can ask a tree what it stores and how\nmuch more fits, without touching a data block.\n\n`StorageStats` reports:\n- `used_bytes` — true physical on-disk size of every live SST + blob\nfile\n- `item_count`, `table_count`\n- `avg_entry_on_disk_bytes` (`used_bytes / item_count`)\n- `avg_key_bytes` / `avg_value_bytes` (`Option<u64>` — exact average K/V\nshape from new per-table byte sums; `None` if any live table predates\nthe accumulators)\n- `reclaimable_bytes_estimate` (from weak-tombstone-reclaimable\ncounters)\n- `status: StorageStatus`\n\n`StorageStats::estimated_remaining_entries(budget_bytes)` divides a byte\nbudget by the average on-disk entry size to estimate how many more\naverage-shaped entries fit.\n\n`StorageStatus` enum (`Healthy`, `FullCompactionAvailable`,\n`TightCompactionAvailable`, `ReadOnlyOutOfSpace`,\n`CompactionInProgress`) is defined now; this PR returns the baseline\n(`Healthy` / `CompactionInProgress`). The capacity-dependent variants\nare populated by the storage-admission follow-ups.\n\n## Key decision\n\n`used_bytes` is the physical file size (one `Fs::metadata().len` stat\nper live table, matching what `create_checkpoint` reports), **not** the\nwriter's `Metadata::file_size`. The latter records `file_pos` before the\nmeta block and footer were appended, so it undercounts the physical file\nby hundreds to thousands of bytes per table. An integration test\ncross-checks `used_bytes` against the checkpoint total.\n\n## Backward compatibility\n\nThe two new `TableMetadata` fields are additive optional meta-block\nentries. Older SSTs without them still open and report stats; the\naverage K/V split simply reports `None` (the on-disk average is always\navailable).\n\n## Testing\n\n- Unit: byte-sum parse-as-`None` on legacy SSTs and `Some` round-trip;\ncompaction-flag-to-status mapping on an empty version;\n`estimated_remaining_entries` math + zero-item edge case.\n- Integration: average shape after flush; survives flush + reopen (read\nback from the on-disk meta block); `used_bytes == checkpoint\ntotal_bytes`.\n- `cargo nextest run` 1830 passed; `--all-features` 2127 passed; clippy\n`--all-features --all-targets` clean; doctest passes.\n\nPart of #482. Closes #483.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n## Release Notes\n\n* **New Features**\n* Introduced storage introspection API to query on-disk usage metrics\nand storage health status\n* Provides disk byte usage, live entry/table counts, average per-entry\nkey/value sizes, and estimated compaction-reclaimable space\n* Added estimation tool to calculate remaining entries within a byte\nbudget\n* Full backward compatibility; statistics persist across tree reopenings\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-16T18:34:56+03:00",
+          "tree_id": "30ea7beef84d01724a8a76f4bd380f8656042f58",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/61425cbda00d13579a62a49644bbb4e487ece533"
+        },
+        "date": 1781624152816,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2088582.6813178512,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1204884.4424850882,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.5us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 908796.7728844706,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.0us | P99.9: 6.7us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3815836.875415711,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 465129.8175925512,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.2us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 245547.49826362316,
+            "unit": "ops/sec",
+            "extra": "P50: 3.8us | P99: 4.7us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.81s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1237327.6153619618,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1090714.8464936377,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.4us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 715017.3685762773,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.4us | P99.9: 6.8us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
         ]
       }
