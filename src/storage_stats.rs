@@ -173,7 +173,6 @@ pub(crate) fn compute_storage_stats(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, reason = "test code")]
 mod tests {
     use super::*;
 
@@ -217,6 +216,10 @@ mod tests {
         // pure and exercises only the status mapping and the zero-table path.
         let version = Version::new(0, TreeType::Standard);
 
+        #[expect(
+            clippy::unwrap_used,
+            reason = "compute_storage_stats cannot fail on an empty in-memory version (no file to stat)"
+        )]
         let busy = compute_storage_stats(&version, true).unwrap();
         assert_eq!(busy.status, StorageStatus::CompactionInProgress);
         assert_eq!(busy.used_bytes, 0);
@@ -225,6 +228,10 @@ mod tests {
         assert_eq!(busy.avg_key_bytes, None);
         assert_eq!(busy.estimated_remaining_entries(1_000_000), 0);
 
+        #[expect(
+            clippy::unwrap_used,
+            reason = "compute_storage_stats cannot fail on an empty in-memory version (no file to stat)"
+        )]
         let idle = compute_storage_stats(&version, false).unwrap();
         assert_eq!(idle.status, StorageStatus::Healthy);
     }
