@@ -264,6 +264,63 @@ fn blob_tree_admits_gated_writes_when_open() -> lsm_tree::Result<()> {
 }
 
 #[test]
+fn cached_usage_refreshes_when_a_new_version_is_installed() -> lsm_tree::Result<()> {
+    // Write `range` 1 KiB high-entropy values (incompressible, so it holds
+    // under `--all-features` compression) and flush, returning the live size.
+    fn flush_batch(tree: &lsm_tree::Tree, range: std::ops::Range<u64>) -> u64 {
+        for i in range {
+            let mut s = (i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let value: Vec<u8> = (0..1024u32)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    (s >> 24) as u8
+                })
+                .collect();
+            tree.insert(format!("key{i:06}").as_bytes(), &value, i);
+        }
+        tree.flush_active_memtable(0).expect("flush");
+        tree.disk_space()
+    }
+
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path());
+    let used1 = flush_batch(&tree, 0..4000); // version V1, ~4 MiB
+
+    // Budget above V1 + reserved headroom (1 MiB floor) but below what a second
+    // ~4 MiB batch reaches: the gate caches V1's usage and admits now.
+    let budget = used1 + 2 * 1024 * 1024;
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = Some(budget);
+    })?;
+    assert!(
+        !tree.is_read_only(),
+        "must admit while under budget (used1 {used1})"
+    );
+
+    // Second batch installs a new version (V2), growing the footprint past the
+    // budget. The per-version cache must invalidate on the version change rather
+    // than serve V1's smaller usage.
+    let used2 = flush_batch(&tree, 4000..8000);
+    assert!(
+        used2 > budget,
+        "second flush must exceed the budget (used2 {used2})"
+    );
+
+    assert!(
+        tree.is_read_only(),
+        "cache must refresh on the new version and see the over-budget footprint"
+    );
+    assert!(
+        tree.try_insert(b"k".as_slice(), b"v".as_slice(), 9999)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
 fn flush_and_bare_insert_are_never_gated_at_the_limit() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let tree = open_tree(folder.path());

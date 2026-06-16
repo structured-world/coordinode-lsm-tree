@@ -2287,6 +2287,8 @@ impl Tree {
     /// `Ok(())` unless admission control is enabled AND a budget is set AND the
     /// live footprint plus reserved headroom exceeds it.
     fn compute_write_admission(&self) -> crate::Result<()> {
+        use portable_atomic::Ordering;
+
         let rc = self.0.runtime_config.load();
         if !rc.storage_admission_check {
             return Ok(());
@@ -2302,7 +2304,26 @@ impl Tree {
         // `storage_stats()` reports, so the gate and the reported usage agree.
         // NOT `disk_space()` (metadata Level::size, which omits blob files and
         // undercounts the physical file by the meta block / footer).
-        let used = crate::storage_stats::compute_used_bytes(&self.current_version())?;
+        //
+        // Cached per version so gated writes don't re-stat every live file:
+        // the file set only changes when a new version is installed (flush /
+        // compaction), so a full stat runs once per version and every
+        // subsequent admission check in that version is a constant-time atomic
+        // read. See `TreeInner::admission_used_version`.
+        let version = self.current_version();
+        let vid = version.id();
+        let used = if self.0.admission_used_version.load(Ordering::Acquire) == vid {
+            self.0.admission_used_bytes.load(Ordering::Acquire)
+        } else {
+            let computed = crate::storage_stats::compute_used_bytes(&version)?;
+            // Publish bytes before stamping the version so a reader that sees
+            // the new stamp also sees the matching bytes.
+            self.0
+                .admission_used_bytes
+                .store(computed, Ordering::Release);
+            self.0.admission_used_version.store(vid, Ordering::Release);
+            computed
+        };
 
         // Reserved headroom keeps the soft budget from becoming a hard wall:
         // enough to flush the current active memtable (plus a margin for the
@@ -2657,6 +2678,8 @@ impl Tree {
             runtime_config: Arc::new(crate::runtime_config::handle::RuntimeConfigHandle::new(
                 initial_runtime,
             )),
+            admission_used_version: portable_atomic::AtomicU64::new(u64::MAX),
+            admission_used_bytes: portable_atomic::AtomicU64::new(0),
 
             #[cfg(feature = "metrics")]
             metrics,

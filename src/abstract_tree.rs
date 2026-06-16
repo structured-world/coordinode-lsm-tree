@@ -151,8 +151,10 @@ pub trait AbstractTree: sealed::Sealed {
     /// the next call admits again with no restart.
     ///
     /// Intended as a cheap pre-check the caller consults before applying a
-    /// write batch (it reads in-memory size accounting, no syscall). Internal
-    /// flush / compaction are never gated, so the engine can always reclaim.
+    /// write batch. The footprint is cached per version, so the check is a
+    /// constant-time read on the common path and only re-measures when a new
+    /// version is installed (flush / compaction). Internal flush / compaction
+    /// are never gated, so the engine can always reclaim.
     ///
     /// # Errors
     ///
@@ -166,8 +168,16 @@ pub trait AbstractTree: sealed::Sealed {
     /// [`write_admission`](Self::write_admission)). Convenience for callers that
     /// want a boolean rather than a `Result`. Always `false` unless admission
     /// control is enabled and the tree is over budget.
+    ///
+    /// Only [`Error::StorageFull`](crate::Error::StorageFull) counts as
+    /// read-only: an unrelated admission error (e.g. an I/O failure while
+    /// measuring the footprint) is NOT an out-of-space condition and must not be
+    /// reported as one.
     fn is_read_only(&self) -> bool {
-        self.write_admission().is_err()
+        matches!(
+            self.write_admission(),
+            Err(crate::Error::StorageFull { .. })
+        )
     }
 
     /// Proactively verifies every block's XXH3 checksum across every SST in
