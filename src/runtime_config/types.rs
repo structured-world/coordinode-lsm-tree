@@ -851,6 +851,30 @@ pub struct RuntimeConfig {
     /// Default `true`. On a filesystem without reflink the checkpoint driver
     /// uses the existing hard-link path, so the setting is a no-op there.
     pub use_reflink_for_checkpoint: bool,
+
+    /// Opt-in write admission control. When `false` (default) the tree never
+    /// computes an admission state and the gated write path always admits, so
+    /// there is zero overhead and behaviour is unchanged. When `true`, the
+    /// engine maintains a cached read-only predicate (see
+    /// [`crate::Tree::write_admission`]) driven by [`Self::storage_limit_bytes`]
+    /// (and, once wired, the filesystem free-space probe), and the gated write
+    /// path ([`crate::Tree::try_insert`] / batch apply) declines writes with
+    /// [`crate::Error::StorageFull`] while the tree is over budget.
+    ///
+    /// Toggle takes effect on the next admission check.
+    pub storage_admission_check: bool,
+
+    /// Soft byte budget for the tree's live on-disk footprint, enforced by the
+    /// admission gate when [`Self::storage_admission_check`] is `true`. `None`
+    /// (default) means unbounded. Live-toggleable: raising it (or a compaction
+    /// reclaiming space) clears read-only on the next check with no restart,
+    /// because the predicate is computed, not latched.
+    ///
+    /// Internal flush / compaction are never gated by this budget — a reserved
+    /// headroom band is always kept available so the engine can flush the
+    /// active memtable and run a space-reclaiming compaction even at the limit.
+    /// That is what makes the budget a safe soft limit rather than a hard wall.
+    pub storage_limit_bytes: Option<u64>,
 }
 
 impl Default for RuntimeConfig {
@@ -872,6 +896,8 @@ impl Default for RuntimeConfig {
             index_partition_spill_threshold: crate::table::writer::DEFAULT_SPILL_THRESHOLD,
             disable_cow_on_sst_files: true,
             use_reflink_for_checkpoint: true,
+            storage_admission_check: false,
+            storage_limit_bytes: None,
         }
     }
 }

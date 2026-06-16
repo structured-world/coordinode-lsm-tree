@@ -322,11 +322,24 @@ impl AbstractTree for BlobTree {
         // always report idle), and mark value bytes as NOT user values: large
         // values are KV-separated into blob files, so the SST records only
         // indirection pointers.
-        crate::storage_stats::compute_storage_stats(
+        let mut stats = crate::storage_stats::compute_storage_stats(
             &self.current_version(),
             self.index.is_compacting(),
             false,
-        )
+        )?;
+        // Admission is driven by the index tree's runtime config / footprint;
+        // a closed gate is the operator-actionable state (see the standard
+        // tree's override for the precedence rationale).
+        if self.index.is_read_only() {
+            stats.status = crate::StorageStatus::ReadOnlyOutOfSpace;
+        }
+        Ok(stats)
+    }
+
+    fn write_admission(&self) -> crate::Result<()> {
+        // Admission state lives on the index tree (which holds the runtime
+        // config and the SST footprint); forward to it.
+        self.index.write_admission()
     }
 
     #[cfg(feature = "metrics")]

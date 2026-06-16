@@ -41,6 +41,12 @@ use spin::{Mutex, RwLock};
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
 
+/// Floor for the storage-admission reserved headroom band (see
+/// [`Tree::compute_write_admission`]). Even with an empty active memtable the
+/// gate keeps at least this much room below the budget so the next writes and a
+/// space-reclaiming compaction have somewhere to land. 1 MiB.
+const MIN_RESERVED_HEADROOM: u64 = 1024 * 1024;
+
 /// Iterator value guard
 pub struct Guard(crate::Result<(UserKey, UserValue)>);
 
@@ -310,11 +316,22 @@ impl AbstractTree for Tree {
 
     fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
         // Standard tree: SST values ARE user values (no KV separation).
-        crate::storage_stats::compute_storage_stats(
+        let mut stats = crate::storage_stats::compute_storage_stats(
             &self.current_version(),
             self.is_compacting(),
             true,
-        )
+        )?;
+        // A closed admission gate is the operator-actionable state, so it takes
+        // precedence over CompactionInProgress (a read-only tree may well be
+        // compacting to reclaim space).
+        if self.is_read_only() {
+            stats.status = crate::StorageStatus::ReadOnlyOutOfSpace;
+        }
+        Ok(stats)
+    }
+
+    fn write_admission(&self) -> crate::Result<()> {
+        self.compute_write_admission()
     }
 
     fn get_flush_lock(&self) -> FlushGuard<'_> {
@@ -2261,6 +2278,48 @@ impl Tree {
     #[must_use]
     pub fn is_compacting(&self) -> bool {
         !self.compaction_state.lock().hidden_set().is_empty()
+    }
+
+    /// Computed storage admission predicate backing
+    /// [`AbstractTree::write_admission`](crate::AbstractTree::write_admission).
+    ///
+    /// Cheap: reads in-memory size accounting only (no syscall). Returns
+    /// `Ok(())` unless admission control is enabled AND a budget is set AND the
+    /// live footprint plus reserved headroom exceeds it.
+    fn compute_write_admission(&self) -> crate::Result<()> {
+        let rc = self.0.runtime_config.load();
+        if !rc.storage_admission_check {
+            return Ok(());
+        }
+        // Admission on but no budget set → unbounded (the disk-free probe that
+        // narrows the effective limit lands in a follow-up; until then only a
+        // configured quota gates).
+        let Some(limit) = rc.storage_limit_bytes else {
+            return Ok(());
+        };
+
+        let used = self.disk_space();
+
+        // Reserved headroom keeps the soft budget from becoming a hard wall:
+        // enough to flush the current active memtable (plus a margin for the
+        // index/filter/footer overhead a flush adds) so a flush always fits at
+        // the limit, with a floor for compaction working space. Internal flush /
+        // compaction are never gated, so this band is the engine's room to
+        // reclaim.
+        let memtable_bytes = self
+            .version_history
+            .read()
+            .latest_version()
+            .active_memtable
+            .size();
+        let reserved = memtable_bytes
+            .saturating_add(memtable_bytes / 8)
+            .max(MIN_RESERVED_HEADROOM);
+
+        if used.saturating_add(reserved) > limit {
+            return Err(crate::Error::StorageFull { used, limit });
+        }
+        Ok(())
     }
 
     fn inner_compact(
