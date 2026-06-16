@@ -97,19 +97,27 @@ impl StorageStats {
 /// [`StorageStatus::Healthy`]; the caller supplies it because compaction state
 /// is engine-internal.
 ///
-/// `used_bytes` is the true on-disk file size of every live table (one
-/// metadata stat per file), not the writer's `Metadata::file_size`: the latter
-/// records `file_pos` BEFORE the meta block and footer were appended, so it
-/// undercounts the physical file by hundreds to thousands of bytes per table.
+/// `value_bytes_are_user_values` must be `false` for a KV-separated
+/// (`BlobTree`) tree: there the SST records a small indirection pointer per
+/// large value, not the user value, so the per-table value-byte sum measures
+/// pointers and the value average would misreport. When `false`,
+/// [`StorageStats::avg_value_bytes`] is forced to `None`. Key bytes are never
+/// separated, so [`StorageStats::avg_key_bytes`] stays exact either way.
+///
+/// `used_bytes` is the true on-disk file size of every live table and blob
+/// file (one metadata stat per file), not the writer's `Metadata::file_size`
+/// or [`crate::version::Version::blob_files`]' compressed-payload sum: those
+/// undercount the physical file by the meta block / footer / blob trailer.
 /// Statting matches the figure `Tree::create_checkpoint` reports, so the two
 /// agree on disk reality.
 ///
 /// # Errors
 ///
-/// Returns an error if a live table's size cannot be stat-ed.
+/// Returns an error if a live table or blob file's size cannot be stat-ed.
 pub(crate) fn compute_storage_stats(
     version: &Version,
     is_compacting: bool,
+    value_bytes_are_user_values: bool,
 ) -> crate::Result<StorageStats> {
     let mut used_bytes = 0u64;
     let mut item_count = 0u64;
@@ -138,7 +146,11 @@ pub(crate) fn compute_storage_stats(
         }
     }
 
-    used_bytes = used_bytes.saturating_add(version.blob_files.on_disk_size());
+    // Physical blob-file size (metadata + trailer included), NOT
+    // BlobFileList::on_disk_size() which sums only the compressed payload.
+    for blob in version.blob_files.iter() {
+        used_bytes = used_bytes.saturating_add(blob.0.fs.metadata(&blob.0.path)?.len);
+    }
 
     let avg_entry_on_disk_bytes = if item_count == 0 {
         0
@@ -146,11 +158,11 @@ pub(crate) fn compute_storage_stats(
         used_bytes / item_count
     };
 
-    let (avg_key_bytes, avg_value_bytes) = if all_have_shape && item_count > 0 {
-        (Some(sum_key / item_count), Some(sum_value / item_count))
-    } else {
-        (None, None)
-    };
+    let have_shape = all_have_shape && item_count > 0;
+    let avg_key_bytes = have_shape.then(|| sum_key / item_count);
+    // Value bytes are only meaningful when not KV-separated (see param doc).
+    let avg_value_bytes =
+        (have_shape && value_bytes_are_user_values).then(|| sum_value / item_count);
 
     let reclaimable_bytes_estimate = reclaimable_entries.saturating_mul(avg_entry_on_disk_bytes);
 
@@ -220,7 +232,7 @@ mod tests {
             clippy::unwrap_used,
             reason = "compute_storage_stats cannot fail on an empty in-memory version (no file to stat)"
         )]
-        let busy = compute_storage_stats(&version, true).unwrap();
+        let busy = compute_storage_stats(&version, true, true).unwrap();
         assert_eq!(busy.status, StorageStatus::CompactionInProgress);
         assert_eq!(busy.used_bytes, 0);
         assert_eq!(busy.item_count, 0);
@@ -232,7 +244,7 @@ mod tests {
             clippy::unwrap_used,
             reason = "compute_storage_stats cannot fail on an empty in-memory version (no file to stat)"
         )]
-        let idle = compute_storage_stats(&version, false).unwrap();
+        let idle = compute_storage_stats(&version, false, true).unwrap();
         assert_eq!(idle.status, StorageStatus::Healthy);
     }
 }

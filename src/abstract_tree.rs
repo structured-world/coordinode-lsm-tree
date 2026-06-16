@@ -137,7 +137,7 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// Returns an error if a live file's size cannot be stat-ed.
     fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
-        crate::storage_stats::compute_storage_stats(&self.current_version(), false)
+        crate::storage_stats::compute_storage_stats(&self.current_version(), false, true)
     }
 
     /// Proactively verifies every block's XXH3 checksum across every SST in

@@ -317,6 +317,18 @@ impl AbstractTree for BlobTree {
         self.index.current_version()
     }
 
+    fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
+        // Forward the index tree's compaction state (the default impl would
+        // always report idle), and mark value bytes as NOT user values: large
+        // values are KV-separated into blob files, so the SST records only
+        // indirection pointers.
+        crate::storage_stats::compute_storage_stats(
+            &self.current_version(),
+            self.index.is_compacting(),
+            false,
+        )
+    }
+
     #[cfg(feature = "metrics")]
     fn metrics(&self) -> &Arc<crate::Metrics> {
         self.index.metrics()

@@ -309,7 +309,12 @@ impl AbstractTree for Tree {
     }
 
     fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
-        crate::storage_stats::compute_storage_stats(&self.current_version(), self.is_compacting())
+        // Standard tree: SST values ARE user values (no KV separation).
+        crate::storage_stats::compute_storage_stats(
+            &self.current_version(),
+            self.is_compacting(),
+            true,
+        )
     }
 
     fn get_flush_lock(&self) -> FlushGuard<'_> {
