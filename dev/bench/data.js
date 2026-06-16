@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781592341626,
+  "lastUpdate": 1781616761778,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -17004,6 +17004,84 @@ window.BENCHMARK_DATA = {
             "value": 725392.4730535013,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.6us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "bfd8a31bd5070c450893c83d21831ffe4aad7d39",
+          "message": "feat(integrity): per-KV residence checksum at memtable insert (#481)\n\n## Summary\n\nCompletes the per-KV protection axis by wiring\n`KvChecksumComputePoint::AtInsert` end to end (the remaining increment\nof #298; the `AtBlockCompile` tier shipped earlier in #369).\n\nUnder `AtInsert`, each entry's 4-byte per-KV digest is computed at\n`tree.insert` / `WriteBatch` insert, stored in the skiplist node, and\nverified at flush against a recompute over the entry's current bytes. A\ndivergence means the entry was corrupted by a RAM bit-flip while it sat\nin the memtable, surfaced as the new\n`Error::MemtableKvChecksumMismatch`. This closes the memtable-residence\nwindow that `AtBlockCompile` (compute-at-flush) cannot cover.\n\n## Design\n\n- **Zero size growth.** The digest reuses the skiplist node's 4-byte\nalignment-padding slot; presence is flagged in the high bit of the\n`value_type` byte. A node without a digest is byte-identical to before,\nso `Off` / `AtBlockCompile` memtables are unchanged.\n- **Off is free.** The insert path adds one cheap arc-swap config load\nplus two enum checks; no digest is computed unless `AtInsert` is active.\nOn-disk format is unchanged (the footer matches `AtBlockCompile`);\noff-by-default, byte-identical when disabled.\n- **4-byte algorithm required.** Config validation accepts `AtInsert`\nwith `Xxh3Low32` / `Crc32c` and rejects the 8-byte `Xxh3_64` (which\nwould not fit the reserved slot).\n- **Mixed-variant memtables.** An `Off` to `AtInsert` toggle\nmid-memtable is handled: only digest-bearing nodes are verified at\nflush.\n- **Separate pre-merge verify (not fused into the footer).** The\nresidence check walks the as-inserted memtable entries. It is\nintentionally not folded into the writer's per-KV footer encode: the\nfooter digest is computed over post-merge bytes (flush applies the merge\noperator), so fusing would false-positive on every legitimate merge.\nResidence corruption is a property of what was inserted, so it must be\nverified pre-merge. A call-site comment documents this so the pass is\nnot fused away later.\n\n## Testing\n\n- Full suite: 2033 passed, 0 failed.\n- New tests: skiplist unit (intact / corruption / mixed / no-digest),\nmemtable end-to-end residence detection, config validation (4-byte\naccepted, 8-byte rejected), Tree integration (round-trip through flush +\nreopen, `Off` to `AtInsert` toggle mid-memtable).\n- `cargo clippy --all-features --all-targets` clean.\n- Adds a `write_throughput` bench (`off` / `at_block_compile` /\n`at_insert`). On a flush-heavy micro-bench `at_insert` is ~9.6% over\n`off`: ~3% the existing `AllLevels` footer, ~3% the per-insert digest,\n~3% the residence verify pass. The verify pass cannot be removed without\nbreaking correctness under a merge operator (see Design).\n\nCloses #298\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Enabled per-KV checksum digests for\n`KvChecksumComputePoint::AtInsert`, with flush-time verification to\ndetect memtable-residency corruption.\n* Updated runtime config so `AtInsert` is accepted only with supported\n4-byte checksum algorithms.\n* **Bug Fixes**\n* Flush now aborts early on detected per-KV digest mismatches or invalid\nresidency digest metadata.\n* **Tests**\n* Added integration tests for `AtInsert` end-to-end behavior, including\nswitching compute-point mid-memtable.\n* **Documentation**\n* Expanded integrity documentation and refreshed configuration/feature\ndescriptions for `AtInsert`.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-16T16:31:39+03:00",
+          "tree_id": "0ffdb46b69e0dfa3d15e258759f0a3436da614a5",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/bfd8a31bd5070c450893c83d21831ffe4aad7d39"
+        },
+        "date": 1781616750964,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1961905.6582153756,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1167117.9775722174,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.7us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 897080.9322868735,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.2us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3700858.497397788,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.1us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 464372.7858415338,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.2us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 243366.1407764486,
+            "unit": "ops/sec",
+            "extra": "P50: 3.8us | P99: 4.9us | P99.9: 11.7us\nthreads: 1 | elapsed: 0.82s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1212140.9443065235,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.5us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1097748.812480034,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.5us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 724377.5220222085,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.4us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
         ]
       }
