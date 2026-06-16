@@ -725,6 +725,11 @@ impl Writer {
         let user_key = item.key.user_key.clone();
         let value_len = item.value.len();
 
+        // Per-entry shape accounting (pairs with item_count: counts every
+        // version). usize -> u64 is a widening cast on every supported target.
+        self.meta.sum_user_key_bytes += user_key.len() as u64;
+        self.meta.sum_value_bytes += value_len as u64;
+
         if item.is_tombstone() {
             self.meta.tombstone_count += 1;
         }
@@ -1393,6 +1398,8 @@ impl Writer {
             weak_tombstone_count: self.meta.weak_tombstone_count as u64,
             weak_tombstone_reclaimable: self.meta.weak_tombstone_reclaimable_count as u64,
             key_count: self.meta.key_count as u64,
+            sum_user_key_bytes: self.meta.sum_user_key_bytes,
+            sum_value_bytes: self.meta.sum_value_bytes,
             uncompressed_size: self.meta.uncompressed_size,
             first_key,
             last_key,
@@ -1613,6 +1620,8 @@ struct MetaSectionParams<'a> {
     weak_tombstone_count: u64,
     weak_tombstone_reclaimable: u64,
     key_count: u64,
+    sum_user_key_bytes: u64,
+    sum_value_bytes: u64,
     uncompressed_size: u64,
     first_key: &'a [u8],
     last_key: &'a [u8],
@@ -1788,6 +1797,7 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
         meta("item_count", &p.item_count.to_le_bytes()),
         meta("key#max", p.last_key),
         meta("key#min", p.first_key),
+        meta("key_bytes#sum", &p.sum_user_key_bytes.to_le_bytes()),
         meta("key_count", &p.key_count.to_le_bytes()),
         meta("prefix_truncation#data", &[1]),
         meta("prefix_truncation#index", &[1]),
@@ -1810,6 +1820,7 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
         meta("table_version", &[3u8]),
         meta("tombstone_count", &p.tombstone_count.to_le_bytes()),
         meta("user_data_size", &p.uncompressed_size.to_le_bytes()),
+        meta("value_bytes#sum", &p.sum_value_bytes.to_le_bytes()),
         meta(
             "weak_tombstone_count",
             &p.weak_tombstone_count.to_le_bytes(),
