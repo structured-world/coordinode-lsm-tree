@@ -7,7 +7,8 @@
 //! resume when the budget is raised.
 
 use lsm_tree::{
-    AbstractTree, AnyTree, Config, Error, SequenceNumberCounter, StorageStatus, get_tmp_folder,
+    AbstractTree, AnyTree, Config, Error, KvSeparationOptions, SequenceNumberCounter,
+    StorageStatus, get_tmp_folder,
 };
 
 fn open_tree(path: &std::path::Path) -> lsm_tree::Tree {
@@ -21,6 +22,21 @@ fn open_tree(path: &std::path::Path) -> lsm_tree::Tree {
     match any {
         AnyTree::Standard(t) => t,
         AnyTree::Blob(_) => panic!("expected Standard tree"),
+    }
+}
+
+fn open_blob_tree(path: &std::path::Path) -> lsm_tree::BlobTree {
+    let any = Config::new(
+        path,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
+    .open()
+    .expect("open");
+    match any {
+        AnyTree::Blob(t) => t,
+        AnyTree::Standard(_) => panic!("expected Blob tree"),
     }
 }
 
@@ -112,6 +128,48 @@ fn raising_budget_clears_read_only_without_restart() -> lsm_tree::Result<()> {
             .is_ok()
     );
     assert_eq!(tree.storage_stats()?.status, StorageStatus::Healthy);
+    Ok(())
+}
+
+#[test]
+fn admission_counts_blob_files_not_just_the_index() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_blob_tree(folder.path());
+
+    // Large values are KV-separated into blob files, so the index SSTs stay
+    // small while the real footprint is dominated by blobs.
+    let value = vec![b'v'; 4096];
+    for i in 0..500u64 {
+        tree.insert(format!("key{i:05}").as_bytes(), &value, i);
+    }
+    tree.flush_active_memtable(0)?;
+
+    let index_only = tree.index.disk_space(); // index SST size, WITHOUT blobs
+    let total = tree.storage_stats()?.used_bytes; // physical, includes blobs
+    assert!(
+        total > index_only + 1024 * 1024,
+        "blob footprint must dominate (index {index_only}, total {total})"
+    );
+
+    // Budget set just above the index size + reserved headroom: an index-only
+    // gate would admit, but the tree is already far over budget in blobs.
+    tree.index.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = Some(index_only + 1024 * 1024 + 4096);
+    })?;
+
+    assert!(
+        tree.is_read_only(),
+        "blob bytes must count toward admission, not just the index"
+    );
+    assert!(
+        tree.try_insert(b"k".as_slice(), b"v".as_slice(), 10_000)
+            .is_err()
+    );
+    assert_eq!(
+        tree.storage_stats()?.status,
+        StorageStatus::ReadOnlyOutOfSpace
+    );
     Ok(())
 }
 
