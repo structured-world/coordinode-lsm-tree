@@ -2287,8 +2287,6 @@ impl Tree {
     /// `Ok(())` unless admission control is enabled AND a budget is set AND the
     /// live footprint plus reserved headroom exceeds it.
     fn compute_write_admission(&self) -> crate::Result<()> {
-        use portable_atomic::Ordering;
-
         let rc = self.0.runtime_config.load();
         if !rc.storage_admission_check {
             return Ok(());
@@ -2300,29 +2298,36 @@ impl Tree {
             return Ok(());
         };
 
+        // Take ONE coherent snapshot of the latest super-version and derive
+        // BOTH the on-disk footprint and the pending-memtable bytes from it.
+        // Reading them from two separate `latest_version()` loads would be a
+        // TOCTOU bug: a flush installing a new version between the two reads
+        // could pair an old (larger) disk usage with new (smaller) pending
+        // bytes — or vice versa — and open the gate incorrectly.
+        let super_version = self.version_history.read().latest_version();
+        let vid = super_version.version.id();
+
         // True physical footprint, including blob files — the SAME basis
         // `storage_stats()` reports, so the gate and the reported usage agree.
         // NOT `disk_space()` (metadata Level::size, which omits blob files and
         // undercounts the physical file by the meta block / footer).
         //
-        // Cached per version so gated writes don't re-stat every live file:
-        // the file set only changes when a new version is installed (flush /
-        // compaction), so a full stat runs once per version and every
-        // subsequent admission check in that version is a constant-time atomic
-        // read. See `TreeInner::admission_used_version`.
-        let version = self.current_version();
-        let vid = version.id();
-        let used = if self.0.admission_used_version.load(Ordering::Acquire) == vid {
-            self.0.admission_used_bytes.load(Ordering::Acquire)
-        } else {
-            let computed = crate::storage_stats::compute_used_bytes(&version)?;
-            // Publish bytes before stamping the version so a reader that sees
-            // the new stamp also sees the matching bytes.
-            self.0
-                .admission_used_bytes
-                .store(computed, Ordering::Release);
-            self.0.admission_used_version.store(vid, Ordering::Release);
-            computed
+        // Cached per version so gated writes don't re-stat every live file: the
+        // file set only changes when a new version is installed (flush /
+        // compaction), so a full stat runs once per version and every later
+        // check in that version reads the cache. The `(version_id, used_bytes)`
+        // pair lives behind one mutex so the stamp and bytes are always a
+        // coherent unit (see `TreeInner::admission_used_cache`).
+        let used = {
+            // cache = (version_id, used_bytes)
+            let mut cache = self.0.admission_used_cache.lock();
+            if cache.0 == vid {
+                cache.1
+            } else {
+                let computed = crate::storage_stats::compute_used_bytes(&super_version.version)?;
+                *cache = (vid, computed);
+                computed
+            }
         };
 
         // Reserved headroom keeps the soft budget from becoming a hard wall:
@@ -2332,32 +2337,28 @@ impl Tree {
         // Internal flush / compaction are never gated, so this band is the
         // engine's room to reclaim.
         //
-        // Count ALL pending memtable bytes in the current version — the active
-        // one AND any sealed (rotated) memtables awaiting flush — not just the
-        // active one: after a rotation the active memtable is empty but the
-        // sealed memtable's queued flush will still consume disk, so it must be
-        // reserved for. Scoped to the latest version (not the whole retained
-        // history) so older versions don't inflate the reservation.
-        let pending_memtable_bytes = {
-            let super_version = self.version_history.read().latest_version();
-            let sealed: u64 = super_version
-                .sealed_memtables
-                .iter()
-                .map(|m| m.size())
-                .sum();
-            super_version.active_memtable.size() + sealed
-        };
-        // Plain arithmetic, not saturating: these are real in-RAM byte counts
-        // (bounded by memory) and on-disk file sizes (bounded by disk), many
-        // orders of magnitude below `u64::MAX`, so the sums provably cannot
-        // overflow.
-        let reserved =
-            (pending_memtable_bytes + pending_memtable_bytes / 8).max(MIN_RESERVED_HEADROOM);
+        // Count ALL pending memtable bytes in this snapshot — the active one AND
+        // any sealed (rotated) memtables awaiting flush — not just the active
+        // one: after a rotation the active memtable is empty but the sealed
+        // memtable's queued flush will still consume disk, so it must be
+        // reserved for.
+        let sealed_bytes: u64 = super_version
+            .sealed_memtables
+            .iter()
+            .map(|m| m.size())
+            .sum();
+        let pending_memtable_bytes = super_version.active_memtable.size() + sealed_bytes;
 
-        if used + reserved > limit {
-            return Err(crate::Error::StorageFull { used, limit });
+        // `compute_used_bytes` saturates its file-size sums, so `used` could in
+        // principle be `u64::MAX`; keep the gate fail-closed with checked
+        // arithmetic — any overflow means "definitely over budget", so deny.
+        let reserved = pending_memtable_bytes
+            .saturating_add(pending_memtable_bytes / 8)
+            .max(MIN_RESERVED_HEADROOM);
+        match used.checked_add(reserved) {
+            Some(total) if total <= limit => Ok(()),
+            _ => Err(crate::Error::StorageFull { used, limit }),
         }
-        Ok(())
     }
 
     fn inner_compact(
@@ -2691,8 +2692,7 @@ impl Tree {
             runtime_config: Arc::new(crate::runtime_config::handle::RuntimeConfigHandle::new(
                 initial_runtime,
             )),
-            admission_used_version: portable_atomic::AtomicU64::new(u64::MAX),
-            admission_used_bytes: portable_atomic::AtomicU64::new(0),
+            admission_used_cache: Mutex::new((u64::MAX, 0)),
 
             #[cfg(feature = "metrics")]
             metrics,

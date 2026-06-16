@@ -177,14 +177,13 @@ pub struct TreeInner {
     /// version is installed (flush / compaction), so the physical footprint is
     /// computed once per version and reused until the version id moves.
     ///
-    /// `admission_used_version` holds the [`crate::version::VersionId`] the
-    /// cached bytes belong to, or `u64::MAX` when unset (no real version uses
-    /// that id in practice; a spurious match would only cost one extra
-    /// recompute). A stale read across a concurrent version install is
-    /// harmless: admission is a soft pre-check, so an occasional value from the
-    /// adjacent version is acceptable, and the next check reconciles.
-    pub(crate) admission_used_version: AtomicU64,
-    pub(crate) admission_used_bytes: AtomicU64,
+    /// The `(version_id, used_bytes)` pair is kept behind a single `Mutex` so
+    /// the stamp and its byte count are always read and published together as
+    /// one coherent snapshot — two independent atomics could let a reader pair
+    /// a matching stamp with bytes from a different computation. `version_id`
+    /// starts at `u64::MAX` (unset; no real version uses that id, a spurious
+    /// match would only cost one extra recompute).
+    pub(crate) admission_used_cache: Mutex<(u64, u64)>,
 
     #[doc(hidden)]
     #[cfg(feature = "metrics")]
@@ -259,8 +258,7 @@ impl TreeInner {
             background_deleter: Arc::new(crate::BackgroundDeleter::new(None)),
             heal_hints: crate::heal_hints::HealHints::new_shared(initial_runtime.auto_heal),
             runtime_config: Arc::new(RuntimeConfigHandle::new((*initial_runtime).clone())),
-            admission_used_version: AtomicU64::new(u64::MAX),
-            admission_used_bytes: AtomicU64::new(0),
+            admission_used_cache: Mutex::new((u64::MAX, 0)),
 
             #[cfg(feature = "metrics")]
             metrics: Metrics::default().into(),
