@@ -338,7 +338,10 @@ impl AbstractTree for BlobTree {
 
     fn write_admission(&self) -> crate::Result<()> {
         // Admission state lives on the index tree (which holds the runtime
-        // config and the SST footprint); forward to it.
+        // config). The forward is blob-aware: the index tree's version IS this
+        // blob tree's version (current_version() delegates here), and the gate's
+        // footprint basis (`storage_stats::compute_used_bytes`) stats live
+        // tables AND blob files, so blob bytes count toward the budget.
         self.index.write_admission()
     }
 
