@@ -321,6 +321,46 @@ fn cached_usage_refreshes_when_a_new_version_is_installed() -> lsm_tree::Result<
 }
 
 #[test]
+fn reserved_headroom_counts_sealed_memtables_pending_flush() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path());
+
+    // Fill ~2 MiB of high-entropy data into the active memtable WITHOUT
+    // flushing, then rotate: the large memtable is sealed (queued for flush)
+    // and a fresh empty active memtable is installed.
+    for i in 0..2000u64 {
+        let mut s = (i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let value: Vec<u8> = (0..1024u32)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 24) as u8
+            })
+            .collect();
+        tree.insert(format!("key{i:06}").as_bytes(), &value, i);
+    }
+    let sealed = tree.rotate_memtable();
+    assert!(sealed.is_some(), "active memtable must seal");
+
+    // Nothing is on disk yet (no flush), but the sealed memtable (~2 MiB)
+    // will consume space once flushed. A budget of 1.5 MiB sits above the
+    // 1 MiB reserved floor but below the pending sealed footprint: reserved
+    // headroom must count the sealed memtable, not just the (now empty) active
+    // one, so the gate is closed.
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = Some(3 * 512 * 1024); // 1.5 MiB
+    })?;
+
+    assert!(
+        tree.is_read_only(),
+        "sealed memtable pending flush must count toward reserved headroom"
+    );
+    Ok(())
+}
+
+#[test]
 fn flush_and_bare_insert_are_never_gated_at_the_limit() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let tree = open_tree(folder.path());
