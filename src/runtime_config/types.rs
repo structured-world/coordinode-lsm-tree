@@ -655,13 +655,12 @@ pub struct RuntimeConfig {
     /// When the per-KV digest is computed:
     /// [`KvChecksumComputePoint::AtBlockCompile`] (default) at flush /
     /// compaction, or [`KvChecksumComputePoint::AtInsert`] at memtable
-    /// insert (the future memtable-residence-window mode). `AtInsert` is
-    /// NOT yet implemented: `RuntimeConfigHandle::try_update` (behind
-    /// [`crate::Tree::update_runtime_config`]) currently rejects EVERY
-    /// `AtInsert` setting with a typed error, regardless of
-    /// [`Self::kv_checksum_algo`] (both `Xxh3_64` and `Xxh3Low32`), so it
-    /// cannot be applied today. Default `AtBlockCompile` is always
-    /// accepted.
+    /// insert (the memtable-residence-window mode that catches a RAM
+    /// bit-flip while a record sits in the memtable). `AtInsert` requires a
+    /// 4-byte [`Self::kv_checksum_algo`] (`Xxh3Low32` / `Crc32c`) that is
+    /// compiled into the build; `RuntimeConfigHandle::try_update` (behind
+    /// [`crate::Tree::update_runtime_config`]) rejects `AtInsert` with the
+    /// 8-byte `Xxh3_64`, or with an uncompiled algorithm, via a typed error.
     pub kv_checksum_compute_point: KvChecksumComputePoint,
 
     /// When `true`, every manifest write reserves a 4 KiB region at
