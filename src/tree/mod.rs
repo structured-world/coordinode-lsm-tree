@@ -308,6 +308,10 @@ impl AbstractTree for Tree {
         self.version_history.read().latest_version().version
     }
 
+    fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
+        crate::storage_stats::compute_storage_stats(&self.current_version(), self.is_compacting())
+    }
+
     fn get_flush_lock(&self) -> FlushGuard<'_> {
         self.flush_lock.lock()
     }

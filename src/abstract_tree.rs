@@ -98,6 +98,25 @@ pub trait AbstractTree: sealed::Sealed {
     #[doc(hidden)]
     fn current_version(&self) -> Version;
 
+    /// Returns a read-only snapshot of the tree's on-disk storage footprint:
+    /// total used bytes, entry count, the average shape of a stored entry
+    /// (average key / value bytes), and an estimate of how many more
+    /// average-shaped entries fit in a byte budget (see
+    /// [`StorageStats::estimated_remaining_entries`]).
+    ///
+    /// Computed from the live version's table + blob metadata plus one
+    /// size-stat per live file; it never reads a data block. The default
+    /// implementation reports [`StorageStatus::Healthy`]; the standard tree
+    /// overrides it to report [`StorageStatus::CompactionInProgress`] while a
+    /// compaction runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a live file's size cannot be stat-ed.
+    fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
+        crate::storage_stats::compute_storage_stats(&self.current_version(), false)
+    }
+
     /// Proactively verifies every block's XXH3 checksum across every SST in
     /// the tree's current version — a scrubber for catching bit rot before it
     /// surfaces as a user-visible read failure (cron / scrub jobs).

@@ -422,6 +422,9 @@ pub mod inspect;
 #[cfg(feature = "std")]
 pub mod scrub;
 
+pub mod storage_stats;
+pub use storage_stats::{StorageStats, StorageStatus};
+
 mod version;
 mod vlog;
 
