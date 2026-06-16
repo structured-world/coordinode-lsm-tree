@@ -8,7 +8,8 @@
 // `AbstractTree` is used for its trait methods (`insert`,
 // `flush_active_memtable`, `storage_stats`, `create_checkpoint`).
 use lsm_tree::{
-    AbstractTree, AnyTree, Config, SequenceNumberCounter, StorageStatus, get_tmp_folder,
+    AbstractTree, AnyTree, BlobTree, Config, KvSeparationOptions, SequenceNumberCounter,
+    StorageStatus, get_tmp_folder,
 };
 
 fn open_tree(path: &std::path::Path) -> lsm_tree::Tree {
@@ -22,6 +23,21 @@ fn open_tree(path: &std::path::Path) -> lsm_tree::Tree {
     match any {
         AnyTree::Standard(t) => t,
         AnyTree::Blob(_) => panic!("expected Standard tree"),
+    }
+}
+
+fn open_blob_tree(path: &std::path::Path) -> BlobTree {
+    let any = Config::new(
+        path,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
+    .open()
+    .expect("open");
+    match any {
+        AnyTree::Blob(t) => t,
+        AnyTree::Standard(_) => panic!("expected Blob tree"),
     }
 }
 
@@ -104,6 +120,44 @@ fn storage_stats_survive_flush_and_reopen() -> lsm_tree::Result<()> {
     assert_eq!(stats.avg_key_bytes, Some(8));
     assert_eq!(stats.avg_value_bytes, Some(10));
     assert!(stats.used_bytes > 0);
+
+    Ok(())
+}
+
+#[test]
+fn storage_stats_blob_tree_counts_physical_bytes_and_hides_value_average() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_blob_tree(folder.path());
+
+    // Large values cross the separation threshold and land in blob files, so
+    // the SST stores only a small indirection pointer per entry.
+    let n = 200u64;
+    let value = vec![b'v'; 256];
+    for i in 0..n {
+        tree.insert(format!("key{i:05}").as_bytes(), &value, i);
+    }
+    tree.flush_active_memtable(0)?;
+
+    let stats = tree.storage_stats()?;
+    assert_eq!(stats.item_count, n);
+    assert!(stats.used_bytes > 0);
+
+    // used_bytes must include the PHYSICAL blob-file footprint (metadata +
+    // trailer), so it agrees with the checkpoint total which links the real
+    // files. A payload-only blob figure would undercount here.
+    let cp_dir = get_tmp_folder();
+    let cp_path = cp_dir.path().join("checkpoint");
+    let info = tree.create_checkpoint(&cp_path)?;
+    assert_eq!(
+        stats.used_bytes, info.total_bytes,
+        "blob-tree used_bytes must match the checkpoint total"
+    );
+
+    // Keys are never separated, so the key average is still exact.
+    assert_eq!(stats.avg_key_bytes, Some(8));
+    // Values ARE separated: the SST records indirection pointers, not user
+    // values, so the value average is not representable and must be None.
+    assert_eq!(stats.avg_value_bytes, None);
 
     Ok(())
 }
