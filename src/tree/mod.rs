@@ -2342,12 +2342,14 @@ impl Tree {
         // one: after a rotation the active memtable is empty but the sealed
         // memtable's queued flush will still consume disk, so it must be
         // reserved for.
-        let sealed_bytes: u64 = super_version
+        // Saturating fold so the running total stays fail-closed (a hypothetical
+        // overflow clamps to u64::MAX → downstream sees over-budget), consistent
+        // with the checked/saturating arithmetic below.
+        let pending_memtable_bytes = super_version
             .sealed_memtables
             .iter()
             .map(|m| m.size())
-            .sum();
-        let pending_memtable_bytes = super_version.active_memtable.size() + sealed_bytes;
+            .fold(super_version.active_memtable.size(), u64::saturating_add);
 
         // `compute_used_bytes` saturates its file-size sums, so `used` could in
         // principle be `u64::MAX`; keep the gate fail-closed with checked
