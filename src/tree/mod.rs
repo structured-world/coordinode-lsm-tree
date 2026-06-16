@@ -2298,7 +2298,11 @@ impl Tree {
             return Ok(());
         };
 
-        let used = self.disk_space();
+        // True physical footprint, including blob files — the SAME basis
+        // `storage_stats()` reports, so the gate and the reported usage agree.
+        // NOT `disk_space()` (metadata Level::size, which omits blob files and
+        // undercounts the physical file by the meta block / footer).
+        let used = crate::storage_stats::compute_used_bytes(&self.current_version())?;
 
         // Reserved headroom keeps the soft budget from becoming a hard wall:
         // enough to flush the current active memtable (plus a margin for the

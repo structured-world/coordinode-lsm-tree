@@ -88,6 +88,19 @@ fn budget_below_usage_declines_gated_write_and_reports_read_only() -> lsm_tree::
         other => panic!("expected StorageFull, got {other:?}"),
     }
 
+    // Every gated write entry refuses, including the tombstone variants — a
+    // tombstone is itself a write that consumes space.
+    assert!(
+        tree.try_merge(b"k".as_slice(), b"v".as_slice(), 1001)
+            .is_err()
+    );
+    assert!(tree.try_remove(b"k".as_slice(), 1002).is_err());
+    assert!(tree.try_remove_weak(b"k".as_slice(), 1003).is_err());
+    assert!(
+        tree.try_remove_range(b"a".as_slice(), b"z".as_slice(), 1004)
+            .is_err()
+    );
+
     // The status surfaces the read-only state for operators / planners.
     assert_eq!(
         tree.storage_stats()?.status,
@@ -137,9 +150,20 @@ fn admission_counts_blob_files_not_just_the_index() -> lsm_tree::Result<()> {
     let tree = open_blob_tree(folder.path());
 
     // Large values are KV-separated into blob files, so the index SSTs stay
-    // small while the real footprint is dominated by blobs.
-    let value = vec![b'v'; 4096];
+    // small while the real footprint is dominated by blobs. Fill each value
+    // with high-entropy bytes (cheap xorshift) so the blob footprint survives
+    // compression under `--all-features` — a repeated-byte payload would shrink
+    // to almost nothing and the blobs would no longer dominate.
     for i in 0..500u64 {
+        let mut state = (i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let value: Vec<u8> = (0..4096u32)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect();
         tree.insert(format!("key{i:05}").as_bytes(), &value, i);
     }
     tree.flush_active_memtable(0)?;

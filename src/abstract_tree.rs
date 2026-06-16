@@ -1076,6 +1076,35 @@ pub trait AbstractTree: sealed::Sealed {
         Ok(self.remove(key, seqno))
     }
 
+    /// Admission-gated [`remove_weak`](Self::remove_weak). See
+    /// [`try_insert`](Self::try_insert).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StorageFull`](crate::Error::StorageFull) when the admission gate
+    /// is closed.
+    fn try_remove_weak<K: Into<UserKey>>(&self, key: K, seqno: SeqNo) -> crate::Result<(u64, u64)> {
+        self.write_admission()?;
+        Ok(self.remove_weak(key, seqno))
+    }
+
+    /// Admission-gated [`remove_range`](Self::remove_range). See
+    /// [`try_insert`](Self::try_insert).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StorageFull`](crate::Error::StorageFull) when the admission gate
+    /// is closed.
+    fn try_remove_range<K: Into<UserKey>>(
+        &self,
+        start: K,
+        end: K,
+        seqno: SeqNo,
+    ) -> crate::Result<u64> {
+        self.write_admission()?;
+        Ok(self.remove_range(start, end, seqno))
+    }
+
     /// Removes an item from the tree.
     ///
     /// Returns the added item's size and new size of the memtable.
