@@ -82,6 +82,33 @@ fn storage_stats_reports_shape_and_capacity_after_flush() -> lsm_tree::Result<()
 }
 
 #[test]
+fn storage_stats_survive_flush_and_reopen() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    {
+        let tree = open_tree(folder.path());
+        for i in 0..200u64 {
+            tree.insert(
+                format!("key{i:05}").as_bytes(),
+                format!("value{i:05}").as_bytes(),
+                i,
+            );
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Reopen forces the per-table byte sums to be read back from the on-disk
+    // meta block (not the in-memory writer metadata), proving they round-trip.
+    let reopened = open_tree(folder.path());
+    let stats = reopened.storage_stats()?;
+    assert_eq!(stats.item_count, 200);
+    assert_eq!(stats.avg_key_bytes, Some(8));
+    assert_eq!(stats.avg_value_bytes, Some(10));
+    assert!(stats.used_bytes > 0);
+
+    Ok(())
+}
+
+#[test]
 fn storage_stats_empty_tree_has_zero_usage_and_no_estimate() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let tree = open_tree(folder.path());

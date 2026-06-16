@@ -626,6 +626,33 @@ mod tests {
         assert!(result.is_ok(), "valid meta must parse: {result:?}");
     }
 
+    /// Backward compatibility: an SST written before the per-table key/value
+    /// byte sums existed has no `key_bytes#sum` / `value_bytes#sum` meta keys
+    /// (`valid_meta_items` omits them, mirroring an older writer). The parse
+    /// must succeed with both fields `None`, never error.
+    #[test]
+    fn load_with_handle_missing_key_value_byte_sums_parses_as_none() {
+        let items = valid_meta_items();
+        let parsed = load_meta_from_items(&items).unwrap();
+        assert_eq!(parsed.sum_user_key_bytes, None);
+        assert_eq!(parsed.sum_value_bytes, None);
+    }
+
+    /// When present, the byte sums round-trip through the meta block as
+    /// `Some(_)`.
+    #[test]
+    fn load_with_handle_key_value_byte_sums_present_round_trip() {
+        let mut items = valid_meta_items();
+        items.push(meta("key_bytes#sum", &320u64.to_le_bytes()));
+        items.push(meta("value_bytes#sum", &640u64.to_le_bytes()));
+        // The meta block is a sorted KV block; re-sort after appending.
+        items.sort_by(|a, b| a.key.user_key.cmp(&b.key.user_key));
+
+        let parsed = load_meta_from_items(&items).unwrap();
+        assert_eq!(parsed.sum_user_key_bytes, Some(320));
+        assert_eq!(parsed.sum_value_bytes, Some(640));
+    }
+
     /// Missing `table_version` must return `Err(InvalidHeader)`, not panic.
     #[test]
     fn load_with_handle_missing_table_version_returns_err() {

@@ -173,6 +173,7 @@ pub(crate) fn compute_storage_stats(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "test code")]
 mod tests {
     use super::*;
 
@@ -205,5 +206,26 @@ mod tests {
         // yields 0 rather than dividing by zero.
         let stats = stats_with_avg(0);
         assert_eq!(stats.estimated_remaining_entries(1_000_000), 0);
+    }
+
+    #[test]
+    fn compute_on_empty_version_maps_compaction_flag_to_status() {
+        use crate::TreeType;
+        use crate::version::Version;
+
+        // An empty version has no tables, so no file is stat-ed: the call is
+        // pure and exercises only the status mapping and the zero-table path.
+        let version = Version::new(0, TreeType::Standard);
+
+        let busy = compute_storage_stats(&version, true).unwrap();
+        assert_eq!(busy.status, StorageStatus::CompactionInProgress);
+        assert_eq!(busy.used_bytes, 0);
+        assert_eq!(busy.item_count, 0);
+        assert_eq!(busy.table_count, 0);
+        assert_eq!(busy.avg_key_bytes, None);
+        assert_eq!(busy.estimated_remaining_entries(1_000_000), 0);
+
+        let idle = compute_storage_stats(&version, false).unwrap();
+        assert_eq!(idle.status, StorageStatus::Healthy);
     }
 }
