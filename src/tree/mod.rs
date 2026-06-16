@@ -2326,22 +2326,35 @@ impl Tree {
         };
 
         // Reserved headroom keeps the soft budget from becoming a hard wall:
-        // enough to flush the current active memtable (plus a margin for the
-        // index/filter/footer overhead a flush adds) so a flush always fits at
-        // the limit, with a floor for compaction working space. Internal flush /
-        // compaction are never gated, so this band is the engine's room to
-        // reclaim.
-        let memtable_bytes = self
-            .version_history
-            .read()
-            .latest_version()
-            .active_memtable
-            .size();
-        let reserved = memtable_bytes
-            .saturating_add(memtable_bytes / 8)
-            .max(MIN_RESERVED_HEADROOM);
+        // enough to flush every pending memtable (plus a margin for the
+        // index/filter/footer overhead a flush adds) so a queued flush always
+        // fits at the limit, with a floor for compaction working space.
+        // Internal flush / compaction are never gated, so this band is the
+        // engine's room to reclaim.
+        //
+        // Count ALL pending memtable bytes in the current version — the active
+        // one AND any sealed (rotated) memtables awaiting flush — not just the
+        // active one: after a rotation the active memtable is empty but the
+        // sealed memtable's queued flush will still consume disk, so it must be
+        // reserved for. Scoped to the latest version (not the whole retained
+        // history) so older versions don't inflate the reservation.
+        let pending_memtable_bytes = {
+            let super_version = self.version_history.read().latest_version();
+            let sealed: u64 = super_version
+                .sealed_memtables
+                .iter()
+                .map(|m| m.size())
+                .sum();
+            super_version.active_memtable.size() + sealed
+        };
+        // Plain arithmetic, not saturating: these are real in-RAM byte counts
+        // (bounded by memory) and on-disk file sizes (bounded by disk), many
+        // orders of magnitude below `u64::MAX`, so the sums provably cannot
+        // overflow.
+        let reserved =
+            (pending_memtable_bytes + pending_memtable_bytes / 8).max(MIN_RESERVED_HEADROOM);
 
-        if used.saturating_add(reserved) > limit {
+        if used + reserved > limit {
             return Err(crate::Error::StorageFull { used, limit });
         }
         Ok(())
