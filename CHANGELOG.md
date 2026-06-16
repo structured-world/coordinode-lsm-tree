@@ -11,6 +11,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.4.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.3.0...v5.4.0) - 2026-06-16
+
+### Added
+
+- *(integrity)* per-KV residence checksum at memtable insert ([#481](https://github.com/structured-world/coordinode-lsm-tree/pull/481))
+- *(fs)* raw io_uring Fs / FsFile backend (no_std) ([#477](https://github.com/structured-world/coordinode-lsm-tree/pull/477))
+- *(read)* opt-in row cache for point reads ([#476](https://github.com/structured-world/coordinode-lsm-tree/pull/476))
+- *(table)* retrieval-ribbon point-read locator (O(1) point reads) ([#468](https://github.com/structured-world/coordinode-lsm-tree/pull/468))
+- *(fs)* no_std io_uring driver core on raw Linux syscalls ([#471](https://github.com/structured-world/coordinode-lsm-tree/pull/471))
+
+### Fixed
+
+- *(build)* pin standalone tool crates as their own workspace roots ([#473](https://github.com/structured-world/coordinode-lsm-tree/pull/473))
+
+### Performance
+
+- *(memtable)* devirtualize the default comparator in skiplist search ([#480](https://github.com/structured-world/coordinode-lsm-tree/pull/480))
+- *(table)* expand leb128 decode as a macro at call sites ([#478](https://github.com/structured-world/coordinode-lsm-tree/pull/478))
+- *(table)* move seqno bounds to a parallel section ([#474](https://github.com/structured-world/coordinode-lsm-tree/pull/474))
+- *(table)* no-std SIMD key-comparison dispatch ([#469](https://github.com/structured-world/coordinode-lsm-tree/pull/469))
+
 ## [5.3.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.2.1...v5.3.0) - 2026-06-15
 
 ### Added
