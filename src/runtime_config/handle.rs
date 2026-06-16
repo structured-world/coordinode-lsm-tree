@@ -416,6 +416,26 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "crc32c"))]
+    #[test]
+    fn try_update_rejects_at_insert_with_uncompiled_algorithm() {
+        use super::super::types::KvChecksumComputePoint;
+
+        // Crc32c is a 4-byte algorithm, but without the crc32c feature its
+        // digest cannot be computed (compute returns None). Accepting AtInsert
+        // with it would silently skip residence digests at insert and/or fail
+        // later at flush, so the config update must reject it up front.
+        let handle = RuntimeConfigHandle::new(RuntimeConfig::default());
+        let result = handle.try_update(|c| {
+            c.kv_checksum_algo = ChecksumAlgorithm::Crc32c;
+            c.kv_checksum_compute_point = KvChecksumComputePoint::AtInsert;
+        });
+        assert!(
+            matches!(result, Err(crate::Error::FeatureUnsupported(_))),
+            "AtInsert + uncompiled Crc32c must be rejected, got {result:?}"
+        );
+    }
+
     #[test]
     fn update_applies_mutation_visible_on_next_load() {
         let handle = RuntimeConfigHandle::new(RuntimeConfig::default());

@@ -548,6 +548,37 @@ mod tests {
         assert!(mt.verify_kv_residence().is_ok());
     }
 
+    #[cfg(feature = "crc32c")]
+    #[test]
+    fn verify_kv_residence_uses_per_node_algorithm_no_drift() {
+        // Algorithm drift regression: insert one entry under Xxh3Low32, then a
+        // second under Crc32c (as if kv_checksum_algo changed mid-memtable).
+        // Both entries are intact, so the residence check must pass. It only
+        // passes if each node is verified under the algorithm it was stored
+        // with; a single per-memtable algorithm would recompute the first
+        // entry under Crc32c and falsely flag it.
+        let mt = new_memtable(0);
+
+        let a = InternalValue::from_components(b"aaa", b"va", 1, ValueType::Value);
+        let da = at_insert_digest(&a, crate::runtime_config::ChecksumAlgorithm::Xxh3Low32);
+        mt.insert_with_kv_digest(
+            a,
+            Some((da, crate::runtime_config::ChecksumAlgorithm::Xxh3Low32)),
+        );
+
+        let b = InternalValue::from_components(b"bbb", b"vb", 2, ValueType::Value);
+        let db = at_insert_digest(&b, crate::runtime_config::ChecksumAlgorithm::Crc32c);
+        mt.insert_with_kv_digest(
+            b,
+            Some((db, crate::runtime_config::ChecksumAlgorithm::Crc32c)),
+        );
+
+        assert!(
+            mt.verify_kv_residence().is_ok(),
+            "per-node algorithm must prevent drift across a mid-memtable algo change"
+        );
+    }
+
     #[test]
     #[expect(clippy::expect_used, reason = "test asserts the error via expect_err")]
     fn verify_kv_residence_detects_corruption_end_to_end() {
