@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781678263322,
+  "lastUpdate": 1781698126575,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -17394,6 +17394,84 @@ window.BENCHMARK_DATA = {
             "value": 724947.1758178502,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.5us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8f3d1a7654bafb9a004ef8715658b785d028bb3c",
+          "message": "feat(fs): Fs::available_space free-space probe + disk-pressure admission (#492)\n\n## Summary\n\nAdds a best-effort filesystem free-space probe and wires it into storage\nadmission, so a tree defends against the **physical** disk filling\n(shared with other processes), not just a configured byte quota. Also\ndelivers a unified capacity UX: a fixed-size disk (on-disk or in-memory)\nthat fills as data is written, turns read-only when full, and reports \"X\nof Y used\" in a single introspection call.\n\n## Changes\n\n- **`Fs::available_space(&self, &Path) -> io::Result<u64>`** — new trait\nmethod, default `u64::MAX` (\"treat as unbounded\"; a backend that can't\nreport free space never drives a phantom disk-pressure read-only).\nBest-effort by contract: the disk is shared, the figure is a reservation\nhint; the atomic single-transaction commit still prevents corruption if\na physical `ENOSPC` slips through.\n- **StdFs** — `statvfs` (unix, `f_bavail * f_frsize`) /\n`GetDiskFreeSpaceExW` (windows); bytes available to an unprivileged\nprocess. Shared unix `statvfs` helper in `fs::mod`.\n- **IoUringFs** — delegates the cold-path probe to the shared `statvfs`\nhelper (Linux-only backend, libc available).\n- **IoUringRawFs** — raw `statfs` syscall (no libc), matching its\nno-libc design; minimal kernel `struct statfs` for 64-bit Linux.\n- **MemFs — capacity-based** — `MemFs::with_capacity(n)` /\n`set_capacity(n)` model a fixed-size in-memory disk: `available_space =\ncapacity - bytes stored`, so the disk fills naturally as data is flushed\nand turns the tree read-only when full, matching the on-disk capped-disk\nbehaviour. Shared across clones. Default stays unbounded (`u64::MAX`).\n- **Admission (#484 extension)** — the per-version footprint cache now\nalso samples disk-free: one `available_space` syscall per version\ntransition (= flush / compaction boundary, never per write);\n`update_runtime_config` clears the cache to force a fresh probe. The\neffective limit is `min(configured quota, disk_free + used)`, so a\nnear-full disk drives read-only **even with no configured quota**.\n`disk_free` is the **minimum** free across the primary path and every\nlevel route, and the `+ used` cancels out of the disk branch (passing\nrequires `reserved <= min_free`), so a near-full routed cold-tier volume\nturns the whole tree read-only without summing an unrelated volume's\nslack.\n- **`storage_stats()` capacity figures** — one call now answers used /\ncapacity / available plus a `compaction_possible` flag. `capacity_bytes`\nis the tighter of the configured quota and the physical free-space probe\n(reported regardless of whether the admission gate is enabled); `None`\nmeans genuinely unbounded; `used_bytes + available_bytes ==\ncapacity_bytes` by construction.\n\n## Testing\n\n- `tests/available_space.rs`: StdFs reports plausible non-zero free\nspace (and errors on a missing path); MemFs defaults unbounded; a capped\nMemFs reports `capacity - stored` and shares it across clones.\n- `tests/storage_admission.rs`: near-full MemFs drives read-only with\n**no** quota (`StorageFull` + `ReadOnlyOutOfSpace`); a **capped MemFs\nfills naturally** (per-flush re-probe) and flips to read-only; a\n**near-full routed volume** drives the whole tree read-only (per-volume\nheadroom invariant); `storage_stats()` exposes used / capacity /\navailable + the compaction flag, and reports unbounded as `None`.\n- 1850 (default) tests pass; clippy clean (host +\n`x86_64-unknown-linux-gnu` cross for the io_uring/statfs paths); no-std\ncross-compile 0 errors.\n\nPart of #482. Closes #485.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added best-effort free-space probing via `available_space` across\nbackends (Unix `statvfs`, Windows `GetDiskFreeSpaceExW`, and capped\n`MemFs`), with an unbounded fallback when probing fails.\n* Introduced disk-aware admission and capacity reporting using\n`capacity_bytes`, `available_bytes`, and `compaction_possible`\n(reflected in storage stats).\n  * Added `MemFs::with_capacity` and `MemFs::set_capacity`.\n* **Bug Fixes**\n* Improved admission caching by storing a coherent snapshot (used bytes\n+ probed free space) with TTL refresh and forced invalidation after\nruntime config updates.\n* **Tests**\n* Added/expanded tests for real free-space, missing-path and\ninterior-NUL validation, `MemFs` capacity accounting, and\ndisk-free-driven read-only behavior.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-17T15:07:37+03:00",
+          "tree_id": "45b5c41dcc0d74d394dd96674def798c78a3b6e8",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/8f3d1a7654bafb9a004ef8715658b785d028bb3c"
+        },
+        "date": 1781698109367,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2095383.2494203935,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1150539.29372132,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.7us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 918436.6322051027,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 4.1us | P99.9: 6.8us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3713773.324980067,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.0us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 467351.27240940585,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.1us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 238742.87674965002,
+            "unit": "ops/sec",
+            "extra": "P50: 3.8us | P99: 8.6us | P99.9: 11.0us\nthreads: 1 | elapsed: 0.84s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1216456.9522251312,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1098593.486688598,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.4us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 714024.7943253365,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.4us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
         ]
       }
