@@ -212,17 +212,19 @@ fn configured_quota_below_footprint_gates_a_merge_on_ample_disk() -> lsm_tree::R
 }
 
 #[test]
-fn blob_tree_full_status_accounts_for_blob_relocation_footprint() -> lsm_tree::Result<()> {
-    // Regression: a blob tree's full-compaction figure must include the physical
-    // blob-file footprint, not just the largest SST level. With incompressible
-    // blobs dominating the footprint and the index SSTs tiny, free space that
-    // clears the SST level but not the blobs must report TightCompactionAvailable
-    // (the gate would skip a full merge for lack of blob room), not Full.
+fn blob_tree_full_status_ignores_non_stale_blob_footprint() -> lsm_tree::Result<()> {
+    // Regression: the full-compaction figure must budget only the STALE blob
+    // files a merge actually relocates (`pick_blob_files_to_rewrite`), not the
+    // whole live blob footprint. With large incompressible NON-stale blobs (a
+    // single flush, no overwrites → zero dead fraction) and tiny index SSTs, a
+    // full merge relocates no blobs, so free space that clears the SST level must
+    // report FullCompactionAvailable — matching the gate, which would admit the
+    // merge — not a stricter TightCompactionAvailable from counting live blobs
+    // the merge never touches.
     let folder = get_tmp_folder();
     let (tree, mem) = open_capped_blob(folder.path(), u64::MAX);
-    // ~8 MiB of incompressible blob payload so the footprint comfortably exceeds
-    // the ~1 MiB reserved floor — leaving a band where free space is above the
-    // floor (not read-only) yet below SST + blobs (not a full compaction).
+    // ~8 MiB of incompressible blob payload so the live footprint comfortably
+    // exceeds 3 MiB — under the old all-live accounting this band reported tight.
     let n = 8_000u64;
     for i in 0..n {
         // High-entropy value (xorshift) so blobs do not compress away.
@@ -244,11 +246,12 @@ fn blob_tree_full_status_accounts_for_blob_relocation_footprint() -> lsm_tree::R
     let blob_portion = used - index_sst;
     assert!(
         blob_portion > 4 * 1024 * 1024,
-        "blobs must dominate and exceed the reserved floor (blob {blob_portion}, index {index_sst})"
+        "live blobs must dominate the footprint (blob {blob_portion}, index {index_sst})"
     );
 
-    // Free space (3 MiB) is above the reserved floor — so not read-only — but
-    // well below SST + blobs, so a full compaction does not fit.
+    // Free space (3 MiB) is well below the live blob footprint but far above the
+    // tiny index SSTs. Because the blobs are non-stale (not relocated by a merge),
+    // a full compaction's actual transient need is the SST level alone → it fits.
     mem.set_capacity(used + 3 * 1024 * 1024);
     tree.index.update_runtime_config(|c| {
         c.storage_admission_check = true;
@@ -256,8 +259,8 @@ fn blob_tree_full_status_accounts_for_blob_relocation_footprint() -> lsm_tree::R
     })?;
     assert_eq!(
         tree.storage_stats()?.status,
-        StorageStatus::TightCompactionAvailable,
-        "blob footprint must be folded into the full-compaction threshold"
+        StorageStatus::FullCompactionAvailable,
+        "non-stale blobs are not relocated, so they must not gate a full compaction"
     );
     Ok(())
 }

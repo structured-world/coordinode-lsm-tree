@@ -153,6 +153,23 @@ pub(crate) fn compute_used_bytes(version: &Version) -> crate::Result<u64> {
     Ok(used_bytes)
 }
 
+/// The largest level's index and on-disk size: the destination level and the
+/// transient-output bound a full compaction's space check uses.
+///
+/// A full compaction's largest single merge is bounded by the largest level's
+/// on-disk size (the `full_compaction_bytes` gauge figure), and its output lands
+/// in that level's own volume — which matters for the per-volume physical check
+/// when tiered routing places levels on different filesystems. Returns `(0, 0)`
+/// for an empty tree.
+pub(crate) fn largest_level_for_compaction(version: &Version) -> (u8, u64) {
+    version
+        .iter_levels()
+        .enumerate()
+        .map(|(idx, level)| (u8::try_from(idx).unwrap_or(u8::MAX), level.size()))
+        .max_by_key(|(_, size)| *size)
+        .unwrap_or((0, 0))
+}
+
 /// Computes [`StorageStats`] from a live version's table + blob-file metadata.
 ///
 /// `is_compacting` selects [`StorageStatus::CompactionInProgress`] vs

@@ -160,6 +160,20 @@ pub struct BlobTree {
 }
 
 impl BlobTree {
+    /// Physical footprint of the stale blob files a full compaction would
+    /// relocate: the linked, stale, non-dead subset across every live table (the
+    /// SAME set the merge gate budgets via `pick_blob_files_to_rewrite`), summed
+    /// by on-disk size. Zero when KV separation is unconfigured.
+    fn full_compaction_blob_need(&self, version: &crate::version::Version) -> crate::Result<u64> {
+        let Some(blob_opts) = &self.index.config.kv_separation_opts else {
+            return Ok(0);
+        };
+        let all_tables: crate::HashSet<TableId> = version.iter_tables().map(Table::id).collect();
+        crate::compaction::worker::pick_blob_files_to_rewrite(&all_tables, version, blob_opts)?
+            .iter()
+            .try_fold(0u64, |acc, bf| bf.physical_size().map(|size| acc + size))
+    }
+
     pub(crate) fn open(config: Config) -> crate::Result<Self> {
         use crate::file::{BLOBS_FOLDER, fsync_directory};
 
@@ -339,27 +353,37 @@ impl AbstractTree for BlobTree {
         stats.capacity_bytes = capacity;
         stats.available_bytes = available;
         stats.compaction_possible = compaction_possible;
-        // A full compaction of a blob tree may also relocate stale blob files,
-        // which the merge gate counts against the budget. Fold the physical
-        // blob-file footprint into the full-compaction figure (a conservative
-        // upper bound: a single compaction relocates at most the stale subset),
-        // so the status does not report full availability while the gate would
-        // skip the merge for lack of blob room.
-        let mut blob_bytes = 0u64;
-        for blob in version.blob_files.iter() {
-            blob_bytes += blob.physical_size()?;
-        }
-        stats.full_compaction_bytes += blob_bytes;
-        // Surface full-vs-tight compaction availability when gating is active and
-        // no compaction is running (see the standard tree's override).
+        // A full compaction of a blob tree also relocates STALE blob files, which
+        // the merge gate budgets via `pick_blob_files_to_rewrite` (linked, stale,
+        // non-dead). Estimate the same subset across every table — NOT the whole
+        // live blob footprint, which would overstate the need (large non-stale
+        // blobs are not rewritten) and report tight while the gate would admit
+        // the merge. Fold it into the gauge figure.
+        let blob_need = self.full_compaction_blob_need(&version)?;
+        stats.full_compaction_bytes += blob_need;
+        // Surface full-vs-tight compaction availability through the SAME two-layer
+        // check the compaction space gate enforces (logical quota + physical free
+        // per destination volume), so the status matches what the gate admits.
         if self.index.storage_admission_enabled()
             && capacity.is_some()
             && stats.status == crate::StorageStatus::Healthy
         {
-            // Full when the free room covers a full compaction's transient
-            // output, tight otherwise (see the standard tree's override).
-            let available = available.unwrap_or(0);
-            stats.status = if available >= stats.full_compaction_bytes {
+            // SST output lands in the largest level's volume; stale blob
+            // relocation lands in the primary blobs volume. The per-volume gate
+            // (not `available >= full_compaction_bytes` against the min-volume
+            // free) keeps the status from reporting tight when the SST and blob
+            // outputs each fit their own volume — see the gate's two-layer model.
+            let (sst_dest_level, sst_need) =
+                crate::storage_stats::largest_level_for_compaction(&version);
+            let quota_headroom = self.index.quota_headroom(stats.used_bytes);
+            let full_fits = crate::compaction::worker::space_fits_two_layer(
+                &self.index.config,
+                quota_headroom,
+                sst_need,
+                sst_dest_level,
+                blob_need,
+            );
+            stats.status = if full_fits {
                 crate::StorageStatus::FullCompactionAvailable
             } else {
                 crate::StorageStatus::TightCompactionAvailable

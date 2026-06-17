@@ -321,12 +321,13 @@ impl AbstractTree for Tree {
     }
 
     fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
+        // One version snapshot reused for the footprint and the full-compaction
+        // estimate below: a second `current_version()` could race a concurrent
+        // flush / compaction and mix two snapshots.
+        let version = self.current_version();
         // Standard tree: SST values ARE user values (no KV separation).
-        let mut stats = crate::storage_stats::compute_storage_stats(
-            &self.current_version(),
-            self.is_compacting(),
-            true,
-        )?;
+        let mut stats =
+            crate::storage_stats::compute_storage_stats(&version, self.is_compacting(), true)?;
         // Fill the disk-aware capacity figures (quota + free-space probe) the
         // version-only computation can't know.
         let (capacity, available, compaction_possible) = self.admission_capacity(stats.used_bytes);
@@ -334,19 +335,33 @@ impl AbstractTree for Tree {
         stats.available_bytes = available;
         stats.compaction_possible = compaction_possible;
         // When admission gating is active and a compaction is not already
-        // running, surface whether a full compaction has working room: the same
-        // band the compaction space gate enforces. With gating off the gate
-        // never runs, so the status stays `Healthy` even though the backend can
-        // report a finite capacity.
+        // running, surface whether a full compaction has working room through the
+        // SAME two-layer check the compaction space gate enforces (logical quota +
+        // physical free per destination volume), so the reported status matches
+        // what the gate will admit. With gating off the gate never runs, so the
+        // status stays `Healthy` even though the backend can report a finite
+        // capacity.
         if self.storage_admission_enabled()
             && capacity.is_some()
             && stats.status == crate::StorageStatus::Healthy
         {
-            // Full when the free room covers a full compaction's transient
-            // output, tight otherwise — the same thresholds the gauge figures
-            // expose, so the reported status matches the compaction space gate.
-            let available = available.unwrap_or(0);
-            stats.status = if available >= stats.full_compaction_bytes {
+            // A full compaction's transient output is bounded by the largest
+            // level's on-disk size, landing in that level's own volume. A
+            // standard tree has no blob relocation. Using the per-volume gate
+            // (not `available >= full_compaction_bytes` against the min-volume
+            // free) keeps the status from reporting tight when a routed merge
+            // would actually be admitted.
+            let (sst_dest_level, sst_need) =
+                crate::storage_stats::largest_level_for_compaction(&version);
+            let quota_headroom = self.quota_headroom(stats.used_bytes);
+            let full_fits = crate::compaction::worker::space_fits_two_layer(
+                &self.0.config,
+                quota_headroom,
+                sst_need,
+                sst_dest_level,
+                0,
+            );
+            stats.status = if full_fits {
                 crate::StorageStatus::FullCompactionAvailable
             } else {
                 crate::StorageStatus::TightCompactionAvailable
@@ -2373,6 +2388,21 @@ impl Tree {
             Some(available),
             available >= MIN_RESERVED_HEADROOM,
         )
+    }
+
+    /// The logical partition-quota headroom for the two-layer space model:
+    /// `max(0, storage_limit_bytes - used)`, or `u64::MAX` when no quota is set.
+    ///
+    /// This is Layer 1 (volume-agnostic) of [`crate::compaction::worker::space_fits_two_layer`];
+    /// the physical free-space probe is Layer 2. An operator quota set below the
+    /// live footprint leaves zero headroom — the clamp-to-zero is the intended
+    /// min-semantics, not masking.
+    pub(crate) fn quota_headroom(&self, used: u64) -> u64 {
+        self.0
+            .runtime_config
+            .load()
+            .storage_limit_bytes
+            .map_or(u64::MAX, |limit| limit.saturating_sub(used))
     }
 
     /// Whether the opt-in storage admission gate is active (a near-full disk or
