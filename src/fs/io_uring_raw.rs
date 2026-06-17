@@ -650,13 +650,16 @@ pub fn statx_path_raw(path: &core::ffi::CStr) -> Result<Option<RawMetadata>, Err
     }
 }
 
-/// The kernel `struct statfs` for 64-bit Linux (x86-64 / aarch64). Unlike
-/// `statx`, this struct is architecture-dependent: the field widths below (and
-/// the syscall's expected buffer layout) are the 64-bit ABI, so it is gated to
-/// `target_pointer_width = "64"`. A 32-bit build (e.g. `i686`) would read the
-/// kernel's 32-bit `statfs` into the wrong layout. Only `f_frsize` and
+/// The kernel `struct statfs` for x86-64 / aarch64 Linux. Unlike `statx`, this
+/// struct is architecture-dependent: the field widths below (and the syscall's
+/// expected buffer layout) match the verified x86-64 / aarch64 ABI, so it is
+/// gated to exactly those targets. Other 64-bit Linux architectures (e.g.
+/// s390x) place `f_bavail` / `f_frsize` at different offsets, so reading this
+/// layout there would yield bogus free space; they fall back to the trait
+/// default (`u64::MAX`, no disk-pressure signal). A 32-bit build would likewise
+/// read the kernel's 32-bit `statfs` into the wrong layout. Only `f_frsize` and
 /// `f_bavail` are read.
-#[cfg(target_pointer_width = "64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
 #[allow(
@@ -680,7 +683,8 @@ struct Statfs {
 
 /// `statfs(path, &buf)` — bytes available to an unprivileged process on the
 /// filesystem backing `path`: `f_bavail * f_frsize`. Raw syscall (no libc),
-/// matching this backend's no-libc design. 64-bit-only (see [`Statfs`]).
+/// matching this backend's no-libc design. x86-64 / aarch64 only (see
+/// [`Statfs`]).
 ///
 /// `f_frsize` (fundamental fragment size), not `f_bsize` (preferred transfer
 /// block size), to match `available_space`'s contract and the `statvfs`-based
@@ -688,7 +692,7 @@ struct Statfs {
 ///
 /// # Errors
 /// Returns an [`Error`] if the `statfs` syscall fails.
-#[cfg(target_pointer_width = "64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub fn statfs_available_raw(path: &core::ffi::CStr) -> Result<u64, Error> {
     let mut buf = Statfs::default();
     // SAFETY: `path` is a valid NUL-terminated C string the kernel reads;
@@ -1108,11 +1112,12 @@ impl Fs for IoUringRawFs {
         }
     }
 
-    // 64-bit only: the raw `statfs` ABI struct is gated to 64-bit targets. On a
-    // 32-bit build this method is absent, so the trait default (u64::MAX = no
+    // x86-64 / aarch64 only: the raw `statfs` ABI struct is verified for those
+    // layouts. On any other target (a different 64-bit arch like s390x, or a
+    // 32-bit build) this method is absent, so the trait default (u64::MAX = no
     // disk-pressure signal) applies — correct, since admission must not gate on
-    // a value it cannot read.
-    #[cfg(target_pointer_width = "64")]
+    // a value it cannot read from a matching layout.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn available_space(&self, path: &Path) -> crate::io::Result<u64> {
         statfs_available_raw(&path_to_cstring(path)?)
     }
@@ -1802,7 +1807,7 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::InvalidInput); // EBADF -> InvalidInput
     }
 
-    #[cfg(target_pointer_width = "64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn raw_available_space_reports_plausible_free_bytes() {
         // The raw `statfs` syscall path: the filesystem backing the tempdir must
@@ -1825,7 +1830,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_pointer_width = "64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn raw_statfs_on_missing_path_errors() {
         // `statfs` on a path that does not exist surfaces an error, not a silent
