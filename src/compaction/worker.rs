@@ -245,15 +245,17 @@ enum SpaceGate {
 ///
 /// **Layer 2 (physical free space, per destination volume).** SST output lands
 /// in `sst_dest_level`'s volume; KV-separated blob relocation lands in the
-/// primary blobs volume. When the destination level is NOT separately routed,
-/// both outputs share the primary filesystem, so their transient peak is the
-/// **sum on one volume** — checked as a single combined budget (checking them
-/// independently would over-admit: each fits the free space alone, but together
-/// they exhaust it). When the level IS routed to its own volume (tiered
-/// storage), the two outputs land on different filesystems and are checked
-/// independently, so a full cold-tier route never stalls a hot-level merge.
-/// Each volume leaves the reserved flush floor when ample, or consumes it (raw
-/// free) to break the no-space-to-free-space deadlock.
+/// primary blobs volume. The two are budgeted **independently only when they are
+/// proven to be on different physical volumes** ([`Fs::volume_id`] reports
+/// distinct device ids) — then a full cold-tier route never stalls a hot-level
+/// merge. Otherwise (same volume, or independence not proven) their transient
+/// peak is the **combined sum** on the tighter volume: checking them
+/// independently would over-admit, since each fits the free space alone while
+/// together they exhaust it and the merge hits `ENOSPC`. `level_routes` maps
+/// levels to paths but does NOT prove a separate mount (a route may point at the
+/// same filesystem), so routing alone is not treated as independence. Each
+/// volume leaves the reserved flush floor when ample, or consumes it (raw free)
+/// to break the no-space-to-free-space deadlock.
 ///
 /// A volume that cannot report free space contributes `u64::MAX`, so a probe
 /// failure never fabricates disk pressure. With no quota and every volume
@@ -285,25 +287,24 @@ pub fn space_fits_two_layer(
 
     let (sst_path, sst_fs) = config.tables_folder_for_level(sst_dest_level);
     let sst_free = sst_fs.available_space(&sst_path).unwrap_or(u64::MAX);
+    let blob_dir = config.path.join(BLOBS_FOLDER);
+    let blob_free = config.fs.available_space(&blob_dir).unwrap_or(u64::MAX);
 
-    let sst_routed_away = config
-        .level_routes
-        .as_ref()
-        .is_some_and(|routes| routes.iter().any(|r| r.levels.contains(&sst_dest_level)));
+    // Independent only when both destinations report a volume id AND the ids
+    // differ — provably separate free-space pools. A route to the same mount, or
+    // any backend that cannot prove independence, falls through to the combined
+    // budget so a shared-volume transient peak cannot slip past into `ENOSPC`.
+    let independent = match (sst_fs.volume_id(&sst_path), config.fs.volume_id(&blob_dir)) {
+        (Some(sst_vol), Some(blob_vol)) => sst_vol != blob_vol,
+        _ => false,
+    };
 
-    if sst_routed_away {
-        // Different filesystems: SST on the routed (cold-tier) volume, blob on
-        // the primary blobs volume → independent per-volume checks.
-        let blob_free = config
-            .fs
-            .available_space(&config.path.join(BLOBS_FOLDER))
-            .unwrap_or(u64::MAX);
+    if independent {
         volume_fits(sst_bytes, sst_free) && volume_fits(blob_bytes, blob_free)
     } else {
-        // Same primary filesystem (no route covers the destination level): the
-        // SST tables folder and the blobs folder share it, so the transient peak
-        // is the combined sum on that one volume.
-        volume_fits(sst_bytes + blob_bytes, sst_free)
+        // Same (or unproven-distinct) volume: the transient peak is the combined
+        // sum against the tighter free probe.
+        volume_fits(sst_bytes + blob_bytes, sst_free.min(blob_free))
     }
 }
 
@@ -2457,10 +2458,11 @@ mod tests {
             40 * MIB
         ));
 
-        // Routed: level 6 lives on its own cold-tier volume, blobs on the primary.
-        // The two outputs land on different filesystems and are checked
-        // independently — 60 MiB on each of two 100 MiB volumes fits, even though
-        // the sum is 120 MiB (a full cold-tier route must not stall a hot merge).
+        // Routed to a PROVEN-independent volume: level 6 lives on its own MemFs
+        // (a distinct volume id), blobs on the primary MemFs. The two outputs are
+        // checked independently — 60 MiB on each of two 100 MiB volumes fits, even
+        // though the sum is 120 MiB (a full cold-tier route must not stall a hot
+        // merge).
         let routed = Config::new(
             &dir,
             SequenceNumberCounter::default(),
@@ -2474,7 +2476,7 @@ mod tests {
         }]);
         assert!(
             super::space_fits_two_layer(&routed, u64::MAX, 60 * MIB, 6, 60 * MIB),
-            "routed outputs land on separate volumes and are checked independently"
+            "proven-independent volumes are checked independently"
         );
         // A blob output that overflows the primary volume alone still fails.
         assert!(!super::space_fits_two_layer(
@@ -2484,6 +2486,110 @@ mod tests {
             6,
             130 * MIB
         ));
+
+        // Routed but NOT proven independent: the route points at the SAME backend
+        // as the primary (one shared MemFs → one volume id / one free-space pool),
+        // as happens when level_routes maps a level to a directory on the same
+        // mount. The SST and blob budgets must combine, so 60 + 60 = 120 MiB > 100
+        // MiB free is rejected even though each fits alone — the routed
+        // over-admission guard.
+        let shared = MemFs::with_capacity(100 * MIB);
+        let routed_same_mount = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::new(shared.clone()))
+        .level_routes(vec![crate::config::LevelRoute {
+            levels: 6..7,
+            path: crate::path::PathBuf::from("/same-mount-subdir"),
+            // Same backend instance as the primary → same volume id (one shared
+            // free-space pool), the not-proven-independent case.
+            fs: Arc::new(shared),
+        }]);
+        assert!(
+            !super::space_fits_two_layer(&routed_same_mount, u64::MAX, 60 * MIB, 6, 60 * MIB),
+            "a route on the same volume must combine budgets, not admit each independently"
+        );
+
+        Ok(())
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "test asserts over known-good fixtures; failure surfaces via panic"
+    )]
+    #[test]
+    fn space_gate_for_merge_narrows_a_full_run_that_exceeds_free() -> crate::Result<()> {
+        use crate::fs::MemFs;
+
+        // Build a multi-table bottom-level run on a capped simulated disk, then
+        // ask the gate to admit a whole-run merge whose transient output does NOT
+        // fit free space but a run-adjacent pair does. The gate must narrow rather
+        // than skip — exercising the per-payload demand, the candidate loop, and
+        // the `Narrowed` return that integration tests cannot reach (the public
+        // major-compaction path picks a non-narrowable multi-level merge).
+        let dir = tempfile::tempdir()?;
+        let mem = MemFs::with_capacity(u64::MAX);
+        let any = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::new(mem.clone()))
+        .data_block_size_policy(BlockSizePolicy::all(512))
+        .open()?;
+        let crate::AnyTree::Standard(tree) = any else {
+            panic!("expected Standard tree");
+        };
+        for i in 0..3_000u64 {
+            tree.insert(format!("k{i:08}"), "v".repeat(40), i);
+        }
+        tree.flush_active_memtable(0)?;
+        tree.major_compact(16 * 1024, 0)?;
+
+        let version = tree.current_version();
+        let run = version
+            .iter_levels()
+            .flat_map(|level| level.iter())
+            .find(|run| run.len() >= 3)
+            .expect("a bottom-level run with >= 3 tables");
+        let run_sigma: u64 = run.iter().map(Table::file_size).sum();
+        let payload = Input {
+            table_ids: run.iter().map(Table::id).collect(),
+            dest_level: 6,
+            canonical_level: 6,
+            target_size: 64 * 1024 * 1024,
+        };
+
+        // Free space below the full run's Σ but above a single pair: the run does
+        // not fit, a run-adjacent pair does. Calibrate against the SIMULATED
+        // disk's real stored bytes (manifest / WAL count too, not just live SSTs),
+        // since the gate probes `available_space`, not the version footprint.
+        // `run_sigma >= 1` (real SST files), so `- 1` cannot underflow.
+        let probe_capacity = 1u64 << 40;
+        mem.set_capacity(probe_capacity);
+        let stored = probe_capacity
+            - crate::fs::Fs::available_space(&mem, dir.path()).unwrap_or(probe_capacity);
+        mem.set_capacity(stored + run_sigma - 1);
+        tree.update_runtime_config(|c| {
+            c.storage_admission_check = true;
+            c.storage_limit_bytes = None;
+        })?;
+
+        let opts = super::Options::from_tree(
+            &tree,
+            Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
+        );
+        match super::space_gate_for_merge(&version, &opts, &payload)? {
+            super::SpaceGate::Narrowed(narrowed) => {
+                assert_eq!(narrowed.table_ids.len(), 2, "narrowed to an adjacent pair");
+            }
+            super::SpaceGate::Run => {
+                panic!("expected Narrowed, got Run (full run wrongly admitted)")
+            }
+            super::SpaceGate::Skip => panic!("expected Narrowed, got Skip (no pair admitted)"),
+        }
 
         Ok(())
     }

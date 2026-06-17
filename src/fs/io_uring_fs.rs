@@ -246,6 +246,12 @@ impl Fs for IoUringFs {
         // two backends.
         super::StdFs.backend_id()
     }
+
+    fn volume_id(&self, path: &Path) -> Option<u64> {
+        // Same kernel mount as `StdFs` — free space is a property of the mount,
+        // not the I/O submission path.
+        super::StdFs.volume_id(path)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1321,6 +1327,25 @@ mod tests {
             free < u64::MAX,
             "a real probe must not return the unbounded sentinel"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn volume_id_matches_the_kernel_mount() -> io::Result<()> {
+        // Free space is a property of the mount, not the I/O submission path, so
+        // the uring backend reports the same volume id as `StdFs` for a path —
+        // letting the space gate treat a uring data dir and a `StdFs` blob dir on
+        // the same mount as one free-space pool.
+        let Some(fs) = try_io_uring() else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        assert_eq!(
+            fs.volume_id(dir.path()),
+            crate::fs::StdFs.volume_id(dir.path()),
+            "uring and std agree on the mount backing a path"
+        );
+        assert!(fs.volume_id(dir.path()).is_some(), "a real mount has an id");
         Ok(())
     }
 }

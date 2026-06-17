@@ -832,6 +832,14 @@ impl Fs for MemFs {
         Some(self.namespace_id)
     }
 
+    fn volume_id(&self, _path: &Path) -> Option<u64> {
+        // One `MemFs` instance is one simulated disk with a single capacity /
+        // free-space pool (shared across clones via the same `state` Arc), so the
+        // per-instance namespace ID also identifies the volume. Independently
+        // constructed instances are independent volumes.
+        Some(self.namespace_id)
+    }
+
     /// In-memory backend: no filesystem-level guarantees on any path.
     /// Explicitly returns the all-`false` default so the "no integrity / no
     /// `CoW` / no reflink" stance is intentional rather than inherited by
