@@ -13,10 +13,14 @@ use crate::version::Version;
 
 /// Coarse storage state of a tree.
 ///
-/// This release reports [`Self::Healthy`] and [`Self::CompactionInProgress`].
-/// The capacity-dependent variants are populated once storage admission control
-/// (a configured byte quota / disk-free probe) lands; they are defined now so
-/// the enum stays stable across that work.
+/// With storage admission gating off (no configured quota and a backend that
+/// cannot report free space) a tree reports [`Self::Healthy`] or, mid-run,
+/// [`Self::CompactionInProgress`]. Once gating is active (bounded capacity), an
+/// idle tree instead reports compaction availability:
+/// [`Self::FullCompactionAvailable`] when a full compaction has working room,
+/// [`Self::TightCompactionAvailable`] when only the opt-in tight-space mode
+/// would fit, and [`Self::ReadOnlyOutOfSpace`] when the write gate is closed
+/// (this takes precedence over a concurrent compaction).
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub enum StorageStatus {

@@ -336,6 +336,18 @@ impl AbstractTree for BlobTree {
         stats.capacity_bytes = capacity;
         stats.available_bytes = available;
         stats.compaction_possible = compaction_possible;
+        // Surface full-vs-tight compaction availability when gating is active and
+        // no compaction is running (see the standard tree's override).
+        if self.index.storage_admission_enabled()
+            && capacity.is_some()
+            && stats.status == crate::StorageStatus::Healthy
+        {
+            stats.status = if compaction_possible {
+                crate::StorageStatus::FullCompactionAvailable
+            } else {
+                crate::StorageStatus::TightCompactionAvailable
+            };
+        }
         // Admission is driven by the index tree's runtime config / footprint;
         // a closed gate is the operator-actionable state (see the standard
         // tree's override for the precedence rationale).

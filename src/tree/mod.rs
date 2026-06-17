@@ -45,7 +45,7 @@ use crate::metrics::Metrics;
 /// [`Tree::compute_write_admission`]). Even with an empty active memtable the
 /// gate keeps at least this much room below the budget so the next writes and a
 /// space-reclaiming compaction have somewhere to land. 1 MiB.
-const MIN_RESERVED_HEADROOM: u64 = 1024 * 1024;
+pub const MIN_RESERVED_HEADROOM: u64 = 1024 * 1024;
 
 /// How long a cached disk-free sample stays valid before the admission gate
 /// re-probes. Bounds how stale the physical free-space figure can be when the
@@ -333,9 +333,24 @@ impl AbstractTree for Tree {
         stats.capacity_bytes = capacity;
         stats.available_bytes = available;
         stats.compaction_possible = compaction_possible;
+        // When admission gating is active and a compaction is not already
+        // running, surface whether a full compaction has working room: the same
+        // band the compaction space gate enforces. With gating off the gate
+        // never runs, so the status stays `Healthy` even though the backend can
+        // report a finite capacity.
+        if self.storage_admission_enabled()
+            && capacity.is_some()
+            && stats.status == crate::StorageStatus::Healthy
+        {
+            stats.status = if compaction_possible {
+                crate::StorageStatus::FullCompactionAvailable
+            } else {
+                crate::StorageStatus::TightCompactionAvailable
+            };
+        }
         // A closed admission gate is the operator-actionable state, so it takes
-        // precedence over CompactionInProgress (a read-only tree may well be
-        // compacting to reclaim space).
+        // precedence over the others (a read-only tree may well be compacting to
+        // reclaim space).
         if self.is_read_only() {
             stats.status = crate::StorageStatus::ReadOnlyOutOfSpace;
         }
@@ -2312,18 +2327,7 @@ impl Tree {
     /// `u64::MAX` = "no disk pressure", so a probe failure never falsely drives
     /// the tree read-only.
     fn probe_disk_free(&self) -> u64 {
-        let mut free = self
-            .0
-            .config
-            .fs
-            .available_space(&self.0.config.path)
-            .unwrap_or(u64::MAX);
-        if let Some(routes) = &self.0.config.level_routes {
-            for route in routes {
-                free = free.min(route.fs.available_space(&route.path).unwrap_or(u64::MAX));
-            }
-        }
-        free
+        self.0.config.min_available_space()
     }
 
     /// Disk-aware capacity figures for [`AbstractTree::storage_stats`], given the
@@ -2336,6 +2340,14 @@ impl Tree {
     /// `None` capacity/available means unbounded (no quota AND the backend
     /// cannot report free space). `compaction_possible` is `true` when unbounded
     /// or when at least [`MIN_RESERVED_HEADROOM`] of working room remains.
+    /// Whether the opt-in storage admission gate is active (a near-full disk or
+    /// configured quota can drive the tree read-only and gate compaction space).
+    /// Capacity introspection figures are reported regardless; this only governs
+    /// whether the gate actually enforces.
+    pub(crate) fn storage_admission_enabled(&self) -> bool {
+        self.0.runtime_config.load().storage_admission_check
+    }
+
     pub(crate) fn admission_capacity(&self, used: u64) -> (Option<u64>, Option<u64>, bool) {
         let quota = self
             .0

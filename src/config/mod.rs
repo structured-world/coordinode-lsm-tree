@@ -1054,6 +1054,26 @@ impl Config {
         (self.path.join(TABLES_FOLDER), self.fs.clone())
     }
 
+    /// Best-effort minimum free space (bytes) across every filesystem this tree
+    /// writes to: the primary [`path`](Self::path) plus each
+    /// [`level_routes`](Self::level_routes) volume.
+    ///
+    /// The tightest volume bounds storage admission and compaction space gating,
+    /// since a full routed (cold-tier) volume fails a flush / compaction
+    /// targeting it even while the primary still has room. A backend that cannot
+    /// report free space (or an I/O hiccup) contributes `u64::MAX`, so a probe
+    /// failure never fabricates disk pressure.
+    #[must_use]
+    pub(crate) fn min_available_space(&self) -> u64 {
+        let mut free = self.fs.available_space(&self.path).unwrap_or(u64::MAX);
+        if let Some(routes) = &self.level_routes {
+            for route in routes {
+                free = free.min(route.fs.available_space(&route.path).unwrap_or(u64::MAX));
+            }
+        }
+        free
+    }
+
     /// Returns all unique tables folders that need to be scanned during
     /// recovery: the primary folder plus every [`LevelRoute`] folder.
     #[must_use]

@@ -180,7 +180,12 @@ fn raising_budget_clears_read_only_without_restart() -> lsm_tree::Result<()> {
         tree.try_insert(b"k".as_slice(), b"v".as_slice(), 1001)
             .is_ok()
     );
-    assert_eq!(tree.storage_stats()?.status, StorageStatus::Healthy);
+    // Admission stays enabled with a generous budget: bounded capacity + ample
+    // free room reports full-compaction availability, not the gate-off `Healthy`.
+    assert_eq!(
+        tree.storage_stats()?.status,
+        StorageStatus::FullCompactionAvailable
+    );
     Ok(())
 }
 

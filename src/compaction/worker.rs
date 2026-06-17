@@ -148,7 +148,36 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
 
     match choice {
         Choice::Merge(payload) => {
-            merge_tables(compaction_state, version_history_lock, opts, &payload)
+            // Space-admission gate (opt-in). A merge transiently needs room for
+            // its output while the inputs still exist, so on a near-full disk a
+            // naive run can hit ENOSPC. Gating merges like user writes would
+            // deadlock (compaction is what frees space), so the gate keeps an
+            // emergency reserve and narrows rather than blanket-skips. `Move` /
+            // `Drop` are zero / negative space and always run (below).
+            let decision = {
+                let super_version = version_history_lock.latest_version();
+                space_gate_for_merge(&super_version.version, opts, &payload)
+            };
+            match decision {
+                SpaceGate::Run => {
+                    merge_tables(compaction_state, version_history_lock, opts, &payload)
+                }
+                SpaceGate::Narrowed(narrowed) => {
+                    log::debug!(
+                        "Compaction space gate: narrowed merge from {} to {} tables to fit free space",
+                        payload.table_ids.len(),
+                        narrowed.table_ids.len(),
+                    );
+                    merge_tables(compaction_state, version_history_lock, opts, &narrowed)
+                }
+                SpaceGate::Skip => {
+                    log::info!(
+                        "Compaction space gate: skipping {}-table merge — free space cannot cover the transient output and no fitting subset exists (opt-in tight-space reclaim handles this)",
+                        payload.table_ids.len(),
+                    );
+                    Ok(CompactionResult::nothing())
+                }
+            }
         }
         Choice::Move(payload) => {
             // Cross-folder trivial moves are not possible — the file must be
@@ -189,6 +218,119 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
             Ok(CompactionResult::nothing())
         }
     }
+}
+
+/// Outcome of the compaction space-admission gate for a [`Choice::Merge`].
+enum SpaceGate {
+    /// Run the merge as chosen (admission off, backend can't report free space,
+    /// or the inputs fit the available space).
+    Run,
+    /// Run a smaller fitting subset (a minimal reclaiming merge) instead of the
+    /// chosen one, which did not fit.
+    Narrowed(CompactionPayload),
+    /// No fitting subset exists; skip this cycle. The truly-too-big single merge
+    /// is the opt-in tight-space mode's domain; meanwhile `Drop` / `Move` cycles
+    /// still reclaim and reorganize.
+    Skip,
+}
+
+/// Decides whether a chosen merge fits the available disk space, narrowing it to
+/// a minimal reclaiming subset when it does not.
+///
+/// Bound: a merge's transient extra need is at most `Σ input file_size` (the
+/// output never exceeds the inputs). Budget: the minimum free space across every
+/// volume the tree writes to ([`Config::min_available_space`]).
+///
+/// - Admission off, or a backend that cannot report free space → [`SpaceGate::Run`]
+///   (no disk-pressure signal; behaviour identical to a build without the gate).
+/// - `Σinputs + reserve ≤ free` → run (ample room, leaves the flush/metadata floor).
+/// - `Σinputs ≤ free` → run anyway, consuming the emergency reserve: a
+///   space-reclaiming merge must be able to run even at the limit, which is what
+///   breaks the no-space-to-free-space deadlock.
+/// - `Σinputs > free` → narrow to the smallest run-adjacent table pair that fits;
+///   if none fits, skip.
+fn space_gate_for_merge(
+    version: &Version,
+    opts: &Options,
+    payload: &CompactionPayload,
+) -> SpaceGate {
+    if !opts.runtime_config.load_full().storage_admission_check {
+        return SpaceGate::Run;
+    }
+
+    let free = opts.config.min_available_space();
+    if free == u64::MAX {
+        // Backend cannot report free space → never fabricate disk pressure.
+        return SpaceGate::Run;
+    }
+
+    let sigma: u64 = payload
+        .table_ids
+        .iter()
+        .filter_map(|&id| version.get_table(id))
+        .map(Table::file_size)
+        .fold(0u64, u64::saturating_add);
+
+    if sigma.saturating_add(crate::tree::MIN_RESERVED_HEADROOM) <= free || sigma <= free {
+        return SpaceGate::Run;
+    }
+
+    match narrow_merge_to_budget(version, payload, free) {
+        Some(narrowed) => SpaceGate::Narrowed(narrowed),
+        None => SpaceGate::Skip,
+    }
+}
+
+/// Narrows a too-large merge to the smallest run-adjacent table pair whose
+/// combined `file_size` fits `budget`, preserving the merge's destination.
+///
+/// Narrowing is only safe within a single run (key-sorted, non-overlapping
+/// tables): a run-adjacent pair is always a valid, reclaiming merge, and the
+/// merge stream culls exactly that pair. A cross-run / cross-level payload (e.g.
+/// a leveled `Lₙ → Lₙ₊₁` overlap set) cannot be narrowed here without risking an
+/// invalid partial merge, so it returns `None` (the chosen merge is skipped and
+/// left to the opt-in tight-space mode). The pair must be adjacent IN THE RUN —
+/// a gap would make the merge stream pull the in-between tables too, breaking the
+/// size bound.
+fn narrow_merge_to_budget(
+    version: &Version,
+    payload: &CompactionPayload,
+    budget: u64,
+) -> Option<CompactionPayload> {
+    // The single run that holds every payload table (if any).
+    let run = version
+        .iter_levels()
+        .flat_map(|level| level.iter())
+        .find(|run| {
+            payload
+                .table_ids
+                .iter()
+                .all(|id| run.iter().any(|t| t.id() == *id))
+        })?;
+
+    let run_tables: Vec<&Table> = run.iter().collect();
+    let mut best: Option<(u64, [TableId; 2])> = None;
+    for pair in run_tables.windows(2) {
+        let [a, b] = pair else { continue };
+        if !payload.table_ids.contains(&a.id()) || !payload.table_ids.contains(&b.id()) {
+            continue;
+        }
+        let combined = a.file_size().saturating_add(b.file_size());
+        if combined > budget {
+            continue;
+        }
+        if best.is_none_or(|(best_size, _)| combined < best_size) {
+            best = Some((combined, [a.id(), b.id()]));
+        }
+    }
+
+    let (_, ids) = best?;
+    Some(CompactionPayload {
+        table_ids: ids.into_iter().collect(),
+        dest_level: payload.dest_level,
+        canonical_level: payload.canonical_level,
+        target_size: payload.target_size,
+    })
 }
 
 fn pick_run_indexes(run: &Run<Table>, to_compact: &[TableId]) -> Option<(usize, usize)> {
@@ -1453,7 +1595,7 @@ fn drop_tables(
 mod tests {
     use super::{create_compaction_stream, pick_run_indexes};
     use crate::{
-        AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter, TableId,
+        AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter, Table, TableId,
         compaction::{Choice, CompactionStrategy, Input, state::CompactionState},
         config::BlockSizePolicy,
         version::Version,
@@ -2056,6 +2198,79 @@ mod tests {
                 **tree.current_version().gc_stats(),
             );
         }
+
+        Ok(())
+    }
+
+    #[expect(
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        reason = "test asserts over known-good fixtures; failure surfaces via panic"
+    )]
+    #[test]
+    fn narrow_merge_picks_smallest_fitting_run_adjacent_pair() -> crate::Result<()> {
+        // Build a single bottom-level run of several tables (small target size
+        // forces table rotation), then narrow a whole-run merge to a budget that
+        // fits only one adjacent pair.
+        let dir = tempfile::tempdir()?;
+        let tree = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_size_policy(BlockSizePolicy::all(512))
+        .open()?;
+        for i in 0..3_000u64 {
+            tree.insert(format!("k{i:08}"), "v".repeat(40), i);
+        }
+        tree.flush_active_memtable(0)?;
+        // Small target size → the major compaction emits a run of several tables.
+        tree.major_compact(16 * 1024, 0)?;
+
+        let version = tree.current_version();
+        let run = version
+            .iter_levels()
+            .flat_map(|level| level.iter())
+            .find(|run| run.len() >= 3)
+            .expect("a bottom-level run with >= 3 tables");
+        let ordered: Vec<(TableId, u64)> = run.iter().map(|t| (t.id(), t.file_size())).collect();
+
+        let payload = Input {
+            table_ids: ordered.iter().map(|(id, _)| *id).collect(),
+            dest_level: 6,
+            canonical_level: 6,
+            target_size: 64 * 1024 * 1024,
+        };
+
+        // Smallest combined size over run-adjacent pairs.
+        let smallest_pair = ordered
+            .windows(2)
+            .map(|w| w[0].1 + w[1].1)
+            .min()
+            .expect(">= 2 tables");
+
+        // A budget at that size narrows to exactly that pair (2 tables, Σ == budget).
+        let narrowed = super::narrow_merge_to_budget(&version, &payload, smallest_pair)
+            .expect("smallest pair fits the budget");
+        assert_eq!(narrowed.table_ids.len(), 2, "narrowed to an adjacent pair");
+        let narrowed_sum: u64 = narrowed
+            .table_ids
+            .iter()
+            .filter_map(|id| version.get_table(*id))
+            .map(Table::file_size)
+            .sum();
+        assert_eq!(
+            narrowed_sum, smallest_pair,
+            "narrowed pair is the smallest-Σ adjacent pair"
+        );
+
+        // A budget below the smallest single table fits nothing → None.
+        let smallest_table = ordered.iter().map(|(_, s)| *s).min().expect("non-empty");
+        assert!(
+            super::narrow_merge_to_budget(&version, &payload, smallest_table.saturating_sub(1))
+                .is_none(),
+            "no pair fits a sub-single-table budget"
+        );
 
         Ok(())
     }
