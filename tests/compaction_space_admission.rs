@@ -266,6 +266,62 @@ fn blob_tree_full_status_ignores_non_stale_blob_footprint() -> lsm_tree::Result<
 }
 
 #[test]
+fn status_probes_the_last_level_route_volume_not_the_largest_footprint() -> lsm_tree::Result<()> {
+    // Regression: a full compaction writes its SST output to the LAST level
+    // (level_count - 1), so the status must probe THAT level's volume, not the
+    // largest-footprint level's. Here the bottom level is routed to a near-full
+    // cold volume while the bulk of the data (L0) sits on a roomy primary. The
+    // compaction gate would skip a full compaction for lack of cold-volume room,
+    // so the status must report TightCompactionAvailable — not Full from the
+    // primary's free space.
+    let folder = get_tmp_folder();
+    let cold_dir = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(MemFs::new())) // unbounded primary (roomy)
+    .level_routes(vec![lsm_tree::config::LevelRoute {
+        levels: 6..7,
+        path: cold_dir.path().to_path_buf(),
+        // Near-full cold tier: above the reserved floor (not read-only) but well
+        // below the full-compaction demand below.
+        fs: Arc::new(MemFs::with_capacity(2 * 1024 * 1024)),
+    }])
+    .open()
+    .expect("open");
+    let AnyTree::Standard(tree) = any else {
+        panic!("expected Standard tree");
+    };
+
+    // Write much more than the cold capacity into L0 (lands on the primary): the
+    // full-compaction demand (largest level = L0) far exceeds the cold volume's
+    // free space.
+    let value = vec![0xABu8; 200];
+    for i in 0..30_000u64 {
+        tree.insert(format!("key{i:08}").as_bytes(), &value, i);
+    }
+    tree.flush_active_memtable(0)?;
+    let demand = tree.storage_stats()?.full_compaction_bytes;
+    assert!(
+        demand > 2 * 1024 * 1024,
+        "L0 demand must exceed the 2 MiB cold capacity (got {demand})"
+    );
+
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+    })?;
+    assert_eq!(
+        tree.storage_stats()?.status,
+        StorageStatus::TightCompactionAvailable,
+        "status must probe the last-level (cold) route volume, not the largest-footprint primary"
+    );
+    Ok(())
+}
+
+#[test]
 fn blob_tree_compaction_space_gate_and_status() -> lsm_tree::Result<()> {
     // Drives the KV-separation branch of the gate (blob-file relocation budget)
     // and the blob-tree FullCompactionAvailable status.
