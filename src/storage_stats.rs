@@ -43,8 +43,28 @@ pub enum StorageStatus {
 #[must_use]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct StorageStats {
-    /// Total on-disk bytes of all live SSTs plus blob files.
+    /// Total on-disk bytes of all live SSTs plus blob files: how much is
+    /// **occupied**. Pairs with [`Self::capacity_bytes`] / [`Self::available_bytes`]
+    /// for an "X of Y used" view in a single call.
     pub used_bytes: u64,
+
+    /// Total bytes the tree may occupy: the tighter of a configured byte quota
+    /// (`storage_limit_bytes`) and the physical disk headroom (free space plus
+    /// what is already used), across every volume the tree writes to. `None`
+    /// when unbounded: no quota set AND the backend cannot report free space.
+    pub capacity_bytes: Option<u64>,
+
+    /// Free room left before the tree turns read-only: `capacity_bytes - used_bytes`
+    /// (saturating). `None` exactly when [`Self::capacity_bytes`] is `None`
+    /// (unbounded).
+    pub available_bytes: Option<u64>,
+
+    /// Whether a compaction can still run given the remaining free space (it
+    /// needs working room to write merged output). `true` when unbounded or
+    /// when at least the reserved compaction-working floor remains; `false`
+    /// when the disk is too full for a compaction to make progress. The finer
+    /// full-vs-tight distinction is carried by [`Self::status`].
+    pub compaction_possible: bool,
 
     /// Number of live entries (all versions) across all live SSTs.
     pub item_count: u64,
@@ -197,6 +217,12 @@ pub(crate) fn compute_storage_stats(
 
     Ok(StorageStats {
         used_bytes,
+        // Capacity is disk-aware (quota + free-space probe) and lives at the
+        // tree layer; this version-only computation leaves it unbounded. The
+        // caller (`Tree::storage_stats`) fills the real figures.
+        capacity_bytes: None,
+        available_bytes: None,
+        compaction_possible: true,
         item_count,
         table_count,
         avg_entry_on_disk_bytes,
@@ -214,6 +240,9 @@ mod tests {
     fn stats_with_avg(avg_entry_on_disk_bytes: u64) -> StorageStats {
         StorageStats {
             used_bytes: 0,
+            capacity_bytes: None,
+            available_bytes: None,
+            compaction_possible: true,
             item_count: 0,
             table_count: 0,
             avg_entry_on_disk_bytes,

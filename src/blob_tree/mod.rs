@@ -327,6 +327,15 @@ impl AbstractTree for BlobTree {
             self.index.is_compacting(),
             false,
         )?;
+        // Capacity is disk-aware and driven by the index tree's runtime config;
+        // its footprint basis (`compute_used_bytes`) already stats blob files, so
+        // `used_bytes` here is the blob-inclusive figure capacity is measured
+        // against.
+        let (capacity, available, compaction_possible) =
+            self.index.admission_capacity(stats.used_bytes);
+        stats.capacity_bytes = capacity;
+        stats.available_bytes = available;
+        stats.compaction_possible = compaction_possible;
         // Admission is driven by the index tree's runtime config / footprint;
         // a closed gate is the operator-actionable state (see the standard
         // tree's override for the precedence rationale).

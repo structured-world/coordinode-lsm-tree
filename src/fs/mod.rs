@@ -875,6 +875,75 @@ pub trait Fs: Send + Sync + 'static {
             "hard_link_count is not supported by this backend",
         ))
     }
+
+    /// Best-effort free space, in bytes, on the filesystem backing `path`.
+    ///
+    /// Reports bytes available to an unprivileged process (Unix `statvfs`
+    /// `f_bavail * f_frsize`), which the storage-admission gate uses to defend
+    /// against the *physical* disk filling, alongside any configured byte
+    /// quota. Best-effort by nature: the disk is shared with other processes,
+    /// so the figure is a reservation hint, not a guarantee — the atomic
+    /// single-transaction commit model still prevents corruption if a physical
+    /// `ENOSPC` slips through. Callers should sample it (e.g. at flush /
+    /// compaction boundaries) and cache it, never probe per write.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns `u64::MAX` ("treat as unbounded"), so a backend that cannot
+    /// report free space never drives the tree read-only on a phantom
+    /// disk-pressure signal. Real backends override it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the underlying probe fails on a backend that
+    /// supports it.
+    fn available_space(&self, path: &Path) -> io::Result<u64> {
+        let _ = path;
+        Ok(u64::MAX)
+    }
+}
+
+/// Bytes available to an unprivileged process on the filesystem backing
+/// `path`, via POSIX `statvfs(3)`: `f_bavail * f_frsize`.
+///
+/// `f_bavail` (blocks free to non-root) is used rather than `f_bfree` (total
+/// free, including the root reserve) so the figure matches what a normal write
+/// can actually consume. Shared by the std and `io_uring` (libc) backends; the
+/// raw `io_uring` backend uses a direct `statfs` syscall instead (no libc).
+#[cfg(all(unix, feature = "std"))]
+#[allow(
+    clippy::unnecessary_cast,
+    clippy::cast_lossless,
+    reason = "statvfs field widths vary by platform (e.g. fsblkcnt_t is u32 on \
+              macOS, u64 on Linux); `as u64` is the portable widening that is a \
+              no-op where the field is already u64"
+)]
+pub(crate) fn statvfs_available_space(path: &Path) -> std::io::Result<u64> {
+    use core::mem::MaybeUninit;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains an interior NUL byte",
+        )
+    })?;
+    let mut buf = MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `c` is a valid NUL-terminated C string; on success (rc == 0)
+    // the kernel fully initializes the `statvfs` buffer.
+    #[expect(unsafe_code, reason = "statvfs FFI to read filesystem free space")]
+    let rc = unsafe { libc::statvfs(c.as_ptr(), buf.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: statvfs returned 0, so `buf` is initialized.
+    #[expect(unsafe_code, reason = "read initialized statvfs fields")]
+    let st = unsafe { buf.assume_init() };
+    // Saturate the product so an implausible value can never wrap.
+    let frsize = st.f_frsize as u64;
+    let bavail = st.f_bavail as u64;
+    Ok(bavail.saturating_mul(frsize))
 }
 
 /// Streamed independent copy of `src` to `dst` through `fs`'s own [`Fs::open`].

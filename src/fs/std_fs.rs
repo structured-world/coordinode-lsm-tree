@@ -235,6 +235,16 @@ impl Fs for StdFs {
         })
     }
 
+    #[cfg(unix)]
+    fn available_space(&self, path: &Path) -> io::Result<u64> {
+        super::statvfs_available_space(path).map_err(io::Error::from)
+    }
+
+    #[cfg(windows)]
+    fn available_space(&self, path: &Path) -> io::Result<u64> {
+        available_space_sys::disk_free_available(path).map_err(io::Error::from)
+    }
+
     fn sync_directory(&self, path: &Path) -> io::Result<()> {
         #[cfg(not(target_os = "windows"))]
         {
@@ -1163,6 +1173,66 @@ mod linux_caps {
         } else {
             Err(err)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem free-space probe
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+mod available_space_sys {
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    // GetDiskFreeSpaceExW: free bytes available to the calling user on the
+    // volume containing `path`.
+    //
+    // SAFETY (ABI): the signature matches the Win32 `GetDiskFreeSpaceExW`
+    // contract — a wide directory-name pointer plus three optional `u64` out
+    // pointers, returning a non-zero `BOOL` on success. Edition 2024 requires
+    // foreign declarations in an `unsafe extern` block.
+    #[allow(non_snake_case, reason = "Win32 API signature")]
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lpDirectoryName: *const u16,
+            lpFreeBytesAvailableToCaller: *mut u64,
+            lpTotalNumberOfBytes: *mut u64,
+            lpTotalNumberOfFreeBytes: *mut u64,
+        ) -> i32;
+    }
+
+    pub(super) fn disk_free_available(path: &Path) -> io::Result<u64> {
+        // NUL-terminated wide string of the path. Reject an interior NUL first:
+        // Win32 treats the first NUL as the string terminator, so a path with an
+        // embedded NUL would silently probe a truncated path (a different volume)
+        // and feed admission / storage_stats free space for the wrong filesystem.
+        // Mirrors the unix statvfs helper's `CString::new` rejection.
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path contains an interior NUL byte",
+            ));
+        }
+        wide.push(0);
+        let mut avail: u64 = 0;
+        // SAFETY: `wide` is a valid NUL-terminated UTF-16 string; the three out
+        // pointers are valid for the call; we read `avail` only on success.
+        #[expect(unsafe_code, reason = "GetDiskFreeSpaceExW FFI for free space")]
+        let rc = unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut avail,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            )
+        };
+        if rc == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(avail)
     }
 }
 

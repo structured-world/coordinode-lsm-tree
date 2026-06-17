@@ -650,6 +650,61 @@ pub fn statx_path_raw(path: &core::ffi::CStr) -> Result<Option<RawMetadata>, Err
     }
 }
 
+/// The kernel `struct statfs` for x86-64 / aarch64 Linux. Unlike `statx`, this
+/// struct is architecture-dependent: the field widths below (and the syscall's
+/// expected buffer layout) match the verified x86-64 / aarch64 ABI, so it is
+/// gated to exactly those targets. Other 64-bit Linux architectures (e.g.
+/// s390x) place `f_bavail` / `f_frsize` at different offsets, so reading this
+/// layout there would yield bogus free space; they fall back to the trait
+/// default (`u64::MAX`, no disk-pressure signal). A 32-bit build would likewise
+/// read the kernel's 32-bit `statfs` into the wrong layout. Only `f_frsize` and
+/// `f_bavail` are read.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "field names mirror the kernel `struct statfs` (f_type, f_bsize, …) verbatim"
+)]
+struct Statfs {
+    f_type: i64,
+    f_bsize: i64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [i32; 2],
+    f_namelen: i64,
+    f_frsize: i64,
+    f_flags: i64,
+    f_spare: [i64; 4],
+}
+
+/// `statfs(path, &buf)` — bytes available to an unprivileged process on the
+/// filesystem backing `path`: `f_bavail * f_frsize`. Raw syscall (no libc),
+/// matching this backend's no-libc design. x86-64 / aarch64 only (see
+/// [`Statfs`]).
+///
+/// `f_frsize` (fundamental fragment size), not `f_bsize` (preferred transfer
+/// block size), to match `available_space`'s contract and the `statvfs`-based
+/// std backend (`f_bavail * f_frsize`).
+///
+/// # Errors
+/// Returns an [`Error`] if the `statfs` syscall fails.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub fn statfs_available_raw(path: &core::ffi::CStr) -> Result<u64, Error> {
+    let mut buf = Statfs::default();
+    // SAFETY: `path` is a valid NUL-terminated C string the kernel reads;
+    // `buf` is a valid, writable Statfs the kernel fills on success.
+    unsafe { syscall2(Sysno::statfs, path.as_ptr() as usize, &raw mut buf as usize) }
+        .map_err(|e| err("statfs", e))?;
+    // `f_bavail` counts blocks free to a non-root caller; `f_frsize` is the
+    // fundamental block size. Saturate so an implausible value can never wrap.
+    let frsize = buf.f_frsize as u64;
+    Ok(buf.f_bavail.saturating_mul(frsize))
+}
+
 // SAFETY: `IoUringRaw`'s raw pointers address `mmap` regions it owns for its
 // whole lifetime, and its ring fd is process-global; moving it to another
 // thread is sound because every access is serialized through the `Mutex` that
@@ -1055,6 +1110,16 @@ impl Fs for IoUringRawFs {
             }),
             None => Err(Error::new(ErrorKind::NotFound, "path not found")),
         }
+    }
+
+    // x86-64 / aarch64 only: the raw `statfs` ABI struct is verified for those
+    // layouts. On any other target (a different 64-bit arch like s390x, or a
+    // 32-bit build) this method is absent, so the trait default (u64::MAX = no
+    // disk-pressure signal) applies — correct, since admission must not gate on
+    // a value it cannot read from a matching layout.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn available_space(&self, path: &Path) -> crate::io::Result<u64> {
+        statfs_available_raw(&path_to_cstring(path)?)
     }
 
     fn sync_directory(&self, path: &Path) -> crate::io::Result<()> {
@@ -1740,5 +1805,38 @@ mod tests {
             .write_at(1 << 30, b"x", 0)
             .expect_err("write to a non-open fd must fail");
         assert_eq!(err.kind(), ErrorKind::InvalidInput); // EBADF -> InvalidInput
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn raw_available_space_reports_plausible_free_bytes() {
+        // The raw `statfs` syscall path: the filesystem backing the tempdir must
+        // report a plausible, non-zero free figure below the unbounded sentinel.
+        use crate::fs::Fs;
+        use crate::path::Path;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fs = IoUringRawFs::new(8).expect("fs setup");
+        let free = fs
+            .available_space(Path::new(tmp.path().to_str().expect("utf8 path")))
+            .expect("statfs must succeed on a real filesystem");
+        assert!(
+            free > 0,
+            "a writable tempdir filesystem must report free space"
+        );
+        assert!(
+            free < u64::MAX,
+            "a real probe must not return the unbounded sentinel"
+        );
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn raw_statfs_on_missing_path_errors() {
+        // `statfs` on a path that does not exist surfaces an error, not a silent
+        // zero or the unbounded sentinel — exercising the syscall error branch.
+        let cpath =
+            std::ffi::CString::new("/proc/does-not-exist/iou_raw_statfs").expect("no interior NUL");
+        assert!(statfs_available_raw(&cpath).is_err());
     }
 }

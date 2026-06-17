@@ -210,6 +210,12 @@ impl Fs for IoUringFs {
         })
     }
 
+    fn available_space(&self, path: &Path) -> crate::io::Result<u64> {
+        // Free-space probe is a cold-path stat; delegate to the shared statvfs
+        // helper (this backend is Linux-only, so libc statvfs is available).
+        super::statvfs_available_space(path).map_err(crate::io::Error::from)
+    }
+
     fn sync_directory(&self, path: &Path) -> crate::io::Result<()> {
         let dir = File::open(path)?;
         if !dir.metadata()?.is_dir() {
@@ -1294,6 +1300,27 @@ mod tests {
         assert_eq!(fs.metadata(&p1)?.len, 3);
         assert_eq!(fs2.metadata(&p2)?.len, 3);
 
+        Ok(())
+    }
+
+    #[test]
+    fn available_space_reports_plausible_free_bytes() -> io::Result<()> {
+        // The cold-path free-space probe delegates to the shared statvfs helper:
+        // the filesystem backing the tempdir must report a plausible, non-zero
+        // figure below the unbounded sentinel.
+        let Some(fs) = try_io_uring() else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let free = fs.available_space(dir.path())?;
+        assert!(
+            free > 0,
+            "a writable tempdir filesystem must report free space"
+        );
+        assert!(
+            free < u64::MAX,
+            "a real probe must not return the unbounded sentinel"
+        );
         Ok(())
     }
 }
