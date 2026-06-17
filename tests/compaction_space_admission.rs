@@ -8,9 +8,30 @@
 
 use lsm_tree::fs::MemFs;
 use lsm_tree::{
-    AbstractTree, AnyTree, Config, SequenceNumberCounter, StorageStatus, get_tmp_folder,
+    AbstractTree, AnyTree, Config, KvSeparationOptions, SequenceNumberCounter, StorageStatus,
+    get_tmp_folder,
 };
 use std::sync::Arc;
+
+/// Opens a KV-separated (blob) tree on a `MemFs` capped at `capacity` bytes.
+fn open_capped_blob(path: &std::path::Path, capacity: u64) -> (lsm_tree::BlobTree, MemFs) {
+    let mem = MemFs::with_capacity(capacity);
+    let any = Config::new(
+        path,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(mem.clone()))
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(64),
+    ))
+    .open()
+    .expect("open");
+    match any {
+        AnyTree::Blob(t) => (t, mem),
+        AnyTree::Standard(_) => panic!("expected Blob tree"),
+    }
+}
 
 /// Opens a Standard tree on a `MemFs` capped at `capacity` bytes, returning both
 /// the tree and the backend clone so a test can re-cap the simulated disk.
@@ -159,6 +180,76 @@ fn admission_off_never_gates_compaction() -> lsm_tree::Result<()> {
         tree.table_count(),
         1,
         "with admission off the merge runs regardless of free space"
+    );
+    Ok(())
+}
+
+#[test]
+fn configured_quota_below_footprint_gates_a_merge_on_ample_disk() -> lsm_tree::Result<()> {
+    // A quota set just above the live footprint must gate compaction even when
+    // the physical disk has plenty of room: the merge would grow the tree past
+    // the operator's budget. Exercises the quota-headroom branch of the gate.
+    let folder = get_tmp_folder();
+    // Huge simulated disk → physical free is never the constraint here.
+    let (tree, _mem) = open_capped(folder.path(), 100 * 1024 * 1024 * 1024);
+    let n = 2_000u64;
+    let used = seed_two_generations(&tree, n);
+    let tables_before = tree.table_count();
+    assert!(tables_before >= 2);
+
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        // Quota leaves less headroom than a full merge's input bound needs.
+        c.storage_limit_bytes = Some(used + 64 * 1024);
+    })?;
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+    assert_eq!(
+        tree.table_count(),
+        tables_before,
+        "a merge exceeding the quota headroom must be gated even with ample disk"
+    );
+    Ok(())
+}
+
+#[test]
+fn blob_tree_compaction_space_gate_and_status() -> lsm_tree::Result<()> {
+    // Drives the KV-separation branch of the gate (blob-file relocation budget)
+    // and the blob-tree FullCompactionAvailable status.
+    let folder = get_tmp_folder();
+    let (tree, mem) = open_capped_blob(folder.path(), u64::MAX);
+    let n = 1_000u64;
+    let value = vec![0xABu8; 256]; // > separation threshold → blob files
+    for i in 0..n {
+        tree.insert(format!("key{i:08}").as_bytes(), &value, i);
+    }
+    tree.flush_active_memtable(0)?;
+    for i in 0..n {
+        tree.insert(format!("key{i:08}").as_bytes(), &value, n + i);
+    }
+    tree.flush_active_memtable(0)?;
+    let used = tree.storage_stats()?.used_bytes;
+
+    // Ample room: status reports full-compaction availability. Runtime config
+    // lives on the blob tree's index tree.
+    mem.set_capacity(used + 512 * 1024 * 1024);
+    tree.index.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+    })?;
+    assert_eq!(
+        tree.storage_stats()?.status,
+        StorageStatus::FullCompactionAvailable
+    );
+
+    // Near-full: the blob-aware gate keeps the tree consistent — every key still
+    // resolves through its blob file after a gated compaction.
+    mem.set_capacity(used + 64 * 1024);
+    tree.index.update_runtime_config(|_c| {})?;
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+    assert_eq!(
+        tree.get(b"key00000000".as_slice(), u64::MAX)?.as_deref(),
+        Some(value.as_slice()),
+        "blob-backed value still resolves after a gated compaction"
     );
     Ok(())
 }
