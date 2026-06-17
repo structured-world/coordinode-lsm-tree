@@ -212,6 +212,57 @@ fn configured_quota_below_footprint_gates_a_merge_on_ample_disk() -> lsm_tree::R
 }
 
 #[test]
+fn blob_tree_full_status_accounts_for_blob_relocation_footprint() -> lsm_tree::Result<()> {
+    // Regression: a blob tree's full-compaction figure must include the physical
+    // blob-file footprint, not just the largest SST level. With incompressible
+    // blobs dominating the footprint and the index SSTs tiny, free space that
+    // clears the SST level but not the blobs must report TightCompactionAvailable
+    // (the gate would skip a full merge for lack of blob room), not Full.
+    let folder = get_tmp_folder();
+    let (tree, mem) = open_capped_blob(folder.path(), u64::MAX);
+    // ~8 MiB of incompressible blob payload so the footprint comfortably exceeds
+    // the ~1 MiB reserved floor — leaving a band where free space is above the
+    // floor (not read-only) yet below SST + blobs (not a full compaction).
+    let n = 8_000u64;
+    for i in 0..n {
+        // High-entropy value (xorshift) so blobs do not compress away.
+        let mut s = (i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let value: Vec<u8> = (0..1024u32)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 24) as u8
+            })
+            .collect();
+        tree.insert(format!("key{i:08}").as_bytes(), &value, i);
+    }
+    tree.flush_active_memtable(0)?;
+
+    let used = tree.storage_stats()?.used_bytes;
+    let index_sst = tree.index.disk_space(); // SST-only footprint (tiny: pointers)
+    let blob_portion = used - index_sst;
+    assert!(
+        blob_portion > 4 * 1024 * 1024,
+        "blobs must dominate and exceed the reserved floor (blob {blob_portion}, index {index_sst})"
+    );
+
+    // Free space (3 MiB) is above the reserved floor — so not read-only — but
+    // well below SST + blobs, so a full compaction does not fit.
+    mem.set_capacity(used + 3 * 1024 * 1024);
+    tree.index.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+    })?;
+    assert_eq!(
+        tree.storage_stats()?.status,
+        StorageStatus::TightCompactionAvailable,
+        "blob footprint must be folded into the full-compaction threshold"
+    );
+    Ok(())
+}
+
+#[test]
 fn blob_tree_compaction_space_gate_and_status() -> lsm_tree::Result<()> {
     // Drives the KV-separation branch of the gate (blob-file relocation budget)
     // and the blob-tree FullCompactionAvailable status.
