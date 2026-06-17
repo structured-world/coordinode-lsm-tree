@@ -61,13 +61,16 @@ pub struct MemFs {
     /// constructed `MemFs::new()` values get DIFFERENT IDs because they
     /// have disjoint file trees.
     namespace_id: u64,
-    /// Simulated free space reported by [`Fs::available_space`]. Shared across
-    /// clones (same backend) so a test can drive the tree near-full. Defaults
-    /// to `u64::MAX` ("unbounded"); set via [`MemFs::set_available_space`].
+    /// Total simulated disk capacity in bytes. `u64::MAX` (default) means
+    /// "unbounded": [`Fs::available_space`] then reports `u64::MAX` (no disk
+    /// pressure). When set to a finite value via [`MemFs::with_capacity`] /
+    /// [`MemFs::set_capacity`], `available_space` reports `capacity − bytes
+    /// stored`, so the simulated disk fills as data is written and reaches zero
+    /// when full — a real capped disk. Shared across clones (same backend).
     ///
     /// `portable_atomic::AtomicU64` (not `core`'s): native 64-bit atomics are
     /// absent on some `no_std` targets (e.g. thumbv7em).
-    available_space: Arc<portable_atomic::AtomicU64>,
+    capacity: Arc<portable_atomic::AtomicU64>,
 }
 
 #[derive(Debug, Default)]
@@ -86,16 +89,39 @@ impl MemFs {
         Self {
             state: Arc::new(RwLock::new(state)),
             namespace_id: next_mem_fs_namespace_id(),
-            available_space: Arc::new(portable_atomic::AtomicU64::new(u64::MAX)),
+            capacity: Arc::new(portable_atomic::AtomicU64::new(u64::MAX)),
         }
     }
 
-    /// Sets the free space [`Fs::available_space`] reports (shared across
-    /// clones of this `MemFs`). Lets a test simulate a near-full disk to
-    /// exercise the storage-admission disk-pressure path.
-    pub fn set_available_space(&self, bytes: u64) {
-        self.available_space
-            .store(bytes, portable_atomic::Ordering::Relaxed);
+    /// Creates an empty in-memory filesystem with a fixed total capacity in
+    /// bytes — a simulated capped disk. [`Fs::available_space`] reports
+    /// `capacity − bytes stored`, so the disk fills as data is written and the
+    /// storage-admission gate drives the tree read-only when it is full,
+    /// without any manual free-space poking. `u64::MAX` means unbounded (same
+    /// as [`MemFs::new`]).
+    #[must_use]
+    pub fn with_capacity(capacity_bytes: u64) -> Self {
+        let fs = Self::new();
+        fs.set_capacity(capacity_bytes);
+        fs
+    }
+
+    /// Sets the simulated total disk capacity (shared across clones). See
+    /// [`MemFs::with_capacity`]. `u64::MAX` restores unbounded behaviour.
+    pub fn set_capacity(&self, capacity_bytes: u64) {
+        self.capacity
+            .store(capacity_bytes, portable_atomic::Ordering::Relaxed);
+    }
+
+    /// Total bytes currently stored across all files (the simulated disk
+    /// usage). Sums every file's length under the state read lock.
+    fn stored_bytes(&self) -> u64 {
+        let state = self.state.read();
+        state
+            .files
+            .values()
+            .map(|data| data.lock().len() as u64)
+            .fold(0u64, u64::saturating_add)
     }
 }
 
@@ -727,9 +753,15 @@ impl Fs for MemFs {
     }
 
     fn available_space(&self, _path: &Path) -> io::Result<u64> {
-        Ok(self
-            .available_space
-            .load(portable_atomic::Ordering::Relaxed))
+        let capacity = self.capacity.load(portable_atomic::Ordering::Relaxed);
+        // Unbounded → no disk pressure. Otherwise the simulated free space is
+        // capacity minus what is currently stored (saturating: an over-capacity
+        // state reports zero free, never wraps).
+        if capacity == u64::MAX {
+            Ok(u64::MAX)
+        } else {
+            Ok(capacity.saturating_sub(self.stored_bytes()))
+        }
     }
 
     fn sync_directory(&self, path: &Path) -> io::Result<()> {

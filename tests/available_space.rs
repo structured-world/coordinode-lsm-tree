@@ -44,19 +44,38 @@ fn mem_fs_defaults_to_unbounded() {
 }
 
 #[test]
-fn mem_fs_reports_configured_capacity_shared_across_clones() {
-    // set_available_space simulates a near-full disk; the value is shared with
-    // clones (same backend) so a tree holding a clone sees it.
-    let fs = MemFs::new();
-    fs.set_available_space(4096);
+fn mem_fs_capacity_minus_stored_shared_across_clones() {
+    use lsm_tree::fs::{Fs, FsOpenOptions};
+    use std::io::Write;
+
+    // A capped MemFs reports capacity − bytes stored: an empty 4 KiB disk has
+    // 4 KiB free.
+    let fs = MemFs::with_capacity(4096);
     assert_eq!(fs.available_space(std::path::Path::new("/")).unwrap(), 4096);
 
+    // Writing consumes the simulated disk; free space shrinks by what is stored.
+    {
+        let mut f = fs
+            .open(
+                std::path::Path::new("/f"),
+                &FsOpenOptions::new().write(true).create(true),
+            )
+            .expect("open");
+        f.write_all(&[0u8; 1000]).expect("write");
+        f.sync_all().expect("sync");
+    }
+    assert_eq!(
+        fs.available_space(std::path::Path::new("/")).unwrap(),
+        4096 - 1000
+    );
+
+    // Capacity (and the stored bytes) are shared with clones (same backend).
     let clone = fs.clone();
     assert_eq!(
         clone.available_space(std::path::Path::new("/")).unwrap(),
-        4096
+        4096 - 1000
     );
-    // A write through one handle's setter is observed through the other.
-    clone.set_available_space(0);
+    // Lowering capacity below what is stored saturates to zero free.
+    clone.set_capacity(500);
     assert_eq!(fs.available_space(std::path::Path::new("/")).unwrap(), 0);
 }

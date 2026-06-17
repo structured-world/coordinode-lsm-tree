@@ -327,6 +327,12 @@ impl AbstractTree for Tree {
             self.is_compacting(),
             true,
         )?;
+        // Fill the disk-aware capacity figures (quota + free-space probe) the
+        // version-only computation can't know.
+        let (capacity, available, compaction_possible) = self.admission_capacity(stats.used_bytes);
+        stats.capacity_bytes = capacity;
+        stats.available_bytes = available;
+        stats.compaction_possible = compaction_possible;
         // A closed admission gate is the operator-actionable state, so it takes
         // precedence over CompactionInProgress (a read-only tree may well be
         // compacting to reclaim space).
@@ -2318,6 +2324,35 @@ impl Tree {
             }
         }
         free
+    }
+
+    /// Disk-aware capacity figures for [`AbstractTree::storage_stats`], given the
+    /// live footprint `used`: `(capacity, available, compaction_possible)`.
+    ///
+    /// `capacity` is the tighter of the configured quota and the physical disk
+    /// headroom (`free + used`) — the same effective limit
+    /// [`Self::compute_write_admission`] gates against — reported regardless of
+    /// whether the admission gate is enabled (introspection is always available).
+    /// `None` capacity/available means unbounded (no quota AND the backend
+    /// cannot report free space). `compaction_possible` is `true` when unbounded
+    /// or when at least [`MIN_RESERVED_HEADROOM`] of working room remains.
+    pub(crate) fn admission_capacity(&self, used: u64) -> (Option<u64>, Option<u64>, bool) {
+        let quota = self
+            .0
+            .runtime_config
+            .load()
+            .storage_limit_bytes
+            .unwrap_or(u64::MAX);
+        let capacity = quota.min(self.probe_disk_free().saturating_add(used));
+        if capacity == u64::MAX {
+            return (None, None, true);
+        }
+        let available = capacity.saturating_sub(used);
+        (
+            Some(capacity),
+            Some(available),
+            available >= MIN_RESERVED_HEADROOM,
+        )
     }
 
     #[expect(

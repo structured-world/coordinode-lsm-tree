@@ -31,6 +31,25 @@ fn open_tree_on_memfs(path: &std::path::Path) -> (lsm_tree::Tree, MemFs) {
     }
 }
 
+/// Opens a Standard tree on a `MemFs` capped at `capacity` bytes, modelling a
+/// fixed-size in-memory disk that fills as data is flushed. Returns both the
+/// tree and the backend clone.
+fn open_tree_on_capped_memfs(path: &std::path::Path, capacity: u64) -> (lsm_tree::Tree, MemFs) {
+    let mem = MemFs::with_capacity(capacity);
+    let any = Config::new(
+        path,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(mem.clone()))
+    .open()
+    .expect("open");
+    match any {
+        AnyTree::Standard(t) => (t, mem),
+        AnyTree::Blob(_) => panic!("expected Standard tree"),
+    }
+}
+
 fn open_tree(path: &std::path::Path) -> lsm_tree::Tree {
     let any = Config::new(
         path,
@@ -397,10 +416,12 @@ fn disk_free_drives_read_only_without_a_configured_quota() -> lsm_tree::Result<(
     // MemFs defaults to u64::MAX free → no disk pressure → admits.
     assert!(!tree.is_read_only(), "ample free space must admit");
 
-    // Simulate a near-full disk. The cached probe still holds the old free
-    // value (sampled at the last version), so force a re-probe the way an
-    // operator action would: update_runtime_config clears the cache.
-    mem.set_available_space(0);
+    // Simulate a full disk by capping the MemFs capacity at zero: with any
+    // bytes already stored, capacity − stored saturates to zero free. The
+    // cached probe still holds the old free value (sampled at the last
+    // version), so force a re-probe the way an operator action would:
+    // update_runtime_config clears the cache.
+    mem.set_capacity(0);
     tree.update_runtime_config(|_c| {})?;
 
     assert!(
@@ -410,6 +431,125 @@ fn disk_free_drives_read_only_without_a_configured_quota() -> lsm_tree::Result<(
     match tree.try_insert(b"k".as_slice(), b"v".as_slice(), 1000) {
         Err(Error::StorageFull { .. }) => {}
         other => panic!("expected StorageFull, got {other:?}"),
+    }
+    assert_eq!(
+        tree.storage_stats()?.status,
+        StorageStatus::ReadOnlyOutOfSpace
+    );
+    Ok(())
+}
+
+#[test]
+fn storage_stats_exposes_used_capacity_available_and_compaction_flag() -> lsm_tree::Result<()> {
+    // The introspection UX: one storage_stats() call answers "X bytes used of Y
+    // total, Z available" plus whether a compaction can still run. The three
+    // byte figures satisfy used + available == capacity by construction.
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path());
+    let seeded = seed(&tree);
+
+    // A generous quota is the tighter bound vs the real tempdir's free space, so
+    // capacity is deterministic; ample room means compaction is possible.
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = Some(seeded + 100 * 1024 * 1024);
+    })?;
+    let s = tree.storage_stats()?;
+    let capacity = s
+        .capacity_bytes
+        .expect("a configured quota sets a finite capacity");
+    let available = s
+        .available_bytes
+        .expect("a finite capacity yields a finite available figure");
+    assert_eq!(
+        s.used_bytes.saturating_add(available),
+        capacity,
+        "used + available must equal capacity"
+    );
+    assert!(
+        s.used_bytes < capacity,
+        "used must be below a generous capacity"
+    );
+    assert!(
+        s.compaction_possible,
+        "ample free space must allow compaction"
+    );
+
+    // Tighten the quota to just above the live footprint: introspection still
+    // reports the figures, but there is no room left for a compaction to write
+    // its merged output.
+    tree.update_runtime_config(|c| {
+        c.storage_limit_bytes = Some(s.used_bytes + 1024);
+    })?;
+    let tight = tree.storage_stats()?;
+    let tight_avail = tight.available_bytes.expect("finite capacity");
+    assert!(
+        tight_avail < 1024 * 1024,
+        "a near-full quota must leave less than the reserved compaction floor"
+    );
+    assert!(
+        !tight.compaction_possible,
+        "no working room must report compaction as not possible"
+    );
+    Ok(())
+}
+
+#[test]
+fn storage_stats_reports_unbounded_capacity_without_quota_or_probe() -> lsm_tree::Result<()> {
+    // With no quota and a backend that cannot report free space (default MemFs),
+    // capacity is genuinely unbounded: the figures are None and compaction is
+    // always possible. Honest absence beats a fabricated number.
+    let folder = get_tmp_folder();
+    let (tree, _mem) = open_tree_on_memfs(folder.path());
+    seed(&tree);
+    let s = tree.storage_stats()?;
+    assert_eq!(
+        s.capacity_bytes, None,
+        "unbounded capacity is reported as None"
+    );
+    assert_eq!(s.available_bytes, None);
+    assert!(s.compaction_possible);
+    Ok(())
+}
+
+#[test]
+fn capped_memfs_fills_naturally_and_drives_read_only() -> lsm_tree::Result<()> {
+    // The unified capacity UX: a fixed-size disk (here an in-memory one) fills
+    // as data is flushed, and admission flips to read-only once the remaining
+    // free space can no longer cover the reserved headroom, with no operator
+    // action and no configured quota. A 3 MiB disk against the >=1 MiB reserved
+    // floor crosses that threshold after a handful of flushed SST files.
+    let folder = get_tmp_folder();
+    let (tree, _mem) = open_tree_on_capped_memfs(folder.path(), 3 * 1024 * 1024);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+    })?;
+
+    // Each flush is a version transition that re-probes the simulated disk, so
+    // the falling free space is observed without clearing the cache manually.
+    let value = vec![0xABu8; 4096];
+    let mut seqno = 0u64;
+    let mut became_read_only = false;
+    for _ in 0..64 {
+        for _ in 0..100 {
+            tree.insert(format!("key{seqno:08}").as_bytes(), &value, seqno);
+            seqno += 1;
+        }
+        tree.flush_active_memtable(0)?;
+        if tree.is_read_only() {
+            became_read_only = true;
+            break;
+        }
+    }
+
+    assert!(
+        became_read_only,
+        "a capped in-memory disk must fill and flip to read-only as data is flushed"
+    );
+    match tree.try_insert(b"k".as_slice(), b"v".as_slice(), seqno) {
+        Err(Error::StorageFull { .. }) => {}
+        other => panic!("expected StorageFull on a full capped disk, got {other:?}"),
     }
     assert_eq!(
         tree.storage_stats()?.status,
