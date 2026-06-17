@@ -2493,19 +2493,20 @@ mod tests {
         // mount. The SST and blob budgets must combine, so 60 + 60 = 120 MiB > 100
         // MiB free is rejected even though each fits alone — the routed
         // over-admission guard.
-        let shared = MemFs::with_capacity(100 * MIB);
+        // ONE `Arc<MemFs>` reused for both config slots so the primary and the
+        // route are unambiguously the same backend (one volume id / one
+        // free-space pool), the not-proven-independent case.
+        let shared: Arc<dyn crate::fs::Fs> = Arc::new(MemFs::with_capacity(100 * MIB));
         let routed_same_mount = Config::new(
             &dir,
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
-        .with_shared_fs(Arc::new(shared.clone()))
+        .with_shared_fs(Arc::clone(&shared))
         .level_routes(vec![crate::config::LevelRoute {
             levels: 6..7,
             path: crate::path::PathBuf::from("/same-mount-subdir"),
-            // Same backend instance as the primary → same volume id (one shared
-            // free-space pool), the not-proven-independent case.
-            fs: Arc::new(shared),
+            fs: Arc::clone(&shared),
         }]);
         assert!(
             !super::space_fits_two_layer(&routed_same_mount, u64::MAX, 60 * MIB, 6, 60 * MIB),
