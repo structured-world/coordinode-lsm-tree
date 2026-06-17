@@ -336,6 +336,18 @@ impl AbstractTree for BlobTree {
         stats.capacity_bytes = capacity;
         stats.available_bytes = available;
         stats.compaction_possible = compaction_possible;
+        // A full compaction of a blob tree may also relocate stale blob files,
+        // which the merge gate counts against the budget. Fold the physical
+        // blob-file footprint into the full-compaction figure (a conservative
+        // upper bound: a single compaction relocates at most the stale subset),
+        // so the status does not report full availability while the gate would
+        // skip the merge for lack of blob room.
+        let version = self.current_version();
+        let mut blob_bytes = 0u64;
+        for blob in version.blob_files.iter() {
+            blob_bytes += blob.physical_size()?;
+        }
+        stats.full_compaction_bytes += blob_bytes;
         // Surface full-vs-tight compaction availability when gating is active and
         // no compaction is running (see the standard tree's override).
         if self.index.storage_admission_enabled()

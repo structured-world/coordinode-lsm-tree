@@ -289,10 +289,16 @@ fn space_gate_for_merge(
     // volume.
     let (blob_sigma, blob_free) = match &opts.config.kv_separation_opts {
         Some(blob_opts) => {
+            // Sum the PHYSICAL size of each blob file selected for relocation
+            // (framing + meta + trailer, not just the compressed payload), a
+            // conservative upper bound on the rewritten output. A stat failure
+            // falls back to 0 for that file — the merge would surface the real
+            // error, and the atomic-commit guarantee keeps a slipped-through
+            // ENOSPC consistent.
             let bytes: u64 = pick_blob_files_to_rewrite(&payload.table_ids, version, blob_opts)
                 .unwrap_or_default()
                 .iter()
-                .map(BlobFile::on_disk_bytes)
+                .map(|bf| bf.physical_size().unwrap_or(0))
                 .sum();
             let folder = opts.config.path.join(BLOBS_FOLDER);
             (
