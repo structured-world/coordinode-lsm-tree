@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781635437879,
+  "lastUpdate": 1781678263322,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -17316,6 +17316,84 @@ window.BENCHMARK_DATA = {
             "value": 702693.8432526774,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 5.6us | P99.9: 9.3us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "df40494e001f7326c1d6021e31f3ba7f87531c09",
+          "message": "feat(storage): opt-in write admission control (#490)\n\n## Summary\n\nAdds an opt-in storage admission gate so a tree can decline writes and\nreport read-only when over budget, resuming automatically when space is\nfreed. **Additive only** — existing infallible `insert`/`merge`/`remove`\nare unchanged, so this is not a breaking change.\n\n## Design\n\nA **computed pre-check gate**, not per-operation plumbing:\n\n- `RuntimeConfig.storage_admission_check: bool` (opt-in, default `false`\n→ zero overhead, behaviour unchanged) + `storage_limit_bytes:\nOption<u64>` (live-toggleable soft budget).\n- `AbstractTree::write_admission() -> Result<(), Error>` and\n`is_read_only() -> bool`: a cheap computed predicate over in-memory size\naccounting (`disk_space()` + active-memtable size, no syscall). Not\nlatched — raising the budget, a compaction reclaiming space, or\n(follow-up) freeing disk clears read-only on the next check with no\nrestart.\n- `try_insert` / `try_merge` / `try_remove`: admission-gated write entry\npoints returning `Error::StorageFull { used, limit }` when the gate is\nclosed. The caller consults the gate (per-batch or per-write, both\ncheap) before writing. Bare `insert`/`merge`/`remove` stay infallible\nfor callers that do not opt in.\n- **Reserved headroom** (active memtable + ~12.5% overhead, 1 MiB floor)\nkeeps the soft budget from becoming a hard wall: internal flush /\ncompaction are never gated, so the engine can always drain the memtable\nand run a space-reclaiming compaction even at the limit.\n- `StorageStatus::ReadOnlyOutOfSpace` is surfaced from the same\npredicate (takes precedence over `CompactionInProgress`, the\noperator-actionable state).\n\n### AC interpretation\n\nThe issue's AC #1 (“the next user write returns `Error::StorageFull`”)\nis realised as the **gated** write returning it: `try_insert` / a\ncaller-side `write_admission()?` pre-check. This keeps the ubiquitous\ninfallible `insert` (≈2000 in-crate call sites) untouched while giving\nthe production write path a clear error. The consumer adopts the gated\npath in a follow-up in its own repo.\n\n## Testing\n\n`tests/storage_admission.rs`:\n- admission off by default admits every write;\n- budget below usage → `try_insert` returns `StorageFull`,\n`is_read_only()` true, status `ReadOnlyOutOfSpace`, tree stays\nconsistent + reopenable;\n- raising the budget clears read-only with no restart (auto-resume);\n- flush + bare insert never gated at the limit (reserved-headroom\nguarantee).\n\n1835 (default) + 2132 (all-features) tests pass; clippy `--all-features\n--all-targets` clean; doctests pass.\n\nPart of #482. Closes #484.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added opt-in storage admission control to `RuntimeConfig`\n(`storage_admission_check`, `storage_limit_bytes`).\n* Introduced `Error::StorageFull { used, limit }` when the gate rejects\nwrites due to budget.\n* Added admission-gated write helpers (`try_insert`, `try_merge`,\n`try_remove`, `try_remove_weak`, `try_remove_range`); `BlobTree`\naccounts for total blob payload size.\n* **Bug Fixes**\n* Storage stats now report read-only out-of-space when the storage gate\ndenies writes.\n* **Tests**\n* Added end-to-end coverage for both `Tree` and `BlobTree`, including\nbudget changes, caching/refresh behavior, headroom, and ensuring ungated\ninserts/flushes still succeed.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-17T09:36:38+03:00",
+          "tree_id": "12b9a82680ed9316e44c6e556a00f8f68de299d2",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/df40494e001f7326c1d6021e31f3ba7f87531c09"
+        },
+        "date": 1781678247059,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2115563.9053572025,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1247768.6231697395,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 925087.5353673107,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 4.1us | P99.9: 6.6us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3743051.2125764126,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 468686.352393345,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.1us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 241632.97789484734,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 4.7us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.83s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1274808.9615908472,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1101751.0564732195,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.5us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 724947.1758178502,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.5us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
         ]
       }
