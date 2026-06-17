@@ -910,7 +910,7 @@ pub trait Fs: Send + Sync + 'static {
 /// free, including the root reserve) so the figure matches what a normal write
 /// can actually consume. Shared by the std and `io_uring` (libc) backends; the
 /// raw `io_uring` backend uses a direct `statfs` syscall instead (no libc).
-#[cfg(unix)]
+#[cfg(all(unix, feature = "std"))]
 #[allow(
     clippy::unnecessary_cast,
     clippy::cast_lossless,

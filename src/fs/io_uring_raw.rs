@@ -651,9 +651,12 @@ pub fn statx_path_raw(path: &core::ffi::CStr) -> Result<Option<RawMetadata>, Err
 }
 
 /// The kernel `struct statfs` for 64-bit Linux (x86-64 / aarch64). Unlike
-/// `statx`, this struct is architecture-dependent; this backend is gated to
-/// 64-bit Linux, where the layout below is stable. Only `f_bsize` and
+/// `statx`, this struct is architecture-dependent: the field widths below (and
+/// the syscall's expected buffer layout) are the 64-bit ABI, so it is gated to
+/// `target_pointer_width = "64"`. A 32-bit build (e.g. `i686`) would read the
+/// kernel's 32-bit `statfs` into the wrong layout. Only `f_frsize` and
 /// `f_bavail` are read.
+#[cfg(target_pointer_width = "64")]
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
 #[allow(
@@ -676,21 +679,26 @@ struct Statfs {
 }
 
 /// `statfs(path, &buf)` — bytes available to an unprivileged process on the
-/// filesystem backing `path`: `f_bavail * f_bsize`. Raw syscall (no libc),
-/// matching this backend's no-libc design.
+/// filesystem backing `path`: `f_bavail * f_frsize`. Raw syscall (no libc),
+/// matching this backend's no-libc design. 64-bit-only (see [`Statfs`]).
+///
+/// `f_frsize` (fundamental fragment size), not `f_bsize` (preferred transfer
+/// block size), to match `available_space`'s contract and the `statvfs`-based
+/// std backend (`f_bavail * f_frsize`).
 ///
 /// # Errors
 /// Returns an [`Error`] if the `statfs` syscall fails.
+#[cfg(target_pointer_width = "64")]
 pub fn statfs_available_raw(path: &core::ffi::CStr) -> Result<u64, Error> {
     let mut buf = Statfs::default();
     // SAFETY: `path` is a valid NUL-terminated C string the kernel reads;
     // `buf` is a valid, writable Statfs the kernel fills on success.
     unsafe { syscall2(Sysno::statfs, path.as_ptr() as usize, &raw mut buf as usize) }
         .map_err(|e| err("statfs", e))?;
-    // `f_bavail` counts blocks free to a non-root caller; `f_bsize` is the
-    // block size. Saturate so an implausible value can never wrap.
-    let bsize = buf.f_bsize as u64;
-    Ok(buf.f_bavail.saturating_mul(bsize))
+    // `f_bavail` counts blocks free to a non-root caller; `f_frsize` is the
+    // fundamental block size. Saturate so an implausible value can never wrap.
+    let frsize = buf.f_frsize as u64;
+    Ok(buf.f_bavail.saturating_mul(frsize))
 }
 
 // SAFETY: `IoUringRaw`'s raw pointers address `mmap` regions it owns for its
@@ -1100,6 +1108,11 @@ impl Fs for IoUringRawFs {
         }
     }
 
+    // 64-bit only: the raw `statfs` ABI struct is gated to 64-bit targets. On a
+    // 32-bit build this method is absent, so the trait default (u64::MAX = no
+    // disk-pressure signal) applies — correct, since admission must not gate on
+    // a value it cannot read.
+    #[cfg(target_pointer_width = "64")]
     fn available_space(&self, path: &Path) -> crate::io::Result<u64> {
         statfs_available_raw(&path_to_cstring(path)?)
     }

@@ -1188,8 +1188,13 @@ mod available_space_sys {
 
     // GetDiskFreeSpaceExW: free bytes available to the calling user on the
     // volume containing `path`.
-    #[expect(non_snake_case, reason = "Win32 API signature")]
-    extern "system" {
+    //
+    // SAFETY (ABI): the signature matches the Win32 `GetDiskFreeSpaceExW`
+    // contract — a wide directory-name pointer plus three optional `u64` out
+    // pointers, returning a non-zero `BOOL` on success. Edition 2024 requires
+    // foreign declarations in an `unsafe extern` block.
+    #[allow(non_snake_case, reason = "Win32 API signature")]
+    unsafe extern "system" {
         fn GetDiskFreeSpaceExW(
             lpDirectoryName: *const u16,
             lpFreeBytesAvailableToCaller: *mut u64,

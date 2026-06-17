@@ -47,6 +47,12 @@ use crate::metrics::Metrics;
 /// space-reclaiming compaction have somewhere to land. 1 MiB.
 const MIN_RESERVED_HEADROOM: u64 = 1024 * 1024;
 
+/// How long a cached disk-free sample stays valid before the admission gate
+/// re-probes. Bounds how stale the physical free-space figure can be when the
+/// filesystem fills from another process between flushes, without issuing a
+/// `statfs`/`statvfs` syscall on every gated write. 1 second.
+const ADMISSION_DISK_FREE_TTL: core::time::Duration = core::time::Duration::from_secs(1);
+
 /// Iterator value guard
 pub struct Guard(crate::Result<(UserKey, UserValue)>);
 
@@ -2290,7 +2296,31 @@ impl Tree {
     /// Cheap: reads in-memory size accounting only (no syscall). Returns
     /// `Ok(())` unless admission control is enabled AND a budget is set AND the
     /// live footprint plus reserved headroom exceeds it.
-    #[allow(
+    /// Best-effort minimum free space across every filesystem this tree writes
+    /// to: the primary data path AND each per-level route (`Config::level_routes`
+    /// can place cold-level SSTs on separate volumes). The admission gate must
+    /// reflect the tightest volume, since a full routed disk fails compaction /
+    /// flush targeting it even while the primary still has room.
+    ///
+    /// A backend that cannot report free space (or an I/O hiccup) yields
+    /// `u64::MAX` = "no disk pressure", so a probe failure never falsely drives
+    /// the tree read-only.
+    fn probe_disk_free(&self) -> u64 {
+        let mut free = self
+            .0
+            .config
+            .fs
+            .available_space(&self.0.config.path)
+            .unwrap_or(u64::MAX);
+        if let Some(routes) = &self.0.config.level_routes {
+            for route in routes {
+                free = free.min(route.fs.available_space(&route.path).unwrap_or(u64::MAX));
+            }
+        }
+        free
+    }
+
+    #[expect(
         clippy::significant_drop_tightening,
         reason = "the admission cache lock intentionally spans the recompute \
                   (stat + disk-free probe) so concurrent admission checks \
@@ -2316,30 +2346,36 @@ impl Tree {
         // NOT `disk_space()` (metadata Level::size, which omits blob files and
         // undercounts the physical file by the meta block / footer).
         //
-        // Cached per version so gated writes don't re-stat every live file or
-        // re-probe disk on every call: the file set only changes when a new
-        // version is installed (flush / compaction), which is also the natural
-        // disk-free sampling boundary. A full stat + one `available_space`
-        // syscall run once per version; every later check in that version reads
-        // the cache. The `(version_id, used_bytes, disk_free)` triple lives
-        // behind one mutex so the stamp and values are always a coherent unit
-        // (see `TreeInner::admission_used_cache`).
+        // Cached so gated writes don't re-stat every live file or re-probe disk
+        // on every call. `used_bytes` only changes when a new version is
+        // installed (flush / compaction), so it is recomputed on a version
+        // change. `disk_free` can change under us (another process writing the
+        // same filesystem), so it is ALSO re-probed once its sample is older
+        // than `ADMISSION_DISK_FREE_TTL` — bounding staleness without a syscall
+        // per write. `update_runtime_config` resets the entry for an immediate
+        // re-probe. The values live behind one mutex as a coherent unit (see
+        // `TreeInner::admission_used_cache`).
+        let now = crate::time::Instant::now();
         let (used, disk_free) = {
             let mut cache = self.0.admission_used_cache.lock();
             match *cache {
-                Some((cached_vid, used, free)) if cached_vid == vid => (used, free),
+                // Fresh: same version AND disk sample within the TTL.
+                Some((cvid, used, free, at))
+                    if cvid == vid && at.elapsed() < ADMISSION_DISK_FREE_TTL =>
+                {
+                    (used, free)
+                }
+                // Same version, stale disk sample: keep `used`, re-probe disk.
+                Some((cvid, used, _, _)) if cvid == vid => {
+                    let free = self.probe_disk_free();
+                    *cache = Some((vid, used, free, now));
+                    (used, free)
+                }
+                // New version (or unset): recompute footprint and re-probe disk.
                 _ => {
                     let used = crate::storage_stats::compute_used_bytes(&super_version.version)?;
-                    // Best-effort disk-free probe: a backend that cannot report
-                    // it (or an I/O hiccup) yields u64::MAX = "no disk pressure",
-                    // so a probe failure never falsely drives the tree read-only.
-                    let free = self
-                        .0
-                        .config
-                        .fs
-                        .available_space(&self.0.config.path)
-                        .unwrap_or(u64::MAX);
-                    *cache = Some((vid, used, free));
+                    let free = self.probe_disk_free();
+                    *cache = Some((vid, used, free, now));
                     (used, free)
                 }
             }

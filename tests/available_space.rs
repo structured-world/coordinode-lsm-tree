@@ -25,9 +25,11 @@ fn std_fs_reports_plausible_free_space() {
 #[test]
 fn std_fs_available_space_nonexistent_path_errors() {
     // statvfs on a path that does not exist must surface an error, not a
-    // silent zero or the unbounded sentinel.
-    let missing = std::path::Path::new("/nonexistent-coordinode-lsm-probe-path-xyz");
-    assert!(StdFs.available_space(missing).is_err());
+    // silent zero or the unbounded sentinel. Own the precondition: a child
+    // of a fresh tempdir that we deliberately never create.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("definitely-absent-child");
+    assert!(StdFs.available_space(&missing).is_err());
 }
 
 #[test]

@@ -185,10 +185,13 @@ pub struct TreeInner {
     /// every `u64` is a valid id); also reset on `update_runtime_config` to
     /// force a fresh disk-free probe when an operator changes the budget.
     ///
-    /// `disk_free` is sampled at the same point `used_bytes` is computed (a new
-    /// version = a flush / compaction boundary), so the free-space probe is a
-    /// syscall per version transition, never per write.
-    pub(crate) admission_used_cache: Mutex<Option<(u64, u64, u64)>>,
+    /// `used_bytes` is recomputed only on a version change (it is version-
+    /// stable); `disk_free` is also re-probed when the sample's age exceeds a
+    /// short TTL, so a disk filled by another process between flushes is seen
+    /// within that window — without a `statfs`/`statvfs` syscall per write. The
+    /// trailing `Instant` is the sample time; `update_runtime_config` resets the
+    /// whole entry to `None` for an immediate re-probe.
+    pub(crate) admission_used_cache: Mutex<Option<(u64, u64, u64, crate::time::Instant)>>,
 
     #[doc(hidden)]
     #[cfg(feature = "metrics")]
