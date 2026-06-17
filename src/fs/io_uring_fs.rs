@@ -210,6 +210,12 @@ impl Fs for IoUringFs {
         })
     }
 
+    fn available_space(&self, path: &Path) -> crate::io::Result<u64> {
+        // Free-space probe is a cold-path stat; delegate to the shared statvfs
+        // helper (this backend is Linux-only, so libc statvfs is available).
+        super::statvfs_available_space(path).map_err(crate::io::Error::from)
+    }
+
     fn sync_directory(&self, path: &Path) -> crate::io::Result<()> {
         let dir = File::open(path)?;
         if !dir.metadata()?.is_dir() {

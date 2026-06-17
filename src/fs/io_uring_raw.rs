@@ -650,6 +650,49 @@ pub fn statx_path_raw(path: &core::ffi::CStr) -> Result<Option<RawMetadata>, Err
     }
 }
 
+/// The kernel `struct statfs` for 64-bit Linux (x86-64 / aarch64). Unlike
+/// `statx`, this struct is architecture-dependent; this backend is gated to
+/// 64-bit Linux, where the layout below is stable. Only `f_bsize` and
+/// `f_bavail` are read.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "field names mirror the kernel `struct statfs` (f_type, f_bsize, …) verbatim"
+)]
+struct Statfs {
+    f_type: i64,
+    f_bsize: i64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [i32; 2],
+    f_namelen: i64,
+    f_frsize: i64,
+    f_flags: i64,
+    f_spare: [i64; 4],
+}
+
+/// `statfs(path, &buf)` — bytes available to an unprivileged process on the
+/// filesystem backing `path`: `f_bavail * f_bsize`. Raw syscall (no libc),
+/// matching this backend's no-libc design.
+///
+/// # Errors
+/// Returns an [`Error`] if the `statfs` syscall fails.
+pub fn statfs_available_raw(path: &core::ffi::CStr) -> Result<u64, Error> {
+    let mut buf = Statfs::default();
+    // SAFETY: `path` is a valid NUL-terminated C string the kernel reads;
+    // `buf` is a valid, writable Statfs the kernel fills on success.
+    unsafe { syscall2(Sysno::statfs, path.as_ptr() as usize, &raw mut buf as usize) }
+        .map_err(|e| err("statfs", e))?;
+    // `f_bavail` counts blocks free to a non-root caller; `f_bsize` is the
+    // block size. Saturate so an implausible value can never wrap.
+    let bsize = buf.f_bsize as u64;
+    Ok(buf.f_bavail.saturating_mul(bsize))
+}
+
 // SAFETY: `IoUringRaw`'s raw pointers address `mmap` regions it owns for its
 // whole lifetime, and its ring fd is process-global; moving it to another
 // thread is sound because every access is serialized through the `Mutex` that
@@ -1055,6 +1098,10 @@ impl Fs for IoUringRawFs {
             }),
             None => Err(Error::new(ErrorKind::NotFound, "path not found")),
         }
+    }
+
+    fn available_space(&self, path: &Path) -> crate::io::Result<u64> {
+        statfs_available_raw(&path_to_cstring(path)?)
     }
 
     fn sync_directory(&self, path: &Path) -> crate::io::Result<()> {

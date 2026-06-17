@@ -177,12 +177,18 @@ pub struct TreeInner {
     /// version is installed (flush / compaction), so the physical footprint is
     /// computed once per version and reused until the version id moves.
     ///
-    /// The `(version_id, used_bytes)` pair is kept behind a single `Mutex` so
-    /// the stamp and its byte count are always read and published together as
-    /// one coherent snapshot — two independent atomics could let a reader pair
-    /// a matching stamp with bytes from a different computation. `None` is the
-    /// unset state (no sentinel `version_id`, since every `u64` is a valid id).
-    pub(crate) admission_used_cache: Mutex<Option<(u64, u64)>>,
+    /// The `(version_id, used_bytes, disk_free)` triple is kept behind a single
+    /// `Mutex` so the stamp and the two byte counts are always read and
+    /// published together as one coherent snapshot — independent atomics could
+    /// let a reader pair a matching stamp with values from a different
+    /// computation. `None` is the unset state (no sentinel `version_id`, since
+    /// every `u64` is a valid id); also reset on `update_runtime_config` to
+    /// force a fresh disk-free probe when an operator changes the budget.
+    ///
+    /// `disk_free` is sampled at the same point `used_bytes` is computed (a new
+    /// version = a flush / compaction boundary), so the free-space probe is a
+    /// syscall per version transition, never per write.
+    pub(crate) admission_used_cache: Mutex<Option<(u64, u64, u64)>>,
 
     #[doc(hidden)]
     #[cfg(feature = "metrics")]

@@ -6,10 +6,30 @@
 //! reserved-headroom guarantee (flush still works at the limit), and automatic
 //! resume when the budget is raised.
 
+use lsm_tree::fs::MemFs;
 use lsm_tree::{
     AbstractTree, AnyTree, Config, Error, KvSeparationOptions, SequenceNumberCounter,
     StorageStatus, get_tmp_folder,
 };
+use std::sync::Arc;
+
+/// Opens a Standard tree on a shared `MemFs` clone, returning both so a test
+/// can drive the backend's simulated free space.
+fn open_tree_on_memfs(path: &std::path::Path) -> (lsm_tree::Tree, MemFs) {
+    let mem = MemFs::new();
+    let any = Config::new(
+        path,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(mem.clone()))
+    .open()
+    .expect("open");
+    match any {
+        AnyTree::Standard(t) => (t, mem),
+        AnyTree::Blob(_) => panic!("expected Standard tree"),
+    }
+}
 
 fn open_tree(path: &std::path::Path) -> lsm_tree::Tree {
     let any = Config::new(
@@ -356,6 +376,44 @@ fn reserved_headroom_counts_sealed_memtables_pending_flush() -> lsm_tree::Result
     assert!(
         tree.is_read_only(),
         "sealed memtable pending flush must count toward reserved headroom"
+    );
+    Ok(())
+}
+
+#[test]
+fn disk_free_drives_read_only_without_a_configured_quota() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let (tree, mem) = open_tree_on_memfs(folder.path());
+    for i in 0..100u64 {
+        tree.insert(format!("key{i:05}").as_bytes(), b"value", i);
+    }
+    tree.flush_active_memtable(0)?;
+
+    // Admission on, NO configured quota: only physical disk-free can gate.
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+    })?;
+    // MemFs defaults to u64::MAX free → no disk pressure → admits.
+    assert!(!tree.is_read_only(), "ample free space must admit");
+
+    // Simulate a near-full disk. The cached probe still holds the old free
+    // value (sampled at the last version), so force a re-probe the way an
+    // operator action would: update_runtime_config clears the cache.
+    mem.set_available_space(0);
+    tree.update_runtime_config(|_c| {})?;
+
+    assert!(
+        tree.is_read_only(),
+        "a near-full disk must drive read-only even without a configured quota"
+    );
+    match tree.try_insert(b"k".as_slice(), b"v".as_slice(), 1000) {
+        Err(Error::StorageFull { .. }) => {}
+        other => panic!("expected StorageFull, got {other:?}"),
+    }
+    assert_eq!(
+        tree.storage_stats()?.status,
+        StorageStatus::ReadOnlyOutOfSpace
     );
     Ok(())
 }

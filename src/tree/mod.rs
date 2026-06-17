@@ -1358,6 +1358,10 @@ impl Tree {
             auto_heal = c.auto_heal;
         })?;
         self.0.heal_hints.set_enabled(auto_heal);
+        // Drop the cached admission footprint so the next check re-probes
+        // disk-free: an operator who just raised the budget (or freed disk)
+        // should see it promptly, not at the next flush.
+        *self.0.admission_used_cache.lock() = None;
         Ok(())
     }
 
@@ -2286,17 +2290,17 @@ impl Tree {
     /// Cheap: reads in-memory size accounting only (no syscall). Returns
     /// `Ok(())` unless admission control is enabled AND a budget is set AND the
     /// live footprint plus reserved headroom exceeds it.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the admission cache lock intentionally spans the recompute \
+                  (stat + disk-free probe) so concurrent admission checks \
+                  coalesce on a single probe rather than each issuing a syscall"
+    )]
     fn compute_write_admission(&self) -> crate::Result<()> {
         let rc = self.0.runtime_config.load();
         if !rc.storage_admission_check {
             return Ok(());
         }
-        // Admission on but no budget set → unbounded (the disk-free probe that
-        // narrows the effective limit lands in a follow-up; until then only a
-        // configured quota gates).
-        let Some(limit) = rc.storage_limit_bytes else {
-            return Ok(());
-        };
 
         // Take ONE coherent snapshot of the latest super-version and derive
         // BOTH the on-disk footprint and the pending-memtable bytes from it.
@@ -2312,25 +2316,46 @@ impl Tree {
         // NOT `disk_space()` (metadata Level::size, which omits blob files and
         // undercounts the physical file by the meta block / footer).
         //
-        // Cached per version so gated writes don't re-stat every live file: the
-        // file set only changes when a new version is installed (flush /
-        // compaction), so a full stat runs once per version and every later
-        // check in that version reads the cache. The `(version_id, used_bytes)`
-        // pair lives behind one mutex so the stamp and bytes are always a
-        // coherent unit (see `TreeInner::admission_used_cache`).
-        let used = {
-            // cache = Some((version_id, used_bytes)); None = unset.
+        // Cached per version so gated writes don't re-stat every live file or
+        // re-probe disk on every call: the file set only changes when a new
+        // version is installed (flush / compaction), which is also the natural
+        // disk-free sampling boundary. A full stat + one `available_space`
+        // syscall run once per version; every later check in that version reads
+        // the cache. The `(version_id, used_bytes, disk_free)` triple lives
+        // behind one mutex so the stamp and values are always a coherent unit
+        // (see `TreeInner::admission_used_cache`).
+        let (used, disk_free) = {
             let mut cache = self.0.admission_used_cache.lock();
             match *cache {
-                Some((cached_vid, cached_used)) if cached_vid == vid => cached_used,
+                Some((cached_vid, used, free)) if cached_vid == vid => (used, free),
                 _ => {
-                    let computed =
-                        crate::storage_stats::compute_used_bytes(&super_version.version)?;
-                    *cache = Some((vid, computed));
-                    computed
+                    let used = crate::storage_stats::compute_used_bytes(&super_version.version)?;
+                    // Best-effort disk-free probe: a backend that cannot report
+                    // it (or an I/O hiccup) yields u64::MAX = "no disk pressure",
+                    // so a probe failure never falsely drives the tree read-only.
+                    let free = self
+                        .0
+                        .config
+                        .fs
+                        .available_space(&self.0.config.path)
+                        .unwrap_or(u64::MAX);
+                    *cache = Some((vid, used, free));
+                    (used, free)
                 }
             }
         };
+
+        // Effective limit is the tighter of the configured quota and the
+        // physical disk headroom (free + what we already occupy): the disk can
+        // fill from other processes even below a generous quota, and a tree with
+        // no quota at all must still stop before ENOSPC. `None` quota = unbounded
+        // by configuration; disk-free then alone bounds it.
+        let quota = rc.storage_limit_bytes.unwrap_or(u64::MAX);
+        let limit = quota.min(disk_free.saturating_add(used));
+        // Both sources unbounded → nothing to gate.
+        if limit == u64::MAX {
+            return Ok(());
+        }
 
         // Reserved headroom keeps the soft budget from becoming a hard wall:
         // enough to flush every pending memtable (plus a margin for the

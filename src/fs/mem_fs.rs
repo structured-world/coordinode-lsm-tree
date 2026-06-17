@@ -61,6 +61,13 @@ pub struct MemFs {
     /// constructed `MemFs::new()` values get DIFFERENT IDs because they
     /// have disjoint file trees.
     namespace_id: u64,
+    /// Simulated free space reported by [`Fs::available_space`]. Shared across
+    /// clones (same backend) so a test can drive the tree near-full. Defaults
+    /// to `u64::MAX` ("unbounded"); set via [`MemFs::set_available_space`].
+    ///
+    /// `portable_atomic::AtomicU64` (not `core`'s): native 64-bit atomics are
+    /// absent on some `no_std` targets (e.g. thumbv7em).
+    available_space: Arc<portable_atomic::AtomicU64>,
 }
 
 #[derive(Debug, Default)]
@@ -79,7 +86,16 @@ impl MemFs {
         Self {
             state: Arc::new(RwLock::new(state)),
             namespace_id: next_mem_fs_namespace_id(),
+            available_space: Arc::new(portable_atomic::AtomicU64::new(u64::MAX)),
         }
+    }
+
+    /// Sets the free space [`Fs::available_space`] reports (shared across
+    /// clones of this `MemFs`). Lets a test simulate a near-full disk to
+    /// exercise the storage-admission disk-pressure path.
+    pub fn set_available_space(&self, bytes: u64) {
+        self.available_space
+            .store(bytes, portable_atomic::Ordering::Relaxed);
     }
 }
 
@@ -708,6 +724,12 @@ impl Fs for MemFs {
                 format!("path not found: {}", path.display()),
             ))
         }
+    }
+
+    fn available_space(&self, _path: &Path) -> io::Result<u64> {
+        Ok(self
+            .available_space
+            .load(portable_atomic::Ordering::Relaxed))
     }
 
     fn sync_directory(&self, path: &Path) -> io::Result<()> {
