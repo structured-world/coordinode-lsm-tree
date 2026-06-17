@@ -48,6 +48,23 @@ fn std_fs_available_space_path_with_interior_nul_errors() {
     assert_eq!(err.kind(), lsm_tree::io::ErrorKind::InvalidInput);
 }
 
+#[cfg(windows)]
+#[test]
+fn std_fs_available_space_path_with_interior_nul_errors() {
+    // Symmetric to the unix case: Win32 treats the first NUL as the wide-string
+    // terminator, so an interior NUL must be rejected with InvalidInput rather
+    // than probing the truncated (wrong-volume) path.
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    let bad_os = OsString::from_wide(&[b'C' as u16, b':' as u16, 0, b'x' as u16]);
+    let bad = std::path::PathBuf::from(bad_os);
+    let err = StdFs
+        .available_space(&bad)
+        .expect_err("an interior NUL must be rejected");
+    assert_eq!(err.kind(), lsm_tree::io::ErrorKind::InvalidInput);
+}
+
 #[test]
 fn mem_fs_defaults_to_unbounded() {
     // A fresh MemFs reports u64::MAX until a capacity is configured, so it

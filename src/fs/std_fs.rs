@@ -1204,8 +1204,18 @@ mod available_space_sys {
     }
 
     pub(super) fn disk_free_available(path: &Path) -> io::Result<u64> {
-        // NUL-terminated wide string of the path.
+        // NUL-terminated wide string of the path. Reject an interior NUL first:
+        // Win32 treats the first NUL as the string terminator, so a path with an
+        // embedded NUL would silently probe a truncated path (a different volume)
+        // and feed admission / storage_stats free space for the wrong filesystem.
+        // Mirrors the unix statvfs helper's `CString::new` rejection.
         let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path contains an interior NUL byte",
+            ));
+        }
         wide.push(0);
         let mut avail: u64 = 0;
         // SAFETY: `wide` is a valid NUL-terminated UTF-16 string; the three out
