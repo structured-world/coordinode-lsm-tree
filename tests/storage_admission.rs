@@ -6,6 +6,7 @@
 //! reserved-headroom guarantee (flush still works at the limit), and automatic
 //! resume when the budget is raised.
 
+use lsm_tree::config::LevelRoute;
 use lsm_tree::fs::MemFs;
 use lsm_tree::{
     AbstractTree, AnyTree, Config, Error, KvSeparationOptions, SequenceNumberCounter,
@@ -435,6 +436,60 @@ fn disk_free_drives_read_only_without_a_configured_quota() -> lsm_tree::Result<(
     assert_eq!(
         tree.storage_stats()?.status,
         StorageStatus::ReadOnlyOutOfSpace
+    );
+    Ok(())
+}
+
+#[test]
+fn a_near_full_routed_volume_drives_the_whole_tree_read_only() -> lsm_tree::Result<()> {
+    // Per-volume safety: the disk-free gate mins free space across the primary
+    // path AND every level route, so a near-full routed (cold-tier) volume
+    // turns the whole tree read-only even while the primary has ample room and
+    // no quota is configured. The `+ used` in the effective limit cancels out
+    // of the disk branch (passing requires reserved <= min_free), so an empty
+    // routed volume's slack can never be summed against the primary's
+    // occupancy to mask the tight volume. Without that, a later flush /
+    // compaction targeting the route could hit ENOSPC.
+    let folder = get_tmp_folder();
+
+    // Primary volume: unbounded in-memory disk. Routed cold tier (L5+): a
+    // capped in-memory disk with less than the reserved headroom free.
+    let primary = MemFs::new();
+    let cold = MemFs::with_capacity(64 * 1024); // < MIN_RESERVED_HEADROOM (1 MiB)
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(primary))
+    .level_routes(vec![LevelRoute {
+        levels: 5..7,
+        path: folder.path().join("cold"),
+        fs: Arc::new(cold),
+    }])
+    .open()
+    .expect("open");
+    let tree = match any {
+        AnyTree::Standard(t) => t,
+        AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+
+    // Admission on, NO quota: only the physical free-space probe can gate, and
+    // it must reflect the tightest volume.
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+    })?;
+
+    assert!(
+        tree.is_read_only(),
+        "a routed volume below the reserved headroom must drive the tree read-only"
+    );
+    let stats = tree.storage_stats()?;
+    assert_eq!(stats.status, StorageStatus::ReadOnlyOutOfSpace);
+    assert!(
+        !stats.compaction_possible,
+        "no headroom on the tightest volume means compaction cannot run"
     );
     Ok(())
 }

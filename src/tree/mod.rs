@@ -2421,6 +2421,18 @@ impl Tree {
         // fill from other processes even below a generous quota, and a tree with
         // no quota at all must still stop before ENOSPC. `None` quota = unbounded
         // by configuration; disk-free then alone bounds it.
+        //
+        // `disk_free` is the MINIMUM free across every volume the tree writes to
+        // (`probe_disk_free` mins the primary path and all `level_routes`). The
+        // `+ used` here is NOT an accounting of one volume's usage against
+        // another's free space — it cancels out of the disk branch of the gate:
+        // passing requires `used + reserved <= disk_free + used`, i.e.
+        // `reserved <= disk_free`. So a passing gate guarantees the TIGHTEST
+        // volume alone has at least `reserved` free — a conservative per-volume
+        // headroom, never the sum of an empty routed volume's slack plus an
+        // unrelated full volume's occupancy. A route that drops below `reserved`
+        // free drives the whole tree read-only, exactly so a later flush /
+        // compaction targeting that route cannot hit ENOSPC.
         let quota = rc.storage_limit_bytes.unwrap_or(u64::MAX);
         let limit = quota.min(disk_free.saturating_add(used));
         // Both sources unbounded → nothing to gate.
