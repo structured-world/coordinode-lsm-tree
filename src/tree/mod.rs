@@ -2390,13 +2390,25 @@ impl Tree {
         // per write. `update_runtime_config` resets the entry for an immediate
         // re-probe. The values live behind one mutex as a coherent unit (see
         // `TreeInner::admission_used_cache`).
+        //
+        // The TTL fast-path is std-only: under `no_std` there is no monotonic
+        // clock (`crate::time::Instant::elapsed` is a zero stub), so an
+        // elapsed-time window cannot bound staleness — a same-version sample
+        // would otherwise look fresh forever and a filling disk would never be
+        // re-probed. Under `no_std` the fast-path is skipped, so `disk_free` is
+        // re-probed on every gated write (the `used` footprint stays cached by
+        // version either way), keeping admission safe without a monotonic clock.
         let now = crate::time::Instant::now();
         let (used, disk_free) = {
             let mut cache = self.0.admission_used_cache.lock();
             match *cache {
-                // Fresh: same version AND disk sample within the TTL.
+                // Fresh: same version AND disk sample within the TTL. std-only —
+                // `cfg!(feature = "std")` is `false` under `no_std`, so the guard
+                // short-circuits there and the next arm re-probes every call.
                 Some((cvid, used, free, at))
-                    if cvid == vid && at.elapsed() < ADMISSION_DISK_FREE_TTL =>
+                    if cvid == vid
+                        && cfg!(feature = "std")
+                        && at.elapsed() < ADMISSION_DISK_FREE_TTL =>
                 {
                     (used, free)
                 }
