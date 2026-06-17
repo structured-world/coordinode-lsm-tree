@@ -346,13 +346,16 @@ impl AbstractTree for Tree {
             && stats.status == crate::StorageStatus::Healthy
         {
             // A full compaction's transient output is bounded by the largest
-            // level's on-disk size, landing in that level's own volume. A
-            // standard tree has no blob relocation. Using the per-volume gate
-            // (not `available >= full_compaction_bytes` against the min-volume
-            // free) keeps the status from reporting tight when a routed merge
-            // would actually be admitted.
-            let (sst_dest_level, sst_need) =
-                crate::storage_stats::largest_level_for_compaction(&version);
+            // level's on-disk size, but it LANDS in the last configured level's
+            // volume (`level_count - 1`), which under tiered routing can be a
+            // different filesystem than the largest level. A standard tree has no
+            // blob relocation. Using the per-volume gate (not `available >=
+            // full_compaction_bytes` against the min-volume free) keeps the status
+            // from reporting tight when a routed merge would actually be admitted.
+            let sst_need = crate::storage_stats::full_compaction_demand_bytes(&version);
+            // `saturating_sub`: `level_count >= 1` always, so this is the last
+            // level index; the clamp only guards a degenerate zero-level config.
+            let sst_dest_level = self.0.config.level_count.saturating_sub(1);
             let quota_headroom = self.quota_headroom(stats.used_bytes);
             let full_fits = crate::compaction::worker::space_fits_two_layer(
                 &self.0.config,

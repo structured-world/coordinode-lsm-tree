@@ -368,13 +368,17 @@ impl AbstractTree for BlobTree {
             && capacity.is_some()
             && stats.status == crate::StorageStatus::Healthy
         {
-            // SST output lands in the largest level's volume; stale blob
-            // relocation lands in the primary blobs volume. The per-volume gate
-            // (not `available >= full_compaction_bytes` against the min-volume
-            // free) keeps the status from reporting tight when the SST and blob
-            // outputs each fit their own volume — see the gate's two-layer model.
-            let (sst_dest_level, sst_need) =
-                crate::storage_stats::largest_level_for_compaction(&version);
+            // SST output lands in the LAST configured level's volume
+            // (`level_count - 1`), stale blob relocation in the primary blobs
+            // volume; the demand is bounded by the largest level's size. The
+            // per-volume gate (not `available >= full_compaction_bytes` against
+            // the min-volume free) keeps the status from reporting tight when the
+            // SST and blob outputs each fit their own volume — see the gate's
+            // two-layer model.
+            let sst_need = crate::storage_stats::full_compaction_demand_bytes(&version);
+            // `saturating_sub`: `level_count >= 1` always (the clamp only guards a
+            // degenerate zero-level config) → the last level index.
+            let sst_dest_level = self.index.config.level_count.saturating_sub(1);
             let quota_headroom = self.index.quota_headroom(stats.used_bytes);
             let full_fits = crate::compaction::worker::space_fits_two_layer(
                 &self.index.config,

@@ -153,21 +153,21 @@ pub(crate) fn compute_used_bytes(version: &Version) -> crate::Result<u64> {
     Ok(used_bytes)
 }
 
-/// The largest level's index and on-disk size: the destination level and the
-/// transient-output bound a full compaction's space check uses.
+/// The transient-output bound a full compaction's space check uses: the largest
+/// level's on-disk size (the `full_compaction_bytes` gauge figure), an upper
+/// bound on a single merge's input set. `0` for an empty tree.
 ///
-/// A full compaction's largest single merge is bounded by the largest level's
-/// on-disk size (the `full_compaction_bytes` gauge figure), and its output lands
-/// in that level's own volume — which matters for the per-volume physical check
-/// when tiered routing places levels on different filesystems. Returns `(0, 0)`
-/// for an empty tree.
-pub(crate) fn largest_level_for_compaction(version: &Version) -> (u8, u64) {
+/// This is the DEMAND. The destination VOLUME is a separate concern: a full
+/// compaction writes its output to the last configured level
+/// (`level_count - 1`), not to whichever level is currently largest, so callers
+/// pass the last level as the destination to the per-volume space check (the two
+/// differ only under tiered routing, where they can be different filesystems).
+pub(crate) fn full_compaction_demand_bytes(version: &Version) -> u64 {
     version
         .iter_levels()
-        .enumerate()
-        .map(|(idx, level)| (u8::try_from(idx).unwrap_or(u8::MAX), level.size()))
-        .max_by_key(|(_, size)| *size)
-        .unwrap_or((0, 0))
+        .map(crate::version::Level::size)
+        .max()
+        .unwrap_or(0)
 }
 
 /// Computes [`StorageStats`] from a live version's table + blob-file metadata.
