@@ -91,6 +91,29 @@ impl StorageStats {
     }
 }
 
+/// Sums the true physical on-disk size of every live table and blob file in
+/// `version` (one metadata stat per file).
+///
+/// This is the same physical basis [`compute_storage_stats`] reports as
+/// `used_bytes` and that `Tree::create_checkpoint` totals, so the storage
+/// admission gate agrees with both. It deliberately does NOT use
+/// `Metadata::file_size` (undercounts by the meta block / footer) or
+/// `disk_space()` (metadata `Level::size`, which also omits blob files).
+///
+/// # Errors
+///
+/// Returns an error if a live table or blob file's size cannot be stat-ed.
+pub(crate) fn compute_used_bytes(version: &Version) -> crate::Result<u64> {
+    let mut used_bytes = 0u64;
+    for table in version.iter_tables() {
+        used_bytes = used_bytes.saturating_add(table.fs.metadata(&table.path)?.len);
+    }
+    for blob in version.blob_files.iter() {
+        used_bytes = used_bytes.saturating_add(blob.0.fs.metadata(&blob.0.path)?.len);
+    }
+    Ok(used_bytes)
+}
+
 /// Computes [`StorageStats`] from a live version's table + blob-file metadata.
 ///
 /// `is_compacting` selects [`StorageStatus::CompactionInProgress`] vs

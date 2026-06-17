@@ -140,6 +140,46 @@ pub trait AbstractTree: sealed::Sealed {
         crate::storage_stats::compute_storage_stats(&self.current_version(), false, true)
     }
 
+    /// Storage admission gate: `Ok(())` if a write may proceed, or
+    /// [`Error::StorageFull`](crate::Error::StorageFull) if the tree is
+    /// over budget and should be treated as read-only.
+    ///
+    /// Opt-in: returns `Ok(())` unless
+    /// [`storage_admission_check`](crate::RuntimeConfig::storage_admission_check)
+    /// is enabled. The predicate is computed (not latched), so once space is
+    /// freed — the budget raised, a compaction reclaiming space, or disk freed —
+    /// the next call admits again with no restart.
+    ///
+    /// Intended as a cheap pre-check the caller consults before applying a
+    /// write batch. The footprint is cached per version, so the check is a
+    /// constant-time read on the common path and only re-measures when a new
+    /// version is installed (flush / compaction). Internal flush / compaction
+    /// are never gated, so the engine can always reclaim.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StorageFull`](crate::Error::StorageFull) when the live footprint
+    /// plus reserved headroom exceeds the effective budget.
+    fn write_admission(&self) -> crate::Result<()> {
+        Ok(())
+    }
+
+    /// `true` when the admission gate is currently closed (see
+    /// [`write_admission`](Self::write_admission)). Convenience for callers that
+    /// want a boolean rather than a `Result`. Always `false` unless admission
+    /// control is enabled and the tree is over budget.
+    ///
+    /// Only [`Error::StorageFull`](crate::Error::StorageFull) counts as
+    /// read-only: an unrelated admission error (e.g. an I/O failure while
+    /// measuring the footprint) is NOT an out-of-space condition and must not be
+    /// reported as one.
+    fn is_read_only(&self) -> bool {
+        matches!(
+            self.write_admission(),
+            Err(crate::Error::StorageFull { .. })
+        )
+    }
+
     /// Proactively verifies every block's XXH3 checksum across every SST in
     /// the tree's current version — a scrubber for catching bit rot before it
     /// surfaces as a user-visible read failure (cron / scrub jobs).
@@ -989,6 +1029,91 @@ pub trait AbstractTree: sealed::Sealed {
         value: V,
         seqno: SeqNo,
     ) -> (u64, u64);
+
+    /// Admission-gated [`insert`](Self::insert): consults
+    /// [`write_admission`](Self::write_admission) first and declines with
+    /// [`Error::StorageFull`](crate::Error::StorageFull) when the tree is over
+    /// budget, otherwise inserts and returns the same `(added_bytes,
+    /// memtable_size)` tuple. This is the write entry a space-aware caller uses
+    /// so over-budget writes are refused up front rather than failing a flush
+    /// later; bare [`insert`](Self::insert) stays infallible for callers that
+    /// do not opt into admission control.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StorageFull`](crate::Error::StorageFull) when the admission gate
+    /// is closed.
+    fn try_insert<K: Into<UserKey>, V: Into<UserValue>>(
+        &self,
+        key: K,
+        value: V,
+        seqno: SeqNo,
+    ) -> crate::Result<(u64, u64)> {
+        self.write_admission()?;
+        Ok(self.insert(key, value, seqno))
+    }
+
+    /// Admission-gated [`merge`](Self::merge). See
+    /// [`try_insert`](Self::try_insert).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StorageFull`](crate::Error::StorageFull) when the admission gate
+    /// is closed.
+    fn try_merge<K: Into<UserKey>, V: Into<UserValue>>(
+        &self,
+        key: K,
+        operand: V,
+        seqno: SeqNo,
+    ) -> crate::Result<(u64, u64)> {
+        self.write_admission()?;
+        Ok(self.merge(key, operand, seqno))
+    }
+
+    /// Admission-gated [`remove`](Self::remove). See
+    /// [`try_insert`](Self::try_insert).
+    ///
+    /// Note a tombstone is itself a write that consumes space; an over-budget
+    /// tree refuses it too. Reclaim space via compaction (never gated) rather
+    /// than relying on deletes when already read-only.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StorageFull`](crate::Error::StorageFull) when the admission gate
+    /// is closed.
+    fn try_remove<K: Into<UserKey>>(&self, key: K, seqno: SeqNo) -> crate::Result<(u64, u64)> {
+        self.write_admission()?;
+        Ok(self.remove(key, seqno))
+    }
+
+    /// Admission-gated [`remove_weak`](Self::remove_weak). See
+    /// [`try_insert`](Self::try_insert).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StorageFull`](crate::Error::StorageFull) when the admission gate
+    /// is closed.
+    fn try_remove_weak<K: Into<UserKey>>(&self, key: K, seqno: SeqNo) -> crate::Result<(u64, u64)> {
+        self.write_admission()?;
+        Ok(self.remove_weak(key, seqno))
+    }
+
+    /// Admission-gated [`remove_range`](Self::remove_range). See
+    /// [`try_insert`](Self::try_insert).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StorageFull`](crate::Error::StorageFull) when the admission gate
+    /// is closed.
+    fn try_remove_range<K: Into<UserKey>>(
+        &self,
+        start: K,
+        end: K,
+        seqno: SeqNo,
+    ) -> crate::Result<u64> {
+        self.write_admission()?;
+        Ok(self.remove_range(start, end, seqno))
+    }
 
     /// Removes an item from the tree.
     ///

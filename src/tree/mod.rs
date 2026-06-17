@@ -41,6 +41,12 @@ use spin::{Mutex, RwLock};
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
 
+/// Floor for the storage-admission reserved headroom band (see
+/// [`Tree::compute_write_admission`]). Even with an empty active memtable the
+/// gate keeps at least this much room below the budget so the next writes and a
+/// space-reclaiming compaction have somewhere to land. 1 MiB.
+const MIN_RESERVED_HEADROOM: u64 = 1024 * 1024;
+
 /// Iterator value guard
 pub struct Guard(crate::Result<(UserKey, UserValue)>);
 
@@ -310,11 +316,22 @@ impl AbstractTree for Tree {
 
     fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
         // Standard tree: SST values ARE user values (no KV separation).
-        crate::storage_stats::compute_storage_stats(
+        let mut stats = crate::storage_stats::compute_storage_stats(
             &self.current_version(),
             self.is_compacting(),
             true,
-        )
+        )?;
+        // A closed admission gate is the operator-actionable state, so it takes
+        // precedence over CompactionInProgress (a read-only tree may well be
+        // compacting to reclaim space).
+        if self.is_read_only() {
+            stats.status = crate::StorageStatus::ReadOnlyOutOfSpace;
+        }
+        Ok(stats)
+    }
+
+    fn write_admission(&self) -> crate::Result<()> {
+        self.compute_write_admission()
     }
 
     fn get_flush_lock(&self) -> FlushGuard<'_> {
@@ -2263,6 +2280,91 @@ impl Tree {
         !self.compaction_state.lock().hidden_set().is_empty()
     }
 
+    /// Computed storage admission predicate backing
+    /// [`AbstractTree::write_admission`](crate::AbstractTree::write_admission).
+    ///
+    /// Cheap: reads in-memory size accounting only (no syscall). Returns
+    /// `Ok(())` unless admission control is enabled AND a budget is set AND the
+    /// live footprint plus reserved headroom exceeds it.
+    fn compute_write_admission(&self) -> crate::Result<()> {
+        let rc = self.0.runtime_config.load();
+        if !rc.storage_admission_check {
+            return Ok(());
+        }
+        // Admission on but no budget set → unbounded (the disk-free probe that
+        // narrows the effective limit lands in a follow-up; until then only a
+        // configured quota gates).
+        let Some(limit) = rc.storage_limit_bytes else {
+            return Ok(());
+        };
+
+        // Take ONE coherent snapshot of the latest super-version and derive
+        // BOTH the on-disk footprint and the pending-memtable bytes from it.
+        // Reading them from two separate `latest_version()` loads would be a
+        // TOCTOU bug: a flush installing a new version between the two reads
+        // could pair an old (larger) disk usage with new (smaller) pending
+        // bytes — or vice versa — and open the gate incorrectly.
+        let super_version = self.version_history.read().latest_version();
+        let vid = super_version.version.id();
+
+        // True physical footprint, including blob files — the SAME basis
+        // `storage_stats()` reports, so the gate and the reported usage agree.
+        // NOT `disk_space()` (metadata Level::size, which omits blob files and
+        // undercounts the physical file by the meta block / footer).
+        //
+        // Cached per version so gated writes don't re-stat every live file: the
+        // file set only changes when a new version is installed (flush /
+        // compaction), so a full stat runs once per version and every later
+        // check in that version reads the cache. The `(version_id, used_bytes)`
+        // pair lives behind one mutex so the stamp and bytes are always a
+        // coherent unit (see `TreeInner::admission_used_cache`).
+        let used = {
+            // cache = Some((version_id, used_bytes)); None = unset.
+            let mut cache = self.0.admission_used_cache.lock();
+            match *cache {
+                Some((cached_vid, cached_used)) if cached_vid == vid => cached_used,
+                _ => {
+                    let computed =
+                        crate::storage_stats::compute_used_bytes(&super_version.version)?;
+                    *cache = Some((vid, computed));
+                    computed
+                }
+            }
+        };
+
+        // Reserved headroom keeps the soft budget from becoming a hard wall:
+        // enough to flush every pending memtable (plus a margin for the
+        // index/filter/footer overhead a flush adds) so a queued flush always
+        // fits at the limit, with a floor for compaction working space.
+        // Internal flush / compaction are never gated, so this band is the
+        // engine's room to reclaim.
+        //
+        // Count ALL pending memtable bytes in this snapshot — the active one AND
+        // any sealed (rotated) memtables awaiting flush — not just the active
+        // one: after a rotation the active memtable is empty but the sealed
+        // memtable's queued flush will still consume disk, so it must be
+        // reserved for.
+        // Saturating fold so the running total stays fail-closed (a hypothetical
+        // overflow clamps to u64::MAX → downstream sees over-budget), consistent
+        // with the checked/saturating arithmetic below.
+        let pending_memtable_bytes = super_version
+            .sealed_memtables
+            .iter()
+            .map(|m| m.size())
+            .fold(super_version.active_memtable.size(), u64::saturating_add);
+
+        // `compute_used_bytes` saturates its file-size sums, so `used` could in
+        // principle be `u64::MAX`; keep the gate fail-closed with checked
+        // arithmetic — any overflow means "definitely over budget", so deny.
+        let reserved = pending_memtable_bytes
+            .saturating_add(pending_memtable_bytes / 8)
+            .max(MIN_RESERVED_HEADROOM);
+        match used.checked_add(reserved) {
+            Some(total) if total <= limit => Ok(()),
+            _ => Err(crate::Error::StorageFull { used, limit }),
+        }
+    }
+
     fn inner_compact(
         &self,
         strategy: Arc<dyn CompactionStrategy>,
@@ -2594,6 +2696,7 @@ impl Tree {
             runtime_config: Arc::new(crate::runtime_config::handle::RuntimeConfigHandle::new(
                 initial_runtime,
             )),
+            admission_used_cache: Mutex::new(None),
 
             #[cfg(feature = "metrics")]
             metrics,
