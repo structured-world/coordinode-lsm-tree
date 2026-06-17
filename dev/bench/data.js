@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781698126575,
+  "lastUpdate": 1781737404559,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -17472,6 +17472,84 @@ window.BENCHMARK_DATA = {
             "value": 714024.7943253365,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.4us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a4866aa5e3f9c86116a69d9fcc392cf014014860",
+          "message": "feat(compaction): deadlock-free space admission for merges (#493)\n\n## Summary\n\nAdds an opt-in, deadlock-free space-admission gate for compaction\nmerges. A merge transiently needs room for its output while its inputs\nstill exist, so on a near-full disk a naive merge can hit `ENOSPC`.\nGating merges like user writes would deadlock — compaction is what\n*frees* space — so the gate keeps an emergency reserve and narrows\nrather than blanket-skipping.\n\n## Changes\n\n- **`Config::min_available_space`** — minimum free space across the\nprimary path and every level route (the tightest volume bounds\nadmission). `Tree::probe_disk_free` now delegates to it.\n- **Compaction space gate** (`storage_admission_check`, in the worker's\n`do_compaction` for `Choice::Merge`):\n  - Bounds a merge's extra need by `Σ input file_size`.\n- Runs the merge when it fits free space (including the emergency\nreserve, so a space-reclaiming merge runs even at the limit — the\ndeadlock break).\n- Narrows a too-large merge to the smallest run-adjacent table pair that\nfits (`narrow_merge_to_budget`); a cross-run / cross-level set that\ncannot be safely narrowed is skipped and left to the opt-in tight-space\nmode.\n  - `Move` / `Drop` are zero / negative space and always run.\n- **`storage_stats().status`** now reports `FullCompactionAvailable` /\n`TightCompactionAvailable` when gating is active (gated on the admission\nflag, not merely a finite capacity), `ReadOnlyOutOfSpace` when the write\ngate is closed.\n\nConsistency under a mid-merge failure is the pre-existing atomic-commit\nguarantee (orphan output, intact inputs, unchanged manifest); the gate\njust keeps such a merge from starting.\n\n## Testing\n\n- Unit: `narrow_merge_picks_smallest_fitting_run_adjacent_pair`\n(narrowing picks the smallest adjacent pair; returns `None` below a\nsingle table).\n- Integration (`tests/compaction_space_admission.rs`): near-full disk\nskips a non-fitting merge and stays consistent + reopenable; raising\ncapacity lets the same merge run (gate causation); admission off never\ngates; status reports `FullCompactionAvailable` → `ReadOnlyOutOfSpace`.\n- Full suite 1857 passed; clippy host + `x86_64-unknown-linux-gnu`\n`--all-features -D warnings` clean; no-std `thumbv7em-none-eabihf` 0\nerrors.\n\nPart of #482. Closes #486.\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added opt-in storage space admission gating for major compactions,\nincluding narrowed-merge behavior when full-run compaction doesn’t fit.\n* Added physical blob sizing to improve blob-tree compaction admission\nand status reporting.\n* Exposed new storage stats gauges for compaction headroom\n(`full_compaction_bytes`, `tight_compaction_bytes`).\n* **Improvements**\n* Refined two-layer space admission and safer disk-free probing when\nfree space can’t be determined.\n  * Updated compaction I/O byte accounting for rate limiting.\n* Improved overflow-safety and more accurate storage-stat calculations\nto reflect compaction needs.\n* **Documentation**\n* Expanded `StorageStatus` behavior and precedence for admission-driven\noverrides.\n* **Tests**\n* Added end-to-end and gauge coverage for admission behavior, plus\nvolume-ID compatibility and encryption fd-exhaustion tolerance.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-18T02:02:14+03:00",
+          "tree_id": "8ee5af6bf26cac6365b26bec18f47b5f8562606c",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/a4866aa5e3f9c86116a69d9fcc392cf014014860"
+        },
+        "date": 1781737385173,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2125189.719671006,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1223631.1090417877,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 924569.5139623125,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 4.1us | P99.9: 6.5us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3806361.2670767643,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.0us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 476220.4406609175,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.1us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 246403.93507872813,
+            "unit": "ops/sec",
+            "extra": "P50: 3.8us | P99: 4.7us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.81s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1285142.4285441854,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.0us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1076067.2764793725,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 2.5us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 713202.7668273418,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.6us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
         ]
       }
