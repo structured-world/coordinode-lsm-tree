@@ -1801,4 +1801,37 @@ mod tests {
             .expect_err("write to a non-open fd must fail");
         assert_eq!(err.kind(), ErrorKind::InvalidInput); // EBADF -> InvalidInput
     }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn raw_available_space_reports_plausible_free_bytes() {
+        // The raw `statfs` syscall path: the filesystem backing the tempdir must
+        // report a plausible, non-zero free figure below the unbounded sentinel.
+        use crate::fs::Fs;
+        use crate::path::Path;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fs = IoUringRawFs::new(8).expect("fs setup");
+        let free = fs
+            .available_space(Path::new(tmp.path().to_str().expect("utf8 path")))
+            .expect("statfs must succeed on a real filesystem");
+        assert!(
+            free > 0,
+            "a writable tempdir filesystem must report free space"
+        );
+        assert!(
+            free < u64::MAX,
+            "a real probe must not return the unbounded sentinel"
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn raw_statfs_on_missing_path_errors() {
+        // `statfs` on a path that does not exist surfaces an error, not a silent
+        // zero or the unbounded sentinel — exercising the syscall error branch.
+        let cpath =
+            std::ffi::CString::new("/proc/does-not-exist/iou_raw_statfs").expect("no interior NUL");
+        assert!(statfs_available_raw(&cpath).is_err());
+    }
 }

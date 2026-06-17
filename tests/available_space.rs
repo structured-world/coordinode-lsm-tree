@@ -32,6 +32,22 @@ fn std_fs_available_space_nonexistent_path_errors() {
     assert!(StdFs.available_space(&missing).is_err());
 }
 
+#[cfg(unix)]
+#[test]
+fn std_fs_available_space_path_with_interior_nul_errors() {
+    // A path containing an interior NUL byte cannot become a C string, so the
+    // statvfs helper must surface InvalidInput rather than passing a truncated
+    // path to the kernel.
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let bad = std::path::Path::new(OsStr::from_bytes(b"/tmp/has\0nul"));
+    let err = StdFs
+        .available_space(bad)
+        .expect_err("an interior NUL must be rejected");
+    assert_eq!(err.kind(), lsm_tree::io::ErrorKind::InvalidInput);
+}
+
 #[test]
 fn mem_fs_defaults_to_unbounded() {
     // A fresh MemFs reports u64::MAX until a capacity is configured, so it

@@ -441,6 +441,48 @@ fn disk_free_drives_read_only_without_a_configured_quota() -> lsm_tree::Result<(
 }
 
 #[test]
+fn disk_free_re_probes_on_ttl_expiry_without_a_version_change() -> lsm_tree::Result<()> {
+    // The disk-free sample is re-probed once it ages past the TTL even when the
+    // version (and thus the cached footprint) is unchanged: an external process
+    // filling the shared disk must drive the tree read-only without waiting for
+    // the next flush / compaction. Uses a capped MemFs whose free space we lower
+    // out from under a steady version, then waits past the 1s TTL so the next
+    // check re-probes rather than serving the stale free value.
+    let folder = get_tmp_folder();
+    let (tree, mem) = open_tree_on_capped_memfs(folder.path(), 100 * 1024 * 1024);
+    seed(&tree); // installs a version; the footprint stays fixed hereafter
+
+    // No quota: only the physical free-space probe gates. 100 MiB free admits.
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+    })?;
+    assert!(!tree.is_read_only(), "100 MiB free must admit");
+
+    // Shrink the simulated disk so available falls below the reserved headroom,
+    // WITHOUT a version change or a config update (either would clear the cache
+    // and force an immediate re-probe, bypassing the path under test). Capacity
+    // just above the live footprint leaves only a sliver free (< the 1 MiB
+    // reserved floor), since the MemFs also holds the manifest / lock / journal.
+    let used = tree.storage_stats()?.used_bytes;
+    mem.set_capacity(used + 1024);
+
+    // Within the TTL the stale free value is still served, so the tree is not
+    // yet read-only; after the TTL elapses the next check re-probes and sees the
+    // near-full disk.
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    assert!(
+        tree.is_read_only(),
+        "a TTL-expired re-probe must observe the shrunk disk and gate writes"
+    );
+    assert_eq!(
+        tree.storage_stats()?.status,
+        StorageStatus::ReadOnlyOutOfSpace
+    );
+    Ok(())
+}
+
+#[test]
 fn a_near_full_routed_volume_drives_the_whole_tree_read_only() -> lsm_tree::Result<()> {
     // Per-volume safety: the disk-free gate mins free space across the primary
     // path AND every level route, so a near-full routed (cold-tier) volume

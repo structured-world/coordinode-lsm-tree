@@ -1302,4 +1302,25 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn available_space_reports_plausible_free_bytes() -> io::Result<()> {
+        // The cold-path free-space probe delegates to the shared statvfs helper:
+        // the filesystem backing the tempdir must report a plausible, non-zero
+        // figure below the unbounded sentinel.
+        let Some(fs) = try_io_uring() else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let free = fs.available_space(dir.path())?;
+        assert!(
+            free > 0,
+            "a writable tempdir filesystem must report free space"
+        );
+        assert!(
+            free < u64::MAX,
+            "a real probe must not return the unbounded sentinel"
+        );
+        Ok(())
+    }
 }
