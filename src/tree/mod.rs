@@ -2319,14 +2319,16 @@ impl Tree {
         // pair lives behind one mutex so the stamp and bytes are always a
         // coherent unit (see `TreeInner::admission_used_cache`).
         let used = {
-            // cache = (version_id, used_bytes)
+            // cache = Some((version_id, used_bytes)); None = unset.
             let mut cache = self.0.admission_used_cache.lock();
-            if cache.0 == vid {
-                cache.1
-            } else {
-                let computed = crate::storage_stats::compute_used_bytes(&super_version.version)?;
-                *cache = (vid, computed);
-                computed
+            match *cache {
+                Some((cached_vid, cached_used)) if cached_vid == vid => cached_used,
+                _ => {
+                    let computed =
+                        crate::storage_stats::compute_used_bytes(&super_version.version)?;
+                    *cache = Some((vid, computed));
+                    computed
+                }
             }
         };
 
@@ -2694,7 +2696,7 @@ impl Tree {
             runtime_config: Arc::new(crate::runtime_config::handle::RuntimeConfigHandle::new(
                 initial_runtime,
             )),
-            admission_used_cache: Mutex::new((u64::MAX, 0)),
+            admission_used_cache: Mutex::new(None),
 
             #[cfg(feature = "metrics")]
             metrics,

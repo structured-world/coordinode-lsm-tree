@@ -180,10 +180,9 @@ pub struct TreeInner {
     /// The `(version_id, used_bytes)` pair is kept behind a single `Mutex` so
     /// the stamp and its byte count are always read and published together as
     /// one coherent snapshot — two independent atomics could let a reader pair
-    /// a matching stamp with bytes from a different computation. `version_id`
-    /// starts at `u64::MAX` (unset; no real version uses that id, a spurious
-    /// match would only cost one extra recompute).
-    pub(crate) admission_used_cache: Mutex<(u64, u64)>,
+    /// a matching stamp with bytes from a different computation. `None` is the
+    /// unset state (no sentinel `version_id`, since every `u64` is a valid id).
+    pub(crate) admission_used_cache: Mutex<Option<(u64, u64)>>,
 
     #[doc(hidden)]
     #[cfg(feature = "metrics")]
@@ -258,7 +257,7 @@ impl TreeInner {
             background_deleter: Arc::new(crate::BackgroundDeleter::new(None)),
             heal_hints: crate::heal_hints::HealHints::new_shared(initial_runtime.auto_heal),
             runtime_config: Arc::new(RuntimeConfigHandle::new((*initial_runtime).clone())),
-            admission_used_cache: Mutex::new((u64::MAX, 0)),
+            admission_used_cache: Mutex::new(None),
 
             #[cfg(feature = "metrics")]
             metrics: Metrics::default().into(),
