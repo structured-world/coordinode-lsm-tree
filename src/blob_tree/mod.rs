@@ -321,9 +321,12 @@ impl AbstractTree for BlobTree {
         // Forward the index tree's compaction state (the default impl would
         // always report idle), and mark value bytes as NOT user values: large
         // values are KV-separated into blob files, so the SST records only
-        // indirection pointers.
+        // indirection pointers. One version snapshot is reused for both the
+        // footprint and the blob-headroom sum below: a second `current_version()`
+        // could race a concurrent flush / compaction and mix two snapshots.
+        let version = self.current_version();
         let mut stats = crate::storage_stats::compute_storage_stats(
-            &self.current_version(),
+            &version,
             self.index.is_compacting(),
             false,
         )?;
@@ -342,7 +345,6 @@ impl AbstractTree for BlobTree {
         // upper bound: a single compaction relocates at most the stale subset),
         // so the status does not report full availability while the gate would
         // skip the merge for lack of blob room.
-        let version = self.current_version();
         let mut blob_bytes = 0u64;
         for blob in version.blob_files.iter() {
             blob_bytes += blob.physical_size()?;

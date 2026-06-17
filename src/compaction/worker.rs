@@ -156,7 +156,7 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
             // `Drop` are zero / negative space and always run (below).
             let decision = {
                 let super_version = version_history_lock.latest_version();
-                space_gate_for_merge(&super_version.version, opts, &payload)
+                space_gate_for_merge(&super_version.version, opts, &payload)?
             };
             match decision {
                 SpaceGate::Run => {
@@ -265,89 +265,84 @@ fn space_gate_for_merge(
     version: &Version,
     opts: &Options,
     payload: &CompactionPayload,
-) -> SpaceGate {
+) -> crate::Result<SpaceGate> {
     let rc = opts.runtime_config.load_full();
     if !rc.storage_admission_check {
-        return SpaceGate::Run;
+        return Ok(SpaceGate::Run);
     }
 
-    // SST output lands in the destination level's volume (tiered routing aware).
+    // Payload-independent budgets, probed once.
+    //
+    // SST output lands in the destination level's volume (tiered routing aware);
+    // blob relocation (KV-separated trees) lands in the primary blobs folder.
     let (sst_path, sst_fs) = opts.config.tables_folder_for_level(payload.dest_level);
     let sst_free = sst_fs.available_space(&sst_path).unwrap_or(u64::MAX);
-
-    // SST input bound (output never exceeds the inputs for a pure compaction).
-    // Plain sum: on-disk file sizes are bounded by the filesystem capacity.
-    let sst_sigma: u64 = payload
-        .table_ids
-        .iter()
-        .filter_map(|&id| version.get_table(id))
-        .map(Table::file_size)
-        .sum();
-
-    // A KV-separated tree may relocate stale blob files into the primary blobs
-    // folder; those bytes are not part of the SST sizes and land on a different
-    // volume.
-    let (blob_sigma, blob_free) = match &opts.config.kv_separation_opts {
-        Some(blob_opts) => {
-            // Sum the PHYSICAL size of each blob file selected for relocation
-            // (framing + meta + trailer, not just the compressed payload), a
-            // conservative upper bound on the rewritten output. A stat failure
-            // falls back to 0 for that file — the merge would surface the real
-            // error, and the atomic-commit guarantee keeps a slipped-through
-            // ENOSPC consistent.
-            let bytes: u64 = pick_blob_files_to_rewrite(&payload.table_ids, version, blob_opts)
-                .unwrap_or_default()
-                .iter()
-                .map(|bf| bf.physical_size().unwrap_or(0))
-                .sum();
-            let folder = opts.config.path.join(BLOBS_FOLDER);
-            (
-                bytes,
-                opts.config.fs.available_space(&folder).unwrap_or(u64::MAX),
-            )
-        }
-        None => (0, u64::MAX),
+    let blob_free = if opts.config.kv_separation_opts.is_some() {
+        let folder = opts.config.path.join(BLOBS_FOLDER);
+        opts.config.fs.available_space(&folder).unwrap_or(u64::MAX)
+    } else {
+        u64::MAX
     };
-
     // Quota headroom (tree-wide) bounds the total new bytes on top of the live
     // footprint. `max(0, limit - used)`: an operator quota set below the live
     // footprint leaves zero headroom — the clamp-to-zero is the intended
     // semantics (saturating_sub is the genuine min-clamp here, not masking).
+    // The footprint stat is propagated, not swallowed (an undercounted `used`
+    // would overstate the headroom).
     let quota_headroom = match rc.storage_limit_bytes {
-        Some(limit) => {
-            let used = crate::storage_stats::compute_used_bytes(version).unwrap_or(0);
-            limit.saturating_sub(used)
-        }
+        Some(limit) => limit.saturating_sub(crate::storage_stats::compute_used_bytes(version)?),
         None => u64::MAX,
     };
 
     // Nothing constrains the merge (no probe, no quota) → run.
     if sst_free == u64::MAX && blob_free == u64::MAX && quota_headroom == u64::MAX {
-        return SpaceGate::Run;
+        return Ok(SpaceGate::Run);
     }
 
     const RESERVE: u64 = crate::tree::MIN_RESERVED_HEADROOM;
-    // SST output must fit its volume: leaving the reserved flush floor when
-    // ample, or consuming the emergency reserve (raw free) to break the
-    // no-space-to-free-space deadlock. `>= RESERVE` guards the subtraction.
-    let sst_fits =
-        (sst_free >= RESERVE && sst_sigma <= sst_free - RESERVE) || sst_sigma <= sst_free;
-    let blob_fits = blob_sigma <= blob_free;
-    let quota_fits = sst_sigma + blob_sigma <= quota_headroom;
+    // Whether a given payload's transient output fits every relevant budget. The
+    // per-payload sizes are recomputed because narrowing changes both the SST
+    // input set AND (via `pick_blob_files_to_rewrite` on the actual payload) the
+    // blob relocation set, so a narrowed blob merge can fit where the full one
+    // did not. Stat failures propagate (a silent 0 would undercount and admit
+    // the very rewrite this gate must block).
+    let fits = |p: &CompactionPayload| -> crate::Result<bool> {
+        // SST input bound (output never exceeds the inputs for a pure compaction).
+        let sst_sigma: u64 = p
+            .table_ids
+            .iter()
+            .filter_map(|&id| version.get_table(id))
+            .map(Table::file_size)
+            .sum();
+        let blob_sigma: u64 = match &opts.config.kv_separation_opts {
+            Some(blob_opts) => pick_blob_files_to_rewrite(&p.table_ids, version, blob_opts)?
+                .iter()
+                .try_fold(0u64, |acc, bf| bf.physical_size().map(|size| acc + size))?,
+            None => 0,
+        };
+        // SST output must fit its volume: leaving the reserved flush floor when
+        // ample, or consuming the emergency reserve (raw free) to break the
+        // no-space-to-free-space deadlock. `>= RESERVE` guards the subtraction.
+        let sst_fits =
+            (sst_free >= RESERVE && sst_sigma <= sst_free - RESERVE) || sst_sigma <= sst_free;
+        Ok(sst_fits && blob_sigma <= blob_free && sst_sigma + blob_sigma <= quota_headroom)
+    };
 
-    if sst_fits && blob_fits && quota_fits {
-        return SpaceGate::Run;
+    if fits(payload)? {
+        return Ok(SpaceGate::Run);
     }
 
-    // Narrowing only shrinks the SST input set, so it can rescue an SST-bound
-    // merge but not a blob-relocating one whose blob output is the constraint.
-    if blob_sigma == 0 {
-        let budget = sst_free.min(quota_headroom);
-        if let Some(narrowed) = narrow_merge_to_budget(version, payload, budget) {
-            return SpaceGate::Narrowed(narrowed);
-        }
+    // Constrained: narrow to the smallest run-adjacent pair that fits the SST /
+    // quota budget, then re-check the narrowed payload's full budget (its own
+    // blob relocation set included). Skip only when even the narrowed merge does
+    // not fit.
+    let budget = sst_free.min(quota_headroom);
+    if let Some(narrowed) = narrow_merge_to_budget(version, payload, budget)
+        && fits(&narrowed)?
+    {
+        return Ok(SpaceGate::Narrowed(narrowed));
     }
-    SpaceGate::Skip
+    Ok(SpaceGate::Skip)
 }
 
 /// Narrows a too-large merge to the smallest run-adjacent table pair whose
