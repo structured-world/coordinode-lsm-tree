@@ -234,51 +234,114 @@ enum SpaceGate {
     Skip,
 }
 
-/// Decides whether a chosen merge fits the available disk space, narrowing it to
-/// a minimal reclaiming subset when it does not.
+/// Decides whether a chosen merge fits the available space, narrowing it to a
+/// minimal reclaiming subset when it does not.
 ///
-/// Bound: a merge's transient extra need is at most `Σ input file_size` (the
-/// output never exceeds the inputs). Budget: the minimum free space across every
-/// volume the tree writes to ([`Config::min_available_space`]).
+/// The merge writes two kinds of output to two (possibly different) volumes:
+/// the merged SSTs land in the destination level's volume, and a KV-separated
+/// tree may relocate stale blob files into the blobs folder (the primary
+/// volume). Each output is checked against the free space of the volume it lands
+/// on (the tightest, per-level-routed volume — not a global minimum, so a full
+/// cold-tier route never stalls a hot-level merge), and the total new bytes are
+/// also checked against the configured quota headroom (`storage_limit_bytes`),
+/// so compaction cannot grow the tree past the operator's budget.
 ///
-/// - Admission off, or a backend that cannot report free space → [`SpaceGate::Run`]
-///   (no disk-pressure signal; behaviour identical to a build without the gate).
-/// - `Σinputs + reserve ≤ free` → run (ample room, leaves the flush/metadata floor).
-/// - `Σinputs ≤ free` → run anyway, consuming the emergency reserve: a
-///   space-reclaiming merge must be able to run even at the limit, which is what
-///   breaks the no-space-to-free-space deadlock.
-/// - `Σinputs > free` → narrow to the smallest run-adjacent table pair that fits;
-///   if none fits, skip.
+/// The SST bound is `Σ input file_size`; the blob bound is the on-disk size of
+/// the blob files selected for relocation. This is a best-effort estimate: a
+/// merge operator / compaction filter that *grows* values can still write more
+/// than the inputs, so a mid-merge `ENOSPC` remains possible — that case is
+/// handled by the atomic-commit guarantee (orphan output, intact inputs,
+/// unchanged manifest, retried later), not by this gate. The gate's job is to
+/// keep the common doomed merge from starting.
+///
+/// - Admission off, or no volume can report free space and no quota → [`SpaceGate::Run`].
+/// - SST output fits its volume (leaving the reserved flush floor when ample, or
+///   consuming the emergency reserve to break the deadlock), blob output fits the
+///   blobs volume, and the total fits the quota → [`SpaceGate::Run`].
+/// - Otherwise, a pure-SST merge is narrowed to the smallest run-adjacent pair
+///   that fits; a blob-relocating merge that does not fit is skipped (narrowing
+///   does not shrink blob output).
 fn space_gate_for_merge(
     version: &Version,
     opts: &Options,
     payload: &CompactionPayload,
 ) -> SpaceGate {
-    if !opts.runtime_config.load_full().storage_admission_check {
+    let rc = opts.runtime_config.load_full();
+    if !rc.storage_admission_check {
         return SpaceGate::Run;
     }
 
-    let free = opts.config.min_available_space();
-    if free == u64::MAX {
-        // Backend cannot report free space → never fabricate disk pressure.
-        return SpaceGate::Run;
-    }
+    // SST output lands in the destination level's volume (tiered routing aware).
+    let (sst_path, sst_fs) = opts.config.tables_folder_for_level(payload.dest_level);
+    let sst_free = sst_fs.available_space(&sst_path).unwrap_or(u64::MAX);
 
-    let sigma: u64 = payload
+    // SST input bound (output never exceeds the inputs for a pure compaction).
+    // Plain sum: on-disk file sizes are bounded by the filesystem capacity.
+    let sst_sigma: u64 = payload
         .table_ids
         .iter()
         .filter_map(|&id| version.get_table(id))
         .map(Table::file_size)
-        .fold(0u64, u64::saturating_add);
+        .sum();
 
-    if sigma.saturating_add(crate::tree::MIN_RESERVED_HEADROOM) <= free || sigma <= free {
+    // A KV-separated tree may relocate stale blob files into the primary blobs
+    // folder; those bytes are not part of the SST sizes and land on a different
+    // volume.
+    let (blob_sigma, blob_free) = match &opts.config.kv_separation_opts {
+        Some(blob_opts) => {
+            let bytes: u64 = pick_blob_files_to_rewrite(&payload.table_ids, version, blob_opts)
+                .unwrap_or_default()
+                .iter()
+                .map(BlobFile::on_disk_bytes)
+                .sum();
+            let folder = opts.config.path.join(BLOBS_FOLDER);
+            (
+                bytes,
+                opts.config.fs.available_space(&folder).unwrap_or(u64::MAX),
+            )
+        }
+        None => (0, u64::MAX),
+    };
+
+    // Quota headroom (tree-wide) bounds the total new bytes on top of the live
+    // footprint. `max(0, limit - used)`: an operator quota set below the live
+    // footprint leaves zero headroom — the clamp-to-zero is the intended
+    // semantics (saturating_sub is the genuine min-clamp here, not masking).
+    let quota_headroom = match rc.storage_limit_bytes {
+        Some(limit) => {
+            let used = crate::storage_stats::compute_used_bytes(version).unwrap_or(0);
+            limit.saturating_sub(used)
+        }
+        None => u64::MAX,
+    };
+
+    // Nothing constrains the merge (no probe, no quota) → run.
+    if sst_free == u64::MAX && blob_free == u64::MAX && quota_headroom == u64::MAX {
         return SpaceGate::Run;
     }
 
-    match narrow_merge_to_budget(version, payload, free) {
-        Some(narrowed) => SpaceGate::Narrowed(narrowed),
-        None => SpaceGate::Skip,
+    const RESERVE: u64 = crate::tree::MIN_RESERVED_HEADROOM;
+    // SST output must fit its volume: leaving the reserved flush floor when
+    // ample, or consuming the emergency reserve (raw free) to break the
+    // no-space-to-free-space deadlock. `>= RESERVE` guards the subtraction.
+    let sst_fits =
+        (sst_free >= RESERVE && sst_sigma <= sst_free - RESERVE) || sst_sigma <= sst_free;
+    let blob_fits = blob_sigma <= blob_free;
+    let quota_fits = sst_sigma + blob_sigma <= quota_headroom;
+
+    if sst_fits && blob_fits && quota_fits {
+        return SpaceGate::Run;
     }
+
+    // Narrowing only shrinks the SST input set, so it can rescue an SST-bound
+    // merge but not a blob-relocating one whose blob output is the constraint.
+    if blob_sigma == 0 {
+        let budget = sst_free.min(quota_headroom);
+        if let Some(narrowed) = narrow_merge_to_budget(version, payload, budget) {
+            return SpaceGate::Narrowed(narrowed);
+        }
+    }
+    SpaceGate::Skip
 }
 
 /// Narrows a too-large merge to the smallest run-adjacent table pair whose
@@ -315,7 +378,9 @@ fn narrow_merge_to_budget(
         if !payload.table_ids.contains(&a.id()) || !payload.table_ids.contains(&b.id()) {
             continue;
         }
-        let combined = a.file_size().saturating_add(b.file_size());
+        // Two on-disk file sizes; the sum is bounded by filesystem capacity and
+        // cannot overflow u64.
+        let combined = a.file_size() + b.file_size();
         if combined > budget {
             continue;
         }
@@ -717,7 +782,8 @@ fn run_subcompaction(
     for (idx, item) in merge_iter.enumerate() {
         let item = item?;
 
-        let io_bytes = (item.key.user_key.len() as u64).saturating_add(item.value.len() as u64);
+        // One key + value length; the sum is far below u64::MAX → plain add.
+        let io_bytes = item.key.user_key.len() as u64 + item.value.len() as u64;
         if opts
             .rate_limiter
             .request_interruptible(io_bytes, || opts.stop_signal.is_stopped())
@@ -1377,7 +1443,8 @@ fn merge_tables(
             // payload of KV-separated compactions is debited separately at
             // its write site in `RelocatingCompaction::write`, where the
             // real moved bytes are known.
-            let io_bytes = (item.key.user_key.len() as u64).saturating_add(item.value.len() as u64);
+            // One key + value length; the sum is far below u64::MAX → plain add.
+            let io_bytes = item.key.user_key.len() as u64 + item.value.len() as u64;
             if opts
                 .rate_limiter
                 .request_interruptible(io_bytes, || opts.stop_signal.is_stopped())
@@ -2264,11 +2331,11 @@ mod tests {
             "narrowed pair is the smallest-Σ adjacent pair"
         );
 
-        // A budget below the smallest single table fits nothing → None.
+        // A budget below the smallest single table fits nothing → None. An SST
+        // file is always larger than a byte, so `- 1` cannot underflow.
         let smallest_table = ordered.iter().map(|(_, s)| *s).min().expect("non-empty");
         assert!(
-            super::narrow_merge_to_budget(&version, &payload, smallest_table.saturating_sub(1))
-                .is_none(),
+            super::narrow_merge_to_budget(&version, &payload, smallest_table - 1).is_none(),
             "no pair fits a sub-single-table budget"
         );
 

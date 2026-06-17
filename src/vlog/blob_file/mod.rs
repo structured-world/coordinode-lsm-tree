@@ -242,6 +242,12 @@ impl BlobFile {
         self.0.meta.item_count
     }
 
+    /// On-disk compressed payload size in bytes (without the metadata block /
+    /// trailer). Used to bound the transient output of a blob relocation.
+    pub(crate) fn on_disk_bytes(&self) -> u64 {
+        self.0.meta.total_compressed_bytes
+    }
+
     /// Returns `true` if the blob file is stale (based on the given staleness threshold).
     pub(crate) fn is_stale(&self, frag_map: &FragmentationMap, threshold: f32) -> bool {
         frag_map.get(&self.id()).is_some_and(|x| {

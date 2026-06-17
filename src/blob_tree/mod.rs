@@ -342,7 +342,10 @@ impl AbstractTree for BlobTree {
             && capacity.is_some()
             && stats.status == crate::StorageStatus::Healthy
         {
-            stats.status = if compaction_possible {
+            // Full when the free room covers a full compaction's transient
+            // output, tight otherwise (see the standard tree's override).
+            let available = available.unwrap_or(0);
+            stats.status = if available >= stats.full_compaction_bytes {
                 crate::StorageStatus::FullCompactionAvailable
             } else {
                 crate::StorageStatus::TightCompactionAvailable
