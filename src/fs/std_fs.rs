@@ -322,6 +322,11 @@ impl Fs for StdFs {
         Some(KERNEL_BACKEND_ID)
     }
 
+    #[cfg(unix)]
+    fn volume_id(&self, path: &Path) -> Option<u64> {
+        super::unix_volume_id(path)
+    }
+
     fn hard_link_count(&self, path: &Path) -> io::Result<u64> {
         #[cfg(unix)]
         {
@@ -1273,6 +1278,30 @@ mod tests {
         file.read_to_string(&mut buf)?;
         assert_eq!(buf, "hello world");
 
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn std_fs_volume_id_is_shared_within_a_mount_and_none_for_missing_path() -> io::Result<()> {
+        // `volume_id` is the `st_dev` of the mount: two directories under one
+        // tempdir share it (one free-space pool), so the space gate combines
+        // their budgets. A path that cannot be stat-ed yields `None`
+        // (independence unproven → callers combine conservatively).
+        let dir = tempfile::tempdir()?;
+        let fs = StdFs;
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        fs.create_dir_all(&a)?;
+        fs.create_dir_all(&b)?;
+        let id_a = fs.volume_id(&a);
+        assert!(id_a.is_some(), "a real path reports its device id");
+        assert_eq!(id_a, fs.volume_id(&b), "same mount → same volume id");
+        assert_eq!(
+            fs.volume_id(&dir.path().join("does-not-exist")),
+            None,
+            "an un-stat-able path is unproven, not falsely independent"
+        );
         Ok(())
     }
 

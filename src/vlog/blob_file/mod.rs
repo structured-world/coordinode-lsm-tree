@@ -242,6 +242,21 @@ impl BlobFile {
         self.0.meta.item_count
     }
 
+    /// Physical on-disk file size in bytes, including the per-entry framing
+    /// (V4 header + key) and the metadata block / trailer — not just the
+    /// compressed payload (`meta.total_compressed_bytes`). Used as a
+    /// conservative upper bound on the transient output of a blob relocation:
+    /// the rewritten file re-emits the same framing, so the source file's
+    /// physical size bounds the output (and includes the dead blobs a relocation
+    /// drops, making it strictly conservative).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blob file's size cannot be stat-ed.
+    pub(crate) fn physical_size(&self) -> crate::Result<u64> {
+        Ok(self.0.fs.metadata(&self.0.path)?.len)
+    }
+
     /// Returns `true` if the blob file is stale (based on the given staleness threshold).
     pub(crate) fn is_stale(&self, frag_map: &FragmentationMap, threshold: f32) -> bool {
         frag_map.get(&self.id()).is_some_and(|x| {

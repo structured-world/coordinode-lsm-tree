@@ -176,3 +176,46 @@ fn storage_stats_empty_tree_has_zero_usage_and_no_estimate() -> lsm_tree::Result
     assert_eq!(stats.estimated_remaining_entries(1_000_000), 0);
     Ok(())
 }
+
+#[test]
+fn storage_stats_reports_compaction_headroom_figures_for_gauge() -> lsm_tree::Result<()> {
+    // The capacity-gauge figures: a full compaction needs room for its transient
+    // output (bounded by the largest level), a tight compaction needs only the
+    // reserved working floor. With everything in one level after a flush, the
+    // full figure equals that level's on-disk size (== used_bytes here).
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path());
+
+    // Empty tree: nothing to compact.
+    let empty = tree.storage_stats()?;
+    assert_eq!(
+        empty.full_compaction_bytes, 0,
+        "no levels → no full-compaction need"
+    );
+    assert!(
+        empty.tight_compaction_bytes > 0,
+        "tight need is the fixed reserved working floor"
+    );
+
+    for i in 0..500u64 {
+        tree.insert(format!("key{i:05}").as_bytes(), b"value-payload", i);
+    }
+    tree.flush_active_memtable(0)?;
+
+    let stats = tree.storage_stats()?;
+    // All data sits in a single level, so the largest level's size is the whole
+    // footprint. The figure is in metadata `file_size` units (what the gate
+    // bounds against), which is just below the physical `used_bytes` (it omits
+    // the meta block / footer), so it is positive and does not exceed used_bytes.
+    assert!(
+        stats.full_compaction_bytes > 0 && stats.full_compaction_bytes <= stats.used_bytes,
+        "single-level full need ({}) must be in (0, used_bytes={}]",
+        stats.full_compaction_bytes,
+        stats.used_bytes
+    );
+    assert_eq!(
+        stats.tight_compaction_bytes, empty.tight_compaction_bytes,
+        "tight need is a fixed floor, independent of data volume"
+    );
+    Ok(())
+}

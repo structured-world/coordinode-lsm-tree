@@ -45,7 +45,7 @@ use crate::metrics::Metrics;
 /// [`Tree::compute_write_admission`]). Even with an empty active memtable the
 /// gate keeps at least this much room below the budget so the next writes and a
 /// space-reclaiming compaction have somewhere to land. 1 MiB.
-const MIN_RESERVED_HEADROOM: u64 = 1024 * 1024;
+pub const MIN_RESERVED_HEADROOM: u64 = 1024 * 1024;
 
 /// How long a cached disk-free sample stays valid before the admission gate
 /// re-probes. Bounds how stale the physical free-space figure can be when the
@@ -321,21 +321,58 @@ impl AbstractTree for Tree {
     }
 
     fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
+        // One version snapshot reused for the footprint and the full-compaction
+        // estimate below: a second `current_version()` could race a concurrent
+        // flush / compaction and mix two snapshots.
+        let version = self.current_version();
         // Standard tree: SST values ARE user values (no KV separation).
-        let mut stats = crate::storage_stats::compute_storage_stats(
-            &self.current_version(),
-            self.is_compacting(),
-            true,
-        )?;
+        let mut stats =
+            crate::storage_stats::compute_storage_stats(&version, self.is_compacting(), true)?;
         // Fill the disk-aware capacity figures (quota + free-space probe) the
         // version-only computation can't know.
         let (capacity, available, compaction_possible) = self.admission_capacity(stats.used_bytes);
         stats.capacity_bytes = capacity;
         stats.available_bytes = available;
         stats.compaction_possible = compaction_possible;
+        // When admission gating is active and a compaction is not already
+        // running, surface whether a full compaction has working room through the
+        // SAME two-layer check the compaction space gate enforces (logical quota +
+        // physical free per destination volume), so the reported status matches
+        // what the gate will admit. With gating off the gate never runs, so the
+        // status stays `Healthy` even though the backend can report a finite
+        // capacity.
+        if self.storage_admission_enabled()
+            && capacity.is_some()
+            && stats.status == crate::StorageStatus::Healthy
+        {
+            // A full compaction's transient output is bounded by the largest
+            // level's on-disk size, but it LANDS in the last configured level's
+            // volume (`level_count - 1`), which under tiered routing can be a
+            // different filesystem than the largest level. A standard tree has no
+            // blob relocation. Using the per-volume gate (not `available >=
+            // full_compaction_bytes` against the min-volume free) keeps the status
+            // from reporting tight when a routed merge would actually be admitted.
+            let sst_need = crate::storage_stats::full_compaction_demand_bytes(&version);
+            // `saturating_sub`: `level_count >= 1` always, so this is the last
+            // level index; the clamp only guards a degenerate zero-level config.
+            let sst_dest_level = self.0.config.level_count.saturating_sub(1);
+            let quota_headroom = self.quota_headroom(stats.used_bytes);
+            let full_fits = crate::compaction::worker::space_fits_two_layer(
+                &self.0.config,
+                quota_headroom,
+                sst_need,
+                sst_dest_level,
+                0,
+            );
+            stats.status = if full_fits {
+                crate::StorageStatus::FullCompactionAvailable
+            } else {
+                crate::StorageStatus::TightCompactionAvailable
+            };
+        }
         // A closed admission gate is the operator-actionable state, so it takes
-        // precedence over CompactionInProgress (a read-only tree may well be
-        // compacting to reclaim space).
+        // precedence over the others (a read-only tree may well be compacting to
+        // reclaim space).
         if self.is_read_only() {
             stats.status = crate::StorageStatus::ReadOnlyOutOfSpace;
         }
@@ -2312,18 +2349,7 @@ impl Tree {
     /// `u64::MAX` = "no disk pressure", so a probe failure never falsely drives
     /// the tree read-only.
     fn probe_disk_free(&self) -> u64 {
-        let mut free = self
-            .0
-            .config
-            .fs
-            .available_space(&self.0.config.path)
-            .unwrap_or(u64::MAX);
-        if let Some(routes) = &self.0.config.level_routes {
-            for route in routes {
-                free = free.min(route.fs.available_space(&route.path).unwrap_or(u64::MAX));
-            }
-        }
-        free
+        self.0.config.min_available_space()
     }
 
     /// Disk-aware capacity figures for [`AbstractTree::storage_stats`], given the
@@ -2343,16 +2369,51 @@ impl Tree {
             .load()
             .storage_limit_bytes
             .unwrap_or(u64::MAX);
-        let capacity = quota.min(self.probe_disk_free().saturating_add(used));
+        let free = self.probe_disk_free();
+        // `free == u64::MAX` is the "backend can't report free space" sentinel:
+        // adding `used` would overflow, so treat capacity as quota-only (the
+        // explicit branch avoids the overflow without masking it with saturation).
+        // Otherwise `free + used` ≤ ~2× disk capacity and cannot overflow u64.
+        let capacity = if free == u64::MAX {
+            quota
+        } else {
+            quota.min(free + used)
+        };
         if capacity == u64::MAX {
             return (None, None, true);
         }
+        // `available = max(0, capacity - used)`: an operator quota set below the
+        // live footprint makes `capacity < used`, and available space cannot be
+        // negative. The clamp-to-zero IS the intended semantics here.
         let available = capacity.saturating_sub(used);
         (
             Some(capacity),
             Some(available),
             available >= MIN_RESERVED_HEADROOM,
         )
+    }
+
+    /// The logical partition-quota headroom for the two-layer space model:
+    /// `max(0, storage_limit_bytes - used)`, or `u64::MAX` when no quota is set.
+    ///
+    /// This is Layer 1 (volume-agnostic) of [`crate::compaction::worker::space_fits_two_layer`];
+    /// the physical free-space probe is Layer 2. An operator quota set below the
+    /// live footprint leaves zero headroom — the clamp-to-zero is the intended
+    /// min-semantics, not masking.
+    pub(crate) fn quota_headroom(&self, used: u64) -> u64 {
+        self.0
+            .runtime_config
+            .load()
+            .storage_limit_bytes
+            .map_or(u64::MAX, |limit| limit.saturating_sub(used))
+    }
+
+    /// Whether the opt-in storage admission gate is active (a near-full disk or
+    /// configured quota can drive the tree read-only and gate compaction space).
+    /// Capacity introspection figures are reported regardless; this only governs
+    /// whether the gate actually enforces.
+    pub(crate) fn storage_admission_enabled(&self) -> bool {
+        self.0.runtime_config.load().storage_admission_check
     }
 
     #[expect(
@@ -2446,7 +2507,15 @@ impl Tree {
         // free drives the whole tree read-only, exactly so a later flush /
         // compaction targeting that route cannot hit ENOSPC.
         let quota = rc.storage_limit_bytes.unwrap_or(u64::MAX);
-        let limit = quota.min(disk_free.saturating_add(used));
+        // `disk_free == u64::MAX` is the "backend can't report" sentinel; adding
+        // `used` would overflow, so treat the limit as quota-only (explicit
+        // branch, no saturation masking). Otherwise `disk_free + used` ≤ ~2× disk
+        // capacity and cannot overflow u64.
+        let limit = if disk_free == u64::MAX {
+            quota
+        } else {
+            quota.min(disk_free + used)
+        };
         // Both sources unbounded → nothing to gate.
         if limit == u64::MAX {
             return Ok(());
@@ -2463,22 +2532,20 @@ impl Tree {
         // any sealed (rotated) memtables awaiting flush — not just the active
         // one: after a rotation the active memtable is empty but the sealed
         // memtable's queued flush will still consume disk, so it must be
-        // reserved for.
-        // Saturating fold so the running total stays fail-closed (a hypothetical
-        // overflow clamps to u64::MAX → downstream sees over-budget), consistent
-        // with the checked/saturating arithmetic below.
-        let pending_memtable_bytes = super_version
-            .sealed_memtables
-            .iter()
-            .map(|m| m.size())
-            .fold(super_version.active_memtable.size(), u64::saturating_add);
+        // reserved for. Memtable sizes are bounded by RAM, so the sum (and the
+        // +1/8 overhead margin below) cannot overflow u64 → plain arithmetic.
+        let pending_memtable_bytes: u64 = super_version.active_memtable.size()
+            + super_version
+                .sealed_memtables
+                .iter()
+                .map(|m| m.size())
+                .sum::<u64>();
 
-        // `compute_used_bytes` saturates its file-size sums, so `used` could in
-        // principle be `u64::MAX`; keep the gate fail-closed with checked
-        // arithmetic — any overflow means "definitely over budget", so deny.
-        let reserved = pending_memtable_bytes
-            .saturating_add(pending_memtable_bytes / 8)
-            .max(MIN_RESERVED_HEADROOM);
+        let reserved =
+            (pending_memtable_bytes + pending_memtable_bytes / 8).max(MIN_RESERVED_HEADROOM);
+        // `used` (disk) + `reserved` (RAM-bounded) cannot realistically overflow,
+        // but keep the comparison fail-closed with checked arithmetic: any
+        // overflow means "definitely over budget", so deny.
         match used.checked_add(reserved) {
             Some(total) if total <= limit => Ok(()),
             _ => Err(crate::Error::StorageFull { used, limit }),

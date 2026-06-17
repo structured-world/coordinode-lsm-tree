@@ -753,6 +753,33 @@ pub trait Fs: Send + Sync + 'static {
         None
     }
 
+    /// Identifies the **physical volume** (free-space pool) backing `path`.
+    ///
+    /// Distinct from [`backend_id`](Self::backend_id), which identifies the path
+    /// *namespace* (inode table) and is therefore the SAME for every `StdFs`
+    /// path on a host even across different mounts. This instead identifies the
+    /// *mount / device* `path` lives on (Unix `st_dev`), so two paths can be
+    /// compared for sharing one free-space pool.
+    ///
+    /// The storage-admission gate uses it to decide whether a routed SST
+    /// destination and the blob folder land on independent volumes (budget each
+    /// separately) or the same filesystem (budget their combined transient peak,
+    /// or it can `ENOSPC`). `level_routes` maps levels to paths but does NOT
+    /// prove a separate mount.
+    ///
+    /// Two paths with the same `Some(id)` share a volume; two with different
+    /// `Some(id)` are provably independent. `None` means the backend cannot
+    /// prove independence — callers MUST conservatively assume the paths share a
+    /// volume (combine budgets), even when both sides return `None`.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns `None` (independence unknown → callers combine).
+    fn volume_id(&self, path: &Path) -> Option<u64> {
+        let _ = path;
+        None
+    }
+
     /// Reports the [`FsCapabilities`] of the filesystem backing `path`.
     ///
     /// Capabilities are a property of the *mount* `path` lives on, not of the
@@ -944,6 +971,17 @@ pub(crate) fn statvfs_available_space(path: &Path) -> std::io::Result<u64> {
     let frsize = st.f_frsize as u64;
     let bavail = st.f_bavail as u64;
     Ok(bavail.saturating_mul(frsize))
+}
+
+/// The device id (`st_dev`) of the mount backing `path`, the
+/// [`Fs::volume_id`] basis for the std and `io_uring` (libc) backends. Two
+/// paths on the same mount share `st_dev` (one free-space pool); different
+/// mounts have different `st_dev`. `None` if `path` cannot be stat-ed (e.g. it
+/// does not exist yet) — independence is then unproven and callers combine.
+#[cfg(all(unix, feature = "std"))]
+pub(crate) fn unix_volume_id(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.dev())
 }
 
 /// Streamed independent copy of `src` to `dst` through `fs`'s own [`Fs::open`].

@@ -160,6 +160,20 @@ pub struct BlobTree {
 }
 
 impl BlobTree {
+    /// Physical footprint of the stale blob files a full compaction would
+    /// relocate: the linked, stale, non-dead subset across every live table (the
+    /// SAME set the merge gate budgets via `pick_blob_files_to_rewrite`), summed
+    /// by on-disk size. Zero when KV separation is unconfigured.
+    fn full_compaction_blob_need(&self, version: &crate::version::Version) -> crate::Result<u64> {
+        let Some(blob_opts) = &self.index.config.kv_separation_opts else {
+            return Ok(0);
+        };
+        let all_tables: crate::HashSet<TableId> = version.iter_tables().map(Table::id).collect();
+        crate::compaction::worker::pick_blob_files_to_rewrite(&all_tables, version, blob_opts)?
+            .iter()
+            .try_fold(0u64, |acc, bf| bf.physical_size().map(|size| acc + size))
+    }
+
     pub(crate) fn open(config: Config) -> crate::Result<Self> {
         use crate::file::{BLOBS_FOLDER, fsync_directory};
 
@@ -321,9 +335,12 @@ impl AbstractTree for BlobTree {
         // Forward the index tree's compaction state (the default impl would
         // always report idle), and mark value bytes as NOT user values: large
         // values are KV-separated into blob files, so the SST records only
-        // indirection pointers.
+        // indirection pointers. One version snapshot is reused for both the
+        // footprint and the blob-headroom sum below: a second `current_version()`
+        // could race a concurrent flush / compaction and mix two snapshots.
+        let version = self.current_version();
         let mut stats = crate::storage_stats::compute_storage_stats(
-            &self.current_version(),
+            &version,
             self.index.is_compacting(),
             false,
         )?;
@@ -336,6 +353,46 @@ impl AbstractTree for BlobTree {
         stats.capacity_bytes = capacity;
         stats.available_bytes = available;
         stats.compaction_possible = compaction_possible;
+        // A full compaction of a blob tree also relocates STALE blob files, which
+        // the merge gate budgets via `pick_blob_files_to_rewrite` (linked, stale,
+        // non-dead). Estimate the same subset across every table — NOT the whole
+        // live blob footprint, which would overstate the need (large non-stale
+        // blobs are not rewritten) and report tight while the gate would admit
+        // the merge. Fold it into the gauge figure.
+        let blob_need = self.full_compaction_blob_need(&version)?;
+        stats.full_compaction_bytes += blob_need;
+        // Surface full-vs-tight compaction availability through the SAME two-layer
+        // check the compaction space gate enforces (logical quota + physical free
+        // per destination volume), so the status matches what the gate admits.
+        if self.index.storage_admission_enabled()
+            && capacity.is_some()
+            && stats.status == crate::StorageStatus::Healthy
+        {
+            // SST output lands in the LAST configured level's volume
+            // (`level_count - 1`), stale blob relocation in the primary blobs
+            // volume; the demand is bounded by the largest level's size. The
+            // per-volume gate (not `available >= full_compaction_bytes` against
+            // the min-volume free) keeps the status from reporting tight when the
+            // SST and blob outputs each fit their own volume — see the gate's
+            // two-layer model.
+            let sst_need = crate::storage_stats::full_compaction_demand_bytes(&version);
+            // `saturating_sub`: `level_count >= 1` always (the clamp only guards a
+            // degenerate zero-level config) → the last level index.
+            let sst_dest_level = self.index.config.level_count.saturating_sub(1);
+            let quota_headroom = self.index.quota_headroom(stats.used_bytes);
+            let full_fits = crate::compaction::worker::space_fits_two_layer(
+                &self.index.config,
+                quota_headroom,
+                sst_need,
+                sst_dest_level,
+                blob_need,
+            );
+            stats.status = if full_fits {
+                crate::StorageStatus::FullCompactionAvailable
+            } else {
+                crate::StorageStatus::TightCompactionAvailable
+            };
+        }
         // Admission is driven by the index tree's runtime config / footprint;
         // a closed gate is the operator-actionable state (see the standard
         // tree's override for the precedence rationale).

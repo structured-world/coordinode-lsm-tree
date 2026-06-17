@@ -13,10 +13,14 @@ use crate::version::Version;
 
 /// Coarse storage state of a tree.
 ///
-/// This release reports [`Self::Healthy`] and [`Self::CompactionInProgress`].
-/// The capacity-dependent variants are populated once storage admission control
-/// (a configured byte quota / disk-free probe) lands; they are defined now so
-/// the enum stays stable across that work.
+/// With storage admission gating off (no configured quota and a backend that
+/// cannot report free space) a tree reports [`Self::Healthy`] or, mid-run,
+/// [`Self::CompactionInProgress`]. Once gating is active (bounded capacity), an
+/// idle tree instead reports compaction availability:
+/// [`Self::FullCompactionAvailable`] when a full compaction has working room,
+/// [`Self::TightCompactionAvailable`] when only the opt-in tight-space mode
+/// would fit, and [`Self::ReadOnlyOutOfSpace`] when the write gate is closed
+/// (this takes precedence over a concurrent compaction).
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub enum StorageStatus {
@@ -61,10 +65,23 @@ pub struct StorageStats {
 
     /// Whether a compaction can still run given the remaining free space (it
     /// needs working room to write merged output). `true` when unbounded or
-    /// when at least the reserved compaction-working floor remains; `false`
-    /// when the disk is too full for a compaction to make progress. The finer
-    /// full-vs-tight distinction is carried by [`Self::status`].
+    /// when at least [`Self::tight_compaction_bytes`] of free space remains;
+    /// `false` when the disk is too full for a compaction to make progress. The
+    /// finer full-vs-tight distinction is carried by [`Self::status`].
     pub compaction_possible: bool,
+
+    /// Estimated free space (bytes) a FULL compaction needs for its transient
+    /// output while the inputs still exist: the largest level's on-disk size
+    /// (an upper bound on a single merge's input set). A full compaction has
+    /// room when [`Self::available_bytes`] `>=` this. Pair with `used_bytes` /
+    /// `capacity_bytes` to draw a capacity gauge: `used` → `used + tight_compaction_bytes`
+    /// → `used + full_compaction_bytes` → `capacity`.
+    pub full_compaction_bytes: u64,
+
+    /// Estimated free space (bytes) a minimal (tight) space-reclaiming
+    /// compaction needs to make forward progress: the reserved working floor.
+    /// Tight compaction has room when [`Self::available_bytes`] `>=` this.
+    pub tight_compaction_bytes: u64,
 
     /// Number of live entries (all versions) across all live SSTs.
     pub item_count: u64,
@@ -124,14 +141,33 @@ impl StorageStats {
 ///
 /// Returns an error if a live table or blob file's size cannot be stat-ed.
 pub(crate) fn compute_used_bytes(version: &Version) -> crate::Result<u64> {
+    // Sum of on-disk file sizes, bounded by the filesystem capacity → cannot
+    // overflow u64; plain arithmetic.
     let mut used_bytes = 0u64;
     for table in version.iter_tables() {
-        used_bytes = used_bytes.saturating_add(table.fs.metadata(&table.path)?.len);
+        used_bytes += table.fs.metadata(&table.path)?.len;
     }
     for blob in version.blob_files.iter() {
-        used_bytes = used_bytes.saturating_add(blob.0.fs.metadata(&blob.0.path)?.len);
+        used_bytes += blob.0.fs.metadata(&blob.0.path)?.len;
     }
     Ok(used_bytes)
+}
+
+/// The transient-output bound a full compaction's space check uses: the largest
+/// level's on-disk size (the `full_compaction_bytes` gauge figure), an upper
+/// bound on a single merge's input set. `0` for an empty tree.
+///
+/// This is the DEMAND. The destination VOLUME is a separate concern: a full
+/// compaction writes its output to the last configured level
+/// (`level_count - 1`), not to whichever level is currently largest, so callers
+/// pass the last level as the destination to the per-volume space check (the two
+/// differ only under tiered routing, where they can be different filesystems).
+pub(crate) fn full_compaction_demand_bytes(version: &Version) -> u64 {
+    version
+        .iter_levels()
+        .map(crate::version::Level::size)
+        .max()
+        .unwrap_or(0)
 }
 
 /// Computes [`StorageStats`] from a live version's table + blob-file metadata.
@@ -172,18 +208,22 @@ pub(crate) fn compute_storage_stats(
     // sums; a single legacy table without them makes the average unrepresentable.
     let mut all_have_shape = true;
 
+    // Every running total below is a sum of on-disk byte sizes or live item
+    // counts; both are bounded by the filesystem capacity / the live entry count
+    // and cannot overflow u64, so plain arithmetic is correct (a debug-overflow
+    // would itself signal a corrupt metadata read).
     for table in version.iter_tables() {
         let m = &table.metadata;
         // Physical file size, NOT m.file_size (which undercounts — see above).
         let on_disk = table.fs.metadata(&table.path)?.len;
-        used_bytes = used_bytes.saturating_add(on_disk);
-        item_count = item_count.saturating_add(m.item_count);
+        used_bytes += on_disk;
+        item_count += m.item_count;
         table_count += 1;
-        reclaimable_entries = reclaimable_entries.saturating_add(m.weak_tombstone_reclaimable);
+        reclaimable_entries += m.weak_tombstone_reclaimable;
         match (m.sum_user_key_bytes, m.sum_value_bytes) {
             (Some(k), Some(v)) => {
-                sum_key = sum_key.saturating_add(k);
-                sum_value = sum_value.saturating_add(v);
+                sum_key += k;
+                sum_value += v;
             }
             _ => all_have_shape = false,
         }
@@ -192,7 +232,7 @@ pub(crate) fn compute_storage_stats(
     // Physical blob-file size (metadata + trailer included), NOT
     // BlobFileList::on_disk_size() which sums only the compressed payload.
     for blob in version.blob_files.iter() {
-        used_bytes = used_bytes.saturating_add(blob.0.fs.metadata(&blob.0.path)?.len);
+        used_bytes += blob.0.fs.metadata(&blob.0.path)?.len;
     }
 
     let avg_entry_on_disk_bytes = if item_count == 0 {
@@ -207,7 +247,17 @@ pub(crate) fn compute_storage_stats(
     let avg_value_bytes =
         (have_shape && value_bytes_are_user_values).then(|| sum_value / item_count);
 
-    let reclaimable_bytes_estimate = reclaimable_entries.saturating_mul(avg_entry_on_disk_bytes);
+    // reclaimable_entries ≤ item_count and avg_entry_on_disk_bytes = used / item_count,
+    // so the product is ≤ used_bytes (bounded by disk capacity): plain multiply.
+    let reclaimable_bytes_estimate = reclaimable_entries * avg_entry_on_disk_bytes;
+
+    // A full compaction's transient output is bounded by its input set; the
+    // largest single merge is bounded by the largest level's on-disk size, so
+    // that is the free space a full compaction needs.
+    let full_compaction_bytes = full_compaction_demand_bytes(version);
+    // A minimal (tight) space-reclaiming merge needs only the reserved working
+    // floor to make forward progress.
+    let tight_compaction_bytes = crate::tree::MIN_RESERVED_HEADROOM;
 
     let status = if is_compacting {
         StorageStatus::CompactionInProgress
@@ -223,6 +273,8 @@ pub(crate) fn compute_storage_stats(
         capacity_bytes: None,
         available_bytes: None,
         compaction_possible: true,
+        full_compaction_bytes,
+        tight_compaction_bytes,
         item_count,
         table_count,
         avg_entry_on_disk_bytes,
@@ -243,6 +295,8 @@ mod tests {
             capacity_bytes: None,
             available_bytes: None,
             compaction_possible: true,
+            full_compaction_bytes: 0,
+            tight_compaction_bytes: 0,
             item_count: 0,
             table_count: 0,
             avg_entry_on_disk_bytes,
