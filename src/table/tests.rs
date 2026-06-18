@@ -710,6 +710,52 @@ fn restricted_view_clamps_point_and_range_reads() -> crate::Result<()> {
     )
 }
 
+#[test]
+#[expect(clippy::unwrap_used)]
+fn reopen_restricted_yields_a_distinct_clamped_view() -> crate::Result<()> {
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"c", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"d", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"e", b"v", 0, crate::ValueType::Value),
+    ];
+
+    test_with_table(
+        &items,
+        |table| {
+            // Re-open as a distinct Inner over the same file, clamped to >= "c".
+            let restricted = table.reopen_restricted(crate::UserKey::from(&b"c"[..]))?;
+
+            assert_eq!(None, restricted.get(b"a", SeqNo::MAX, hash64(b"a"))?);
+            assert_eq!(None, restricted.get(b"b", SeqNo::MAX, hash64(b"b"))?);
+            assert!(restricted.get(b"c", SeqNo::MAX, hash64(b"c"))?.is_some());
+            assert!(restricted.get(b"e", SeqNo::MAX, hash64(b"e"))?.is_some());
+
+            // The original view of the same file is unaffected.
+            assert!(table.get(b"a", SeqNo::MAX, hash64(b"a"))?.is_some());
+
+            // A full scan of the re-opened view yields only keys >= the bound.
+            let keys: Vec<_> = restricted
+                .range(..)
+                .map(|r| r.unwrap().key.user_key)
+                .collect();
+            assert_eq!(
+                keys,
+                vec![
+                    crate::UserKey::from(&b"c"[..]),
+                    crate::UserKey::from(&b"d"[..]),
+                    crate::UserKey::from(&b"e"[..]),
+                ],
+            );
+
+            Ok(())
+        },
+        None,
+        Some(|x| x),
+    )
+}
+
 /// Writes `items` through an adaptive-index writer with the given spill
 /// threshold and recovers the resulting [`Table`]. Returns the table plus
 /// the backing temp dir (kept alive by the caller).

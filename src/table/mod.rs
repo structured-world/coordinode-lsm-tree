@@ -2036,6 +2036,49 @@ impl Table {
         Self(self.0.clone(), Some(lower))
     }
 
+    /// Re-opens this table as a DISTINCT [`Inner`](inner::Inner) (its own file
+    /// handle and fresh drop / punch-on-drop atomics) restricted to keys
+    /// `>= lower`. Used by tight-space compaction so the PRIOR unrestricted view
+    /// can drop — and punch its consumed prefix on that drop — independently of
+    /// this restricted view, which keeps serving the suffix. Heavier than
+    /// [`with_restriction`](Self::with_restriction) (re-reads the footer + block
+    /// index), which is acceptable on the opt-in, emergency tight-space path.
+    ///
+    /// Opens with its own file handle (no shared descriptor table) so the old
+    /// view's handle lifecycle stays fully separate.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from re-opening the SST file.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by the tight-space compaction loop landing next on this branch"
+        )
+    )]
+    pub(crate) fn reopen_restricted(&self, lower: UserKey) -> crate::Result<Self> {
+        let reopened = Self::recover(
+            (*self.path).clone(),
+            self.checksum,
+            self.global_seqno,
+            self.tree_id,
+            self.metadata.id,
+            self.cache.clone(),
+            None,
+            self.fs.clone(),
+            self.pinned_filter_size() > 0,
+            self.pinned_block_index_size() > 0,
+            self.encryption.clone(),
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.clone(),
+            self.comparator.clone(),
+            #[cfg(feature = "metrics")]
+            self.metrics.clone(),
+        )?;
+        Ok(reopened.with_restriction(lower))
+    }
+
     /// Installs the tree-wide deletion pause used by checkpoints.
     ///
     /// Idempotent: a second call is a no-op. Called by the owning tree
