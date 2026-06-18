@@ -317,11 +317,19 @@ impl Version {
                         let run_tables = run
                             .iter()
                             .map(|table| {
-                                tables
+                                let opened = tables
                                     .iter()
                                     .find(|x| x.id() == table.id)
                                     .cloned()
-                                    .ok_or(crate::Error::Unrecoverable)
+                                    .ok_or(crate::Error::Unrecoverable)?;
+                                // Rebuild the tight-space restricted view: the
+                                // data below the bound was punched out, so reads
+                                // must clamp to it (its index still references the
+                                // punched prefix).
+                                Ok(match recovery.restrictions.get(&table.id) {
+                                    Some(bound) => opened.with_restriction(bound.clone()),
+                                    None => opened,
+                                })
                             })
                             .collect::<crate::Result<Vec<_>>>()?;
 
@@ -863,6 +871,28 @@ impl Version {
         writer.start("blob_gc_stats")?;
 
         self.gc_stats.encode_into(writer)?;
+
+        // Tight-space restrictions: per-table key-range lower bounds for tables
+        // whose prefix has been punched out and superseded by a merged output.
+        // Empty (count 0) on versions that never ran tight-space reclaim, so the
+        // section is one zero count in the common case. Each entry is the table
+        // id then a length-prefixed key (variable length, hence its own section
+        // rather than the fixed-length per-table `tables` record).
+        writer.start("restrictions")?;
+        let restricted: Vec<(TableId, crate::UserKey)> = self
+            .iter_tables()
+            .filter_map(|t| t.restrict_lower_bound().map(|b| (t.id(), b.clone())))
+            .collect();
+        writer.write_u32::<LittleEndian>(
+            u32::try_from(restricted.len()).map_err(|_| crate::Error::Unrecoverable)?,
+        )?;
+        for (id, key) in &restricted {
+            writer.write_u64::<LittleEndian>(*id)?;
+            writer.write_u32::<LittleEndian>(
+                u32::try_from(key.len()).map_err(|_| crate::Error::Unrecoverable)?,
+            )?;
+            writer.write_all(key)?;
+        }
 
         Ok(())
     }

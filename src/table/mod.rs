@@ -2012,10 +2012,6 @@ impl Table {
     /// caller punches the data blocks below `lower` only after this view is
     /// durably installed.
     #[must_use]
-    #[expect(
-        dead_code,
-        reason = "consumed by the tight-space compaction install/op landing next on this branch"
-    )]
     pub(crate) fn with_restriction(&self, lower: UserKey) -> Self {
         Self(self.0.clone(), Some(lower))
     }
