@@ -469,3 +469,48 @@ fn tight_space_compaction_rewrites_a_gated_single_table_and_preserves_data() -> 
     }
     Ok(())
 }
+
+#[test]
+fn tight_space_compaction_falls_back_to_skip_without_punch_hole_support() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let (tree, mem) = open_capped(folder.path(), u64::MAX);
+    let n = 2_000u64;
+
+    for i in 0..n {
+        tree.insert(format!("key{i:08}").as_bytes(), vec![0xCDu8; 64], i);
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    let used = tree.storage_stats().expect("stats").used_bytes;
+    let tables_before = tree.table_count();
+
+    // Backend cannot punch holes: tight-space reclaim must NOT engage even
+    // though it is enabled and the gate would otherwise skip a too-big merge.
+    mem.set_punch_hole_supported(false);
+    mem.set_capacity(used + used / 4);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+        c.tight_space_compaction = true;
+    })?;
+
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+
+    assert_eq!(
+        tree.table_count(),
+        tables_before,
+        "without punch_hole support the gated merge is skipped, not sliced",
+    );
+    assert_eq!(
+        mem.punched_bytes(),
+        0,
+        "a backend that cannot punch must never be punched",
+    );
+    for i in 0..n {
+        assert!(
+            tree.get(format!("key{i:08}").as_bytes(), u64::MAX)?
+                .is_some(),
+            "key {i} lost after a skipped compaction",
+        );
+    }
+    Ok(())
+}

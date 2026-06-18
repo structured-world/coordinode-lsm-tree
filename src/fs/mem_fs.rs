@@ -81,6 +81,11 @@ pub struct MemFs {
     /// modelled — `MemFs` is a test backend, and the reclaim accounting only
     /// needs to be monotonic within one compaction's punch sequence.
     punched_bytes: Arc<portable_atomic::AtomicU64>,
+    /// Whether [`Fs::capabilities`] advertises `punch_hole` (default `true`).
+    /// A test sets this `false` via [`MemFs::set_punch_hole_supported`] to drive
+    /// the capability-gated fallback (tight-space compaction skips on a backend
+    /// that cannot punch). Shared across clones.
+    punch_hole_supported: Arc<portable_atomic::AtomicBool>,
 }
 
 #[derive(Debug, Default)]
@@ -101,7 +106,16 @@ impl MemFs {
             namespace_id: next_mem_fs_namespace_id(),
             capacity: Arc::new(portable_atomic::AtomicU64::new(u64::MAX)),
             punched_bytes: Arc::new(portable_atomic::AtomicU64::new(0)),
+            punch_hole_supported: Arc::new(portable_atomic::AtomicBool::new(true)),
         }
+    }
+
+    /// Toggles whether [`Fs::capabilities`] advertises `punch_hole`. Lets a test
+    /// exercise the capability-gated fallback where tight-space compaction skips
+    /// because the backend cannot reclaim extents in place.
+    pub fn set_punch_hole_supported(&self, supported: bool) {
+        self.punch_hole_supported
+            .store(supported, portable_atomic::Ordering::Relaxed);
     }
 
     /// Creates an empty in-memory filesystem with a fixed total capacity in
@@ -871,7 +885,9 @@ impl Fs for MemFs {
     /// run against this backend.
     fn capabilities(&self, _path: &Path) -> FsCapabilities {
         FsCapabilities {
-            punch_hole: true,
+            punch_hole: self
+                .punch_hole_supported
+                .load(portable_atomic::Ordering::Relaxed),
             ..FsCapabilities::default()
         }
     }
