@@ -238,6 +238,19 @@ pub struct VersionInner {
 
     /// Blob file fragmentation
     gc_stats: Arc<FragmentationMap>,
+
+    /// Per-table key-range lower-bound overrides for tight-space compaction.
+    ///
+    /// When a table id maps to a key here, the table's effective key range is
+    /// clamped to `[bound, original_hi)`: its on-disk data blocks below `bound`
+    /// have been punched out ([`crate::fs::Fs::punch_hole`]) and their content
+    /// lives in a freshly merged output table. Reads route keys `< bound` to
+    /// that output and clamp this table's scans to start at `bound` (its index
+    /// is intact and still references the punched prefix). Empty on every
+    /// version that never ran tight-space reclaim, so the common read path pays
+    /// only an empty-map probe. Version-scoped (not table-intrinsic) so an older
+    /// snapshot keeps its own unrestricted view of the same shared table.
+    restrictions: Arc<crate::HashMap<TableId, crate::UserKey>>,
 }
 
 /// A version is an immutable, point-in-time view of a tree's structure
@@ -272,6 +285,19 @@ impl Version {
         &self.gc_stats
     }
 
+    /// Returns the key-range lower-bound override for `table_id` under
+    /// tight-space reclaim, or `None` on the common path (empty restriction
+    /// map). When `Some(bound)`, the table's data below `bound` is punched out
+    /// and reads must clamp the table's scan start to `bound` and route keys
+    /// `< bound` to the freshly merged output table that supersedes them.
+    #[expect(
+        dead_code,
+        reason = "consumed by the read-path key-range clamp landing next on this branch"
+    )]
+    pub(crate) fn restriction_for(&self, table_id: TableId) -> Option<&crate::UserKey> {
+        self.restrictions.get(&table_id)
+    }
+
     pub fn l0(&self) -> &Level {
         #[expect(clippy::expect_used)]
         self.levels.first().expect("L0 should exist")
@@ -298,6 +324,7 @@ impl Version {
                 levels,
                 blob_files: Arc::default(),
                 gc_stats: Arc::default(),
+                restrictions: Arc::default(),
             }),
         }
     }
@@ -367,6 +394,7 @@ impl Version {
                 levels,
                 blob_files: Arc::new(blob_files),
                 gc_stats: Arc::new(gc_stats),
+                restrictions: Arc::default(),
             }),
         }
     }
@@ -486,6 +514,7 @@ impl Version {
                 levels,
                 blob_files: value_log,
                 gc_stats,
+                restrictions: self.restrictions.clone(),
             }),
         }
     }
@@ -572,6 +601,7 @@ impl Version {
                 levels,
                 blob_files: value_log,
                 gc_stats,
+                restrictions: self.restrictions.clone(),
             }),
         })
     }
@@ -668,6 +698,7 @@ impl Version {
                 levels,
                 blob_files: value_log,
                 gc_stats,
+                restrictions: self.restrictions.clone(),
             }),
         }
     }
@@ -722,6 +753,7 @@ impl Version {
                 levels,
                 blob_files: self.blob_files.clone(),
                 gc_stats: self.gc_stats.clone(),
+                restrictions: self.restrictions.clone(),
             }),
         }
     }
