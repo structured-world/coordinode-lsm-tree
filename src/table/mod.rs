@@ -517,9 +517,7 @@ impl Table {
         // `>= bound` (the prefix below it is punched out and superseded by a
         // merged output table). Keys below `bound` must miss here so the read
         // falls through to that output; the punched blocks are never touched.
-        if let Some(bound) = &self.1
-            && self.comparator.compare(key, bound) == core::cmp::Ordering::Less
-        {
+        if self.is_below_restriction(key) {
             return Ok(None);
         }
 
@@ -600,6 +598,12 @@ impl Table {
         seqno: SeqNo,
         key_hash: u64,
     ) -> crate::Result<Option<(crate::ValueType, SeqNo, crate::Slice)>> {
+        // Tight-space restriction (mirrors `Table::get`): a key below the bound
+        // misses so the read falls through to the superseding output.
+        if self.is_below_restriction(key) {
+            return Ok(None);
+        }
+
         let global_seqno = self.global_seqno();
         let seqno = seqno.saturating_sub(global_seqno);
 
@@ -716,6 +720,13 @@ impl Table {
         seqno: SeqNo,
         key_hash: u64,
     ) -> crate::Result<Option<(InternalValue, Block)>> {
+        // Tight-space restriction (mirrors `Table::get`): a key below the bound
+        // misses so the read falls through to the superseding output and never
+        // touches the punched-out prefix.
+        if self.is_below_restriction(key) {
+            return Ok(None);
+        }
+
         let global_seqno = self.global_seqno();
         let seqno = seqno.saturating_sub(global_seqno);
 
@@ -2023,6 +2034,18 @@ impl Table {
     #[must_use]
     pub(crate) fn restrict_lower_bound(&self) -> Option<&UserKey> {
         self.1.as_ref()
+    }
+
+    /// True when `key` is below this version's tight-space restriction bound, so
+    /// a point read must miss here and fall through to the output table that
+    /// superseded the punched-out prefix. Every point-read entry point
+    /// ([`get`](Self::get), [`get_value`](Self::get_value),
+    /// [`get_with_block`](Self::get_with_block)) consults this first.
+    #[inline]
+    fn is_below_restriction(&self, key: &[u8]) -> bool {
+        self.1
+            .as_ref()
+            .is_some_and(|bound| self.comparator.compare(key, bound) == core::cmp::Ordering::Less)
     }
 
     /// Returns a view of this table restricted to keys `>= lower`, for

@@ -271,20 +271,36 @@ impl Drop for Inner {
         } else {
             // Not deleted, but possibly marked for tight-space prefix reclaim:
             // this (old, unrestricted) view's last Arc is dropping, so no read
-            // can touch the prefix anymore. Punch `[0, offset)` and LEAVE the
-            // file — the restricted view (a distinct Inner) still serves the
-            // suffix. `punch_hole` opens the path itself, so it is fine that
-            // this view's own handles drop right after this body.
+            // can touch the prefix anymore. Reclaim the consumed prefix's DATA
+            // blocks and LEAVE the file — the restricted view (a distinct Inner)
+            // still serves the suffix. `punch_hole` opens the path itself, so it
+            // is fine that this view's own handles drop right after this body.
+            //
+            // Punch each data block below the boundary INDIVIDUALLY rather than
+            // the whole `[0, offset)` span: index / filter blocks are interleaved
+            // among the data blocks and the reopen path reads them, so a single
+            // span punch would zero a section the SST needs. The block index
+            // yields only data-block handles, so iterating it punches exactly the
+            // reclaimable data and never an index / filter / footer region.
             let off = self
                 .punch_on_drop
                 .load(core::sync::atomic::Ordering::Acquire);
-            if off != u64::MAX
-                && let Err(e) = self.fs.punch_hole(&self.path, 0, off)
-            {
-                log::warn!(
-                    "Failed to punch tight-space prefix [0, {off}) of table {global_id:?} at {:?}: {e:?}",
-                    self.path,
-                );
+            if off != u64::MAX {
+                use crate::table::block_index::BlockIndex;
+                for handle in self.block_index.iter() {
+                    let Ok(handle) = handle else { break };
+                    let block_off = handle.offset().0;
+                    if block_off < off
+                        && let Err(e) =
+                            self.fs
+                                .punch_hole(&self.path, block_off, u64::from(handle.size()))
+                    {
+                        log::warn!(
+                            "Failed to punch tight-space data block at {block_off} of table {global_id:?} at {:?}: {e:?}",
+                            self.path,
+                        );
+                    }
+                }
             }
         }
     }

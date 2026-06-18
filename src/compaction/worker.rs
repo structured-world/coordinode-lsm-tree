@@ -860,6 +860,18 @@ fn run_tight_space_compaction(
             // slice's output is written. A concurrent snapshot keeps its own
             // clone, which safely defers the punch until that reader is done.
             opts.version_history.write().drain_obsolete_to_latest();
+
+            // Test-only crash point: abort right after the first slice is
+            // durably installed and punched, so the reopen path (recovering a
+            // persisted input restriction) is exercised deterministically.
+            #[cfg(test)]
+            if opts
+                .config
+                .fail_tight_after_first_slice
+                .swap(false, core::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(cancelled_compaction());
+            }
         }
 
         // Tail [last boundary, hi): merge the remainder and remove the input.
@@ -2047,6 +2059,81 @@ mod tests {
                 Some(val(i, 1).as_bytes()),
                 "value for {} must survive the rolled-back compaction",
                 key(i),
+            );
+        }
+        Ok(())
+    }
+
+    /// A tight-space compaction that crashes after durably installing and
+    /// punching its first slice must reopen consistently: the manifest carries
+    /// the input's persisted key-range restriction, and recovery rebuilds the
+    /// restricted view so every key (those in the installed slice output AND
+    /// those still in the punched input's intact suffix) reads back.
+    #[test]
+    fn tight_space_crash_after_first_slice_recovers_all_keys_on_reopen() -> crate::Result<()> {
+        use core::sync::atomic::Ordering;
+
+        const N: u64 = 2_000;
+        let k = |i: u64| format!("key{i:08}");
+
+        let dir = tempfile::tempdir()?;
+        let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+        let config = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_size_policy(BlockSizePolicy::all(512))
+        .with_shared_fs(Arc::new(mem.clone()));
+        let failpoint = config.fail_tight_after_first_slice.clone();
+        let tree = match config.open()? {
+            crate::AnyTree::Standard(t) => t,
+            crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+        };
+
+        for i in 0..N {
+            tree.insert(k(i).as_bytes(), vec![0xCDu8; 64], i);
+        }
+        tree.flush_active_memtable(0)?;
+        let used = tree.storage_stats()?.used_bytes;
+
+        // Force the single-table major compaction to be gated, and opt in to
+        // tight-space reclaim.
+        mem.set_capacity(used + used / 4);
+        tree.update_runtime_config(|c| {
+            c.storage_admission_check = true;
+            c.tight_space_compaction = true;
+        })?;
+
+        // Crash right after the first slice is durably installed + punched.
+        failpoint.store(true, Ordering::SeqCst);
+        assert!(
+            tree.major_compact(64 * 1024 * 1024, 0).is_err(),
+            "the crash failpoint must abort the tight-space compaction",
+        );
+        assert!(
+            !failpoint.load(Ordering::SeqCst),
+            "the failpoint should have fired and disarmed",
+        );
+        assert!(
+            mem.punched_bytes() > 0,
+            "the first slice must have punched before the crash",
+        );
+
+        // Reopen on the same simulated disk: recovery must rebuild the restricted
+        // input from the persisted manifest restriction.
+        drop(tree);
+        let reopened = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::new(mem))
+        .open()?;
+        for i in 0..N {
+            assert!(
+                reopened.get(k(i).as_bytes(), crate::MAX_SEQNO)?.is_some(),
+                "key {i} lost after a crash mid tight-space compaction + reopen",
             );
         }
         Ok(())
