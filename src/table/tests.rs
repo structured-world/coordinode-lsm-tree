@@ -642,6 +642,74 @@ fn table_point_read() -> crate::Result<()> {
     )
 }
 
+#[test]
+#[expect(clippy::unwrap_used)]
+fn restricted_view_clamps_point_and_range_reads() -> crate::Result<()> {
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"c", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"d", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"e", b"v", 0, crate::ValueType::Value),
+    ];
+
+    test_with_table(
+        &items,
+        |table| {
+            // Restrict the view to keys >= "c" (the prefix a, b is punched out
+            // and superseded by a merged output table in tight-space reclaim).
+            let restricted = table.with_restriction(crate::UserKey::from(&b"c"[..]));
+
+            // Point reads below the bound miss (so the read falls through to the
+            // superseding output); at/above the bound they hit.
+            assert_eq!(None, restricted.get(b"a", SeqNo::MAX, hash64(b"a"))?);
+            assert_eq!(None, restricted.get(b"b", SeqNo::MAX, hash64(b"b"))?);
+            assert!(restricted.get(b"c", SeqNo::MAX, hash64(b"c"))?.is_some());
+            assert!(restricted.get(b"d", SeqNo::MAX, hash64(b"d"))?.is_some());
+
+            // The unrestricted view of the same physical SST is unaffected.
+            assert!(table.get(b"a", SeqNo::MAX, hash64(b"a"))?.is_some());
+
+            // A full scan yields only keys >= the bound, in order — the iterator
+            // never walks into the punched prefix.
+            let keys: Vec<_> = restricted
+                .range(..)
+                .map(|r| r.unwrap().key.user_key)
+                .collect();
+            assert_eq!(
+                keys,
+                vec![
+                    crate::UserKey::from(&b"c"[..]),
+                    crate::UserKey::from(&b"d"[..]),
+                    crate::UserKey::from(&b"e"[..]),
+                ],
+            );
+
+            let cmp = crate::comparator::default_comparator();
+            // A query entirely below the bound does not overlap the live range.
+            assert!(!restricted.check_key_range_overlap_cmp(
+                &(
+                    core::ops::Bound::Unbounded,
+                    core::ops::Bound::Excluded(&b"c"[..]),
+                ),
+                cmp.as_ref(),
+            ));
+            // A query reaching into [bound, hi] does overlap.
+            assert!(restricted.check_key_range_overlap_cmp(
+                &(
+                    core::ops::Bound::Included(&b"d"[..]),
+                    core::ops::Bound::Unbounded,
+                ),
+                cmp.as_ref(),
+            ));
+
+            Ok(())
+        },
+        None,
+        Some(|x| x),
+    )
+}
+
 /// Writes `items` through an adaptive-index writer with the given spill
 /// threshold and recovers the resulting [`Table`]. Returns the table plus
 /// the backing temp dir (kept alive by the caller).
