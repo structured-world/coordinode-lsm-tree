@@ -71,6 +71,16 @@ pub struct MemFs {
     /// `portable_atomic::AtomicU64` (not `core`'s): native 64-bit atomics are
     /// absent on some `no_std` targets (e.g. thumbv7em).
     capacity: Arc<portable_atomic::AtomicU64>,
+    /// Total bytes deallocated by [`Fs::punch_hole`] across all files, subtracted
+    /// from [`Self::stored_bytes`] so the simulated disk reflects in-place extent
+    /// reclaim (the real `fallocate(PUNCH_HOLE)` frees physical blocks while the
+    /// file's logical length is unchanged). Shared across clones. The contract is
+    /// non-overlapping punches (the tight-compaction reclaim loop punches
+    /// strictly advancing input prefixes), so summing punched lengths cannot
+    /// double-count. Reset to zero when a file is removed or truncated is not
+    /// modelled — `MemFs` is a test backend, and the reclaim accounting only
+    /// needs to be monotonic within one compaction's punch sequence.
+    punched_bytes: Arc<portable_atomic::AtomicU64>,
 }
 
 #[derive(Debug, Default)]
@@ -90,6 +100,7 @@ impl MemFs {
             state: Arc::new(RwLock::new(state)),
             namespace_id: next_mem_fs_namespace_id(),
             capacity: Arc::new(portable_atomic::AtomicU64::new(u64::MAX)),
+            punched_bytes: Arc::new(portable_atomic::AtomicU64::new(0)),
         }
     }
 
@@ -117,11 +128,14 @@ impl MemFs {
     /// usage). Sums every file's length under the state read lock.
     fn stored_bytes(&self) -> u64 {
         let state = self.state.read();
-        state
+        let logical = state
             .files
             .values()
             .map(|data| data.lock().len() as u64)
-            .fold(0u64, u64::saturating_add)
+            .fold(0u64, u64::saturating_add);
+        // Subtract bytes reclaimed by punch_hole: their physical blocks are
+        // freed even though the logical file length is unchanged.
+        logical.saturating_sub(self.punched_bytes.load(portable_atomic::Ordering::Relaxed))
     }
 }
 
@@ -843,9 +857,46 @@ impl Fs for MemFs {
     /// In-memory backend: no filesystem-level guarantees on any path.
     /// Explicitly returns the all-`false` default so the "no integrity / no
     /// `CoW` / no reflink" stance is intentional rather than inherited by
-    /// accident.
+    /// accident. Only `punch_hole` is set: [`Self::punch_hole`] simulates
+    /// in-place extent reclaim, so tight-space compaction (and its tests) can
+    /// run against this backend.
     fn capabilities(&self, _path: &Path) -> FsCapabilities {
-        FsCapabilities::default()
+        FsCapabilities {
+            punch_hole: true,
+            ..FsCapabilities::default()
+        }
+    }
+
+    /// Simulates `fallocate(PUNCH_HOLE)`: zeroes `[offset, offset+len)` in the
+    /// file (so the hole reads back as zeros) and records the reclaimed bytes so
+    /// [`Fs::available_space`] reflects the freed space, while the file's logical
+    /// length stays unchanged. The range is clamped to the current file length;
+    /// a punch wholly past EOF is a no-op.
+    fn punch_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<()> {
+        let state = self.state.read();
+        let data = state
+            .files
+            .get(path)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "punch_hole: file not found"))?;
+        let mut buf = data.lock();
+        let file_len = buf.len() as u64;
+        // Clamp to the file: a hole cannot extend the logical length.
+        let start = offset.min(file_len);
+        let end = offset.saturating_add(len).min(file_len);
+        if start >= end {
+            return Ok(());
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "start/end are clamped to buf.len() (a usize), so they fit usize"
+        )]
+        let (s, e) = (start as usize, end as usize);
+        if let Some(slice) = buf.get_mut(s..e) {
+            slice.fill(0);
+        }
+        self.punched_bytes
+            .fetch_add(end - start, portable_atomic::Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -918,6 +969,75 @@ mod tests {
         assert_eq!(buf, "hello world");
 
         Ok(())
+    }
+
+    #[test]
+    fn punch_hole_zeroes_range_keeps_length_and_reclaims_space() -> io::Result<()> {
+        let fs = MemFs::with_capacity(1000);
+        let path = Path::new("/f");
+        let mut file = fs.open(path, &FsOpenOptions::new().write(true).create(true))?;
+        file.write_all(&[0xAB; 600])?;
+        drop(file);
+
+        assert!(
+            fs.capabilities(path).punch_hole,
+            "MemFs advertises punch-hole"
+        );
+        assert_eq!(fs.available_space(path)?, 400, "1000 capacity − 600 stored");
+
+        // Punch [100, 300): 200 bytes freed.
+        fs.punch_hole(path, 100, 200)?;
+
+        let mut buf = Vec::new();
+        fs.open(path, &FsOpenOptions::new().read(true))?
+            .read_to_end(&mut buf)?;
+        assert_eq!(buf.len(), 600, "logical length unchanged by the hole");
+        assert!(
+            buf.iter().take(100).all(|&b| b == 0xAB),
+            "data before the hole is intact"
+        );
+        assert!(
+            buf.iter().skip(100).take(200).all(|&b| b == 0),
+            "the hole reads back as zeros"
+        );
+        assert!(
+            buf.iter().skip(300).all(|&b| b == 0xAB),
+            "data after the hole is intact"
+        );
+        assert_eq!(
+            fs.available_space(path)?,
+            600,
+            "1000 capacity − (600 − 200 punched) stored"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn punch_hole_clamps_past_eof_to_a_noop() -> io::Result<()> {
+        let fs = MemFs::with_capacity(1000);
+        let path = Path::new("/f");
+        let mut file = fs.open(path, &FsOpenOptions::new().write(true).create(true))?;
+        file.write_all(&[0xCD; 100])?;
+        drop(file);
+
+        // Wholly past EOF → nothing freed.
+        fs.punch_hole(path, 200, 50)?;
+        assert_eq!(fs.available_space(path)?, 900, "no reclaim past EOF");
+        // Straddling EOF → only the in-file portion is freed.
+        fs.punch_hole(path, 80, 100)?;
+        assert_eq!(
+            fs.available_space(path)?,
+            920,
+            "only [80,100) (20 bytes) freed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn punch_hole_on_missing_file_is_not_found() {
+        let fs = MemFs::new();
+        let err = fs.punch_hole(Path::new("/nope"), 0, 10).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
@@ -1546,12 +1666,16 @@ mod tests {
     }
 
     #[test]
-    fn memfs_capabilities_match_default_no_guarantees() {
-        // RAM has no FS-level integrity / `CoW` / reflink - MemFs must report the
-        // all-false profile for any path.
+    fn memfs_capabilities_advertise_only_punch_hole() {
+        // RAM has no FS-level integrity / `CoW` / reflink, so those stay false;
+        // only `punch_hole` is set, since `MemFs::punch_hole` simulates in-place
+        // extent reclaim for tight-space compaction tests.
         assert_eq!(
             MemFs::new().capabilities(Path::new("/dir/sst.bin")),
-            FsCapabilities::default()
+            FsCapabilities {
+                punch_hole: true,
+                ..FsCapabilities::default()
+            }
         );
     }
 

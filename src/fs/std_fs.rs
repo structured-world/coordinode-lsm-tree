@@ -412,6 +412,15 @@ impl Fs for StdFs {
     fn try_disable_cow(&self, path: &Path) -> io::Result<()> {
         linux_caps::try_disable_cow(path).map_err(io::Error::from)
     }
+
+    /// Linux: reclaim a mid-file byte range via `fallocate(PUNCH_HOLE)`. Gated
+    /// by callers on [`super::FsCapabilities::punch_hole`], which `capabilities`
+    /// sets for ext4 / xfs / btrfs / zfs / tmpfs. macOS and other targets keep
+    /// the trait default ([`io::ErrorKind::Unsupported`]).
+    #[cfg(target_os = "linux")]
+    fn punch_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<()> {
+        linux_caps::punch_hole(path, offset, len).map_err(io::Error::from)
+    }
 }
 
 /// Shared by every backend that resolves paths against the host kernel's
@@ -992,6 +1001,8 @@ mod linux_caps {
         const BTRFS: i64 = 0x9123_683E;
         const ZFS: i64 = 0x2FC1_2FC1;
         const XFS: i64 = 0x5846_5342;
+        const EXT_FAMILY: i64 = 0x0000_EF53; // ext2/3/4 share this magic
+        const TMPFS: i64 = 0x0102_1994;
 
         let Ok(c) = to_cstring(path) else {
             return FsCapabilities::default();
@@ -1016,6 +1027,10 @@ mod linux_caps {
         )]
         let f_type = unsafe { buf.assume_init() }.f_type as i64;
 
+        // fallocate(PUNCH_HOLE) is supported by every common local Linux
+        // filesystem (ext4 / xfs / btrfs / zfs / tmpfs); leave it false for
+        // unknown / network mounts so a runtime EOPNOTSUPP never surprises the
+        // tight-space compaction gate.
         match f_type {
             BTRFS | ZFS => FsCapabilities {
                 per_block_integrity_on_read: true,
@@ -1023,14 +1038,66 @@ mod linux_caps {
                 copy_on_write: true,
                 reflink: true,
                 native_snapshot: true,
+                punch_hole: true,
             },
             XFS => FsCapabilities {
                 copy_on_write: true,
                 reflink: true,
+                punch_hole: true,
+                ..FsCapabilities::default()
+            },
+            EXT_FAMILY | TMPFS => FsCapabilities {
+                punch_hole: true,
                 ..FsCapabilities::default()
             },
             _ => FsCapabilities::default(),
         }
+    }
+
+    /// Deallocates `[offset, offset+len)` inside the file at `path` via
+    /// `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`: frees the
+    /// physical blocks, keeps the logical length, the hole reads back as zeros.
+    ///
+    /// 64-bit only: `off_t` is `i64` here, matching the `i64::try_from` range
+    /// guard. 32-bit Linux reports `punch_hole = false` (see `capabilities`), so
+    /// the mode never engages there; the stub below keeps the call site building.
+    #[cfg(target_pointer_width = "64")]
+    pub(super) fn punch_hole(path: &Path, offset: u64, len: u64) -> io::Result<()> {
+        // off_t is i64 on 64-bit Linux; a file offset / length that exceeds
+        // i64::MAX is not a real SST extent, so reject rather than wrap.
+        let off = i64::try_from(offset)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "punch offset exceeds i64"))?;
+        let length = i64::try_from(len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "punch len exceeds i64"))?;
+        let f = OpenOptions::new().write(true).open(path)?;
+        // SAFETY: `f` owns a valid writable fd for the duration of the call;
+        // the flags + range are plain integers.
+        #[expect(
+            unsafe_code,
+            reason = "fallocate(PUNCH_HOLE) FFI for in-place extent reclaim"
+        )]
+        let rc = unsafe {
+            libc::fallocate(
+                f.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                off,
+                length,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// 32-bit Linux: `punch_hole` capability is reported false, so this is
+    /// unreachable in practice; surface `Unsupported` to keep the contract.
+    #[cfg(not(target_pointer_width = "64"))]
+    pub(super) fn punch_hole(_path: &Path, _offset: u64, _len: u64) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "punch_hole unsupported on 32-bit",
+        ))
     }
 
     /// 32-bit Linux: not a storage-engine deployment target; the `statfs`
@@ -1257,6 +1324,56 @@ mod tests {
     use std::io::{Read, Write};
     use std::sync::Arc;
     use test_log::test;
+
+    /// Linux: `fallocate(PUNCH_HOLE)` frees a mid-file range and reads it back
+    /// as zeros, leaving the logical length unchanged. Skips cleanly on a mount
+    /// that does not advertise the capability (e.g. overlayfs in CI), so the
+    /// test never fails on an unsupported filesystem.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn std_fs_punch_hole_zeroes_range_on_linux() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("f");
+        std::fs::write(&path, vec![0xABu8; 16 * 1024])?;
+
+        if !StdFs.capabilities(&path).punch_hole {
+            return Ok(()); // mount without punch-hole support → nothing to assert
+        }
+
+        // Block-aligned range so the extent is actually deallocated.
+        StdFs.punch_hole(&path, 4096, 4096)?;
+
+        let data = std::fs::read(&path)?;
+        assert_eq!(data.len(), 16 * 1024, "logical length unchanged");
+        assert!(
+            data.iter().skip(4096).take(4096).all(|&b| b == 0),
+            "the punched range reads back as zeros"
+        );
+        assert!(
+            data.iter().take(4096).all(|&b| b == 0xAB),
+            "data before the hole is intact"
+        );
+        Ok(())
+    }
+
+    /// Off Linux, `StdFs` keeps the trait default: hole punching is unsupported
+    /// and the capability is not advertised, so tight-space compaction never
+    /// engages on those targets.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn std_fs_punch_hole_is_unsupported_off_linux() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("f");
+        std::fs::write(&path, vec![0u8; 64])?;
+
+        assert!(
+            !StdFs.capabilities(&path).punch_hole,
+            "punch-hole capability is not advertised off Linux"
+        );
+        let err = StdFs.punch_hole(&path, 0, 16).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        Ok(())
+    }
 
     #[test]
     fn std_fs_create_read_write() -> io::Result<()> {
