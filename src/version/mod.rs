@@ -741,11 +741,25 @@ impl Version {
     /// so `diff` / `encode_into` persist it; a replaced / removed prior view is
     /// released by the version swap and (for a restricted view) punches its
     /// consumed prefix once its readers drain.
+    ///
+    /// For KV-separated trees the slice's `gc_diff` (newly dead blob entries)
+    /// and any `new_blob_files` it produced are folded in, so the running GC
+    /// stats stay accurate; globally-dead blob files are not dropped here (an
+    /// unprocessed slice may still reference them) — that happens at the final
+    /// removal.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a slice install carries the SST swaps/removes/outputs plus the \
+                  KV-separation blob delta (new files + GC diff); bundling would \
+                  just move the argument list"
+    )]
     pub fn with_tight_slice(
         &self,
         restricted: &[(TableId, Table)],
         removed_ids: &[TableId],
         outputs: &[Table],
+        new_blob_files: Vec<BlobFile>,
+        gc_diff: Option<FragmentationMap>,
         dest_level: usize,
         ctx: &TransformContext<'_>,
     ) -> Self {
@@ -788,13 +802,33 @@ impl Version {
             levels.push(Level::from_runs(runs.into_iter().map(Arc::new).collect()));
         }
 
+        // KV-separation blob delta: add any newly written blob files and fold in
+        // this slice's GC diff. Dead blob files are NOT pruned here — a later
+        // slice may still reference them; the final removal does the drop.
+        let value_log = if gc_diff.is_some() || !new_blob_files.is_empty() {
+            let mut copy = self.blob_files.deref().clone();
+            for blob_file in new_blob_files {
+                copy.insert(blob_file.id(), blob_file);
+            }
+            Arc::new(copy)
+        } else {
+            self.blob_files.clone()
+        };
+        let gc_stats = if let Some(diff) = gc_diff {
+            let mut copy = self.gc_stats.deref().clone();
+            diff.merge_into(&mut copy);
+            Arc::new(copy)
+        } else {
+            self.gc_stats.clone()
+        };
+
         Self {
             inner: Arc::new(VersionInner {
                 id,
                 tree_type: self.tree_type,
                 levels,
-                blob_files: self.blob_files.clone(),
-                gc_stats: self.gc_stats.clone(),
+                blob_files: value_log,
+                gc_stats,
             }),
         }
     }

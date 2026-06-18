@@ -523,7 +523,10 @@ fn tight_space_compaction_rewrites_a_gated_multi_table_merge() -> lsm_tree::Resu
     // Two overlapping generations → a multi-input merge whose latest values win.
     let used = seed_two_generations(&tree, n);
     let tables_before = tree.table_count();
-    assert!(tables_before >= 2, "two generations must leave a multi-input merge");
+    assert!(
+        tables_before >= 2,
+        "two generations must leave a multi-input merge"
+    );
 
     // Cap so the cross-generation merge cannot fit; opt in to tight reclaim.
     mem.set_capacity(used + used / 4);
@@ -569,6 +572,84 @@ fn tight_space_compaction_rewrites_a_gated_multi_table_merge() -> lsm_tree::Resu
                 .get(format!("key{i:08}").as_bytes(), u64::MAX)?
                 .as_deref(),
             Some([0xEFu8; 64].as_slice()),
+            "key {i} latest value must survive reopen",
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn tight_space_compaction_rewrites_a_gated_kv_separated_merge() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let (tree, mem) = open_capped_blob(folder.path(), u64::MAX);
+    let n = 2_000u64;
+
+    // Values exceed the 64-byte separation threshold, so they live in blob
+    // files; two overlapping generations make the merge drop shadowed values
+    // (and their now-dead blobs).
+    for i in 0..n {
+        tree.insert(format!("key{i:08}").as_bytes(), vec![0xCDu8; 200], i);
+    }
+    tree.flush_active_memtable(0).expect("flush 1");
+    for i in 0..n {
+        tree.insert(format!("key{i:08}").as_bytes(), vec![0xEFu8; 200], n + i);
+    }
+    tree.flush_active_memtable(0).expect("flush 2");
+    let used = tree.storage_stats().expect("stats").used_bytes;
+    assert!(
+        tree.table_count() >= 2,
+        "two generations → multi-input merge"
+    );
+
+    // Cap so the index-tree SST output (small: just blob handles, but it is the
+    // gated-merge's transient) does not fit, forcing the gate to skip the merge
+    // and the tight path to slice it instead. Completing the merge is what lets
+    // the tail drop the shadowed generation's now-dead blob files — the real
+    // KV-separated reclaim, which a plain skip would forgo.
+    let index_sst = tree.index.disk_space().max(4096);
+    mem.set_capacity(used + index_sst / 4);
+    tree.index.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+        c.tight_space_compaction = true;
+    })?;
+
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+
+    assert!(
+        mem.punched_bytes() > 0,
+        "KV-separated tight compaction must reclaim consumed slices via punching",
+    );
+    for i in 0..n {
+        assert_eq!(
+            tree.get(format!("key{i:08}").as_bytes(), u64::MAX)?
+                .as_deref(),
+            Some([0xEFu8; 200].as_slice()),
+            "key {i} must read the latest value after KV-separated tight compaction",
+        );
+    }
+
+    drop(tree);
+    let reopened = match Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(64),
+    ))
+    .with_shared_fs(Arc::new(mem))
+    .open()?
+    {
+        AnyTree::Blob(t) => t,
+        AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+    for i in (0..n).step_by(53) {
+        assert_eq!(
+            reopened
+                .get(format!("key{i:08}").as_bytes(), u64::MAX)?
+                .as_deref(),
+            Some([0xEFu8; 200].as_slice()),
             "key {i} latest value must survive reopen",
         );
     }

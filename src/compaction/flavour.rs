@@ -207,13 +207,6 @@ pub(super) struct ProducedOutput {
 }
 
 impl ProducedOutput {
-    /// Marks this produced-but-not-installed output's freshly written files as
-    /// deleted. Used when a sibling sub-compaction fails and the shared
-    /// [`install_merge`] is skipped: each already-finished sub-compaction has
-    /// finalized its SSTs and blob files on disk, so without this they would be
-    /// orphaned. Only the newly created files are dropped — input tables stay
-    /// intact (the caller un-hides them) and rewritten-blob-file drops are left
-    /// for a later successful compaction.
     /// The SSTs this (sub-)compaction finalized on disk but has not installed.
     /// Used by the tight-space loop, which installs them via a custom version
     /// edit (restricting the input) rather than the standard [`install_merge`].
@@ -221,6 +214,26 @@ impl ProducedOutput {
         &self.created_tables
     }
 
+    /// The blob files this (sub-)compaction wrote (KV separation). Empty on the
+    /// non-relocating tight-space path; the loop folds them into its slice edit.
+    pub(super) fn created_blob_files(&self) -> &[BlobFile] {
+        &self.created_blob_files
+    }
+
+    /// The blob fragmentation this (sub-)compaction accumulated (entries dropped
+    /// from the merge), folded into the version's running GC stats by the
+    /// tight-space loop so dead blob files are detected at the final removal.
+    pub(super) fn blob_frag_map(&self) -> &FragmentationMap {
+        &self.blob_frag_map
+    }
+
+    /// Marks this produced-but-not-installed output's freshly written files as
+    /// deleted. Used when a sibling sub-compaction fails and the shared
+    /// [`install_merge`] is skipped: each already-finished sub-compaction has
+    /// finalized its SSTs and blob files on disk, so without this they would be
+    /// orphaned. Only the newly created files are dropped — input tables stay
+    /// intact (the caller un-hides them) and rewritten-blob-file drops are left
+    /// for a later successful compaction.
     pub(super) fn rollback_uninstalled(&self) {
         for table in &self.created_tables {
             table.mark_as_deleted();

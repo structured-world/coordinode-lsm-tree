@@ -767,11 +767,13 @@ fn slice_payload_for(views: &[Table], payload: &CompactionPayload) -> Compaction
 /// from [`do_compaction`] when the space gate finds no fitting merge and the tree
 /// opts in.
 ///
-/// Handles single- and multi-input merges. Each slice merges the surviving
-/// inputs over `[lower, boundary)`; an input whose data extends past the
-/// boundary is re-opened as a restricted view (clamped + prefix punched), while
-/// one fully consumed by the slice is dropped outright. KV-separated trees fall
-/// back to skipping (blob relocation is not yet wired into the sliced path).
+/// Handles single- and multi-input merges, including KV-separated trees. Each
+/// slice merges the surviving inputs over `[lower, boundary)`; an input whose
+/// data extends past the boundary is re-opened as a restricted view (clamped +
+/// prefix punched), while one fully consumed by the slice is dropped outright.
+/// Blob fragmentation each slice produces is folded into the running GC stats so
+/// dead blob files are dropped at the final removal (a blob may still be
+/// referenced by an unprocessed slice, so per-slice dropping would be unsafe).
 #[cfg(feature = "std")]
 fn run_tight_space_compaction(
     mut compaction_state: CompactionGuard<'_>,
@@ -780,10 +782,6 @@ fn run_tight_space_compaction(
     payload: &CompactionPayload,
 ) -> crate::Result<CompactionResult> {
     use core::ops::Bound;
-
-    if opts.config.kv_separation_opts.is_some() {
-        return Ok(CompactionResult::nothing());
-    }
 
     // Capability gate: the destination volume must support hole punching.
     let (dest_path, dest_fs) = opts.config.tables_folder_for_level(payload.dest_level);
@@ -858,6 +856,12 @@ fn run_tight_space_compaction(
                 &blobs_folder,
             )?;
             let outputs: Vec<Table> = produced.created_tables().to_vec();
+            // KV-separation: blob files this slice wrote (usually none on the
+            // non-relocating path) plus the GC diff of entries it dropped.
+            let new_blobs: Vec<BlobFile> = produced.created_blob_files().to_vec();
+            let frag = produced.blob_frag_map().clone();
+            let gc_diff = if frag.is_empty() { None } else { Some(frag) };
+            let blobs_for_cleanup = new_blobs.clone();
 
             // Classify each input at this boundary: restrict (extends past it) or
             // remove (fully consumed by this slice). Re-open restricted views as
@@ -887,6 +891,8 @@ fn run_tight_space_compaction(
                         &restricted_pairs,
                         &removed_ids,
                         &outputs,
+                        new_blobs,
+                        gc_diff,
                         payload.dest_level as usize,
                         &ctx,
                     );
@@ -901,6 +907,9 @@ fn run_tight_space_compaction(
             if let Err(e) = install {
                 for t in &outputs {
                     t.mark_as_deleted();
+                }
+                for b in &blobs_for_cleanup {
+                    b.mark_as_deleted();
                 }
                 return Err(e);
             }
