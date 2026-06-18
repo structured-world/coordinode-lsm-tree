@@ -734,16 +734,17 @@ impl Version {
         }
     }
 
-    /// Tight-space slice install: replaces the input table `input_id` with its
-    /// restricted view `restricted_input` (same id, clamped to a higher lower
-    /// bound) wherever it sits, and adds the slice `outputs` as a new run in
-    /// `dest_level`. The restriction rides on the [`Table`] wrapper, so `diff` /
-    /// `encode_into` persist it; the prior view is released by the version swap
-    /// and punches its consumed prefix once its readers drain.
+    /// Tight-space slice install for one or more inputs: replaces each
+    /// `(id, restricted view)` in `restricted` with its clamped view, drops the
+    /// fully-consumed inputs in `removed_ids`, and adds the slice `outputs` as a
+    /// new run in `dest_level`. The restriction rides on the [`Table`] wrapper,
+    /// so `diff` / `encode_into` persist it; a replaced / removed prior view is
+    /// released by the version swap and (for a restricted view) punches its
+    /// consumed prefix once its readers drain.
     pub fn with_tight_slice(
         &self,
-        input_id: TableId,
-        restricted_input: &Table,
+        restricted: &[(TableId, Table)],
+        removed_ids: &[TableId],
         outputs: &[Table],
         dest_level: usize,
         ctx: &TransformContext<'_>,
@@ -759,13 +760,17 @@ impl Version {
                 .iter()
                 .map(|run| {
                     let mut run: Run<_> = run.deref().clone();
+                    // Drop fully-consumed inputs.
+                    run.retain(|t| !removed_ids.contains(&t.id()));
+                    // Swap each restricted input for its clamped view (same id).
                     for t in run.inner_mut().iter_mut() {
-                        if t.id() == input_id {
-                            *t = restricted_input.clone();
+                        if let Some((_, view)) = restricted.iter().find(|(rid, _)| *rid == t.id()) {
+                            *t = view.clone();
                         }
                     }
                     run
                 })
+                .filter(|run| !run.is_empty())
                 .collect::<Vec<_>>();
 
             if level_idx == dest_level

@@ -514,3 +514,63 @@ fn tight_space_compaction_falls_back_to_skip_without_punch_hole_support() -> lsm
     }
     Ok(())
 }
+
+#[test]
+fn tight_space_compaction_rewrites_a_gated_multi_table_merge() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let (tree, mem) = open_capped(folder.path(), u64::MAX);
+    let n = 2_000u64;
+    // Two overlapping generations → a multi-input merge whose latest values win.
+    let used = seed_two_generations(&tree, n);
+    let tables_before = tree.table_count();
+    assert!(tables_before >= 2, "two generations must leave a multi-input merge");
+
+    // Cap so the cross-generation merge cannot fit; opt in to tight reclaim.
+    mem.set_capacity(used + used / 4);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+        c.tight_space_compaction = true;
+    })?;
+
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+
+    assert!(
+        mem.punched_bytes() > 0,
+        "multi-input tight compaction must reclaim consumed slices via punching",
+    );
+    // The merge dropped the shadowed first generation; every key reads the
+    // latest (second-generation) value.
+    for i in 0..n {
+        assert_eq!(
+            tree.get(format!("key{i:08}").as_bytes(), u64::MAX)?
+                .as_deref(),
+            Some([0xEFu8; 64].as_slice()),
+            "key {i} must read the latest value after multi-input tight compaction",
+        );
+    }
+
+    // Survives reopen on the same simulated disk.
+    drop(tree);
+    let reopened = match Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(mem))
+    .open()?
+    {
+        AnyTree::Standard(t) => t,
+        AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    for i in (0..n).step_by(53) {
+        assert_eq!(
+            reopened
+                .get(format!("key{i:08}").as_bytes(), u64::MAX)?
+                .as_deref(),
+            Some([0xEFu8; 64].as_slice()),
+            "key {i} latest value must survive reopen",
+        );
+    }
+    Ok(())
+}
