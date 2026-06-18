@@ -1258,6 +1258,16 @@ impl Table {
         for handle in self.block_index.iter() {
             let handle = handle?;
 
+            // Tight-space restriction: a block whose last key is below the bound
+            // sits entirely in the punched-out (zeroed) prefix — never read it.
+            // The block straddling the bound is intact (punch starts at its
+            // offset) and is filtered per entry in the loop below.
+            if let Some(bound) = &self.1
+                && self.comparator.compare(handle.end_key(), bound) == core::cmp::Ordering::Less
+            {
+                continue;
+            }
+
             // Block-skip: look this block's seqno bounds up in the parallel
             // `seqno_bounds` section (keyed by file offset). If its (local) min
             // exceeds the upper bound, or its (local) max is below the target, it
@@ -1278,6 +1288,15 @@ impl Table {
             let data = &block.inner.data;
             for item in block.iter(self.comparator.clone()) {
                 let mut value = item.materialize(data);
+                // Drop entries below the restriction bound in the straddling
+                // block (their authoritative copy lives in the superseding
+                // output table).
+                if let Some(bound) = &self.1
+                    && self.comparator.compare(&value.key.user_key, bound)
+                        == core::cmp::Ordering::Less
+                {
+                    continue;
+                }
                 if value.key.seqno >= local_target && value.key.seqno < local_end {
                     value.key.seqno = value.key.seqno.saturating_add(global_seqno);
                     out.push(value);
