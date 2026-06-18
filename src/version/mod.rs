@@ -28,7 +28,7 @@ pub mod edit_log;
 // directory transitions to no-std together. See
 // `.github/workflows/coordinode-ci.yml` no-std-check job for the
 // progress meter.
-mod framing;
+pub(crate) mod framing;
 mod optimize;
 mod persist;
 pub mod recovery;
