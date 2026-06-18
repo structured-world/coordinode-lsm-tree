@@ -58,6 +58,7 @@
 //! record shape is recognised on both paths.
 
 use super::framing;
+use crate::UserKey;
 use crate::io::{LittleEndian, ReadBytesExt, WriteBytesExt};
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -119,6 +120,13 @@ pub struct VersionEdit {
     /// `None` when unchanged from the prior version. Opaque bytes at this layer
     /// (encoded / decoded by the version layer that owns the map).
     pub gc_stats: Option<Vec<u8>>,
+    /// Per-table key-range lower-bound overrides for tight-space compaction
+    /// (`table id → punched-prefix lower bound`). A table listed here has had
+    /// its data below the bound punched out and superseded by a freshly merged
+    /// output table; recovery rebuilds the restricted view via
+    /// [`Table::with_restriction`](crate::Table::with_restriction). Empty on
+    /// every edit that did not run tight-space reclaim.
+    pub restrictions: Vec<(u64, UserKey)>,
 }
 
 /// `checksum_type` byte written for XXH3-128 (matches the snapshot encoder).
@@ -162,6 +170,13 @@ impl VersionEdit {
                 out.write_all(bytes)?;
             }
             None => out.write_u32::<LittleEndian>(0)?,
+        }
+
+        out.write_u32::<LittleEndian>(u32_len(self.restrictions.len())?)?;
+        for (id, key) in &self.restrictions {
+            out.write_u64::<LittleEndian>(*id)?;
+            out.write_u32::<LittleEndian>(u32_len(key.len())?)?;
+            out.write_all(key)?;
         }
         Ok(())
     }
@@ -249,6 +264,19 @@ impl VersionEdit {
             Some(head.to_vec())
         };
 
+        let restriction_count = r.read_u32::<LittleEndian>().map_err(|_| ERR)?;
+        let mut restrictions = Vec::with_capacity(cap(restriction_count));
+        for _ in 0..restriction_count {
+            let id = r.read_u64::<LittleEndian>().map_err(|_| ERR)?;
+            let key_len = r.read_u32::<LittleEndian>().map_err(|_| ERR)? as usize;
+            if r.len() < key_len {
+                return Err(ERR);
+            }
+            let (head, tail) = r.split_at(key_len);
+            *r = tail;
+            restrictions.push((id, UserKey::from(head)));
+        }
+
         // A well-formed edit consumes its payload exactly. Trailing bytes mean a
         // corrupt / mis-encoded record (format drift, not power loss — the
         // framing checksum already passed), so reject rather than silently
@@ -263,6 +291,7 @@ impl VersionEdit {
             added_blob_files,
             removed_blob_file_ids,
             gc_stats,
+            restrictions,
         })
     }
 }
@@ -444,6 +473,12 @@ mod tests {
             }],
             removed_blob_file_ids: vec![4],
             gc_stats: Some(vec![0xAB; 20]),
+            // Two tight-space restrictions, so the framed round-trip exercises
+            // the variable-length restriction codec (ids + length-prefixed keys).
+            restrictions: vec![
+                (7, UserKey::from(&b"mmm"[..])),
+                (10, UserKey::from(&b"zzzz"[..])),
+            ],
         }
     }
 

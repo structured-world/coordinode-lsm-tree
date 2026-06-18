@@ -2001,10 +2001,6 @@ impl Table {
     /// reads route keys `< bound` elsewhere and clamp this table's scans to
     /// start at `bound` (its index still references the punched prefix).
     #[must_use]
-    #[expect(
-        dead_code,
-        reason = "consumed by the restriction persistence (encode_into) landing next on this branch"
-    )]
     pub(crate) fn restrict_lower_bound(&self) -> Option<&UserKey> {
         self.1.as_ref()
     }
