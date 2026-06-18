@@ -69,6 +69,19 @@ pub struct Inner {
     /// May be kept alive until all Arcs to the table have been dropped (to facilitate snapshots)
     pub is_deleted: AtomicBool,
 
+    /// Tight-space punch-on-drop offset, or [`u64::MAX`] (the default) for "no
+    /// punch". When a tight-space compaction restricts a table to `[K, hi)`, the
+    /// PRIOR (unrestricted) view of the same physical SST is marked here with
+    /// `offset(K)`: once every reader holding that old view has dropped its
+    /// `Arc` (so no read can touch the prefix), this view's [`Drop`] reclaims the
+    /// `[0, offset)` byte range via [`Fs::punch_hole`](crate::fs::Fs::punch_hole)
+    /// while LEAVING the file in place (the restricted view, a distinct `Inner`,
+    /// still serves the suffix). Distinct from [`Self::is_deleted`]: a punched
+    /// view is not deleted. Using the `Drop`-at-refcount-zero signal makes the
+    /// punch safe without an explicit snapshot gate — it fires exactly when the
+    /// old view is unreachable. Cumulative across slices and idempotent.
+    pub(crate) punch_on_drop: AtomicU64,
+
     pub(super) checksum: Checksum,
 
     pub(super) global_seqno: SeqNo,
@@ -252,6 +265,24 @@ impl Drop for Inner {
             if let Err(e) = self.fs.remove_file(&self.path) {
                 log::warn!(
                     "Failed to cleanup deleted table {global_id:?} at {:?}: {e:?}",
+                    self.path,
+                );
+            }
+        } else {
+            // Not deleted, but possibly marked for tight-space prefix reclaim:
+            // this (old, unrestricted) view's last Arc is dropping, so no read
+            // can touch the prefix anymore. Punch `[0, offset)` and LEAVE the
+            // file — the restricted view (a distinct Inner) still serves the
+            // suffix. `punch_hole` opens the path itself, so it is fine that
+            // this view's own handles drop right after this body.
+            let off = self
+                .punch_on_drop
+                .load(core::sync::atomic::Ordering::Acquire);
+            if off != u64::MAX
+                && let Err(e) = self.fs.punch_hole(&self.path, 0, off)
+            {
+                log::warn!(
+                    "Failed to punch tight-space prefix [0, {off}) of table {global_id:?} at {:?}: {e:?}",
                     self.path,
                 );
             }

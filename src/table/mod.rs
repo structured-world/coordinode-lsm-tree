@@ -1984,6 +1984,7 @@ impl Table {
                 pinned_filter_block,
 
                 is_deleted: AtomicBool::default(),
+                punch_on_drop: AtomicU64::new(u64::MAX),
 
                 checksum,
                 global_seqno,
