@@ -2079,6 +2079,48 @@ impl Table {
         Ok(reopened.with_restriction(lower))
     }
 
+    /// Marks this view to punch `[0, offset)` when its last `Arc` drops (see
+    /// [`Inner::punch_on_drop`](inner::Inner::punch_on_drop)). Set on the PRIOR
+    /// unrestricted view once a tight-space slice has been installed, so the
+    /// consumed prefix is reclaimed exactly when no reader can still see it.
+    #[expect(
+        dead_code,
+        reason = "consumed by the tight-space compaction loop landing next on this branch"
+    )]
+    pub(crate) fn mark_punch_on_drop(&self, offset: u64) {
+        self.0
+            .punch_on_drop
+            .store(offset, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Byte offset of the first data block whose last key reaches `key`. Punching
+    /// `[0, offset)` reclaims every data block strictly below `key` while leaving
+    /// the straddling block and the index / footer (which follow all data blocks)
+    /// intact. When `key` is past the last block's keys, returns the end of the
+    /// data region (every data block is punchable).
+    ///
+    /// # Errors
+    ///
+    /// Propagates a block-index read error.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by the tight-space compaction loop landing next on this branch"
+        )
+    )]
+    pub(crate) fn punch_offset_for(&self, key: &[u8]) -> crate::Result<u64> {
+        let mut data_end = 0u64;
+        for handle in self.block_index.iter() {
+            let handle = handle?;
+            if self.comparator.compare(handle.end_key(), key) != core::cmp::Ordering::Less {
+                return Ok(handle.offset().0);
+            }
+            data_end = handle.offset().0 + u64::from(handle.size());
+        }
+        Ok(data_end)
+    }
+
     /// Installs the tree-wide deletion pause used by checkpoints.
     ///
     /// Idempotent: a second call is a no-op. Called by the owning tree

@@ -756,6 +756,47 @@ fn reopen_restricted_yields_a_distinct_clamped_view() -> crate::Result<()> {
     )
 }
 
+#[test]
+#[expect(clippy::unwrap_used)]
+fn punch_offset_for_locates_the_first_block_reaching_a_key() -> crate::Result<()> {
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"c", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"d", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"e", b"v", 0, crate::ValueType::Value),
+    ];
+
+    // rotate_every Some(1) spills a block before every item, so each key lands
+    // in its own data block with a strictly increasing offset.
+    test_with_table(
+        &items,
+        |table| {
+            // "a" is in the first block at offset 0 (nothing below it to punch).
+            assert_eq!(0, table.punch_offset_for(b"a")?);
+
+            let pb = table.punch_offset_for(b"b")?;
+            let pc = table.punch_offset_for(b"c")?;
+            let pe = table.punch_offset_for(b"e")?;
+            assert!(pb > 0, "punching up to b reclaims a's block");
+            assert!(pc > pb, "offsets advance with the key");
+            assert!(pe > pc);
+
+            // A key past the last block reports the end of the data region, so
+            // the whole data area is punchable.
+            let beyond = table.punch_offset_for(b"zzz")?;
+            assert!(
+                beyond >= pe,
+                "a key beyond the last block punches every data block",
+            );
+
+            Ok(())
+        },
+        Some(1),
+        Some(|x| x),
+    )
+}
+
 /// Writes `items` through an adaptive-index writer with the given spill
 /// threshold and recovers the resulting [`Table`]. Returns the table plus
 /// the backing temp dir (kept alive by the caller).
