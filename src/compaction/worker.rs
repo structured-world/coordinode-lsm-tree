@@ -854,6 +854,12 @@ fn run_tight_space_compaction(
             tables_out += outputs.len();
             current = restricted;
             lower = Bound::Included(boundary.clone());
+
+            // Release the prior view from the in-memory history so its Drop
+            // punches the consumed prefix NOW, reclaiming space before the next
+            // slice's output is written. A concurrent snapshot keeps its own
+            // clone, which safely defers the punch until that reader is done.
+            opts.version_history.write().drain_obsolete_to_latest();
         }
 
         // Tail [last boundary, hi): merge the remainder and remove the input.

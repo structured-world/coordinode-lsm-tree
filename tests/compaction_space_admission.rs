@@ -429,6 +429,14 @@ fn tight_space_compaction_rewrites_a_gated_single_table_and_preserves_data() -> 
         "tight-space loop must slice the gated table (skip would leave {tables_before})",
     );
 
+    // Reclaim: the consumed input prefixes were punched in place (not merely
+    // deleted at the end), which is what let the rewrite proceed on a disk
+    // smaller than a normal merge's transient peak.
+    assert!(
+        mem.punched_bytes() > 0,
+        "tight-space compaction must reclaim consumed slices via hole punching",
+    );
+
     // Correctness: every key remains readable after the tight-space rewrite.
     for i in 0..n {
         assert!(

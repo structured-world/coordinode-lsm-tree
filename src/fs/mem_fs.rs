@@ -137,6 +137,15 @@ impl MemFs {
         // freed even though the logical file length is unchanged.
         logical.saturating_sub(self.punched_bytes.load(portable_atomic::Ordering::Relaxed))
     }
+
+    /// Total bytes reclaimed by [`Fs::punch_hole`] across all files on this
+    /// simulated disk. Lets a test assert that an in-place extent reclaim (e.g.
+    /// the tight-space compaction prefix punch) actually fired, distinct from a
+    /// whole-file deletion.
+    #[must_use]
+    pub fn punched_bytes(&self) -> u64 {
+        self.punched_bytes.load(portable_atomic::Ordering::Relaxed)
+    }
 }
 
 /// Allocates the next per-instance `MemFs` namespace ID. Values are
