@@ -1389,13 +1389,23 @@ mod tests {
         // Build the on-disk section bytes the way `Version::encode_into` does:
         // count, then per entry (id u64, key_len u32, key bytes).
         let mut bytes = Vec::new();
-        bytes.write_u32::<LittleEndian>(2).unwrap();
-        bytes.write_u64::<LittleEndian>(7).unwrap();
-        bytes.write_u32::<LittleEndian>(3).unwrap();
-        bytes.write_all(b"mmm").unwrap();
-        bytes.write_u64::<LittleEndian>(42).unwrap();
-        bytes.write_u32::<LittleEndian>(4).unwrap();
-        bytes.write_all(b"zzzz").unwrap();
+        bytes
+            .write_u32::<LittleEndian>(2)
+            .expect("encode test bytes");
+        bytes
+            .write_u64::<LittleEndian>(7)
+            .expect("encode test bytes");
+        bytes
+            .write_u32::<LittleEndian>(3)
+            .expect("encode test bytes");
+        bytes.write_all(b"mmm").expect("encode test bytes");
+        bytes
+            .write_u64::<LittleEndian>(42)
+            .expect("encode test bytes");
+        bytes
+            .write_u32::<LittleEndian>(4)
+            .expect("encode test bytes");
+        bytes.write_all(b"zzzz").expect("encode test bytes");
 
         let map = parse_restrictions_section(&bytes).expect("parse");
         assert_eq!(map.len(), 2);
@@ -1407,10 +1417,16 @@ mod tests {
     fn parse_restrictions_section_rejects_a_truncated_key() {
         // count=1, id, key_len=8, but only 2 key bytes present.
         let mut bytes = Vec::new();
-        bytes.write_u32::<LittleEndian>(1).unwrap();
-        bytes.write_u64::<LittleEndian>(1).unwrap();
-        bytes.write_u32::<LittleEndian>(8).unwrap();
-        bytes.write_all(b"xy").unwrap();
+        bytes
+            .write_u32::<LittleEndian>(1)
+            .expect("encode test bytes");
+        bytes
+            .write_u64::<LittleEndian>(1)
+            .expect("encode test bytes");
+        bytes
+            .write_u32::<LittleEndian>(8)
+            .expect("encode test bytes");
+        bytes.write_all(b"xy").expect("encode test bytes");
         assert!(
             parse_restrictions_section(&bytes).is_err(),
             "a key shorter than its length prefix must not silently un-clamp",

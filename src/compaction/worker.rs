@@ -171,6 +171,15 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
                     merge_tables(compaction_state, version_history_lock, opts, &narrowed)
                 }
                 SpaceGate::Skip => {
+                    #[cfg(feature = "std")]
+                    if opts.runtime_config.load().tight_space_compaction {
+                        return run_tight_space_compaction(
+                            compaction_state,
+                            version_history_lock,
+                            opts,
+                            &payload,
+                        );
+                    }
                     log::info!(
                         "Compaction space gate: skipping {}-table merge — free space cannot cover the transient output and no fitting subset exists (opt-in tight-space reclaim handles this)",
                         payload.table_ids.len(),
@@ -695,6 +704,199 @@ fn cancelled_compaction() -> crate::Error {
         crate::io::ErrorKind::Interrupted,
         "sub-compaction cancelled by stop signal",
     ))
+}
+
+/// Block-aligned key-range boundaries that split `input` into slices of roughly
+/// `slice_budget` bytes each. The last block is never a boundary (its keys are
+/// the rewrite's tail, handled by the final removal), so a single-block table
+/// yields no boundaries (it cannot be reclaimed incrementally).
+#[cfg(feature = "std")]
+fn tight_slice_boundaries(input: &Table, slice_budget: u64) -> crate::Result<Vec<UserKey>> {
+    use crate::table::block_index::BlockIndex;
+    let handles = input
+        .block_index
+        .iter()
+        .collect::<crate::Result<Vec<_>>>()?;
+    let mut boundaries = Vec::new();
+    let mut acc = 0u64;
+    for handle in handles.iter().take(handles.len().saturating_sub(1)) {
+        acc = acc.saturating_add(u64::from(handle.size()));
+        if acc >= slice_budget {
+            boundaries.push(handle.end_key().clone());
+            acc = 0;
+        }
+    }
+    Ok(boundaries)
+}
+
+/// Opt-in tight-space compaction: rewrites a single oversized input in
+/// key-range slices, installing each slice as one durable version edit and
+/// reclaiming the consumed input prefix via hole punching once the prior view
+/// drains, so the peak transient footprint is one slice rather than the whole
+/// rewrite. Engaged from [`do_compaction`] when the space gate finds no fitting
+/// merge and the tree opts in.
+///
+/// First cut: single-input, non-KV-separated rewrites (the headline "one SST
+/// larger than the free space"). Other shapes fall back to skipping.
+#[cfg(feature = "std")]
+fn run_tight_space_compaction(
+    mut compaction_state: CompactionGuard<'_>,
+    version_history_lock: VersionsReadGuard<'_>,
+    opts: &Options,
+    payload: &CompactionPayload,
+) -> crate::Result<CompactionResult> {
+    use core::ops::Bound;
+
+    if payload.table_ids.len() != 1 || opts.config.kv_separation_opts.is_some() {
+        return Ok(CompactionResult::nothing());
+    }
+    let Some(&input_id) = payload.table_ids.iter().next() else {
+        return Ok(CompactionResult::nothing());
+    };
+
+    // Capability gate: the destination volume must support hole punching.
+    let (dest_path, dest_fs) = opts.config.tables_folder_for_level(payload.dest_level);
+    if !dest_fs.capabilities(&dest_path).punch_hole {
+        log::info!("Tight-space compaction unavailable: backend lacks punch_hole");
+        return Ok(CompactionResult::nothing());
+    }
+
+    let Some(input) = version_history_lock
+        .latest_version()
+        .version
+        .get_table(input_id)
+        .cloned()
+    else {
+        return Ok(CompactionResult::nothing());
+    };
+    drop(version_history_lock);
+
+    let slice_budget = dest_fs
+        .available_space(&dest_path)
+        .unwrap_or(u64::MAX)
+        .max(1);
+    let boundaries = tight_slice_boundaries(&input, slice_budget)?;
+    if boundaries.is_empty() {
+        // Indivisible (single block) — incremental reclaim is impossible.
+        return Ok(CompactionResult::nothing());
+    }
+
+    // Hide the input so the strategy cannot re-select it mid-loop.
+    compaction_state
+        .hidden_set_mut()
+        .hide(core::iter::once(input_id));
+
+    let dst_lvl: usize = payload.canonical_level.into();
+    let is_last_level = payload.dest_level == opts.config.level_count - 1;
+    let blobs_folder = opts.config.path.join(BLOBS_FOLDER);
+    let rts: Vec<crate::range_tombstone::RangeTombstone> = input.range_tombstones().to_vec();
+
+    let mut current = input;
+    let mut lower: Bound<UserKey> = Bound::Unbounded;
+
+    let result = (|| -> crate::Result<usize> {
+        let mut tables_out = 0usize;
+
+        for boundary in &boundaries {
+            // Merge [lower, boundary) from the CURRENT (restricted) input view.
+            let version = opts.version_history.read().latest_version();
+            let produced = run_subcompaction(
+                opts,
+                payload,
+                &version.version,
+                Vec::new(),
+                &rts,
+                (lower.clone(), Bound::Excluded(boundary.clone())),
+                dst_lvl,
+                is_last_level,
+                &blobs_folder,
+            )?;
+            let outputs: Vec<Table> = produced.created_tables().to_vec();
+
+            // Re-open the input restricted to the boundary (a distinct Inner so
+            // the prior view can drop and punch its prefix independently).
+            let restricted = current.reopen_restricted(boundary.clone())?;
+
+            // Install: add the slice output, replace the input with its
+            // restricted view. One atomic, durable version edit (the diff
+            // persists the restriction).
+            let comparator = opts.config.comparator.clone();
+            let install = opts.version_history.write().upgrade_version(
+                &opts.config.path,
+                |sv| {
+                    let mut copy = sv.clone();
+                    let ctx = crate::version::TransformContext::new(comparator.as_ref());
+                    copy.version = copy.version.with_tight_slice(
+                        input_id,
+                        &restricted,
+                        &outputs,
+                        payload.dest_level as usize,
+                        &ctx,
+                    );
+                    Ok(copy)
+                },
+                &opts.global_seqno,
+                &opts.visible_seqno,
+                &*opts.config.fs,
+                opts.runtime_config.load_full(),
+                opts.encryption.clone(),
+            );
+            if let Err(e) = install {
+                for t in &outputs {
+                    t.mark_as_deleted();
+                }
+                return Err(e);
+            }
+
+            // Arm the prior view to punch its consumed prefix once it drains.
+            current.mark_punch_on_drop(current.punch_offset_for(boundary)?);
+
+            tables_out += outputs.len();
+            current = restricted;
+            lower = Bound::Included(boundary.clone());
+        }
+
+        // Tail [last boundary, hi): merge the remainder and remove the input.
+        let version = opts.version_history.read().latest_version();
+        let produced = run_subcompaction(
+            opts,
+            payload,
+            &version.version,
+            vec![current.clone()],
+            &rts,
+            (lower.clone(), Bound::Unbounded),
+            dst_lvl,
+            is_last_level,
+            &blobs_folder,
+        )?;
+        let tail_out = produced.created_tables().len();
+        super::flavour::install_merge(
+            &mut opts.version_history.write(),
+            opts,
+            payload,
+            vec![produced],
+        )?;
+        Ok(tables_out + tail_out)
+    })();
+
+    compaction_state
+        .hidden_set_mut()
+        .show(core::iter::once(input_id));
+
+    let tables_out = result?;
+
+    opts.version_history.write().maintenance(
+        &opts.config.path,
+        opts.mvcc_gc_watermark,
+        &*opts.config.fs,
+    )?;
+
+    Ok(CompactionResult {
+        action: CompactionAction::Merged,
+        dest_level: Some(payload.dest_level),
+        tables_in: 1,
+        tables_out,
+    })
 }
 
 /// Runs one sub-compaction over the key range `bounds`: builds a bounded merge

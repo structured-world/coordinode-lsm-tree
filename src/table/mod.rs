@@ -2050,13 +2050,6 @@ impl Table {
     /// # Errors
     ///
     /// Propagates any error from re-opening the SST file.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by the tight-space compaction loop landing next on this branch"
-        )
-    )]
     pub(crate) fn reopen_restricted(&self, lower: UserKey) -> crate::Result<Self> {
         let reopened = Self::recover(
             (*self.path).clone(),
@@ -2083,10 +2076,6 @@ impl Table {
     /// [`Inner::punch_on_drop`](inner::Inner::punch_on_drop)). Set on the PRIOR
     /// unrestricted view once a tight-space slice has been installed, so the
     /// consumed prefix is reclaimed exactly when no reader can still see it.
-    #[expect(
-        dead_code,
-        reason = "consumed by the tight-space compaction loop landing next on this branch"
-    )]
     pub(crate) fn mark_punch_on_drop(&self, offset: u64) {
         self.0
             .punch_on_drop
@@ -2102,13 +2091,6 @@ impl Table {
     /// # Errors
     ///
     /// Propagates a block-index read error.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by the tight-space compaction loop landing next on this branch"
-        )
-    )]
     pub(crate) fn punch_offset_for(&self, key: &[u8]) -> crate::Result<u64> {
         let mut data_end = 0u64;
         for handle in self.block_index.iter() {

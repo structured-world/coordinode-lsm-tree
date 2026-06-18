@@ -733,6 +733,66 @@ impl Version {
             }),
         }
     }
+
+    /// Tight-space slice install: replaces the input table `input_id` with its
+    /// restricted view `restricted_input` (same id, clamped to a higher lower
+    /// bound) wherever it sits, and adds the slice `outputs` as a new run in
+    /// `dest_level`. The restriction rides on the [`Table`] wrapper, so `diff` /
+    /// `encode_into` persist it; the prior view is released by the version swap
+    /// and punches its consumed prefix once its readers drain.
+    pub fn with_tight_slice(
+        &self,
+        input_id: TableId,
+        restricted_input: &Table,
+        outputs: &[Table],
+        dest_level: usize,
+        ctx: &TransformContext<'_>,
+    ) -> Self {
+        let comparator = ctx.comparator;
+        let id = self.id + 1;
+
+        let mut levels = vec![];
+
+        for (level_idx, level) in self.levels.iter().enumerate() {
+            let mut runs = level
+                .runs
+                .iter()
+                .map(|run| {
+                    let mut run: Run<_> = run.deref().clone();
+                    for t in run.inner_mut().iter_mut() {
+                        if t.id() == input_id {
+                            *t = restricted_input.clone();
+                        }
+                    }
+                    run
+                })
+                .collect::<Vec<_>>();
+
+            if level_idx == dest_level
+                && let Some(run) = Run::new(outputs.to_vec())
+            {
+                if dest_level == 0 {
+                    runs.push(run);
+                } else {
+                    runs.insert(0, run);
+                }
+            }
+
+            let runs = optimize_runs(runs, comparator);
+
+            levels.push(Level::from_runs(runs.into_iter().map(Arc::new).collect()));
+        }
+
+        Self {
+            inner: Arc::new(VersionInner {
+                id,
+                tree_type: self.tree_type,
+                levels,
+                blob_files: self.blob_files.clone(),
+                gc_stats: self.gc_stats.clone(),
+            }),
+        }
+    }
 }
 
 impl Version {

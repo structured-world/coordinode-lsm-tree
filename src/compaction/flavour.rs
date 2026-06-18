@@ -214,6 +214,13 @@ impl ProducedOutput {
     /// orphaned. Only the newly created files are dropped — input tables stay
     /// intact (the caller un-hides them) and rewritten-blob-file drops are left
     /// for a later successful compaction.
+    /// The SSTs this (sub-)compaction finalized on disk but has not installed.
+    /// Used by the tight-space loop, which installs them via a custom version
+    /// edit (restricting the input) rather than the standard [`install_merge`].
+    pub(super) fn created_tables(&self) -> &[Table] {
+        &self.created_tables
+    }
+
     pub(super) fn rollback_uninstalled(&self) {
         for table in &self.created_tables {
             table.mark_as_deleted();

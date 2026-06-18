@@ -757,7 +757,6 @@ fn reopen_restricted_yields_a_distinct_clamped_view() -> crate::Result<()> {
 }
 
 #[test]
-#[expect(clippy::unwrap_used)]
 fn punch_offset_for_locates_the_first_block_reaching_a_key() -> crate::Result<()> {
     let items = [
         crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),

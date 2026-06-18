@@ -392,3 +392,72 @@ fn storage_status_reports_full_compaction_availability() -> lsm_tree::Result<()>
     );
     Ok(())
 }
+
+#[test]
+fn tight_space_compaction_rewrites_a_gated_single_table_and_preserves_data() -> lsm_tree::Result<()>
+{
+    let folder = get_tmp_folder();
+    let (tree, mem) = open_capped(folder.path(), u64::MAX);
+    let n = 2_000u64;
+
+    // One generation flushed to a single multi-block SST.
+    for i in 0..n {
+        tree.insert(format!("key{i:08}").as_bytes(), vec![0xCDu8; 64], i);
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    let used = tree.storage_stats().expect("stats").used_bytes;
+    let tables_before = tree.table_count();
+
+    // Cap the disk so a full rewrite of the table cannot fit alongside it: the
+    // space gate skips the merge, and the opt-in tight-space loop reclaims the
+    // input in slices instead.
+    mem.set_capacity(used + used / 4);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+        c.tight_space_compaction = true;
+    })?;
+
+    // A normal merge needs ~2x the table size transiently and would ENOSPC on
+    // this cap; tight-space reclaim completes by punching consumed slices.
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+
+    // Engagement: the gated single table is rewritten into multiple slice
+    // outputs (a plain skip would leave the one input untouched).
+    assert!(
+        tree.table_count() > tables_before,
+        "tight-space loop must slice the gated table (skip would leave {tables_before})",
+    );
+
+    // Correctness: every key remains readable after the tight-space rewrite.
+    for i in 0..n {
+        assert!(
+            tree.get(format!("key{i:08}").as_bytes(), u64::MAX)?
+                .is_some(),
+            "key {i} lost after tight-space compaction",
+        );
+    }
+
+    // Consistency survives a reopen on the same simulated disk.
+    drop(tree);
+    let reopened = match Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(mem.clone()))
+    .open()?
+    {
+        AnyTree::Standard(t) => t,
+        AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    for i in (0..n).step_by(53) {
+        assert!(
+            reopened
+                .get(format!("key{i:08}").as_bytes(), u64::MAX)?
+                .is_some(),
+            "key {i} lost after reopen",
+        );
+    }
+    Ok(())
+}
