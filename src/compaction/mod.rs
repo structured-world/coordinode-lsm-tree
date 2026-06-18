@@ -14,16 +14,11 @@ pub(crate) mod heal;
 pub(crate) mod major;
 pub(crate) mod movedown;
 pub(crate) mod pulldown;
-// Crash-resume journal for tight-space compaction. Its public surface is wired
-// by the tight-compaction loop landing later on this branch; until that lands
-// the journal is exercised only by its own unit tests.
 #[cfg(feature = "std")]
 pub(crate) mod seqno_zeroer;
 pub(crate) mod state;
 pub(crate) mod stream;
 pub(crate) mod tiered;
-#[allow(dead_code)]
-pub(crate) mod tight_journal;
 pub(crate) mod worker;
 
 pub use fifo::Strategy as Fifo;
