@@ -431,10 +431,15 @@ fn tight_space_compaction_rewrites_a_gated_single_table_and_preserves_data() -> 
 
     // Reclaim: the consumed input prefixes were punched in place (not merely
     // deleted at the end), which is what let the rewrite proceed on a disk
-    // smaller than a normal merge's transient peak.
+    // smaller than a normal merge's transient peak. The punched bytes are a
+    // large fraction of the input — the punch keeps pace with the slice output,
+    // so the transient footprint stays near one input rather than ballooning to
+    // input + full output (a peak-bounded reclaim, not a token punch at the end).
+    let punched = mem.punched_bytes();
     assert!(
-        mem.punched_bytes() > 0,
-        "tight-space compaction must reclaim consumed slices via hole punching",
+        punched > used / 3,
+        "tight-space reclaim must punch the bulk of the input incrementally \
+         (punched {punched} of ~{used} used)",
     );
 
     // Correctness: every key remains readable after the tight-space rewrite.
