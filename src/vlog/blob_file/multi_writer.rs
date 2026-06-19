@@ -203,6 +203,7 @@ impl MultiWriter {
                 tree_id,
                 path,
                 is_deleted: AtomicBool::new(false),
+                punch_on_drop: portable_atomic::AtomicU64::new(u64::MAX),
                 id: blob_file_id,
                 file_accessor,
                 meta: Metadata {

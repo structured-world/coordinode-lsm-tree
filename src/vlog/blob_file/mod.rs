@@ -43,6 +43,16 @@ pub struct Inner {
     /// Whether this blob file is deleted (logically)
     pub is_deleted: AtomicBool,
 
+    /// Tight-space punch-on-drop offset, or [`u64::MAX`] (default) for "no
+    /// punch". When tight-space blob relocation rewrites this file's live
+    /// entries below an offset into a fresh compact file, the PRIOR view is
+    /// marked here with that offset; once every reader holding it drops, this
+    /// view's [`Drop`] reclaims the consumed `[0, offset)` frames via
+    /// [`Fs::punch_hole`](crate::fs::Fs::punch_hole) and LEAVES the file in
+    /// place (the restricted view still serves the suffix). Mirrors
+    /// `table::Inner::punch_on_drop`. Distinct from [`Self::is_deleted`].
+    pub(crate) punch_on_drop: portable_atomic::AtomicU64,
+
     pub checksum: Checksum,
 
     pub(crate) file_accessor: FileAccessor,
@@ -170,6 +180,25 @@ impl Drop for Inner {
                     self.path.display(),
                 );
             }
+        } else {
+            // Not deleted, but possibly marked for tight-space prefix reclaim:
+            // this (old) view's last Arc is dropping, so no reader can touch the
+            // relocated prefix anymore. Punch the consumed `[0, offset)` frames
+            // and LEAVE the file — the restricted view (a distinct Inner) still
+            // serves the suffix. Blob frames are contiguous with no file header,
+            // so a single span punch is safe; the footer sits at the tail.
+            let off = self
+                .punch_on_drop
+                .load(core::sync::atomic::Ordering::Acquire);
+            if off != u64::MAX
+                && let Err(e) = self.fs.punch_hole(&self.path, 0, off)
+            {
+                log::warn!(
+                    "Failed to punch tight-space prefix [0, {off}) of blob file {:?} at {}: {e:?}",
+                    self.id,
+                    self.path.display(),
+                );
+            }
         }
     }
 }
@@ -197,6 +226,21 @@ impl BlobFile {
         self.0
             .is_deleted
             .store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Marks this view to punch the consumed `[0, offset)` frames when its last
+    /// `Arc` drops (see [`Inner::punch_on_drop`]). Set on the prior view once a
+    /// tight-space relocation slice has moved its `[0, offset)` live entries
+    /// into a fresh compact file and that move is durably installed.
+    #[cfg(feature = "std")]
+    #[expect(
+        dead_code,
+        reason = "consumed by the tight-space blob relocation loop landing next on this branch"
+    )]
+    pub(crate) fn mark_punch_on_drop(&self, offset: u64) {
+        self.0
+            .punch_on_drop
+            .store(offset, core::sync::atomic::Ordering::Release);
     }
 
     /// Installs the tree-wide deletion pause used by checkpoints.
