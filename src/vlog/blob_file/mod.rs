@@ -259,10 +259,11 @@ impl BlobFile {
             .store(true, core::sync::atomic::Ordering::Release);
     }
 
-    /// Marks this view to punch the consumed `[0, offset)` frames when its last
-    /// `Arc` drops (see [`Inner::punch_on_drop`]). Set on the prior view once a
-    /// tight-space relocation slice has moved its `[0, offset)` live entries
-    /// into a fresh compact file and that move is durably installed.
+    /// Marks this view to punch the consumed `[data_start, offset)` data frames
+    /// when its last `Arc` drops (see [`Inner::punch_on_drop`]). `offset` is an
+    /// absolute data-section position. Set on the PRIOR view once a tight-space
+    /// relocation slice has moved its `[data_start, offset)` live entries into a
+    /// fresh compact file and that move is durably installed.
     #[cfg(feature = "std")]
     #[expect(
         dead_code,
@@ -272,6 +273,31 @@ impl BlobFile {
         self.0
             .punch_on_drop
             .store(offset, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Re-opens this blob file as a DISTINCT [`Inner`] (its own file handle and a
+    /// fresh punch-on-drop atomic) over the same physical file. The tight-space
+    /// relocation loop installs the re-opened view in the new version and arms
+    /// the prior view to punch its consumed prefix once its readers drain, so a
+    /// stale blob file is reclaimed in place while the suffix keeps serving the
+    /// not-yet-relocated entries — the blob analog of [`Table::reopen_restricted`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from re-opening the file.
+    #[cfg(feature = "std")]
+    #[expect(
+        dead_code,
+        reason = "consumed by the tight-space blob relocation loop landing next on this branch"
+    )]
+    pub(crate) fn reopen(&self) -> crate::Result<Self> {
+        super::recover_blob_file(
+            &self.0.path,
+            self.0.id,
+            self.0.checksum,
+            self.0.tree_id,
+            &self.0.fs,
+        )
     }
 
     /// Installs the tree-wide deletion pause used by checkpoints.
