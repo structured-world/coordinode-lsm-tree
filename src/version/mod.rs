@@ -317,11 +317,19 @@ impl Version {
                         let run_tables = run
                             .iter()
                             .map(|table| {
-                                tables
+                                let opened = tables
                                     .iter()
                                     .find(|x| x.id() == table.id)
                                     .cloned()
-                                    .ok_or(crate::Error::Unrecoverable)
+                                    .ok_or(crate::Error::Unrecoverable)?;
+                                // Rebuild the tight-space restricted view: the
+                                // data below the bound was punched out, so reads
+                                // must clamp to it (its index still references the
+                                // punched prefix).
+                                Ok(match recovery.restrictions.get(&table.id) {
+                                    Some(bound) => opened.with_restriction(bound.clone()),
+                                    None => opened,
+                                })
                             })
                             .collect::<crate::Result<Vec<_>>>()?;
 
@@ -725,6 +733,105 @@ impl Version {
             }),
         }
     }
+
+    /// Tight-space slice install for one or more inputs: replaces each
+    /// `(id, restricted view)` in `restricted` with its clamped view, drops the
+    /// fully-consumed inputs in `removed_ids`, and adds the slice `outputs` as a
+    /// new run in `dest_level`. The restriction rides on the [`Table`] wrapper,
+    /// so `diff` / `encode_into` persist it; a replaced / removed prior view is
+    /// released by the version swap and (for a restricted view) punches its
+    /// consumed prefix once its readers drain.
+    ///
+    /// For KV-separated trees the slice's `gc_diff` (newly dead blob entries)
+    /// and any `new_blob_files` it produced are folded in, so the running GC
+    /// stats stay accurate; globally-dead blob files are not dropped here (an
+    /// unprocessed slice may still reference them) — that happens at the final
+    /// removal.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a slice install carries the SST swaps/removes/outputs plus the \
+                  KV-separation blob delta (new files + GC diff); bundling would \
+                  just move the argument list"
+    )]
+    pub fn with_tight_slice(
+        &self,
+        restricted: &[(TableId, Table)],
+        removed_ids: &[TableId],
+        outputs: &[Table],
+        new_blob_files: Vec<BlobFile>,
+        gc_diff: Option<FragmentationMap>,
+        dest_level: usize,
+        ctx: &TransformContext<'_>,
+    ) -> Self {
+        let comparator = ctx.comparator;
+        let id = self.id + 1;
+
+        let mut levels = vec![];
+
+        for (level_idx, level) in self.levels.iter().enumerate() {
+            let mut runs = level
+                .runs
+                .iter()
+                .map(|run| {
+                    let mut run: Run<_> = run.deref().clone();
+                    // Drop fully-consumed inputs.
+                    run.retain(|t| !removed_ids.contains(&t.id()));
+                    // Swap each restricted input for its clamped view (same id).
+                    for t in run.inner_mut().iter_mut() {
+                        if let Some((_, view)) = restricted.iter().find(|(rid, _)| *rid == t.id()) {
+                            *t = view.clone();
+                        }
+                    }
+                    run
+                })
+                .filter(|run| !run.is_empty())
+                .collect::<Vec<_>>();
+
+            if level_idx == dest_level
+                && let Some(run) = Run::new(outputs.to_vec())
+            {
+                if dest_level == 0 {
+                    runs.push(run);
+                } else {
+                    runs.insert(0, run);
+                }
+            }
+
+            let runs = optimize_runs(runs, comparator);
+
+            levels.push(Level::from_runs(runs.into_iter().map(Arc::new).collect()));
+        }
+
+        // KV-separation blob delta: add any newly written blob files and fold in
+        // this slice's GC diff. Dead blob files are NOT pruned here — a later
+        // slice may still reference them; the final removal does the drop.
+        let value_log = if gc_diff.is_some() || !new_blob_files.is_empty() {
+            let mut copy = self.blob_files.deref().clone();
+            for blob_file in new_blob_files {
+                copy.insert(blob_file.id(), blob_file);
+            }
+            Arc::new(copy)
+        } else {
+            self.blob_files.clone()
+        };
+        let gc_stats = if let Some(diff) = gc_diff {
+            let mut copy = self.gc_stats.deref().clone();
+            diff.merge_into(&mut copy);
+            Arc::new(copy)
+        } else {
+            self.gc_stats.clone()
+        };
+
+        Self {
+            inner: Arc::new(VersionInner {
+                id,
+                tree_type: self.tree_type,
+                levels,
+                blob_files: value_log,
+                gc_stats,
+            }),
+        }
+    }
 }
 
 impl Version {
@@ -863,6 +970,28 @@ impl Version {
         writer.start("blob_gc_stats")?;
 
         self.gc_stats.encode_into(writer)?;
+
+        // Tight-space restrictions: per-table key-range lower bounds for tables
+        // whose prefix has been punched out and superseded by a merged output.
+        // Empty (count 0) on versions that never ran tight-space reclaim, so the
+        // section is one zero count in the common case. Each entry is the table
+        // id then a length-prefixed key (variable length, hence its own section
+        // rather than the fixed-length per-table `tables` record).
+        writer.start("restrictions")?;
+        let restricted: Vec<(TableId, crate::UserKey)> = self
+            .iter_tables()
+            .filter_map(|t| t.restrict_lower_bound().map(|b| (t.id(), b.clone())))
+            .collect();
+        writer.write_u32::<LittleEndian>(
+            u32::try_from(restricted.len()).map_err(|_| crate::Error::Unrecoverable)?,
+        )?;
+        for (id, key) in &restricted {
+            writer.write_u64::<LittleEndian>(*id)?;
+            writer.write_u32::<LittleEndian>(
+                u32::try_from(key.len()).map_err(|_| crate::Error::Unrecoverable)?,
+            )?;
+            writer.write_all(key)?;
+        }
 
         Ok(())
     }

@@ -43,6 +43,17 @@ pub struct Inner {
     /// Whether this blob file is deleted (logically)
     pub is_deleted: AtomicBool,
 
+    /// Tight-space punch-on-drop offset, or [`u64::MAX`] (default) for "no
+    /// punch". When tight-space blob relocation rewrites this file's live
+    /// entries below an offset into a fresh compact file, the PRIOR view is
+    /// marked here with that absolute data-section offset; once every reader
+    /// holding it drops, this view's [`Drop`] reclaims the consumed
+    /// `[data_start, offset)` data frames via
+    /// [`Fs::punch_hole`](crate::fs::Fs::punch_hole) and LEAVES the file in
+    /// place (the restricted view still serves the suffix). Mirrors
+    /// `table::Inner::punch_on_drop`. Distinct from [`Self::is_deleted`].
+    pub(crate) punch_on_drop: portable_atomic::AtomicU64,
+
     pub checksum: Checksum,
 
     pub(crate) file_accessor: FileAccessor,
@@ -170,8 +181,66 @@ impl Drop for Inner {
                     self.path.display(),
                 );
             }
+        } else {
+            // Not deleted, but possibly marked for tight-space prefix reclaim:
+            // this (old) view's last Arc is dropping, so no reader can touch the
+            // relocated prefix anymore. Punch the consumed data frames
+            // `[data_start, offset)` and LEAVE the file — the restricted view (a
+            // distinct Inner) still serves the suffix. A blob file is an SFA
+            // archive, so the punch must start at the `data` section (skip the
+            // header); the TOC sits at the tail and stays intact. `offset` is an
+            // absolute data-section position (a frame boundary from the
+            // relocation scanner). Re-read the data-section start from the TOC
+            // here rather than carrying it on every blob-file Inner — the punch
+            // is a rare, tight-space-only path.
+            //
+            // Hole punching is a std-only capability (the tight-space relocation
+            // loop that arms it is itself `#[cfg(feature = "std")]`), so the punch
+            // action is gated. The atomic load is no-std-safe but pointless when
+            // nothing can arm it.
+            #[cfg(feature = "std")]
+            {
+                let off = self
+                    .punch_on_drop
+                    .load(core::sync::atomic::Ordering::Acquire);
+                if off != u64::MAX {
+                    match data_section_start(&*self.fs, &self.path) {
+                        Ok(data_start) if off > data_start => {
+                            if let Err(e) =
+                                self.fs.punch_hole(&self.path, data_start, off - data_start)
+                            {
+                                log::warn!(
+                                    "Failed to punch tight-space data [{data_start}, {off}) of blob file {:?} at {}: {e:?}",
+                                    self.id,
+                                    self.path.display(),
+                                );
+                            }
+                        }
+                        Ok(_) => {} // nothing consumed below the data start
+                        Err(e) => log::warn!(
+                            "Skipping tight-space punch of blob file {:?} at {}: could not read data section: {e:?}",
+                            self.id,
+                            self.path.display(),
+                        ),
+                    }
+                }
+            }
         }
     }
+}
+
+/// Byte offset where a blob file's `data` section begins, read from its SFA TOC.
+/// Used by the tight-space punch so it reclaims only data frames and never the
+/// SFA header that precedes them.
+#[cfg(feature = "std")]
+fn data_section_start(fs: &dyn Fs, path: &Path) -> crate::Result<u64> {
+    let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+    let reader = crate::sfa::Reader::from_reader(&mut file)?;
+    let data = reader
+        .toc()
+        .section(b"data")
+        .ok_or(crate::Error::InvalidHeader("BlobFile"))?;
+    Ok(data.pos())
 }
 
 /// A blob file stores large values and is part of the value log
@@ -197,6 +266,39 @@ impl BlobFile {
         self.0
             .is_deleted
             .store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Marks this view to punch the consumed `[data_start, offset)` data frames
+    /// when its last `Arc` drops (see [`Inner::punch_on_drop`]). `offset` is an
+    /// absolute data-section position. Set on the PRIOR view once a tight-space
+    /// relocation slice has moved its `[data_start, offset)` live entries into a
+    /// fresh compact file and that move is durably installed.
+    #[cfg(feature = "std")]
+    pub(crate) fn mark_punch_on_drop(&self, offset: u64) {
+        self.0
+            .punch_on_drop
+            .store(offset, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Re-opens this blob file as a DISTINCT [`Inner`] (its own file handle and a
+    /// fresh punch-on-drop atomic) over the same physical file. The tight-space
+    /// relocation loop installs the re-opened view in the new version and arms
+    /// the prior view to punch its consumed prefix once its readers drain, so a
+    /// stale blob file is reclaimed in place while the suffix keeps serving the
+    /// not-yet-relocated entries — the blob analog of [`Table::reopen_restricted`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from re-opening the file.
+    #[cfg(feature = "std")]
+    pub(crate) fn reopen(&self) -> crate::Result<Self> {
+        super::recover_blob_file(
+            &self.0.path,
+            self.0.id,
+            self.0.checksum,
+            self.0.tree_id,
+            &self.0.fs,
+        )
     }
 
     /// Installs the tree-wide deletion pause used by checkpoints.

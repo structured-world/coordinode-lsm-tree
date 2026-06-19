@@ -85,6 +85,40 @@ fn decode_blob_entry_payload(payload: &[u8]) -> crate::Result<(BlobFileId, Check
     Ok((id, checksum))
 }
 
+/// Parses the optional `restrictions` section: `count: u32 | repeat(table id:
+/// u64, key_len: u32, key bytes)`. Read strictly (no tail tolerance): a
+/// restriction is safety-critical — an un-clamped table whose prefix was
+/// punched out would read zeroed blocks — so a malformed section aborts rather
+/// than silently dropping a clamp. Absent section is handled by the caller
+/// (legitimate: no tight-space reclaim ever ran) and never reaches here.
+fn parse_restrictions_section(
+    mut bytes: &[u8],
+) -> crate::Result<crate::HashMap<TableId, crate::UserKey>> {
+    const ERR: crate::Error = crate::Error::InvalidHeader("restrictions section");
+    let r = &mut bytes;
+    let count = r.read_u32::<LittleEndian>().map_err(|_| ERR)?;
+    let mut map = crate::HashMap::default();
+    for _ in 0..count {
+        let id = r.read_u64::<LittleEndian>().map_err(|_| ERR)?;
+        let key_len = r.read_u32::<LittleEndian>().map_err(|_| ERR)? as usize;
+        if r.len() < key_len {
+            return Err(ERR);
+        }
+        let (head, tail) = r.split_at(key_len);
+        *r = tail;
+        // Reject a duplicate table id: a corrupt section that lists a table twice
+        // could otherwise silently lower an already-advanced bound and un-clamp a
+        // punched prefix on reopen.
+        if map.insert(id, crate::UserKey::from(head)).is_some() {
+            return Err(ERR);
+        }
+    }
+    if !r.is_empty() {
+        return Err(ERR);
+    }
+    Ok(map)
+}
+
 /// Reads and validates the CURRENT version pointer file.
 ///
 /// The file format is: `version_id: u64 | checksum: u128 | checksum_type: u8`
@@ -248,6 +282,11 @@ pub struct Recovery {
     pub table_ids: Vec<Vec<Vec<RecoveredTable>>>,
     pub blob_file_ids: Vec<(BlobFileId, Checksum)>,
     pub gc_stats: crate::blob_tree::FragmentationMap,
+    /// Per-table tight-space key-range lower bounds recovered from the snapshot
+    /// `restrictions` section and advanced by replayed edits. A table id present
+    /// here is rebuilt as a restricted view ([`super::Version::from_recovery`]);
+    /// stale entries for tables no longer in the layout are simply never applied.
+    pub restrictions: crate::HashMap<TableId, crate::UserKey>,
     /// Per-section counters describing how many records were dropped
     /// during this recovery. Always zero under
     /// [`ManifestRecoveryMode::AbsoluteConsistency`] (any corruption
@@ -332,6 +371,22 @@ impl Recovery {
 
         if let Some(bytes) = &edit.gc_stats {
             self.gc_stats = crate::blob_tree::FragmentationMap::decode_from(&mut &bytes[..])?;
+        }
+
+        // Tight-space restrictions advance per slice: each edit lists the
+        // straddling input's new (higher) lower bound, so a later edit overwrites
+        // the earlier bound for the same table. A monotonicity (no-regression)
+        // check would be COMPARATOR-RELATIVE — "advancing" is defined by the
+        // tree's configured comparator, not byte order — but the comparator is not
+        // plumbed into recovery, so a byte-order check would wrongly reject valid
+        // advances (or miss real regressions) under a custom/reverse comparator.
+        // The edit log is framing-checksummed, so a corrupt/reordered edit is
+        // already rejected upstream; the comparator-independent duplicate guard
+        // lives in `parse_restrictions_section` for the snapshot path.
+        // Entries for tables later dropped from the layout are simply never
+        // applied by `from_recovery`, and the next snapshot rewrite drops them.
+        for (id, key) in &edit.restrictions {
+            self.restrictions.insert(*id, key.clone());
         }
 
         self.curr_version_id = edit.new_version_id;
@@ -1119,6 +1174,16 @@ pub fn recover(
         }
     };
 
+    // Optional tight-space restrictions section. Absent on versions that never
+    // ran tight-space reclaim (→ empty). When present it is read strictly: a
+    // restriction is safety-critical, so a malformed section aborts rather than
+    // silently un-clamping a punched table.
+    let restrictions = if archive.section("restrictions").is_some() {
+        parse_restrictions_section(&archive.read_section("restrictions")?)?
+    } else {
+        crate::HashMap::default()
+    };
+
     let mut recovery = Recovery {
         tree_type: {
             if archive.section("tree_type").is_none() {
@@ -1139,6 +1204,7 @@ pub fn recover(
         table_ids: levels,
         blob_file_ids,
         gc_stats,
+        restrictions,
         stats: RecoveryStats {
             tables_dropped_to_tail,
             tables_dropped_to_corruption,
@@ -1198,6 +1264,7 @@ mod tests {
             table_ids,
             blob_file_ids: Vec::new(),
             gc_stats: crate::blob_tree::FragmentationMap::default(),
+            restrictions: crate::HashMap::default(),
             stats: RecoveryStats::default(),
         }
     }
@@ -1296,6 +1363,114 @@ mod tests {
         assert_eq!(rec.table_ids.len(), 3, "levels grew to fit index 2");
         assert!(rec.table_ids[1].is_empty(), "the gap level is empty");
         assert_eq!(rec.table_ids[2], vec![vec![rtable(5, 20)]]);
+    }
+
+    #[test]
+    fn apply_edit_merges_and_advances_restrictions() {
+        let mut rec = recovery_with(1, vec![vec![vec![rtable(1, 10)]]]);
+        assert!(rec.restrictions.is_empty(), "starts unrestricted");
+
+        // First slice restricts table 1 at "ccc".
+        rec.apply_edit(&VersionEdit {
+            new_version_id: 2,
+            restrictions: vec![(1, crate::UserKey::from(&b"ccc"[..]))],
+            ..Default::default()
+        })
+        .expect("apply");
+        assert_eq!(
+            rec.restrictions.get(&1),
+            Some(&crate::UserKey::from(&b"ccc"[..])),
+        );
+
+        // Next slice advances the same table's bound to "mmm" (overwrite).
+        rec.apply_edit(&VersionEdit {
+            new_version_id: 3,
+            restrictions: vec![(1, crate::UserKey::from(&b"mmm"[..]))],
+            ..Default::default()
+        })
+        .expect("apply");
+        assert_eq!(
+            rec.restrictions.get(&1),
+            Some(&crate::UserKey::from(&b"mmm"[..])),
+            "a later slice's higher bound overwrites the earlier one",
+        );
+    }
+
+    #[test]
+    fn parse_restrictions_section_roundtrips_entries() {
+        // Build the on-disk section bytes the way `Version::encode_into` does:
+        // count, then per entry (id u64, key_len u32, key bytes).
+        let mut bytes = Vec::new();
+        bytes
+            .write_u32::<LittleEndian>(2)
+            .expect("encode test bytes");
+        bytes
+            .write_u64::<LittleEndian>(7)
+            .expect("encode test bytes");
+        bytes
+            .write_u32::<LittleEndian>(3)
+            .expect("encode test bytes");
+        bytes.write_all(b"mmm").expect("encode test bytes");
+        bytes
+            .write_u64::<LittleEndian>(42)
+            .expect("encode test bytes");
+        bytes
+            .write_u32::<LittleEndian>(4)
+            .expect("encode test bytes");
+        bytes.write_all(b"zzzz").expect("encode test bytes");
+
+        let map = parse_restrictions_section(&bytes).expect("parse");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&7), Some(&crate::UserKey::from(&b"mmm"[..])));
+        assert_eq!(map.get(&42), Some(&crate::UserKey::from(&b"zzzz"[..])));
+    }
+
+    #[test]
+    fn parse_restrictions_section_rejects_a_truncated_key() {
+        // count=1, id, key_len=8, but only 2 key bytes present.
+        let mut bytes = Vec::new();
+        bytes
+            .write_u32::<LittleEndian>(1)
+            .expect("encode test bytes");
+        bytes
+            .write_u64::<LittleEndian>(1)
+            .expect("encode test bytes");
+        bytes
+            .write_u32::<LittleEndian>(8)
+            .expect("encode test bytes");
+        bytes.write_all(b"xy").expect("encode test bytes");
+        assert!(
+            parse_restrictions_section(&bytes).is_err(),
+            "a key shorter than its length prefix must not silently un-clamp",
+        );
+    }
+
+    #[test]
+    fn parse_restrictions_section_rejects_a_duplicate_table_id() {
+        // count=2, but both entries name table id 5. A duplicate could silently
+        // lower an already-advanced bound, so it must abort recovery.
+        let mut bytes = Vec::new();
+        bytes
+            .write_u32::<LittleEndian>(2)
+            .expect("encode test bytes");
+        bytes
+            .write_u64::<LittleEndian>(5)
+            .expect("encode test bytes");
+        bytes
+            .write_u32::<LittleEndian>(3)
+            .expect("encode test bytes");
+        bytes.write_all(b"mmm").expect("encode test bytes");
+        bytes
+            .write_u64::<LittleEndian>(5)
+            .expect("encode test bytes");
+        bytes
+            .write_u32::<LittleEndian>(3)
+            .expect("encode test bytes");
+        bytes.write_all(b"ccc").expect("encode test bytes");
+        assert!(
+            parse_restrictions_section(&bytes).is_err(),
+            "a duplicate table id must not silently un-clamp an advanced bound",
+        );
     }
 
     #[test]

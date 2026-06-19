@@ -49,6 +49,38 @@ impl Scanner {
         fs: &dyn Fs,
         blob_file_id: BlobFileId,
     ) -> crate::Result<Self> {
+        Self::open(path, fs, blob_file_id, None)
+    }
+
+    /// Re-opens a blob file mid-stream, positioning the reader at `start_offset`
+    /// (an absolute data-section frame boundary captured from a previous scan's
+    /// [`ScanEntry::frame_end`]). Used by the tight-space blob relocation loop so
+    /// each slice resumes the stale-file scan where the prior slice stopped,
+    /// instead of re-reading a prefix that has already been hole-punched.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if an IO error occurs, the blob file lacks a "data" section,
+    /// or `start_offset` falls outside the data section.
+    #[cfg(feature = "std")]
+    pub fn resume<P: AsRef<Path>>(
+        path: P,
+        fs: &dyn Fs,
+        blob_file_id: BlobFileId,
+        start_offset: u64,
+    ) -> crate::Result<Self> {
+        Self::open(path, fs, blob_file_id, Some(start_offset))
+    }
+
+    /// Reads the SFA TOC to bound the "data" section, then positions the reader
+    /// at `start` if given (validated to lie within `[data_start, data_end]`) or
+    /// at the data-section start otherwise.
+    fn open<P: AsRef<Path>>(
+        path: P,
+        fs: &dyn Fs,
+        blob_file_id: BlobFileId,
+        start: Option<u64>,
+    ) -> crate::Result<Self> {
         let path = path.as_ref();
 
         let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
@@ -66,7 +98,18 @@ impl Scanner {
             crate::Error::InvalidHeader("BlobFile")
         })?;
 
-        file.seek(SeekFrom::Start(data_start))?;
+        let seek_to = match start {
+            None => data_start,
+            Some(off) if off >= data_start && off <= data_end => off,
+            Some(off) => {
+                log::error!(
+                    "BlobFile: resume offset {off} outside data section [{data_start}, {data_end}]"
+                );
+                return Err(crate::Error::InvalidHeader("BlobFile"));
+            }
+        };
+
+        file.seek(SeekFrom::Start(seek_to))?;
         let file_reader = BufReader::with_capacity(32_000, file);
 
         Ok(Self {
@@ -78,7 +121,7 @@ impl Scanner {
     }
     // No `with_reader` constructor: Scanner is crate-private (parent
     // `vlog` module is not re-exported from lib.rs), so there are no
-    // external callers. All internal usage goes through `new()`.
+    // external callers. All internal usage goes through `new()` / `resume()`.
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -88,6 +131,12 @@ pub struct ScanEntry {
     pub value: UserValue,
     pub offset: u64,
     pub uncompressed_len: u32,
+    /// Absolute data-section position immediately AFTER this frame (the start of
+    /// the next frame, or the data-section end for the last frame). The
+    /// tight-space relocation loop uses it as the exact punch / resume boundary:
+    /// once an entry is consumed, `[data_start, frame_end)` is reclaimable and a
+    /// resumed scan opens here.
+    pub frame_end: u64,
 }
 
 impl Iterator for Scanner {
@@ -195,12 +244,17 @@ impl Iterator for Scanner {
             }
         }
 
+        // The reader is now positioned at the next frame: capture it as the exact
+        // punch / resume boundary for this frame.
+        let frame_end = fail_iter!(self.inner.stream_position());
+
         Some(Ok(ScanEntry {
             key,
             seqno,
             value,
             offset,
             uncompressed_len: real_val_len,
+            frame_end,
         }))
     }
 }
@@ -246,6 +300,54 @@ mod tests {
             assert!(scanner.next().is_none());
         }
 
+        Ok(())
+    }
+
+    /// `Scanner::resume` re-opens at a carried frame boundary and reads only the
+    /// suffix (the tight-space relocation loop's per-slice resume), and rejects an
+    /// offset outside the data section.
+    #[test]
+    fn blob_scanner_resume_reads_suffix_and_rejects_bad_offset() -> crate::Result<()> {
+        let dir = tempdir()?;
+        let blob_file_path = dir.path().join("0");
+
+        let keys = [b"a", b"b", b"c", b"d", b"e"];
+        {
+            let mut writer = BlobFileWriter::new(&blob_file_path, 0, 0, &StdFs)?;
+            for key in keys {
+                writer.write(key, 0, &key.repeat(100))?;
+            }
+            writer.finish()?;
+        }
+
+        // Scan the first two frames and capture the frame boundary after "b".
+        let resume_at = {
+            let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
+            let _a = scanner.next().unwrap()?;
+            let b = scanner.next().unwrap()?;
+            b.frame_end
+        };
+
+        // Resuming at that boundary yields exactly the suffix c, d, e.
+        {
+            let mut scanner = Scanner::resume(&blob_file_path, &StdFs, 0, resume_at)?;
+            for key in [b"c", b"d", b"e"] {
+                assert_eq!(
+                    Slice::from(&key[..]),
+                    scanner.next().map(|r| r.map(|e| e.key)).unwrap()?,
+                );
+            }
+            assert!(scanner.next().is_none());
+        }
+
+        // An offset past the data section is rejected, never silently mis-seeked.
+        assert!(
+            matches!(
+                Scanner::resume(&blob_file_path, &StdFs, 0, u64::MAX),
+                Err(crate::Error::InvalidHeader("BlobFile")),
+            ),
+            "resume offset past the data section must error",
+        );
         Ok(())
     }
 

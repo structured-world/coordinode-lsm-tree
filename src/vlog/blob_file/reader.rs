@@ -1050,6 +1050,7 @@ mod tests {
                 compression: CompressionType::None,
             },
             is_deleted: AtomicBool::new(false),
+            punch_on_drop: portable_atomic::AtomicU64::new(u64::MAX),
             checksum: crate::Checksum::from_raw(0),
             file_accessor: FileAccessor::File(Arc::new(file2)),
             fs: Arc::new(crate::fs::StdFs),

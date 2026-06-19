@@ -83,7 +83,17 @@ pub type TableInner = Inner;
 /// Tables can be merged together to improve read performance and free unneeded disk space by removing outdated item versions.
 #[doc(alias("sstable", "sst", "sorted string table"))]
 #[derive(Clone)]
-pub struct Table(Arc<Inner>);
+pub struct Table(
+    Arc<Inner>,
+    /// Tight-space restriction: when `Some(bound)`, this version's view of the
+    /// table is clamped to keys `>= bound`. The on-disk data blocks below
+    /// `bound` have been punched out ([`crate::fs::Fs::punch_hole`]) and their
+    /// content lives in a freshly merged output table that supersedes them, so
+    /// reads must not touch the punched prefix. Carried on the `Table` wrapper
+    /// (not the shared `Arc<Inner>`) so an older snapshot keeps its own
+    /// unrestricted view of the same physical SST. `None` on the common path.
+    Option<UserKey>,
+);
 
 impl core::ops::Deref for Table {
     type Target = Inner;
@@ -503,6 +513,14 @@ impl Table {
         seqno: SeqNo,
         key_hash: u64,
     ) -> crate::Result<Option<InternalValue>> {
+        // Tight-space restriction: this version sees the table only at keys
+        // `>= bound` (the prefix below it is punched out and superseded by a
+        // merged output table). Keys below `bound` must miss here so the read
+        // falls through to that output; the punched blocks are never touched.
+        if self.is_below_restriction(key) {
+            return Ok(None);
+        }
+
         let global_seqno = self.global_seqno();
         let seqno = seqno.saturating_sub(global_seqno);
 
@@ -580,6 +598,12 @@ impl Table {
         seqno: SeqNo,
         key_hash: u64,
     ) -> crate::Result<Option<(crate::ValueType, SeqNo, crate::Slice)>> {
+        // Tight-space restriction (mirrors `Table::get`): a key below the bound
+        // misses so the read falls through to the superseding output.
+        if self.is_below_restriction(key) {
+            return Ok(None);
+        }
+
         let global_seqno = self.global_seqno();
         let seqno = seqno.saturating_sub(global_seqno);
 
@@ -696,6 +720,13 @@ impl Table {
         seqno: SeqNo,
         key_hash: u64,
     ) -> crate::Result<Option<(InternalValue, Block)>> {
+        // Tight-space restriction (mirrors `Table::get`): a key below the bound
+        // misses so the read falls through to the superseding output and never
+        // touches the punched-out prefix.
+        if self.is_below_restriction(key) {
+            return Ok(None);
+        }
+
         let global_seqno = self.global_seqno();
         let seqno = seqno.saturating_sub(global_seqno);
 
@@ -1238,6 +1269,16 @@ impl Table {
         for handle in self.block_index.iter() {
             let handle = handle?;
 
+            // Tight-space restriction: a block whose last key is below the bound
+            // sits entirely in the punched-out (zeroed) prefix — never read it.
+            // The block straddling the bound is intact (punch starts at its
+            // offset) and is filtered per entry in the loop below.
+            if let Some(bound) = &self.1
+                && self.comparator.compare(handle.end_key(), bound) == core::cmp::Ordering::Less
+            {
+                continue;
+            }
+
             // Block-skip: look this block's seqno bounds up in the parallel
             // `seqno_bounds` section (keyed by file offset). If its (local) min
             // exceeds the upper bound, or its (local) max is below the target, it
@@ -1258,6 +1299,15 @@ impl Table {
             let data = &block.inner.data;
             for item in block.iter(self.comparator.clone()) {
                 let mut value = item.materialize(data);
+                // Drop entries below the restriction bound in the straddling
+                // block (their authoritative copy lives in the superseding
+                // output table).
+                if let Some(bound) = &self.1
+                    && self.comparator.compare(&value.key.user_key, bound)
+                        == core::cmp::Ordering::Less
+                {
+                    continue;
+                }
                 if value.key.seqno >= local_target && value.key.seqno < local_end {
                     value.key.seqno = value.key.seqno.saturating_add(global_seqno);
                     out.push(value);
@@ -1308,6 +1358,23 @@ impl Table {
             Bound::Included(key) => iter.set_lower_bound(iter::Bound::Included(key.clone())),
             Bound::Excluded(key) => iter.set_lower_bound(iter::Bound::Excluded(key.clone())),
             Bound::Unbounded => {}
+        }
+
+        // Tight-space restriction: raise the scan's lower bound up to `bound`
+        // when this version restricts the table, so the iterator never walks
+        // index entries pointing into the punched-out (zeroed) prefix below
+        // `bound`. Only raises (never lowers) the requested start: a request
+        // already at or above `bound` is left untouched.
+        if let Some(bound) = &self.1 {
+            let raise = match range.start_bound() {
+                Bound::Included(key) | Bound::Excluded(key) => {
+                    self.comparator.compare(bound, key) == core::cmp::Ordering::Greater
+                }
+                Bound::Unbounded => true,
+            };
+            if raise {
+                iter.set_lower_bound(iter::Bound::Included(bound.clone()));
+            }
         }
 
         match range.end_bound() {
@@ -1908,51 +1975,155 @@ impl Table {
             file_path.display(),
         );
 
-        Ok(Self(Arc::new(Inner {
-            path: file_path,
-            tree_id,
+        Ok(Self(
+            Arc::new(Inner {
+                path: file_path,
+                tree_id,
 
-            metadata,
-            regions,
+                metadata,
+                regions,
 
-            cache,
+                cache,
 
-            file_accessor,
-            fs,
+                file_accessor,
+                fs,
 
-            block_index: Arc::new(block_index),
+                block_index: Arc::new(block_index),
 
-            pinned_filter_index,
+                pinned_filter_index,
 
-            pinned_filter_block,
+                pinned_filter_block,
 
-            is_deleted: AtomicBool::default(),
+                is_deleted: AtomicBool::default(),
+                punch_on_drop: AtomicU64::new(u64::MAX),
 
-            checksum,
-            global_seqno,
+                checksum,
+                global_seqno,
 
-            comparator,
+                comparator,
 
-            #[cfg(feature = "metrics")]
-            metrics,
+                #[cfg(feature = "metrics")]
+                metrics,
 
-            cached_blob_bytes: AtomicU64::new(u64::MAX),
-            range_tombstones,
-            block_layout,
-            seqno_bounds,
-            locator_index,
-            encryption,
+                cached_blob_bytes: AtomicU64::new(u64::MAX),
+                range_tombstones,
+                block_layout,
+                seqno_bounds,
+                locator_index,
+                encryption,
 
+                #[cfg(zstd_any)]
+                zstd_dictionary,
+
+                deletion_pause: once_cell::race::OnceBox::new(),
+
+                #[cfg(feature = "std")]
+                background_deleter: once_cell::race::OnceBox::new(),
+
+                heal_hints: once_cell::race::OnceBox::new(),
+            }),
+            None,
+        ))
+    }
+
+    /// The tight-space restriction lower bound for this version's view of the
+    /// table, or `None` on the common path. `Some(bound)` means the data below
+    /// `bound` has been punched out and superseded by a merged output table, so
+    /// reads route keys `< bound` elsewhere and clamp this table's scans to
+    /// start at `bound` (its index still references the punched prefix).
+    #[must_use]
+    pub(crate) fn restrict_lower_bound(&self) -> Option<&UserKey> {
+        self.1.as_ref()
+    }
+
+    /// True when `key` is below this version's tight-space restriction bound, so
+    /// a point read must miss here and fall through to the output table that
+    /// superseded the punched-out prefix. Every point-read entry point
+    /// ([`get`](Self::get), [`get_value`](Self::get_value),
+    /// [`get_with_block`](Self::get_with_block)) consults this first.
+    #[inline]
+    fn is_below_restriction(&self, key: &[u8]) -> bool {
+        self.1
+            .as_ref()
+            .is_some_and(|bound| self.comparator.compare(key, bound) == core::cmp::Ordering::Less)
+    }
+
+    /// Returns a view of this table restricted to keys `>= lower`, for
+    /// tight-space compaction. Shares the same `Arc<Inner>` (no file re-open,
+    /// no extra handle, no [`Drop`] interaction), so the original and the
+    /// restricted view are one physical SST seen by different versions. The
+    /// caller punches the data blocks below `lower` only after this view is
+    /// durably installed.
+    #[must_use]
+    pub(crate) fn with_restriction(&self, lower: UserKey) -> Self {
+        Self(self.0.clone(), Some(lower))
+    }
+
+    /// Re-opens this table as a DISTINCT [`Inner`](inner::Inner) (its own file
+    /// handle and fresh drop / punch-on-drop atomics) restricted to keys
+    /// `>= lower`. Used by tight-space compaction so the PRIOR unrestricted view
+    /// can drop — and punch its consumed prefix on that drop — independently of
+    /// this restricted view, which keeps serving the suffix. Heavier than
+    /// [`with_restriction`](Self::with_restriction) (re-reads the footer + block
+    /// index), which is acceptable on the opt-in, emergency tight-space path.
+    ///
+    /// Opens with its own file handle (no shared descriptor table) so the old
+    /// view's handle lifecycle stays fully separate.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from re-opening the SST file.
+    pub(crate) fn reopen_restricted(&self, lower: UserKey) -> crate::Result<Self> {
+        let reopened = Self::recover(
+            (*self.path).clone(),
+            self.checksum,
+            self.global_seqno,
+            self.tree_id,
+            self.metadata.id,
+            self.cache.clone(),
+            None,
+            self.fs.clone(),
+            self.pinned_filter_size() > 0,
+            self.pinned_block_index_size() > 0,
+            self.encryption.clone(),
             #[cfg(zstd_any)]
-            zstd_dictionary,
+            self.zstd_dictionary.clone(),
+            self.comparator.clone(),
+            #[cfg(feature = "metrics")]
+            self.metrics.clone(),
+        )?;
+        Ok(reopened.with_restriction(lower))
+    }
 
-            deletion_pause: once_cell::race::OnceBox::new(),
+    /// Marks this view to punch `[0, offset)` when its last `Arc` drops (see
+    /// [`Inner::punch_on_drop`](inner::Inner::punch_on_drop)). Set on the PRIOR
+    /// unrestricted view once a tight-space slice has been installed, so the
+    /// consumed prefix is reclaimed exactly when no reader can still see it.
+    pub(crate) fn mark_punch_on_drop(&self, offset: u64) {
+        self.0
+            .punch_on_drop
+            .store(offset, core::sync::atomic::Ordering::Release);
+    }
 
-            #[cfg(feature = "std")]
-            background_deleter: once_cell::race::OnceBox::new(),
-
-            heal_hints: once_cell::race::OnceBox::new(),
-        })))
+    /// Byte offset of the first data block whose last key reaches `key`. Punching
+    /// `[0, offset)` reclaims every data block strictly below `key` while leaving
+    /// the straddling block and the index / footer (which follow all data blocks)
+    /// intact. When `key` is past the last block's keys, returns the end of the
+    /// data region (every data block is punchable).
+    ///
+    /// # Errors
+    ///
+    /// Propagates a block-index read error.
+    pub(crate) fn punch_offset_for(&self, key: &[u8]) -> crate::Result<u64> {
+        let mut data_end = 0u64;
+        for handle in self.block_index.iter() {
+            let handle = handle?;
+            if self.comparator.compare(handle.end_key(), key) != core::cmp::Ordering::Less {
+                return Ok(handle.offset().0);
+            }
+            data_end = handle.offset().0 + u64::from(handle.size());
+        }
+        Ok(data_end)
     }
 
     /// Installs the tree-wide deletion pause used by checkpoints.
@@ -2141,9 +2312,37 @@ impl Table {
         bounds: &(Bound<&[u8]>, Bound<&[u8]>),
         cmp: &dyn crate::comparator::UserComparator,
     ) -> bool {
-        self.metadata
+        if !self
+            .metadata
             .key_range
             .overlaps_with_bounds_cmp(bounds, cmp)
+        {
+            return false;
+        }
+
+        // Tight-space restriction: the live range is `[bound, hi]`. If the
+        // query's upper bound is strictly below `bound`, the query targets only
+        // the punched-out prefix (now served by a superseding output table), so
+        // this table does not overlap.
+        if let Some(bound) = &self.1 {
+            match bounds.1 {
+                Bound::Included(end) => {
+                    if cmp.compare(end, bound) == core::cmp::Ordering::Less {
+                        return false;
+                    }
+                }
+                Bound::Excluded(end) => {
+                    // end <= bound: every key the query can reach is below the
+                    // live range.
+                    if cmp.compare(end, bound) != core::cmp::Ordering::Greater {
+                        return false;
+                    }
+                }
+                Bound::Unbounded => {}
+            }
+        }
+
+        true
     }
 
     /// Checks the full-table bloom filter for a hash value.

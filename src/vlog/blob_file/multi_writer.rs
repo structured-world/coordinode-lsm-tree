@@ -111,6 +111,10 @@ impl MultiWriter {
     pub(crate) fn use_passthrough_compression(mut self, compression: CompressionType) -> Self {
         assert_eq!(self.compression, CompressionType::None);
         self.passthrough_compression = compression;
+        // The bytes handed to `write_raw` are already compressed, so the writer
+        // keeps `compression = None` (no re-compress) but must RECORD the real
+        // codec in the file metadata or a reopened reader cannot decode it.
+        self.active_writer.metadata_compression_override = Some(compression);
         self
     }
 
@@ -146,9 +150,14 @@ impl MultiWriter {
         let blob_file_path = self.folder.join(new_blob_file_id.to_string());
 
         let new_writer = {
-            let w = Writer::new(blob_file_path, new_blob_file_id, self.tree_id, &*self.fs)?
+            let mut w = Writer::new(blob_file_path, new_blob_file_id, self.tree_id, &*self.fs)?
                 .use_compression(self.compression)
                 .use_sync_mode(self.sync_mode);
+            // Carry the passthrough metadata codec onto each rotated writer so
+            // every file in a relocation records the real compression.
+            if self.passthrough_compression != CompressionType::None {
+                w.metadata_compression_override = Some(self.passthrough_compression);
+            }
             #[cfg(zstd_any)]
             let w = w.use_zstd_dictionary(self.zstd_dictionary.clone());
             w
@@ -203,6 +212,7 @@ impl MultiWriter {
                 tree_id,
                 path,
                 is_deleted: AtomicBool::new(false),
+                punch_on_drop: portable_atomic::AtomicU64::new(u64::MAX),
                 id: blob_file_id,
                 file_accessor,
                 meta: Metadata {

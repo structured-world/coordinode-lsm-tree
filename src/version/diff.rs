@@ -73,12 +73,23 @@ impl Version {
             Some(buf)
         };
 
+        // Per-table tight-space restrictions carried by the new version's
+        // tables. Empty unless a tight-space compaction punched a prefix and
+        // installed the table as a restricted view.
+        let mut restrictions = Vec::new();
+        for table in self.iter_tables() {
+            if let Some(bound) = table.restrict_lower_bound() {
+                restrictions.push((table.id(), bound.clone()));
+            }
+        }
+
         Ok(VersionEdit {
             new_version_id: self.id(),
             changed_levels,
             added_blob_files,
             removed_blob_file_ids,
             gc_stats,
+            restrictions,
         })
     }
 }

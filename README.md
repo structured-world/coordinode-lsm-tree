@@ -168,6 +168,11 @@ detection), the Page ECC spectrum, self-healing scrub, tamper-evident
 encryption, the five-layer manifest hardening surface, and the manifest
 recovery modes.
 
+See **[docs/tight-space-compaction.md](docs/tight-space-compaction.md)** for the
+opt-in tight-space compaction: how a gated merge on a near-full disk is rewritten
+in key-range slices and reclaimed in place with hole punching, so a compaction
+completes on a disk far smaller than the data it rewrites.
+
 ## Support the project
 
 <div align="center">

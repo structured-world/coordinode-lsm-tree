@@ -642,6 +642,160 @@ fn table_point_read() -> crate::Result<()> {
     )
 }
 
+#[test]
+#[expect(clippy::unwrap_used)]
+fn restricted_view_clamps_point_and_range_reads() -> crate::Result<()> {
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"c", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"d", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"e", b"v", 0, crate::ValueType::Value),
+    ];
+
+    test_with_table(
+        &items,
+        |table| {
+            // Restrict the view to keys >= "c" (the prefix a, b is punched out
+            // and superseded by a merged output table in tight-space reclaim).
+            let restricted = table.with_restriction(crate::UserKey::from(&b"c"[..]));
+
+            // Point reads below the bound miss (so the read falls through to the
+            // superseding output); at/above the bound they hit.
+            assert_eq!(None, restricted.get(b"a", SeqNo::MAX, hash64(b"a"))?);
+            assert_eq!(None, restricted.get(b"b", SeqNo::MAX, hash64(b"b"))?);
+            assert!(restricted.get(b"c", SeqNo::MAX, hash64(b"c"))?.is_some());
+            assert!(restricted.get(b"d", SeqNo::MAX, hash64(b"d"))?.is_some());
+
+            // The unrestricted view of the same physical SST is unaffected.
+            assert!(table.get(b"a", SeqNo::MAX, hash64(b"a"))?.is_some());
+
+            // A full scan yields only keys >= the bound, in order — the iterator
+            // never walks into the punched prefix.
+            let keys: Vec<_> = restricted
+                .range(..)
+                .map(|r| r.unwrap().key.user_key)
+                .collect();
+            assert_eq!(
+                keys,
+                vec![
+                    crate::UserKey::from(&b"c"[..]),
+                    crate::UserKey::from(&b"d"[..]),
+                    crate::UserKey::from(&b"e"[..]),
+                ],
+            );
+
+            let cmp = crate::comparator::default_comparator();
+            // A query entirely below the bound does not overlap the live range.
+            assert!(!restricted.check_key_range_overlap_cmp(
+                &(
+                    core::ops::Bound::Unbounded,
+                    core::ops::Bound::Excluded(&b"c"[..]),
+                ),
+                cmp.as_ref(),
+            ));
+            // A query reaching into [bound, hi] does overlap.
+            assert!(restricted.check_key_range_overlap_cmp(
+                &(
+                    core::ops::Bound::Included(&b"d"[..]),
+                    core::ops::Bound::Unbounded,
+                ),
+                cmp.as_ref(),
+            ));
+
+            Ok(())
+        },
+        None,
+        Some(|x| x),
+    )
+}
+
+#[test]
+#[expect(clippy::unwrap_used)]
+fn reopen_restricted_yields_a_distinct_clamped_view() -> crate::Result<()> {
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"c", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"d", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"e", b"v", 0, crate::ValueType::Value),
+    ];
+
+    test_with_table(
+        &items,
+        |table| {
+            // Re-open as a distinct Inner over the same file, clamped to >= "c".
+            let restricted = table.reopen_restricted(crate::UserKey::from(&b"c"[..]))?;
+
+            assert_eq!(None, restricted.get(b"a", SeqNo::MAX, hash64(b"a"))?);
+            assert_eq!(None, restricted.get(b"b", SeqNo::MAX, hash64(b"b"))?);
+            assert!(restricted.get(b"c", SeqNo::MAX, hash64(b"c"))?.is_some());
+            assert!(restricted.get(b"e", SeqNo::MAX, hash64(b"e"))?.is_some());
+
+            // The original view of the same file is unaffected.
+            assert!(table.get(b"a", SeqNo::MAX, hash64(b"a"))?.is_some());
+
+            // A full scan of the re-opened view yields only keys >= the bound.
+            let keys: Vec<_> = restricted
+                .range(..)
+                .map(|r| r.unwrap().key.user_key)
+                .collect();
+            assert_eq!(
+                keys,
+                vec![
+                    crate::UserKey::from(&b"c"[..]),
+                    crate::UserKey::from(&b"d"[..]),
+                    crate::UserKey::from(&b"e"[..]),
+                ],
+            );
+
+            Ok(())
+        },
+        None,
+        Some(|x| x),
+    )
+}
+
+#[test]
+fn punch_offset_for_locates_the_first_block_reaching_a_key() -> crate::Result<()> {
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"c", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"d", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"e", b"v", 0, crate::ValueType::Value),
+    ];
+
+    // rotate_every Some(1) spills a block before every item, so each key lands
+    // in its own data block with a strictly increasing offset.
+    test_with_table(
+        &items,
+        |table| {
+            // "a" is in the first block at offset 0 (nothing below it to punch).
+            assert_eq!(0, table.punch_offset_for(b"a")?);
+
+            let pb = table.punch_offset_for(b"b")?;
+            let pc = table.punch_offset_for(b"c")?;
+            let pe = table.punch_offset_for(b"e")?;
+            assert!(pb > 0, "punching up to b reclaims a's block");
+            assert!(pc > pb, "offsets advance with the key");
+            assert!(pe > pc);
+
+            // A key past the last block reports the end of the data region, so
+            // the whole data area is punchable.
+            let beyond = table.punch_offset_for(b"zzz")?;
+            assert!(
+                beyond >= pe,
+                "a key beyond the last block punches every data block",
+            );
+
+            Ok(())
+        },
+        Some(1),
+        Some(|x| x),
+    )
+}
+
 /// Writes `items` through an adaptive-index writer with the given spill
 /// threshold and recovers the resulting [`Table`]. Returns the table plus
 /// the backing temp dir (kept alive by the caller).

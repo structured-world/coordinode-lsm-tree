@@ -278,6 +278,19 @@ pub struct FsCapabilities {
     /// The filesystem supports instant native snapshots (Btrfs subvolume
     /// snapshot, ZFS snapshot, APFS snapshot).
     pub native_snapshot: bool,
+
+    /// The filesystem can deallocate a byte range *inside* a file, freeing its
+    /// physical blocks while leaving the logical length unchanged (a hole that
+    /// reads back as zeros): `fallocate(FALLOC_FL_PUNCH_HOLE)` on Linux,
+    /// `fcntl(F_PUNCHHOLE)` on macOS/APFS. True for ext4 / xfs / btrfs / zfs /
+    /// tmpfs / apfs; false for network mounts and any backend that cannot
+    /// reclaim mid-file extents.
+    ///
+    /// Enables the opt-in tight-space incremental-reclaim compaction mode, which
+    /// frees consumed input extents in place as the merged output grows. When
+    /// false the mode is unavailable and the engine falls back to whole-output
+    /// compaction.
+    pub punch_hole: bool,
 }
 
 /// A directory entry returned by [`Fs::read_dir`].
@@ -822,6 +835,38 @@ pub trait Fs: Send + Sync + 'static {
     fn try_disable_cow(&self, path: &Path) -> io::Result<()> {
         let _ = path;
         Ok(())
+    }
+
+    /// Deallocates `len` bytes starting at `offset` inside the file at `path`,
+    /// freeing the physical blocks while leaving the file's logical length
+    /// unchanged: the punched range reads back as zeros. `fallocate(fd,
+    /// FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, ...)` on Linux,
+    /// `fcntl(F_PUNCHHOLE)` on macOS/APFS.
+    ///
+    /// This is the in-place reclaim primitive for tight-space incremental
+    /// compaction: as merged output becomes durable, the consumed input prefix
+    /// is punched to return its extents to the filesystem without rewriting or
+    /// truncating the input file (which concurrent readers may still hold).
+    ///
+    /// Callers MUST gate this on [`FsCapabilities::punch_hole`] for the mount
+    /// (via [`capabilities`](Self::capabilities)); a backend that cannot punch
+    /// returns [`io::ErrorKind::Unsupported`] from the default below.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns [`io::ErrorKind::Unsupported`]. Only backends whose
+    /// `capabilities().punch_hole` is true override it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the backend does not support hole punching, or if
+    /// the underlying syscall fails (e.g. the mount reports `EOPNOTSUPP`).
+    fn punch_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<()> {
+        let _ = (path, offset, len);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "punch_hole is not supported by this backend",
+        ))
     }
 
     /// Clones the file at `src` to `dst` with O(1) reflink semantics when the

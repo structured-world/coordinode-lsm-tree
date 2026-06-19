@@ -69,6 +69,19 @@ pub struct Inner {
     /// May be kept alive until all Arcs to the table have been dropped (to facilitate snapshots)
     pub is_deleted: AtomicBool,
 
+    /// Tight-space punch-on-drop offset, or [`u64::MAX`] (the default) for "no
+    /// punch". When a tight-space compaction restricts a table to `[K, hi)`, the
+    /// PRIOR (unrestricted) view of the same physical SST is marked here with
+    /// `offset(K)`: once every reader holding that old view has dropped its
+    /// `Arc` (so no read can touch the prefix), this view's [`Drop`] reclaims the
+    /// `[0, offset)` byte range via [`Fs::punch_hole`](crate::fs::Fs::punch_hole)
+    /// while LEAVING the file in place (the restricted view, a distinct `Inner`,
+    /// still serves the suffix). Distinct from [`Self::is_deleted`]: a punched
+    /// view is not deleted. Using the `Drop`-at-refcount-zero signal makes the
+    /// punch safe without an explicit snapshot gate — it fires exactly when the
+    /// old view is unreachable. Cumulative across slices and idempotent.
+    pub(crate) punch_on_drop: AtomicU64,
+
     pub(super) checksum: Checksum,
 
     pub(super) global_seqno: SeqNo,
@@ -254,6 +267,51 @@ impl Drop for Inner {
                     "Failed to cleanup deleted table {global_id:?} at {:?}: {e:?}",
                     self.path,
                 );
+            }
+        } else {
+            // Not deleted, but possibly marked for tight-space prefix reclaim:
+            // this (old, unrestricted) view's last Arc is dropping, so no read
+            // can touch the prefix anymore. Reclaim the consumed prefix's DATA
+            // blocks and LEAVE the file — the restricted view (a distinct Inner)
+            // still serves the suffix. `punch_hole` opens the path itself, so it
+            // is fine that this view's own handles drop right after this body.
+            //
+            // Punch each data block below the boundary INDIVIDUALLY rather than
+            // the whole `[0, offset)` span: index / filter blocks are interleaved
+            // among the data blocks and the reopen path reads them, so a single
+            // span punch would zero a section the SST needs. The block index
+            // yields only data-block handles, so iterating it punches exactly the
+            // reclaimable data and never an index / filter / footer region.
+            let off = self
+                .punch_on_drop
+                .load(core::sync::atomic::Ordering::Acquire);
+            if off != u64::MAX {
+                use crate::table::block_index::BlockIndex;
+                for handle in self.block_index.iter() {
+                    // Log why reclaim stopped instead of silently swallowing the
+                    // block-index read error (this is an integrity-sensitive path).
+                    let handle = match handle {
+                        Ok(handle) => handle,
+                        Err(e) => {
+                            log::warn!(
+                                "Failed to iterate block index while punching table {global_id:?} at {:?}: {e:?}",
+                                self.path,
+                            );
+                            break;
+                        }
+                    };
+                    let block_off = handle.offset().0;
+                    if block_off < off
+                        && let Err(e) =
+                            self.fs
+                                .punch_hole(&self.path, block_off, u64::from(handle.size()))
+                    {
+                        log::warn!(
+                            "Failed to punch tight-space data block at {block_off} of table {global_id:?} at {:?}: {e:?}",
+                            self.path,
+                        );
+                    }
+                }
             }
         }
     }

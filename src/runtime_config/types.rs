@@ -875,6 +875,25 @@ pub struct RuntimeConfig {
     /// active memtable and run a space-reclaiming compaction even at the limit.
     /// That is what makes the budget a safe soft limit rather than a hard wall.
     pub storage_limit_bytes: Option<u64>,
+
+    /// Opt-in tight-space compaction. When `false` (default) a merge whose
+    /// transient output cannot fit the free space (and has no fitting smaller
+    /// subset) is simply skipped, leaving the level un-compacted until space
+    /// frees up elsewhere. When `true`, such a merge instead runs an
+    /// incremental, resumable reclaim: it rewrites the run one key-range slice
+    /// at a time, installs each finished slice, and punches the consumed input
+    /// extents ([`crate::fs::Fs::punch_hole`]) so the peak transient footprint
+    /// is one slice rather than the whole run. This lets the engine compact even
+    /// when free space is smaller than the data being rewritten.
+    ///
+    /// Engages only on backends that advertise the punch-hole capability and
+    /// only for inputs not pinned by an older snapshot; otherwise the merge
+    /// falls back to the skip behaviour. Has no effect unless
+    /// [`Self::storage_admission_check`] is also `true` (the admission gate is
+    /// what detects the no-fit condition that triggers tight mode).
+    ///
+    /// Toggle takes effect on the next compaction cycle.
+    pub tight_space_compaction: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -898,6 +917,7 @@ impl Default for RuntimeConfig {
             use_reflink_for_checkpoint: true,
             storage_admission_check: false,
             storage_limit_bytes: None,
+            tight_space_compaction: false,
         }
     }
 }

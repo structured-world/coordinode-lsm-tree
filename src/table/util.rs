@@ -651,6 +651,19 @@ fn select_lsp_kernel(f: LspCpuFeatures) -> LspKernel {
 ///   bit in the XOR word corresponds to the first source byte.
 ///
 /// Tail shorter than 8 bytes falls back to a byte-by-byte loop.
+// On little-endian aarch64 the NEON kernel is selected unconditionally (NEON is
+// in the ARMv8 baseline), so the portable scalar fallback has no caller on that
+// target alone — it is still the live kernel on x86 without SSE2, big-endian
+// aarch64, riscv, powerpc, etc. `expect` (not `allow`) keeps this honest: it
+// errors if the fallback ever becomes reachable here, or if it stops being dead.
+#[cfg_attr(
+    all(target_arch = "aarch64", target_endian = "little", not(test)),
+    expect(
+        dead_code,
+        reason = "portable LSP fallback; aarch64-LE always selects the NEON kernel \
+                  (unit tests still call it directly, hence not(test))"
+    )
+)]
 #[must_use]
 pub(crate) fn lsp_scalar(s1: &[u8], s2: &[u8]) -> usize {
     let min_len = s1.len().min(s2.len());
