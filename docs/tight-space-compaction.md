@@ -69,15 +69,38 @@ with every key readable, and a later compaction continues the work.
 
 KV-separated trees store large values in blob files and keep only handles in the
 index SSTs, so their reclaimable space is mostly in blobs. Tight-space compaction
-still helps: a gated KV-separated merge is *completed* rather than skipped, and
-completing it lets the final removal drop the shadowed generation's now-dead blob
-files — the real reclaim a skip would forgo. Each slice's blob fragmentation is
-folded into the running GC stats; dead blob files are dropped once every key is
-processed (a blob a later slice still references must not be dropped early).
+handles two cases:
 
-Incrementally relocating (defragmenting) live blob files under tight space — as
-opposed to dropping dead ones — is not yet implemented; a KV-separated merge that
-needs blob relocation completes without defragmenting.
+**Dead blob files.** A gated KV-separated merge is *completed* rather than
+skipped, and completing it lets the final removal drop the shadowed generation's
+now-dead blob files — the real reclaim a skip would forgo. Each slice's blob
+fragmentation is folded into the running GC stats; dead blob files are dropped
+once every key is processed (a blob a later slice still references must not be
+dropped early).
+
+**Fragmented (live-but-stale) blob files — defragmentation.** A blob file that
+holds a mix of live and dead entries keeps its dead regions until its live
+entries are relocated into a fresh compact file. Under tight space that
+relocation is done *in slices*, exactly like the SST path: each slice relocates
+the live entries whose keys fall in `[lower, boundary)` into a new compact blob
+file, rewrites the index handles to point at it, and — once the slice's edit is
+durable — punches the consumed prefix of each stale blob file. Blob files are
+immutable and key-sorted, so a slice consumes a *prefix* of each stale file; the
+next slice resumes its scan exactly where the previous one stopped, never
+re-reading a punched prefix. The final slice drops the fully-consumed stale
+files. Peak transient stays near one compact slice instead of all stale files
+plus the whole compacted file.
+
+Because the index SSTs of a KV-separated tree are tiny (just handles) while the
+payload lives in the blobs, slice boundaries are weighted by blob payload rather
+than SST size, so each slice's relocated bytes stay within the free space the
+gate flagged as tight.
+
+Every value — relocated or not-yet-relocated — reads its latest version
+throughout, and the result survives a reopen, including after a crash
+mid-relocation (the partially-punched stale file's archive trailer and unpunched
+suffix stay intact, and the installed slices route their keys to the compact
+file).
 
 ## Cost and guarantees
 
