@@ -79,6 +79,10 @@ pub struct MemFs {
     /// what drives free space — [`Self::stored_bytes`] uses the per-file
     /// [`State::punched`] ranges so a removed/truncated file stops freeing space.
     punched_total: Arc<portable_atomic::AtomicU64>,
+    /// Set once any [`Fs::punch_hole`] has recorded a range, so the common
+    /// (never-punched) write path can skip punched-range invalidation with a
+    /// single relaxed atomic load instead of taking the state lock per write.
+    has_punches: Arc<portable_atomic::AtomicBool>,
     /// Whether [`Fs::capabilities`] advertises `punch_hole` (default `true`).
     /// A test sets this `false` via [`MemFs::set_punch_hole_supported`] to drive
     /// the capability-gated fallback (tight-space compaction skips on a backend
@@ -118,6 +122,27 @@ fn merge_punched_range(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) {
     *ranges = merged;
 }
 
+/// Removes `[start, end)` from a sorted, non-overlapping range set (splitting a
+/// straddling range). Used when a later write or `set_len` re-materializes
+/// previously-punched bytes so they stop counting as reclaimed.
+fn subtract_punched_range(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) {
+    if start >= end {
+        return;
+    }
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(ranges.len() + 1);
+    for &(s, e) in ranges.iter() {
+        // Keep the slice of [s, e) that falls before `start` and after `end`.
+        if s < start {
+            out.push((s, start.min(e)));
+        }
+        if e > end {
+            out.push((s.max(end), e));
+        }
+    }
+    out.retain(|&(s, e)| s < e);
+    *ranges = out;
+}
+
 /// Total punched bytes of one file's range set, clipped to its current `len`
 /// (ranges past a later truncation no longer count).
 fn clipped_punched_len(ranges: &[(u64, u64)], len: u64) -> u64 {
@@ -143,6 +168,7 @@ impl MemFs {
             namespace_id: next_mem_fs_namespace_id(),
             capacity: Arc::new(portable_atomic::AtomicU64::new(u64::MAX)),
             punched_total: Arc::new(portable_atomic::AtomicU64::new(0)),
+            has_punches: Arc::new(portable_atomic::AtomicBool::new(false)),
             punch_hole_supported: Arc::new(portable_atomic::AtomicBool::new(true)),
         }
     }
@@ -241,6 +267,13 @@ struct MemFile {
     readable: bool,
     writable: bool,
     is_append: bool,
+    /// Shared `MemFs` state + this file's path, so a write / `set_len` that
+    /// re-materializes previously-punched bytes can drop the stale reclaim from
+    /// [`State::punched`]. Gated by `has_punches` so the never-punched common
+    /// path stays lock-free.
+    state: Arc<RwLock<State>>,
+    path: PathBuf,
+    has_punches: Arc<portable_atomic::AtomicBool>,
 }
 
 /// Copies bytes from `data[pos..]` into `buf`, returning byte count.
@@ -306,8 +339,46 @@ impl MemFile {
             dst.copy_from_slice(buf);
         }
         drop(data);
+        // The written span re-materializes any punched bytes it overlaps.
+        self.drop_punched_overlap(pos as u64, end as u64);
         self.cursor = end as u64;
         Ok(buf.len())
+    }
+
+    /// Drops `[start, end)` from this file's punched ranges (a write re-wrote
+    /// those bytes, so they are no longer reclaimed). Lock-free no-op until some
+    /// punch has happened. Acquired AFTER the data lock is released to keep the
+    /// state→data lock order one-directional with `punch_hole`.
+    fn drop_punched_overlap(&self, start: u64, end: u64) {
+        if !self.has_punches.load(portable_atomic::Ordering::Relaxed) {
+            return;
+        }
+        let mut state = self.state.write();
+        if let Some(ranges) = state.punched.get_mut(&self.path) {
+            subtract_punched_range(ranges, start, end);
+            if ranges.is_empty() {
+                state.punched.remove(&self.path);
+            }
+        }
+    }
+
+    /// Clips this file's punched ranges to `new_len` after a `set_len`, so a
+    /// shrink permanently removes past-end reclaim (it cannot resurrect on a
+    /// later grow).
+    fn clip_punched_to(&self, new_len: u64) {
+        if !self.has_punches.load(portable_atomic::Ordering::Relaxed) {
+            return;
+        }
+        let mut state = self.state.write();
+        if let Some(ranges) = state.punched.get_mut(&self.path) {
+            ranges.retain_mut(|(s, e)| {
+                *e = (*e).min(new_len);
+                *s < *e
+            });
+            if ranges.is_empty() {
+                state.punched.remove(&self.path);
+            }
+        }
     }
 
     fn seek_impl(&mut self, pos: SeekFrom) -> io::Result<u64> {
@@ -424,6 +495,9 @@ impl FsFile for MemFile {
             )
         })?;
         lock(&self.data)?.resize(new_len, 0);
+        // A shrink permanently removes past-end reclaim; a grow keeps the
+        // in-bounds ranges (they stay valid).
+        self.clip_punched_to(size);
         Ok(())
     }
 
@@ -557,13 +631,16 @@ impl Fs for MemFs {
                 ));
             }
             let data = Arc::new(Mutex::new(Vec::new()));
-            state.files.insert(path, Arc::clone(&data));
+            state.files.insert(path.clone(), Arc::clone(&data));
             return Ok(Box::new(MemFile {
                 data,
                 cursor: 0,
                 readable: opts.read,
                 writable: opts.write || opts.append,
                 is_append: opts.append,
+                state: Arc::clone(&self.state),
+                path,
+                has_punches: Arc::clone(&self.has_punches),
             }));
         }
 
@@ -592,16 +669,22 @@ impl Fs for MemFs {
                 readable: opts.read,
                 writable: opts.write || opts.append,
                 is_append: opts.append,
+                state: Arc::clone(&self.state),
+                path,
+                has_punches: Arc::clone(&self.has_punches),
             }))
         } else if opts.create {
             let data = Arc::new(Mutex::new(Vec::new()));
-            state.files.insert(path, Arc::clone(&data));
+            state.files.insert(path.clone(), Arc::clone(&data));
             Ok(Box::new(MemFile {
                 data,
                 cursor: 0,
                 readable: opts.read,
                 writable: opts.write || opts.append,
                 is_append: opts.append,
+                state: Arc::clone(&self.state),
+                path,
+                has_punches: Arc::clone(&self.has_punches),
             }))
         } else {
             Err(io::Error::new(
@@ -998,6 +1081,9 @@ impl Fs for MemFs {
         let after: u64 = ranges.iter().map(|&(s, e)| e - s).sum();
         self.punched_total
             .fetch_add(after - before, portable_atomic::Ordering::Relaxed);
+        // Arm the write/set_len invalidation fast-path now that a punch exists.
+        self.has_punches
+            .store(true, portable_atomic::Ordering::Relaxed);
         Ok(())
     }
 }
@@ -1218,6 +1304,55 @@ mod tests {
             fs.available_space(path)?,
             600,
             "1000 capacity − 400 freshly written (no phantom reclaim)",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn overwriting_punched_bytes_reclaims_the_space_accounting() -> io::Result<()> {
+        // Re-opening a punched file for write (no truncate) and overwriting the
+        // hole re-materializes those bytes, so they must stop counting as freed.
+        let fs = MemFs::with_capacity(1000);
+        let path = Path::new("/f");
+        fs.open(path, &FsOpenOptions::new().write(true).create(true))?
+            .write_all(&[0xAB; 400])?;
+        fs.punch_hole(path, 0, 400)?;
+        assert_eq!(
+            fs.available_space(path)?,
+            1000,
+            "1000 − (400 − 400 punched)"
+        );
+
+        // Overwrite [0,400) in place (no truncate).
+        fs.open(path, &FsOpenOptions::new().write(true))?
+            .write_all(&[0xCD; 400])?;
+        assert_eq!(
+            fs.available_space(path)?,
+            600,
+            "the rewritten hole is no longer free (1000 − 400)",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shrinking_then_growing_a_punched_file_does_not_resurrect_reclaim() -> io::Result<()> {
+        // `set_len` shrink must permanently drop past-end punched ranges so a
+        // later grow cannot re-count them as freed.
+        let fs = MemFs::with_capacity(1000);
+        let path = Path::new("/f");
+        fs.open(path, &FsOpenOptions::new().write(true).create(true))?
+            .write_all(&[0xAB; 400])?;
+        fs.punch_hole(path, 200, 200)?; // free [200,400)
+        assert_eq!(fs.available_space(path)?, 800, "1000 − (400 − 200)");
+
+        // Shrink below the hole, then grow well past it.
+        let file = fs.open(path, &FsOpenOptions::new().write(true))?;
+        file.set_len(100)?;
+        file.set_len(500)?;
+        assert_eq!(
+            fs.available_space(path)?,
+            500,
+            "the dropped hole must not resurrect on grow (1000 − 500)",
         );
         Ok(())
     }
