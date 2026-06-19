@@ -125,6 +125,14 @@ pub struct Writer {
 
     pub(crate) compression: CompressionType,
 
+    /// Compression to RECORD in the blob file's metadata, when it must differ
+    /// from [`Self::compression`]. Set for relocation / GC passthrough: the
+    /// caller hands `write_raw` bytes that are ALREADY compressed (so
+    /// `compression` stays `None` to skip re-compressing), but the file's
+    /// metadata must still declare the real codec so a reopened reader
+    /// decompresses correctly. `None` here means "record `compression`".
+    pub(crate) metadata_compression_override: Option<CompressionType>,
+
     /// Durability level for the final blob-file fsync. Default
     /// [`SyncMode::Normal`]; wired from `Config::sync_mode` via
     /// [`Self::use_sync_mode`].
@@ -177,6 +185,7 @@ impl Writer {
             last_key: None,
 
             compression: CompressionType::None,
+            metadata_compression_override: None,
             sync_mode: SyncMode::Normal,
 
             #[cfg(zstd_any)]
@@ -402,7 +411,12 @@ impl Writer {
                     .clone()
                     .expect("should have written at least 1 item"),
             )),
-            compression: self.compression,
+            // Record the override (relocation passthrough) when set, so a
+            // reopened reader sees the real codec of the already-compressed
+            // bytes; otherwise record this writer's own compression.
+            compression: self
+                .metadata_compression_override
+                .unwrap_or(self.compression),
         };
         metadata.encode_into(&mut self.writer)?;
 
