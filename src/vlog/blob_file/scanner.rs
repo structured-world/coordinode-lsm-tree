@@ -303,6 +303,54 @@ mod tests {
         Ok(())
     }
 
+    /// `Scanner::resume` re-opens at a carried frame boundary and reads only the
+    /// suffix (the tight-space relocation loop's per-slice resume), and rejects an
+    /// offset outside the data section.
+    #[test]
+    fn blob_scanner_resume_reads_suffix_and_rejects_bad_offset() -> crate::Result<()> {
+        let dir = tempdir()?;
+        let blob_file_path = dir.path().join("0");
+
+        let keys = [b"a", b"b", b"c", b"d", b"e"];
+        {
+            let mut writer = BlobFileWriter::new(&blob_file_path, 0, 0, &StdFs)?;
+            for key in keys {
+                writer.write(key, 0, &key.repeat(100))?;
+            }
+            writer.finish()?;
+        }
+
+        // Scan the first two frames and capture the frame boundary after "b".
+        let resume_at = {
+            let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
+            let _a = scanner.next().unwrap()?;
+            let b = scanner.next().unwrap()?;
+            b.frame_end
+        };
+
+        // Resuming at that boundary yields exactly the suffix c, d, e.
+        {
+            let mut scanner = Scanner::resume(&blob_file_path, &StdFs, 0, resume_at)?;
+            for key in [b"c", b"d", b"e"] {
+                assert_eq!(
+                    Slice::from(&key[..]),
+                    scanner.next().map(|r| r.map(|e| e.key)).unwrap()?,
+                );
+            }
+            assert!(scanner.next().is_none());
+        }
+
+        // An offset past the data section is rejected, never silently mis-seeked.
+        assert!(
+            matches!(
+                Scanner::resume(&blob_file_path, &StdFs, 0, u64::MAX),
+                Err(crate::Error::InvalidHeader("BlobFile")),
+            ),
+            "resume offset past the data section must error",
+        );
+        Ok(())
+    }
+
     /// Tamper seqno in first blob frame and verify scanner's V4 header
     /// CRC catches the corruption.
     #[test]
