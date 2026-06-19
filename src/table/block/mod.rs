@@ -1722,7 +1722,7 @@ mod tests {
 
     /// A pathological-but-valid shard config (1 data shard, 255 parity shards)
     /// over a large block makes `shard_bytes * parity_shards` exceed u32. The
-    /// parity length must saturate to u32::MAX (it is rejected against the actual
+    /// parity length must saturate to `u32::MAX` (it is rejected against the actual
     /// block downstream), never wrap or panic.
     #[test]
     fn expected_parity_len_saturates_on_huge_parity_product() {
