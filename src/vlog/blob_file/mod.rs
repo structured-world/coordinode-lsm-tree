@@ -46,8 +46,9 @@ pub struct Inner {
     /// Tight-space punch-on-drop offset, or [`u64::MAX`] (default) for "no
     /// punch". When tight-space blob relocation rewrites this file's live
     /// entries below an offset into a fresh compact file, the PRIOR view is
-    /// marked here with that offset; once every reader holding it drops, this
-    /// view's [`Drop`] reclaims the consumed `[0, offset)` frames via
+    /// marked here with that absolute data-section offset; once every reader
+    /// holding it drops, this view's [`Drop`] reclaims the consumed
+    /// `[data_start, offset)` data frames via
     /// [`Fs::punch_hole`](crate::fs::Fs::punch_hole) and LEAVES the file in
     /// place (the restricted view still serves the suffix). Mirrors
     /// `table::Inner::punch_on_drop`. Distinct from [`Self::is_deleted`].
@@ -183,24 +184,54 @@ impl Drop for Inner {
         } else {
             // Not deleted, but possibly marked for tight-space prefix reclaim:
             // this (old) view's last Arc is dropping, so no reader can touch the
-            // relocated prefix anymore. Punch the consumed `[0, offset)` frames
-            // and LEAVE the file — the restricted view (a distinct Inner) still
-            // serves the suffix. Blob frames are contiguous with no file header,
-            // so a single span punch is safe; the footer sits at the tail.
+            // relocated prefix anymore. Punch the consumed data frames
+            // `[data_start, offset)` and LEAVE the file — the restricted view (a
+            // distinct Inner) still serves the suffix. A blob file is an SFA
+            // archive, so the punch must start at the `data` section (skip the
+            // header); the TOC sits at the tail and stays intact. `offset` is an
+            // absolute data-section position (a frame boundary from the
+            // relocation scanner). Re-read the data-section start from the TOC
+            // here rather than carrying it on every blob-file Inner — the punch
+            // is a rare, tight-space-only path.
             let off = self
                 .punch_on_drop
                 .load(core::sync::atomic::Ordering::Acquire);
-            if off != u64::MAX
-                && let Err(e) = self.fs.punch_hole(&self.path, 0, off)
-            {
-                log::warn!(
-                    "Failed to punch tight-space prefix [0, {off}) of blob file {:?} at {}: {e:?}",
-                    self.id,
-                    self.path.display(),
-                );
+            if off != u64::MAX {
+                match data_section_start(&*self.fs, &self.path) {
+                    Ok(data_start) if off > data_start => {
+                        if let Err(e) = self.fs.punch_hole(&self.path, data_start, off - data_start)
+                        {
+                            log::warn!(
+                                "Failed to punch tight-space data [{data_start}, {off}) of blob file {:?} at {}: {e:?}",
+                                self.id,
+                                self.path.display(),
+                            );
+                        }
+                    }
+                    Ok(_) => {} // nothing consumed below the data start
+                    Err(e) => log::warn!(
+                        "Skipping tight-space punch of blob file {:?} at {}: could not read data section: {e:?}",
+                        self.id,
+                        self.path.display(),
+                    ),
+                }
             }
         }
     }
+}
+
+/// Byte offset where a blob file's `data` section begins, read from its SFA TOC.
+/// Used by the tight-space punch so it reclaims only data frames and never the
+/// SFA header that precedes them.
+#[cfg(feature = "std")]
+fn data_section_start(fs: &dyn Fs, path: &Path) -> crate::Result<u64> {
+    let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+    let reader = crate::sfa::Reader::from_reader(&mut file)?;
+    let data = reader
+        .toc()
+        .section(b"data")
+        .ok_or(crate::Error::InvalidHeader("BlobFile"))?;
+    Ok(data.pos())
 }
 
 /// A blob file stores large values and is part of the value log
