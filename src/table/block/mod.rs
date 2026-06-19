@@ -81,14 +81,17 @@ pub(crate) fn expected_parity_len(data_length: u32, params: EccParams) -> u32 {
     if data_length == 0 || data_shards == 0 || parity_shards == 0 {
         return 0;
     }
-    // ceil(N / data_shards). `data_length` is already capped at
-    // MAX_DECOMPRESSION_SIZE + max overhead by the caller before this function
-    // fires, so all of these are provably within u32 — plain arithmetic.
+    // ceil(N / data_shards). `data_length` is capped at MAX_DECOMPRESSION_SIZE +
+    // max overhead by the caller, so the division and the +1 even-rounding stay
+    // within u32 — plain arithmetic.
     let ceil = (data_length / data_shards) + u32::from(!data_length.is_multiple_of(data_shards));
     // Round up to even (the `reed-solomon-simd` engine requires shard
     // sizes that are a multiple of two; XOR shares the layout).
     let shard_bytes = ceil + u32::from(!ceil.is_multiple_of(2));
-    shard_bytes * parity_shards
+    // `parity_shards` is a u8 (≤ 255), so for a large block with many parity
+    // shards the product CAN exceed u32 — saturate. An over-large parity length
+    // is rejected against the actual block downstream, so the clamp is safe.
+    shard_bytes.saturating_mul(parity_shards)
 }
 
 /// Whether the on-disk block carries a Reed-Solomon parity trailer.
