@@ -374,21 +374,18 @@ impl Recovery {
         }
 
         // Tight-space restrictions advance per slice: each edit lists the
-        // straddling input's new (higher) lower bound. The bound is monotonic by
-        // construction (each slice clamps further forward), so a replayed bound
-        // that REGRESSES below the current one signals a corrupt or reordered edit
-        // log; accepting it would un-clamp an already-punched prefix and surface
-        // zeroed blocks. Reject it (equality is allowed for idempotent replay).
+        // straddling input's new (higher) lower bound, so a later edit overwrites
+        // the earlier bound for the same table. A monotonicity (no-regression)
+        // check would be COMPARATOR-RELATIVE — "advancing" is defined by the
+        // tree's configured comparator, not byte order — but the comparator is not
+        // plumbed into recovery, so a byte-order check would wrongly reject valid
+        // advances (or miss real regressions) under a custom/reverse comparator.
+        // The edit log is framing-checksummed, so a corrupt/reordered edit is
+        // already rejected upstream; the comparator-independent duplicate guard
+        // lives in `parse_restrictions_section` for the snapshot path.
         // Entries for tables later dropped from the layout are simply never
         // applied by `from_recovery`, and the next snapshot rewrite drops them.
         for (id, key) in &edit.restrictions {
-            if let Some(prev) = self.restrictions.get(id)
-                && key < prev
-            {
-                return Err(crate::Error::InvalidHeader(
-                    "restrictions edit regressed a table lower bound",
-                ));
-            }
             self.restrictions.insert(*id, key.clone());
         }
 
@@ -1473,39 +1470,6 @@ mod tests {
         assert!(
             parse_restrictions_section(&bytes).is_err(),
             "a duplicate table id must not silently un-clamp an advanced bound",
-        );
-    }
-
-    #[test]
-    fn apply_edit_rejects_a_regressing_restriction_bound() {
-        let mut rec = recovery_with(1, vec![vec![vec![rtable(1, 10)]]]);
-
-        // Advance table 1's bound to "mmm".
-        rec.apply_edit(&VersionEdit {
-            new_version_id: 2,
-            restrictions: vec![(1, crate::UserKey::from(&b"mmm"[..]))],
-            ..Default::default()
-        })
-        .expect("apply");
-
-        // An idempotent replay of the SAME bound is allowed.
-        rec.apply_edit(&VersionEdit {
-            new_version_id: 3,
-            restrictions: vec![(1, crate::UserKey::from(&b"mmm"[..]))],
-            ..Default::default()
-        })
-        .expect("equal bound is idempotent");
-
-        // A REGRESSING bound ("ccc" < "mmm") would un-clamp a punched prefix on
-        // reopen → must abort recovery.
-        assert!(
-            rec.apply_edit(&VersionEdit {
-                new_version_id: 4,
-                restrictions: vec![(1, crate::UserKey::from(&b"ccc"[..]))],
-                ..Default::default()
-            })
-            .is_err(),
-            "a regressing restriction bound must abort recovery, not un-clamp",
         );
     }
 
