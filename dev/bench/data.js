@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781737404559,
+  "lastUpdate": 1781873267235,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -17550,6 +17550,84 @@ window.BENCHMARK_DATA = {
             "value": 713202.7668273418,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.6us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9a7d37ee1c2a423a1ba4ac0fd9b9c40e18347e2b",
+          "message": "feat(compaction): tight-space compaction with in-place reclaim and blob defrag (#497)\n\n## Summary\n\nOpt-in **tight-space compaction**: when a near-full disk would make the\nspace-admission gate *skip* a merge (rather than run it into `ENOSPC`),\nthis lets the merge complete by rewriting one key-range slice at a time\nand reclaiming each consumed input prefix **in place** with a hole\npunch. Peak transient footprint is one slice instead of\ninputs-plus-output, so a compaction that could never fit as a single\nrewrite completes on a disk far smaller than the data it rewrites.\n\nDelivered in two layers:\n\n### SST tight reclaim (`#487`)\n- New `Fs` **punch-hole** capability (`fallocate(PUNCH_HOLE)`),\nadvertised per volume.\n- Per-version **restricted table views**: a distinct handle over the\nsame physical SST whose reads clamp to `[boundary, hi)`; the punched\nprefix is routed to the freshly installed slice output. Centralized read\nclamp on every point-read path, range scan, and seqno-range scan.\n- **Slice-and-punch loop**: each slice merges `[lower, boundary)`,\ninstalls one atomic durable version edit (add output + restrict/remove\ninputs), then punches the consumed prefix once the prior view drains (a\nconcurrent snapshot defers the reclaim safely).\n- Multi-input merges and KV-separated trees (dead blob files dropped at\nthe final removal).\n- **Crash safety**: each slice is one durable manifest edit; the\nrestriction is persisted in the edit log and rebuilt on recovery, so a\npartially-rewritten tree reopens consistent with every key readable.\n\n### Blob defragmentation (`#496`)\n- A blob file holding a mix of live and dead entries is now\n**defragmented** under tight space: its live entries are relocated into\na fresh compact file in key-range slices, the index handles rewritten,\nand the consumed prefix of each stale file punched per slice.\n- Blob files are immutable and key-sorted, so a slice consumes a\n*prefix*; the scanner gains an **offset-resume** constructor (and a\nper-frame `frame_end`) so the next slice resumes exactly where the\nprevious stopped, never re-reading a punched prefix.\n- Slice boundaries are weighted by **blob payload**, not SST size: a\nKV-separated tree's index SSTs are tiny (handles), so SST-size\nboundaries would map the whole payload into one slice and overflow the\nvery disk the gate flagged as tight.\n- The tail drops the now fully-consumed stale files.\n\n### Fix: relocated blob metadata codec\nRelocation passes already-compressed bytes through `write_raw` (writer\ncompression `None`, no re-compress), but the file metadata then recorded\n`None` while only the in-memory wrapper carried the real codec — so a\nreopened reader treated the compressed payload as raw and failed every\nread with `InvalidHeader`. A latent bug affecting GC relocation too. The\nwriter now records the real codec in the file metadata via a\n`metadata_compression_override`, while `write_raw` still skips\nre-compression.\n\n## Engagement\n\nTight mode is a fallback on the space-admission path; it never changes a\nmerge that already fits. It runs only when `tight_space_compaction` and\n`storage_admission_check` are both on, the chosen merge does not fit\n(and no smaller subset does), the destination volume advertises\n`punch_hole`, and the data spans more than one block. Both toggles are\nlive (next compaction cycle, no restart).\n\n```rust\ntree.update_runtime_config(|c| {\n    c.storage_admission_check = true;\n    c.tight_space_compaction = true;\n})?;\n```\n\n## Testing\n\n- Unit crash-matrix tests for both paths: abort after the first\ninstalled-and-punched slice, reopen, assert every key reads its latest\nvalue (SST:\n`tight_space_crash_after_first_slice_recovers_all_keys_on_reopen`; blob:\n`tight_space_blob_relocation_crash_after_first_slice_recovers_all_keys`).\n- Integration tests: single-table, multi-table, KV-separated,\nfall-back-without-punch-hole, and full blob defrag (relocation + tail +\nreopen).\n- Benchmark `tight_space` with SST and blob-defrag arms (tight vs ample\nbaseline).\n- Full suite green (1897 tests), `clippy --all-features --all-targets`\nclean, no-std check clean, x86_64-linux cross clean.\n- Format note: the on-disk manifest/blob changes are amended in place\nunder the still-unreleased disk version; no released format is broken.\n\n## Docs\n\n`docs/tight-space-compaction.md` covers engagement conditions, the slice\nmechanism, crash safety, KV-separated defragmentation, cost/guarantees,\nand configuration. The runtime flag carries a full docstring.\n\nCloses #487\nCloses #496\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added opt-in “tight-space compaction” that installs incremental tight\nslices when a merge won’t fit, and reclaims space via hole punching.\n* Added KV-separated tight-space slice defragmentation/relocation and\nimproved recovery using per-table tight lower-bound restrictions.\n* Expanded filesystem support for in-file hole punching, including Linux\ncapability detection and `MemFs` reclaimed-space accounting.\n* **Documentation**\n  * Added detailed tight-space compaction documentation.\n* **Configuration**\n  * Added `tight_space_compaction` runtime toggle (default: disabled).\n* **Benchmarks & Tests**\n* Added tight-space benchmark and end-to-end tests, including\ncrash-mid-loop recovery scenarios.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-19T15:46:35+03:00",
+          "tree_id": "8473d870c212e6d9ad9265312a7300f615dec3c2",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/9a7d37ee1c2a423a1ba4ac0fd9b9c40e18347e2b"
+        },
+        "date": 1781873248245,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2033671.7885165184,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1169580.6368627385,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 910914.589081897,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 4.1us | P99.9: 6.7us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3709234.722190745,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 472839.27399416215,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.1us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 245662.28785880728,
+            "unit": "ops/sec",
+            "extra": "P50: 3.8us | P99: 4.8us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.81s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1183648.616390225,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1099769.4877654796,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 705794.8783846432,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 5.6us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
         ]
       }
