@@ -1717,6 +1717,20 @@ mod tests {
     use super::*;
     use test_log::test;
 
+    /// A pathological-but-valid shard config (1 data shard, 255 parity shards)
+    /// over a large block makes `shard_bytes * parity_shards` exceed u32. The
+    /// parity length must saturate to u32::MAX (it is rejected against the actual
+    /// block downstream), never wrap or panic.
+    #[test]
+    fn expected_parity_len_saturates_on_huge_parity_product() {
+        let data_length = 100 * 1024 * 1024; // 100 MiB
+        let params = EccParams::Shard {
+            data_shards: 1,
+            parity_shards: 255,
+        };
+        assert_eq!(expected_parity_len(data_length, params), u32::MAX);
+    }
+
     /// Result of [`write_block_to_tempfile`]. Bundles the open
     /// file, the pre-computed [`crate::table::BlockHandle`], and
     /// the owning [`tempfile::TempDir`].
