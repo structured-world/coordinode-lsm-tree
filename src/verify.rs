@@ -1229,9 +1229,24 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
             });
             return;
         }
-        // Clamp-to-zero: a block whose header runs past the section end leaves
-        // zero remaining payload, which the `>` check below then rejects.
-        let remaining = end_offset.saturating_sub(offset).saturating_sub(header_len);
+        // A header whose own bytes cross the section boundary is corrupt and must
+        // be rejected here: clamping `remaining` to zero would let a header with a
+        // zero-length declared payload slip past the `>` check below even though
+        // the header itself ran past the section end.
+        let bytes_to_section_end = end_offset.saturating_sub(offset);
+        if header_len > bytes_to_section_end {
+            ctx.errors.push(BlockVerifyError::HeaderCorrupted {
+                table_id: ctx.table_id,
+                path: ctx.path.to_path_buf(),
+                offset,
+                reason: format!(
+                    "block header ({header_len} bytes) extends past the section end \
+                     ({bytes_to_section_end} bytes remain)",
+                ),
+            });
+            return;
+        }
+        let remaining = bytes_to_section_end - header_len;
         // `data_length_u64` is already capped at `ctx.max_data_length` (checked
         // above) and `parity_len` is derived from it, so the sum is bounded well
         // within u64 — a plain add cannot overflow.
