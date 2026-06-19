@@ -1358,6 +1358,39 @@ mod tests {
     }
 
     #[test]
+    fn writing_through_a_pre_rename_handle_invalidates_reclaim() -> io::Result<()> {
+        // A handle opened before a rename keeps the OLD path but writes to the
+        // SAME backing buffer (now under the new path). Punched-range
+        // invalidation must follow the backing file, not the stale path, or the
+        // rewritten bytes keep counting as reclaimed.
+        let fs = MemFs::with_capacity(1000);
+        fs.open(
+            Path::new("/a"),
+            &FsOpenOptions::new().write(true).create(true),
+        )?
+        .write_all(&[0xAB; 400])?;
+        // A writable handle captured BEFORE the punch + rename.
+        let mut pre_rename = fs.open(Path::new("/a"), &FsOpenOptions::new().write(true))?;
+
+        fs.punch_hole(Path::new("/a"), 0, 400)?;
+        fs.rename(Path::new("/a"), Path::new("/b"))?;
+        assert_eq!(
+            fs.available_space(Path::new("/b"))?,
+            1000,
+            "1000 − (400 − 400)"
+        );
+
+        // Rewrite the hole through the stale handle (its buffer is now `/b`).
+        pre_rename.write_all(&[0xCD; 400])?;
+        assert_eq!(
+            fs.available_space(Path::new("/b"))?,
+            600,
+            "the rewritten bytes must stop counting as reclaimed (1000 − 400)",
+        );
+        Ok(())
+    }
+
+    #[test]
     fn directory_operations() -> io::Result<()> {
         let fs = MemFs::new();
         let nested = PathBuf::from("/a/b/c");
