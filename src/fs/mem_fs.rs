@@ -345,6 +345,25 @@ impl MemFile {
         Ok(buf.len())
     }
 
+    /// Resolves the path this handle's backing buffer lives under RIGHT NOW.
+    /// The captured `self.path` goes stale after a `rename`, but the data `Arc`
+    /// is the stable identity, so match it against `state.files` (fast-path the
+    /// captured path). Returns `None` if the file was removed.
+    fn current_path(&self, state: &State) -> Option<PathBuf> {
+        if state
+            .files
+            .get(&self.path)
+            .is_some_and(|data| Arc::ptr_eq(data, &self.data))
+        {
+            return Some(self.path.clone());
+        }
+        state
+            .files
+            .iter()
+            .find(|(_, data)| Arc::ptr_eq(data, &self.data))
+            .map(|(path, _)| path.clone())
+    }
+
     /// Drops `[start, end)` from this file's punched ranges (a write re-wrote
     /// those bytes, so they are no longer reclaimed). Lock-free no-op until some
     /// punch has happened. Acquired AFTER the data lock is released to keep the
@@ -354,10 +373,13 @@ impl MemFile {
             return;
         }
         let mut state = self.state.write();
-        if let Some(ranges) = state.punched.get_mut(&self.path) {
+        let Some(path) = self.current_path(&state) else {
+            return;
+        };
+        if let Some(ranges) = state.punched.get_mut(&path) {
             subtract_punched_range(ranges, start, end);
             if ranges.is_empty() {
-                state.punched.remove(&self.path);
+                state.punched.remove(&path);
             }
         }
     }
@@ -370,13 +392,16 @@ impl MemFile {
             return;
         }
         let mut state = self.state.write();
-        if let Some(ranges) = state.punched.get_mut(&self.path) {
+        let Some(path) = self.current_path(&state) else {
+            return;
+        };
+        if let Some(ranges) = state.punched.get_mut(&path) {
             ranges.retain_mut(|(s, e)| {
                 *e = (*e).min(new_len);
                 *s < *e
             });
             if ranges.is_empty() {
-                state.punched.remove(&self.path);
+                state.punched.remove(&path);
             }
         }
     }
