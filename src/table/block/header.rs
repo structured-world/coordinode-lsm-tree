@@ -266,10 +266,11 @@ impl Header {
         )]
         let header = Self::header_len(self.block_type) as u32;
         let parity = ecc.map_or(0, |p| super::expected_parity_len(self.data_length, p));
-        // Same bound as `on_disk_size`: `data_length` (and the parity derived
-        // from it) keep header + data + parity within u32, so this never
-        // saturates — the clamp is a defensive belt for a corrupt-but-parsed
-        // header that is rejected elsewhere before the size is consumed.
+        // Defensive clamp: `expected_parity_len` itself saturates for extreme
+        // shard layouts, and a corrupt-but-parsed header can carry an arbitrary
+        // `data_length`, so header + data + parity can reach `u32::MAX`. Saturate
+        // rather than overflow; such a header is rejected elsewhere before the
+        // size is consumed.
         header
             .saturating_add(self.data_length)
             .saturating_add(parity)
