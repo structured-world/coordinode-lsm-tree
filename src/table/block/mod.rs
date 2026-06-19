@@ -1734,6 +1734,19 @@ mod tests {
         assert_eq!(expected_parity_len(data_length, params), u32::MAX);
     }
 
+    /// A `u32::MAX` data length with a single data shard makes `ceil` equal an
+    /// odd `u32::MAX`; rounding it up to an even shard size must saturate, not
+    /// overflow `u32`. A corrupt header reaching this path is rejected
+    /// downstream, so the clamp must not panic here.
+    #[test]
+    fn expected_parity_len_saturates_on_max_data_length_even_rounding() {
+        let params = EccParams::Shard {
+            data_shards: 1,
+            parity_shards: 2,
+        };
+        assert_eq!(expected_parity_len(u32::MAX, params), u32::MAX);
+    }
+
     /// Result of [`write_block_to_tempfile`]. Bundles the open
     /// file, the pre-computed [`crate::table::BlockHandle`], and
     /// the owning [`tempfile::TempDir`].
