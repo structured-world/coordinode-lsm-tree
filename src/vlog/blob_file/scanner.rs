@@ -203,11 +203,15 @@ impl Iterator for Scanner {
             } else {
                 super::writer::BLOB_HEADER_LEN_V3 as u64
             };
+            // `key_len` / `on_disk_val_len` come from the on-disk frame header and
+            // may be corrupt. Use checked adds so a value that overflows u64 fails
+            // loudly here (treated as "does not fit") instead of saturating to
+            // u64::MAX and relying on the `> data_end` compare to reject it.
             let frame_end = offset
-                .saturating_add(header_len)
-                .saturating_add(u64::from(key_len))
-                .saturating_add(u64::from(on_disk_val_len));
-            if frame_end > self.data_end {
+                .checked_add(header_len)
+                .and_then(|x| x.checked_add(u64::from(key_len)))
+                .and_then(|x| x.checked_add(u64::from(on_disk_val_len)));
+            if frame_end.is_none_or(|end| end > self.data_end) {
                 self.is_terminated = true;
                 return Some(Err(crate::Error::InvalidHeader("Blob")));
             }
