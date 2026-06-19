@@ -660,3 +660,125 @@ fn tight_space_compaction_rewrites_a_gated_kv_separated_merge() -> lsm_tree::Res
     }
     Ok(())
 }
+
+#[test]
+fn tight_space_blob_defrag_relocates_a_fragmented_file_in_slices() -> lsm_tree::Result<()> {
+    // A KV-separated tree whose blob files are HALF dead (a stale, not fully-dead
+    // generation) must be DEFRAGMENTED under tight space: the tight loop relocates
+    // each stale file's live entries into a fresh compact file in key-range slices,
+    // punching the consumed prefix per slice, and the tail drops the now-consumed
+    // stale files. Every key keeps its latest value, through the rewrite and a
+    // reopen. Distinct from the fully-dead case (which just drops dead files): here
+    // the live half is physically moved.
+    let folder = get_tmp_folder();
+    let n = 4_000u64;
+    // High-entropy values so the blobs do not compress away (the relocation
+    // transient must be real for the gate to skip the full merge). Deterministic
+    // per (key, generation) for the post-reopen assertion.
+    let val = |i: u64, generation: u8| -> Vec<u8> {
+        let mut s = (i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (u64::from(generation) << 1);
+        (0..200u32)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 24) as u8
+            })
+            .collect()
+    };
+
+    let mem = MemFs::with_capacity(u64::MAX);
+    let tree = match Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(mem.clone()))
+    .with_kv_separation(Some(
+        KvSeparationOptions::default()
+            .separation_threshold(64)
+            // Keep every stale file and treat a lightly-dead file as stale, so the
+            // half-shadowed generation is relocated rather than ignored.
+            .age_cutoff(1.0)
+            .staleness_threshold(0.1)
+            // Small blob files → several per generation → the merge slices across
+            // multiple stale files.
+            .file_target_size(48 * 1024),
+    ))
+    .open()?
+    {
+        AnyTree::Blob(t) => t,
+        AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+
+    for i in 0..n {
+        tree.insert(format!("key{i:08}").as_bytes(), val(i, 1), i);
+    }
+    tree.flush_active_memtable(0)?;
+    // Overwrite EVEN keys only → every gen-1 blob file ends up ~half dead.
+    for i in (0..n).step_by(2) {
+        tree.insert(format!("key{i:08}").as_bytes(), val(i, 2), n + i);
+    }
+    tree.flush_active_memtable(0)?;
+
+    // Fragmentation is learned during a merge, so run one ample-space merge (with
+    // a watermark above every live seqno) to mark the even-key gen-1 blobs dead.
+    let gc_watermark = 4 * n;
+    tree.index.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+    })?;
+    tree.major_compact(64 * 1024 * 1024, gc_watermark)?;
+
+    let used = tree.storage_stats()?.used_bytes;
+    // Cap so the full relocation of the stale generation cannot fit; opt in to
+    // tight reclaim.
+    mem.set_capacity(used + used / 4);
+    tree.index.update_runtime_config(|c| {
+        c.tight_space_compaction = true;
+    })?;
+
+    tree.major_compact(64 * 1024 * 1024, gc_watermark)?;
+
+    assert!(
+        mem.punched_bytes() > 0,
+        "blob defrag must reclaim the consumed stale-file prefixes via punching",
+    );
+    for i in 0..n {
+        let expected = if i % 2 == 0 { val(i, 2) } else { val(i, 1) };
+        assert_eq!(
+            tree.get(format!("key{i:08}").as_bytes(), u64::MAX)?
+                .as_deref(),
+            Some(expected.as_slice()),
+            "key {i} wrong after blob defrag (odd=gen1 relocated, even=gen2)",
+        );
+    }
+
+    // Survives reopen on the same simulated disk.
+    drop(tree);
+    let reopened = match Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(64),
+    ))
+    .with_shared_fs(Arc::new(mem))
+    .open()?
+    {
+        AnyTree::Blob(t) => t,
+        AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+    for i in (0..n).step_by(37) {
+        let expected = if i % 2 == 0 { val(i, 2) } else { val(i, 1) };
+        assert_eq!(
+            reopened
+                .get(format!("key{i:08}").as_bytes(), u64::MAX)?
+                .as_deref(),
+            Some(expected.as_slice()),
+            "key {i} latest value must survive reopen after blob defrag",
+        );
+    }
+    Ok(())
+}

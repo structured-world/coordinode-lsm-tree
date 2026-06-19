@@ -19,10 +19,16 @@ use alloc::{boxed::Box, string::ToString, vec::Vec};
 use core::iter::Peekable;
 
 /// Drains all blobs that come "before" the given vptr.
+///
+/// `record_consumed` is invoked with `(blob_file_id, frame_end)` for every
+/// drained entry so the tight-space relocation loop can advance its per-file
+/// punch / resume frontier past the bytes this drain reclaimed. The non-tight
+/// path passes a no-op.
 fn drain_blobs<I: Iterator<Item = crate::Result<(ScanEntry, BlobFileId)>>>(
     scanner: &mut Peekable<I>,
     key: &[u8],
     vptr: &BlobIndirection,
+    record_consumed: &mut dyn FnMut(BlobFileId, u64),
 ) -> crate::Result<()> {
     loop {
         let Some(blob) = scanner.next_if(|x| match x {
@@ -35,9 +41,10 @@ fn drain_blobs<I: Iterator<Item = crate::Result<(ScanEntry, BlobFileId)>>>(
         }) else {
             break;
         };
-        let (entry, _) = blob?;
+        let (entry, blob_file_id) = blob?;
 
         assert!(entry.key <= key, "vptr was not matched with blob");
+        record_consumed(blob_file_id, entry.frame_end);
     }
 
     Ok(())
@@ -204,6 +211,11 @@ pub(super) struct ProducedOutput {
     rewritten_blob_files_to_drop: Vec<BlobFile>,
     tables_to_delete: Vec<Table>,
     blob_frag_map: FragmentationMap,
+    /// Per-rewritten-file consumed frontier (`blob_file_id -> frame_end`) from a
+    /// relocating sub-compaction. Empty for non-relocating outputs. The
+    /// tight-space loop punches `[data_start, frontier)` of each stale file and
+    /// resumes the next slice's scan here.
+    consumed_through: crate::HashMap<BlobFileId, u64>,
 }
 
 impl ProducedOutput {
@@ -225,6 +237,12 @@ impl ProducedOutput {
     /// tight-space loop so dead blob files are detected at the final removal.
     pub(super) fn blob_frag_map(&self) -> &FragmentationMap {
         &self.blob_frag_map
+    }
+
+    /// The per-rewritten-file consumed frontier from a relocating slice. The
+    /// tight-space loop punches and resumes each stale file at these offsets.
+    pub(super) fn consumed_through(&self) -> &crate::HashMap<BlobFileId, u64> {
+        &self.consumed_through
     }
 
     /// Marks this produced-but-not-installed output's freshly written files as
@@ -372,6 +390,12 @@ pub struct RelocatingCompaction {
     /// Polled by the blob throttle so a long wait under a low limit stays
     /// interruptible by tree drop / shutdown.
     stop_signal: crate::stop_signal::StopSignal,
+    /// Per-rewritten-file frontier: the highest `frame_end` consumed (relocated
+    /// or drained) so far. The tight-space slice loop reads this after a slice to
+    /// punch `[data_start, frontier)` of each stale file and to resume the next
+    /// slice's scan there. Maintained unconditionally; the non-tight path ignores
+    /// it.
+    consumed_through: crate::HashMap<BlobFileId, u64>,
 }
 
 impl RelocatingCompaction {
@@ -391,12 +415,30 @@ impl RelocatingCompaction {
             rewriting_blob_files,
             rate_limiter,
             stop_signal,
+            consumed_through: crate::HashMap::default(),
         }
     }
 
-    // TODO: vvv validate/unit test this vvv
+    /// Advances the per-file frontier for `blob_file_id` to the max of its
+    /// current value and `frame_end` (frames are consumed in increasing offset
+    /// order, so this is monotonic; `max` only guards reordering bugs).
+    fn record_consumed(&mut self, blob_file_id: BlobFileId, frame_end: u64) {
+        let slot = self.consumed_through.entry(blob_file_id).or_insert(0);
+        *slot = (*slot).max(frame_end);
+    }
+
     fn drain_blobs(&mut self, key: &[u8], indirection: &BlobIndirection) -> crate::Result<()> {
-        drain_blobs(&mut self.blob_scanner, key, indirection)
+        // Disjoint borrows: drain advances `blob_scanner` while recording each
+        // reclaimed frame into `consumed_through`.
+        let Self {
+            blob_scanner,
+            consumed_through,
+            ..
+        } = self;
+        drain_blobs(blob_scanner, key, indirection, &mut |id, frame_end| {
+            let slot = consumed_through.entry(id).or_insert(0);
+            *slot = (*slot).max(frame_end);
+        })
     }
 }
 
@@ -443,6 +485,10 @@ impl CompactionFlavour for RelocatingCompaction {
                     blob_entry.offset, indirection.vhandle.offset,
                     "matched blob has different offset than vptr",
                 );
+
+                // Advance the consumed frontier past this relocated frame so the
+                // tight-space loop can punch / resume here once the slice installs.
+                self.record_consumed(blob_file_id, blob_entry.frame_end);
 
                 log::trace!(
                     "=> use blob: {:?}:{} offset: {} from BF {}",
@@ -538,6 +584,7 @@ impl CompactionFlavour for RelocatingCompaction {
             rewritten_blob_files_to_drop: self.rewriting_blob_files,
             tables_to_delete,
             blob_frag_map,
+            consumed_through: self.consumed_through,
         })
     }
 }
@@ -637,6 +684,8 @@ impl CompactionFlavour for StandardCompaction {
             rewritten_blob_files_to_drop: Vec::new(),
             tables_to_delete,
             blob_frag_map,
+            // A standard sub-compaction relocates nothing.
+            consumed_through: crate::HashMap::default(),
         })
     }
 }
@@ -660,6 +709,7 @@ mod tests {
                 seqno: 0,
                 uncompressed_len: 0,
                 value: UserValue::empty(),
+                frame_end: offset,
             },
             blob_file_id,
         ))
@@ -688,6 +738,7 @@ mod tests {
                     on_disk_size: 0,
                 },
             },
+            &mut |_, _| {},
         )?;
 
         assert_eq!(entry(0, b"a", 4)?, iter.next().unwrap()?);
@@ -718,6 +769,7 @@ mod tests {
                     on_disk_size: 0,
                 },
             },
+            &mut |_, _| {},
         )?;
 
         assert_eq!(entry(0, b"e", 0)?, iter.next().unwrap()?);

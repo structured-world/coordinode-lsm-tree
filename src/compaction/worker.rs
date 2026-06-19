@@ -22,7 +22,7 @@ use crate::{
     stop_signal::StopSignal,
     tree::inner::TreeId,
     version::{Run, SuperVersions, Version},
-    vlog::{BlobFileMergeScanner, BlobFileScanner, BlobFileWriter},
+    vlog::{BlobFileId, BlobFileMergeScanner, BlobFileScanner, BlobFileWriter},
 };
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
@@ -799,6 +799,29 @@ fn run_tight_space_compaction(
     else {
         return Ok(CompactionResult::nothing());
     };
+
+    // KV-separated trees: identify the stale (fragmented) blob files this merge
+    // would relocate. When non-empty the slice loop runs a RELOCATING tight
+    // compaction (blob defrag) — moving live entries into a fresh compact file
+    // and punching each stale file's consumed prefix per slice. We keep only the
+    // IDs, not the `BlobFile` handles: retaining an Arc would pin the stale
+    // `Inner` and block its punch-on-drop. Each slice re-fetches the current
+    // handle from the version.
+    let (stale_ids, stale_total_bytes): (Vec<BlobFileId>, u64) =
+        match &opts.config.kv_separation_opts {
+            Some(blob_opts) => {
+                let picked: HashSet<TableId> = payload.table_ids.iter().copied().collect();
+                let files = pick_blob_files_to_rewrite(&picked, &latest.version, blob_opts)?;
+                let mut total = 0u64;
+                for bf in &files {
+                    total = total.saturating_add(bf.physical_size()?);
+                }
+                (files.iter().map(BlobFile::id).collect(), total)
+            }
+            None => (Vec::new(), 0),
+        };
+    let relocating = !stale_ids.is_empty();
+
     drop(latest);
     drop(version_history_lock);
     if inputs.is_empty() {
@@ -807,10 +830,22 @@ fn run_tight_space_compaction(
     let tables_in = inputs.len();
 
     let comparator = opts.config.comparator.clone();
-    let slice_budget = dest_fs
-        .available_space(&dest_path)
-        .unwrap_or(u64::MAX)
-        .max(1);
+    let available = dest_fs.available_space(&dest_path).unwrap_or(u64::MAX);
+    // Slice boundaries are derived from SST block sizes, but on a KV-separated
+    // relocating merge the transient is dominated by the RELOCATED blob payload,
+    // not the (tiny, handle-only) SSTs. Scale the SST-space budget so a slice
+    // covering `b` SST bytes relocates roughly `b * stale_total / inputs_total`
+    // blob bytes ≈ the free space: without this, a few small SST blocks would map
+    // to the whole blob payload in one slice and overflow the very disk the gate
+    // already flagged as too tight.
+    let slice_budget = if relocating && stale_total_bytes > 0 {
+        let inputs_total: u64 = inputs.iter().map(Table::file_size).sum();
+        let scaled = u128::from(available).saturating_mul(u128::from(inputs_total.max(1)))
+            / u128::from(stale_total_bytes);
+        u64::try_from(scaled).unwrap_or(u64::MAX).max(1)
+    } else {
+        available.max(1)
+    };
     let boundaries = tight_slice_boundaries(&inputs, slice_budget, comparator.as_ref())?;
     if boundaries.is_empty() {
         // Indivisible (single block across all inputs) — no incremental reclaim.
@@ -836,6 +871,10 @@ fn run_tight_space_compaction(
 
     let mut current_views = inputs;
     let mut lower: Bound<UserKey> = Bound::Unbounded;
+    // Cumulative per-stale-file consumed frontier (`blob_file_id -> frame_end`).
+    // Doubles as the next slice's scan-resume map and the punch offset for each
+    // stale file's prior view. Empty (and unused) on the non-relocating path.
+    let mut resume_offsets: crate::HashMap<BlobFileId, u64> = crate::HashMap::default();
 
     let result = (|| -> crate::Result<usize> {
         let mut tables_out = 0usize;
@@ -844,6 +883,27 @@ fn run_tight_space_compaction(
             // Merge [lower, boundary) over the surviving (restricted) input views.
             let slice_payload = slice_payload_for(&current_views, payload);
             let version = opts.version_history.read().latest_version();
+
+            // Re-fetch the stale blob files' CURRENT handles (slice 0: originals;
+            // later: the prior slice's re-opened views). Never retained across the
+            // iteration — a lingering Arc would block the prior view's punch.
+            let current_stale: Vec<BlobFile> = if relocating {
+                stale_ids
+                    .iter()
+                    .filter_map(|id| version.version.blob_files.get(*id).cloned())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let reloc = if relocating {
+                Some(RelocationSetup {
+                    stale_files: current_stale.clone(),
+                    resume_offsets: resume_offsets.clone(),
+                })
+            } else {
+                None
+            };
+
             let produced = run_subcompaction(
                 opts,
                 &slice_payload,
@@ -854,13 +914,44 @@ fn run_tight_space_compaction(
                 dst_lvl,
                 is_last_level,
                 &blobs_folder,
+                reloc,
             )?;
+            drop(version);
+
             let outputs: Vec<Table> = produced.created_tables().to_vec();
-            // KV-separation: blob files this slice wrote (usually none on the
-            // non-relocating path) plus the GC diff of entries it dropped.
-            let new_blobs: Vec<BlobFile> = produced.created_blob_files().to_vec();
+            // KV-separation: blob files this slice relocated live entries into,
+            // plus the GC diff of entries it dropped.
+            let mut new_blobs: Vec<BlobFile> = produced.created_blob_files().to_vec();
             let frag = produced.blob_frag_map().clone();
             let gc_diff = if frag.is_empty() { None } else { Some(frag) };
+
+            // Advance the cumulative frontier from this slice's relocation, then
+            // release `produced` (and its clones of the stale Inners) so the prior
+            // views can punch once drained.
+            if relocating {
+                for (id, fe) in produced.consumed_through() {
+                    let slot = resume_offsets.entry(*id).or_insert(0);
+                    *slot = (*slot).max(*fe);
+                }
+            }
+            drop(produced);
+
+            // Re-open each stale blob file as a distinct Inner: the re-opened view
+            // replaces the original in the new version (same id), and the original
+            // — held only by prior snapshots after this — punches its consumed
+            // `[data_start, frontier)` prefix when it drains. Mirrors the SST
+            // `reopen_restricted` swap. Files with no consumption yet are skipped
+            // (nothing to punch, original stays installed).
+            let mut prior_to_punch: Vec<(BlobFile, u64)> = Vec::new();
+            if relocating {
+                for sf in &current_stale {
+                    if let Some(off) = resume_offsets.get(&sf.id()).copied() {
+                        new_blobs.push(sf.reopen()?);
+                        prior_to_punch.push((sf.clone(), off));
+                    }
+                }
+            }
+
             let blobs_for_cleanup = new_blobs.clone();
 
             // Classify each input at this boundary: restrict (extends past it) or
@@ -914,8 +1005,8 @@ fn run_tight_space_compaction(
                 return Err(e);
             }
 
-            // Arm each surviving prior view to punch its consumed prefix on drop;
-            // a fully-consumed input is deleted outright (its data is in outputs).
+            // Arm each surviving prior SST view to punch its consumed prefix on
+            // drop; a fully-consumed input is deleted outright (data is in outputs).
             for view in &current_views {
                 if removed_ids.contains(&view.id()) {
                     view.mark_as_deleted();
@@ -923,15 +1014,22 @@ fn run_tight_space_compaction(
                     view.mark_punch_on_drop(view.punch_offset_for(boundary)?);
                 }
             }
+            // Arm each re-opened stale blob file's prior view to punch its
+            // relocated `[data_start, frontier)` prefix once it drains.
+            for (bf, off) in &prior_to_punch {
+                bf.mark_punch_on_drop(*off);
+            }
 
             tables_out += outputs.len();
             current_views = next_views;
             lower = Bound::Included(boundary.clone());
 
-            // Release the prior views from the in-memory history so their Drop
-            // punches / deletes NOW, reclaiming space before the next slice. A
-            // concurrent snapshot keeps its own clone, deferring the reclaim
-            // safely until that reader is done.
+            // Drop this iteration's handles to the stale Inners so the only
+            // remaining Arcs are the prior version snapshots; draining them then
+            // drops + punches the originals NOW, reclaiming space before the next
+            // slice. (Concurrent reader snapshots defer their share safely.)
+            drop(prior_to_punch);
+            drop(current_stale);
             opts.version_history.write().drain_obsolete_to_latest();
 
             // Test-only crash point: abort right after the first slice is durably
@@ -951,9 +1049,23 @@ fn run_tight_space_compaction(
             }
         }
 
-        // Tail [last boundary, hi): merge the remainder and remove the inputs.
+        // Tail [last boundary, hi): merge the remainder, remove the inputs, and
+        // drop the now fully-consumed stale blob files (install_merge deletes
+        // them outright — the prior slices already punched their prefixes).
         let slice_payload = slice_payload_for(&current_views, payload);
         let version = opts.version_history.read().latest_version();
+        let tail_reloc = if relocating {
+            let current_stale: Vec<BlobFile> = stale_ids
+                .iter()
+                .filter_map(|id| version.version.blob_files.get(*id).cloned())
+                .collect();
+            Some(RelocationSetup {
+                stale_files: current_stale,
+                resume_offsets: resume_offsets.clone(),
+            })
+        } else {
+            None
+        };
         let produced = run_subcompaction(
             opts,
             &slice_payload,
@@ -964,7 +1076,9 @@ fn run_tight_space_compaction(
             dst_lvl,
             is_last_level,
             &blobs_folder,
+            tail_reloc,
         )?;
+        drop(version);
         let tail_out = produced.created_tables().len();
         super::flavour::install_merge(
             &mut opts.version_history.write(),
@@ -995,6 +1109,16 @@ fn run_tight_space_compaction(
     })
 }
 
+/// Per-slice relocation inputs for the tight-space blob-defrag path: the stale
+/// blob files to rewrite and, per file, the absolute data-section offset to
+/// resume its scan at (the prior slice's consumed frontier, with everything
+/// before it already hole-punched).
+#[cfg(feature = "std")]
+struct RelocationSetup {
+    stale_files: Vec<BlobFile>,
+    resume_offsets: crate::HashMap<BlobFileId, u64>,
+}
+
 /// Runs one sub-compaction over the key range `bounds`: builds a bounded merge
 /// stream of the inputs, applies the same transforms as the serial path
 /// (tombstone eviction, KV-separation drop tracking, compaction filter), writes
@@ -1020,6 +1144,11 @@ fn run_subcompaction(
     dst_lvl: usize,
     is_last_level: bool,
     blobs_folder: &std::path::Path,
+    // When `Some` (tight-space blob defrag only), this sub-compaction relocates
+    // the live entries of `stale_files` into a fresh compact blob file, resuming
+    // each stale file's scan at `resume_offsets` so an already-punched prefix is
+    // never re-read. `None` is the pass-through path (no blob relocation).
+    relocation: Option<RelocationSetup>,
 ) -> crate::Result<super::flavour::ProducedOutput> {
     use super::flavour::CompactionFlavour;
 
@@ -1114,8 +1243,52 @@ fn run_subcompaction(
     // block_parallel = false: this sub-compaction already runs on a pool thread,
     // so its block compression must stay serial (nested-pool deadlock otherwise).
     let table_writer = super::flavour::prepare_table_writer(version, opts, payload, false)?;
-    let mut compactor: Box<dyn CompactionFlavour> =
-        Box::new(StandardCompaction::new(table_writer, tables_for_deletion));
+    let mut compactor: Box<dyn CompactionFlavour> = match relocation {
+        // Tight-space blob defrag: relocate the stale files' live entries into a
+        // fresh compact file, resuming each stale scan at its carried-over
+        // frame boundary (the prior slice punched everything before it).
+        Some(reloc) if opts.config.kv_separation_opts.is_some() => {
+            #[expect(clippy::expect_used, reason = "guarded by is_some() above")]
+            let blob_opts = opts
+                .config
+                .kv_separation_opts
+                .as_ref()
+                .expect("kv_separation_opts present");
+
+            let scanner = BlobFileMergeScanner::new(
+                reloc
+                    .stale_files
+                    .iter()
+                    .map(|bf| match reloc.resume_offsets.get(&bf.id()) {
+                        Some(&off) => BlobFileScanner::resume(&bf.0.path, &*bf.0.fs, bf.id(), off),
+                        None => BlobFileScanner::new(&bf.0.path, &*bf.0.fs, bf.id()),
+                    })
+                    .collect::<crate::Result<Vec<_>>>()?,
+            );
+
+            let writer = BlobFileWriter::new(
+                opts.blob_file_id_generator.clone(),
+                blobs_folder,
+                opts.tree_id,
+                opts.config.descriptor_table.clone(),
+                opts.config.fs.clone(),
+            )?
+            .use_target_size(blob_opts.file_target_size)
+            .use_passthrough_compression(blob_opts.compression)
+            .use_sync_mode(opts.config.sync_mode);
+
+            let inner = StandardCompaction::new(table_writer, tables_for_deletion);
+            Box::new(RelocatingCompaction::new(
+                inner,
+                scanner.peekable(),
+                writer,
+                reloc.stale_files,
+                opts.rate_limiter.clone(),
+                opts.stop_signal.clone(),
+            ))
+        }
+        _ => Box::new(StandardCompaction::new(table_writer, tables_for_deletion)),
+    };
 
     // Propagate range tombstones to this sub-range's output (GC'd at the last
     // level when fully applied); the writer clips them to each output table's
@@ -1486,6 +1659,9 @@ fn merge_tables(
                                 dst_lvl,
                                 is_last_level,
                                 &blobs,
+                                // The parallel path never relocates blobs; tight
+                                // blob defrag is the serial slice loop's domain.
+                                None,
                             );
                             // The receiver outlives every send (it drains N
                             // items below), so this cannot fail.
@@ -1529,6 +1705,7 @@ fn merge_tables(
                                 dst_lvl,
                                 is_last_level,
                                 &blobs_folder,
+                                None,
                             )
                         })
                         .collect()
@@ -2212,6 +2389,147 @@ mod tests {
             assert!(
                 reopened.get(k(i).as_bytes(), crate::MAX_SEQNO)?.is_some(),
                 "key {i} lost after a crash mid tight-space compaction + reopen",
+            );
+        }
+        Ok(())
+    }
+
+    /// A KV-separated tight-space compaction that RELOCATES a fragmented blob
+    /// file in slices and crashes after the first slice must reopen consistently:
+    /// the relocated entries (now in fresh compact files referenced by the
+    /// installed slice output) AND the not-yet-relocated entries (still in the
+    /// punched stale file's intact suffix) must all read their latest value.
+    #[test]
+    fn tight_space_blob_relocation_crash_after_first_slice_recovers_all_keys() -> crate::Result<()>
+    {
+        use core::sync::atomic::Ordering;
+
+        const N: u64 = 4_000;
+        let k = |i: u64| format!("key{i:08}");
+        // High-entropy (xorshift) values so the blobs do NOT compress away: the
+        // relocation transient must be real for the space gate to skip the full
+        // merge and engage the slicing path. Deterministic per (key, generation)
+        // so the post-reopen assertion can regenerate the expected bytes. Odd keys
+        // keep their first-generation value (a relocated live blob); even keys are
+        // overwritten (their first-gen blob is dead → in-file fragmentation).
+        let val = |i: u64, generation: u8| -> Vec<u8> {
+            let mut s = (i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (u64::from(generation) << 1);
+            (0..200u32)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "xorshift byte extraction; the high bits are intentionally dropped"
+                    )]
+                    let byte = (s >> 24) as u8;
+                    byte
+                })
+                .collect()
+        };
+
+        let dir = tempfile::tempdir()?;
+        let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+        let config = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_size_policy(BlockSizePolicy::all(512))
+        .with_shared_fs(Arc::new(mem.clone()))
+        .with_kv_separation(Some(
+            KvSeparationOptions::default()
+                .separation_threshold(64)
+                // Keep every stale file (default age_cutoff 0.25 would drain a
+                // small candidate set to empty) and treat a lightly-dead file as
+                // stale so the half-shadowed first generation is relocated.
+                .age_cutoff(1.0)
+                .staleness_threshold(0.1)
+                // Small blob files → several per generation, so relocation has
+                // multiple stale files and the merge slices across them.
+                .file_target_size(48 * 1024),
+        ));
+        let failpoint = config.fail_tight_after_first_slice.clone();
+        let tree = match config.open()? {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+        };
+
+        // Generation 1: every key → a blob.
+        for i in 0..N {
+            tree.insert(k(i).as_bytes(), val(i, 1), i);
+        }
+        tree.flush_active_memtable(0)?;
+        // Generation 2: overwrite EVEN keys only, interleaved so every gen-1 blob
+        // file ends up ~half dead (stale, not fully dead → eligible to relocate).
+        for i in (0..N).step_by(2) {
+            tree.insert(k(i).as_bytes(), val(i, 2), N + i);
+        }
+        tree.flush_active_memtable(0)?;
+
+        // Blob fragmentation is only LEARNED during a merge (the drop callback
+        // records each shadowed gen-1 blob as dead). Run one ample-space merge
+        // first so the even-key gen-1 blobs are counted dead, leaving every gen-1
+        // file ~half stale — the precondition for the next merge to RELOCATE them.
+        // It also collapses the index SSTs to the bottom level. The watermark sits
+        // above every live seqno so the merge actually folds the shadowed entries
+        // (seqno 0 keeps all MVCC versions and records no fragmentation).
+        let gc_watermark = 4 * N;
+        tree.index.update_runtime_config(|c| {
+            c.storage_admission_check = true;
+            c.storage_limit_bytes = None;
+        })?;
+        tree.major_compact(64 * 1024 * 1024, gc_watermark)?;
+
+        let used = tree.storage_stats()?.used_bytes;
+
+        // Cap so the full relocation of the now-stale generation cannot fit,
+        // forcing the gate to skip and the tight loop to relocate in slices.
+        mem.set_capacity(used + used / 4);
+        tree.index.update_runtime_config(|c| {
+            c.tight_space_compaction = true;
+        })?;
+
+        // Crash right after the first relocated slice is durably installed +
+        // punched.
+        failpoint.store(true, Ordering::SeqCst);
+        assert!(
+            tree.major_compact(64 * 1024 * 1024, gc_watermark).is_err(),
+            "the crash failpoint must abort the relocating tight-space compaction",
+        );
+        assert!(
+            !failpoint.load(Ordering::SeqCst),
+            "the failpoint should have fired and disarmed",
+        );
+        assert!(
+            mem.punched_bytes() > 0,
+            "the first relocated slice must have punched a stale blob prefix",
+        );
+
+        // Reopen on the same simulated disk and verify every key reads its latest
+        // value: odd keys = relocated gen-1 blob, even keys = gen-2 blob.
+        drop(tree);
+        let reopened = match Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(64),
+        ))
+        .with_shared_fs(Arc::new(mem))
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+        };
+        for i in 0..N {
+            let expected = if i % 2 == 0 { val(i, 2) } else { val(i, 1) };
+            assert_eq!(
+                reopened.get(k(i).as_bytes(), crate::MAX_SEQNO)?.as_deref(),
+                Some(expected.as_slice()),
+                "key {i} wrong/lost after a crash mid blob-relocation + reopen",
             );
         }
         Ok(())

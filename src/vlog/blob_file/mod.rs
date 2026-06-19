@@ -193,27 +193,36 @@ impl Drop for Inner {
             // relocation scanner). Re-read the data-section start from the TOC
             // here rather than carrying it on every blob-file Inner — the punch
             // is a rare, tight-space-only path.
-            let off = self
-                .punch_on_drop
-                .load(core::sync::atomic::Ordering::Acquire);
-            if off != u64::MAX {
-                match data_section_start(&*self.fs, &self.path) {
-                    Ok(data_start) if off > data_start => {
-                        if let Err(e) = self.fs.punch_hole(&self.path, data_start, off - data_start)
-                        {
-                            log::warn!(
-                                "Failed to punch tight-space data [{data_start}, {off}) of blob file {:?} at {}: {e:?}",
-                                self.id,
-                                self.path.display(),
-                            );
+            //
+            // Hole punching is a std-only capability (the tight-space relocation
+            // loop that arms it is itself `#[cfg(feature = "std")]`), so the punch
+            // action is gated. The atomic load is no-std-safe but pointless when
+            // nothing can arm it.
+            #[cfg(feature = "std")]
+            {
+                let off = self
+                    .punch_on_drop
+                    .load(core::sync::atomic::Ordering::Acquire);
+                if off != u64::MAX {
+                    match data_section_start(&*self.fs, &self.path) {
+                        Ok(data_start) if off > data_start => {
+                            if let Err(e) =
+                                self.fs.punch_hole(&self.path, data_start, off - data_start)
+                            {
+                                log::warn!(
+                                    "Failed to punch tight-space data [{data_start}, {off}) of blob file {:?} at {}: {e:?}",
+                                    self.id,
+                                    self.path.display(),
+                                );
+                            }
                         }
+                        Ok(_) => {} // nothing consumed below the data start
+                        Err(e) => log::warn!(
+                            "Skipping tight-space punch of blob file {:?} at {}: could not read data section: {e:?}",
+                            self.id,
+                            self.path.display(),
+                        ),
                     }
-                    Ok(_) => {} // nothing consumed below the data start
-                    Err(e) => log::warn!(
-                        "Skipping tight-space punch of blob file {:?} at {}: could not read data section: {e:?}",
-                        self.id,
-                        self.path.display(),
-                    ),
                 }
             }
         }
@@ -265,10 +274,6 @@ impl BlobFile {
     /// relocation slice has moved its `[data_start, offset)` live entries into a
     /// fresh compact file and that move is durably installed.
     #[cfg(feature = "std")]
-    #[expect(
-        dead_code,
-        reason = "consumed by the tight-space blob relocation loop landing next on this branch"
-    )]
     pub(crate) fn mark_punch_on_drop(&self, offset: u64) {
         self.0
             .punch_on_drop
@@ -286,10 +291,6 @@ impl BlobFile {
     ///
     /// Propagates any error from re-opening the file.
     #[cfg(feature = "std")]
-    #[expect(
-        dead_code,
-        reason = "consumed by the tight-space blob relocation loop landing next on this branch"
-    )]
     pub(crate) fn reopen(&self) -> crate::Result<Self> {
         super::recover_blob_file(
             &self.0.path,
