@@ -81,15 +81,14 @@ pub(crate) fn expected_parity_len(data_length: u32, params: EccParams) -> u32 {
     if data_length == 0 || data_shards == 0 || parity_shards == 0 {
         return 0;
     }
-    // ceil(N / data_shards) — overflow-safe for u32 since `data_length`
-    // is already capped at MAX_DECOMPRESSION_SIZE + max overhead by the
-    // caller before this function fires.
-    let ceil = (data_length / data_shards)
-        .saturating_add(u32::from(!data_length.is_multiple_of(data_shards)));
+    // ceil(N / data_shards). `data_length` is already capped at
+    // MAX_DECOMPRESSION_SIZE + max overhead by the caller before this function
+    // fires, so all of these are provably within u32 — plain arithmetic.
+    let ceil = (data_length / data_shards) + u32::from(!data_length.is_multiple_of(data_shards));
     // Round up to even (the `reed-solomon-simd` engine requires shard
     // sizes that are a multiple of two; XOR shares the layout).
-    let shard_bytes = ceil.saturating_add(u32::from(!ceil.is_multiple_of(2)));
-    shard_bytes.saturating_mul(parity_shards)
+    let shard_bytes = ceil + u32::from(!ceil.is_multiple_of(2));
+    shard_bytes * parity_shards
 }
 
 /// Whether the on-disk block carries a Reed-Solomon parity trailer.
@@ -1272,6 +1271,8 @@ impl Block {
                 0
             };
 
+            // Clamp-to-zero: a block truncated before its header ends has no
+            // payload, which `classify_block_trailer` then flags as a mismatch.
             let actual_payload_plus_ecc = block_size.saturating_sub(header_len);
             let actual_data_len = parsed_header.data_length as usize;
             let ecc_status = classify_block_trailer(
@@ -1446,6 +1447,8 @@ impl Block {
                 0
             };
 
+            // Clamp-to-zero: a buffer shorter than the header carries no payload,
+            // which the trailer classification then flags as a mismatch.
             let actual_payload_plus_ecc = buf.len().saturating_sub(header_len);
             let actual_data_len = parsed_header.data_length as usize;
             let ecc_status = classify_block_trailer(
@@ -1658,6 +1661,8 @@ impl Block {
             0
         };
 
+        // Clamp-to-zero: a buffer shorter than the header carries no payload,
+        // which the trailer classification then flags as a mismatch.
         let actual_payload_plus_ecc = buf.len().saturating_sub(header_len);
         let actual_data_len = parsed_header.data_length as usize;
         let _ecc_status = classify_block_trailer(

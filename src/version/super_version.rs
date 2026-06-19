@@ -141,6 +141,8 @@ impl SuperVersions {
     }
 
     pub fn free_list_len(&self) -> usize {
+        // Clamp-to-zero: the live version is excluded from the free list, so an
+        // empty history yields a zero-length free list rather than underflowing.
         self.len().saturating_sub(1)
     }
 

@@ -1054,6 +1054,8 @@ fn compare_prefixed_slice_lexicographic(
         }
     }
 
+    // Clamp-to-zero: when `needle` is longer than `prefix` there is no remainder
+    // (the prefix is exhausted), which the `> 0` check below treats correctly.
     let rest_len = prefix.len().saturating_sub(needle.len());
     if rest_len > 0 {
         return Greater;

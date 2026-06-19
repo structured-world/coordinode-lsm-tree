@@ -1179,6 +1179,9 @@ impl<T: AsRef<[u8]>> Read for Cursor<T> {
 impl<T: AsRef<[u8]>> Seek for Cursor<T> {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
         let len = self.inner.as_ref().len() as u64;
+        // Clamp a caller-supplied relative seek into `[0, u64::MAX]` rather than
+        // underflowing on a negative offset that would point before the start
+        // (the offset is internal, not on-disk-decoded input).
         let new = match pos {
             SeekFrom::Start(n) => n,
             SeekFrom::End(off) => len.saturating_add_signed(off),

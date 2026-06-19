@@ -762,7 +762,9 @@ impl IoUringRawFile {
             return Ok(0);
         }
         let n = self.ring.lock().read_at(self.fd, buf, self.cursor)?;
-        self.cursor = self.cursor.saturating_add(n as u64);
+        // The cursor is bounded by the file size (n is the bytes just
+        // read/written), so a plain add cannot overflow u64.
+        self.cursor += n as u64;
         Ok(n)
     }
 
@@ -780,7 +782,9 @@ impl IoUringRawFile {
             return self.ring.lock().write_at(self.fd, buf, u64::MAX);
         }
         let n = self.ring.lock().write_at(self.fd, buf, self.cursor)?;
-        self.cursor = self.cursor.saturating_add(n as u64);
+        // The cursor is bounded by the file size (n is the bytes just
+        // read/written), so a plain add cannot overflow u64.
+        self.cursor += n as u64;
         Ok(n)
     }
 

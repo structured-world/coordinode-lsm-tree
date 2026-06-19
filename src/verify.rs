@@ -1163,7 +1163,9 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         // DataReadError / data-length-bounds HeaderCorrupted would
         // be silently uncounted, contradicting the documented
         // semantics.
-        *ctx.blocks_scanned = ctx.blocks_scanned.saturating_add(1);
+        // Block counter; a tree cannot hold 2^64 blocks, so a plain add cannot
+        // overflow.
+        *ctx.blocks_scanned += 1;
 
         // Actual header length for this block (variable: SST blocks omit the
         // block_flags byte). Used for the section-bounds math and the offset
@@ -1227,8 +1229,13 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
             });
             return;
         }
+        // Clamp-to-zero: a block whose header runs past the section end leaves
+        // zero remaining payload, which the `>` check below then rejects.
         let remaining = end_offset.saturating_sub(offset).saturating_sub(header_len);
-        let on_disk_payload = data_length_u64.saturating_add(parity_len);
+        // `data_length_u64` is already capped at `ctx.max_data_length` (checked
+        // above) and `parity_len` is derived from it, so the sum is bounded well
+        // within u64 — a plain add cannot overflow.
+        let on_disk_payload = data_length_u64 + parity_len;
         if on_disk_payload > remaining {
             ctx.errors.push(BlockVerifyError::HeaderCorrupted {
                 table_id: ctx.table_id,
@@ -1317,10 +1324,10 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         // blocks_scanned was already incremented right after a
         // successful Header::decode_from above — do not double-count
         // here.
-        offset = offset
-            .saturating_add(header_len)
-            .saturating_add(data_length_u64)
-            .saturating_add(parity_len);
+        // Advance past this block. Each term is bounded (data_length capped
+        // above, parity derived from it, header a const) and `offset` is bounded
+        // by the section end, so the running cursor cannot overflow u64.
+        offset += header_len + data_length_u64 + parity_len;
     }
 }
 

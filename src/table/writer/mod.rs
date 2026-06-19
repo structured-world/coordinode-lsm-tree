@@ -1071,6 +1071,8 @@ impl Writer {
         let layout = core::mem::take(&mut prepared.layout);
         let header = prepared.write_to(&mut self.file_writer)?;
         // Header is Copy; read the in-flight size before handing it off.
+        // Clamp-to-zero: this block's bytes were counted into the in-flight total
+        // when queued, so the subtraction stays non-negative.
         self.parallel_pending_bytes = self
             .parallel_pending_bytes
             .saturating_sub(u64::from(header.uncompressed_length));

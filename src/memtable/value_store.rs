@@ -219,6 +219,9 @@ impl Drop for ValueStore {
 
             // Drop initialised slots in this segment.
             let seg_start = (seg_idx as u32) << SEGMENT_SHIFT;
+            // `.min(total)` is the real bound (segment end clamped to the live
+            // count); the saturating add just guards the intermediate u32 sum
+            // before that clamp.
             let seg_end = seg_start.saturating_add(SEGMENT_SIZE as u32).min(total);
 
             if seg_start < total {

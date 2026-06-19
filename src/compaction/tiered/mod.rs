@@ -256,9 +256,11 @@ impl CompactionStrategy for Strategy {
             //   (total / largest - 1) * 100 >= threshold
             // is equivalent to:
             //   total * 100 >= largest * (100 + threshold)
-            let lhs = u128::from(total_size).saturating_mul(100);
+            // u64 sizes widened to u128, so multiplying by a small percentage
+            // factor cannot overflow u128 — plain multiplies.
+            let lhs = u128::from(total_size) * 100;
             let rhs = u128::from(largest_run_size)
-                .saturating_mul(100 + u128::from(self.max_space_amplification_percent));
+                * (100 + u128::from(self.max_space_amplification_percent));
 
             if lhs >= rhs {
                 let table_ids: HashSet<TableId> = runs

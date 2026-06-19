@@ -353,6 +353,8 @@ impl Strategy {
                     let canonical = idx - level_shift;
                     // In the forward formula, target(k+1)/target(k) = ratio[k-1],
                     // so backwards: target(k) = target(k+1) / ratio[k-1]
+                    // Clamp-to-zero: the ratio for the first dynamic level reuses
+                    // index 0 rather than underflowing to a phantom level.
                     let ratio_idx = canonical.saturating_sub(1);
                     let ratio = f64::from(
                         self.level_ratio_policy

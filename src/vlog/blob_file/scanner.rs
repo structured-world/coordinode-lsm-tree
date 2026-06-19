@@ -505,6 +505,59 @@ mod tests {
         Ok(())
     }
 
+    /// A frame whose declared `on_disk_val_len` runs past the data section must be
+    /// rejected by the checked frame-fit bound, not read past the section. Uses a
+    /// V3 frame (no header CRC) so the oversized length reaches the fit check
+    /// rather than being caught earlier by the V4 header CRC.
+    #[test]
+    fn blob_scanner_rejects_oversized_on_disk_len() -> crate::Result<()> {
+        use crate::io::{LittleEndian, WriteBytesExt};
+        use std::io::Write;
+
+        let dir = tempdir()?;
+        let blob_file_path = dir.path().join("0");
+
+        let key = b"abc";
+        let value = b"hi";
+        {
+            let file = std::fs::File::create(&blob_file_path)?;
+            let mut sfa_writer = crate::sfa::Writer::from_writer(file);
+            sfa_writer.start("data")?;
+            sfa_writer.write_all(b"BLOB")?;
+            sfa_writer.write_u128::<LittleEndian>(0)?; // checksum (unreached)
+            sfa_writer.write_u64::<LittleEndian>(1)?; // seqno
+            #[expect(clippy::cast_possible_truncation, reason = "test key fits u16")]
+            sfa_writer.write_u16::<LittleEndian>(key.len() as u16)?;
+            sfa_writer.write_u32::<LittleEndian>(2)?; // real_val_len
+            // on_disk_val_len far exceeds the data section → frame-fit reject.
+            sfa_writer.write_u32::<LittleEndian>(u32::MAX)?;
+            sfa_writer.write_all(key)?;
+            sfa_writer.write_all(value)?;
+
+            sfa_writer.start("meta")?;
+            let metadata = crate::vlog::blob_file::meta::Metadata {
+                id: 0,
+                version: 3,
+                created_at: 0,
+                item_count: 1,
+                total_compressed_bytes: 2,
+                total_uncompressed_bytes: 2,
+                key_range: crate::KeyRange::new((key[..].into(), key[..].into())),
+                compression: crate::CompressionType::None,
+            };
+            metadata.encode_into(&mut sfa_writer)?;
+            sfa_writer.into_inner()?.sync_all()?;
+        }
+
+        let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
+        let result = scanner.next().unwrap();
+        assert!(
+            matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
+            "an oversized on_disk_val_len must be rejected, got: {result:?}",
+        );
+        Ok(())
+    }
+
     /// Scanner rejects frames with invalid magic (neither V3 nor V4).
     #[test]
     fn blob_scanner_rejects_invalid_magic() -> crate::Result<()> {

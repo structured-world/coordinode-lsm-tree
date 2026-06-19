@@ -96,7 +96,9 @@ impl FsFile for File {
             // SAFETY: loop guard `filled < buf.len()` ensures this is in-bounds.
             #[expect(clippy::expect_used, reason = "filled < buf.len() by loop guard")]
             let remaining = buf.get_mut(filled..).expect("filled < buf.len()");
-            let off = offset.saturating_add(filled as u64);
+            // Base read offset plus the bytes filled so far (≤ buf.len()); both
+            // are bounded by the file size, so a plain add cannot overflow.
+            let off = offset + filled as u64;
 
             let n = {
                 #[cfg(unix)]
