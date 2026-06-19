@@ -740,9 +740,18 @@ fn tight_space_blob_defrag_relocates_a_fragmented_file_in_slices() -> lsm_tree::
 
     tree.major_compact(64 * 1024 * 1024, gc_watermark)?;
 
+    // The defrag punched the consumed stale-file prefixes incrementally
+    // (`punched_bytes` is the lifetime reclaim total, so it stays > 0 even though
+    // the tail then deletes the fully-consumed stale files) AND the footprint
+    // shrank as the dead halves were dropped.
     assert!(
         mem.punched_bytes() > 0,
         "blob defrag must reclaim the consumed stale-file prefixes via punching",
+    );
+    let used_after = tree.storage_stats()?.used_bytes;
+    assert!(
+        used_after < used,
+        "blob defrag must reclaim the dead halves (used {used} -> {used_after})",
     );
     for i in 0..n {
         let expected = if i % 2 == 0 { val(i, 2) } else { val(i, 1) };

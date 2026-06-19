@@ -71,16 +71,14 @@ pub struct MemFs {
     /// `portable_atomic::AtomicU64` (not `core`'s): native 64-bit atomics are
     /// absent on some `no_std` targets (e.g. thumbv7em).
     capacity: Arc<portable_atomic::AtomicU64>,
-    /// Total bytes deallocated by [`Fs::punch_hole`] across all files, subtracted
-    /// from [`Self::stored_bytes`] so the simulated disk reflects in-place extent
-    /// reclaim (the real `fallocate(PUNCH_HOLE)` frees physical blocks while the
-    /// file's logical length is unchanged). Shared across clones. The contract is
-    /// non-overlapping punches (the tight-compaction reclaim loop punches
-    /// strictly advancing input prefixes), so summing punched lengths cannot
-    /// double-count. Reset to zero when a file is removed or truncated is not
-    /// modelled — `MemFs` is a test backend, and the reclaim accounting only
-    /// needs to be monotonic within one compaction's punch sequence.
-    punched_bytes: Arc<portable_atomic::AtomicU64>,
+    /// LIFETIME total of distinct bytes ever reclaimed by [`Fs::punch_hole`] on
+    /// this simulated disk, exposed via [`MemFs::punched_bytes`] purely so a test
+    /// can assert that an in-place reclaim FIRED (and roughly how much), even
+    /// after the punched files are later deleted. Monotonic; counts each punch's
+    /// newly-freed bytes once (overlapping re-punches add nothing). This is NOT
+    /// what drives free space — [`Self::stored_bytes`] uses the per-file
+    /// [`State::punched`] ranges so a removed/truncated file stops freeing space.
+    punched_total: Arc<portable_atomic::AtomicU64>,
     /// Whether [`Fs::capabilities`] advertises `punch_hole` (default `true`).
     /// A test sets this `false` via [`MemFs::set_punch_hole_supported`] to drive
     /// the capability-gated fallback (tight-space compaction skips on a backend
@@ -92,6 +90,45 @@ pub struct MemFs {
 struct State {
     files: HashMap<PathBuf, Arc<Mutex<Vec<u8>>>>,
     dirs: HashSet<PathBuf>,
+    /// Per-file reclaimed (punched) byte ranges, kept non-overlapping and
+    /// merged. Subtracted from each file's logical length in [`MemFs::stored_bytes`]
+    /// so the simulated disk reflects in-place extent reclaim (real
+    /// `fallocate(PUNCH_HOLE)` frees physical blocks while the logical length is
+    /// unchanged). Tracking PER FILE (not a global counter) keeps the accounting
+    /// correct when a punched file is removed, renamed, truncated, or overwritten,
+    /// and merging ranges keeps overlapping/cumulative punches from double-counting.
+    punched: HashMap<PathBuf, Vec<(u64, u64)>>,
+}
+
+/// Merges `[start, end)` into a sorted, non-overlapping range set. Overlapping
+/// or adjacent ranges coalesce, so cumulative prefix punches never double-count.
+fn merge_punched_range(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) {
+    if start >= end {
+        return;
+    }
+    ranges.push((start, end));
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for &(s, e) in ranges.iter() {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    *ranges = merged;
+}
+
+/// Total punched bytes of one file's range set, clipped to its current `len`
+/// (ranges past a later truncation no longer count).
+fn clipped_punched_len(ranges: &[(u64, u64)], len: u64) -> u64 {
+    ranges
+        .iter()
+        .map(|&(s, e)| {
+            let e = e.min(len);
+            let s = s.min(e);
+            e - s
+        })
+        .sum()
 }
 
 impl MemFs {
@@ -105,7 +142,7 @@ impl MemFs {
             state: Arc::new(RwLock::new(state)),
             namespace_id: next_mem_fs_namespace_id(),
             capacity: Arc::new(portable_atomic::AtomicU64::new(u64::MAX)),
-            punched_bytes: Arc::new(portable_atomic::AtomicU64::new(0)),
+            punched_total: Arc::new(portable_atomic::AtomicU64::new(0)),
             punch_hole_supported: Arc::new(portable_atomic::AtomicBool::new(true)),
         }
     }
@@ -142,23 +179,34 @@ impl MemFs {
     /// usage). Sums every file's length under the state read lock.
     fn stored_bytes(&self) -> u64 {
         let state = self.state.read();
-        let logical = state
+        // Each file contributes its logical length minus the bytes punched out of
+        // it (clipped to the current length). Per-file accounting means a removed
+        // or truncated file stops subtracting stale reclaim. The sum is bounded by
+        // the simulated capacity, so it cannot overflow u64.
+        state
             .files
-            .values()
-            .map(|data| data.lock().len() as u64)
-            .fold(0u64, u64::saturating_add);
-        // Subtract bytes reclaimed by punch_hole: their physical blocks are
-        // freed even though the logical file length is unchanged.
-        logical.saturating_sub(self.punched_bytes.load(portable_atomic::Ordering::Relaxed))
+            .iter()
+            .map(|(path, data)| {
+                let len = data.lock().len() as u64;
+                let punched = state
+                    .punched
+                    .get(path)
+                    .map_or(0, |ranges| clipped_punched_len(ranges, len));
+                len - punched
+            })
+            .sum()
     }
 
-    /// Total bytes reclaimed by [`Fs::punch_hole`] across all files on this
+    /// LIFETIME total of distinct bytes reclaimed by [`Fs::punch_hole`] on this
     /// simulated disk. Lets a test assert that an in-place extent reclaim (e.g.
-    /// the tight-space compaction prefix punch) actually fired, distinct from a
-    /// whole-file deletion.
+    /// the tight-space compaction prefix punch) actually fired and roughly how
+    /// much — it stays counted even after the punched files are deleted, so it is
+    /// the right metric for "did the rewrite punch incrementally?". It is NOT the
+    /// current free space: [`Fs::available_space`] reflects that, dropping a
+    /// removed/truncated file's reclaim.
     #[must_use]
     pub fn punched_bytes(&self) -> u64 {
-        self.punched_bytes.load(portable_atomic::Ordering::Relaxed)
+        self.punched_total.load(portable_atomic::Ordering::Relaxed)
     }
 }
 
@@ -528,6 +576,9 @@ impl Fs for MemFs {
 
             if opts.truncate {
                 lock(&data)?.clear();
+                // The bytes are gone; drop stale punched ranges so they cannot
+                // resurrect and over-free once the file is rewritten and grows.
+                state.punched.remove(&path);
             }
 
             // Cursor starts at 0 even in append mode - append only affects
@@ -700,6 +751,8 @@ impl Fs for MemFs {
                 format!("file not found: {}", path.display()),
             ));
         }
+        // Drop any punched-range accounting so a removed file stops freeing space.
+        state.punched.remove(path);
         Ok(())
     }
 
@@ -723,6 +776,7 @@ impl Fs for MemFs {
 
         state.files.retain(|p, _| !p.starts_with(path));
         state.dirs.retain(|p| !p.starts_with(path));
+        state.punched.retain(|p, _| !p.starts_with(path));
 
         // Re-seed root so exists("/") and read_dir("/") remain valid.
         state.dirs.insert(PathBuf::from("/"));
@@ -756,6 +810,16 @@ impl Fs for MemFs {
 
         if let Some(data) = state.files.remove(from) {
             state.files.insert(to.to_path_buf(), data);
+            // Move the punched-range accounting with the file; the destination is
+            // replaced, so its old ranges (if any) are dropped first.
+            match state.punched.remove(from) {
+                Some(ranges) => {
+                    state.punched.insert(to.to_path_buf(), ranges);
+                }
+                None => {
+                    state.punched.remove(to);
+                }
+            }
             Ok(())
         } else {
             Err(io::Error::new(
@@ -898,29 +962,42 @@ impl Fs for MemFs {
     /// length stays unchanged. The range is clamped to the current file length;
     /// a punch wholly past EOF is a no-op.
     fn punch_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<()> {
-        let state = self.state.read();
-        let data = state
-            .files
-            .get(path)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "punch_hole: file not found"))?;
-        let mut buf = data.lock();
-        let file_len = buf.len() as u64;
-        // Clamp to the file: a hole cannot extend the logical length.
-        let start = offset.min(file_len);
-        let end = offset.saturating_add(len).min(file_len);
-        if start >= end {
-            return Ok(());
-        }
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "start/end are clamped to buf.len() (a usize), so they fit usize"
-        )]
-        let (s, e) = (start as usize, end as usize);
-        if let Some(slice) = buf.get_mut(s..e) {
-            slice.fill(0);
-        }
-        self.punched_bytes
-            .fetch_add(end - start, portable_atomic::Ordering::Relaxed);
+        // Write lock: the punched-range bookkeeping lives in `State`, and the
+        // reclaim must be atomic with zeroing the bytes.
+        let mut state = self.state.write();
+        let (start, end) = {
+            let data = state.files.get(path).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "punch_hole: file not found")
+            })?;
+            let mut buf = data.lock();
+            let file_len = buf.len() as u64;
+            // Clamp to the file: a hole cannot extend the logical length.
+            let start = offset.min(file_len);
+            // offset + len can exceed u64 for an adversarial caller; the result is
+            // immediately clamped to the file length, so the saturating add only
+            // avoids a wraparound that would defeat that clamp.
+            let end = offset.saturating_add(len).min(file_len);
+            if start >= end {
+                return Ok(());
+            }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "start/end are clamped to buf.len() (a usize), so they fit usize"
+            )]
+            let (s, e) = (start as usize, end as usize);
+            if let Some(slice) = buf.get_mut(s..e) {
+                slice.fill(0);
+            }
+            (start, end)
+        };
+        // Update the per-file ranges (drives free space) and, by the union delta,
+        // the lifetime counter (drives the `punched_bytes` test metric).
+        let ranges = state.punched.entry(path.to_path_buf()).or_default();
+        let before: u64 = ranges.iter().map(|&(s, e)| e - s).sum();
+        merge_punched_range(ranges, start, end);
+        let after: u64 = ranges.iter().map(|&(s, e)| e - s).sum();
+        self.punched_total
+            .fetch_add(after - before, portable_atomic::Ordering::Relaxed);
         Ok(())
     }
 }
@@ -1063,6 +1140,86 @@ mod tests {
         let fs = MemFs::new();
         let err = fs.punch_hole(Path::new("/nope"), 0, 10).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn overlapping_prefix_punches_do_not_double_count() -> io::Result<()> {
+        // The tight-space reclaim punches strictly-advancing prefixes of the same
+        // file. Per-file range merging must count the UNION, not the sum, or
+        // available_space would over-report free space under an impossible disk.
+        let fs = MemFs::with_capacity(1000);
+        let path = Path::new("/f");
+        fs.open(path, &FsOpenOptions::new().write(true).create(true))?
+            .write_all(&[0xAB; 600])?;
+
+        fs.punch_hole(path, 0, 300)?;
+        fs.punch_hole(path, 0, 500)?; // overlaps the first punch
+        assert_eq!(
+            fs.punched_bytes(),
+            500,
+            "overlapping prefix punches count the union (500), not the sum (800)",
+        );
+        assert_eq!(
+            fs.available_space(path)?,
+            900,
+            "1000 capacity − (600 − 500 punched) stored",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn removing_a_punched_file_releases_its_reclaim_accounting() -> io::Result<()> {
+        // A global punched counter would keep subtracting a removed file's freed
+        // bytes, letting available_space report more than the disk can hold.
+        // Per-file tracking must drop the accounting on remove.
+        let fs = MemFs::with_capacity(1000);
+        let path = Path::new("/f");
+        fs.open(path, &FsOpenOptions::new().write(true).create(true))?
+            .write_all(&[0xAB; 400])?;
+        fs.punch_hole(path, 0, 400)?;
+        assert_eq!(
+            fs.available_space(path)?,
+            1000,
+            "1000 − (400 − 400 punched)"
+        );
+
+        fs.remove_file(path)?;
+        // The free-space accounting must drop the removed file's reclaim: a global
+        // counter would keep subtracting it and report MORE than the full disk.
+        assert_eq!(
+            fs.available_space(path)?,
+            1000,
+            "the whole disk is free again after removal, not over-reported",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn truncating_a_punched_file_on_reopen_drops_stale_ranges() -> io::Result<()> {
+        // After a punched file is truncated and rewritten larger, the old punched
+        // ranges must not resurrect and over-free the freshly written bytes.
+        let fs = MemFs::with_capacity(1000);
+        let path = Path::new("/f");
+        fs.open(path, &FsOpenOptions::new().write(true).create(true))?
+            .write_all(&[0xAB; 400])?;
+        fs.punch_hole(path, 0, 400)?;
+        assert_eq!(
+            fs.available_space(path)?,
+            1000,
+            "1000 − (400 − 400 punched)"
+        );
+
+        // Truncate-on-open clears the data; rewrite 400 fresh bytes.
+        fs.open(path, &FsOpenOptions::new().write(true).truncate(true))?
+            .write_all(&[0xCD; 400])?;
+        // The stale punched ranges must not resurrect and over-free the fresh
+        // bytes: free space reflects only the 400 newly written.
+        assert_eq!(
+            fs.available_space(path)?,
+            600,
+            "1000 capacity − 400 freshly written (no phantom reclaim)",
+        );
+        Ok(())
     }
 
     #[test]
