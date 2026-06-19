@@ -736,7 +736,10 @@ fn tight_slice_boundaries(
     let mut boundaries = Vec::new();
     let mut acc = 0u64;
     for (end_key, size) in &entries {
-        acc = acc.saturating_add(u64::from(*size));
+        // `size` is a u32 block length and `acc` resets each boundary; the
+        // running sum is bounded by the inputs' on-disk size, so a plain add
+        // cannot overflow u64.
+        acc += u64::from(*size);
         if acc >= slice_budget
             && global_max.as_ref() != Some(end_key)
             && boundaries.last() != Some(end_key)
@@ -812,9 +815,11 @@ fn run_tight_space_compaction(
             Some(blob_opts) => {
                 let picked: HashSet<TableId> = payload.table_ids.iter().copied().collect();
                 let files = pick_blob_files_to_rewrite(&picked, &latest.version, blob_opts)?;
+                // Sum of on-disk blob-file sizes; bounded by filesystem capacity,
+                // so it cannot overflow u64 (matches the gate's `acc + size`).
                 let mut total = 0u64;
                 for bf in &files {
-                    total = total.saturating_add(bf.physical_size()?);
+                    total += bf.physical_size()?;
                 }
                 (files.iter().map(BlobFile::id).collect(), total)
             }
@@ -840,8 +845,10 @@ fn run_tight_space_compaction(
     // already flagged as too tight.
     let slice_budget = if relocating && stale_total_bytes > 0 {
         let inputs_total: u64 = inputs.iter().map(Table::file_size).sum();
-        let scaled = u128::from(available).saturating_mul(u128::from(inputs_total.max(1)))
-            / u128::from(stale_total_bytes);
+        // Both factors are u64, so their u128 product is at most
+        // (2^64-1)^2 < u128::MAX — plain multiply cannot overflow.
+        let scaled =
+            u128::from(available) * u128::from(inputs_total.max(1)) / u128::from(stale_total_bytes);
         u64::try_from(scaled).unwrap_or(u64::MAX).max(1)
     } else {
         available.max(1)
