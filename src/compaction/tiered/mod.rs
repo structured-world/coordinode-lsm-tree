@@ -256,11 +256,15 @@ impl CompactionStrategy for Strategy {
             //   (total / largest - 1) * 100 >= threshold
             // is equivalent to:
             //   total * 100 >= largest * (100 + threshold)
-            // u64 sizes widened to u128, so multiplying by a small percentage
-            // factor cannot overflow u128 — plain multiplies.
+            // `lhs` multiplies a u64-derived u128 by the constant 100, which
+            // cannot overflow u128 — plain multiply. `rhs` multiplies by
+            // `100 + max_space_amplification_percent`, and the percentage is an
+            // unvalidated u64 (tests pass u64::MAX), so that product CAN exceed
+            // u128 — saturate. An over-large amplification bound simply forces a
+            // full compaction, which is the safe direction.
             let lhs = u128::from(total_size) * 100;
             let rhs = u128::from(largest_run_size)
-                * (100 + u128::from(self.max_space_amplification_percent));
+                .saturating_mul(100 + u128::from(self.max_space_amplification_percent));
 
             if lhs >= rhs {
                 let table_ids: HashSet<TableId> = runs
