@@ -501,6 +501,24 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_a_truncated_restriction_key() {
+        // The last section is the restriction codec; dropping the tail leaves the
+        // final restriction's key shorter than its length prefix, which must be
+        // rejected rather than silently un-clamping a punched table.
+        let edit = sample(); // ends with restriction (10, "zzzz")
+        let mut buf = Vec::new();
+        edit.append_to(&mut buf, &mut Vec::new()).expect("append");
+        let mut payload = Vec::new();
+        framing::read_framed_record(&mut &buf[..], u64::MAX, None, &mut payload).expect("read");
+
+        payload.truncate(payload.len() - 2); // chop 2 of the 4 key bytes
+        assert!(
+            VersionEdit::decode_payload(&payload).is_err(),
+            "a restriction key shorter than its length prefix must be rejected",
+        );
+    }
+
+    #[test]
     fn empty_level_layout_roundtrips() {
         // A compaction that drains a level emits an empty-runs ChangedLevel.
         let mut edit = sample();
