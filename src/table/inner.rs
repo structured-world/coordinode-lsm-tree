@@ -288,7 +288,18 @@ impl Drop for Inner {
             if off != u64::MAX {
                 use crate::table::block_index::BlockIndex;
                 for handle in self.block_index.iter() {
-                    let Ok(handle) = handle else { break };
+                    // Log why reclaim stopped instead of silently swallowing the
+                    // block-index read error (this is an integrity-sensitive path).
+                    let handle = match handle {
+                        Ok(handle) => handle,
+                        Err(e) => {
+                            log::warn!(
+                                "Failed to iterate block index while punching table {global_id:?} at {:?}: {e:?}",
+                                self.path,
+                            );
+                            break;
+                        }
+                    };
                     let block_off = handle.offset().0;
                     if block_off < off
                         && let Err(e) =
