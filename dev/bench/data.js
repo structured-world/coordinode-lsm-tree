@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781928379662,
+  "lastUpdate": 1781948165124,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -17706,6 +17706,84 @@ window.BENCHMARK_DATA = {
             "value": 726049.3341446935,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.5us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b668e25c5794f963c81f5ecfc866d30b5d8db98b",
+          "message": "feat(range): seekable range iterator + decompress-path zero-copy (#501)\n\n## Summary\n\nAdds a seekable range iterator and a batched multi-interval scan, and\nremoves a redundant zero-fill + copy around block decompression on the\nread path.\n\n## Seekable range iterator (#495)\n\n`AbstractTree` gains:\n\n- **`range_seekable(range)`** → a `SeekableGuardIter` that exposes\n`seek_to(key)` (first key ≥ target, RocksDB `Seek`) and\n`seek_to_for_prev(key)` (last key ≤ target, RocksDB `SeekForPrev`).\nSeeks are valid mid-iteration, so a live iterator can jump to any key —\nenabling data-dependent scans (merge / zig-zag joins, skip-scan) without\nreopening per-SST readers per jump.\n- **`batch_range_scan(intervals)`** — walks a lazily-pulled sequence of\ndisjoint, ascending sub-ranges through one shared iterator. The per-SST\nsetup is paid once and amortized across all intervals, so multi-interval\nscan throughput scales with the rows returned rather than the interval\ncount. Intervals may be produced on demand (data-dependently).\n\nImplementation splits the range pipeline into Phase 1 (collect the\noverlapping SSTs / runs / range tombstones once) and Phase 2 (rebuild\nthe cheap merge stack for a sub-range). A reposition reuses the\ncollected sources via an `Arc` and rebuilds only Phase 2 — the\nper-source readers reuse the existing, tested seek-to-start path, so\nthere is no seek surgery inside the loser-tree / MVCC / range-tombstone\nlayers. The common `iter` / `prefix` / `range` surface is unchanged.\n\nEquivalence tests assert `seek_to` / `seek_to_for_prev` /\n`batch_range_scan` return exactly what the equivalent `range()` calls\nreturn, across overwrites, deletes, multi-level SSTs and the active\nmemtable.\n\n## Read-path zero-copy (#500)\n\nThe block read path zero-filled a scratch buffer for every payload and\nthen copied it into a `Slice`:\n\n- `read_payload_and_verify` now reads straight into a `Slice` (via\n`from_reader`, no zero-fill) and returns it; the no-encryption /\nECC-recovery callers return it with no copy, and the parity read drops\nits zero-fill too. ECC recovery (rare) still copies out for in-place\ncorrection.\n\n## Decompress-path perf\n\nEvery compressed block decompress allocated a zero-filled scratch\nbuffer, decompressed into it, then copied that buffer into a `Slice`.\nThe zero-fill is wasted (the decompressor overwrites the whole buffer)\nand the copy is a second full-block memcpy around the decompressor's\nwildcopy.\n\n- **lz4** arms now decompress straight into an uninitialized `Slice`\nbuilder and freeze it: one allocation, no zero-fill, no second copy (was\n2 allocs + a memset + an extra n-byte copy per block). Measured ~1.18×\non the decompress step (release micro-bench, 16 KiB block).\n- **zstd** arms gain `ZstdProvider::decompress_into`, which streams\nstraight into a caller-provided buffer of the exact uncompressed length,\nremoving the same zero-fill + copy. The excess-byte probe (reject frames\nthat decode past the declared length) is preserved.\n\nThe block checksum is verified before decompress, so the stream is\nintact and wildcopy never reads an unwritten position.\n\n## Testing\n\n- Full suite green (2015 tests with `lz4,zstd`), `clippy --all-targets`\nclean, `no-std-check` errcount 0.\n- New `tests/seekable_range.rs` equivalence suite (5 tests) + a\nblock-overflow regression already in the tree.\n\n## Related\n\n- #499 — `approximate_range_stats` (RocksDB `GetApproximateSizes`):\nper-range byte/key estimate + split points for parallel scan (filed\nduring the RocksDB API review).\n\nCloses #495\nCloses #500\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added seekable range iteration with in-place repositioning (forward\nand reverse).\n  * Added batch range scanning across multiple disjoint key intervals.\n* Implemented these APIs for both standard tree access and KV-separated\nblob mode.\n* Added `decompress_into` for buffer-based Zstd decompression with\ndecoded-size enforcement.\n* **Performance**\n* Reduced allocations/copies in block decrypt/decompress by decoding\ndirectly into destination buffers where applicable.\n* **Tests**\n* Added end-to-end equivalence tests for seekable and batch scans,\nincluding range tombstones, ephemeral context, and multi-run scenarios.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-20T12:34:53+03:00",
+          "tree_id": "6437fc1e25a24b3cc9932a9470044ec3fbaeb7ca",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b668e25c5794f963c81f5ecfc866d30b5d8db98b"
+        },
+        "date": 1781948143374,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1956171.469618613,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1097150.1377057824,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.3us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 889082.8432990244,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.1us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3707230.103360912,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.1us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 467323.47938004433,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.3us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 241403.97966723805,
+            "unit": "ops/sec",
+            "extra": "P50: 3.8us | P99: 7.6us | P99.9: 10.8us\nthreads: 1 | elapsed: 0.83s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1174317.9115329012,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1078544.490189411,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 712908.6319650857,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 5.5us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
         ]
       }
