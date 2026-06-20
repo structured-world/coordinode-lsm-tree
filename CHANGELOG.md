@@ -11,6 +11,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.5.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.4.0...v5.5.0) - 2026-06-20
+
+### Added
+
+- *(range)* seekable range iterator + decompress-path zero-copy ([#501](https://github.com/structured-world/coordinode-lsm-tree/pull/501))
+- *(compaction)* tight-space compaction with in-place reclaim and blob defrag ([#497](https://github.com/structured-world/coordinode-lsm-tree/pull/497))
+- *(compaction)* deadlock-free space admission for merges ([#493](https://github.com/structured-world/coordinode-lsm-tree/pull/493))
+- *(fs)* Fs::available_space free-space probe + disk-pressure admission ([#492](https://github.com/structured-world/coordinode-lsm-tree/pull/492))
+- *(storage)* opt-in write admission control ([#490](https://github.com/structured-world/coordinode-lsm-tree/pull/490))
+- *(storage)* storage introspection API (capacity, K/V shape, remaining estimate) ([#488](https://github.com/structured-world/coordinode-lsm-tree/pull/488))
+
+### Performance
+
+- *(range)* in-place seekable re-seek without merge-stack rebuild + peek ([#510](https://github.com/structured-world/coordinode-lsm-tree/pull/510))
+
+### Refactored
+
+- audit and de-mask saturating arithmetic ([#498](https://github.com/structured-world/coordinode-lsm-tree/pull/498))
+
 ## [5.4.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.3.0...v5.4.0) - 2026-06-16
 
 ### Added
