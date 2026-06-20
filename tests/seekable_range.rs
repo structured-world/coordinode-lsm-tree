@@ -209,6 +209,41 @@ fn seek_to_for_prev_matches_reverse_range() -> lsm_tree::Result<()> {
 }
 
 #[test]
+fn seek_outside_declared_window_stays_clamped() -> lsm_tree::Result<()> {
+    for kv_sep in [false, true] {
+        let (tree, _folder) = build_tree(kv_sep)?;
+        // A seekable opened over a bounded window [100, 200) only collected its
+        // Phase-1 sources for that window. Seeking outside the window must clamp
+        // to it (bounded-iterator semantics), not leak rows below/above the
+        // window or drop rows from sources skipped during collection.
+        let in_window: Vec<_> = tree
+            .range(key(100)..key(200), SeqNo::MAX, None)
+            .map(kv)
+            .collect();
+
+        // Forward seek below the lower bound → clamps to the window start.
+        let mut it = tree.range_seekable(key(100)..key(200), SeqNo::MAX, None);
+        it.seek_to(&key(50));
+        let got: Vec<_> = (&mut it).map(kv).collect();
+        assert_eq!(
+            got, in_window,
+            "seek_to below the window must clamp to it (kv_sep={kv_sep})"
+        );
+
+        // Reverse seek above the upper bound → clamps to the window end.
+        let mut it = tree.range_seekable(key(100)..key(200), SeqNo::MAX, None);
+        it.seek_to_for_prev(&key(250));
+        let mut got: Vec<_> = std::iter::from_fn(|| it.next_back()).map(kv).collect();
+        got.reverse();
+        assert_eq!(
+            got, in_window,
+            "seek_to_for_prev above the window must clamp to it (kv_sep={kv_sep})"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn seekable_with_range_tombstone() -> lsm_tree::Result<()> {
     for kv_sep in [false, true] {
         let (tree, _folder) = build_tree(kv_sep)?;
