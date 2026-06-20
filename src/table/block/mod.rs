@@ -965,10 +965,18 @@ impl Block {
                 CompressionType::Lz4 => {
                     // Decompress straight into the Slice's heap allocation,
                     // skipping both the zero-fill of `vec![0; n]` and the
-                    // Vec -> Slice copy. SAFETY: `decompress_into` writes every
-                    // byte of a valid lz4 stream, and the block checksum was
-                    // verified above, so the stream is intact and lz4's wildcopy
-                    // never reads an unwritten position.
+                    // Vec -> Slice copy.
+                    //
+                    // SAFETY (load-bearing, do NOT reorder): the block checksum is
+                    // verified ABOVE, before this point. That ordering is the
+                    // precondition, not an optimization. `lz4_flex` is the
+                    // unchecked fast decoder: it may wildcopy a back-reference out
+                    // of the output buffer before detecting a malformed frame, so
+                    // it must only ever run on a checksum-verified, intact stream.
+                    // On such a stream every back-reference targets an
+                    // already-written byte, so the uninitialized builder is written
+                    // before it is ever read. Never move the decompress ahead of
+                    // the checksum check.
                     #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
                     let mut builder =
                         unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };
@@ -985,8 +993,12 @@ impl Block {
 
                 #[cfg(zstd_any)]
                 CompressionType::Zstd(_) => {
-                    // Decompress straight into the Slice allocation — no
-                    // zero-filled scratch Vec and no Vec -> Slice copy.
+                    // Decompress straight into the Slice allocation: no
+                    // zero-filled scratch Vec and no Vec -> Slice copy. SAFETY:
+                    // same checksum-first precondition as the lz4 arm above. The
+                    // stream is checksum-verified before this point, so the decoder
+                    // only writes the uninitialized builder, never reads it
+                    // unwritten. Do not reorder ahead of the checksum check.
                     #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
                     let mut builder =
                         unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };
