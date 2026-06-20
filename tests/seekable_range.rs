@@ -10,9 +10,11 @@
 //! batch paths is covered too.
 
 use lsm_tree::{
-    AbstractTree, Config, Guard, KvSeparationOptions, SeqNo, SequenceNumberCounter, get_tmp_folder,
+    AbstractTree, Config, DefaultUserComparator, Guard, InternalValue, KvSeparationOptions,
+    Memtable, SeqNo, SequenceNumberCounter, SharedComparator, UserKey, ValueType, get_tmp_folder,
 };
 use std::ops::Range;
+use std::sync::Arc;
 use test_log::test;
 
 fn key(i: u32) -> Vec<u8> {
@@ -200,5 +202,75 @@ fn seek_to_for_prev_matches_reverse_range() -> lsm_tree::Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+#[test]
+fn seekable_with_range_tombstone() -> lsm_tree::Result<()> {
+    for kv_sep in [false, true] {
+        let (tree, _folder) = build_tree(kv_sep)?;
+        // A dropped sub-range plants a range tombstone, so the merge pipeline
+        // wraps in the RangeTombstoneFilter branch.
+        tree.drop_range(key(50)..key(150))?;
+
+        let intervals: Vec<Range<Vec<u8>>> = vec![key(30)..key(80), key(120)..key(200)];
+        let expected = reference(&tree, &intervals);
+        let got: Vec<_> = tree
+            .batch_range_scan(intervals, SeqNo::MAX, None)
+            .map(kv)
+            .collect();
+        assert_eq!(got, expected, "RT batch (kv_sep={kv_sep})");
+
+        let mut it = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, None);
+        it.seek_to(&key(40));
+        let got: Vec<_> = (&mut it).map(kv).collect();
+        let exp: Vec<_> = tree.range(key(40).., SeqNo::MAX, None).map(kv).collect();
+        assert_eq!(got, exp, "RT seek_to (kv_sep={kv_sep})");
+    }
+    Ok(())
+}
+
+#[test]
+fn seekable_with_ephemeral_memtable() -> lsm_tree::Result<()> {
+    let (tree, _folder) = build_tree(false)?;
+
+    // An ephemeral memtable (passed via the `index` parameter) with overriding
+    // values and a range tombstone — exercises the ephemeral source branches.
+    let comparator: SharedComparator = Arc::new(DefaultUserComparator);
+    let mt = Arc::new(Memtable::new(123, comparator));
+    for i in (0..300u32).step_by(11) {
+        mt.insert(InternalValue::from_components(
+            key(i),
+            val(i + 9_000_000),
+            10,
+            ValueType::Value,
+        ));
+    }
+    assert!(
+        mt.insert_range_tombstone(
+            UserKey::from(key(70).as_slice()),
+            UserKey::from(key(90).as_slice()),
+            10,
+        ) > 0,
+        "ephemeral range tombstone rejected",
+    );
+    let eph = Some((mt, 11u64));
+
+    let intervals: Vec<Range<Vec<u8>>> = vec![key(0)..key(60), key(85)..key(160)];
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = intervals
+        .iter()
+        .flat_map(|iv| tree.range(iv.clone(), SeqNo::MAX, eph.clone()).map(kv))
+        .collect();
+    let got: Vec<_> = tree
+        .batch_range_scan(intervals, SeqNo::MAX, eph.clone())
+        .map(kv)
+        .collect();
+    assert_eq!(got, expected, "ephemeral batch");
+
+    let mut it = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, eph.clone());
+    it.seek_to(&key(50));
+    let got: Vec<_> = (&mut it).map(kv).collect();
+    let exp: Vec<_> = tree.range(key(50).., SeqNo::MAX, eph).map(kv).collect();
+    assert_eq!(got, exp, "ephemeral seek_to");
     Ok(())
 }
