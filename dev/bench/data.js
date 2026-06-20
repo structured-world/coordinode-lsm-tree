@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781948165124,
+  "lastUpdate": 1781964729696,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -17784,6 +17784,138 @@ window.BENCHMARK_DATA = {
             "value": 712908.6319650857,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 5.5us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "dfd4772a2b808bc2e41ee6aab6ea7d423a99c77e",
+          "message": "perf(range): in-place seekable re-seek without merge-stack rebuild + peek (#510)\n\n## Summary\n\nImplements the seekable-iterator follow-up: repositioning the seekable\nrange iterator now moves only the leaf cursors and **reuses the entire\nmerge stack** (loser-tree merger, MVCC stream, range-tombstone filter)\ninstead of rebuilding the whole pipeline per seek. Adds a non-consuming\n`peek_key`. A leapfrog-join inner loop doing O(result × vars) tight\nseeks is no longer allocation-bound.\n\n### What changed\n- **`Reseekable` propagation trait** (`src/reseek.rs`, `core + alloc`):\neach merge-stack layer resets its own per-position state and forwards\nthe new bounds down to the leaves. Reposition is infallible; leaf I/O\nstays deferred to the next pull, so a corrupt block still surfaces\nlazily.\n- **Concrete reseekable pipeline**\n`RangeTombstoneFilter<TombstoneSkip<MvccStream<SeekingMerger<SeekableLeaf>>>>`\n(was a boxed-closure stack), so reposition can reach every layer in\nplace.\n- **Leaf re-seek primitives**, all reusing the existing reader:\n- SST: `Table::reseek_range` re-seeks the owned index iterator in place\n(no new reader, no `Arc` re-clone).\n  - run: `RunReader::reseek` recomputes the overlapping-table window.\n  - memtable: recreate the skiplist range cursor (a `seek_ge` walk).\n- **Allocation-free hardening**: `LoserTree::clear` + `refill_with`\nre-prime the tournament in place reusing storage; `SeekingMerger` gains\nprimed flags so a reseek empties + refills the retained tournaments\nwithout realloc; `user_to_internal_bounds` clones the reference-counted\n`UserKey` (an `Arc` bump) instead of heap-copying the key bytes per\nreposition.\n- **`peek_key`**: returns the current key without consuming it (a\nleapfrog join takes the max of several iterators' current keys before\ndeciding where to seek next).\n\n### Acceptance\n- `peek()` returns the same key a consuming step yields, across\noverwrites / deletes / multi-level SSTs / the active memtable — covered\nby the equivalence suite.\n- Micro-bench `tight_seek_loop_allocation_is_width_invariant`: a tight\n`seek_to` loop allocates the **same** amount on a wide merge stack (many\nsources) and a narrow one (two sources). The shared input-key cost\ncancels; any residual difference would be per-source rebuild traffic,\nwhich must be zero. (Asserting an absolute zero would be\nbacking-dependent — the `bytes_1` `Slice` backend allocates when\nmaterializing the seek-target key, which is input cost, not a\nmerge-stack rebuild.)\n\n## Testing\n- 12 seekable equivalence tests (incl. `peek_key_matches_next_key`,\nmulti-SST runs, ephemeral memtable, range tombstones, clamped\nout-of-window seeks) — byte-identical to the rebuild path.\n- All merger / loser-tree / MVCC / tombstone-filter / run-reader unit\ntests.\n- 1376 lib unit tests + a broad read-path integration sweep (incl.\n`prop_mvcc`, `prop_range_tombstone`) — the same `SeekingMerger` powers\nthe non-seekable read path.\n- `clippy --all-features --all-targets -D warnings` clean; no-std\n(`thumbv7em`, alloc) build clean.\n\nCloses #504\n\n## Also included\n\n- **Metadata cache priority pin (Part of #509):** an admission-priority\nhint for\nthe S3-FIFO block cache so index / filter / range-tombstone blocks\nsurvive\ndata-block churn (`Cache::with_metadata_priority`, default on).\nIndex/filter\nblocks of small single-level tables are pinned in the table reader at\nopen and\nnever reach the cache, so the pin targets partitioned metadata.\nMechanism +\nunit test here; the end-to-end working-set-`>>`-cache benchmark lives in\nthe\n  bench harness (below).\n- **100k working-set bench variant:** compare-rocksdb sweeps `{1k, 10k,\n100k}`\nacross all scenarios (the 100k variant drops to the criterion\nsample-size\nfloor to stay bounded); db_bench gains a `--name-suffix` for size-tagged\nseries, and `run-benchmarks.sh` runs a 100k pass merged with the default\nsize.\ndb_bench also exposes `--metadata-priority` / `--partition-metadata` to\n  exercise the #509 pin regime.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added `peek_key()` support for seekable iterators (including seekable\nrange iteration).\n* Enabled in-place reseeking to reuse iterator/merge state across\nrepositioning.\n* Introduced metadata-aware cache admission with priority-based sharded\ncache insertion.\n* **Refactor**\n* Reworked seekable range iteration into a reusable reseek pipeline;\nadded supporting reseek/reset behavior across key iterator components.\n  * Added loser-tree reuse helpers to clear/refill tournaments in place.\n* **Tests**\n* Added `peek_key()` and reseek correctness tests, plus\nallocation-focused coverage and regression scenarios.\n* **Chores**\n* Updated benchmark tooling and db_bench flags for larger working sets\nand named outputs.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-20T17:10:52+03:00",
+          "tree_id": "972226a23ed72c3e307da91ea82e4880261a9fb1",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/dfd4772a2b808bc2e41ee6aab6ea7d423a99c77e"
+        },
+        "date": 1781964707718,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2004279.1962122892,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1216327.9597727745,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 904355.514524343,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 4.1us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3659455.465707792,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 466319.0242796694,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.3us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 241151.84752350667,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 4.8us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.83s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1254023.416567361,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1081234.0903161322,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.5us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 698055.634091662,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 5.6us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq /100k",
+            "value": 2099307.8854811597,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.05s | num: 100000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom /100k",
+            "value": 1305989.125080795,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 2.0us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.08s | num: 100000 | iterations: 3"
+          },
+          {
+            "name": "readrandom /100k",
+            "value": 1000266.5710411825,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 4.0us | P99.9: 6.5us\nthreads: 1 | elapsed: 0.10s | num: 100000 | iterations: 3"
+          },
+          {
+            "name": "readseq /100k",
+            "value": 3775199.408864176,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.1us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.03s | num: 100000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom /100k",
+            "value": 492914.9854096425,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 5.2us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.20s | num: 100000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan /100k",
+            "value": 253056.9558630913,
+            "unit": "ops/sec",
+            "extra": "P50: 3.7us | P99: 4.6us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.40s | num: 100000 | iterations: 3"
+          },
+          {
+            "name": "overwrite /100k",
+            "value": 1304070.7167295243,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.0us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.08s | num: 100000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom /100k",
+            "value": 1135047.0849312148,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.4us\nthreads: 1 | elapsed: 0.09s | num: 100000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting /100k",
+            "value": 811388.427267474,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 4.4us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.12s | num: 100000 | iterations: 3"
           }
         ]
       }
