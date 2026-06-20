@@ -62,3 +62,25 @@ pub enum IterGuardImpl {
     /// Iterator value of a key-value separated tree
     Blob(BlobGuard),
 }
+
+/// A range iterator that can reposition (seek) in place, without reopening its
+/// per-SST readers.
+///
+/// Returned by [`AbstractTree::range_seekable`](crate::AbstractTree::range_seekable).
+/// The per-SST setup is paid once when the iterator is created; each
+/// [`seek_to`](Self::seek_to) / [`seek_to_for_prev`](Self::seek_to_for_prev)
+/// only rebuilds the cheap merge pipeline, so scanning many disjoint key
+/// sub-intervals amortizes that setup instead of paying it per interval.
+///
+/// Seeks are valid mid-iteration (an explicit jump to a known key), which
+/// enables data-dependent scan patterns — merge / zig-zag joins, skip-scan —
+/// where the next seek target is computed from rows already returned.
+pub trait SeekableGuardIter: DoubleEndedIterator<Item = IterGuardImpl> + Send {
+    /// Reposition so the next [`Iterator::next`] yields the first entry with
+    /// user key `>= key` (`RocksDB` `Seek`).
+    fn seek_to(&mut self, key: &[u8]);
+
+    /// Reposition so the next [`DoubleEndedIterator::next_back`] yields the last
+    /// entry with user key `<= key` (`RocksDB` `SeekForPrev`).
+    fn seek_to_for_prev(&mut self, key: &[u8]);
+}

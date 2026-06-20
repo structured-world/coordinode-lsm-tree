@@ -5,7 +5,11 @@
 use crate::tree::inner::{FlushGuard, VersionsWriteGuard};
 use crate::{
     AnyTree, BlobTree, Config, Guard, InternalValue, KvPair, Memtable, SeqNo, TableId, Tree,
-    UserKey, UserValue, iter_guard::IterGuardImpl, table::Table, version::Version, vlog::BlobFile,
+    UserKey, UserValue,
+    iter_guard::{IterGuardImpl, SeekableGuardIter},
+    table::Table,
+    version::Version,
+    vlog::BlobFile,
 };
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
@@ -427,6 +431,41 @@ pub trait AbstractTree: sealed::Sealed {
         seqno: SeqNo,
         index: Option<(Arc<Memtable>, SeqNo)>,
     ) -> Box<dyn DoubleEndedIterator<Item = IterGuardImpl> + Send + 'static>;
+
+    /// Returns a range iterator that can reposition (seek) in place without
+    /// reopening its per-SST readers.
+    ///
+    /// Unlike [`range`](Self::range)'s boxed `DoubleEndedIterator`, the returned
+    /// [`SeekableGuardIter`] additionally exposes `seek_to` / `seek_to_for_prev`,
+    /// so a consumer can jump a live iterator to any key (`RocksDB` `Seek` /
+    /// `SeekForPrev`) — enabling data-dependent scans (joins, skip-scan) without
+    /// reopening per-SST readers per jump.
+    fn range_seekable<K: AsRef<[u8]>, R: RangeBounds<K>>(
+        &self,
+        range: R,
+        seqno: SeqNo,
+        index: Option<(Arc<Memtable>, SeqNo)>,
+    ) -> Box<dyn SeekableGuardIter + 'static>;
+
+    /// Scans a sequence of disjoint, ascending key sub-intervals, reusing one set
+    /// of per-SST readers across all of them.
+    ///
+    /// The per-SST setup is paid once (when the underlying seekable iterator is
+    /// opened); each interval is served by repositioning that iterator. This
+    /// amortizes the setup across `N` intervals instead of paying it per
+    /// interval, so multi-interval scan throughput scales with the total rows
+    /// returned rather than the interval count.
+    ///
+    /// The interval source is pulled lazily, so intervals may be produced on
+    /// demand (e.g. computed from rows already returned).
+    fn batch_range_scan<K: AsRef<[u8]>, R: RangeBounds<K> + 'static, I: IntoIterator<Item = R>>(
+        &self,
+        intervals: I,
+        seqno: SeqNo,
+        index: Option<(Arc<Memtable>, SeqNo)>,
+    ) -> Box<dyn Iterator<Item = IterGuardImpl> + Send + 'static>
+    where
+        I::IntoIter: Send + 'static;
 
     /// Returns the approximate number of tombstones in the tree.
     fn tombstone_count(&self) -> u64;

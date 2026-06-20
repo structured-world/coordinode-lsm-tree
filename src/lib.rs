@@ -446,7 +446,7 @@ pub type KvPair = (UserKey, UserValue);
 #[doc(hidden)]
 pub use {
     checksum::Checksum,
-    iter_guard::IterGuardImpl,
+    iter_guard::{IterGuardImpl, SeekableGuardIter},
     key_range::KeyRange,
     merge::BoxedIterator,
     slice::Builder,
