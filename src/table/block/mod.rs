@@ -209,27 +209,21 @@ fn encrypt_block_payload(
 /// [`EncryptionProvider::decrypt_block_aad`] (the reader supplies only
 /// `identity`; the transform fields are read back from the frame); without zstd
 /// it falls back to the opaque in-place `decrypt_vec`.
-#[cfg_attr(
-    zstd_any,
-    expect(
-        clippy::needless_pass_by_value,
-        reason = "raw is consumed by decrypt_vec on the non-zstd path; the AAD path \
-                  only borrows it, so by-value is needed for the other cfg"
-    )
-)]
 fn decrypt_block_payload(
     enc: &dyn crate::encryption::EncryptionProvider,
-    raw: Vec<u8>,
+    raw: &[u8],
     identity: &BlockIdentity,
 ) -> crate::Result<Vec<u8>> {
     #[cfg(zstd_any)]
     {
-        enc.decrypt_block_aad(&raw, identity)
+        enc.decrypt_block_aad(raw, identity)
     }
     #[cfg(not(zstd_any))]
     {
         let _ = identity;
-        enc.decrypt_vec(raw)
+        // `decrypt_vec` consumes an owned buffer; the read path now hands us a
+        // borrowed Slice, so copy once (this branch is the no-zstd build only).
+        enc.decrypt_vec(raw.to_vec())
     }
 }
 
@@ -428,9 +422,11 @@ impl Block {
             expect(unused_variables, reason = "recovery scheme only used under page_ecc")
         )]
         ecc_params: EccParams,
-    ) -> crate::Result<(Vec<u8>, Option<EccRecoveryKind>)> {
-        let mut data = vec![0u8; data_length as usize];
-        reader.read_exact(&mut data)?;
+    ) -> crate::Result<(Slice, Option<EccRecoveryKind>)> {
+        // Read straight into the Slice allocation — `read_exact` overwrites every
+        // byte, so a zero-filled scratch buffer would be wasted, and returning a
+        // Slice lets the no-compression / ECC-recovery callers avoid a later copy.
+        let data = Slice::from_reader(reader, data_length as usize)?;
 
         let computed = Checksum::from_raw(crate::hash::hash128(&data));
 
@@ -446,8 +442,7 @@ impl Block {
         // ECC trailer present — always consume the parity bytes so
         // the reader cursor lands on the next block's header even
         // when the happy path doesn't need them.
-        let mut parity = vec![0u8; ecc_length as usize];
-        reader.read_exact(&mut parity)?;
+        let parity = Slice::from_reader(reader, ecc_length as usize)?;
 
         if computed == expected {
             return Ok((data, None));
@@ -465,7 +460,9 @@ impl Block {
             // fall-through here — the shard schemes are a separate EccParams
             // variant.
             if matches!(ecc_params, crate::table::block::EccParams::Secded) {
-                let mut healed = data.clone();
+                // In-place single-bit heal needs an owned, mutable buffer; the
+                // recovery path is rare, so the copy out of the read Slice is fine.
+                let mut healed = data.to_vec();
                 if crate::secded::try_correct_block(&mut healed, &parity)
                     == crate::secded::SecdedOutcome::Corrected
                     && crate::hash::hash128(&healed) == expected_raw
@@ -475,7 +472,7 @@ impl Block {
                          checksum mismatch (data_len={}, ecc_len={ecc_length})",
                         data.len(),
                     );
-                    return Ok((healed, Some(EccRecoveryKind::Secded)));
+                    return Ok((Slice::from(healed), Some(EccRecoveryKind::Secded)));
                 }
                 log::error!(
                     "Checksum mismatch on SEC-DED block, heal failed, \
@@ -501,7 +498,7 @@ impl Block {
                      (data_len={}, ecc_len={ecc_length})",
                     data.len(),
                 );
-                return Ok((recovered, Some(EccRecoveryKind::Shard)));
+                return Ok((Slice::from(recovered), Some(EccRecoveryKind::Shard)));
             }
             log::error!(
                 "Checksum mismatch on ECC-protected block, recovery failed, \
@@ -947,7 +944,7 @@ impl Block {
 
             // Recover the plaintext: AAD-bound envelope under zstd (verifies the
             // block identity), opaque in-place decrypt otherwise.
-            let decrypted = decrypt_block_payload(enc, raw_vec, &identity)?;
+            let decrypted = decrypt_block_payload(enc, &raw_vec, &identity)?;
 
             match compression {
                 CompressionType::None => {
@@ -1056,7 +1053,7 @@ impl Block {
                     header.checksum,
                     block_ecc_params(&header, transform),
                 )?;
-                Slice::from(payload)
+                payload
             };
 
             match compression {
@@ -1357,7 +1354,7 @@ impl Block {
                 // Strip header prefix + any opaque trailer so buf is the payload.
                 buf.copy_within(header_len..header_len + actual_data_len, 0);
                 buf.truncate(actual_data_len);
-                (buf, None)
+                (Slice::from(buf), None)
             } else {
                 #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
                 let mut cursor = crate::io::Cursor::new(&buf[header_len..]);
@@ -1379,7 +1376,7 @@ impl Block {
                 ecc_status
             };
 
-            let decrypted = decrypt_block_payload(enc, buf, &identity)?;
+            let decrypted = decrypt_block_payload(enc, &buf, &identity)?;
 
             let data = match compression {
                 CompressionType::None => {
@@ -1535,7 +1532,7 @@ impl Block {
                         parsed_header.checksum,
                         block_ecc_params(&parsed_header, transform),
                     )?;
-                    (Slice::from(payload), recovery)
+                    (payload, recovery)
                 };
             // Fold a successful ECC repair into the status; the recovery
             // mechanism is carried out separately as `payload_corrected`.
@@ -1748,7 +1745,7 @@ impl Block {
                 parsed_header.checksum,
                 block_ecc_params(&parsed_header, transform),
             )?;
-            (Slice::from(frame), recovery)
+            (frame, recovery)
         };
 
         Ok((parsed_header, payload, recovery))
