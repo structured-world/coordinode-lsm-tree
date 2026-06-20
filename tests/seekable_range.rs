@@ -13,9 +13,12 @@ use lsm_tree::{
     AbstractTree, Config, DefaultUserComparator, Guard, InternalValue, KvSeparationOptions,
     Memtable, SeqNo, SequenceNumberCounter, SharedComparator, UserKey, ValueType, get_tmp_folder,
 };
-use std::ops::Range;
+use std::ops::{Bound, Range};
 use std::sync::Arc;
 use test_log::test;
+
+/// An explicit `(start, end)` bound pair used to build excluded-bound ranges.
+type BoundPair = (Bound<Vec<u8>>, Bound<Vec<u8>>);
 
 fn key(i: u32) -> Vec<u8> {
     format!("k{i:05}").into_bytes()
@@ -326,8 +329,6 @@ fn seekable_over_multi_sst_run() -> lsm_tree::Result<()> {
 
 #[test]
 fn seekable_sealed_memtable_and_excluded_bounds() -> lsm_tree::Result<()> {
-    use std::ops::Bound;
-
     for kv_sep in [false, true] {
         let (tree, _folder) = build_tree(kv_sep)?;
         // Seal a memtable without flushing it (rotate), then keep writing to the
@@ -341,7 +342,7 @@ fn seekable_sealed_memtable_and_excluded_bounds() -> lsm_tree::Result<()> {
         }
 
         // Excluded lower bounds exercise the Excluded arm of the bound builders.
-        let intervals: Vec<(Bound<Vec<u8>>, Bound<Vec<u8>>)> = vec![
+        let intervals: Vec<BoundPair> = vec![
             (Bound::Excluded(key(20)), Bound::Excluded(key(90))),
             (Bound::Excluded(key(305)), Bound::Included(key(355))),
         ];
