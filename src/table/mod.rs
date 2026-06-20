@@ -1918,42 +1918,55 @@ impl Table {
 
         // Load the optional seqno-bounds section (parallel to the index; powers
         // the scan_since_seqno block-skip). Absent unless seqno_in_index was on.
+        //
+        // Best-effort, like the zone map below: the seqno-bounds section is
+        // derived, non-authoritative metadata, so a corrupt / unreadable section
+        // disables the block-skip (falling back to a full per-entry filter)
+        // rather than failing the whole table open.
         let seqno_bounds = if let Some(sb_handle) = regions.seqno_bounds {
-            let block = Block::from_file(
-                file_handle.as_ref(),
-                sb_handle,
-                crate::table::block::BlockIdentity {
-                    table_id: metadata.id,
-                    block_type: BlockType::SeqnoBounds,
-                    dict_id: 0,
-                    window_log: 0,
-                },
-                &{
-                    let t = match encryption.as_deref() {
-                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
-                        None => crate::table::block::BlockTransform::PLAIN,
-                    };
-                    if let Some(ecc) = metadata.ecc_params {
-                        t.with_ecc(ecc)
-                    } else {
-                        t
-                    }
-                },
-            )?;
-            if block.header.block_type != BlockType::SeqnoBounds {
-                return Err(crate::Error::InvalidTag((
-                    "BlockType",
-                    block.header.block_type.into(),
-                )));
-            }
-            let map = crate::table::seqno_bounds::SeqnoBoundsMap::decode(&block.data)?;
-            if !map.is_empty() {
-                log::trace!("Loaded {} seqno-bounds entries", map.len());
-            }
-            map
+            let load = || -> crate::Result<crate::table::seqno_bounds::SeqnoBoundsMap> {
+                let block = Block::from_file(
+                    file_handle.as_ref(),
+                    sb_handle,
+                    crate::table::block::BlockIdentity {
+                        table_id: metadata.id,
+                        block_type: BlockType::SeqnoBounds,
+                        dict_id: 0,
+                        window_log: 0,
+                    },
+                    &{
+                        let t = match encryption.as_deref() {
+                            Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                            None => crate::table::block::BlockTransform::PLAIN,
+                        };
+                        if let Some(ecc) = metadata.ecc_params {
+                            t.with_ecc(ecc)
+                        } else {
+                            t
+                        }
+                    },
+                )?;
+                if block.header.block_type != BlockType::SeqnoBounds {
+                    return Err(crate::Error::InvalidTag((
+                        "BlockType",
+                        block.header.block_type.into(),
+                    )));
+                }
+                crate::table::seqno_bounds::SeqnoBoundsMap::decode(&block.data)
+            };
+            load().unwrap_or_else(|e| {
+                log::warn!(
+                    "seqno-bounds section for table {:?} is unreadable ({e}); disabling seqno block-skip",
+                    metadata.id
+                );
+                crate::table::seqno_bounds::SeqnoBoundsMap::default()
+            })
         } else {
             crate::table::seqno_bounds::SeqnoBoundsMap::default()
         };
+        if !seqno_bounds.is_empty() {
+            log::trace!("Loaded {} seqno-bounds entries", seqno_bounds.len());
+        }
 
         // Load the optional zone-map section (parallel to the index; powers the
         // predicate-based block-skip). Absent unless the zone-map policy was on.
