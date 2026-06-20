@@ -281,12 +281,33 @@ fn seekable_with_ephemeral_memtable() -> lsm_tree::Result<()> {
 #[test]
 fn seekable_over_multi_sst_run() -> lsm_tree::Result<()> {
     for kv_sep in [false, true] {
-        let (tree, _folder) = build_tree(kv_sep)?;
-        // A tiny target size makes the merged bottom-level run span several
-        // SSTs, exercising the multi-run RunReader collection / build path.
-        tree.major_compact(2048, 4)?;
+        let folder = get_tmp_folder();
+        let config = Config::new(
+            &folder,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        );
+        let config = if kv_sep {
+            config.with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
+        } else {
+            config
+        };
+        let tree = config.open()?;
 
-        let intervals: Vec<Range<Vec<u8>>> = vec![key(10)..key(120), key(200)..key(290)];
+        // Enough data that a tiny-target compaction splits the merged bottom
+        // level into many SSTs forming one multi-SST run, exercising the
+        // multi-run RunReader collection / build path.
+        for i in 0..4000u32 {
+            tree.insert(key(i), val(i % 200), 0);
+        }
+        tree.flush_active_memtable(0)?;
+        tree.major_compact(4096, 1)?;
+
+        let intervals: Vec<Range<Vec<u8>>> = vec![
+            key(10)..key(900),
+            key(1500)..key(1600),
+            key(3000)..key(3990),
+        ];
         let expected = reference(&tree, &intervals);
         let got: Vec<_> = tree
             .batch_range_scan(intervals, SeqNo::MAX, None)
@@ -295,10 +316,55 @@ fn seekable_over_multi_sst_run() -> lsm_tree::Result<()> {
         assert_eq!(got, expected, "multi-run batch (kv_sep={kv_sep})");
 
         let mut it = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, None);
-        it.seek_to(&key(75));
+        it.seek_to(&key(2500));
         let got: Vec<_> = (&mut it).map(kv).collect();
-        let exp: Vec<_> = tree.range(key(75).., SeqNo::MAX, None).map(kv).collect();
+        let exp: Vec<_> = tree.range(key(2500).., SeqNo::MAX, None).map(kv).collect();
         assert_eq!(got, exp, "multi-run seek_to (kv_sep={kv_sep})");
+    }
+    Ok(())
+}
+
+#[test]
+fn seekable_sealed_memtable_and_excluded_bounds() -> lsm_tree::Result<()> {
+    use std::ops::Bound;
+
+    for kv_sep in [false, true] {
+        let (tree, _folder) = build_tree(kv_sep)?;
+        // Seal a memtable without flushing it (rotate), then keep writing to the
+        // new active one — exercises the sealed-memtable source branches.
+        for i in 300..340u32 {
+            tree.insert(key(i), val(i), 4);
+        }
+        tree.rotate_memtable();
+        for i in 340..360u32 {
+            tree.insert(key(i), val(i), 5);
+        }
+
+        // Excluded lower bounds exercise the Excluded arm of the bound builders.
+        let intervals: Vec<(Bound<Vec<u8>>, Bound<Vec<u8>>)> = vec![
+            (Bound::Excluded(key(20)), Bound::Excluded(key(90))),
+            (Bound::Excluded(key(305)), Bound::Included(key(355))),
+        ];
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = intervals
+            .iter()
+            .flat_map(|iv| tree.range(iv.clone(), SeqNo::MAX, None).map(kv))
+            .collect();
+        let got: Vec<_> = tree
+            .batch_range_scan(intervals, SeqNo::MAX, None)
+            .map(kv)
+            .collect();
+        assert_eq!(got, expected, "sealed + excluded batch (kv_sep={kv_sep})");
+
+        // Seekable opened over an excluded-lower union.
+        let mut it = tree.range_seekable(
+            (Bound::Excluded(key(310)), Bound::Unbounded),
+            SeqNo::MAX,
+            None,
+        );
+        it.seek_to(&key(320));
+        let got: Vec<_> = (&mut it).map(kv).collect();
+        let exp: Vec<_> = tree.range(key(320).., SeqNo::MAX, None).map(kv).collect();
+        assert_eq!(got, exp, "sealed + excluded seek_to (kv_sep={kv_sep})");
     }
     Ok(())
 }

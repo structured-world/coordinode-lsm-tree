@@ -1260,4 +1260,34 @@ mod tests {
             "capacity < plaintext must return DecompressedSizeTooLarge; got {result:?}",
         );
     }
+
+    #[test]
+    fn decompress_into_rejects_frame_larger_than_dest() {
+        let raw = vec![7u8; 4096];
+        let frame = ZstdProvider::compress(&raw, 3).expect("compress");
+        // dest is smaller than the frame's output → the excess probe fires.
+        let mut dest = vec![0u8; 2048];
+        let result = ZstdProvider::decompress_into(&frame, &mut dest);
+        assert!(
+            matches!(result, Err(crate::Error::DecompressedSizeTooLarge { .. })),
+            "a frame that decodes past dest must be rejected; got {result:?}",
+        );
+    }
+
+    #[test]
+    fn decompress_into_fills_exact_buffer() {
+        let raw = vec![3u8; 4096];
+        let frame = ZstdProvider::compress(&raw, 3).expect("compress");
+        let mut dest = vec![0u8; raw.len()];
+        let written = ZstdProvider::decompress_into(&frame, &mut dest).expect("decompress_into");
+        assert_eq!(written, raw.len());
+        assert_eq!(dest, raw);
+    }
+
+    #[test]
+    fn decompress_into_propagates_decode_error() {
+        let mut dest = vec![0u8; 64];
+        let result = ZstdProvider::decompress_into(b"definitely not a valid zstd frame", &mut dest);
+        assert!(result.is_err(), "a corrupt frame must error");
+    }
 }
