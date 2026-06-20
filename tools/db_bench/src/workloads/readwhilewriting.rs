@@ -4,8 +4,8 @@ use crate::reporter::Reporter;
 use crate::workloads::Workload;
 use lsm_tree::{AbstractTree, AnyTree};
 use rand::Rng;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Barrier;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 pub struct ReadWhileWriting;
@@ -28,8 +28,8 @@ impl Workload for ReadWhileWriting {
         let max_readers = usize::try_from(config.num.max(1)).unwrap_or(usize::MAX);
         let reader_count = std::cmp::min(threads - 1, max_readers);
         threads = reader_count + 1; // recompute for barrier
-                                    // Distribute ops across readers, giving remainder to the last reader.
-                                    // reader_count is always small (< --threads), safe to cast on all targets.
+        // Distribute ops across readers, giving remainder to the last reader.
+        // reader_count is always small (< --threads), safe to cast on all targets.
         let base_ops = config.num / reader_count as u64;
         let remainder = config.num % reader_count as u64;
         let barrier = Barrier::new(threads);

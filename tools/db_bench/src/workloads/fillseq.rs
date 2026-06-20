@@ -1,7 +1,7 @@
 use crate::config::BenchConfig;
 use crate::db::{make_sequential_key, make_value};
 use crate::reporter::Reporter;
-use crate::workloads::{run_threaded, Workload};
+use crate::workloads::{Workload, run_threaded};
 use lsm_tree::{AbstractTree, AnyTree};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;

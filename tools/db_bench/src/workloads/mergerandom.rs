@@ -1,13 +1,13 @@
 use crate::config::BenchConfig;
 use crate::db::make_sequential_key;
 use crate::reporter::Reporter;
-use crate::workloads::{run_threaded, Workload};
+use crate::workloads::{Workload, run_threaded};
 use lsm_tree::{
-    config::{BlockSizePolicy, CompressionPolicy},
     AbstractTree, AnyTree, Cache, Config, MergeOperator, SequenceNumberCounter, UserValue,
+    config::{BlockSizePolicy, CompressionPolicy},
 };
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Counter merge operator: sums i64 operands.
@@ -150,7 +150,9 @@ impl Workload for MergeRandom {
 
                 eprintln!(
                     "Merged {} operands over {} hot keys, counter verified: {actual} (expected {expected}), {} tables",
-                    config.num, hot_keys, tree.table_count(),
+                    config.num,
+                    hot_keys,
+                    tree.table_count(),
                 );
             }
             None => {
