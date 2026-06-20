@@ -83,4 +83,11 @@ pub trait SeekableGuardIter: DoubleEndedIterator<Item = IterGuardImpl> + Send {
     /// Reposition so the next [`DoubleEndedIterator::next_back`] yields the last
     /// entry with user key `<= key` (`RocksDB` `SeekForPrev`).
     fn seek_to_for_prev(&mut self, key: &[u8]);
+
+    /// Return the current key (the key the next [`Iterator::next`] would yield)
+    /// without consuming it; `None` once the range is exhausted.
+    ///
+    /// A leapfrog / zig-zag join reads each input's current key to compute the
+    /// next seek target before advancing any of them.
+    fn peek_key(&mut self) -> Option<crate::Result<UserKey>>;
 }

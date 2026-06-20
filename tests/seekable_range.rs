@@ -269,6 +269,47 @@ fn seek_outside_declared_window_stays_clamped() -> lsm_tree::Result<()> {
 }
 
 #[test]
+fn peek_key_matches_next_key() -> lsm_tree::Result<()> {
+    for kv_sep in [false, true] {
+        let (tree, _folder) = build_tree(kv_sep)?;
+
+        // Walking the whole range: peek_key must equal the key the next consuming
+        // step yields, at every position, and be None exactly at the end.
+        let mut it = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, None);
+        loop {
+            let peeked = it.peek_key().transpose()?.map(|k| k.to_vec());
+            match it.next() {
+                Some(guard) => {
+                    let (k, _) = guard.into_inner()?;
+                    assert_eq!(
+                        peeked,
+                        Some(k.to_vec()),
+                        "peek_key must match next (kv_sep={kv_sep})"
+                    );
+                }
+                None => {
+                    assert!(peeked.is_none(), "peek at end is None (kv_sep={kv_sep})");
+                    break;
+                }
+            }
+        }
+
+        // A seek must drop a stale lookahead: peek after seek reflects the new
+        // position, not the buffered pre-seek key.
+        let mut it = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, None);
+        let _ = it.peek_key(); // prime the buffer at the start
+        it.seek_to(&key(150));
+        let peeked = it.peek_key().transpose()?.map(|k| k.to_vec());
+        let expected = tree
+            .range(key(150).., SeqNo::MAX, None)
+            .next()
+            .map(|g| kv(g).0);
+        assert_eq!(peeked, expected, "peek after seek (kv_sep={kv_sep})");
+    }
+    Ok(())
+}
+
+#[test]
 fn seekable_with_range_tombstone() -> lsm_tree::Result<()> {
     for kv_sep in [false, true] {
         let (tree, _folder) = build_tree(kv_sep)?;

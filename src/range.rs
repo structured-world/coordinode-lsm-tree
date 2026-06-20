@@ -1092,11 +1092,10 @@ pub struct SeekableOwner {
 }
 
 self_cell!(
-    /// A range iterator that can reposition (seek) in place without reopening
-    /// per-SST readers. Built once over a union range; [`Self::seek_to`],
-    /// [`Self::seek_to_for_prev`], and [`Self::reposition`] rebuild only the
-    /// cheap Phase-2 merge pipeline, reusing the collected sources.
-    pub struct SeekableTreeIter {
+    /// Internal self-referential merge cell: owns the collected sources and
+    /// borrows them into the Phase-2 merge pipeline. Wrapped by
+    /// [`SeekableTreeIter`], which adds the seek API and a lookahead buffer.
+    struct SeekableCell {
         owner: SeekableOwner,
 
         #[covariant]
@@ -1104,7 +1103,7 @@ self_cell!(
     }
 );
 
-impl SeekableTreeIter {
+impl SeekableCell {
     fn build(owner: SeekableOwner) -> Self {
         Self::new(owner, |o| {
             build_stack(
@@ -1116,7 +1115,38 @@ impl SeekableTreeIter {
             )
         })
     }
+}
 
+impl Iterator for SeekableCell {
+    type Item = crate::Result<InternalValue>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.with_dependent_mut(|_, iter| iter.next())
+    }
+}
+
+impl DoubleEndedIterator for SeekableCell {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.with_dependent_mut(|_, iter| iter.next_back())
+    }
+}
+
+/// A range iterator that can reposition (seek) in place without reopening
+/// per-SST readers. Built once over a union range; [`Self::seek_to`],
+/// [`Self::seek_to_for_prev`], and [`Self::reposition`] rebuild only the cheap
+/// Phase-2 merge pipeline, reusing the collected sources.
+///
+/// A one-item lookahead buffer backs [`Self::peek_key`], which reads the next
+/// key without consuming it (a leapfrog join takes the max of several
+/// iterators' current keys before deciding where to seek next).
+pub struct SeekableTreeIter {
+    cell: SeekableCell,
+    /// `None` = nothing peeked; `Some(None)` = peeked past the end;
+    /// `Some(Some(item))` = buffered front item (the std `Peekable` shape).
+    peeked: Option<Option<crate::Result<InternalValue>>>,
+}
+
+impl SeekableTreeIter {
     /// Open a seekable iterator over `[union_lower, union_upper)`. The source
     /// collection (Phase 1) runs once here; subsequent repositions reuse it.
     #[must_use]
@@ -1131,29 +1161,34 @@ impl SeekableTreeIter {
             (union_lower.clone(), union_upper.clone()),
             seqno,
         ));
-        Self::build(SeekableOwner {
-            state,
-            collected,
-            seqno,
-            lower: union_lower,
-            upper: union_upper,
-        })
+        Self {
+            cell: SeekableCell::build(SeekableOwner {
+                state,
+                collected,
+                seqno,
+                lower: union_lower,
+                upper: union_upper,
+            }),
+            peeked: None,
+        }
     }
 
     /// Rebuild the merge pipeline for the sub-range `[lower, upper)`, reusing the
     /// collected sources. Cheap: clones `Arc`s and reconstructs per-source
     /// readers (no block I/O until the next `next`/`next_back`).
     pub(crate) fn reposition(&mut self, lower: Bound<UserKey>, upper: Bound<UserKey>) {
-        let state = self.borrow_owner().state.clone();
-        let collected = Arc::clone(&self.borrow_owner().collected);
-        let seqno = self.borrow_owner().seqno;
-        *self = Self::build(SeekableOwner {
+        let state = self.cell.borrow_owner().state.clone();
+        let collected = Arc::clone(&self.cell.borrow_owner().collected);
+        let seqno = self.cell.borrow_owner().seqno;
+        self.cell = SeekableCell::build(SeekableOwner {
             state,
             collected,
             seqno,
             lower,
             upper,
         });
+        // The lookahead came from the old position; drop it.
+        self.peeked = None;
     }
 
     /// Reposition so the next [`Iterator::next`] yields the first entry with
@@ -1167,7 +1202,7 @@ impl SeekableTreeIter {
     /// stays the window upper.
     pub fn seek_to(&mut self, key: &[u8]) {
         let (lower, upper) = {
-            let union = &self.borrow_owner().collected.union;
+            let union = &self.cell.borrow_owner().collected.union;
             let lower = match &union.0 {
                 Bound::Included(floor) if floor.as_ref() > key => union.0.clone(),
                 Bound::Excluded(floor) if floor.as_ref() >= key => union.0.clone(),
@@ -1186,7 +1221,7 @@ impl SeekableTreeIter {
     /// positions at the window end; the lower bound stays the window lower.
     pub fn seek_to_for_prev(&mut self, key: &[u8]) {
         let (lower, upper) = {
-            let union = &self.borrow_owner().collected.union;
+            let union = &self.cell.borrow_owner().collected.union;
             let upper = match &union.1 {
                 Bound::Included(ceil) if ceil.as_ref() < key => union.1.clone(),
                 Bound::Excluded(ceil) if ceil.as_ref() <= key => union.1.clone(),
@@ -1201,7 +1236,29 @@ impl SeekableTreeIter {
     /// to resolve blob handles against the same snapshot the keys came from.
     #[must_use]
     pub fn version(&self) -> crate::version::Version {
-        self.borrow_owner().state.version.version.clone()
+        self.cell.borrow_owner().state.version.version.clone()
+    }
+
+    /// Return the user key the next [`Iterator::next`] would yield, without
+    /// consuming it. Buffers one item; cleared by any reposition / seek.
+    ///
+    /// A successful key is cloned (cheap: `UserKey` is reference-counted) and
+    /// the item stays buffered for `next`. An error is surfaced once here (it
+    /// is not `Clone`), so it will not be re-yielded by a later `next`.
+    pub fn peek_key(&mut self) -> Option<crate::Result<UserKey>> {
+        if self.peeked.is_none() {
+            self.peeked = Some(self.cell.next());
+        }
+        if matches!(self.peeked, Some(Some(Err(_)))) {
+            return match self.peeked.take() {
+                Some(Some(Err(e))) => Some(Err(e)),
+                _ => None,
+            };
+        }
+        match &self.peeked {
+            Some(Some(Ok(item))) => Some(Ok(item.key.user_key.clone())),
+            _ => None,
+        }
     }
 }
 
@@ -1209,13 +1266,21 @@ impl Iterator for SeekableTreeIter {
     type Item = crate::Result<InternalValue>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.with_dependent_mut(|_, iter| iter.next())
+        match self.peeked.take() {
+            Some(buffered) => buffered,
+            None => self.cell.next(),
+        }
     }
 }
 
 impl DoubleEndedIterator for SeekableTreeIter {
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.with_dependent_mut(|_, iter| iter.next_back())
+        // The buffer holds the FRONT item, so pull from the back first and only
+        // fall back to the buffered front once the back is exhausted.
+        match self.cell.next_back() {
+            Some(item) => Some(item),
+            None => self.peeked.take().flatten(),
+        }
     }
 }
 
