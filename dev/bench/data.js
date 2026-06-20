@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781873267235,
+  "lastUpdate": 1781928379662,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -17628,6 +17628,84 @@ window.BENCHMARK_DATA = {
             "value": 705794.8783846432,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 5.6us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1a66ae86ad8e53a2119d73aa792b808e982f27f8",
+          "message": "refactor: audit and de-mask saturating arithmetic (#498)\n\n## Summary\n\nAudits every remaining `saturating_*` in the codebase against the\nproject arithmetic policy, so a saturating clamp is only used where a\ngenuine `min`/`max` is intended — never to silently mask corruption or a\ngratuitous \"can't really overflow\" sum.\n\nEach site was classified individually (no blanket sed):\n\n- **Provably-bounded** (byte/count accumulators, ECC shard-size math,\nread-ahead size hints, version-id and file-cursor increments, percentage\nratios in u128) → **plain arithmetic** with a one-line justifying\ncomment. The bound is real (sums of on-disk sizes are capped by the\ndisk; counts can't reach 2⁶⁴; u64×small-const stays within u64; u128\nproducts of two u64s stay within u128).\n- **Genuine min/max clamps** (clamp-to-zero \"remaining bytes\", index /\nlevel / segment guards, the seqno coordinate translation, the `statvfs`\navailable-bytes clamp for an implausibly huge volume, the rate-limiter\nclock-skew and token-bucket guards) → **kept**, each documented as the\nintended clamp.\n- **Untrusted on-disk lengths** in the decode/recovery cluster →\n**checked / overflow-safe**: the blob scanner's frame-fit bound now uses\n`checked_add` so a corrupt `key_len` / `on_disk_val_len` is rejected\nexplicitly instead of saturating to `u64::MAX` and relying on a later\ncompare; the manifest table-section count guard drops a `saturating_mul`\nthat provably cannot overflow (u32 × 45 < u64::MAX), matching the blob\nsection's overflow-safe division form.\n- **Test fixtures** that deliberately build tampered values → kept.\n\nEarlier work (the storage space-admission PR) already cleaned\n`storage_stats.rs`, `tree/mod.rs`, `compaction/worker.rs`,\n`config/mod.rs`, `blob_tree/mod.rs`, and `vlog/blob_file/mod.rs`; this\nfinishes the remaining files.\n\n## Testing\n\n- New corruption test: a V3 blob frame with an oversized\n`on_disk_val_len` is rejected by the checked frame-fit bound\n(`InvalidHeader`), exercising the converted decode path.\n- Full suite green (1907 tests), `clippy --all-features --all-targets`\nclean, `no-std-check` errcount 0, and the Linux `io-uring-raw`\ncross-check clean for the touched cursor sites.\n- All conversions are behaviour-preserving on the bounded/clamp sites;\nthe only error-path change (blob scanner overflow) already rejected via\nsaturation, now made explicit.\n\n## Notes\n\n`clippy::implicit_saturating_sub` (denied via `clippy::all`) requires\n`saturating_sub` for clamp-to-zero, so most `saturating_sub` sites are\nlegitimate and were kept-with-comment rather than rewritten.\n\nCloses #494\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Strengthened blob frame validation with checked end-offset\ncalculations, rejecting corrupted on-disk length fields earlier.\n* Improved corruption handling during SST verification and repair by\nadding stricter TOC/header boundary checks and using explicit overflow\ndetection.\n* Hardened file read offset behavior by rejecting overflow instead of\nclamping.\n* **Improvements**\n* Refined checkpoint and accounting totals to use non-saturating `u64`\naccumulation where bounds guarantee safety; updated “clamp-to-zero” and\noverflow expectations across sizing/budget logic (mostly comments).\n* **Tests**\n* Added regression coverage for extreme parity sizing and\noversized/invalid blob frames.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-20T07:05:08+03:00",
+          "tree_id": "05787cdbf62d9e74d4874bfd1c3fb420a112a935",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/1a66ae86ad8e53a2119d73aa792b808e982f27f8"
+        },
+        "date": 1781928360739,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2088850.8588059645,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1218997.3545624162,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 925052.1798808366,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 4.1us | P99.9: 6.8us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3763704.6837724033,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 467904.01856792875,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.3us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 242160.85682875133,
+            "unit": "ops/sec",
+            "extra": "P50: 3.8us | P99: 4.8us | P99.9: 8.7us\nthreads: 1 | elapsed: 0.83s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1242858.9055861735,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1089182.852926817,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.8us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 726049.3341446935,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.5us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
         ]
       }
