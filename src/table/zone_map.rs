@@ -36,11 +36,18 @@
 //! Entries are strictly ascending by `block_offset` (write order == file order),
 //! enabling both a binary-search lookup and a sequential cursor.
 
-// The codec lands before its consumers (writer emit, regions parse, reader
-// predicate-skip). `expect` rather than `allow` so this self-removes: once every
-// item is wired the lint stops firing and the unfulfilled expectation forces the
-// attribute's deletion.
-#![expect(dead_code, reason = "consumed by writer / regions / reader wiring")]
+// The reader-side API (columns_for / cursor / ZoneMapCursor) has no live caller
+// until the columnar block-skip scan consumes it; the writer / table-open paths
+// already use the rest. Gated to non-test builds so the in-module tests (which
+// exercise the reader API) do not leave the expectation unfulfilled, and kept as
+// `expect` (not `allow`) so it self-removes once a live caller lands.
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "reader API consumed by the columnar block-skip scan"
+    )
+)]
 
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
@@ -320,11 +327,12 @@ mod tests {
         encode_zone_map(&mut buf, &blocks).expect("encode");
         let map = ZoneMap::decode(&buf).expect("decode");
         assert_eq!(map.len(), 3);
-        assert_eq!(map.columns_for(0), Some(blocks[0].1.as_slice()));
-        assert_eq!(map.columns_for(4096), Some(blocks[1].1.as_slice()));
-        assert_eq!(map.columns_for(9000), Some(blocks[2].1.as_slice()));
+        for (offset, columns) in &blocks {
+            assert_eq!(map.columns_for(offset.0), Some(columns.as_slice()));
+        }
         // Whole-block synthetic column (row block) carries the value range.
-        let c = &map.columns_for(0).expect("present")[0];
+        let first = map.columns_for(0).expect("present");
+        let c = first.first().expect("one column");
         assert_eq!(c.column_id, 0);
         assert_eq!(c.min, b"aaa");
         assert_eq!(c.max, b"mmm");

@@ -3519,3 +3519,62 @@ fn parallel_compression_matches_serial_output() -> crate::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn zone_map_section_roundtrips_one_entry_per_block() -> crate::Result<()> {
+    // 200 keys with frequent block rotation force many data blocks, so the
+    // section must carry several entries that survive write + reopen.
+    let items: Vec<crate::InternalValue> = (0..200u32)
+        .map(|i| {
+            crate::InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                0,
+                crate::ValueType::Value,
+            )
+        })
+        .collect();
+
+    test_with_table(
+        &items,
+        |table| {
+            let zm = &table.zone_map;
+            assert!(!zm.is_empty(), "zone map should be populated when enabled");
+            assert!(
+                zm.len() >= 2,
+                "rotation should yield several blocks, got {}",
+                zm.len()
+            );
+            Ok(())
+        },
+        Some(20),
+        Some(|w: Writer| w.use_zone_map(true)),
+    )
+}
+
+#[test]
+fn zone_map_absent_without_policy() -> crate::Result<()> {
+    let items: Vec<crate::InternalValue> = (0..50u32)
+        .map(|i| {
+            crate::InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                b"v".to_vec(),
+                0,
+                crate::ValueType::Value,
+            )
+        })
+        .collect();
+
+    test_with_table(
+        &items,
+        |table| {
+            assert!(
+                table.zone_map.is_empty(),
+                "no zone map should be loaded without the policy"
+            );
+            Ok(())
+        },
+        None,
+        None::<fn(Writer) -> Writer>,
+    )
+}
