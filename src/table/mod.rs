@@ -1329,6 +1329,14 @@ impl Table {
         &self,
         range: R,
     ) -> impl DoubleEndedIterator<Item = crate::Result<InternalValue>> + Send + use<R> {
+        self.range_iter(range)
+    }
+
+    /// Like [`Self::range`] but returns the concrete [`iter::Iter`] reader.
+    ///
+    /// The seekable range pipeline holds the concrete type so it can re-position
+    /// the reader in place via [`Self::reseek_range`] instead of rebuilding it.
+    pub(crate) fn range_iter<R: RangeBounds<UserKey> + Send>(&self, range: R) -> iter::Iter {
         let index_iter = self.block_index.iter();
 
         let mut iter = Iter::new(
@@ -1384,6 +1392,45 @@ impl Table {
         }
 
         iter
+    }
+
+    /// Re-position an existing [`iter::Iter`] (produced by [`Self::range`] on
+    /// this same table) to a fresh `range`, reusing its owned index iterator and
+    /// `Arc` handles instead of constructing a new reader.
+    ///
+    /// Applies the exact same bound translation as [`Self::range`] (including the
+    /// tight-space lower-bound raise), so the re-seeked iterator yields the same
+    /// entries a freshly-built `self.range(range)` would. Used by the seekable
+    /// range pipeline to move leaf cursors without per-seek allocation.
+    #[doc(hidden)]
+    pub fn reseek_range<R: RangeBounds<UserKey> + Send>(&self, iter: &mut iter::Iter, range: R) {
+        iter.reset_for_reseek();
+
+        match range.start_bound() {
+            Bound::Included(key) => iter.set_lower_bound(iter::Bound::Included(key.clone())),
+            Bound::Excluded(key) => iter.set_lower_bound(iter::Bound::Excluded(key.clone())),
+            Bound::Unbounded => {}
+        }
+
+        // Mirror `range()`'s tight-space restriction: raise the scan's lower
+        // bound up to `bound` when this version restricts the table.
+        if let Some(bound) = &self.1 {
+            let raise = match range.start_bound() {
+                Bound::Included(key) | Bound::Excluded(key) => {
+                    self.comparator.compare(bound, key) == core::cmp::Ordering::Greater
+                }
+                Bound::Unbounded => true,
+            };
+            if raise {
+                iter.set_lower_bound(iter::Bound::Included(bound.clone()));
+            }
+        }
+
+        match range.end_bound() {
+            Bound::Included(key) => iter.set_upper_bound(iter::Bound::Included(key.clone())),
+            Bound::Excluded(key) => iter.set_upper_bound(iter::Bound::Excluded(key.clone())),
+            Bound::Unbounded => {}
+        }
     }
 
     fn read_tli(

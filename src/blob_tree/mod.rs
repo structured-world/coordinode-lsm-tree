@@ -329,6 +329,12 @@ impl crate::iter_guard::SeekableGuardIter for BlobSeekable {
     fn seek_to_for_prev(&mut self, key: &[u8]) {
         self.inner.seek_to_for_prev(key);
     }
+
+    fn peek_key(&mut self) -> Option<crate::Result<crate::UserKey>> {
+        // The key lives in the index tree (blob separation only moves the value),
+        // so the inner seekable's peek already yields the right user key.
+        self.inner.peek_key()
+    }
 }
 
 impl AbstractTree for BlobTree {

@@ -276,6 +276,37 @@ impl Iter {
         self.range.1 = Some(bound);
     }
 
+    /// Reset this iterator to an un-positioned state so it can be re-seeked to a
+    /// fresh range WITHOUT rebuilding the index iterator or re-cloning the
+    /// table's `Arc` handles.
+    ///
+    /// Clears the bound pair, the materialized low/high data blocks, the offset
+    /// cursors, and the poison flag, and rewinds the retained `index_iter` to
+    /// the table start. The rewind is load-bearing: lazy init only calls
+    /// `seek_lower` when the new range HAS a lower bound, so a re-seek to a
+    /// range with an UNBOUNDED lower would otherwise inherit the previous pass's
+    /// front cursor and skip earlier blocks. After this call the next
+    /// [`Iterator::next`] / [`DoubleEndedIterator::next_back`] re-positions from
+    /// scratch against the bounds set via [`set_lower_bound`](Self::set_lower_bound)
+    /// / [`set_upper_bound`](Self::set_upper_bound).
+    pub fn reset_for_reseek(&mut self) {
+        self.range = (None, None);
+        self.index_initialized = false;
+        self.lo_offset = BlockOffset(0);
+        self.lo_data_block = None;
+        self.hi_offset = BlockOffset(u64::MAX);
+        self.hi_data_block = None;
+        // A fresh `table.range()` would produce a non-poisoned iterator; match
+        // that so a re-seek past a previously-corrupt block can make progress
+        // again (the block is re-read, and re-poisons only if still corrupt).
+        self.poisoned = false;
+        // Rewind the front (and back) index cursor to the first block. An empty
+        // needle is `<=` every key, so `seek_lower` positions at the start and
+        // resets both caches; an unbounded-lower re-seek then starts fresh, and
+        // a bounded-lower one re-seeks over this in init.
+        self.index_iter.seek_lower(&[], u64::MAX);
+    }
+
     /// Adaptive partial-tier read for `handle`: keep a cold block only partially
     /// decoded (the touched fraction) instead of materializing the whole block,
     /// and promote it to a full resident block once access justifies the memory.

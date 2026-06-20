@@ -92,6 +92,38 @@ impl RunReader {
         }
     }
 
+    /// Re-position this reader to a fresh `range`, reusing the same run `Arc`
+    /// and struct instead of rebuilding. Recomputes the overlapping table window
+    /// and drops the boundary readers so they re-open lazily against the new
+    /// bounds on the next pull.
+    ///
+    /// When the new range does not overlap the run at all, the reader is left in
+    /// an immediately-exhausted state (both directions yield `None`).
+    pub(crate) fn reseek<R: RangeBounds<UserKey> + Clone + Send + 'static>(
+        &mut self,
+        range: R,
+        cmp: &dyn crate::comparator::UserComparator,
+    ) {
+        self.range = to_owned_range(&range);
+        self.lo_reader = None;
+        self.hi_reader = None;
+
+        if let Some((lo, hi)) = self.run.range_overlap_indexes_cmp(&range, cmp) {
+            self.lo = lo;
+            self.hi = hi;
+            self.lo_initialized = false;
+            self.hi_initialized = lo >= hi;
+        } else {
+            // No overlap: present as exhausted. Marking both sides initialized
+            // with no readers makes `next` / `next_back` fall straight through
+            // to `None` (see their else-branches).
+            self.lo = 0;
+            self.hi = 0;
+            self.lo_initialized = true;
+            self.hi_initialized = true;
+        }
+    }
+
     fn ensure_lo_initialized(&mut self) {
         if !self.lo_initialized {
             #[expect(
@@ -377,6 +409,71 @@ mod tests {
             assert_eq!(Slice::from(*b"g"), iter.next().unwrap().key.user_key);
             assert!(iter.next().is_none());
         }
+
+        Ok(())
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used)]
+    fn run_reader_reseek_repositions_and_handles_no_overlap() -> crate::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let tree = crate::Config::new(
+            &tempdir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+
+        for batch in [
+            ["a", "b", "c"],
+            ["d", "e", "f"],
+            ["g", "h", "i"],
+            ["j", "k", "l"],
+        ] {
+            for id in batch {
+                tree.insert(id, vec![], 0);
+            }
+            tree.flush_active_memtable(0)?;
+        }
+        let tables = tree
+            .current_version()
+            .iter_tables()
+            .cloned()
+            .collect::<Vec<_>>();
+        let level = Arc::new(Run::new(tables).unwrap());
+        let cmp = crate::comparator::DefaultUserComparator;
+
+        // Open over the full range, consume one key, then reseek to a disjoint
+        // sub-window: the reader must serve exactly that window from a fresh
+        // position (boundary readers re-open lazily against the new bounds).
+        let mut reader = RunReader::new(level, ..).unwrap();
+        assert_eq!(Slice::from(*b"a"), reader.next().unwrap()?.key.user_key);
+
+        reader.reseek(UserKey::from("e")..=UserKey::from("h"), &cmp);
+        let got: Vec<_> = std::iter::from_fn(|| reader.next())
+            .map(|r| r.unwrap().key.user_key)
+            .collect();
+        assert_eq!(
+            got,
+            [
+                Slice::from(*b"e"),
+                Slice::from(*b"f"),
+                Slice::from(*b"g"),
+                Slice::from(*b"h"),
+            ],
+        );
+
+        // Reseek to a range that does not overlap the run at all: both
+        // directions must immediately report exhaustion.
+        reader.reseek(UserKey::from("y")..=UserKey::from("z"), &cmp);
+        assert!(
+            reader.next().is_none(),
+            "no-overlap reseek must be empty forward"
+        );
+        assert!(
+            reader.next_back().is_none(),
+            "no-overlap reseek must be empty backward",
+        );
 
         Ok(())
     }

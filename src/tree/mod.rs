@@ -248,6 +248,10 @@ impl crate::iter_guard::SeekableGuardIter for StandardSeekable {
     fn seek_to_for_prev(&mut self, key: &[u8]) {
         self.inner.seek_to_for_prev(key);
     }
+
+    fn peek_key(&mut self) -> Option<crate::Result<crate::UserKey>> {
+        self.inner.peek_key()
+    }
 }
 
 impl AbstractTree for Tree {

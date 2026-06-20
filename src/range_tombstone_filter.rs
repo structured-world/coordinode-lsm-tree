@@ -133,6 +133,26 @@ impl<I> RangeTombstoneFilter<I> {
     }
 }
 
+impl<I: crate::reseek::Reseekable> crate::reseek::Reseekable for RangeTombstoneFilter<I> {
+    /// Reset the forward/reverse activation cursors and active sets so the next
+    /// pull re-activates tombstones from the start of the (position-independent)
+    /// sorted lists, then forward the reposition to the wrapped stream.
+    ///
+    /// The sorted tombstone lists and the `*_initialized` flags are kept: sort
+    /// order does not depend on iteration position, so re-sorting on every
+    /// reposition would be wasted work.
+    fn reseek(&mut self, ctx: &crate::reseek::ReseekCtx) {
+        self.fwd_idx = 0;
+        self.rev_idx = 0;
+        // Clear in place rather than reconstructing: a seek-then-iterate-then-
+        // reseek loop that activated tombstones keeps the active sets' backing
+        // storage for the next pass instead of dropping and re-allocating it.
+        self.fwd_active.clear();
+        self.rev_active.clear();
+        self.inner.reseek(ctx);
+    }
+}
+
 impl<I: Iterator<Item = crate::Result<InternalValue>>> Iterator for RangeTombstoneFilter<I> {
     type Item = crate::Result<InternalValue>;
 

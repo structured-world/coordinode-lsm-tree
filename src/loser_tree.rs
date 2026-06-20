@@ -232,6 +232,56 @@ where
         t
     }
 
+    /// Empty the tournament in place: drop every present leaf and mark all slots
+    /// absent, keeping the backing storage (`leaves` / `present` / `tree`)
+    /// allocated for a later [`Self::refill_with`]. After this, `is_empty()` is
+    /// true and `winner_slot()` is `None`.
+    ///
+    /// Used by the seekable range merger's in-place reposition: stale buffered
+    /// leaves from the old position are dropped without freeing the storage.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "leaves.len() == present.len() by construction (set in build())"
+    )]
+    pub fn clear(&mut self) {
+        for i in 0..self.leaves.len() {
+            if self.present[i] != 0 {
+                // SAFETY: `present[i] != 0` is the LoserTree invariant for
+                // `leaves[i]` being initialised.
+                unsafe { self.leaves[i].assume_init_drop() };
+                self.present[i] = 0;
+            }
+        }
+        self.active = 0;
+    }
+
+    /// Re-prime the tournament in place from a per-slot `pull` closure, reusing
+    /// the existing storage with NO reallocation. Drops any present leaves first
+    /// (via [`Self::clear`]), then pulls a fresh head for each of the `n_sources`
+    /// slots and rebuilds the tree.
+    ///
+    /// `pull(slot)` returns the new head value for `slot`, or `None` if that slot
+    /// is exhausted at the new position. The slot count is unchanged from
+    /// construction, so the power-of-two `cap` and all backing `Vec`s are reused
+    /// as-is.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "slot < n_sources <= leaves.len() == present.len() by construction"
+    )]
+    pub fn refill_with(&mut self, mut pull: impl FnMut(usize) -> Option<E>) {
+        self.clear();
+        for slot in 0..self.n_sources {
+            if let Some(v) = pull(slot) {
+                self.leaves[slot] = MaybeUninit::new(v);
+                self.present[slot] = 1;
+                self.active += 1;
+            }
+        }
+        // Tree storage (size `cap`) is reused; build_subtree overwrites every
+        // internal node and `tree[0]`.
+        self.build_subtree(1, 0, self.leaves.len());
+    }
+
     /// Number of source slots `n` originally supplied (not `cap`).
     ///
     /// Reflects the *capacity* of the tournament; some slots may be

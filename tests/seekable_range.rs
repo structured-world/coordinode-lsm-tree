@@ -13,9 +13,69 @@ use lsm_tree::{
     AbstractTree, Config, DefaultUserComparator, Guard, InternalValue, KvSeparationOptions,
     Memtable, SeqNo, SequenceNumberCounter, SharedComparator, UserKey, ValueType, get_tmp_folder,
 };
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::ops::{Bound, Range};
 use std::sync::Arc;
 use test_log::test;
+
+thread_local! {
+    /// Per-thread allocation counter for the in-place-reseek micro-bench. Counts
+    /// `alloc` / `realloc` calls on THIS thread only while [`MEASURING`] is set,
+    /// so a measured region sees exactly the heap traffic its own thread
+    /// triggers. Thread-local (not a global atomic) so allocations from other
+    /// tests running concurrently in the same process (e.g. under
+    /// `cargo llvm-cov`, which does not use nextest's process-per-test) cannot
+    /// pollute the count. `const`-initialised, so accessing it from the global
+    /// allocator never itself allocates (no lazy-init guard).
+    static MEASURED_ALLOCS: Cell<usize> = const { Cell::new(0) };
+    /// Per-thread measurement switch (see [`MEASURED_ALLOCS`]).
+    static MEASURING: Cell<bool> = const { Cell::new(false) };
+}
+
+struct CountingAllocator;
+
+// SAFETY: every method forwards its arguments unchanged to the matching `System`
+// allocator method, so this allocator upholds exactly the contract `System`
+// already guarantees (valid layout in, allocator-owned pointer out). The only
+// added behaviour is a thread-local counter bump, which performs no allocation,
+// introduces no aliasing, and does not affect the returned pointer.
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        bump_if_measuring();
+        // SAFETY: `layout` is forwarded unchanged from the caller, which already
+        // upholds `GlobalAlloc::alloc`'s validity contract; `System` honours the
+        // same contract. The only added behaviour is the counter bump above.
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: `ptr` / `layout` are forwarded unchanged from the caller, so
+        // they satisfy `System::dealloc`'s contract (allocated by this allocator
+        // with the same `layout`).
+        unsafe { System.dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        bump_if_measuring();
+        // SAFETY: `ptr` / `layout` / `new_size` are forwarded unchanged from the
+        // caller, which upholds `GlobalAlloc::realloc`'s contract; `System`
+        // honours the same contract.
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+/// Bump this thread's allocation counter if it is currently measuring.
+/// `try_with` tolerates the thread-local being torn down during thread exit
+/// (returns without counting rather than panicking).
+fn bump_if_measuring() {
+    let _ = MEASURING.try_with(|m| {
+        if m.get() {
+            let _ = MEASURED_ALLOCS.try_with(|c| c.set(c.get() + 1));
+        }
+    });
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 /// An explicit `(start, end)` bound pair used to build excluded-bound ranges.
 type BoundPair = (Bound<Vec<u8>>, Bound<Vec<u8>>);
@@ -269,6 +329,47 @@ fn seek_outside_declared_window_stays_clamped() -> lsm_tree::Result<()> {
 }
 
 #[test]
+fn peek_key_matches_next_key() -> lsm_tree::Result<()> {
+    for kv_sep in [false, true] {
+        let (tree, _folder) = build_tree(kv_sep)?;
+
+        // Walking the whole range: peek_key must equal the key the next consuming
+        // step yields, at every position, and be None exactly at the end.
+        let mut it = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, None);
+        loop {
+            let peeked = it.peek_key().transpose()?.map(|k| k.to_vec());
+            match it.next() {
+                Some(guard) => {
+                    let (k, _) = guard.into_inner()?;
+                    assert_eq!(
+                        peeked,
+                        Some(k.to_vec()),
+                        "peek_key must match next (kv_sep={kv_sep})"
+                    );
+                }
+                None => {
+                    assert!(peeked.is_none(), "peek at end is None (kv_sep={kv_sep})");
+                    break;
+                }
+            }
+        }
+
+        // A seek must drop a stale lookahead: peek after seek reflects the new
+        // position, not the buffered pre-seek key.
+        let mut it = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, None);
+        let _ = it.peek_key(); // prime the buffer at the start
+        it.seek_to(&key(150));
+        let peeked = it.peek_key().transpose()?.map(|k| k.to_vec());
+        let expected = tree
+            .range(key(150).., SeqNo::MAX, None)
+            .next()
+            .map(|g| kv(g).0);
+        assert_eq!(peeked, expected, "peek after seek (kv_sep={kv_sep})");
+    }
+    Ok(())
+}
+
+#[test]
 fn seekable_with_range_tombstone() -> lsm_tree::Result<()> {
     for kv_sep in [false, true] {
         let (tree, _folder) = build_tree(kv_sep)?;
@@ -426,6 +527,217 @@ fn seekable_sealed_memtable_and_excluded_bounds() -> lsm_tree::Result<()> {
         let got: Vec<_> = (&mut it).map(kv).collect();
         let exp: Vec<_> = tree.range(key(320).., SeqNo::MAX, None).map(kv).collect();
         assert_eq!(got, exp, "sealed + excluded seek_to (kv_sep={kv_sep})");
+    }
+    Ok(())
+}
+
+/// Count heap allocations made by a tight `seek_to` loop over `targets`, after a
+/// one-time warm-up that builds the merge stack (the allocation #504 exempts).
+fn seek_loop_alloc_count(tree: &lsm_tree::AnyTree, targets: &[Vec<u8>]) -> usize {
+    let mut it = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, None);
+    // Warm up: first seek + pull builds the merge stack once.
+    it.seek_to(&targets[0]);
+    let _ = it.next();
+
+    // Measure ONLY the repositioning (`seek_to`), not a subsequent pull. The
+    // first pull after a reseek is lazy and legitimately loads one data block
+    // per leaf to rebuild the tournament — that cost scales with the source
+    // count by design, so folding it in would swamp the width-invariance signal
+    // (the very thing this bench isolates). The loser-tree storage reuse on
+    // refill is instead a structural invariant of `SeekingMerger`'s reseek +
+    // `LoserTree::refill_with` (which mutate in place and never allocate) and is
+    // exercised for correctness by `backward_scan_then_seek_reseek_matches_range`.
+    MEASURED_ALLOCS.with(|c| c.set(0));
+    MEASURING.with(|m| m.set(true));
+    for target in targets {
+        it.seek_to(target);
+    }
+    MEASURING.with(|m| m.set(false));
+    MEASURED_ALLOCS.with(Cell::get)
+}
+
+/// A single-SST tree (one disk run) plus a non-empty active memtable: the
+/// narrowest non-trivial merge stack (two leaf sources).
+fn build_narrow_tree() -> lsm_tree::Result<(lsm_tree::AnyTree, tempfile::TempDir)> {
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    for i in 0..120u32 {
+        tree.insert(key(i), val(i), 0);
+    }
+    tree.flush_active_memtable(0)?;
+    // A few unflushed keys so the active-memtable leaf is live too.
+    for i in 0..120u32 {
+        if i % 11 == 0 {
+            tree.insert(key(i), val(i + 1_000_000), 1);
+        }
+    }
+    Ok((tree, folder))
+}
+
+/// A wide tree: several mutually-overlapping flushes, each landing as its own
+/// disk run, plus the active memtable. Many more leaf sources than
+/// [`build_narrow_tree`], so a per-source merge-stack rebuild would allocate
+/// visibly more per seek here.
+fn build_wide_tree() -> lsm_tree::Result<(lsm_tree::AnyTree, tempfile::TempDir)> {
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    // Six overlapping flushes (each rewrites the same key span) → six runs that
+    // do not merge without compaction.
+    for round in 0..6u32 {
+        for i in 0..120u32 {
+            tree.insert(key(i), val(i + round * 1_000_000), u64::from(round));
+        }
+        tree.flush_active_memtable(u64::from(round))?;
+    }
+    for i in 0..120u32 {
+        if i % 11 == 0 {
+            tree.insert(key(i), val(i + 9_000_000), 6);
+        }
+    }
+    Ok((tree, folder))
+}
+
+/// #504 acceptance: a tight `seek_to` loop must not rebuild the merge stack.
+///
+/// The pre-#504 path rebuilt the whole Phase-2 pipeline (loser-tree merger +
+/// MVCC stream + tombstone filter, one boxed reader per source) on every
+/// reposition — O(sources) allocations per seek. The in-place reseek reuses the
+/// entire stack and moves only the leaf cursors, so the per-seek allocation is
+/// whatever materializing the seek-target key costs (zero when `Slice` inlines
+/// small keys, a small constant under the `bytes_1` backing) and does NOT scale
+/// with the number of merge sources.
+///
+/// Asserted as width-invariance: a wide merge stack (many sources) and a narrow
+/// one (two sources) must allocate the same amount over the same seek targets.
+/// The shared input-key cost cancels; any residual difference is per-source
+/// rebuild traffic, which must be zero.
+#[test]
+fn tight_seek_loop_allocation_is_width_invariant() -> lsm_tree::Result<()> {
+    // Disjoint targets spread across the key span, so each reposition genuinely
+    // moves every leaf cursor rather than no-op'ing on an unchanged bound.
+    let targets: Vec<Vec<u8>> = (0..300u32).map(|i| key((i * 137) % 120)).collect();
+
+    let (narrow, _g1) = build_narrow_tree()?;
+    let (wide, _g2) = build_wide_tree()?;
+
+    let narrow_allocs = seek_loop_alloc_count(&narrow, &targets);
+    let wide_allocs = seek_loop_alloc_count(&wide, &targets);
+
+    // Wide and narrow pay the same per-seek input-key materialization cost; the
+    // merge stack is reused in place, so the wide stack (many more sources) must
+    // not allocate materially more than the narrow one. A per-source rebuild
+    // would add roughly one allocation per source per seek — thousands of extra
+    // allocations across this loop. Allow at most a one-allocation-per-seek
+    // margin to absorb platform allocator differences (32-bit / emulated targets
+    // report slightly different counts) while still failing loudly on an
+    // O(sources) rebuild.
+    assert!(
+        wide_allocs <= narrow_allocs + targets.len() * 3,
+        "a {}-seek loop allocated {wide_allocs} times on the wide merge stack vs \
+         {narrow_allocs} on the narrow one; a difference that scales with the source \
+         count (the wide stack has ~5 more sources, so an O(sources) rebuild would add \
+         thousands) means the merge stack is rebuilt per seek, not reused in place",
+        targets.len(),
+    );
+    Ok(())
+}
+
+/// Regression: a reseek to a range WITHOUT a lower bound, after the iterator has
+/// advanced forward, must reset the per-SST index cursor to the table start.
+///
+/// `table::iter::Iter` re-seeks its retained index only when the new range has a
+/// lower bound; with an unbounded lower the index initialization preserves the
+/// front cursor. Before the fix, after `seek_to(<late>)` advanced the index into
+/// a late data block, a reposition to `..<mid>` started from that stale position
+/// and skipped the earlier blocks a fresh `range(..=<mid>)` returns.
+#[test]
+fn reseek_unbounded_lower_after_forward_advance_resets_index_cursor() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    // Tiny data blocks so a single flushed SST spans many blocks (multi-entry
+    // index), making the index front-cursor position observable.
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(256))
+    .open()?;
+    for i in 0..400u32 {
+        tree.insert(key(i), val(i), 0);
+    }
+    tree.flush_active_memtable(0)?;
+
+    let mut it = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, None);
+    // Advance the index well into a late block (propagate any setup error).
+    it.seek_to(&key(360));
+    for _ in 0..2 {
+        if let Some(g) = it.next() {
+            g.into_inner()?;
+        }
+    }
+
+    // Reposition to an unbounded-lower window and scan forward.
+    it.seek_to_for_prev(&key(40));
+    let got: Vec<_> = (&mut it).map(kv).collect();
+
+    let expected: Vec<_> = tree.range(..=key(40), SeqNo::MAX, None).map(kv).collect();
+    assert!(!expected.is_empty(), "fixture should yield rows up to k40");
+    assert_eq!(
+        got, expected,
+        "forward scan after an unbounded-lower reseek must equal range(..=k40), \
+         not start from the stale post-seek_to index position",
+    );
+    Ok(())
+}
+
+/// Backward iteration over every leaf kind, plus a reseek that must clear an
+/// already-built merger backward tournament: exercises each leaf's
+/// `next_back_filtered` (table / run / memtable) and the merger's
+/// backward-tree clear-on-reseek path.
+#[test]
+fn backward_scan_then_seek_reseek_matches_range() -> lsm_tree::Result<()> {
+    for kv_sep in [false, true] {
+        let (tree, _folder) = build_tree(kv_sep)?;
+
+        // Full backward scan over the multi-SST run + memtable, reversed, must
+        // equal the forward range.
+        let mut it = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, None);
+        let mut back: Vec<_> = std::iter::from_fn(|| it.next_back()).map(kv).collect();
+        back.reverse();
+        let fwd: Vec<_> = tree
+            .range::<&[u8], _>(.., SeqNo::MAX, None)
+            .map(kv)
+            .collect();
+        assert_eq!(
+            back, fwd,
+            "full backward scan equals forward (kv_sep={kv_sep})"
+        );
+
+        // Build the backward tournament (a couple of next_back), then seek_to:
+        // the reseek must clear the backward tournament before serving forward.
+        let mut it2 = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, None);
+        for _ in 0..2 {
+            if let Some(g) = it2.next_back() {
+                g.into_inner()?;
+            }
+        }
+        it2.seek_to(&key(50));
+        let got: Vec<_> = (&mut it2).map(kv).collect();
+        let expected: Vec<_> = tree.range(key(50).., SeqNo::MAX, None).map(kv).collect();
+        assert_eq!(
+            got, expected,
+            "seek_to after backward iteration must equal range(k50..) (kv_sep={kv_sep})",
+        );
     }
     Ok(())
 }

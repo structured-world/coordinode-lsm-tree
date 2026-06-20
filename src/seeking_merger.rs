@@ -159,6 +159,14 @@ pub struct SeekingMerger<S: MergeSource, C: UserComparator + Clone> {
     pending_forward_error: Option<crate::Error>,
     /// Mirror of `pending_forward_error` for the backward direction.
     pending_backward_error: Option<crate::Error>,
+    /// Whether `forward_tree` reflects the current position. `false` means the
+    /// next forward pull must (re)populate it: build it the first time, or
+    /// refill the retained storage in place after a reseek. Decoupled from
+    /// `forward_tree.is_some()` so a reseek can keep the allocation while
+    /// forcing a repopulate.
+    forward_primed: bool,
+    /// Mirror of `forward_primed` for the backward direction.
+    backward_primed: bool,
 }
 
 impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
@@ -176,77 +184,120 @@ impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
             backward_tree: None,
             pending_forward_error: None,
             pending_backward_error: None,
+            forward_primed: false,
+            backward_primed: false,
         }
     }
 
     fn initialize_forward(&mut self) {
-        let mut initial: Vec<Option<MergerEntry>> = Vec::with_capacity(self.n_sources);
-        for i in 0..self.n_sources {
+        let Self {
+            sources,
+            n_sources,
+            comparator,
+            forward_tree,
+            backward_tree,
+            pending_forward_error,
+            ..
+        } = self;
+        let n = *n_sources;
+        // Pull the new forward head for slot `i`. On error, keep earlier
+        // prefetches and queue the FIRST error (surfaces after buffered values).
+        // On forward-exhaustion, MIGRATE any leaf the OPPOSITE tournament still
+        // buffers for this source so it is not silently lost. After a reseek
+        // both tournaments are cleared, so the migrate path finds nothing —
+        // exactly the fresh-position behaviour.
+        let mut pull = |i: usize| -> Option<MergerEntry> {
             #[expect(
                 clippy::indexing_slicing,
                 reason = "i < n_sources by construction; sources len == n_sources"
             )]
-            let pulled = MergeSource::next(&mut self.sources[i]);
-            let slot = match pulled {
+            match MergeSource::next(&mut sources[i]) {
                 Some(Ok(value)) => Some(MergerEntry { source: i, value }),
                 Some(Err(e)) => {
-                    // Don't drop earlier prefetched values: keep the
-                    // erroring slot empty and queue the error so it
-                    // surfaces AFTER any buffered prefetches are
-                    // consumed. Same contract as the refill paths.
-                    // get_or_insert preserves the FIRST queued error.
-                    self.pending_forward_error.get_or_insert(e);
+                    pending_forward_error.get_or_insert(e);
                     None
                 }
-                None => {
-                    // Source exhausted forward. If backward_tree
-                    // still holds a buffered leaf for this source
-                    // (the OPPOSITE direction pulled it earlier and
-                    // hasn't yielded it yet), MIGRATE it into the
-                    // forward tournament — otherwise that value
-                    // would be silently lost when the user iterates
-                    // forward after some backward consumption.
-                    self.backward_tree.as_mut().and_then(|bt| bt.take_slot(i))
-                }
-            };
-            initial.push(slot);
+                None => backward_tree.as_mut().and_then(|bt| bt.take_slot(i)),
+            }
+        };
+        if let Some(tree) = forward_tree {
+            // Retained storage (post-reseek): refill in place, no allocation.
+            tree.refill_with(pull);
+        } else {
+            // First use: build the tournament (one-time allocation).
+            let mut initial: Vec<Option<MergerEntry>> = Vec::with_capacity(n);
+            for i in 0..n {
+                initial.push(pull(i));
+            }
+            let cmp = build_min_cmp(comparator.clone());
+            *forward_tree = Some(LoserTree::build(initial, cmp));
         }
-        let cmp = build_min_cmp(self.comparator.clone());
-        self.forward_tree = Some(LoserTree::build(initial, cmp));
     }
 
     fn initialize_backward(&mut self) {
-        let mut initial: Vec<Option<MergerEntry>> = Vec::with_capacity(self.n_sources);
-        for i in 0..self.n_sources {
+        let Self {
+            sources,
+            n_sources,
+            comparator,
+            forward_tree,
+            backward_tree,
+            pending_backward_error,
+            ..
+        } = self;
+        let n = *n_sources;
+        // Mirror of `initialize_forward`: pull the new backward head, queue the
+        // first error, and migrate a buffered leaf from the forward tournament
+        // for a source already exhausted backward (the single-item-window case).
+        let mut pull = |i: usize| -> Option<MergerEntry> {
             #[expect(
                 clippy::indexing_slicing,
                 reason = "i < n_sources by construction; sources len == n_sources"
             )]
-            let pulled = MergeSource::next_back(&mut self.sources[i]);
-            let slot = match pulled {
+            match MergeSource::next_back(&mut sources[i]) {
                 Some(Ok(value)) => Some(MergerEntry { source: i, value }),
                 Some(Err(e)) => {
-                    // Mirror of initialize_forward: keep prefetched
-                    // backward values, queue the FIRST error for a
-                    // later call (get_or_insert preserves it).
-                    self.pending_backward_error.get_or_insert(e);
+                    pending_backward_error.get_or_insert(e);
                     None
                 }
-                None => {
-                    // Source exhausted backward. If forward_tree
-                    // still holds a buffered leaf for this source
-                    // (the OPPOSITE direction pulled it earlier and
-                    // hasn't yielded it yet), MIGRATE it into the
-                    // backward tournament. CodeRabbit's data-loss
-                    // bug (single-source `[a, z]` returning None on
-                    // post-forward next_back) is exactly this case.
-                    self.forward_tree.as_mut().and_then(|ft| ft.take_slot(i))
-                }
-            };
-            initial.push(slot);
+                None => forward_tree.as_mut().and_then(|ft| ft.take_slot(i)),
+            }
+        };
+        if let Some(tree) = backward_tree {
+            tree.refill_with(pull);
+        } else {
+            let mut initial: Vec<Option<MergerEntry>> = Vec::with_capacity(n);
+            for i in 0..n {
+                initial.push(pull(i));
+            }
+            let cmp = build_max_cmp(comparator.clone());
+            *backward_tree = Some(LoserTree::build(initial, cmp));
         }
-        let cmp = build_max_cmp(self.comparator.clone());
-        self.backward_tree = Some(LoserTree::build(initial, cmp));
+    }
+}
+
+impl<S: MergeSource + crate::reseek::Reseekable, C: UserComparator + Clone>
+    crate::reseek::Reseekable for SeekingMerger<S, C>
+{
+    /// Reposition every source to the new sub-range, then empty both tournaments
+    /// IN PLACE (dropping stale buffered leaves but keeping their storage) and
+    /// unprime them so the next pull refills the retained storage — no
+    /// reallocation. Clearing both before any re-init also means the migrate
+    /// path in `initialize_*` finds nothing stale to rescue. Queued refill
+    /// errors are dropped; they belonged to the old position.
+    fn reseek(&mut self, ctx: &crate::reseek::ReseekCtx) {
+        for source in &mut self.sources {
+            source.reseek(ctx);
+        }
+        if let Some(tree) = &mut self.forward_tree {
+            tree.clear();
+        }
+        if let Some(tree) = &mut self.backward_tree {
+            tree.clear();
+        }
+        self.forward_primed = false;
+        self.backward_primed = false;
+        self.pending_forward_error = None;
+        self.pending_backward_error = None;
     }
 }
 
@@ -266,8 +317,9 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
         if let Some(e) = self.pending_backward_error.take() {
             return Some(Err(e));
         }
-        if self.forward_tree.is_none() {
+        if !self.forward_primed {
             self.initialize_forward();
+            self.forward_primed = true;
             // Init may have queued an error; surface it immediately
             // (same rationale as the top check — errors first).
             if let Some(e) = self.pending_forward_error.take() {
@@ -337,8 +389,9 @@ impl<S: CoherentMergeSource, C: UserComparator + Clone> DoubleEndedIterator
         if let Some(e) = self.pending_forward_error.take() {
             return Some(Err(e));
         }
-        if self.backward_tree.is_none() {
+        if !self.backward_primed {
             self.initialize_backward();
+            self.backward_primed = true;
             if let Some(e) = self.pending_backward_error.take() {
                 return Some(Err(e));
             }

@@ -248,6 +248,21 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
     }
 }
 
+impl<I> crate::reseek::Reseekable for MvccStream<I>
+where
+    I: DoubleEndedIterator<Item = crate::Result<InternalValue>> + crate::reseek::Reseekable,
+{
+    /// Clear the lookahead peek buffers and the reverse-merge scratch buffer,
+    /// then forward the reposition to the inner merger. The installed range
+    /// tombstones and merge operator are position-independent and stay as-is.
+    fn reseek(&mut self, ctx: &crate::reseek::ReseekCtx) {
+        self.inner.reset_front_peeked();
+        self.inner.reset_back_peeked();
+        self.key_entries_buf.clear();
+        self.inner.inner_mut().reseek(ctx);
+    }
+}
+
 impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> Iterator for MvccStream<I> {
     type Item = crate::Result<InternalValue>;
 
