@@ -532,7 +532,7 @@ pub struct Config {
     /// When `true` (the default), [`Config::open`] and [`Config::repair`]
     /// acquire an exclusive cross-process lock on a `LOCK` file in the tree
     /// directory (an advisory OS file lock) and hold it for the lifetime of the
-    /// [`Tree`](crate::Tree) (open) or the duration of the call (repair). A
+    /// [`Tree`] (open) or the duration of the call (repair). A
     /// second process attempting to open / repair the same directory fails fast
     /// with [`Error::Locked`](crate::Error::Locked) instead of racing on the
     /// manifest. Set `false` via [`Config::with_directory_lock`] only when the

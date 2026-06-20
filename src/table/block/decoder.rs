@@ -29,7 +29,7 @@ use crate::io::Cursor;
 /// call for every case and lets the decode fuse with the caller's bounds checks
 /// and constants. Reads through a plain slice index (no `Cursor::read_u8`
 /// `read_exact`-per-byte) and rejects an overlong (> 64-bit) encoding, matching
-/// [`VarintReader::read_u64_varint`].
+/// `VarintReader::read_u64_varint`.
 ///
 /// On a truncated buffer (`?` on the bounds-checked load) or an overlong
 /// encoding it returns `None` from the **enclosing** function, so every call

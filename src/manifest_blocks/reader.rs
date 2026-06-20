@@ -71,13 +71,13 @@ pub struct ManifestArchiveReader {
     /// and to support reopening in tests.
     path: PathBuf,
 
-    /// Open file handle, positioned arbitrarily; [`read_section`]
+    /// Open file handle, positioned arbitrarily; [`Self::read_section`]
     /// seeks each time and reads exactly one Block per call so
     /// successive lookups do not depend on the cursor.
     file: Box<dyn FsFile>,
 
     /// Verified footer payload — the table of contents that every
-    /// [`read_section`] / [`section`] lookup consults.
+    /// [`Self::read_section`] / [`Self::section`] lookup consults.
     footer: FooterPayload,
 
     /// Path that produced the footer: `Tail` (preferred) or `Head`

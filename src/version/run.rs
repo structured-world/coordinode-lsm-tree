@@ -100,7 +100,7 @@ impl<T: Ranged> Run<T> {
     /// byte ordering.
     ///
     /// Only correct when the tree uses the default (lexicographic) comparator.
-    /// For custom comparators, use [`push_cmp`] instead.
+    /// For custom comparators, use [`Self::push_cmp`] instead.
     pub fn push_lexicographic(&mut self, item: T) {
         self.0.push(item);
 
@@ -110,9 +110,9 @@ impl<T: Ranged> Run<T> {
 
     /// Pushes a table and re-sorts using a custom comparator for key ordering.
     ///
-    /// Re-sorts the entire run on each call (mirrors [`push_lexicographic`]
+    /// Re-sorts the entire run on each call (mirrors [`Self::push_lexicographic`]
     /// behavior). Acceptable for typical run sizes (<100 tables); for bulk
-    /// insertion use [`extend`] followed by [`sort_by_cmp`].
+    /// insertion use [`Self::extend`] followed by [`Self::sort_by_cmp`].
     pub fn push_cmp(&mut self, item: T, cmp: &dyn UserComparator) {
         self.0.push(item);
         self.sort_by_cmp(cmp);
@@ -120,14 +120,14 @@ impl<T: Ranged> Run<T> {
 
     /// Sorts the run by min key using the provided user comparator.
     ///
-    /// Use after [`extend`] to re-establish ordering in a single pass.
+    /// Use after [`Self::extend`] to re-establish ordering in a single pass.
     pub fn sort_by_cmp(&mut self, cmp: &dyn UserComparator) {
         self.0
             .sort_by(|a, b| cmp.compare(a.key_range().min(), b.key_range().min()));
     }
 
     /// Appends items without re-sorting. Callers must ensure the run remains
-    /// sorted (e.g. via [`sort_by_cmp`] after all items are added).
+    /// sorted (e.g. via [`Self::sort_by_cmp`] after all items are added).
     pub fn extend(&mut self, items: Vec<T>) {
         self.0.extend(items);
     }
@@ -150,7 +150,7 @@ impl<T: Ranged> Run<T> {
         self.0.get(idx).filter(|x| x.key_range().min() <= &key)
     }
 
-    /// Like [`get_for_key`], but uses a custom comparator for key ordering.
+    /// Like [`Self::get_for_key`], but uses a custom comparator for key ordering.
     ///
     /// # Precondition (guaranteed by construction)
     ///
@@ -186,7 +186,7 @@ impl<T: Ranged> Run<T> {
     /// Returns the sub slice of tables in the run that have
     /// a key range overlapping the input key range.
     ///
-    /// Uses lexicographic ordering. For custom comparators, use [`get_overlapping_cmp`].
+    /// Uses lexicographic ordering. For custom comparators, use [`Self::get_overlapping_cmp`].
     pub fn get_overlapping<'a>(&'a self, key_range: &'a KeyRange) -> &'a [T] {
         let range = key_range.min()..=key_range.max();
 
@@ -197,9 +197,9 @@ impl<T: Ranged> Run<T> {
         self.get(lo..=hi).unwrap_or_default()
     }
 
-    /// Like [`get_overlapping`], but uses a custom comparator for key ordering.
+    /// Like [`Self::get_overlapping`], but uses a custom comparator for key ordering.
     ///
-    /// Lifetime on `key_range` mirrors [`get_overlapping`] for API consistency.
+    /// Lifetime on `key_range` mirrors [`Self::get_overlapping`] for API consistency.
     pub fn get_overlapping_cmp<'a>(
         &'a self,
         key_range: &'a KeyRange,
@@ -228,7 +228,7 @@ impl<T: Ranged> Run<T> {
             .unwrap_or_default()
     }
 
-    /// Like [`get_contained`], but uses a custom comparator for key ordering.
+    /// Like [`Self::get_contained`], but uses a custom comparator for key ordering.
     pub fn get_contained_cmp<'a>(
         &'a self,
         key_range: &KeyRange,
@@ -301,7 +301,7 @@ impl<T: Ranged> Run<T> {
         Some((lo, hi))
     }
 
-    /// Like [`range_overlap_indexes`], but uses a custom comparator for key ordering.
+    /// Like [`Self::range_overlap_indexes`], but uses a custom comparator for key ordering.
     pub fn range_overlap_indexes_cmp<K: AsRef<[u8]>, R: RangeBounds<K>>(
         &self,
         key_range: &R,

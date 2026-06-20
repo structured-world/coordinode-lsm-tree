@@ -93,6 +93,11 @@ pub struct ParsedRegions {
     /// `[seqno_min, seqno_max]` for the `scan_since_seqno` block-skip, kept
     /// parallel to the index so point reads pay nothing for it.
     pub seqno_bounds: Option<BlockHandle>,
+    /// Optional zone-map section (the `zone_map` section). Present only when the
+    /// zone-map policy is enabled; maps each data block's offset to its
+    /// per-column `(min, max, null_count, row_count)` stats for predicate-based
+    /// block-skip, kept parallel to the index so point reads pay nothing for it.
+    pub zone_map: Option<BlockHandle>,
     pub linked_blob_files: Option<BlockHandle>,
     pub metadata: BlockHandle,
     /// Mid-file backup of the meta block. Writer order:
@@ -146,6 +151,10 @@ impl ParsedRegions {
                 .transpose()?,
             seqno_bounds: toc
                 .section(b"seqno_bounds")
+                .map(toc_entry_to_handle)
+                .transpose()?,
+            zone_map: toc
+                .section(b"zone_map")
                 .map(toc_entry_to_handle)
                 .transpose()?,
             linked_blob_files: toc

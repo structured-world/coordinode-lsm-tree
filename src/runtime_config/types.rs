@@ -805,6 +805,16 @@ pub struct RuntimeConfig {
     /// current setting over time.
     pub seqno_in_index: bool,
 
+    /// Whether new SSTs carry the optional `zone_map` section: per-data-block
+    /// per-column statistics (for row blocks, the block's key min / max + row
+    /// count) that let a predicate scan skip blocks that cannot match without
+    /// reading them. Kept parallel to the index, so a point read pays nothing.
+    ///
+    /// Explicit opt-in, default `false` (no section emitted). Takes effect on
+    /// the next compaction / flush; existing SSTs keep whatever they were
+    /// written with, and a missing section just means no block-skip for that SST.
+    pub zone_map: bool,
+
     /// Index-size threshold (bytes) at or below which an SST's block index
     /// is written single-level; above it the index spills to a two-level
     /// (partitioned) layout. A single-level index is one block reached by a
@@ -856,9 +866,9 @@ pub struct RuntimeConfig {
     /// computes an admission state and the gated write path always admits, so
     /// there is zero overhead and behaviour is unchanged. When `true`, the
     /// engine maintains a cached read-only predicate (see
-    /// [`crate::Tree::write_admission`]) driven by [`Self::storage_limit_bytes`]
+    /// [`crate::AbstractTree::write_admission`]) driven by [`Self::storage_limit_bytes`]
     /// (and, once wired, the filesystem free-space probe), and the gated write
-    /// path ([`crate::Tree::try_insert`] / batch apply) declines writes with
+    /// path ([`crate::AbstractTree::try_insert`] / batch apply) declines writes with
     /// [`crate::Error::StorageFull`] while the tree is over budget.
     ///
     /// Toggle takes effect on the next admission check.
@@ -912,6 +922,7 @@ impl Default for RuntimeConfig {
             ecc_granularity: EccGranularity::Block,
             auto_heal: false,
             seqno_in_index: false,
+            zone_map: false,
             index_partition_spill_threshold: crate::table::writer::DEFAULT_SPILL_THRESHOLD,
             disable_cow_on_sst_files: true,
             use_reflink_for_checkpoint: true,

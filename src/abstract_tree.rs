@@ -149,7 +149,7 @@ pub trait AbstractTree: sealed::Sealed {
     /// over budget and should be treated as read-only.
     ///
     /// Opt-in: returns `Ok(())` unless
-    /// [`storage_admission_check`](crate::RuntimeConfig::storage_admission_check)
+    /// [`storage_admission_check`](crate::runtime_config::RuntimeConfig::storage_admission_check)
     /// is enabled. The predicate is computed (not latched), so once space is
     /// freed — the budget raised, a compaction reclaiming space, or disk freed —
     /// the next call admits again with no restart.

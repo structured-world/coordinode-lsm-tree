@@ -185,7 +185,7 @@ pub(crate) fn full_compaction_demand_bytes(version: &Version) -> u64 {
 ///
 /// `used_bytes` is the true on-disk file size of every live table and blob
 /// file (one metadata stat per file), not the writer's `Metadata::file_size`
-/// or [`crate::version::Version::blob_files`]' compressed-payload sum: those
+/// or `crate::version::Version::blob_files`' compressed-payload sum: those
 /// undercount the physical file by the meta block / footer / blob trailer.
 /// Statting matches the figure `Tree::create_checkpoint` reports, so the two
 /// agree on disk reality.

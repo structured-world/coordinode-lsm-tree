@@ -20,7 +20,7 @@
 //!   that load the same starting snapshot will see the second
 //!   `store` overwrite the first, losing the first writer's
 //!   mutation. Callers needing lost-update avoidance must serialize
-//!   at the call site (see [`RuntimeConfigHandle::update`]).
+//!   at the call site (see [`RuntimeConfigHandle::try_update`]).
 
 use super::types::RuntimeConfig;
 use alloc::sync::Arc;

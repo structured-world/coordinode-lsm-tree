@@ -1369,7 +1369,7 @@ impl DoubleEndedIterator for SeekableCell {
 /// per-SST readers or rebuilding the merge stack.
 ///
 /// Built once over a union range; [`Self::seek_to`], [`Self::seek_to_for_prev`],
-/// and [`Self::reposition`] move the leaf cursors in place (SST index re-seek /
+/// and `Self::reposition` move the leaf cursors in place (SST index re-seek /
 /// skiplist `seek_ge` / run-window recompute) while reusing the loser-tree
 /// merger, MVCC stream, and tombstone filter, so a tight seek loop does not
 /// reconstruct the pipeline.

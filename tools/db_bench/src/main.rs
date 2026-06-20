@@ -77,13 +77,6 @@ struct Cli {
     #[arg(long)]
     github_json: bool,
 
-    /// Suffix appended to every github-action-benchmark entry name. Lets one
-    /// run sweep several `--num` sizes into distinct, comparable dashboard
-    /// series (e.g. `--name-suffix " /100k"`) without colliding with the
-    /// default-size entries.
-    #[arg(long, default_value = "")]
-    name_suffix: String,
-
     /// Database directory path. If not set, a temporary directory is used.
     /// Note: some workloads (e.g. `prefixscan`, `mergerandom`) create their
     /// own temporary database (they require special tree configuration) and
@@ -393,7 +386,7 @@ fn run_single(
         // the host actually delivered and let the dashboard show
         // the absolute trend.
         github_entries.push(serde_json::json!({
-            "name": format!("{benchmark_name}{}", cli.name_suffix),
+            "name": benchmark_name.clone(),
             "value": s.ops_per_sec,
             "unit": "ops/sec",
             "extra": format!(

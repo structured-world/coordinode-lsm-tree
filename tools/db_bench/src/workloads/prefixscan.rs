@@ -1,14 +1,14 @@
 use crate::config::BenchConfig;
 use crate::db::{prefill_prefix_keys, read_seqno};
 use crate::reporter::Reporter;
-use crate::workloads::{run_threaded, Workload};
+use crate::workloads::{Workload, run_threaded};
 use lsm_tree::{
-    config::{BlockSizePolicy, CompressionPolicy},
     AbstractTree, AnyTree, Cache, Config, Guard, PrefixExtractor, SequenceNumberCounter,
+    config::{BlockSizePolicy, CompressionPolicy},
 };
 use rand::Rng;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
 pub struct PrefixScan;

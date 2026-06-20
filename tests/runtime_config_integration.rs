@@ -252,6 +252,68 @@ fn seqno_in_index_round_trips_through_disk_and_reopen() -> lsm_tree::Result<()> 
 }
 
 #[test]
+fn zone_map_round_trips_through_disk_and_reopen() -> lsm_tree::Result<()> {
+    // With `zone_map` enabled, the writer emits the parallel `zone_map` SST
+    // section (per-data-block stats). The data must read back identically:
+    // flush, point-read, reopen, point-read again. Reopen is the load-bearing
+    // step — it re-parses the on-disk index and the zone-map section from
+    // scratch, so a broken decode surfaces as a read failure.
+    let folder = get_tmp_folder();
+
+    {
+        let tree = open_tree(folder.path());
+        tree.update_runtime_config(|cfg| {
+            cfg.zone_map = true;
+        })?;
+
+        for i in 0..500u64 {
+            let key = format!("key{i:05}");
+            let value = format!("value{i:05}");
+            tree.insert(key.as_bytes(), value.as_bytes(), i);
+        }
+        tree.flush_active_memtable(0)?;
+
+        // The per-block zone-map path is only exercised with more than one data
+        // block; fail loudly if a future default collapses this to one block.
+        let data_blocks: u64 = tree
+            .current_version()
+            .iter_tables()
+            .map(|t| t.metadata.data_block_count)
+            .sum();
+        assert!(
+            data_blocks > 1,
+            "test must produce >1 data block to exercise the zone map, got {data_blocks}",
+        );
+
+        for i in 0..500u64 {
+            let key = format!("key{i:05}");
+            let got = tree.get(key.as_bytes(), SeqNo::MAX)?;
+            assert_eq!(
+                got.as_deref(),
+                Some(format!("value{i:05}").as_bytes()),
+                "post-flush read of {key} must return its value"
+            );
+        }
+    }
+
+    // Reopen: the index blocks and the zone-map section are decoded fresh from
+    // disk. A broken section decode would fail table open or corrupt reads.
+    let tree = open_tree(folder.path());
+    for i in 0..500u64 {
+        let key = format!("key{i:05}");
+        let got = tree.get(key.as_bytes(), SeqNo::MAX)?;
+        assert_eq!(
+            got.as_deref(),
+            Some(format!("value{i:05}").as_bytes()),
+            "post-reopen read of {key} must return its value"
+        );
+    }
+    assert!(tree.get(b"key99999", SeqNo::MAX)?.is_none());
+
+    Ok(())
+}
+
+#[test]
 fn at_insert_kv_checksum_round_trips_through_flush_and_reopen() -> lsm_tree::Result<()> {
     // KvChecksumComputePoint::AtInsert with a 4-byte algorithm: each entry's
     // digest is computed at insert and verified at flush against a recompute.

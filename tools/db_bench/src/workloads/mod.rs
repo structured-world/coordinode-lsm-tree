@@ -11,8 +11,8 @@ pub mod seekrandom;
 use crate::config::BenchConfig;
 use crate::reporter::Reporter;
 use lsm_tree::AnyTree;
-use std::sync::atomic::AtomicU64;
 use std::sync::Barrier;
+use std::sync::atomic::AtomicU64;
 
 /// All benchmark workloads implement this trait.
 pub trait Workload {

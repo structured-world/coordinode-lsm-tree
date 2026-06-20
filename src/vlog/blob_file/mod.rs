@@ -49,7 +49,7 @@ pub struct Inner {
     /// marked here with that absolute data-section offset; once every reader
     /// holding it drops, this view's [`Drop`] reclaims the consumed
     /// `[data_start, offset)` data frames via
-    /// [`Fs::punch_hole`](crate::fs::Fs::punch_hole) and LEAVES the file in
+    /// [`Fs::punch_hole`] and LEAVES the file in
     /// place (the restricted view still serves the suffix). Mirrors
     /// `table::Inner::punch_on_drop`. Distinct from [`Self::is_deleted`].
     pub(crate) punch_on_drop: portable_atomic::AtomicU64,
@@ -77,7 +77,7 @@ pub struct Inner {
     /// [`Table::install_background_deleter`](crate::Table) for the contract:
     /// when present (and no checkpoint pause is active) the [`Drop`] impl frees
     /// the blob file's blocks synchronously via
-    /// [`Fs::truncate_file`](crate::fs::Fs::truncate_file) and hands the
+    /// [`Fs::truncate_file`] and hands the
     /// directory-entry `unlink` to this deleter, off the foreground path.
     // std-only (the deleter spawns a thread); see Table::Inner for rationale.
     #[cfg(feature = "std")]
@@ -285,7 +285,7 @@ impl BlobFile {
     /// relocation loop installs the re-opened view in the new version and arms
     /// the prior view to punch its consumed prefix once its readers drain, so a
     /// stale blob file is reclaimed in place while the suffix keeps serving the
-    /// not-yet-relocated entries — the blob analog of [`Table::reopen_restricted`].
+    /// not-yet-relocated entries — the blob analog of [`Table::reopen_restricted`](crate::Table::reopen_restricted).
     ///
     /// # Errors
     ///

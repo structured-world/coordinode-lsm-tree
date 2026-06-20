@@ -152,7 +152,7 @@ fn compression_tag_byte(compression: CompressionType) -> u8 {
 /// Seal a (post-compression) block payload for the on-disk encryption envelope.
 ///
 /// Under zstd builds this is the AAD-bound `MetadataFrame ‖ BodyFrame` envelope
-/// ([`EncryptionProvider::encrypt_block_aad`]) binding the block identity +
+/// ([`EncryptionProvider::encrypt_block_aad`](crate::EncryptionProvider::encrypt_block_aad)) binding the block identity +
 /// transform context. Without zstd the wire-format frame is unavailable, so it
 /// falls back to the opaque `[nonce ‖ ciphertext ‖ tag]` form. `owned` is the
 /// compressor's output (reused in-place on the opaque path); `borrow` is the
@@ -206,7 +206,7 @@ fn encrypt_block_payload(
 
 /// Inverse of [`encrypt_block_payload`]: recover the plaintext from the on-disk
 /// envelope. Under zstd builds it verifies the AAD binding via
-/// [`EncryptionProvider::decrypt_block_aad`] (the reader supplies only
+/// [`EncryptionProvider::decrypt_block_aad`](crate::EncryptionProvider::decrypt_block_aad) (the reader supplies only
 /// `identity`; the transform fields are read back from the frame); without zstd
 /// it falls back to the opaque in-place `decrypt_vec`.
 fn decrypt_block_payload(

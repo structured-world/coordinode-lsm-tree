@@ -1,7 +1,7 @@
 use crate::config::BenchConfig;
 use crate::db::{fill_sequential_key, prefill_sequential, read_seqno};
 use crate::reporter::Reporter;
-use crate::workloads::{run_threaded, Workload};
+use crate::workloads::{Workload, run_threaded};
 use lsm_tree::{AbstractTree, AnyTree};
 use rand::Rng;
 use std::sync::atomic::{AtomicU64, Ordering};

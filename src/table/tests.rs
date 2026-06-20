@@ -3519,3 +3519,138 @@ fn parallel_compression_matches_serial_output() -> crate::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn zone_map_section_roundtrips_one_entry_per_block() -> crate::Result<()> {
+    // 200 keys with frequent block rotation force many data blocks, so the
+    // section must carry several entries that survive write + reopen.
+    let items: Vec<crate::InternalValue> = (0..200u32)
+        .map(|i| {
+            crate::InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                0,
+                crate::ValueType::Value,
+            )
+        })
+        .collect();
+
+    test_with_table(
+        &items,
+        |table| {
+            let zm = &table.zone_map;
+            assert!(!zm.is_empty(), "zone map should be populated when enabled");
+            assert!(
+                zm.len() >= 2,
+                "rotation should yield several blocks, got {}",
+                zm.len()
+            );
+            Ok(())
+        },
+        Some(20),
+        Some(|w: Writer| w.use_zone_map(true)),
+    )
+}
+
+#[test]
+fn zone_map_corrupt_section_falls_back_instead_of_failing_open() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+
+    let checksum = {
+        let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_zone_map(true);
+        for i in 0..200u32 {
+            if i % 20 == 0 {
+                writer.spill_block()?;
+            }
+            writer.write(crate::InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                b"v".to_vec(),
+                0,
+                crate::ValueType::Value,
+            ))?;
+        }
+        writer.finish()?.expect("table written").1
+    };
+
+    let recover = || -> crate::Result<Table> {
+        #[cfg(feature = "metrics")]
+        let metrics = Arc::new(Metrics::default());
+        Table::recover(
+            file.clone(),
+            checksum,
+            0,
+            0,
+            0,
+            Arc::new(Cache::with_capacity_bytes(1_000_000)),
+            Some(Arc::new(DescriptorTable::new(10))),
+            Arc::new(StdFs),
+            false,
+            false,
+            None,
+            #[cfg(zstd_any)]
+            None,
+            crate::comparator::default_comparator(),
+            #[cfg(feature = "metrics")]
+            metrics,
+        )
+    };
+
+    // First open: the zone-map section is present and populated.
+    let zm_handle = {
+        let table = recover()?;
+        assert!(!table.zone_map.is_empty(), "zone map should be populated");
+        table.regions.zone_map.expect("zone-map section present")
+    };
+
+    // Corrupt one byte inside the zone-map section block on disk so its
+    // checksum / AEAD rejects it on the next open.
+    let mut bytes = std::fs::read(&file)?;
+    let corrupt_at = usize::try_from(zm_handle.offset().0).expect("offset fits usize") + 4;
+    *bytes
+        .get_mut(corrupt_at)
+        .expect("corruption offset within file") ^= 0xFF;
+    std::fs::write(&file, &bytes)?;
+
+    // Second open: a corrupt OPTIONAL zone-map is derived, non-authoritative
+    // metadata — it must NOT fail table open. It degrades to no block-skip (an
+    // empty map), and the rest of the table still loads intact.
+    let table = recover()?;
+    assert!(
+        table.zone_map.is_empty(),
+        "corrupt zone-map section should disable block-skip, not fail open"
+    );
+    assert_eq!(
+        table.metadata.item_count, 200,
+        "the rest of the table must still load with a corrupt zone map"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn zone_map_absent_without_policy() -> crate::Result<()> {
+    let items: Vec<crate::InternalValue> = (0..50u32)
+        .map(|i| {
+            crate::InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                b"v".to_vec(),
+                0,
+                crate::ValueType::Value,
+            )
+        })
+        .collect();
+
+    test_with_table(
+        &items,
+        |table| {
+            assert!(
+                table.zone_map.is_empty(),
+                "no zone map should be loaded without the policy"
+            );
+            Ok(())
+        },
+        None,
+        None::<fn(Writer) -> Writer>,
+    )
+}

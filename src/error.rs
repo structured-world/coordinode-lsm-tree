@@ -366,9 +366,9 @@ pub enum Error {
     /// A write was declined by the storage admission gate because accepting it
     /// could push the tree's live footprint past its effective budget.
     ///
-    /// Only produced when [`storage_admission_check`](crate::RuntimeConfig::storage_admission_check)
+    /// Only produced when [`storage_admission_check`](crate::runtime_config::RuntimeConfig::storage_admission_check)
     /// is enabled. The predicate is computed, not latched: raising
-    /// [`storage_limit_bytes`](crate::RuntimeConfig::storage_limit_bytes),
+    /// [`storage_limit_bytes`](crate::runtime_config::RuntimeConfig::storage_limit_bytes),
     /// freeing disk, or a compaction reclaiming space clears the read-only
     /// state on the next check with no restart. Internal flush / compaction are
     /// never gated (reserved headroom), so the engine can always reclaim space.

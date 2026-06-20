@@ -128,6 +128,18 @@ pub struct Inner {
     /// per-entry filter. Read only by the seqno-scoped scan path.
     pub(crate) seqno_bounds: crate::table::seqno_bounds::SeqnoBoundsMap,
 
+    /// Per-data-block zone map, loaded on open from the optional `zone_map`
+    /// section. Empty when the table has none (zone-map policy off), so a
+    /// predicate scan falls back to reading every block. Read only by the
+    /// block-skip scan path.
+    // Gated to non-test builds (the round-trip unit test reads it); kept as
+    // `expect` so it self-removes once the live block-skip reader reads it.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the columnar block-skip scan path")
+    )]
+    pub(crate) zone_map: crate::table::zone_map::ZoneMap,
+
     /// Retrieval-ribbon locator, loaded on open from the optional `locator`
     /// section. `Some` only when the table was written with a locator policy
     /// enabled; lets a point read resolve a key to its data block in O(1),
@@ -146,7 +158,7 @@ pub struct Inner {
     /// [`Table::install_deletion_pause`](super::Table::install_deletion_pause)
     /// after the table is registered with a tree. When `Some` and active,
     /// the [`Drop`] impl defers the underlying `remove_file` call so that
-    /// an in-progress [`Tree::create_checkpoint`](crate::Tree::create_checkpoint)
+    /// an in-progress [`Tree::create_checkpoint`](crate::AbstractTree::create_checkpoint)
     /// can hard-link the file before it disappears.
     // `once_cell::race::OnceBox` rather than `std::sync::OnceLock` so
     // this field doesn't pin the type to `std` — OnceBox is no-std +

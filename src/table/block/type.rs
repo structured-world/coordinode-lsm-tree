@@ -54,6 +54,13 @@ pub enum BlockType {
     /// block-skip without bloating the index entries. Absent unless
     /// `seqno_in_index` is on.
     SeqnoBounds,
+    /// Optional per-table zone-map section: maps each data block's file offset
+    /// to per-column `(min, max, null_count, row_count)` statistics, letting a
+    /// range / analytical scan skip a block whose stats prove no predicate
+    /// match without decoding it. Kept parallel to the index (like
+    /// [`Self::SeqnoBounds`]) so point reads never load it. Off by default;
+    /// absent unless the zone-map policy is enabled.
+    ZoneMap,
 }
 
 // Wire tags are renumbered contiguously `0..=6` for V5. The previous
@@ -77,6 +84,7 @@ impl From<BlockType> for u8 {
             BlockType::BlockLayout => 7,
             BlockType::Locator => 8,
             BlockType::SeqnoBounds => 9,
+            BlockType::ZoneMap => 10,
         }
     }
 }
@@ -96,6 +104,7 @@ impl TryFrom<u8> for BlockType {
             7 => Ok(Self::BlockLayout),
             8 => Ok(Self::Locator),
             9 => Ok(Self::SeqnoBounds),
+            10 => Ok(Self::ZoneMap),
             _ => Err(crate::Error::InvalidTag(("BlockType", value))),
         }
     }
@@ -124,6 +133,7 @@ mod tests {
             (7, BlockType::BlockLayout),
             (8, BlockType::Locator),
             (9, BlockType::SeqnoBounds),
+            (10, BlockType::ZoneMap),
         ] {
             assert_eq!(
                 u8::from(variant),
@@ -142,9 +152,9 @@ mod tests {
     fn block_type_rejects_unknown_wire_tag() {
         // Forward-incompatibility guard: a tag this build doesn't know
         // (newer writer, older reader) must surface as a typed error,
-        // not a silent coercion to a known variant. 10 is the first
+        // not a silent coercion to a known variant. 11 is the first
         // unused tag past the contiguous range.
-        assert!(BlockType::try_from(10).is_err());
+        assert!(BlockType::try_from(11).is_err());
         assert!(BlockType::try_from(255).is_err());
     }
 }

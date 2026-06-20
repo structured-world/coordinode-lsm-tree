@@ -60,11 +60,11 @@
 //!
 //! ## Workload coverage
 //!
-//! - `write_throughput/{1k,10k,100k}` — bulk insert N keys, 256-byte
+//! - `write_throughput/{1k,10k,70k}` — bulk insert N keys, 256-byte
 //!   values, random keys. Cold-start: each iteration opens an empty
 //!   engine, writes N, flushes. Dominated by the fixed open + flush
 //!   cost at small N.
-//! - `point_read/{1k,10k,100k}` — read N random keys from an engine
+//! - `point_read/{1k,10k,70k}` — read N random keys from an engine
 //!   pre-populated with N keys and flushed to disk. Warm: the engine
 //!   is opened + populated + flushed ONCE outside the timed window,
 //!   so the measurement is steady-state read latency (block cache +
@@ -75,13 +75,13 @@
 //!   0.75) and an `ours-ribbon` series (retrieval-ribbon locator: key ->
 //!   block + restart in O(1), skipping both the index-block and in-block
 //!   searches) so every index strategy is compared head-to-head on one plot.
-//! - `range_scan/{1k,10k,100k}` — full forward scan reading every value
+//! - `range_scan/{1k,10k,70k}` — full forward scan reading every value
 //!   from a warm, pre-populated engine. Steady-state sequential-scan
 //!   throughput (block decode + iterator advance).
-//! - `seek_random/{1k,10k,100k}` — seek to each (scattered) key and read
+//! - `seek_random/{1k,10k,70k}` — seek to each (scattered) key and read
 //!   the value at the cursor, on a warm engine. Seek-then-read latency
 //!   (index descent + cursor positioning + block decode).
-//! - `overwrite/{1k,10k,100k}` — rewrite the whole keyspace into an engine
+//! - `overwrite/{1k,10k,70k}` — rewrite the whole keyspace into an engine
 //!   that already holds one copy (the first copy is written outside the
 //!   timed window). Overwrite cost (memtable churn over existing keys +
 //!   a superseding flush), distinct from cold first-insert.
@@ -708,12 +708,12 @@ fn write_throughput_variant(c: &mut Criterion, group_name: &str, compression: Co
         Compression::None => Some(skv_runtime().expect("surrealkv: tokio runtime")),
         Compression::Zstd22 => None,
     };
-    for &n in &[1_000_u64, 10_000_u64, 100_000_u64] {
-        // The 100k working set exceeds the default 16 MiB block cache, so each
+    for &n in &[1_000_u64, 10_000_u64, 70_000_u64] {
+        // The 70k working set exceeds the default 16 MiB block cache, so each
         // pass is far slower (scattered miss + decode). Drop to the criterion
         // sample-size floor there to keep the variant's wall-clock bounded while
         // the reported median stays stable; smaller sets keep the default 100.
-        group.sample_size(if n >= 100_000 { 10 } else { 100 });
+        group.sample_size(if n >= 70_000 { 10 } else { 100 });
         // Precompute the keys + values ONCE per `n` (outside the
         // criterion warmup / measurement loop), so the timed body
         // does no per-iteration allocation.
@@ -837,12 +837,12 @@ fn point_read_variant(
     }
 
     let mut group = c.benchmark_group(group_name);
-    for &n in &[1_000_u64, 10_000_u64, 100_000_u64] {
-        // The 100k working set exceeds the default 16 MiB block cache, so each
+    for &n in &[1_000_u64, 10_000_u64, 70_000_u64] {
+        // The 70k working set exceeds the default 16 MiB block cache, so each
         // pass is far slower (scattered miss + decode). Drop to the criterion
         // sample-size floor there to keep the variant's wall-clock bounded while
         // the reported median stays stable; smaller sets keep the default 100.
-        group.sample_size(if n >= 100_000 { 10 } else { 100 });
+        group.sample_size(if n >= 70_000 { 10 } else { 100 });
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
         for &(label, engine, strategy, row_cache) in &series {
@@ -1012,12 +1012,12 @@ fn bench_range_scan(c: &mut Criterion) {
 /// advance), not setup cost.
 fn range_scan_variant(c: &mut Criterion, group_name: &str, compression: Compression) {
     let mut group = c.benchmark_group(group_name);
-    for &n in &[1_000_u64, 10_000_u64, 100_000_u64] {
-        // The 100k working set exceeds the default 16 MiB block cache, so each
+    for &n in &[1_000_u64, 10_000_u64, 70_000_u64] {
+        // The 70k working set exceeds the default 16 MiB block cache, so each
         // pass is far slower (scattered miss + decode). Drop to the criterion
         // sample-size floor there to keep the variant's wall-clock bounded while
         // the reported median stays stable; smaller sets keep the default 100.
-        group.sample_size(if n >= 100_000 { 10 } else { 100 });
+        group.sample_size(if n >= 70_000 { 10 } else { 100 });
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
         for &engine in engines_for(compression) {
@@ -1091,12 +1091,12 @@ fn bench_seek_random(c: &mut Criterion) {
 /// `seekrandom` workload.
 fn seek_random_variant(c: &mut Criterion, group_name: &str, compression: Compression) {
     let mut group = c.benchmark_group(group_name);
-    for &n in &[1_000_u64, 10_000_u64, 100_000_u64] {
-        // The 100k working set exceeds the default 16 MiB block cache, so each
+    for &n in &[1_000_u64, 10_000_u64, 70_000_u64] {
+        // The 70k working set exceeds the default 16 MiB block cache, so each
         // pass is far slower (scattered miss + decode). Drop to the criterion
         // sample-size floor there to keep the variant's wall-clock bounded while
         // the reported median stays stable; smaller sets keep the default 100.
-        group.sample_size(if n >= 100_000 { 10 } else { 100 });
+        group.sample_size(if n >= 70_000 { 10 } else { 100 });
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
         for &engine in engines_for(compression) {
@@ -1185,12 +1185,12 @@ fn bench_overwrite(c: &mut Criterion) {
 /// so each measurement starts from the same one-copy state.
 fn overwrite_variant(c: &mut Criterion, group_name: &str, compression: Compression) {
     let mut group = c.benchmark_group(group_name);
-    for &n in &[1_000_u64, 10_000_u64, 100_000_u64] {
-        // The 100k working set exceeds the default 16 MiB block cache, so each
+    for &n in &[1_000_u64, 10_000_u64, 70_000_u64] {
+        // The 70k working set exceeds the default 16 MiB block cache, so each
         // pass is far slower (scattered miss + decode). Drop to the criterion
         // sample-size floor there to keep the variant's wall-clock bounded while
         // the reported median stays stable; smaller sets keep the default 100.
-        group.sample_size(if n >= 100_000 { 10 } else { 100 });
+        group.sample_size(if n >= 70_000 { 10 } else { 100 });
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
         for &engine in engines_for(compression) {

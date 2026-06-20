@@ -113,7 +113,8 @@ pub fn load_block(
             | BlockType::ManifestFooter
             | BlockType::BlockLayout
             | BlockType::Locator
-            | BlockType::SeqnoBounds => {}
+            | BlockType::SeqnoBounds
+            | BlockType::ZoneMap => {}
         }
 
         return Ok(block);
@@ -207,7 +208,8 @@ pub fn load_block(
         | BlockType::ManifestFooter
         | BlockType::BlockLayout
         | BlockType::Locator
-        | BlockType::SeqnoBounds => {}
+        | BlockType::SeqnoBounds
+        | BlockType::ZoneMap => {}
     }
 
     // ECC recovered this block's payload from parity. The bytes returned below

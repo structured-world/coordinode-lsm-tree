@@ -190,7 +190,7 @@ impl Level {
         }
     }
 
-    /// Like [`aggregate_key_range`], but uses a custom comparator for key ordering.
+    /// Like [`Self::aggregate_key_range`], but uses a custom comparator for key ordering.
     ///
     /// Per-run aggregation via [`Run::aggregate_key_range`] is comparator-correct
     /// because runs are sorted in comparator order (ensured by `push_cmp`), so

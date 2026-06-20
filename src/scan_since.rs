@@ -8,7 +8,7 @@
 
 use crate::{SeqNo, Slice};
 
-/// A single change event emitted by [`Tree::scan_since_seqno`].
+/// A single change event emitted by [`Tree::scan_since_seqno`](crate::Tree::scan_since_seqno).
 ///
 /// Each event carries the sequence number at which the change was committed.
 /// Events are emitted in increasing seqno order, so a downstream consumer

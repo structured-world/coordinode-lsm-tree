@@ -53,6 +53,9 @@ struct HandleMeta {
     last_seqno: crate::SeqNo,
     seqno_bounds: Option<(u64, u64)>,
     item_count: usize,
+    /// The block's first (min) user key, captured for the zone-map synthetic
+    /// column. `Some` only when the zone-map policy is on (else no clone).
+    zone_block_min: Option<UserKey>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, core::hash::Hash)]
@@ -148,6 +151,13 @@ pub struct Writer {
     /// Empty when `use_seqno_in_index` is off (section absent, zero extra bytes).
     seqno_bounds_section: Vec<(BlockOffset, (u64, u64))>,
 
+    /// Per-data-block zone-map stats, accumulated in write order when
+    /// `use_zone_map` is on and serialized into the optional `zone_map` SST
+    /// section at finish. Kept parallel to the index (like
+    /// [`Self::seqno_bounds_section`]) so a point read never loads it. Empty when
+    /// `use_zone_map` is off (section absent, zero extra bytes).
+    zone_map_section: Vec<(BlockOffset, Vec<crate::table::zone_map::ColumnStats>)>,
+
     /// Resolved retrieval-ribbon locator settings for this table, or `None`
     /// (default) when the level's [`crate::config::LocatorPolicy`] is disabled.
     /// `Some` makes the writer accumulate a per-key locator and emit the
@@ -193,7 +203,7 @@ pub struct Writer {
     /// When `Some((policy, algo))`, each data block whose `(level,
     /// table_id)` satisfies `policy.applies` is emitted with a per-entry
     /// checksum footer under `algo` and the `KV_CHECKSUM_FOOTER` flag set
-    /// (the block role stays [`BlockType::Data`]). Wired from the tree's
+    /// (the block role stays [`BlockType::Data`](crate::table::block::BlockType::Data)). Wired from the tree's
     /// runtime `kv_checksums` config via [`Self::use_kv_checksums`].
     kv_checksum: Option<(
         crate::runtime_config::KvChecksumPolicy,
@@ -210,6 +220,15 @@ pub struct Writer {
     /// runtime config into this field via [`Self::use_seqno_in_index`]
     /// before the first key is added.
     use_seqno_in_index: bool,
+
+    /// Zone-map opt-in (the zone-map policy). When `true`, the writer records
+    /// each data block's per-column stats (for row blocks: a single synthetic
+    /// column with the block's key min / max + row count) and emits them in the
+    /// optional parallel `zone_map` SST section, letting a predicate scan skip
+    /// blocks that cannot match without reading them. Default `false` (no section
+    /// emitted). Caller wires the live runtime config in via
+    /// [`Self::use_zone_map`] before the first key is added.
+    use_zone_map: bool,
 
     /// Pre-trained zstd dictionary for dictionary compression
     #[cfg(zstd_any)]
@@ -298,6 +317,7 @@ impl Writer {
 
             block_layouts: Vec::new(),
             seqno_bounds_section: Vec::new(),
+            zone_map_section: Vec::new(),
 
             locator: None,
             locators: Vec::new(),
@@ -329,6 +349,7 @@ impl Writer {
 
             kv_checksum: None,
             use_seqno_in_index: false,
+            use_zone_map: false,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -646,6 +667,19 @@ impl Writer {
         self
     }
 
+    /// Enables the zone-map section: the writer records each data block's stats
+    /// (for row blocks, a synthetic column with the block's key min / max + row
+    /// count) and emits the optional `zone_map` section at finish, for
+    /// predicate-based block-skip. Must be fixed before the first key (the
+    /// section must cover every block); a mid-write toggle would leave some
+    /// blocks unrecorded. Default off.
+    #[must_use]
+    pub fn use_zone_map(mut self, zone_map: bool) -> Self {
+        self.assert_not_started("use_zone_map");
+        self.use_zone_map = zone_map;
+        self
+    }
+
     /// Wires the resolved per-level retrieval-ribbon locator policy entry.
     ///
     /// `Enabled` makes the writer accumulate a per-key `(block_id, slot)`
@@ -841,6 +875,13 @@ impl Writer {
                     (min.min(e.key.seqno), max.max(e.key.seqno))
                 })
         });
+        // Block's first (min) key for the zone-map synthetic column; cloned only
+        // when the policy is on. The chunk is non-empty here (early return
+        // above), so `first()` is `Some`.
+        let zone_block_min = self
+            .use_zone_map
+            .then(|| self.chunk.first().map(|e| e.key.user_key.clone()))
+            .flatten();
 
         // Decide per-block whether to emit the per-KV checksum footer.
         // `kv_checksum` is None unless the tree opted in; even then only blocks
@@ -876,6 +917,7 @@ impl Writer {
                 last_seqno,
                 seqno_bounds,
                 item_count,
+                zone_block_min,
             });
             // Track in-flight uncompressed bytes for the rotation size hint
             // (file_pos only advances once the block is drained and written).
@@ -938,6 +980,7 @@ impl Writer {
             last_seqno,
             seqno_bounds,
             item_count,
+            zone_block_min,
         )?;
 
         // IMPORTANT: Clear chunk after everything else
@@ -984,6 +1027,10 @@ impl Writer {
     /// Records a just-written data block: index entry (with optional seqno
     /// bounds), metadata counters, back link, and the running last key. Single
     /// source of truth for both the serial and parallel write paths.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cohesive per-written-block fields; a param struct adds indirection without clarity"
+    )]
     fn register_written_block(
         &mut self,
         header: crate::table::block::Header,
@@ -992,6 +1039,7 @@ impl Writer {
         last_seqno: crate::SeqNo,
         seqno_bounds: Option<(u64, u64)>,
         item_count: usize,
+        zone_block_min: Option<UserKey>,
     ) -> crate::Result<()> {
         self.meta.uncompressed_size += u64::from(header.uncompressed_length);
 
@@ -1019,6 +1067,23 @@ impl Writer {
         if let Some((seqno_min, seqno_max)) = seqno_bounds {
             self.seqno_bounds_section
                 .push((self.meta.file_pos, (seqno_min, seqno_max)));
+        }
+        // Zone-map entry for this block (parallel section keyed by file offset,
+        // like seqno_bounds). A row block records one synthetic column with the
+        // block's key range; the row count never approaches `u32::MAX` (a data
+        // block holds at most a few thousand entries), so the cap is defensive.
+        if let Some(min_key) = zone_block_min {
+            let row_count = u32::try_from(item_count).unwrap_or(u32::MAX);
+            let columns = alloc::vec![crate::table::zone_map::ColumnStats {
+                column_id: 0,
+                type_tag: 0,
+                codec_id: 0,
+                null_count: 0,
+                row_count,
+                min: min_key.to_vec(),
+                max: last_key.to_vec(),
+            }];
+            self.zone_map_section.push((self.meta.file_pos, columns));
         }
         self.index_writer.register_data_block(handle)?;
 
@@ -1083,6 +1148,7 @@ impl Writer {
             meta.last_seqno,
             meta.seqno_bounds,
             meta.item_count,
+            meta.zone_block_min,
         )
     }
 
@@ -1253,6 +1319,39 @@ impl Writer {
                 crate::table::block::BlockIdentity {
                     table_id: self.table_id,
                     block_type: crate::table::block::BlockType::SeqnoBounds,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                &{
+                    let t = match self.encryption.as_deref() {
+                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                        None => crate::table::block::BlockTransform::PLAIN,
+                    };
+                    if let Some(ecc) = self.ecc {
+                        t.with_ecc(ecc)
+                    } else {
+                        t
+                    }
+                },
+            )?;
+        }
+
+        // Write the optional zone-map section (only when the policy is on and at
+        // least one block was written). Parallel to the index, keyed by
+        // data-block offset; absent otherwise, so a point read pays nothing.
+        if !self.zone_map_section.is_empty() {
+            self.file_writer.start("zone_map")?;
+            self.block_buffer.clear();
+            crate::table::zone_map::encode_zone_map(
+                &mut self.block_buffer,
+                &self.zone_map_section,
+            )?;
+            Block::write_into(
+                &mut self.file_writer,
+                &self.block_buffer,
+                crate::table::block::BlockIdentity {
+                    table_id: self.table_id,
+                    block_type: crate::table::block::BlockType::ZoneMap,
                     dict_id: 0,
                     window_log: 0,
                 },

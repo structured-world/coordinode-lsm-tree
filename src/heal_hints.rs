@@ -21,7 +21,7 @@
 //! that) so the read path can record a hint in O(log n) (a `BTreeSet` insert,
 //! n = pending SSTs, only on the cold corrected path), and the compaction picker
 //! drains the whole set in one place. The set dedups by
-//! [`GlobalTableId`](crate::GlobalTableId): many corrected block-reads against
+//! [`GlobalTableId`]: many corrected block-reads against
 //! the same SST enqueue it once.
 
 use crate::GlobalTableId;

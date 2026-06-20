@@ -13,13 +13,13 @@
 //!   lock-free read path: a *read* only bumps the entry's frequency counter and
 //!   never reorders a queue (promotion small→main happens lazily at eviction
 //!   time, keyed on that counter), unlike LRU which must move the entry to the
-//!   MRU end on every hit. The frequency counter is an [`AtomicU8`], so reads
+//!   MRU end on every hit. The frequency counter is an [`AtomicU8`](core::sync::atomic::AtomicU8), so reads
 //!   run under a *shared* lock and proceed concurrently.
 //! - **Concurrency:** N shards (key hash high-bits → shard), each behind an
 //!   `RwLock` that is `parking_lot::RwLock` under `std` (small, userspace
 //!   fast-path) and `spin::RwLock` under `no_std`. `get` / `peek` take the read
 //!   lock; `insert` / `remove` / eviction take the write lock. The total
-//!   resident weight is an [`AtomicU64`] so `size()` is lock-free.
+//!   resident weight is an [`AtomicU64`](core::sync::atomic::AtomicU64) so `size()` is lock-free.
 //!
 //! Full lock-free eviction (concurrent S3-FIFO queues with epoch reclamation)
 //! was rejected: it is `std`-only (no mature `no_std` epoch GC) and a large UB

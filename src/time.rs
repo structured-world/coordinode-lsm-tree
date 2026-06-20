@@ -10,7 +10,7 @@ use core::time::Duration;
 /// blob files, and for FIFO TTL expiry) through this trait. Under `std` the
 /// built-in [`SystemClock`] is used automatically. Under `no_std` there is no
 /// ambient system clock, so a consumer (e.g. a WASM host exposing `Date.now()`)
-/// injects one once via [`set_clock`] before opening a tree.
+/// injects one once via `set_clock` before opening a tree.
 ///
 /// # Examples
 ///
@@ -63,7 +63,7 @@ impl Clock for SystemClock {
 /// Gets the unix timestamp as a duration (wall-clock time since the epoch).
 ///
 /// Reads through the active [`Clock`]: the built-in [`SystemClock`] under
-/// `std`, or the caller-registered clock under `no_std` (see [`set_clock`]).
+/// `std`, or the caller-registered clock under `no_std` (see `set_clock`).
 /// Until a `no_std` clock is registered the value is [`Duration::ZERO`]
 /// (epoch), which disables TTL expiry rather than expiring everything.
 pub fn unix_timestamp() -> Duration {

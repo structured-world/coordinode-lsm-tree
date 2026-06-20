@@ -56,8 +56,8 @@ impl KeyRange {
 
     /// Returns `true` if the key falls within this key range.
     ///
-    /// Uses lexicographic ordering. See [`overlaps_with_key_range_cmp`] and
-    /// [`contains_range_cmp`] for custom comparator support; a `contains_key_cmp`
+    /// Uses lexicographic ordering. See [`Self::overlaps_with_key_range_cmp`] and
+    /// [`Self::contains_range_cmp`] for custom comparator support; a `contains_key_cmp`
     /// variant can be added when needed (#116).
     #[must_use]
     pub fn contains_key(&self, key: &[u8]) -> bool {
@@ -73,7 +73,7 @@ impl KeyRange {
         start1 <= start2 && end1 >= end2
     }
 
-    /// Like [`contains_range`], but uses a custom comparator for key ordering.
+    /// Like [`Self::contains_range`], but uses a custom comparator for key ordering.
     #[must_use]
     pub fn contains_range_cmp(
         &self,
@@ -94,7 +94,7 @@ impl KeyRange {
         end1 >= start2 && start1 <= end2
     }
 
-    /// Like [`overlaps_with_key_range`], but uses a custom comparator for key ordering.
+    /// Like [`Self::overlaps_with_key_range`], but uses a custom comparator for key ordering.
     #[must_use]
     pub fn overlaps_with_key_range_cmp(
         &self,
@@ -265,7 +265,7 @@ impl KeyRange {
         Self(min.clone(), max.clone())
     }
 
-    /// Like [`aggregate`], but uses a custom comparator for key ordering.
+    /// Like [`Self::aggregate`], but uses a custom comparator for key ordering.
     pub fn aggregate_cmp<'a>(
         mut iter: impl Iterator<Item = &'a Self>,
         cmp: &dyn crate::comparator::UserComparator,

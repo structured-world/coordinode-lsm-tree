@@ -8,7 +8,7 @@
 //! bulk deallocation when the memtable is dropped.  Concurrent skiplist
 //! traversal is lock-free (atomic loads on next-pointers); inserts use CAS with
 //! retry on tower links.  Values are stored in a lock-free segmented
-//! [`ValueStore`](super::value_store::ValueStore) — reads are wait-free.
+//! [`ValueStore`] — reads are wait-free.
 //!
 //! The design follows the arena-skiplist pattern used by Pebble/CockroachDB
 //! and Badger, adapted for Rust's ownership model and the lsm-tree
@@ -729,7 +729,7 @@ impl SkipMap {
         unsafe { self.tower_atomic(node, level).load(Ordering::Acquire) }
     }
 
-    /// The first data node (head.next[0]), or UNSET if empty.
+    /// The first data node (`head.next[0]`), or UNSET if empty.
     fn first_node(&self) -> u32 {
         self.next_at(self.head, 0)
     }
@@ -768,7 +768,7 @@ impl SkipMap {
     /// Compares two nodes by key without allocating (reads raw arena bytes).
     ///
     /// Ordering: `(user_key via comparator, Reverse(seqno))`.  `value_type` is
-    /// intentionally excluded — it is not part of [`InternalKey::Ord`] or
+    /// intentionally excluded — it is not part of `InternalKey::Ord` or
     /// [`InternalKey::compare_with`], and `(user_key, seqno)` is unique per entry.
     fn compare_nodes(&self, a: u32, b: u32) -> CmpOrdering {
         let a_uk = self.node_user_key_bytes(a);
