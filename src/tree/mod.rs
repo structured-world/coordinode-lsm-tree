@@ -991,6 +991,137 @@ impl AbstractTree for Tree {
             .sum()
     }
 
+    fn approximate_range_stats<K: AsRef<[u8]>, R: core::ops::RangeBounds<K>>(
+        &self,
+        range: R,
+        seqno: SeqNo,
+    ) -> crate::Result<crate::ApproximateRangeStats> {
+        use crate::table::block_index::BlockIndex;
+        use core::ops::Bound;
+
+        let lo: Bound<&[u8]> = match range.start_bound() {
+            Bound::Included(k) => Bound::Included(k.as_ref()),
+            Bound::Excluded(k) => Bound::Excluded(k.as_ref()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let hi: Bound<&[u8]> = match range.end_bound() {
+            Bound::Included(k) => Bound::Included(k.as_ref()),
+            Bound::Excluded(k) => Bound::Excluded(k.as_ref()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let bounds = (lo, hi);
+
+        let mut bytes: u64 = 0;
+        let mut key_count: u64 = 0;
+
+        // SST contribution: interpolate data-block offsets at the boundaries
+        // (block granularity), no data-block reads. For a KV-separated SST the
+        // referenced blob bytes are apportioned by the same in-range fraction.
+        let version = self.current_version();
+        for table in version.iter_tables() {
+            if !table.metadata.key_range.overlaps_with_bounds(&bounds) {
+                continue;
+            }
+            // data_end = the data section's byte extent = last data block's end.
+            let Some(last) = table.block_index.iter().next_back() else {
+                continue;
+            };
+            let last = last?;
+            let data_end = *last.offset() + u64::from(last.size());
+            if data_end == 0 {
+                continue;
+            }
+
+            // Block offset at/after a boundary key; the data-section end when the
+            // bound is unbounded (lo → 0 start of data) or past the last key.
+            let offset_at = |key: &[u8]| -> crate::Result<u64> {
+                let Some(mut iter) = table.block_index.forward_reader(key, seqno) else {
+                    return Ok(data_end);
+                };
+                match iter.next() {
+                    Some(handle) => Ok(*handle?.offset()),
+                    None => Ok(data_end),
+                }
+            };
+            let off_lo = match lo {
+                Bound::Included(k) | Bound::Excluded(k) => offset_at(k)?,
+                Bound::Unbounded => 0,
+            };
+            let off_hi = match hi {
+                Bound::Included(k) | Bound::Excluded(k) => offset_at(k)?,
+                Bound::Unbounded => data_end,
+            };
+            let idx_bytes = off_hi.saturating_sub(off_lo);
+            if idx_bytes == 0 {
+                continue;
+            }
+
+            // fraction = idx_bytes / data_end, in u128 to avoid overflow. For a
+            // standard tree `idx_bytes` already includes the inline values. For a
+            // KV-separated SST it covers only the key + pointer bytes, so the
+            // SST's referenced blob bytes (recorded per-SST at both flush and
+            // compaction) are apportioned by the same in-range fraction; blob
+            // files are not key-indexed, so this fraction is the finest estimate
+            // possible without reading data blocks.
+            let num = u128::from(idx_bytes);
+            let den = u128::from(data_end);
+            let blob_bytes = table.referenced_blob_bytes()?;
+            let sst_blob = u64::try_from(u128::from(blob_bytes) * num / den).unwrap_or(u64::MAX);
+            let in_range_entries = u64::try_from(u128::from(table.metadata.item_count) * num / den)
+                .unwrap_or(u64::MAX);
+            bytes = bytes.saturating_add(idx_bytes).saturating_add(sst_blob);
+            key_count = key_count.saturating_add(in_range_entries);
+        }
+
+        // Memtable contribution: the in-range fraction of each memtable's
+        // approximate size (skiplist range count over the internal-key range).
+        let super_version = self.version_history.read().latest_version();
+        let mt_range = (
+            match lo {
+                Bound::Included(k) => {
+                    Bound::Included(InternalKey::new(k, SeqNo::MAX, crate::ValueType::Tombstone))
+                }
+                Bound::Excluded(k) => {
+                    Bound::Excluded(InternalKey::new(k, 0, crate::ValueType::Tombstone))
+                }
+                Bound::Unbounded => Bound::Unbounded,
+            },
+            match hi {
+                Bound::Included(k) => {
+                    Bound::Included(InternalKey::new(k, 0, crate::ValueType::Value))
+                }
+                Bound::Excluded(k) => {
+                    Bound::Excluded(InternalKey::new(k, SeqNo::MAX, crate::ValueType::Value))
+                }
+                Bound::Unbounded => Bound::Unbounded,
+            },
+        );
+        let estimate = |mt: &crate::Memtable| -> (u64, u64) {
+            let total = mt.len() as u64;
+            if total == 0 {
+                return (0, 0);
+            }
+            let count = mt.range_internal(mt_range.clone()).count() as u64;
+            if count == 0 {
+                return (0, 0);
+            }
+            let mt_bytes =
+                u64::try_from(u128::from(mt.size()) * u128::from(count) / u128::from(total))
+                    .unwrap_or(u64::MAX);
+            (mt_bytes, count)
+        };
+        let (b, c) = estimate(&super_version.active_memtable);
+        bytes = bytes.saturating_add(b);
+        key_count = key_count.saturating_add(c);
+        for mt in super_version.sealed_memtables.iter() {
+            let (b, c) = estimate(mt);
+            bytes = bytes.saturating_add(b);
+            key_count = key_count.saturating_add(c);
+        }
+
+        Ok(crate::ApproximateRangeStats { bytes, key_count })
+    }
+
     fn get_highest_memtable_seqno(&self) -> Option<SeqNo> {
         let version = self.version_history.read().latest_version();
 

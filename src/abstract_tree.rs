@@ -673,6 +673,54 @@ pub trait AbstractTree: sealed::Sealed {
     /// Returns the disk space usage.
     fn disk_space(&self) -> u64;
 
+    /// Estimates the on-disk bytes and entry count contained in `range` at
+    /// `seqno`, WITHOUT reading any data block.
+    ///
+    /// The estimate interpolates each overlapping SST's data-block offsets at
+    /// the range boundaries (block granularity) and adds the active + sealed
+    /// memtables' in-range share. For a KV-separated tree the per-SST blob
+    /// bytes are apportioned by the same in-range fraction (blob files are not
+    /// key-indexed, so a finer estimate is impossible without reading data).
+    /// Intended for query planning (split-point selection, cost-based join
+    /// ordering), not exact accounting; accuracy is typically within ~10-15%
+    /// on roughly-uniform data.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lsm_tree::Error as TreeError;
+    /// use lsm_tree::{AbstractTree, Config};
+    ///
+    /// let folder = tempfile::tempdir()?;
+    /// let tree = Config::new(&folder, Default::default(), Default::default()).open()?;
+    /// for i in 0..100u32 {
+    ///     tree.insert(format!("k{i:04}"), "value", 0);
+    /// }
+    /// tree.flush_active_memtable(0)?;
+    ///
+    /// // The full range covers every entry exactly once it is all flushed —
+    /// // estimated without reading a single data block.
+    /// let all = tree.approximate_range_stats::<&str, _>(.., 1)?;
+    /// assert_eq!(all.key_count, tree.approximate_len() as u64);
+    /// assert!(all.bytes > 0);
+    ///
+    /// // A range past every key is empty.
+    /// let none = tree.approximate_range_stats("zzzz".."zzzzz", 1)?;
+    /// assert_eq!(none.key_count, 0);
+    /// assert_eq!(none.bytes, 0);
+    /// #
+    /// # Ok::<(), TreeError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a block index or table metadata read fails.
+    fn approximate_range_stats<K: AsRef<[u8]>, R: RangeBounds<K>>(
+        &self,
+        range: R,
+        seqno: SeqNo,
+    ) -> crate::Result<crate::ApproximateRangeStats>;
+
     /// Returns the highest sequence number of the active memtable.
     fn get_highest_memtable_seqno(&self) -> Option<SeqNo>;
 
