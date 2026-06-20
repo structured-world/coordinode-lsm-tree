@@ -8,10 +8,11 @@ use crate::{
     key::InternalKey,
     memtable::Memtable,
     merge_operator::MergeOperator,
-    merge_source::CoherentIterSource,
+    merge_source::{CoherentIterSource, CoherentMergeSource, IterItem, MergeSource},
     mvcc_stream::MvccStream,
     range_tombstone::RangeTombstone,
     range_tombstone_filter::RangeTombstoneFilter,
+    reseek::{ReseekCtx, Reseekable},
     run_reader::RunReader,
     seeking_merger::SeekingMerger,
     value::{SeqNo, UserKey},
@@ -104,8 +105,8 @@ pub fn prefix_to_range(prefix: &[u8]) -> (Bound<UserKey>, Bound<UserKey>) {
 /// Because of Rust rules, the state is referenced using `self_cell`, see below.
 ///
 /// `Clone` is cheap (every field is an `Arc` / small `Copy` value) and is used
-/// by the seekable range iterator, which rebuilds its merge pipeline on each
-/// reposition while keeping the same underlying version snapshot.
+/// by the seekable range iterator to snapshot the version once; repositions then
+/// reseek the leaf cursors in place against that same snapshot.
 #[derive(Clone)]
 pub struct IterState {
     pub(crate) version: SuperVersion,
@@ -991,91 +992,309 @@ fn collect_sources(state: &IterState, union: UserBounds, seqno: SeqNo) -> Collec
     }
 }
 
-/// Phase 2: build the merge pipeline (`SeekingMerger` -> `MvccStream` ->
-/// tombstone filter -> optional `RangeTombstoneFilter`) for the sub-range
-/// `[lower, upper)` from already-collected sources. Reruns on every reposition;
-/// the per-source readers reuse the tested seek-to-start path (no block I/O
+/// Named tombstone-skip wrapper. The non-seekable read path uses an inline
+/// `.filter(|x| !is_tombstone)` closure (unnameable), but the seekable pipeline
+/// must stay a concrete, [`Reseekable`] type, so the same drop-resolved-
+/// tombstones step is expressed as this struct. Errors pass through unchanged;
+/// the reposition is stateless, so it just forwards to the inner layer.
+struct TombstoneSkip<I> {
+    inner: I,
+}
+
+impl<I: Iterator<Item = crate::Result<InternalValue>>> Iterator for TombstoneSkip<I> {
+    type Item = crate::Result<InternalValue>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.inner.next()? {
+                Ok(value) if value.key.is_tombstone() => {}
+                other => return Some(other),
+            }
+        }
+    }
+}
+
+impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> DoubleEndedIterator
+    for TombstoneSkip<I>
+{
+    fn next_back(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.inner.next_back()? {
+                Ok(value) if value.key.is_tombstone() => {}
+                other => return Some(other),
+            }
+        }
+    }
+}
+
+impl<I: Reseekable> Reseekable for TombstoneSkip<I> {
+    fn reseek(&mut self, ctx: &ReseekCtx) {
+        self.inner.reseek(ctx);
+    }
+}
+
+/// Leaf source over a single SST, re-positioned in place by re-seeking the
+/// reader's owned index iterator (no new reader, no `Arc` re-clone).
+struct TableLeaf {
+    table: crate::table::Table,
+    iter: crate::table::iter::Iter,
+    seqno: SeqNo,
+}
+
+impl TableLeaf {
+    fn new(table: crate::table::Table, user_range: UserBounds, seqno: SeqNo) -> Self {
+        let iter = table.range_iter(user_range);
+        Self { table, iter, seqno }
+    }
+
+    fn next_filtered(&mut self) -> Option<IterItem> {
+        loop {
+            match self.iter.next()? {
+                Ok(value) if seqno_filter(value.key.seqno, self.seqno) => return Some(Ok(value)),
+                Ok(_) => {}
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+
+    fn next_back_filtered(&mut self) -> Option<IterItem> {
+        loop {
+            match self.iter.next_back()? {
+                Ok(value) if seqno_filter(value.key.seqno, self.seqno) => return Some(Ok(value)),
+                Ok(_) => {}
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+}
+
+/// Leaf source over a multi-table run. Re-positioned by recomputing the run's
+/// overlapping-table window; the boundary readers re-open lazily on the next
+/// pull (run-internal residual allocation, unlike the alloc-free table / memtable
+/// leaves — multi-table runs are L1+ and less common on the seekable path).
+struct RunLeaf {
+    reader: RunReader,
+    comparator: SharedComparator,
+    seqno: SeqNo,
+}
+
+impl RunLeaf {
+    fn new(
+        run: Arc<Run<crate::table::Table>>,
+        user_range: UserBounds,
+        seqno: SeqNo,
+        comparator: SharedComparator,
+    ) -> Option<Self> {
+        let reader = RunReader::new_cmp(run, user_range, comparator.as_ref())?;
+        Some(Self {
+            reader,
+            comparator,
+            seqno,
+        })
+    }
+
+    fn next_filtered(&mut self) -> Option<IterItem> {
+        loop {
+            match self.reader.next()? {
+                Ok(value) if seqno_filter(value.key.seqno, self.seqno) => return Some(Ok(value)),
+                Ok(_) => {}
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+
+    fn next_back_filtered(&mut self) -> Option<IterItem> {
+        loop {
+            match self.reader.next_back()? {
+                Ok(value) if seqno_filter(value.key.seqno, self.seqno) => return Some(Ok(value)),
+                Ok(_) => {}
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+}
+
+/// Leaf source over one memtable (active / sealed / ephemeral). Re-positioned by
+/// recreating the skiplist range cursor (a `seek_ge` pointer-walk, no heap
+/// allocation). Borrows the memtable from the owning [`IterState`] for `'a`.
+struct MemtableLeaf<'a> {
+    mt: &'a Memtable,
+    range: crate::memtable::skiplist::Range<'a>,
+    seqno: SeqNo,
+}
+
+impl<'a> MemtableLeaf<'a> {
+    fn new(
+        mt: &'a Memtable,
+        internal: (Bound<InternalKey>, Bound<InternalKey>),
+        seqno: SeqNo,
+    ) -> Self {
+        let range = mt.items.range(internal);
+        Self { mt, range, seqno }
+    }
+
+    fn next_filtered(&mut self) -> Option<IterItem> {
+        loop {
+            let entry = self.range.next()?;
+            let value = InternalValue {
+                key: entry.key(),
+                value: entry.value(),
+            };
+            if seqno_filter(value.key.seqno, self.seqno) {
+                return Some(Ok(value));
+            }
+        }
+    }
+
+    fn next_back_filtered(&mut self) -> Option<IterItem> {
+        loop {
+            let entry = self.range.next_back()?;
+            let value = InternalValue {
+                key: entry.key(),
+                value: entry.value(),
+            };
+            if seqno_filter(value.key.seqno, self.seqno) {
+                return Some(Ok(value));
+            }
+        }
+    }
+}
+
+/// One reseekable leaf of the seekable merge pipeline.
+///
+/// All three variants self-coordinate their forward/back cursors over a single
+/// shrinking window (SST index span, run table window, skiplist node range), so
+/// the enum is a [`CoherentMergeSource`]: mixed forward/backward consumption
+/// never yields an item twice. The [`MergeSource::seek`] hook is a no-op — the
+/// seekable path repositions via [`Reseekable`] (which carries both new bounds),
+/// not the single-target merge-source seek.
+enum SeekableLeaf<'a> {
+    // The SST reader and run reader are large (owned index iterator / per-table
+    // readers); box them so the enum (held one-per-source in a `Vec`) is sized to
+    // the small memtable variant. This is a one-time per-leaf allocation at build,
+    // not a per-seek cost.
+    Table(Box<TableLeaf>),
+    Run(Box<RunLeaf>),
+    Memtable(MemtableLeaf<'a>),
+}
+
+impl MergeSource for SeekableLeaf<'_> {
+    fn next(&mut self) -> Option<IterItem> {
+        match self {
+            SeekableLeaf::Table(l) => l.next_filtered(),
+            SeekableLeaf::Run(l) => l.next_filtered(),
+            SeekableLeaf::Memtable(l) => l.next_filtered(),
+        }
+    }
+
+    fn next_back(&mut self) -> Option<IterItem> {
+        match self {
+            SeekableLeaf::Table(l) => l.next_back_filtered(),
+            SeekableLeaf::Run(l) => l.next_back_filtered(),
+            SeekableLeaf::Memtable(l) => l.next_back_filtered(),
+        }
+    }
+
+    fn seek(&mut self, _target: &InternalKey) -> crate::Result<()> {
+        // No-op: the seekable pipeline repositions via `Reseekable::reseek`
+        // (which carries both the new lower AND upper bound). The single-target
+        // `MergeSource::seek` is never invoked on this path; the leaf cursors
+        // self-coordinate direction switches without it.
+        Ok(())
+    }
+}
+
+impl CoherentMergeSource for SeekableLeaf<'_> {}
+
+impl Reseekable for SeekableLeaf<'_> {
+    fn reseek(&mut self, ctx: &ReseekCtx) {
+        match self {
+            SeekableLeaf::Table(l) => l.table.reseek_range(&mut l.iter, ctx.user.clone()),
+            SeekableLeaf::Run(l) => l.reader.reseek(ctx.user.clone(), l.comparator.as_ref()),
+            SeekableLeaf::Memtable(l) => {
+                l.range = l.mt.items.range(ctx.internal.clone());
+            }
+        }
+    }
+}
+
+/// The concrete, [`Reseekable`] seekable merge pipeline: loser-tree merger ->
+/// MVCC resolution -> drop-resolved-tombstones -> range-tombstone suppression.
+/// Built once over the union range; every reposition reseeks it in place.
+type SeekPipeline<'a> = RangeTombstoneFilter<
+    TombstoneSkip<MvccStream<SeekingMerger<SeekableLeaf<'a>, SharedComparator>>>,
+>;
+
+/// Phase 2: build the [`SeekPipeline`] for the sub-range `[lower, upper)` from
+/// already-collected sources. Runs ONCE per iterator (at construction); every
+/// later reposition reseeks the returned pipeline in place rather than rebuilding
+/// it. The per-source readers reuse the tested seek-to-start path (no block I/O
 /// until the first `next`).
-fn build_stack<'a>(
+fn build_seek_pipeline<'a>(
     state: &'a IterState,
     collected: &CollectedSources,
     lower: Bound<UserKey>,
     upper: Bound<UserKey>,
     seqno: SeqNo,
-) -> BoxedMerge<'a> {
+) -> SeekPipeline<'a> {
     let user_range: UserBounds = (lower, upper);
-    let range = user_to_internal_bounds(&user_range);
+    let internal = user_to_internal_bounds(&user_range);
 
-    let mut iters: Vec<BoxedIterator<'a>> = Vec::with_capacity(collected.single_tables.len() + 3);
+    let mut sources: Vec<SeekableLeaf<'a>> =
+        Vec::with_capacity(collected.single_tables.len() + collected.multi_runs.len() + 3);
 
     for table in &collected.single_tables {
-        let reader = table
-            .range(user_range.clone())
-            .filter(move |item| match item {
-                Ok(item) => seqno_filter(item.key.seqno, seqno),
-                Err(_) => true,
-            });
-        iters.push(Box::new(reader));
+        sources.push(SeekableLeaf::Table(Box::new(TableLeaf::new(
+            table.clone(),
+            user_range.clone(),
+            seqno,
+        ))));
     }
     for run in &collected.multi_runs {
-        if let Some(reader) =
-            RunReader::new_cmp(run.clone(), user_range.clone(), state.comparator.as_ref())
-        {
-            iters.push(Box::new(reader.filter(move |item| match item {
-                Ok(item) => seqno_filter(item.key.seqno, seqno),
-                Err(_) => true,
-            })));
+        if let Some(leaf) = RunLeaf::new(
+            run.clone(),
+            user_range.clone(),
+            seqno,
+            state.comparator.clone(),
+        ) {
+            sources.push(SeekableLeaf::Run(Box::new(leaf)));
         }
     }
     for memtable in state.version.sealed_memtables.iter() {
-        let iter = memtable.range_internal(range.clone());
-        iters.push(Box::new(
-            iter.filter(move |item| seqno_filter(item.key.seqno, seqno))
-                .map(Ok),
-        ));
+        sources.push(SeekableLeaf::Memtable(MemtableLeaf::new(
+            memtable,
+            internal.clone(),
+            seqno,
+        )));
     }
-    {
-        let iter = state.version.active_memtable.range_internal(range.clone());
-        iters.push(Box::new(
-            iter.filter(move |item| seqno_filter(item.key.seqno, seqno))
-                .map(Ok),
-        ));
-    }
+    sources.push(SeekableLeaf::Memtable(MemtableLeaf::new(
+        &state.version.active_memtable,
+        internal.clone(),
+        seqno,
+    )));
     if let Some((mt, eph_seqno)) = &state.ephemeral {
-        let eph_seqno = *eph_seqno;
-        let iter = mt.range_internal(range);
-        iters.push(Box::new(
-            iter.filter(move |item| seqno_filter(item.key.seqno, eph_seqno))
-                .map(Ok),
-        ));
+        sources.push(SeekableLeaf::Memtable(MemtableLeaf::new(
+            mt, internal, *eph_seqno,
+        )));
     }
 
-    let merged = build_seeking(iters, state.comparator.clone());
-    let iter = MvccStream::new_with_comparator(
+    let merged = SeekingMerger::new(sources, state.comparator.clone());
+    let mvcc = MvccStream::new_with_comparator(
         merged,
         state.merge_operator.clone(),
         state.comparator.clone(),
     )
     .with_range_tombstones(collected.range_tombstones.clone());
-
-    let iter = iter.filter(|x| match x {
-        Ok(value) => !value.key.is_tombstone(),
-        Err(_) => true,
-    });
-
-    if collected
-        .range_tombstones
-        .iter()
-        .all(|(rt, cutoff)| !rt.visible_at(*cutoff))
-    {
-        Box::new(iter)
-    } else {
-        Box::new(RangeTombstoneFilter::new_with_comparator(
-            iter,
-            collected.range_tombstones.clone(),
-            state.comparator.clone(),
-        ))
-    }
+    let skip = TombstoneSkip { inner: mvcc };
+    // Always wrap in the range-tombstone filter: with an empty or all-invisible
+    // tombstone set it suppresses nothing (a per-item visibility check), so the
+    // result matches the non-seekable path's fast-path-or-filter branch while
+    // staying a single concrete reseekable type.
+    RangeTombstoneFilter::new_with_comparator(
+        skip,
+        collected.range_tombstones.clone(),
+        state.comparator.clone(),
+    )
 }
 
 /// Owner half of [`SeekableTreeIter`]'s self-cell.
@@ -1095,18 +1314,21 @@ self_cell!(
     /// Internal self-referential merge cell: owns the collected sources and
     /// borrows them into the Phase-2 merge pipeline. Wrapped by
     /// [`SeekableTreeIter`], which adds the seek API and a lookahead buffer.
+    ///
+    /// Built ONCE; [`Self::reseek`] moves the leaf cursors in place, so the
+    /// merge pipeline is never reconstructed across repositions.
     struct SeekableCell {
         owner: SeekableOwner,
 
         #[covariant]
-        dependent: BoxedMerge,
+        dependent: SeekPipeline,
     }
 );
 
 impl SeekableCell {
     fn build(owner: SeekableOwner) -> Self {
         Self::new(owner, |o| {
-            build_stack(
+            build_seek_pipeline(
                 &o.state,
                 &o.collected,
                 o.lower.clone(),
@@ -1114,6 +1336,13 @@ impl SeekableCell {
                 o.seqno,
             )
         })
+    }
+
+    /// Re-position the borrowed pipeline in place to the bounds in `ctx`,
+    /// without rebuilding it. The owner (version snapshot + collected sources)
+    /// is untouched.
+    fn reseek(&mut self, ctx: &ReseekCtx) {
+        self.with_dependent_mut(|_, pipeline| pipeline.reseek(ctx));
     }
 }
 
@@ -1132,9 +1361,13 @@ impl DoubleEndedIterator for SeekableCell {
 }
 
 /// A range iterator that can reposition (seek) in place without reopening
-/// per-SST readers. Built once over a union range; [`Self::seek_to`],
-/// [`Self::seek_to_for_prev`], and [`Self::reposition`] rebuild only the cheap
-/// Phase-2 merge pipeline, reusing the collected sources.
+/// per-SST readers or rebuilding the merge stack.
+///
+/// Built once over a union range; [`Self::seek_to`], [`Self::seek_to_for_prev`],
+/// and [`Self::reposition`] move the leaf cursors in place (SST index re-seek /
+/// skiplist `seek_ge` / run-window recompute) while reusing the loser-tree
+/// merger, MVCC stream, and tombstone filter, so a tight seek loop does not
+/// reconstruct the pipeline.
 ///
 /// A one-item lookahead buffer backs [`Self::peek_key`], which reads the next
 /// key without consuming it (a leapfrog join takes the max of several
@@ -1143,6 +1376,11 @@ pub struct SeekableTreeIter {
     cell: SeekableCell,
     /// `None` = nothing peeked; `Some(None)` = peeked past the end;
     /// `Some(Some(item))` = buffered front item (the std `Peekable` shape).
+    #[expect(
+        clippy::option_option,
+        reason = "std `Peekable` buffer shape: outer None = not yet peeked, \
+                  inner None = peeked past the end, Some(Some) = buffered item"
+    )]
     peeked: Option<Option<crate::Result<InternalValue>>>,
 }
 
@@ -1173,20 +1411,19 @@ impl SeekableTreeIter {
         }
     }
 
-    /// Rebuild the merge pipeline for the sub-range `[lower, upper)`, reusing the
-    /// collected sources. Cheap: clones `Arc`s and reconstructs per-source
-    /// readers (no block I/O until the next `next`/`next_back`).
+    /// Re-position the merge pipeline to the sub-range `[lower, upper)` IN PLACE:
+    /// the loser-tree merger, MVCC stream, and range-tombstone filter are reused;
+    /// only the leaf cursors move (an SST index re-seek / skiplist `seek_ge` /
+    /// run-window recompute). No merge-stack reconstruction, no source re-collection
+    /// (no block I/O until the next `next`/`next_back`).
     pub(crate) fn reposition(&mut self, lower: Bound<UserKey>, upper: Bound<UserKey>) {
-        let state = self.cell.borrow_owner().state.clone();
-        let collected = Arc::clone(&self.cell.borrow_owner().collected);
-        let seqno = self.cell.borrow_owner().seqno;
-        self.cell = SeekableCell::build(SeekableOwner {
-            state,
-            collected,
-            seqno,
-            lower,
-            upper,
-        });
+        let user_range: UserBounds = (lower, upper);
+        let internal = user_to_internal_bounds(&user_range);
+        let ctx = ReseekCtx {
+            user: user_range,
+            internal,
+        };
+        self.cell.reseek(&ctx);
         // The lookahead came from the old position; drop it.
         self.peeked = None;
     }

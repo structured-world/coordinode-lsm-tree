@@ -92,6 +92,38 @@ impl RunReader {
         }
     }
 
+    /// Re-position this reader to a fresh `range`, reusing the same run `Arc`
+    /// and struct instead of rebuilding. Recomputes the overlapping table window
+    /// and drops the boundary readers so they re-open lazily against the new
+    /// bounds on the next pull.
+    ///
+    /// When the new range does not overlap the run at all, the reader is left in
+    /// an immediately-exhausted state (both directions yield `None`).
+    pub(crate) fn reseek<R: RangeBounds<UserKey> + Clone + Send + 'static>(
+        &mut self,
+        range: R,
+        cmp: &dyn crate::comparator::UserComparator,
+    ) {
+        self.range = to_owned_range(&range);
+        self.lo_reader = None;
+        self.hi_reader = None;
+
+        if let Some((lo, hi)) = self.run.range_overlap_indexes_cmp(&range, cmp) {
+            self.lo = lo;
+            self.hi = hi;
+            self.lo_initialized = false;
+            self.hi_initialized = lo >= hi;
+        } else {
+            // No overlap: present as exhausted. Marking both sides initialized
+            // with no readers makes `next` / `next_back` fall straight through
+            // to `None` (see their else-branches).
+            self.lo = 0;
+            self.hi = 0;
+            self.lo_initialized = true;
+            self.hi_initialized = true;
+        }
+    }
+
     fn ensure_lo_initialized(&mut self) {
         if !self.lo_initialized {
             #[expect(

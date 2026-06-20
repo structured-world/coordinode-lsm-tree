@@ -250,6 +250,25 @@ impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
     }
 }
 
+impl<S: MergeSource + crate::reseek::Reseekable, C: UserComparator + Clone>
+    crate::reseek::Reseekable for SeekingMerger<S, C>
+{
+    /// Reposition every source to the new sub-range, then drop both tournaments
+    /// so they lazily re-init from the freshly-positioned sources on the next
+    /// pull. Queued refill errors are cleared — they belonged to the old
+    /// position. The `sources` Vec is reused in place (no realloc); the
+    /// tournament storage is rebuilt on re-init.
+    fn reseek(&mut self, ctx: &crate::reseek::ReseekCtx) {
+        for source in &mut self.sources {
+            source.reseek(ctx);
+        }
+        self.forward_tree = None;
+        self.backward_tree = None;
+        self.pending_forward_error = None;
+        self.pending_backward_error = None;
+    }
+}
+
 impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C> {
     type Item = IterItem;
 
