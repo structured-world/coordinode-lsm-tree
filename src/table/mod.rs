@@ -1955,6 +1955,45 @@ impl Table {
             crate::table::seqno_bounds::SeqnoBoundsMap::default()
         };
 
+        // Load the optional zone-map section (parallel to the index; powers the
+        // predicate-based block-skip). Absent unless the zone-map policy was on.
+        let zone_map = if let Some(zm_handle) = regions.zone_map {
+            let block = Block::from_file(
+                file_handle.as_ref(),
+                zm_handle,
+                crate::table::block::BlockIdentity {
+                    table_id: metadata.id,
+                    block_type: BlockType::ZoneMap,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                &{
+                    let t = match encryption.as_deref() {
+                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                        None => crate::table::block::BlockTransform::PLAIN,
+                    };
+                    if let Some(ecc) = metadata.ecc_params {
+                        t.with_ecc(ecc)
+                    } else {
+                        t
+                    }
+                },
+            )?;
+            if block.header.block_type != BlockType::ZoneMap {
+                return Err(crate::Error::InvalidTag((
+                    "BlockType",
+                    block.header.block_type.into(),
+                )));
+            }
+            let map = crate::table::zone_map::ZoneMap::decode(&block.data)?;
+            if !map.is_empty() {
+                log::trace!("Loaded zone-map for {} blocks", map.len());
+            }
+            map
+        } else {
+            crate::table::zone_map::ZoneMap::default()
+        };
+
         // Load the optional retrieval-ribbon locator section and pair it with an
         // ordinal → data-block-handle map (the index yields handles in key/write
         // order, which is the writer's block_id ordering). Only when the section
@@ -2057,6 +2096,7 @@ impl Table {
                 range_tombstones,
                 block_layout,
                 seqno_bounds,
+                zone_map,
                 locator_index,
                 encryption,
 

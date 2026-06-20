@@ -128,6 +128,14 @@ pub struct Inner {
     /// per-entry filter. Read only by the seqno-scoped scan path.
     pub(crate) seqno_bounds: crate::table::seqno_bounds::SeqnoBoundsMap,
 
+    /// Per-data-block zone map, loaded on open from the optional `zone_map`
+    /// section. Empty when the table has none (zone-map policy off), so a
+    /// predicate scan falls back to reading every block. Read only by the
+    /// block-skip scan path.
+    // `expect` self-removes once the block-skip reader reads this field.
+    #[expect(dead_code, reason = "read by the block-skip scan path (wired next)")]
+    pub(crate) zone_map: crate::table::zone_map::ZoneMap,
+
     /// Retrieval-ribbon locator, loaded on open from the optional `locator`
     /// section. `Some` only when the table was written with a locator policy
     /// enabled; lets a point read resolve a key to its data block in O(1),
