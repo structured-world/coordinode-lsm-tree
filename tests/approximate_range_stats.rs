@@ -149,6 +149,42 @@ fn memtable_only_range_is_counted() {
 }
 
 #[test]
+fn subrange_within_a_single_block_is_nonzero() {
+    // 30 keys with the default (4 KiB) block size land in ONE data block. A
+    // sub-range inside that block must still report a non-empty estimate — the
+    // boundary block has to be counted, not excluded.
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()
+    .expect("open");
+    let AnyTree::Standard(tree) = any else {
+        panic!("expected standard tree");
+    };
+    for i in 0..30u32 {
+        tree.insert(key(i), vec![b'v'; 64], 0);
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    let blocks: u64 = tree
+        .current_version()
+        .iter_tables()
+        .map(|t| t.metadata.data_block_count)
+        .sum();
+    assert_eq!(blocks, 1, "test precondition: a single data block");
+
+    let stats = tree
+        .approximate_range_stats(key(10)..key(20), SeqNo::MAX)
+        .expect("stats");
+    assert!(
+        stats.key_count > 0 && stats.bytes > 0,
+        "a sub-range inside a single block must be non-empty, got {stats:?}"
+    );
+}
+
+#[test]
 fn kv_separated_range_includes_blob_bytes() {
     let folder = get_tmp_folder();
     let any = Config::new(

@@ -1014,14 +1014,32 @@ impl AbstractTree for Tree {
         let mut bytes: u64 = 0;
         let mut key_count: u64 = 0;
 
+        // Use ONE snapshot at the requested seqno for both the SST and memtable
+        // contributions, so the estimate reflects the same visibility as a read
+        // at `seqno` (no entries newer than the snapshot, and a consistent set of
+        // tables + memtables even during a concurrent flush / compaction).
+        let comparator = self.config.comparator.as_ref();
+        let super_version = self.version_history.read().get_version_for_snapshot(seqno);
+
         // SST contribution: interpolate data-block offsets at the boundaries
         // (block granularity), no data-block reads. For a KV-separated SST the
         // referenced blob bytes are apportioned by the same in-range fraction.
-        let version = self.current_version();
-        for table in version.iter_tables() {
-            if !table.metadata.key_range.overlaps_with_bounds(&bounds) {
+        for table in super_version.version.iter_tables() {
+            // Comparator-aware overlap: a custom user comparator orders keys
+            // differently from raw bytes, so use the same comparison the read
+            // path does instead of default byte ordering.
+            if !table
+                .metadata
+                .key_range
+                .overlaps_with_bounds_cmp(&bounds, comparator)
+            {
                 continue;
             }
+            // The block index is keyed by the table-LOCAL seqno; a bulk-ingested
+            // table carries a non-zero global seqno, so translate the snapshot
+            // seqno the same way the read path does before seeking it.
+            let table_seqno = seqno.saturating_sub(table.global_seqno());
+
             // data_end = the data section's byte extent = last data block's end.
             let Some(last) = table.block_index.iter().next_back() else {
                 continue;
@@ -1032,23 +1050,38 @@ impl AbstractTree for Tree {
                 continue;
             }
 
-            // Block offset at/after a boundary key; the data-section end when the
-            // bound is unbounded (lo → 0 start of data) or past the last key.
-            let offset_at = |key: &[u8]| -> crate::Result<u64> {
-                let Some(mut iter) = table.block_index.forward_reader(key, seqno) else {
-                    return Ok(data_end);
-                };
-                match iter.next() {
-                    Some(handle) => Ok(*handle?.offset()),
+            // Lower boundary: the START offset of the block that would contain
+            // `key` (0 / data start when unbounded or before the first key).
+            let block_start = |key: &[u8]| -> crate::Result<u64> {
+                match table.block_index.forward_reader(key, table_seqno) {
+                    Some(mut iter) => match iter.next() {
+                        Some(handle) => Ok(*handle?.offset()),
+                        None => Ok(data_end),
+                    },
+                    None => Ok(data_end),
+                }
+            };
+            // Upper boundary: the END offset of the block that contains `key`, so
+            // the block holding the upper boundary is INCLUDED — a range that
+            // falls inside a single data block must not collapse to zero bytes.
+            let block_end = |key: &[u8]| -> crate::Result<u64> {
+                match table.block_index.forward_reader(key, table_seqno) {
+                    Some(mut iter) => match iter.next() {
+                        Some(handle) => {
+                            let h = handle?;
+                            Ok((*h.offset() + u64::from(h.size())).min(data_end))
+                        }
+                        None => Ok(data_end),
+                    },
                     None => Ok(data_end),
                 }
             };
             let off_lo = match lo {
-                Bound::Included(k) | Bound::Excluded(k) => offset_at(k)?,
+                Bound::Included(k) | Bound::Excluded(k) => block_start(k)?,
                 Bound::Unbounded => 0,
             };
             let off_hi = match hi {
-                Bound::Included(k) | Bound::Excluded(k) => offset_at(k)?,
+                Bound::Included(k) | Bound::Excluded(k) => block_end(k)?,
                 Bound::Unbounded => data_end,
             };
             let idx_bytes = off_hi.saturating_sub(off_lo);
@@ -1067,15 +1100,20 @@ impl AbstractTree for Tree {
             let den = u128::from(data_end);
             let blob_bytes = table.referenced_blob_bytes()?;
             let sst_blob = u64::try_from(u128::from(blob_bytes) * num / den).unwrap_or(u64::MAX);
+            // Round up to at least one entry: a non-empty byte span over a
+            // non-empty SST always covers at least one row, so a narrow range
+            // never reports bytes with a zero key count.
             let in_range_entries = u64::try_from(u128::from(table.metadata.item_count) * num / den)
-                .unwrap_or(u64::MAX);
+                .unwrap_or(u64::MAX)
+                .max(1);
             bytes = bytes.saturating_add(idx_bytes).saturating_add(sst_blob);
             key_count = key_count.saturating_add(in_range_entries);
         }
 
         // Memtable contribution: the in-range fraction of each memtable's
-        // approximate size (skiplist range count over the internal-key range).
-        let super_version = self.version_history.read().latest_version();
+        // approximate size. Built from the SAME snapshot and the SAME
+        // `range_internal` + internal-key bounds the read path uses (range.rs),
+        // so the counted slice matches what a read at `seqno` would traverse.
         let mt_range = (
             match lo {
                 Bound::Included(k) => {
@@ -1101,7 +1139,12 @@ impl AbstractTree for Tree {
             if total == 0 {
                 return (0, 0);
             }
-            let count = mt.range_internal(mt_range.clone()).count() as u64;
+            // Count only entries visible at the snapshot (the same seqno cutoff
+            // reads apply), so the estimate excludes writes newer than `seqno`.
+            let count = mt
+                .range_internal(mt_range.clone())
+                .filter(|kv| kv.key.seqno < seqno)
+                .count() as u64;
             if count == 0 {
                 return (0, 0);
             }

@@ -999,6 +999,12 @@ impl AbstractTree for BlobTree {
         // both flush and compaction), so its estimate already apportions the
         // blob bytes by the in-range fraction. Delegating keeps the
         // KV-separated estimate unified with the standard path.
+        //
+        // The figure tracks the value's CURRENT physical location: an unflushed
+        // value still lives inline in the index memtable, so the memtable share
+        // counts its full size there; once flushed it is separated into a blob
+        // file and counted via the SST's referenced-blob bytes. Both reflect the
+        // real footprint at the requested snapshot.
         self.index.approximate_range_stats(range, seqno)
     }
 
