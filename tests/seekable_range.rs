@@ -13,9 +13,43 @@ use lsm_tree::{
     AbstractTree, Config, DefaultUserComparator, Guard, InternalValue, KvSeparationOptions,
     Memtable, SeqNo, SequenceNumberCounter, SharedComparator, UserKey, ValueType, get_tmp_folder,
 };
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::ops::{Bound, Range};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use test_log::test;
+
+/// Allocation counter for the in-place-reseek micro-bench. Counts `alloc` /
+/// `realloc` calls only while [`MEASURING`] is set, so a measured region sees
+/// exactly the heap traffic it triggers. nextest runs each test in its own
+/// process, so the global counter is isolated per test.
+static MEASURED_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+static MEASURING: AtomicBool = AtomicBool::new(false);
+
+struct CountingAllocator;
+
+// SAFETY: forwards every call verbatim to the system allocator; the only added
+// behaviour is a relaxed counter bump on allocating paths while measuring.
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if MEASURING.load(Ordering::Relaxed) {
+            MEASURED_ALLOCS.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if MEASURING.load(Ordering::Relaxed) {
+            MEASURED_ALLOCS.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 /// An explicit `(start, end)` bound pair used to build excluded-bound ranges.
 type BoundPair = (Bound<Vec<u8>>, Bound<Vec<u8>>);
@@ -468,5 +502,46 @@ fn seekable_sealed_memtable_and_excluded_bounds() -> lsm_tree::Result<()> {
         let exp: Vec<_> = tree.range(key(320).., SeqNo::MAX, None).map(kv).collect();
         assert_eq!(got, exp, "sealed + excluded seek_to (kv_sep={kv_sep})");
     }
+    Ok(())
+}
+
+/// #504 acceptance: a tight `seek_to` loop must not reallocate the merge stack.
+///
+/// Before the in-place reseek, every reposition rebuilt the whole Phase-2
+/// pipeline (loser-tree merger + MVCC stream + tombstone filter, one boxed
+/// reader per source) — O(sources) allocations per seek. Now repositioning
+/// reuses the entire stack and moves only the leaf cursors, so a tight seek
+/// loop allocates nothing after the one-time warm-up build.
+#[test]
+fn tight_seek_loop_does_not_reallocate_merge_stack() -> lsm_tree::Result<()> {
+    // Standard tree spread across several SSTs (incl. a multi-table run) plus
+    // the active memtable, so the reposition exercises every leaf flavour.
+    let (tree, _guard) = build_tree(false)?;
+    let mut it = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, None);
+
+    // Warm up: the first seek + pull builds the merge stack once (the one-time
+    // allocation the acceptance criterion explicitly exempts).
+    it.seek_to(&key(5));
+    let _ = it.next();
+
+    // Disjoint targets spread across the key space, so each reposition genuinely
+    // moves every leaf cursor (SST index re-seek / run-window recompute /
+    // skiplist seek_ge) rather than no-op'ing on an unchanged bound.
+    let targets: Vec<Vec<u8>> = (0..300u32).map(|i| key((i * 137) % 260)).collect();
+
+    MEASURED_ALLOCS.store(0, Ordering::SeqCst);
+    MEASURING.store(true, Ordering::SeqCst);
+    for target in &targets {
+        it.seek_to(target);
+    }
+    MEASURING.store(false, Ordering::SeqCst);
+
+    let allocs = MEASURED_ALLOCS.load(Ordering::SeqCst);
+    assert_eq!(
+        allocs,
+        0,
+        "{} tight seeks allocated {allocs} times; the merge stack must be reused in place",
+        targets.len(),
+    );
     Ok(())
 }

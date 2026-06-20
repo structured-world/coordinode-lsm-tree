@@ -854,14 +854,19 @@ type UserBounds = (Bound<UserKey>, Bound<UserKey>);
 /// expect. Mirrors the bound construction in [`TreeIter::create_range`] (see
 /// there for the seqno-direction reasoning at each end).
 fn user_to_internal_bounds(user: &UserBounds) -> (Bound<InternalKey>, Bound<InternalKey>) {
+    // Clone the `UserKey` (a reference-counted `Slice`: an `Arc` bump, no heap
+    // copy) and hand it to `InternalKey::new` by value — `UserKey: Into<UserKey>`
+    // is the identity, so the key bytes are reused. Passing `key.as_ref()`
+    // (`&[u8]`) instead would force a fresh heap copy of the bytes on every
+    // reposition, which the in-place seek loop must avoid.
     let lo = match &user.0 {
         Bound::Included(key) => Bound::Included(InternalKey::new(
-            key.as_ref(),
+            key.clone(),
             SeqNo::MAX,
             crate::ValueType::Tombstone,
         )),
         Bound::Excluded(key) => Bound::Excluded(InternalKey::new(
-            key.as_ref(),
+            key.clone(),
             0,
             crate::ValueType::Tombstone,
         )),
@@ -869,10 +874,10 @@ fn user_to_internal_bounds(user: &UserBounds) -> (Bound<InternalKey>, Bound<Inte
     };
     let hi = match &user.1 {
         Bound::Included(key) => {
-            Bound::Included(InternalKey::new(key.as_ref(), 0, crate::ValueType::Value))
+            Bound::Included(InternalKey::new(key.clone(), 0, crate::ValueType::Value))
         }
         Bound::Excluded(key) => Bound::Excluded(InternalKey::new(
-            key.as_ref(),
+            key.clone(),
             SeqNo::MAX,
             crate::ValueType::Value,
         )),
