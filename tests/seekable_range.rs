@@ -232,45 +232,73 @@ fn seekable_with_range_tombstone() -> lsm_tree::Result<()> {
 
 #[test]
 fn seekable_with_ephemeral_memtable() -> lsm_tree::Result<()> {
-    let (tree, _folder) = build_tree(false)?;
+    for kv_sep in [false, true] {
+        let (tree, _folder) = build_tree(kv_sep)?;
 
-    // An ephemeral memtable (passed via the `index` parameter) with overriding
-    // values and a range tombstone — exercises the ephemeral source branches.
-    let comparator: SharedComparator = Arc::new(DefaultUserComparator);
-    let mt = Arc::new(Memtable::new(123, comparator));
-    for i in (0..300u32).step_by(11) {
-        mt.insert(InternalValue::from_components(
-            key(i),
-            val(i + 9_000_000),
-            10,
-            ValueType::Value,
-        ));
+        // An ephemeral memtable (passed via the `index` parameter) with
+        // overriding values and a range tombstone — exercises the ephemeral
+        // source branches.
+        let comparator: SharedComparator = Arc::new(DefaultUserComparator);
+        let mt = Arc::new(Memtable::new(123, comparator));
+        for i in (0..300u32).step_by(11) {
+            mt.insert(InternalValue::from_components(
+                key(i),
+                val(i + 9_000_000),
+                10,
+                ValueType::Value,
+            ));
+        }
+        assert!(
+            mt.insert_range_tombstone(
+                UserKey::from(key(70).as_slice()),
+                UserKey::from(key(90).as_slice()),
+                10,
+            ) > 0,
+            "ephemeral range tombstone rejected",
+        );
+        let eph = Some((mt, 11u64));
+
+        let intervals: Vec<Range<Vec<u8>>> = vec![key(0)..key(60), key(85)..key(160)];
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = intervals
+            .iter()
+            .flat_map(|iv| tree.range(iv.clone(), SeqNo::MAX, eph.clone()).map(kv))
+            .collect();
+        let got: Vec<_> = tree
+            .batch_range_scan(intervals, SeqNo::MAX, eph.clone())
+            .map(kv)
+            .collect();
+        assert_eq!(got, expected, "ephemeral batch (kv_sep={kv_sep})");
+
+        let mut it = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, eph.clone());
+        it.seek_to(&key(50));
+        let got: Vec<_> = (&mut it).map(kv).collect();
+        let exp: Vec<_> = tree.range(key(50).., SeqNo::MAX, eph).map(kv).collect();
+        assert_eq!(got, exp, "ephemeral seek_to (kv_sep={kv_sep})");
     }
-    assert!(
-        mt.insert_range_tombstone(
-            UserKey::from(key(70).as_slice()),
-            UserKey::from(key(90).as_slice()),
-            10,
-        ) > 0,
-        "ephemeral range tombstone rejected",
-    );
-    let eph = Some((mt, 11u64));
+    Ok(())
+}
 
-    let intervals: Vec<Range<Vec<u8>>> = vec![key(0)..key(60), key(85)..key(160)];
-    let expected: Vec<(Vec<u8>, Vec<u8>)> = intervals
-        .iter()
-        .flat_map(|iv| tree.range(iv.clone(), SeqNo::MAX, eph.clone()).map(kv))
-        .collect();
-    let got: Vec<_> = tree
-        .batch_range_scan(intervals, SeqNo::MAX, eph.clone())
-        .map(kv)
-        .collect();
-    assert_eq!(got, expected, "ephemeral batch");
+#[test]
+fn seekable_over_multi_sst_run() -> lsm_tree::Result<()> {
+    for kv_sep in [false, true] {
+        let (tree, _folder) = build_tree(kv_sep)?;
+        // A tiny target size makes the merged bottom-level run span several
+        // SSTs, exercising the multi-run RunReader collection / build path.
+        tree.major_compact(2048, 4)?;
 
-    let mut it = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, eph.clone());
-    it.seek_to(&key(50));
-    let got: Vec<_> = (&mut it).map(kv).collect();
-    let exp: Vec<_> = tree.range(key(50).., SeqNo::MAX, eph).map(kv).collect();
-    assert_eq!(got, exp, "ephemeral seek_to");
+        let intervals: Vec<Range<Vec<u8>>> = vec![key(10)..key(120), key(200)..key(290)];
+        let expected = reference(&tree, &intervals);
+        let got: Vec<_> = tree
+            .batch_range_scan(intervals, SeqNo::MAX, None)
+            .map(kv)
+            .collect();
+        assert_eq!(got, expected, "multi-run batch (kv_sep={kv_sep})");
+
+        let mut it = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, None);
+        it.seek_to(&key(75));
+        let got: Vec<_> = (&mut it).map(kv).collect();
+        let exp: Vec<_> = tree.range(key(75).., SeqNo::MAX, None).map(kv).collect();
+        assert_eq!(got, exp, "multi-run seek_to (kv_sep={kv_sep})");
+    }
     Ok(())
 }
