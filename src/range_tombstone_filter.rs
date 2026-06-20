@@ -143,9 +143,12 @@ impl<I: crate::reseek::Reseekable> crate::reseek::Reseekable for RangeTombstoneF
     /// reposition would be wasted work.
     fn reseek(&mut self, ctx: &crate::reseek::ReseekCtx) {
         self.fwd_idx = 0;
-        self.fwd_active = ActiveTombstoneSet::new_with_comparator(self.comparator.clone());
         self.rev_idx = 0;
-        self.rev_active = ActiveTombstoneSetReverse::new_with_comparator(self.comparator.clone());
+        // Clear in place rather than reconstructing: a seek-then-iterate-then-
+        // reseek loop that activated tombstones keeps the active sets' backing
+        // storage for the next pass instead of dropping and re-allocating it.
+        self.fwd_active.clear();
+        self.rev_active.clear();
         self.inner.reseek(ctx);
     }
 }

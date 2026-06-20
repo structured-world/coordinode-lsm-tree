@@ -59,6 +59,17 @@ impl ActiveTombstoneSet {
         }
     }
 
+    /// Resets the set to empty in place, reusing the backing `BTreeMap` /
+    /// `Vec` storage instead of dropping it. Equivalent to replacing with a
+    /// fresh [`Self::new_with_comparator`] but allocation-preserving: a
+    /// seek-then-iterate-then-reseek loop that activated tombstones keeps the
+    /// node / buffer capacity for the next pass.
+    pub fn clear(&mut self) {
+        self.seqno_counts.clear();
+        self.pending_expiry.clear();
+        self.next_id = 0;
+    }
+
     /// Activates a range tombstone, adding it to the active set.
     ///
     /// The tombstone is only activated if it is visible at `cutoff_seqno`
@@ -211,6 +222,15 @@ impl ActiveTombstoneSetReverse {
             pending_expiry: Vec::new(),
             next_id: 0,
         }
+    }
+
+    /// Resets the set to empty in place, reusing the backing `BTreeMap` /
+    /// `Vec` storage instead of dropping it (see
+    /// [`ActiveTombstoneSet::clear`]).
+    pub fn clear(&mut self) {
+        self.seqno_counts.clear();
+        self.pending_expiry.clear();
+        self.next_id = 0;
     }
 
     /// Activates a range tombstone, adding it to the active set.
