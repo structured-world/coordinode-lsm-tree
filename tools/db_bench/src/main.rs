@@ -55,6 +55,19 @@ struct Cli {
     #[arg(long)]
     use_blob_tree: bool,
 
+    /// Pin index / filter blocks at high cache priority against data-block churn
+    /// (#509). On by default; pass `--metadata-priority false` to A/B the
+    /// un-pinned baseline.
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+    metadata_priority: bool,
+
+    /// Partition + table-unpin index / filter blocks so they go through the
+    /// block cache (where the #509 priority pin applies). Pair with a small
+    /// --cache-mb and a large --num to exercise the pin: e.g.
+    /// `seekrandom --num 100000 --cache-mb 4 --partition-metadata`.
+    #[arg(long)]
+    partition_metadata: bool,
+
     /// Output results as JSON.
     #[arg(long)]
     json: bool,
@@ -118,6 +131,8 @@ fn main() {
         compression: cli.compression,
         block_size: cli.block_size,
         use_blob_tree: cli.use_blob_tree,
+        metadata_priority: cli.metadata_priority,
+        partition_metadata: cli.partition_metadata,
     };
 
     if bench_config.num == 0 {

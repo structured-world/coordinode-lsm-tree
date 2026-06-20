@@ -1,7 +1,7 @@
 use clap::ValueEnum;
 use lsm_tree::{
-    config::{BlockSizePolicy, CompressionPolicy},
     AnyTree, Cache, CompressionType, Config, SequenceNumberCounter,
+    config::{BlockSizePolicy, CompressionPolicy, PinningPolicy},
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -43,6 +43,14 @@ pub struct BenchConfig {
     pub compression: Compression,
     pub block_size: u32,
     pub use_blob_tree: bool,
+    /// Pin index / filter blocks at high cache priority against data-block churn
+    /// (#509). Default on.
+    pub metadata_priority: bool,
+    /// Partition index + filter blocks and leave them UNpinned at the table
+    /// level, so they are fetched through the block cache where the priority pin
+    /// applies. Needed to make the #509 pin observable: small single-level tables
+    /// pin index/filter in the reader at open, so they never reach the cache.
+    pub partition_metadata: bool,
 }
 
 impl BenchConfig {
@@ -60,7 +68,9 @@ pub fn create_tree(path: &Path, config: &BenchConfig) -> lsm_tree::Result<AnyTre
             "requested cache size overflows u64",
         )
     })?;
-    let cache = Arc::new(Cache::with_capacity_bytes(cache_bytes));
+    let cache = Arc::new(
+        Cache::with_capacity_bytes(cache_bytes).with_metadata_priority(config.metadata_priority),
+    );
 
     let compression_policy = CompressionPolicy::all(config.compression.to_lsm());
     let block_size_policy = BlockSizePolicy::all(config.block_size);
@@ -73,6 +83,17 @@ pub fn create_tree(path: &Path, config: &BenchConfig) -> lsm_tree::Result<AnyTre
     .data_block_size_policy(block_size_policy)
     .data_block_compression_policy(compression_policy)
     .use_cache(cache);
+
+    if config.partition_metadata {
+        // Force partitioned, table-unpinned index + filter blocks so they are
+        // fetched through the block cache (where the priority pin takes effect)
+        // instead of being held resident in the table reader.
+        builder = builder
+            .index_block_partitioning_policy(PinningPolicy::all(true))
+            .filter_block_partitioning_policy(PinningPolicy::all(true))
+            .index_block_pinning_policy(PinningPolicy::disabled())
+            .filter_block_pinning_policy(PinningPolicy::disabled());
+    }
 
     if config.use_blob_tree {
         builder = builder.with_kv_separation(Some(Default::default()));
