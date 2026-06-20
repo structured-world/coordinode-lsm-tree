@@ -102,6 +102,11 @@ pub fn prefix_to_range(prefix: &[u8]) -> (Bound<UserKey>, Bound<UserKey>) {
 /// The iter state references the memtables used while the range is open
 ///
 /// Because of Rust rules, the state is referenced using `self_cell`, see below.
+///
+/// `Clone` is cheap (every field is an `Arc` / small `Copy` value) and is used
+/// by the seekable range iterator, which rebuilds its merge pipeline on each
+/// reposition while keeping the same underlying version snapshot.
+#[derive(Clone)]
 pub struct IterState {
     pub(crate) version: SuperVersion,
     pub(crate) ephemeral: Option<(Arc<Memtable>, SeqNo)>,
@@ -837,6 +842,402 @@ impl TreeIter {
                 ))
             }
         })
+    }
+}
+
+/// User-key bounds for a scan; the seekable iterator rebuilds its merge
+/// pipeline for any sub-range of the union without recollecting sources.
+type UserBounds = (Bound<UserKey>, Bound<UserKey>);
+
+/// Translate user-key bounds into the internal-key bounds the per-source readers
+/// expect. Mirrors the bound construction in [`TreeIter::create_range`] (see
+/// there for the seqno-direction reasoning at each end).
+fn user_to_internal_bounds(user: &UserBounds) -> (Bound<InternalKey>, Bound<InternalKey>) {
+    let lo = match &user.0 {
+        Bound::Included(key) => Bound::Included(InternalKey::new(
+            key.as_ref(),
+            SeqNo::MAX,
+            crate::ValueType::Tombstone,
+        )),
+        Bound::Excluded(key) => Bound::Excluded(InternalKey::new(
+            key.as_ref(),
+            0,
+            crate::ValueType::Tombstone,
+        )),
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    let hi = match &user.1 {
+        Bound::Included(key) => {
+            Bound::Included(InternalKey::new(key.as_ref(), 0, crate::ValueType::Value))
+        }
+        Bound::Excluded(key) => Bound::Excluded(InternalKey::new(
+            key.as_ref(),
+            SeqNo::MAX,
+            crate::ValueType::Value,
+        )),
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    (lo, hi)
+}
+
+/// SSTs / runs / range-tombstones overlapping the union range, collected once.
+///
+/// Rebuilding the merge pipeline for a sub-range (a seek, or one batch interval)
+/// reuses these — Phase 1 (level iteration + bloom + RT collection) is the
+/// ~100µs setup that [`SeekableTreeIter`] amortizes across repositions.
+#[derive(Clone)]
+struct CollectedSources {
+    single_tables: Vec<crate::table::Table>,
+    multi_runs: Vec<Arc<Run<crate::table::Table>>>,
+    range_tombstones: Vec<(RangeTombstone, SeqNo)>,
+    union: UserBounds,
+}
+
+/// Phase 1: collect every source overlapping `union` once. The table-skip
+/// optimization and the prefix/key-hash sub-filtering used by
+/// [`TreeIter::create_range`] are intentionally omitted: this is a plain range
+/// scan (no prefix/point pipeline), and skipping table-skip only ever reads a
+/// table a tombstone fully covers — correct, just marginally less optimal.
+fn collect_sources(state: &IterState, union: UserBounds, seqno: SeqNo) -> CollectedSources {
+    let mut single_tables: Vec<crate::table::Table> = Vec::new();
+    let mut multi_runs: Vec<Arc<Run<crate::table::Table>>> = Vec::new();
+    let mut rts: Vec<(RangeTombstone, SeqNo)> = Vec::new();
+
+    let bounds_ref = (
+        union.0.as_ref().map(core::convert::AsRef::as_ref),
+        union.1.as_ref().map(core::convert::AsRef::as_ref),
+    );
+
+    for run in state
+        .version
+        .version
+        .iter_levels()
+        .flat_map(|lvl| lvl.iter())
+    {
+        match run.len() {
+            0 => {}
+            1 => {
+                #[expect(clippy::expect_used, reason = "len checked")]
+                let table = run.first().expect("len == 1");
+                rts.extend(
+                    table
+                        .range_tombstones()
+                        .iter()
+                        .filter(|rt| {
+                            range_tombstone_overlaps_bounds(rt, &union, state.comparator.as_ref())
+                        })
+                        .map(|rt| (rt.clone(), seqno)),
+                );
+                if table.check_key_range_overlap_cmp(&bounds_ref, state.comparator.as_ref())
+                    && bloom_passes(state, table)
+                {
+                    single_tables.push(table.clone());
+                }
+            }
+            _ => {
+                for table in run.iter() {
+                    rts.extend(
+                        table
+                            .range_tombstones()
+                            .iter()
+                            .filter(|rt| {
+                                range_tombstone_overlaps_bounds(
+                                    rt,
+                                    &union,
+                                    state.comparator.as_ref(),
+                                )
+                            })
+                            .map(|rt| (rt.clone(), seqno)),
+                    );
+                }
+                multi_runs.push(run.clone());
+            }
+        }
+    }
+
+    let mut collect_mt_rts = |iter: alloc::vec::Vec<RangeTombstone>, cutoff: SeqNo| {
+        rts.extend(
+            iter.into_iter()
+                .filter(|rt| range_tombstone_overlaps_bounds(rt, &union, state.comparator.as_ref()))
+                .map(|rt| (rt, cutoff)),
+        );
+    };
+    for memtable in state.version.sealed_memtables.iter() {
+        collect_mt_rts(memtable.range_tombstones_sorted(), seqno);
+    }
+    collect_mt_rts(
+        state.version.active_memtable.range_tombstones_sorted(),
+        seqno,
+    );
+    if let Some((mt, eph_seqno)) = &state.ephemeral {
+        collect_mt_rts(mt.range_tombstones_sorted(), *eph_seqno);
+    }
+
+    rts.sort_by(|a, b| a.0.cmp_with_comparator(&b.0, state.comparator.as_ref()));
+    rts.dedup_by(|a, b| {
+        if a.0 == b.0 {
+            b.1 = b.1.max(a.1);
+            true
+        } else {
+            false
+        }
+    });
+
+    CollectedSources {
+        single_tables,
+        multi_runs,
+        range_tombstones: rts,
+        union,
+    }
+}
+
+/// Phase 2: build the merge pipeline (`SeekingMerger` -> `MvccStream` ->
+/// tombstone filter -> optional `RangeTombstoneFilter`) for the sub-range
+/// `[lower, upper)` from already-collected sources. Reruns on every reposition;
+/// the per-source readers reuse the tested seek-to-start path (no block I/O
+/// until the first `next`).
+fn build_stack<'a>(
+    state: &'a IterState,
+    collected: &CollectedSources,
+    lower: Bound<UserKey>,
+    upper: Bound<UserKey>,
+    seqno: SeqNo,
+) -> BoxedMerge<'a> {
+    let user_range: UserBounds = (lower, upper);
+    let range = user_to_internal_bounds(&user_range);
+
+    let mut iters: Vec<BoxedIterator<'a>> = Vec::with_capacity(collected.single_tables.len() + 3);
+
+    for table in &collected.single_tables {
+        let reader = table
+            .range(user_range.clone())
+            .filter(move |item| match item {
+                Ok(item) => seqno_filter(item.key.seqno, seqno),
+                Err(_) => true,
+            });
+        iters.push(Box::new(reader));
+    }
+    for run in &collected.multi_runs {
+        if let Some(reader) =
+            RunReader::new_cmp(run.clone(), user_range.clone(), state.comparator.as_ref())
+        {
+            iters.push(Box::new(reader.filter(move |item| match item {
+                Ok(item) => seqno_filter(item.key.seqno, seqno),
+                Err(_) => true,
+            })));
+        }
+    }
+    for memtable in state.version.sealed_memtables.iter() {
+        let iter = memtable.range_internal(range.clone());
+        iters.push(Box::new(
+            iter.filter(move |item| seqno_filter(item.key.seqno, seqno))
+                .map(Ok),
+        ));
+    }
+    {
+        let iter = state.version.active_memtable.range_internal(range.clone());
+        iters.push(Box::new(
+            iter.filter(move |item| seqno_filter(item.key.seqno, seqno))
+                .map(Ok),
+        ));
+    }
+    if let Some((mt, eph_seqno)) = &state.ephemeral {
+        let eph_seqno = *eph_seqno;
+        let iter = mt.range_internal(range);
+        iters.push(Box::new(
+            iter.filter(move |item| seqno_filter(item.key.seqno, eph_seqno))
+                .map(Ok),
+        ));
+    }
+
+    let merged = build_seeking(iters, state.comparator.clone());
+    let iter = MvccStream::new_with_comparator(
+        merged,
+        state.merge_operator.clone(),
+        state.comparator.clone(),
+    )
+    .with_range_tombstones(collected.range_tombstones.clone());
+
+    let iter = iter.filter(|x| match x {
+        Ok(value) => !value.key.is_tombstone(),
+        Err(_) => true,
+    });
+
+    if collected
+        .range_tombstones
+        .iter()
+        .all(|(rt, cutoff)| !rt.visible_at(*cutoff))
+    {
+        Box::new(iter)
+    } else {
+        Box::new(RangeTombstoneFilter::new_with_comparator(
+            iter,
+            collected.range_tombstones.clone(),
+            state.comparator.clone(),
+        ))
+    }
+}
+
+/// Owner half of [`SeekableTreeIter`]'s self-cell.
+///
+/// Holds the version snapshot, the collected sources (shared via `Arc` so a
+/// reposition is a cheap refcount bump), and the current sub-range bounds the
+/// dependent pipeline was built for.
+pub struct SeekableOwner {
+    state: IterState,
+    collected: Arc<CollectedSources>,
+    seqno: SeqNo,
+    lower: Bound<UserKey>,
+    upper: Bound<UserKey>,
+}
+
+self_cell!(
+    /// A range iterator that can reposition (seek) in place without reopening
+    /// per-SST readers. Built once over a union range; [`Self::seek_to`],
+    /// [`Self::seek_to_for_prev`], and [`Self::reposition`] rebuild only the
+    /// cheap Phase-2 merge pipeline, reusing the collected sources.
+    pub struct SeekableTreeIter {
+        owner: SeekableOwner,
+
+        #[covariant]
+        dependent: BoxedMerge,
+    }
+);
+
+impl SeekableTreeIter {
+    fn build(owner: SeekableOwner) -> Self {
+        Self::new(owner, |o| {
+            build_stack(
+                &o.state,
+                &o.collected,
+                o.lower.clone(),
+                o.upper.clone(),
+                o.seqno,
+            )
+        })
+    }
+
+    /// Open a seekable iterator over `[union_lower, union_upper)`. The source
+    /// collection (Phase 1) runs once here; subsequent repositions reuse it.
+    #[must_use]
+    pub fn create(
+        state: IterState,
+        union_lower: Bound<UserKey>,
+        union_upper: Bound<UserKey>,
+        seqno: SeqNo,
+    ) -> Self {
+        let collected = Arc::new(collect_sources(
+            &state,
+            (union_lower.clone(), union_upper.clone()),
+            seqno,
+        ));
+        Self::build(SeekableOwner {
+            state,
+            collected,
+            seqno,
+            lower: union_lower,
+            upper: union_upper,
+        })
+    }
+
+    /// Rebuild the merge pipeline for the sub-range `[lower, upper)`, reusing the
+    /// collected sources. Cheap: clones `Arc`s and reconstructs per-source
+    /// readers (no block I/O until the next `next`/`next_back`).
+    pub(crate) fn reposition(&mut self, lower: Bound<UserKey>, upper: Bound<UserKey>) {
+        let state = self.borrow_owner().state.clone();
+        let collected = Arc::clone(&self.borrow_owner().collected);
+        let seqno = self.borrow_owner().seqno;
+        *self = Self::build(SeekableOwner {
+            state,
+            collected,
+            seqno,
+            lower,
+            upper,
+        });
+    }
+
+    /// Reposition so the next [`Iterator::next`] yields the first entry with
+    /// user key `>= key` (`RocksDB` `Seek`). The upper bound stays the union upper.
+    pub fn seek_to(&mut self, key: &[u8]) {
+        let upper = self.borrow_owner().collected.union.1.clone();
+        self.reposition(Bound::Included(UserKey::from(key)), upper);
+    }
+
+    /// Reposition so the next [`DoubleEndedIterator::next_back`] yields the last
+    /// entry with user key `<= key` (`RocksDB` `SeekForPrev`). The lower bound
+    /// stays the union lower.
+    pub fn seek_to_for_prev(&mut self, key: &[u8]) {
+        let lower = self.borrow_owner().collected.union.0.clone();
+        self.reposition(lower, Bound::Included(UserKey::from(key)));
+    }
+
+    /// The version snapshot this iterator reads from. Used by KV-separated trees
+    /// to resolve blob handles against the same snapshot the keys came from.
+    #[must_use]
+    pub fn version(&self) -> crate::version::Version {
+        self.borrow_owner().state.version.version.clone()
+    }
+}
+
+impl Iterator for SeekableTreeIter {
+    type Item = crate::Result<InternalValue>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.with_dependent_mut(|_, iter| iter.next())
+    }
+}
+
+impl DoubleEndedIterator for SeekableTreeIter {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.with_dependent_mut(|_, iter| iter.next_back())
+    }
+}
+
+/// Forward scan over a (possibly lazily-produced) sequence of disjoint,
+/// ascending sub-ranges, reusing a single [`SeekableTreeIter`].
+///
+/// Each interval is served by repositioning the shared pipeline — the per-SST
+/// setup is paid once (when the `SeekableTreeIter` is created over the union)
+/// and amortized across every interval, rather than reopening readers per
+/// interval.
+///
+/// The interval source is pulled on demand, so intervals may be generated
+/// dynamically (the next interval can depend on rows already returned).
+pub struct BatchRangeScan<I> {
+    iter: SeekableTreeIter,
+    intervals: I,
+    /// Whether the shared iterator is currently positioned on an interval that
+    /// may still yield rows.
+    primed: bool,
+}
+
+impl<I: Iterator<Item = (Bound<UserKey>, Bound<UserKey>)>> BatchRangeScan<I> {
+    /// Build a batch scan from a seekable iterator opened over the union range
+    /// and a (lazy) sequence of `[lower, upper)` sub-ranges to visit in order.
+    pub fn new(iter: SeekableTreeIter, intervals: I) -> Self {
+        Self {
+            iter,
+            intervals,
+            primed: false,
+        }
+    }
+}
+
+impl<I: Iterator<Item = (Bound<UserKey>, Bound<UserKey>)>> Iterator for BatchRangeScan<I> {
+    type Item = crate::Result<InternalValue>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.primed {
+                if let Some(item) = self.iter.next() {
+                    return Some(item);
+                }
+                self.primed = false;
+            }
+            let (lower, upper) = self.intervals.next()?;
+            self.iter.reposition(lower, upper);
+            self.primed = true;
+        }
     }
 }
 

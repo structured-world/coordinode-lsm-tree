@@ -193,6 +193,63 @@ impl core::ops::Deref for Tree {
 
 impl crate::abstract_tree::sealed::Sealed for Tree {}
 
+/// Maps a raw merge-pipeline item into a standard-tree iterator guard.
+fn standard_guard(item: crate::Result<InternalValue>) -> IterGuardImpl {
+    IterGuardImpl::Standard(Guard(item.map(|iv| (iv.key.user_key, iv.value))))
+}
+
+/// Extract owned user-key bounds from any range.
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "reached from blob_tree as crate::tree::range_to_user_bounds"
+)]
+pub(crate) fn range_to_user_bounds<K: AsRef<[u8]>, R: RangeBounds<K>>(
+    range: &R,
+) -> (Bound<UserKey>, Bound<UserKey>) {
+    use core::ops::Bound::{Excluded, Included, Unbounded};
+    let lo = match range.start_bound() {
+        Included(x) => Included(x.as_ref().into()),
+        Excluded(x) => Excluded(x.as_ref().into()),
+        Unbounded => Unbounded,
+    };
+    let hi = match range.end_bound() {
+        Included(x) => Included(x.as_ref().into()),
+        Excluded(x) => Excluded(x.as_ref().into()),
+        Unbounded => Unbounded,
+    };
+    (lo, hi)
+}
+
+/// Wraps a [`SeekableTreeIter`](crate::range::SeekableTreeIter) so a standard
+/// tree can expose it as a [`SeekableGuardIter`].
+struct StandardSeekable {
+    inner: crate::range::SeekableTreeIter,
+}
+
+impl Iterator for StandardSeekable {
+    type Item = IterGuardImpl;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(standard_guard)
+    }
+}
+
+impl DoubleEndedIterator for StandardSeekable {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner.next_back().map(standard_guard)
+    }
+}
+
+impl crate::iter_guard::SeekableGuardIter for StandardSeekable {
+    fn seek_to(&mut self, key: &[u8]) {
+        self.inner.seek_to(key);
+    }
+
+    fn seek_to_for_prev(&mut self, key: &[u8]) {
+        self.inner.seek_to_for_prev(key);
+    }
+}
+
 impl AbstractTree for Tree {
     fn table_file_cache_size(&self) -> usize {
         self.config
@@ -418,6 +475,34 @@ impl AbstractTree for Tree {
             self.create_range(&range, seqno, index)
                 .map(|kv| IterGuardImpl::Standard(Guard(kv))),
         )
+    }
+
+    fn range_seekable<K: AsRef<[u8]>, R: RangeBounds<K>>(
+        &self,
+        range: R,
+        seqno: SeqNo,
+        index: Option<(Arc<Memtable>, SeqNo)>,
+    ) -> Box<dyn crate::iter_guard::SeekableGuardIter + 'static> {
+        let (lo, hi) = range_to_user_bounds(&range);
+        let inner = self.create_seekable_range_bounds(lo, hi, seqno, index);
+        Box::new(StandardSeekable { inner })
+    }
+
+    fn batch_range_scan<K: AsRef<[u8]>, R: RangeBounds<K> + 'static, I: IntoIterator<Item = R>>(
+        &self,
+        intervals: I,
+        seqno: SeqNo,
+        index: Option<(Arc<Memtable>, SeqNo)>,
+    ) -> Box<dyn Iterator<Item = IterGuardImpl> + Send + 'static>
+    where
+        I::IntoIter: Send + 'static,
+    {
+        // Open the seekable iterator over the whole keyspace once; each interval
+        // is served by repositioning it (single per-SST setup, amortized).
+        let inner =
+            self.create_seekable_range_bounds(Bound::Unbounded, Bound::Unbounded, seqno, index);
+        let intervals = intervals.into_iter().map(|r| range_to_user_bounds(&r));
+        Box::new(crate::range::BatchRangeScan::new(inner, intervals).map(standard_guard))
     }
 
     /// Returns the number of tombstones in the tree.
@@ -2600,6 +2685,36 @@ impl Tree {
             Ok(kv) => Ok((kv.key.user_key, kv.value)),
             Err(e) => Err(e),
         })
+    }
+
+    /// Build a [`SeekableTreeIter`](crate::range::SeekableTreeIter) over
+    /// `[lo, hi)`. Source collection (Phase 1) runs once; repositions reuse it.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn create_seekable_range_bounds(
+        &self,
+        lo: Bound<UserKey>,
+        hi: Bound<UserKey>,
+        seqno: SeqNo,
+        ephemeral: Option<(Arc<Memtable>, SeqNo)>,
+    ) -> crate::range::SeekableTreeIter {
+        use crate::range::{IterState, SeekableTreeIter};
+
+        let super_version = self.version_history.read().get_version_for_snapshot(seqno);
+
+        let iter_state = IterState {
+            version: super_version,
+            ephemeral,
+            merge_operator: self.config.merge_operator.clone(),
+            comparator: self.config.comparator.clone(),
+            prefix_hash: None,
+            key_hash: None,
+            bloom_key: None,
+            #[cfg(feature = "metrics")]
+            metrics: Some(self.0.metrics.clone()),
+        };
+
+        SeekableTreeIter::create(iter_state, lo, hi, seqno)
     }
 
     #[doc(hidden)]

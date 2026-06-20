@@ -1,0 +1,179 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026-present, Structured World Foundation
+
+//! Equivalence tests for the seekable range iterator (#495): `seek_to`,
+//! `seek_to_for_prev`, and `batch_range_scan` must return exactly what the
+//! equivalent plain `range()` calls return.
+
+use lsm_tree::{AbstractTree, Config, Guard, SeqNo, SequenceNumberCounter, get_tmp_folder};
+use std::ops::Range;
+use test_log::test;
+
+fn key(i: u32) -> Vec<u8> {
+    format!("k{i:05}").into_bytes()
+}
+
+fn val(i: u32) -> Vec<u8> {
+    format!("v{i:05}-{}", "x".repeat((i % 7) as usize)).into_bytes()
+}
+
+/// Build a tree spread across several SSTs plus the active memtable, with
+/// overwrites (newer seqno wins) and deletes, so the merge pipeline is
+/// non-trivial.
+fn populated_tree() -> lsm_tree::Result<(lsm_tree::AnyTree, tempfile::TempDir)> {
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    // SST 1: keys 0..200 at seqno 0.
+    for i in 0..200u32 {
+        tree.insert(key(i), val(i), 0);
+    }
+    tree.flush_active_memtable(0)?;
+
+    // SST 2: overwrite every 3rd key with a newer value at seqno 1, plus new
+    // keys 200..260.
+    for i in (0..200u32).step_by(3) {
+        tree.insert(key(i), val(i + 1_000_000), 1);
+    }
+    for i in 200..260u32 {
+        tree.insert(key(i), val(i), 1);
+    }
+    tree.flush_active_memtable(1)?;
+
+    // Memtable (unflushed): delete every 7th key, overwrite every 5th, add tail.
+    for i in (0..260u32).step_by(7) {
+        tree.remove(key(i), 2);
+    }
+    for i in (0..260u32).step_by(5) {
+        tree.insert(key(i), val(i + 2_000_000), 3);
+    }
+    for i in 260..300u32 {
+        tree.insert(key(i), val(i), 3);
+    }
+
+    Ok((tree, folder))
+}
+
+fn kv(guard: lsm_tree::IterGuardImpl) -> (Vec<u8>, Vec<u8>) {
+    let (k, v) = guard.into_inner().expect("guard resolves");
+    (k.to_vec(), v.to_vec())
+}
+
+/// Reference: concatenation of N independent `range()` calls.
+fn reference(tree: &lsm_tree::AnyTree, intervals: &[Range<Vec<u8>>]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    intervals
+        .iter()
+        .flat_map(|iv| tree.range(iv.clone(), SeqNo::MAX, None).map(kv))
+        .collect()
+}
+
+#[test]
+fn batch_range_scan_matches_separate_ranges() -> lsm_tree::Result<()> {
+    let (tree, _folder) = populated_tree()?;
+
+    // Disjoint, ascending sub-intervals scattered across the keyspace.
+    let intervals: Vec<Range<Vec<u8>>> = vec![
+        key(3)..key(17),
+        key(40)..key(41),  // single-key window
+        key(95)..key(140), // spans the SST overwrite + memtable region
+        key(205)..key(230),
+        key(280)..key(305), // tail, partially past the last key
+    ];
+
+    let expected = reference(&tree, &intervals);
+    assert!(!expected.is_empty(), "fixture should yield rows");
+
+    let got: Vec<_> = tree
+        .batch_range_scan(intervals.clone(), SeqNo::MAX, None)
+        .map(kv)
+        .collect();
+
+    assert_eq!(got, expected, "batch scan must equal N separate ranges");
+    Ok(())
+}
+
+#[test]
+fn batch_range_scan_empty_and_full_intervals() -> lsm_tree::Result<()> {
+    let (tree, _folder) = populated_tree()?;
+
+    // An empty interval (no keys), a normal one, and one fully covered by deletes.
+    let intervals: Vec<Range<Vec<u8>>> = vec![
+        key(9000)..key(9100), // empty: past all data
+        key(50)..key(60),
+    ];
+    let expected = reference(&tree, &intervals);
+    let got: Vec<_> = tree
+        .batch_range_scan(intervals, SeqNo::MAX, None)
+        .map(kv)
+        .collect();
+    assert_eq!(got, expected);
+    Ok(())
+}
+
+#[test]
+fn seek_to_matches_range_from_key() -> lsm_tree::Result<()> {
+    let (tree, _folder) = populated_tree()?;
+
+    for start in [0u32, 1, 7, 42, 150, 199, 200, 259, 260, 299, 500] {
+        let mut it = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, None);
+        it.seek_to(&key(start));
+        let got: Vec<_> = (&mut it).map(kv).collect();
+
+        let expected: Vec<_> = tree.range(key(start).., SeqNo::MAX, None).map(kv).collect();
+
+        assert_eq!(
+            got, expected,
+            "seek_to({start}) must equal range(k{start}..)"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn seek_to_repeated_jumps_stay_consistent() -> lsm_tree::Result<()> {
+    let (tree, _folder) = populated_tree()?;
+
+    // A single live iterator jumped forward several times must, after each jump,
+    // produce the same rows as a fresh range() from that key.
+    let mut it = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, None);
+    for start in [10u32, 100, 33, 250, 5] {
+        it.seek_to(&key(start));
+        let got: Vec<_> = std::iter::from_fn(|| it.next()).take(8).map(kv).collect();
+        let expected: Vec<_> = tree
+            .range(key(start).., SeqNo::MAX, None)
+            .take(8)
+            .map(kv)
+            .collect();
+        assert_eq!(got, expected, "jump to k{start}");
+    }
+    Ok(())
+}
+
+#[test]
+fn seek_to_for_prev_matches_reverse_range() -> lsm_tree::Result<()> {
+    let (tree, _folder) = populated_tree()?;
+
+    for end in [5u32, 42, 150, 200, 260, 299, 500] {
+        let mut it = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, None);
+        it.seek_to_for_prev(&key(end));
+        // Pull backward from the repositioned iterator.
+        let got: Vec<_> = std::iter::from_fn(|| it.next_back()).map(kv).collect();
+
+        let expected: Vec<_> = tree
+            .range(..=key(end), SeqNo::MAX, None)
+            .rev()
+            .map(kv)
+            .collect();
+
+        assert_eq!(
+            got, expected,
+            "seek_to_for_prev({end}) reverse must equal range(..=k{end}).rev()"
+        );
+    }
+    Ok(())
+}

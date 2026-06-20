@@ -281,6 +281,56 @@ impl BlobTree {
 
 impl crate::abstract_tree::sealed::Sealed for BlobTree {}
 
+/// Maps a raw merge-pipeline item into a KV-separated iterator guard that
+/// resolves the blob handle lazily against `version`.
+fn blob_guard(
+    tree: &crate::BlobTree,
+    version: &Version,
+    item: crate::Result<InternalValue>,
+) -> IterGuardImpl {
+    IterGuardImpl::Blob(Guard {
+        tree: tree.clone(),
+        version: version.clone(),
+        kv: item,
+    })
+}
+
+/// Wraps a [`SeekableTreeIter`](crate::range::SeekableTreeIter) over the index
+/// tree so a KV-separated tree can expose it as a [`SeekableGuardIter`].
+struct BlobSeekable {
+    inner: crate::range::SeekableTreeIter,
+    tree: crate::BlobTree,
+    version: Version,
+}
+
+impl Iterator for BlobSeekable {
+    type Item = IterGuardImpl;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner
+            .next()
+            .map(|item| blob_guard(&self.tree, &self.version, item))
+    }
+}
+
+impl DoubleEndedIterator for BlobSeekable {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner
+            .next_back()
+            .map(|item| blob_guard(&self.tree, &self.version, item))
+    }
+}
+
+impl crate::iter_guard::SeekableGuardIter for BlobSeekable {
+    fn seek_to(&mut self, key: &[u8]) {
+        self.inner.seek_to(key);
+    }
+
+    fn seek_to_for_prev(&mut self, key: &[u8]) {
+        self.inner.seek_to_for_prev(key);
+    }
+}
+
 impl AbstractTree for BlobTree {
     #[cfg(feature = "std")]
     fn create_checkpoint(
@@ -484,6 +534,50 @@ impl AbstractTree for BlobTree {
                     kv,
                 })
             }),
+        )
+    }
+
+    fn range_seekable<K: AsRef<[u8]>, R: RangeBounds<K>>(
+        &self,
+        range: R,
+        seqno: SeqNo,
+        index: Option<(Arc<Memtable>, SeqNo)>,
+    ) -> Box<dyn crate::iter_guard::SeekableGuardIter + 'static> {
+        let (lo, hi) = crate::tree::range_to_user_bounds(&range);
+        let inner = self
+            .index
+            .create_seekable_range_bounds(lo, hi, seqno, index);
+        let version = inner.version();
+        Box::new(BlobSeekable {
+            inner,
+            tree: self.clone(),
+            version,
+        })
+    }
+
+    fn batch_range_scan<K: AsRef<[u8]>, R: RangeBounds<K> + 'static, I: IntoIterator<Item = R>>(
+        &self,
+        intervals: I,
+        seqno: SeqNo,
+        index: Option<(Arc<Memtable>, SeqNo)>,
+    ) -> Box<dyn Iterator<Item = IterGuardImpl> + Send + 'static>
+    where
+        I::IntoIter: Send + 'static,
+    {
+        let inner = self.index.create_seekable_range_bounds(
+            core::ops::Bound::Unbounded,
+            core::ops::Bound::Unbounded,
+            seqno,
+            index,
+        );
+        let version = inner.version();
+        let tree = self.clone();
+        let intervals = intervals
+            .into_iter()
+            .map(|r| crate::tree::range_to_user_bounds(&r));
+        Box::new(
+            crate::range::BatchRangeScan::new(inner, intervals)
+                .map(move |item| blob_guard(&tree, &version, item)),
         )
     }
 
