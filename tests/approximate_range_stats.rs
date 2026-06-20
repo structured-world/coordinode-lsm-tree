@@ -185,6 +185,80 @@ fn subrange_within_a_single_block_is_nonzero() {
 }
 
 #[test]
+fn all_bound_kinds_are_handled() {
+    use std::ops::Bound;
+
+    // Flushed tree: exercises the SST data-block offset bound arms (Excluded
+    // lower, Included upper, and the half-bounded RangeTo / RangeFrom).
+    let f1 = get_tmp_folder();
+    let tree = build_standard(f1.path());
+    let excl_incl = tree
+        .approximate_range_stats(
+            (Bound::Excluded(key(300)), Bound::Included(key(700))),
+            SeqNo::MAX,
+        )
+        .expect("stats");
+    assert!(excl_incl.key_count > 0, "excluded..=included over SSTs");
+    let to = tree
+        .approximate_range_stats(..key(500), SeqNo::MAX)
+        .expect("stats");
+    let from = tree
+        .approximate_range_stats(key(500).., SeqNo::MAX)
+        .expect("stats");
+    assert!(
+        to.key_count > 0 && from.key_count > 0,
+        "half-bounded over SSTs"
+    );
+    // The two halves together cover at least the full count.
+    assert!(to.key_count + from.key_count >= tree.approximate_len() as u64);
+
+    // Memtable-only tree: exercises the same bound arms on the memtable path.
+    let f2 = get_tmp_folder();
+    let any = Config::new(
+        f2.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()
+    .expect("open");
+    let AnyTree::Standard(mt) = any else {
+        panic!("expected standard tree");
+    };
+    for i in 0..100u32 {
+        mt.insert(key(i), vec![b'v'; 64], 0);
+    }
+    let m_excl_incl = mt
+        .approximate_range_stats(
+            (Bound::Excluded(key(10)), Bound::Included(key(50))),
+            SeqNo::MAX,
+        )
+        .expect("stats");
+    assert!(
+        m_excl_incl.key_count > 0,
+        "excluded..=included over memtable"
+    );
+    let m_to = mt
+        .approximate_range_stats(..key(50), SeqNo::MAX)
+        .expect("stats");
+    let m_from = mt
+        .approximate_range_stats(key(50).., SeqNo::MAX)
+        .expect("stats");
+    assert!(
+        m_to.key_count > 0 && m_from.key_count > 0,
+        "half-bounded over memtable"
+    );
+    // A non-empty memtable queried past every key contributes nothing.
+    let m_empty = mt
+        .approximate_range_stats(key(900)..key(999), SeqNo::MAX)
+        .expect("stats");
+    assert_eq!(
+        m_empty.key_count, 0,
+        "memtable range past all keys is empty"
+    );
+    assert_eq!(m_empty.bytes, 0);
+}
+
+#[test]
 fn kv_separated_range_includes_blob_bytes() {
     let folder = get_tmp_folder();
     let any = Config::new(
