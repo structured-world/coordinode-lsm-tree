@@ -281,15 +281,14 @@ impl Iter {
     /// table's `Arc` handles.
     ///
     /// Clears the bound pair, the materialized low/high data blocks, the offset
-    /// cursors, and the poison flag. The owned `index_iter` is kept: its
-    /// [`crate::table::block_index::OwnedIndexBlockIter::seek_lower`] performs a
-    /// full re-seek (resetting both front and back caches), so the next
-    /// [`Iterator::next`] / [`DoubleEndedIterator::next_back`] re-positions it
-    /// from scratch against the new bounds set after this call.
-    ///
-    /// The caller is expected to immediately re-apply bounds via
-    /// [`set_lower_bound`](Self::set_lower_bound) /
-    /// [`set_upper_bound`](Self::set_upper_bound) before the next pull.
+    /// cursors, and the poison flag, and rewinds the retained `index_iter` to
+    /// the table start. The rewind is load-bearing: lazy init only calls
+    /// `seek_lower` when the new range HAS a lower bound, so a re-seek to a
+    /// range with an UNBOUNDED lower would otherwise inherit the previous pass's
+    /// front cursor and skip earlier blocks. After this call the next
+    /// [`Iterator::next`] / [`DoubleEndedIterator::next_back`] re-positions from
+    /// scratch against the bounds set via [`set_lower_bound`](Self::set_lower_bound)
+    /// / [`set_upper_bound`](Self::set_upper_bound).
     pub fn reset_for_reseek(&mut self) {
         self.range = (None, None);
         self.index_initialized = false;
@@ -301,6 +300,11 @@ impl Iter {
         // that so a re-seek past a previously-corrupt block can make progress
         // again (the block is re-read, and re-poisons only if still corrupt).
         self.poisoned = false;
+        // Rewind the front (and back) index cursor to the first block. An empty
+        // needle is `<=` every key, so `seek_lower` positions at the start and
+        // resets both caches; an unbounded-lower re-seek then starts fresh, and
+        // a bounded-lower one re-seeks over this in init.
+        self.index_iter.seek_lower(&[], u64::MAX);
     }
 
     /// Adaptive partial-tier read for `handle`: keep a cold block only partially
