@@ -239,6 +239,31 @@ fn seek_outside_declared_window_stays_clamped() -> lsm_tree::Result<()> {
             got, in_window,
             "seek_to_for_prev above the window must clamp to it (kv_sep={kv_sep})"
         );
+
+        // Same with an excluded-lower / included-upper window, so the other two
+        // clamp arms (Excluded lower, Included upper) are exercised too.
+        let excl_window = (Bound::Excluded(key(100)), Bound::Included(key(200)));
+        let in_excl: Vec<_> = tree
+            .range(excl_window.clone(), SeqNo::MAX, None)
+            .map(kv)
+            .collect();
+
+        let mut it = tree.range_seekable(excl_window.clone(), SeqNo::MAX, None);
+        it.seek_to(&key(80));
+        let got: Vec<_> = (&mut it).map(kv).collect();
+        assert_eq!(
+            got, in_excl,
+            "seek_to below an excluded-lower window must clamp (kv_sep={kv_sep})"
+        );
+
+        let mut it = tree.range_seekable(excl_window, SeqNo::MAX, None);
+        it.seek_to_for_prev(&key(250));
+        let mut got: Vec<_> = std::iter::from_fn(|| it.next_back()).map(kv).collect();
+        got.reverse();
+        assert_eq!(
+            got, in_excl,
+            "seek_to_for_prev above an included-upper window must clamp (kv_sep={kv_sep})"
+        );
     }
     Ok(())
 }
