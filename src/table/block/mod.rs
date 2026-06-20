@@ -966,16 +966,24 @@ impl Block {
 
                 #[cfg(feature = "lz4")]
                 CompressionType::Lz4 => {
-                    let mut buf = vec![0u8; header.uncompressed_length as usize];
+                    // Decompress straight into the Slice's heap allocation,
+                    // skipping both the zero-fill of `vec![0; n]` and the
+                    // Vec -> Slice copy. SAFETY: `decompress_into` writes every
+                    // byte of a valid lz4 stream, and the block checksum was
+                    // verified above, so the stream is intact and lz4's wildcopy
+                    // never reads an unwritten position.
+                    #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
+                    let mut builder =
+                        unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };
 
-                    let bytes_written = lz4_flex::decompress_into(&decrypted, &mut buf)
+                    let bytes_written = lz4_flex::decompress_into(&decrypted, &mut builder)
                         .map_err(|_| crate::Error::Decompress(compression))?;
 
                     if bytes_written != header.uncompressed_length as usize {
                         return Err(crate::Error::Decompress(compression));
                     }
 
-                    Slice::from(buf)
+                    builder.freeze().into()
                 }
 
                 #[cfg(zstd_any)]
@@ -1064,16 +1072,22 @@ impl Block {
 
                 #[cfg(feature = "lz4")]
                 CompressionType::Lz4 => {
-                    let mut buf = vec![0u8; header.uncompressed_length as usize];
+                    // Decompress straight into the Slice's heap allocation,
+                    // skipping the zero-fill and the Vec -> Slice copy. SAFETY:
+                    // see the matching arm above — the checksum-verified stream
+                    // is intact, so wildcopy never reads an unwritten position.
+                    #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
+                    let mut builder =
+                        unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };
 
-                    let bytes_written = lz4_flex::decompress_into(&raw_data, &mut buf)
+                    let bytes_written = lz4_flex::decompress_into(&raw_data, &mut builder)
                         .map_err(|_| crate::Error::Decompress(compression))?;
 
                     if bytes_written != header.uncompressed_length as usize {
                         return Err(crate::Error::Decompress(compression));
                     }
 
-                    Slice::from(buf)
+                    builder.freeze().into()
                 }
 
                 #[cfg(zstd_any)]
@@ -1376,7 +1390,13 @@ impl Block {
 
                 #[cfg(feature = "lz4")]
                 CompressionType::Lz4 => {
-                    let mut decompressed = vec![0u8; parsed_header.uncompressed_length as usize];
+                    // Decompress straight into the Slice allocation (no zero-fill,
+                    // no Vec -> Slice copy). SAFETY: see the read-path arm above;
+                    // the checksum-verified stream is intact.
+                    #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
+                    let mut decompressed = unsafe {
+                        Slice::builder_unzeroed(parsed_header.uncompressed_length as usize)
+                    };
 
                     let bytes_written = lz4_flex::decompress_into(&decrypted, &mut decompressed)
                         .map_err(|_| crate::Error::Decompress(compression))?;
@@ -1385,7 +1405,7 @@ impl Block {
                         return Err(crate::Error::Decompress(compression));
                     }
 
-                    Slice::from(decompressed)
+                    decompressed.freeze().into()
                 }
 
                 #[cfg(zstd_any)]
@@ -1531,7 +1551,13 @@ impl Block {
                 CompressionType::Lz4 => {
                     let compressed_data: &[u8] = &payload_slice;
 
-                    let mut decompressed = vec![0u8; parsed_header.uncompressed_length as usize];
+                    // Decompress straight into the Slice allocation (no zero-fill,
+                    // no Vec -> Slice copy). SAFETY: see the read-path arm above;
+                    // the checksum-verified stream is intact.
+                    #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
+                    let mut decompressed = unsafe {
+                        Slice::builder_unzeroed(parsed_header.uncompressed_length as usize)
+                    };
 
                     let bytes_written =
                         lz4_flex::decompress_into(compressed_data, &mut decompressed)
@@ -1541,7 +1567,7 @@ impl Block {
                         return Err(crate::Error::Decompress(compression));
                     }
 
-                    Slice::from(decompressed)
+                    decompressed.freeze().into()
                 }
 
                 #[cfg(zstd_any)]
