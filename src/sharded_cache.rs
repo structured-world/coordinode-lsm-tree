@@ -68,6 +68,23 @@ enum Location {
     Main,
 }
 
+/// Admission priority for an inserted entry.
+///
+/// [`Priority::High`] entries skip the probationary *small* queue and enter the
+/// *main* queue directly with a full frequency credit, so they survive several
+/// eviction passes of churn through the small queue without first being
+/// cold-evicted. Used to pin frequently-touched index / filter / range-tombstone
+/// blocks against data-block churn when the working set exceeds the cache. Still
+/// bounded: `evict_from_main` decrements the credit, so a high-priority entry can
+/// eventually evict if such entries alone overflow capacity.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Priority {
+    /// Normal admission: ghost-hit → main, otherwise the probationary small queue.
+    Normal,
+    /// Pinned admission: straight to main with a full frequency credit.
+    High,
+}
+
 /// One cached entry: the value, its weight, the S3-FIFO frequency counter, and
 /// the queue it belongs to. `freq` is atomic so a `get` can bump it under a
 /// shared (read) lock; all other fields change only under the write lock.
@@ -166,7 +183,7 @@ where
     /// Inserts or replaces `key`, evicting to stay within capacity. The shard's
     /// running `small_bytes` / `main_bytes` tallies are kept current throughout
     /// (the sharded wrapper reads them under a shared lock for `weight()`).
-    fn insert(&mut self, hash: u64, key: K, value: V, weight: u64) {
+    fn insert(&mut self, hash: u64, key: K, value: V, weight: u64, priority: Priority) {
         if let Some((_, slot)) = self.map.find_mut(hash, |(k, _)| *k == key) {
             // Replace in place: adjust the owning queue's byte tally by the
             // weight delta, keep the queue position and frequency.
@@ -178,13 +195,20 @@ where
                 Location::Main => self.main_bytes = adjust(self.main_bytes, old, weight),
             }
         } else {
-            // Fresh entry. A key found in the ghost queue (recently evicted from
-            // the small queue) is admitted straight to the main queue; otherwise
-            // it enters the small queue.
-            let loc = if self.ghost_set.remove(&key) {
-                Location::Main
-            } else {
-                Location::Small
+            // Fresh entry. High-priority entries (pinned metadata) go straight to
+            // main with a full frequency credit so churn through the small queue
+            // can't cold-evict them. Otherwise: a ghost-queue hit (recently
+            // evicted from small) is re-admitted to main, else the entry enters
+            // the probationary small queue.
+            let (loc, init_freq) = match priority {
+                Priority::High => (Location::Main, MAX_FREQ),
+                Priority::Normal => {
+                    if self.ghost_set.remove(&key) {
+                        (Location::Main, 0)
+                    } else {
+                        (Location::Small, 0)
+                    }
+                }
             };
             let hasher = &self.hasher;
             self.map.insert_unique(
@@ -194,7 +218,7 @@ where
                     Slot {
                         value,
                         weight,
-                        freq: AtomicU8::new(0),
+                        freq: AtomicU8::new(init_freq),
                         loc,
                     },
                 ),
@@ -429,11 +453,19 @@ where
         shard.read().peek(h, key)
     }
 
-    /// Inserts or replaces `key`, evicting as needed to stay within capacity.
+    /// Inserts or replaces `key` at [`Priority::Normal`], evicting as needed to
+    /// stay within capacity.
     pub fn insert(&self, key: K, value: V) {
+        self.insert_with_priority(key, value, Priority::Normal);
+    }
+
+    /// Inserts or replaces `key` at the given admission [`Priority`], evicting as
+    /// needed to stay within capacity. [`Priority::High`] pins the entry against
+    /// churn (see the enum docs).
+    pub fn insert_with_priority(&self, key: K, value: V, priority: Priority) {
         let weight = self.weighter.weight(&key, &value);
         let (h, shard) = self.locate(&key);
-        shard.write().insert(h, key, value, weight);
+        shard.write().insert(h, key, value, weight, priority);
     }
 
     /// Removes `key` if present.
@@ -561,6 +593,33 @@ mod tests {
             let _ = c.get(&0); // keep touching the hot key
         }
         assert_eq!(c.get(&0), Some(vec![0u8; 100]), "hot key was evicted");
+    }
+
+    #[test]
+    fn high_priority_entry_survives_churn_that_evicts_normal() {
+        // A single shard so the churn deterministically targets the same queues
+        // as the pinned entry (multi-shard would scatter the cold keys).
+        let c: ShardedCache<u64, alloc::vec::Vec<u8>, LenWeighter, FxBuildHasher> =
+            ShardedCache::with_weighter(2_000, 1, 1024, LenWeighter, FxBuildHasher);
+
+        // One high-priority entry (pinned metadata) and one normal entry of the
+        // same size, neither re-read after insertion.
+        c.insert_with_priority(0, vec![0u8; 100], Priority::High);
+        c.insert(1, vec![0u8; 100]);
+
+        // Churn far past capacity with cold, single-touch normal entries (the
+        // data-block-churn analogue).
+        for i in 2..200u64 {
+            c.insert(i, vec![0u8; 100]);
+        }
+
+        // The pinned entry survived; the same-age normal entry did not.
+        assert_eq!(
+            c.get(&0),
+            Some(vec![0u8; 100]),
+            "high-priority entry must survive data-style churn",
+        );
+        assert_eq!(c.get(&1), None, "normal entry should have been evicted");
     }
 
     #[test]

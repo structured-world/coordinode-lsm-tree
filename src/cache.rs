@@ -4,8 +4,8 @@
 
 #[cfg(feature = "zstd")]
 use crate::UserKey;
-use crate::sharded_cache::{ShardedCache, Weighter};
-use crate::table::block::Header;
+use crate::sharded_cache::{Priority, ShardedCache, Weighter};
+use crate::table::block::{BlockType, Header};
 use crate::table::{Block, BlockOffset};
 use crate::value::InternalValue;
 use crate::{GlobalTableId, UserValue};
@@ -127,6 +127,12 @@ pub struct Cache {
     /// cached regardless. Off by default to avoid spending the shared capacity on
     /// rows for workloads that do not benefit (e.g. uniform / scan-heavy).
     row_cache_enabled: bool,
+    /// When true (default), index / filter / range-tombstone blocks are admitted
+    /// at [`Priority::High`] so heavy data-block churn (working set >> cache)
+    /// cannot evict the metadata blocks every seek touches, sparing a re-read +
+    /// re-decode on the next index descent. Disable to put every block on equal
+    /// footing (the pre-priority behaviour), e.g. for A/B measurement.
+    metadata_priority: bool,
 }
 
 /// Number of shards in the block cache. 64 keeps per-shard write contention low
@@ -151,6 +157,7 @@ impl Cache {
                 rustc_hash::FxBuildHasher,
             ),
             row_cache_enabled: false,
+            metadata_priority: true,
         }
     }
 
@@ -167,6 +174,22 @@ impl Cache {
     #[must_use]
     pub fn row_cache_enabled(&self) -> bool {
         self.row_cache_enabled
+    }
+
+    /// Enables or disables high-priority pinning of index / filter /
+    /// range-tombstone blocks (see [`Cache::metadata_priority`] field docs),
+    /// returning the cache for builder-style configuration. On by default.
+    #[must_use]
+    pub fn with_metadata_priority(mut self, enabled: bool) -> Self {
+        self.metadata_priority = enabled;
+        self
+    }
+
+    /// Whether metadata-block priority pinning is enabled (see
+    /// [`Cache::with_metadata_priority`]).
+    #[must_use]
+    pub fn metadata_priority(&self) -> bool {
+        self.metadata_priority
     }
 
     /// Returns the amount of cached bytes.
@@ -252,9 +275,23 @@ impl Cache {
 
     #[doc(hidden)]
     pub fn insert_block(&self, id: GlobalTableId, offset: BlockOffset, block: Block) {
-        self.data.insert(
+        // Pin index / filter / range-tombstone blocks: they are touched on every
+        // seek (index descent + bloom check), so under data-block churn (working
+        // set >> cache) they must outlive the data blocks that would otherwise
+        // evict them and force a metadata re-read + re-decode on the next seek.
+        let priority = if self.metadata_priority
+            && matches!(
+                block.header.block_type,
+                BlockType::Index | BlockType::Filter | BlockType::RangeTombstone
+            ) {
+            Priority::High
+        } else {
+            Priority::Normal
+        };
+        self.data.insert_with_priority(
             (TAG_BLOCK, id.tree_id(), id.table_id(), *offset).into(),
             Item::Block(block),
+            priority,
         );
     }
 
