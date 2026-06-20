@@ -90,7 +90,10 @@ impl<'a> Reader<'a> {
         // Allow header+key overhead on top of the data cap.
         // NOTE: A separate `on_disk_size > MAX` check is mathematically redundant here
         // because `total > MAX + overhead` already implies `on_disk_size > MAX`.
-        let max_total_read_size = (MAX_DECOMPRESSION_SIZE as u64).saturating_add(add_size);
+        // 256 MiB cap plus a small (≤ header + u16 key) overhead — bounded well
+        // within u64 (see the `add_size < u32::MAX` note below), so a plain add
+        // cannot overflow.
+        let max_total_read_size = (MAX_DECOMPRESSION_SIZE as u64) + add_size;
 
         // on_disk_size is u32 and add_size < u32::MAX, so this cannot overflow u64.
         let total_read_size = u64::from(vhandle.on_disk_size) + add_size;

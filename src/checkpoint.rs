@@ -280,7 +280,9 @@ pub fn link_or_copy_cross_fs(
                 reason = "n was just produced by read() and is bounded by buf.len()"
             )]
             dst_file.write_all(&buf[..n])?;
-            total = total.saturating_add(n as u64);
+            // Running copied-byte total, bounded by the source file size, so a
+            // plain add cannot overflow u64.
+            total += n as u64;
         }
         dst_file.flush()?;
         FsFile::sync_all_with(&*dst_file, sync_mode)?;
@@ -330,8 +332,10 @@ pub fn link_tables(
             use_reflink,
         )
         .map_err(crate::Error::from)?;
-        bytes = bytes.saturating_add(written);
-        count = count.saturating_add(1);
+        // Checkpoint totals: `bytes` is bounded by the disk size and `count` by
+        // the number of files, so plain adds cannot overflow.
+        bytes += written;
+        count += 1;
     }
     Ok((count, bytes))
 }
@@ -363,8 +367,10 @@ pub fn link_blob_files(
             use_reflink,
         )
         .map_err(crate::Error::from)?;
-        bytes = bytes.saturating_add(written);
-        count = count.saturating_add(1);
+        // Checkpoint totals: `bytes` is bounded by the disk size and `count` by
+        // the number of files, so plain adds cannot overflow.
+        bytes += written;
+        count += 1;
     }
     Ok((count, bytes))
 }
@@ -788,7 +794,9 @@ pub fn run_checkpoint<T: AbstractTree>(
     Ok(CheckpointInfo {
         sst_files,
         blob_files,
-        total_bytes: sst_bytes.saturating_add(blob_bytes),
+        // Sum of two on-disk byte totals, bounded by the disk size; cannot
+        // overflow u64.
+        total_bytes: sst_bytes + blob_bytes,
         version_id: version.id(),
         seqno: captured_seqno,
     })

@@ -203,11 +203,15 @@ impl Iterator for Scanner {
             } else {
                 super::writer::BLOB_HEADER_LEN_V3 as u64
             };
+            // `key_len` / `on_disk_val_len` come from the on-disk frame header and
+            // may be corrupt. Use checked adds so a value that overflows u64 fails
+            // loudly here (treated as "does not fit") instead of saturating to
+            // u64::MAX and relying on the `> data_end` compare to reject it.
             let frame_end = offset
-                .saturating_add(header_len)
-                .saturating_add(u64::from(key_len))
-                .saturating_add(u64::from(on_disk_val_len));
-            if frame_end > self.data_end {
+                .checked_add(header_len)
+                .and_then(|x| x.checked_add(u64::from(key_len)))
+                .and_then(|x| x.checked_add(u64::from(on_disk_val_len)));
+            if frame_end.is_none_or(|end| end > self.data_end) {
                 self.is_terminated = true;
                 return Some(Err(crate::Error::InvalidHeader("Blob")));
             }
@@ -498,6 +502,59 @@ mod tests {
         assert_eq!(entry.seqno, 42);
         assert!(scanner.next().is_none());
 
+        Ok(())
+    }
+
+    /// A frame whose declared `on_disk_val_len` runs past the data section must be
+    /// rejected by the checked frame-fit bound, not read past the section. Uses a
+    /// V3 frame (no header CRC) so the oversized length reaches the fit check
+    /// rather than being caught earlier by the V4 header CRC.
+    #[test]
+    fn blob_scanner_rejects_oversized_on_disk_len() -> crate::Result<()> {
+        use crate::io::{LittleEndian, WriteBytesExt};
+        use std::io::Write;
+
+        let dir = tempdir()?;
+        let blob_file_path = dir.path().join("0");
+
+        let key = b"abc";
+        let value = b"hi";
+        {
+            let file = std::fs::File::create(&blob_file_path)?;
+            let mut sfa_writer = crate::sfa::Writer::from_writer(file);
+            sfa_writer.start("data")?;
+            sfa_writer.write_all(b"BLOB")?;
+            sfa_writer.write_u128::<LittleEndian>(0)?; // checksum (unreached)
+            sfa_writer.write_u64::<LittleEndian>(1)?; // seqno
+            #[expect(clippy::cast_possible_truncation, reason = "test key fits u16")]
+            sfa_writer.write_u16::<LittleEndian>(key.len() as u16)?;
+            sfa_writer.write_u32::<LittleEndian>(2)?; // real_val_len
+            // on_disk_val_len far exceeds the data section → frame-fit reject.
+            sfa_writer.write_u32::<LittleEndian>(u32::MAX)?;
+            sfa_writer.write_all(key)?;
+            sfa_writer.write_all(value)?;
+
+            sfa_writer.start("meta")?;
+            let metadata = crate::vlog::blob_file::meta::Metadata {
+                id: 0,
+                version: 3,
+                created_at: 0,
+                item_count: 1,
+                total_compressed_bytes: 2,
+                total_uncompressed_bytes: 2,
+                key_range: crate::KeyRange::new((key[..].into(), key[..].into())),
+                compression: crate::CompressionType::None,
+            };
+            metadata.encode_into(&mut sfa_writer)?;
+            sfa_writer.into_inner()?.sync_all()?;
+        }
+
+        let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
+        let result = scanner.next().unwrap();
+        assert!(
+            matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
+            "an oversized on_disk_val_len must be rejected, got: {result:?}",
+        );
         Ok(())
     }
 

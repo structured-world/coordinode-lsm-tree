@@ -81,14 +81,18 @@ pub(crate) fn expected_parity_len(data_length: u32, params: EccParams) -> u32 {
     if data_length == 0 || data_shards == 0 || parity_shards == 0 {
         return 0;
     }
-    // ceil(N / data_shards) — overflow-safe for u32 since `data_length`
-    // is already capped at MAX_DECOMPRESSION_SIZE + max overhead by the
-    // caller before this function fires.
-    let ceil = (data_length / data_shards)
-        .saturating_add(u32::from(!data_length.is_multiple_of(data_shards)));
-    // Round up to even (the `reed-solomon-simd` engine requires shard
-    // sizes that are a multiple of two; XOR shares the layout).
+    // ceil(N / data_shards). The division never increases the value and the
+    // remainder bump only fires when there IS a remainder (so the quotient is
+    // already below the dividend), keeping this within u32 — plain arithmetic.
+    let ceil = (data_length / data_shards) + u32::from(!data_length.is_multiple_of(data_shards));
+    // Round up to even (the `reed-solomon-simd` engine requires shard sizes that
+    // are a multiple of two; XOR shares the layout). With `data_shards == 1` and
+    // a `u32::MAX` data length, `ceil` is an odd `u32::MAX`, so the +1 must
+    // saturate; a corrupt header reaching here is rejected downstream.
     let shard_bytes = ceil.saturating_add(u32::from(!ceil.is_multiple_of(2)));
+    // `parity_shards` is a u8 (≤ 255), so for a large block with many parity
+    // shards the product CAN exceed u32 — saturate. An over-large parity length
+    // is rejected against the actual block downstream, so the clamp is safe.
     shard_bytes.saturating_mul(parity_shards)
 }
 
@@ -1272,6 +1276,8 @@ impl Block {
                 0
             };
 
+            // Clamp-to-zero: a block truncated before its header ends has no
+            // payload, which `classify_block_trailer` then flags as a mismatch.
             let actual_payload_plus_ecc = block_size.saturating_sub(header_len);
             let actual_data_len = parsed_header.data_length as usize;
             let ecc_status = classify_block_trailer(
@@ -1446,6 +1452,8 @@ impl Block {
                 0
             };
 
+            // Clamp-to-zero: a buffer shorter than the header carries no payload,
+            // which the trailer classification then flags as a mismatch.
             let actual_payload_plus_ecc = buf.len().saturating_sub(header_len);
             let actual_data_len = parsed_header.data_length as usize;
             let ecc_status = classify_block_trailer(
@@ -1658,6 +1666,8 @@ impl Block {
             0
         };
 
+        // Clamp-to-zero: a buffer shorter than the header carries no payload,
+        // which the trailer classification then flags as a mismatch.
         let actual_payload_plus_ecc = buf.len().saturating_sub(header_len);
         let actual_data_len = parsed_header.data_length as usize;
         let _ecc_status = classify_block_trailer(
@@ -1711,6 +1721,33 @@ impl Block {
 mod tests {
     use super::*;
     use test_log::test;
+
+    /// A pathological-but-valid shard config (1 data shard, 255 parity shards)
+    /// over a large block makes `shard_bytes * parity_shards` exceed u32. The
+    /// parity length must saturate to `u32::MAX` (it is rejected against the actual
+    /// block downstream), never wrap or panic.
+    #[test]
+    fn expected_parity_len_saturates_on_huge_parity_product() {
+        let data_length = 100 * 1024 * 1024; // 100 MiB
+        let params = EccParams::Shard {
+            data_shards: 1,
+            parity_shards: 255,
+        };
+        assert_eq!(expected_parity_len(data_length, params), u32::MAX);
+    }
+
+    /// A `u32::MAX` data length with a single data shard makes `ceil` equal an
+    /// odd `u32::MAX`; rounding it up to an even shard size must saturate, not
+    /// overflow `u32`. A corrupt header reaching this path is rejected
+    /// downstream, so the clamp must not panic here.
+    #[test]
+    fn expected_parity_len_saturates_on_max_data_length_even_rounding() {
+        let params = EccParams::Shard {
+            data_shards: 1,
+            parity_shards: 2,
+        };
+        assert_eq!(expected_parity_len(u32::MAX, params), u32::MAX);
+    }
 
     /// Result of [`write_block_to_tempfile`]. Bundles the open
     /// file, the pre-computed [`crate::table::BlockHandle`], and

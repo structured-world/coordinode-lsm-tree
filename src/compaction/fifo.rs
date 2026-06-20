@@ -97,6 +97,8 @@ impl CompactionStrategy for Strategy {
         // accumulate their sizes. Also collect non-expired tables for possible size-based drops.
         let ttl_cutoff = match self.ttl_seconds {
             Some(s) if s > 0 => Some(
+                // Clamp-to-zero: a TTL longer than the wall clock leaves no
+                // expiry cutoff rather than wrapping.
                 unix_timestamp()
                     .as_nanos()
                     .saturating_sub(u128::from(s) * 1_000_000_000u128),
@@ -114,8 +116,9 @@ impl CompactionStrategy for Strategy {
             if expired {
                 ids_to_drop.insert(table.id());
                 let linked_blob_file_bytes = table.referenced_blob_bytes().unwrap_or_default();
-                ttl_dropped_bytes =
-                    ttl_dropped_bytes.saturating_add(table.file_size() + linked_blob_file_bytes);
+                // Accumulated dropped-byte total, bounded by the on-disk size;
+                // cannot overflow u64.
+                ttl_dropped_bytes += table.file_size() + linked_blob_file_bytes;
             } else {
                 alive.push(table);
             }
@@ -141,8 +144,9 @@ impl CompactionStrategy for Strategy {
                 ids_to_drop.insert(table.id());
 
                 let linked_blob_file_bytes = table.referenced_blob_bytes().unwrap_or_default();
-                collected_bytes =
-                    collected_bytes.saturating_add(table.file_size() + linked_blob_file_bytes);
+                // Accumulated collected-byte total, bounded by the on-disk size;
+                // cannot overflow u64.
+                collected_bytes += table.file_size() + linked_blob_file_bytes;
             }
         }
 

@@ -256,7 +256,15 @@ impl CompactionStrategy for Strategy {
             //   (total / largest - 1) * 100 >= threshold
             // is equivalent to:
             //   total * 100 >= largest * (100 + threshold)
-            let lhs = u128::from(total_size).saturating_mul(100);
+            // `lhs` multiplies a u64-derived u128 by the constant 100, which
+            // cannot overflow u128 — plain multiply. `rhs` multiplies by
+            // `100 + max_space_amplification_percent`, and the percentage is an
+            // unvalidated u64 (tests pass u64::MAX), so that product CAN exceed
+            // u128 — saturate. When `rhs` saturates to u128::MAX the `lhs >= rhs`
+            // check below cannot fire, so a huge amplification bound simply never
+            // triggers a space-amplification compaction, matching the intent of a
+            // very high threshold (tolerate maximum amplification).
+            let lhs = u128::from(total_size) * 100;
             let rhs = u128::from(largest_run_size)
                 .saturating_mul(100 + u128::from(self.max_space_amplification_percent));
 

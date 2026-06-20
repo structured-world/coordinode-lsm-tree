@@ -618,8 +618,14 @@ pub fn recover(
                 // hard "count header forged" abort. Under any of the
                 // tolerant modes it warns and lets the loop walk
                 // bytes-actually-present.
+                // Clamp-to-zero: `tables_bytes_consumed <= section_len` by loop
+                // invariant, so this never actually saturates — it guards the
+                // subtraction (clamp is the intended min semantics).
                 let bytes_remaining = section_len.saturating_sub(tables_bytes_consumed);
-                if u64::from(table_count).saturating_mul(FRAMED_TABLE_ENTRY_LEN) > bytes_remaining {
+                // `table_count` is an untrusted u32; widened to u64 its product
+                // with the 45-byte entry size is at most u32::MAX * 45 < u64::MAX,
+                // so a plain multiply cannot overflow (no need to mask it).
+                if u64::from(table_count) * FRAMED_TABLE_ENTRY_LEN > bytes_remaining {
                     if tolerate_tail {
                         log::warn!(
                             "tables: declared table_count={table_count} exceeds \
@@ -952,6 +958,9 @@ pub fn recover(
         // Each framed blob entry is FRAME_HEADER_LEN (12) + 25 bytes
         // payload = 37 bytes. Same forged-vs-truncated dispatch as the
         // tables-section count check.
+        // Capacity as a DIVISION (count > section/entry), which is overflow-safe
+        // by construction — no multiply to mask. `saturating_sub(4)` clamps to
+        // zero when the section is too short to even hold the count header.
         let blob_section_capacity = section_len.saturating_sub(4) / FRAMED_BLOB_ENTRY_LEN;
         if u64::from(blob_file_count) > blob_section_capacity {
             if tolerate_tail {

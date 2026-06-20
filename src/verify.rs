@@ -1163,7 +1163,9 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         // DataReadError / data-length-bounds HeaderCorrupted would
         // be silently uncounted, contradicting the documented
         // semantics.
-        *ctx.blocks_scanned = ctx.blocks_scanned.saturating_add(1);
+        // Block counter; a tree cannot hold 2^64 blocks, so a plain add cannot
+        // overflow.
+        *ctx.blocks_scanned += 1;
 
         // Actual header length for this block (variable: SST blocks omit the
         // block_flags byte). Used for the section-bounds math and the offset
@@ -1227,8 +1229,29 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
             });
             return;
         }
-        let remaining = end_offset.saturating_sub(offset).saturating_sub(header_len);
-        let on_disk_payload = data_length_u64.saturating_add(parity_len);
+        // A header whose own bytes cross the section boundary is corrupt and must
+        // be rejected here: clamping `remaining` to zero would let a header with a
+        // zero-length declared payload slip past the `>` check below even though
+        // the header itself ran past the section end. Reuse the plain
+        // `remaining_in_section` (the loop invariant `offset < end_offset` keeps
+        // it non-negative) rather than recomputing it.
+        if header_len > remaining_in_section {
+            ctx.errors.push(BlockVerifyError::HeaderCorrupted {
+                table_id: ctx.table_id,
+                path: ctx.path.to_path_buf(),
+                offset,
+                reason: format!(
+                    "block header ({header_len} bytes) extends past the section end \
+                     ({remaining_in_section} bytes remain)",
+                ),
+            });
+            return;
+        }
+        let remaining = remaining_in_section - header_len;
+        // `data_length_u64` is already capped at `ctx.max_data_length` (checked
+        // above) and `parity_len` is derived from it, so the sum is bounded well
+        // within u64 — a plain add cannot overflow.
+        let on_disk_payload = data_length_u64 + parity_len;
         if on_disk_payload > remaining {
             ctx.errors.push(BlockVerifyError::HeaderCorrupted {
                 table_id: ctx.table_id,
@@ -1317,10 +1340,10 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         // blocks_scanned was already incremented right after a
         // successful Header::decode_from above — do not double-count
         // here.
-        offset = offset
-            .saturating_add(header_len)
-            .saturating_add(data_length_u64)
-            .saturating_add(parity_len);
+        // Advance past this block. Each term is bounded (data_length capped
+        // above, parity derived from it, header a const) and `offset` is bounded
+        // by the section end, so the running cursor cannot overflow u64.
+        offset += header_len + data_length_u64 + parity_len;
     }
 }
 
@@ -1962,6 +1985,107 @@ mod block_verify_tests {
             scan.blocks_scanned, 1,
             "header decoded successfully, so blocks_scanned must count this block \
              even though the data segment read failed",
+        );
+    }
+
+    /// A block header whose own bytes extend past the section boundary must be
+    /// reported as `HeaderCorrupted`, not slip through with a clamped-to-zero
+    /// remaining payload.
+    ///
+    /// Setup forges a section whose lied length is exactly `Header::MIN_LEN`
+    /// (so the `< MIN_LEN` guard passes) and stores a `Meta` block, whose
+    /// `header_len` is `MIN_LEN + 1`. `Header::decode_from` reads the full
+    /// `MIN_LEN + 1` header bytes from the file (they are physically present,
+    /// followed by the TOC), but those bytes cross the section boundary, so the
+    /// boundary guard fires.
+    #[test]
+    #[expect(
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation,
+        reason = "synthetic SFA forgery — offsets are in-bounds by construction \
+                  and the forged archive is < 1 KiB"
+    )]
+    fn walk_block_region_reports_header_crossing_section_boundary() {
+        use crate::coding::Encode;
+        use crate::fs::{Fs, FsOpenOptions, MemFs};
+        use crate::table::block::{BlockType, Header};
+
+        const TRAILER_LEN: usize = 4 + 1 + 1 + 16 + 8 + 8;
+
+        // `Meta` blocks carry the block_flags byte, so header_len == MIN_LEN + 1.
+        let header = Header {
+            checksum: Checksum::from_raw(0xDEAD_BEEF_DEAD_BEEF),
+            data_length: 0,
+            uncompressed_length: 0,
+            ..Header::test_dummy(BlockType::Meta)
+        };
+        assert_eq!(
+            Header::header_len(BlockType::Meta) as u64,
+            Header::MIN_LEN as u64 + 1,
+        );
+
+        let mut archive_bytes: Vec<u8> = Vec::new();
+        {
+            let mut writer =
+                crate::sfa::Writer::from_writer(std::io::Cursor::new(&mut archive_bytes));
+            writer.start("data").unwrap();
+            writer.write_all(&header.encode_into_vec()).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let trailer_start = archive_bytes.len() - TRAILER_LEN;
+        let toc_pos_bytes: [u8; 8] = archive_bytes[trailer_start + 22..trailer_start + 30]
+            .try_into()
+            .unwrap();
+        let toc_len_bytes: [u8; 8] = archive_bytes[trailer_start + 30..trailer_start + 38]
+            .try_into()
+            .unwrap();
+        let toc_pos = u64::from_le_bytes(toc_pos_bytes) as usize;
+        let toc_len = u64::from_le_bytes(toc_len_bytes) as usize;
+
+        let first_entry_offset = toc_pos + 4 + 4;
+        let len_field_offset = first_entry_offset + 8;
+
+        // Lie that the section is exactly MIN_LEN bytes: one byte short of the
+        // Meta header, so the header decode crosses the section boundary.
+        let lied_len: u64 = Header::MIN_LEN as u64;
+        archive_bytes[len_field_offset..len_field_offset + 8]
+            .copy_from_slice(&lied_len.to_le_bytes());
+
+        let new_toc_checksum = crate::hash::hash128(&archive_bytes[toc_pos..toc_pos + toc_len]);
+        let csum_field_offset = trailer_start + 4 + 1 + 1;
+        archive_bytes[csum_field_offset..csum_field_offset + 16]
+            .copy_from_slice(&new_toc_checksum.to_le_bytes());
+
+        let fs = MemFs::new();
+        let path = std::path::Path::new("/forged-boundary.sst");
+        {
+            let mut f = fs
+                .open(
+                    path,
+                    &FsOpenOptions::new().write(true).create(true).truncate(true),
+                )
+                .unwrap();
+            f.write_all(&archive_bytes).unwrap();
+        }
+
+        let table_id: TableId = 7;
+        let scan = scan_sst_blocks(&fs, path, table_id, 0, None, false)
+            .expect("forged SFA must parse cleanly");
+        assert_eq!(
+            scan.errors.len(),
+            1,
+            "expected exactly one error, got {:?}",
+            scan.errors,
+        );
+        let err = scan.errors.first().unwrap();
+        assert!(
+            matches!(
+                err,
+                BlockVerifyError::HeaderCorrupted { table_id: t, offset: 0, reason, .. }
+                    if *t == table_id && reason.contains("extends past the section end"),
+            ),
+            "expected a section-boundary HeaderCorrupted; got {err:?}",
         );
     }
 

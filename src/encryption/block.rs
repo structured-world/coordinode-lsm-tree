@@ -422,6 +422,9 @@ pub fn parse_encrypted_block_metadata(
     // actually contains the advertised ciphertext bytes — otherwise a block cut
     // off right after the BodyFrame header would be reported as structurally
     // valid with a ciphertext_len for bytes that aren't there.
+    // Clamp-to-zero: the cursor never advances past the input, so this guards
+    // the subtraction; the `>` check then rejects a frame whose declared
+    // ciphertext_len exceeds the bytes actually present.
     let remaining = u64::try_from(bytes.len())
         .unwrap_or(u64::MAX)
         .saturating_sub(cursor.position());

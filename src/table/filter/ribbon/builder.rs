@@ -212,6 +212,8 @@ impl RibbonBuilder {
             z[row_start..row_end].copy_from_slice(&rhs[row_start..row_end]);
             let upper_lo = coeff_lo[i] & !1u64;
             let upper_hi = coeff_hi[i];
+            // Capacity hint of at most `w - 1` set bits above the diagonal;
+            // clamp-to-zero so `w == 0` yields an empty hint, never underflow.
             let mut row_offsets = Vec::with_capacity(self.params.w.saturating_sub(1));
             for_each_set_bit_u128_parts(upper_lo, upper_hi, |offset| {
                 row_offsets.push(offset);

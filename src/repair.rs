@@ -406,8 +406,13 @@ fn repair_tree(config: &Config) -> crate::Result<RepairReport> {
         levels.push(Level::empty());
     }
 
-    let version_id = highest_existing_version_id(&*config.fs, &config.path)?
-        .map_or(0, |max| max.saturating_add(1));
+    // Next version id after the highest existing one. The max is parsed from
+    // on-disk `v{N}` directory names, so a malformed `v{u64::MAX}` entry would
+    // overflow; reject it explicitly rather than wrapping the version counter.
+    let version_id = match highest_existing_version_id(&*config.fs, &config.path)? {
+        Some(max) => max.checked_add(1).ok_or(crate::Error::Unrecoverable)?,
+        None => 0,
+    };
 
     // KV-separated (blob) trees additionally carry a blob-file list. Discover the
     // blob files from the `blobs/` folder (no manifest to filter against) and

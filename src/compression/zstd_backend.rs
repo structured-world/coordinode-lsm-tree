@@ -83,6 +83,8 @@ fn decode_raw_content_bounded(
 
     let mut output: Vec<u8> = Vec::new();
     loop {
+        // Clamp-to-zero: remaining output budget = capacity minus what has been
+        // decoded so far (never negative once the cap is reached).
         let remaining = capacity.saturating_sub(output.len());
 
         if !decoder.is_finished() {

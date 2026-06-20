@@ -387,6 +387,9 @@ pub fn partial_data_block(
         let extent = if lazy.decoded().is_empty() {
             (64 * 1024).min(total)
         } else {
+            // Grow the read-ahead window geometrically, capped at `total`. The
+            // `.min(total)` is the real bound; the saturating guards the doubling
+            // before that cap.
             lazy.decoded().len().saturating_mul(2).min(total)
         };
         lazy.ensure_decoded_to(extent)?;

@@ -189,6 +189,9 @@ impl BurrBuilder {
 
             let m_target = self.params.layer_m(layer_input);
             let m = if is_last_layer {
+                // Last-layer slot count, doubled then floored at `b * 4`.
+                // `m_target` is bounded by the key count, so the doubling cannot
+                // overflow usize on 64-bit; the saturating guards a 32-bit edge.
                 let doubled = m_target.saturating_mul(2);
                 doubled.max(usize::from(self.params.b) * 4)
             } else {
