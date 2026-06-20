@@ -14,38 +14,59 @@ use lsm_tree::{
     Memtable, SeqNo, SequenceNumberCounter, SharedComparator, UserKey, ValueType, get_tmp_folder,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::ops::{Bound, Range};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use test_log::test;
 
-/// Allocation counter for the in-place-reseek micro-bench. Counts `alloc` /
-/// `realloc` calls only while [`MEASURING`] is set, so a measured region sees
-/// exactly the heap traffic it triggers. nextest runs each test in its own
-/// process, so the global counter is isolated per test.
-static MEASURED_ALLOCS: AtomicUsize = AtomicUsize::new(0);
-static MEASURING: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    /// Per-thread allocation counter for the in-place-reseek micro-bench. Counts
+    /// `alloc` / `realloc` calls on THIS thread only while [`MEASURING`] is set,
+    /// so a measured region sees exactly the heap traffic its own thread
+    /// triggers. Thread-local (not a global atomic) so allocations from other
+    /// tests running concurrently in the same process (e.g. under
+    /// `cargo llvm-cov`, which does not use nextest's process-per-test) cannot
+    /// pollute the count. `const`-initialised, so accessing it from the global
+    /// allocator never itself allocates (no lazy-init guard).
+    static MEASURED_ALLOCS: Cell<usize> = const { Cell::new(0) };
+    /// Per-thread measurement switch (see [`MEASURED_ALLOCS`]).
+    static MEASURING: Cell<bool> = const { Cell::new(false) };
+}
 
 struct CountingAllocator;
 
-// SAFETY: forwards every call verbatim to the system allocator; the only added
-// behaviour is a relaxed counter bump on allocating paths while measuring.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if MEASURING.load(Ordering::Relaxed) {
-            MEASURED_ALLOCS.fetch_add(1, Ordering::Relaxed);
-        }
+        bump_if_measuring();
+        // SAFETY: `layout` is forwarded unchanged from the caller, which already
+        // upholds `GlobalAlloc::alloc`'s validity contract; `System` honours the
+        // same contract. The only added behaviour is the counter bump above.
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: `ptr` / `layout` are forwarded unchanged from the caller, so
+        // they satisfy `System::dealloc`'s contract (allocated by this allocator
+        // with the same `layout`).
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if MEASURING.load(Ordering::Relaxed) {
-            MEASURED_ALLOCS.fetch_add(1, Ordering::Relaxed);
-        }
+        bump_if_measuring();
+        // SAFETY: `ptr` / `layout` / `new_size` are forwarded unchanged from the
+        // caller, which upholds `GlobalAlloc::realloc`'s contract; `System`
+        // honours the same contract.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
+}
+
+/// Bump this thread's allocation counter if it is currently measuring.
+/// `try_with` tolerates the thread-local being torn down during thread exit
+/// (returns without counting rather than panicking).
+fn bump_if_measuring() {
+    let _ = MEASURING.try_with(|m| {
+        if m.get() {
+            let _ = MEASURED_ALLOCS.try_with(|c| c.set(c.get() + 1));
+        }
+    });
 }
 
 #[global_allocator]
@@ -513,13 +534,14 @@ fn seek_loop_alloc_count(tree: &lsm_tree::AnyTree, targets: &[Vec<u8>]) -> usize
     it.seek_to(&targets[0]);
     let _ = it.next();
 
-    MEASURED_ALLOCS.store(0, Ordering::SeqCst);
-    MEASURING.store(true, Ordering::SeqCst);
+    // Measure only this thread's allocations during the tight seek loop.
+    MEASURED_ALLOCS.with(|c| c.set(0));
+    MEASURING.with(|m| m.set(true));
     for target in targets {
         it.seek_to(target);
     }
-    MEASURING.store(false, Ordering::SeqCst);
-    MEASURED_ALLOCS.load(Ordering::SeqCst)
+    MEASURING.with(|m| m.set(false));
+    MEASURED_ALLOCS.with(Cell::get)
 }
 
 /// A single-SST tree (one disk run) plus a non-empty active memtable: the
