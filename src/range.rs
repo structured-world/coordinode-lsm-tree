@@ -1485,8 +1485,21 @@ impl SeekableTreeIter {
     /// consuming it. Buffers one item; cleared by any reposition / seek.
     ///
     /// A successful key is cloned (cheap: `UserKey` is reference-counted) and
-    /// the item stays buffered for `next`. An error is surfaced once here (it
-    /// is not `Clone`), so it will not be re-yielded by a later `next`.
+    /// the item stays buffered for `next`, so `peek_key()` followed by `next()`
+    /// observes the SAME entry.
+    ///
+    /// # Error is a consuming peek
+    ///
+    /// `crate::Error` is not `Clone`, so a `peek_key()` that returns `Err(...)`
+    /// CONSUMES the failing position: the error is moved out of the buffer and
+    /// the iterator is logically advanced past it. A following `next()` yields
+    /// the entry AFTER the error, NOT the error again. Treat a peeked `Err` as
+    /// you would a consumed one (surface / propagate it; do not also expect
+    /// `next()` to re-report it). The leapfrog / zig-zag join callers this
+    /// method is built for read `peek_key()`, propagate any `Err`, and never
+    /// fall through to a redundant `next()` on the failing iterator, so the
+    /// distinction does not bite them; it is documented here for any caller that
+    /// treats `peek_key` as a pure lookahead.
     pub fn peek_key(&mut self) -> Option<crate::Result<UserKey>> {
         if self.peeked.is_none() {
             self.peeked = Some(self.cell.next());
