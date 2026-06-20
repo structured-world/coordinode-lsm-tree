@@ -1050,34 +1050,26 @@ impl AbstractTree for Tree {
                 continue;
             }
 
-            // Lower boundary: the START offset of the block that would contain
-            // `key` (0 / data start when unbounded or before the first key).
-            let block_start = |key: &[u8]| -> crate::Result<u64> {
-                match table.block_index.forward_reader(key, table_seqno) {
-                    Some(mut iter) => match iter.next() {
-                        Some(handle) => Ok(*handle?.offset()),
-                        None => Ok(data_end),
-                    },
-                    None => Ok(data_end),
-                }
-            };
-            // Upper boundary: the END offset of the block that contains `key`, so
-            // the block holding the upper boundary is INCLUDED — a range that
-            // falls inside a single data block must not collapse to zero bytes.
-            let block_end = |key: &[u8]| -> crate::Result<u64> {
-                match table.block_index.forward_reader(key, table_seqno) {
-                    Some(mut iter) => match iter.next() {
-                        Some(handle) => {
-                            let h = handle?;
-                            Ok((*h.offset() + u64::from(h.size())).min(data_end))
-                        }
-                        None => Ok(data_end),
-                    },
-                    None => Ok(data_end),
-                }
+            // The data block that would contain `key`, as (start, end) byte
+            // offsets, or `None` when `key` is past the last block. The full
+            // extent is returned so the lower bound counts from the block start
+            // and the upper bound INCLUDES it (a range inside a single block must
+            // not collapse to zero bytes).
+            let block_span = |key: &[u8]| -> crate::Result<Option<(u64, u64)>> {
+                let Some(mut iter) = table.block_index.forward_reader(key, table_seqno) else {
+                    return Ok(None);
+                };
+                let Some(handle) = iter.next() else {
+                    return Ok(None);
+                };
+                let h = handle?;
+                let start = *h.offset();
+                Ok(Some((start, (start + u64::from(h.size())).min(data_end))))
             };
             let off_lo = match lo {
-                Bound::Included(k) | Bound::Excluded(k) => block_start(k)?,
+                Bound::Included(k) | Bound::Excluded(k) => {
+                    block_span(k)?.map_or(data_end, |(start, _)| start)
+                }
                 Bound::Unbounded => 0,
             };
             // Tight-space restriction: a restricted table view serves only keys
@@ -1085,11 +1077,15 @@ impl AbstractTree for Tree {
             // the replacement table. Raise the lower offset to that bound so the
             // prefix is not double-counted (matching how scans skip it).
             let off_lo = match table.restrict_lower_bound() {
-                Some(rb) => off_lo.max(block_start(rb.as_ref())?),
+                Some(rb) => {
+                    off_lo.max(block_span(rb.as_ref())?.map_or(data_end, |(start, _)| start))
+                }
                 None => off_lo,
             };
             let off_hi = match hi {
-                Bound::Included(k) | Bound::Excluded(k) => block_end(k)?,
+                Bound::Included(k) | Bound::Excluded(k) => {
+                    block_span(k)?.map_or(data_end, |(_, end)| end)
+                }
                 Bound::Unbounded => data_end,
             };
             let idx_bytes = off_hi.saturating_sub(off_lo);
