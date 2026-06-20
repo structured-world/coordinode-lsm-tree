@@ -988,17 +988,21 @@ impl Block {
 
                 #[cfg(zstd_any)]
                 CompressionType::Zstd(_) => {
-                    let decompressed = crate::compression::ZstdBackend::decompress(
-                        &decrypted,
-                        header.uncompressed_length as usize,
-                    )
-                    .map_err(|_| crate::Error::Decompress(compression))?;
+                    // Decompress straight into the Slice allocation — no
+                    // zero-filled scratch Vec and no Vec -> Slice copy.
+                    #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
+                    let mut builder =
+                        unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };
 
-                    if decompressed.len() != header.uncompressed_length as usize {
+                    let bytes_written =
+                        crate::compression::ZstdBackend::decompress_into(&decrypted, &mut builder)
+                            .map_err(|_| crate::Error::Decompress(compression))?;
+
+                    if bytes_written != header.uncompressed_length as usize {
                         return Err(crate::Error::Decompress(compression));
                     }
 
-                    Slice::from(decompressed)
+                    builder.freeze().into()
                 }
 
                 #[cfg(zstd_any)]
@@ -1092,17 +1096,21 @@ impl Block {
 
                 #[cfg(zstd_any)]
                 CompressionType::Zstd(_) => {
-                    let decompressed = crate::compression::ZstdBackend::decompress(
-                        &raw_data,
-                        header.uncompressed_length as usize,
-                    )
-                    .map_err(|_| crate::Error::Decompress(compression))?;
+                    // Decompress straight into the Slice allocation — no
+                    // zero-filled scratch Vec and no Vec -> Slice copy.
+                    #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
+                    let mut builder =
+                        unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };
 
-                    if decompressed.len() != header.uncompressed_length as usize {
+                    let bytes_written =
+                        crate::compression::ZstdBackend::decompress_into(&raw_data, &mut builder)
+                            .map_err(|_| crate::Error::Decompress(compression))?;
+
+                    if bytes_written != header.uncompressed_length as usize {
                         return Err(crate::Error::Decompress(compression));
                     }
 
-                    Slice::from(decompressed)
+                    builder.freeze().into()
                 }
 
                 #[cfg(zstd_any)]
@@ -1410,17 +1418,22 @@ impl Block {
 
                 #[cfg(zstd_any)]
                 CompressionType::Zstd(_) => {
-                    let decompressed = crate::compression::ZstdBackend::decompress(
-                        &decrypted,
-                        parsed_header.uncompressed_length as usize,
-                    )
-                    .map_err(|_| crate::Error::Decompress(compression))?;
+                    // Decompress straight into the Slice allocation — no
+                    // zero-filled scratch Vec and no Vec -> Slice copy.
+                    #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
+                    let mut builder = unsafe {
+                        Slice::builder_unzeroed(parsed_header.uncompressed_length as usize)
+                    };
 
-                    if decompressed.len() != parsed_header.uncompressed_length as usize {
+                    let bytes_written =
+                        crate::compression::ZstdBackend::decompress_into(&decrypted, &mut builder)
+                            .map_err(|_| crate::Error::Decompress(compression))?;
+
+                    if bytes_written != parsed_header.uncompressed_length as usize {
                         return Err(crate::Error::Decompress(compression));
                     }
 
-                    Slice::from(decompressed)
+                    builder.freeze().into()
                 }
 
                 #[cfg(zstd_any)]
@@ -1574,17 +1587,24 @@ impl Block {
                 CompressionType::Zstd(_) => {
                     let compressed_data: &[u8] = &payload_slice;
 
-                    let decompressed = crate::compression::ZstdBackend::decompress(
+                    // Decompress straight into the Slice allocation — no
+                    // zero-filled scratch Vec and no Vec -> Slice copy.
+                    #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
+                    let mut builder = unsafe {
+                        Slice::builder_unzeroed(parsed_header.uncompressed_length as usize)
+                    };
+
+                    let bytes_written = crate::compression::ZstdBackend::decompress_into(
                         compressed_data,
-                        parsed_header.uncompressed_length as usize,
+                        &mut builder,
                     )
                     .map_err(|_| crate::Error::Decompress(compression))?;
 
-                    if decompressed.len() != parsed_header.uncompressed_length as usize {
+                    if bytes_written != parsed_header.uncompressed_length as usize {
                         return Err(crate::Error::Decompress(compression));
                     }
 
-                    Slice::from(decompressed)
+                    builder.freeze().into()
                 }
 
                 #[cfg(zstd_any)]

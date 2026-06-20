@@ -65,6 +65,40 @@ fn bounded_read(reader: &mut impl Read, capacity: usize) -> crate::Result<Vec<u8
     Ok(output)
 }
 
+/// Like [`bounded_read`], but decodes straight into a caller-provided buffer of
+/// the exact expected size — no zero-filled `Vec` and no later copy. Returns the
+/// number of bytes written; the caller checks it equals the expected length.
+fn bounded_read_into(reader: &mut impl Read, dest: &mut [u8]) -> crate::Result<usize> {
+    let mut filled = 0;
+    while filled < dest.len() {
+        // `filled < dest.len()` by the loop guard, so the slice is non-empty.
+        let slot = dest.get_mut(filled..).unwrap_or(&mut []);
+        match reader.read(slot) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) => return Err(crate::Error::from(e)),
+        }
+    }
+
+    // If the buffer filled exactly, probe for excess: a frame that decodes to
+    // more than the declared size is corrupt / over-budget.
+    if filled == dest.len() {
+        let mut probe = [0u8; 1];
+        match reader.read(&mut probe) {
+            Ok(0) => {}
+            Ok(_) => {
+                return Err(crate::Error::DecompressedSizeTooLarge {
+                    declared: (filled as u64).saturating_add(1),
+                    limit: dest.len() as u64,
+                });
+            }
+            Err(e) => return Err(crate::Error::from(e)),
+        }
+    }
+
+    Ok(filled)
+}
+
 /// Incrementally decodes `data` using the pre-initialised `decoder` and
 /// collects the output, enforcing a hard `capacity` limit even when the frame
 /// has no `Frame_Content_Size` field (FCS omitted → `content_size()` == 0).
@@ -597,6 +631,23 @@ impl CompressionProvider for ZstdProvider {
 
             do_decompress_with_dict(decoder, data, dict.id().max(1), capacity, is_raw_content)
         })
+    }
+}
+
+impl ZstdProvider {
+    /// Decompress a frame straight into `dest` (exact expected size), skipping
+    /// the zero-filled scratch `Vec` and the later copy that
+    /// [`decompress`](CompressionProvider::decompress) pays. Returns the bytes
+    /// written; the caller checks it equals the declared uncompressed length.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the frame header is invalid, an I/O error occurs, or
+    /// the frame decodes to more than `dest.len()` bytes.
+    pub fn decompress_into(data: &[u8], dest: &mut [u8]) -> crate::Result<usize> {
+        let mut decoder = structured_zstd::decoding::StreamingDecoder::new(data)
+            .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
+        bounded_read_into(&mut decoder, dest)
     }
 }
 
