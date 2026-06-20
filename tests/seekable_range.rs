@@ -505,42 +505,106 @@ fn seekable_sealed_memtable_and_excluded_bounds() -> lsm_tree::Result<()> {
     Ok(())
 }
 
-/// #504 acceptance: a tight `seek_to` loop must not reallocate the merge stack.
-///
-/// Before the in-place reseek, every reposition rebuilt the whole Phase-2
-/// pipeline (loser-tree merger + MVCC stream + tombstone filter, one boxed
-/// reader per source) — O(sources) allocations per seek. Now repositioning
-/// reuses the entire stack and moves only the leaf cursors, so a tight seek
-/// loop allocates nothing after the one-time warm-up build.
-#[test]
-fn tight_seek_loop_does_not_reallocate_merge_stack() -> lsm_tree::Result<()> {
-    // Standard tree spread across several SSTs (incl. a multi-table run) plus
-    // the active memtable, so the reposition exercises every leaf flavour.
-    let (tree, _guard) = build_tree(false)?;
+/// Count heap allocations made by a tight `seek_to` loop over `targets`, after a
+/// one-time warm-up that builds the merge stack (the allocation #504 exempts).
+fn seek_loop_alloc_count(tree: &lsm_tree::AnyTree, targets: &[Vec<u8>]) -> usize {
     let mut it = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, None);
-
-    // Warm up: the first seek + pull builds the merge stack once (the one-time
-    // allocation the acceptance criterion explicitly exempts).
-    it.seek_to(&key(5));
+    // Warm up: first seek + pull builds the merge stack once.
+    it.seek_to(&targets[0]);
     let _ = it.next();
-
-    // Disjoint targets spread across the key space, so each reposition genuinely
-    // moves every leaf cursor (SST index re-seek / run-window recompute /
-    // skiplist seek_ge) rather than no-op'ing on an unchanged bound.
-    let targets: Vec<Vec<u8>> = (0..300u32).map(|i| key((i * 137) % 260)).collect();
 
     MEASURED_ALLOCS.store(0, Ordering::SeqCst);
     MEASURING.store(true, Ordering::SeqCst);
-    for target in &targets {
+    for target in targets {
         it.seek_to(target);
     }
     MEASURING.store(false, Ordering::SeqCst);
+    MEASURED_ALLOCS.load(Ordering::SeqCst)
+}
 
-    let allocs = MEASURED_ALLOCS.load(Ordering::SeqCst);
+/// A single-SST tree (one disk run) plus a non-empty active memtable: the
+/// narrowest non-trivial merge stack (two leaf sources).
+fn build_narrow_tree() -> lsm_tree::Result<(lsm_tree::AnyTree, tempfile::TempDir)> {
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    for i in 0..120u32 {
+        tree.insert(key(i), val(i), 0);
+    }
+    tree.flush_active_memtable(0)?;
+    // A few unflushed keys so the active-memtable leaf is live too.
+    for i in 0..120u32 {
+        if i % 11 == 0 {
+            tree.insert(key(i), val(i + 1_000_000), 1);
+        }
+    }
+    Ok((tree, folder))
+}
+
+/// A wide tree: several mutually-overlapping flushes, each landing as its own
+/// disk run, plus the active memtable. Many more leaf sources than
+/// [`build_narrow_tree`], so a per-source merge-stack rebuild would allocate
+/// visibly more per seek here.
+fn build_wide_tree() -> lsm_tree::Result<(lsm_tree::AnyTree, tempfile::TempDir)> {
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    // Six overlapping flushes (each rewrites the same key span) → six runs that
+    // do not merge without compaction.
+    for round in 0..6u32 {
+        for i in 0..120u32 {
+            tree.insert(key(i), val(i + round * 1_000_000), u64::from(round));
+        }
+        tree.flush_active_memtable(u64::from(round))?;
+    }
+    for i in 0..120u32 {
+        if i % 11 == 0 {
+            tree.insert(key(i), val(i + 9_000_000), 6);
+        }
+    }
+    Ok((tree, folder))
+}
+
+/// #504 acceptance: a tight `seek_to` loop must not rebuild the merge stack.
+///
+/// The pre-#504 path rebuilt the whole Phase-2 pipeline (loser-tree merger +
+/// MVCC stream + tombstone filter, one boxed reader per source) on every
+/// reposition — O(sources) allocations per seek. The in-place reseek reuses the
+/// entire stack and moves only the leaf cursors, so the per-seek allocation is
+/// whatever materializing the seek-target key costs (zero when `Slice` inlines
+/// small keys, a small constant under the `bytes_1` backing) and does NOT scale
+/// with the number of merge sources.
+///
+/// Asserted as width-invariance: a wide merge stack (many sources) and a narrow
+/// one (two sources) must allocate the same amount over the same seek targets.
+/// The shared input-key cost cancels; any residual difference is per-source
+/// rebuild traffic, which must be zero.
+#[test]
+fn tight_seek_loop_allocation_is_width_invariant() -> lsm_tree::Result<()> {
+    // Disjoint targets spread across the key span, so each reposition genuinely
+    // moves every leaf cursor rather than no-op'ing on an unchanged bound.
+    let targets: Vec<Vec<u8>> = (0..300u32).map(|i| key((i * 137) % 120)).collect();
+
+    let (narrow, _g1) = build_narrow_tree()?;
+    let (wide, _g2) = build_wide_tree()?;
+
+    let narrow_allocs = seek_loop_alloc_count(&narrow, &targets);
+    let wide_allocs = seek_loop_alloc_count(&wide, &targets);
+
     assert_eq!(
-        allocs,
-        0,
-        "{} tight seeks allocated {allocs} times; the merge stack must be reused in place",
+        wide_allocs,
+        narrow_allocs,
+        "a {}-seek loop allocated {wide_allocs} times on the wide merge stack vs \
+         {narrow_allocs} on the narrow one; the per-seek cost must be width-invariant \
+         (the merge stack is reused in place, not rebuilt O(sources) per seek)",
         targets.len(),
     );
     Ok(())
