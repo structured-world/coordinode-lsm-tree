@@ -186,11 +186,32 @@ where
     fn insert(&mut self, hash: u64, key: K, value: V, weight: u64, priority: Priority) {
         if let Some((_, slot)) = self.map.find_mut(hash, |(k, _)| *k == key) {
             // Replace in place: adjust the owning queue's byte tally by the
-            // weight delta, keep the queue position and frequency.
+            // weight delta.
             let old = slot.weight;
             slot.value = value;
             slot.weight = weight;
+            // Honor a High-priority refresh of a probationary (small) entry:
+            // promote it to main with full frequency credit so a re-inserted
+            // index/filter/range-tombstone block gets the same churn protection
+            // as a fresh High admission, instead of being left to cold-evict
+            // from the small queue. The stale small-queue entry is skipped on
+            // its next pop (lazy tombstone).
+            let promote = priority == Priority::High && slot.loc == Location::Small;
+            if promote {
+                slot.loc = Location::Main;
+                slot.freq.store(MAX_FREQ, Ordering::Relaxed);
+            }
             match slot.loc {
+                // `slot.loc` is `Main` here when just promoted: move the old
+                // weight out of the small tally and the new weight into main,
+                // and enqueue the entry on the main queue. `slot` borrows
+                // `self.map`; the queue / tally fields are disjoint, so these
+                // direct field accesses are allowed alongside it.
+                Location::Main if promote => {
+                    self.small_bytes -= old;
+                    self.main_bytes += weight;
+                    self.main.push_back(key);
+                }
                 Location::Small => self.small_bytes = adjust(self.small_bytes, old, weight),
                 Location::Main => self.main_bytes = adjust(self.main_bytes, old, weight),
             }
@@ -620,6 +641,29 @@ mod tests {
             "high-priority entry must survive data-style churn",
         );
         assert_eq!(c.get(&1), None, "normal entry should have been evicted");
+    }
+
+    #[test]
+    fn high_priority_replace_promotes_small_entry() {
+        let c: ShardedCache<u64, alloc::vec::Vec<u8>, LenWeighter, FxBuildHasher> =
+            ShardedCache::with_weighter(2_000, 1, 1024, LenWeighter, FxBuildHasher);
+
+        // Admit at normal priority — lands in the probationary small queue.
+        c.insert(0, vec![0u8; 100]);
+        // Refresh the SAME key at High priority — must promote it to main with
+        // full frequency credit, not leave it in the small queue.
+        c.insert_with_priority(0, vec![0u8; 100], Priority::High);
+
+        // Churn cold normal entries far past capacity; the promoted entry must
+        // survive (it would be cold-evicted from the small queue otherwise).
+        for i in 1..200u64 {
+            c.insert(i, vec![0u8; 100]);
+        }
+        assert_eq!(
+            c.get(&0),
+            Some(vec![0u8; 100]),
+            "High-priority replace must promote the entry to main and protect it",
+        );
     }
 
     #[test]
