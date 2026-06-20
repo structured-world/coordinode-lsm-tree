@@ -21,6 +21,7 @@ mod scanner;
 pub(crate) mod seqno_bounds;
 pub mod util;
 pub mod writer;
+pub(crate) mod zone_map;
 
 #[cfg(test)]
 #[allow(
