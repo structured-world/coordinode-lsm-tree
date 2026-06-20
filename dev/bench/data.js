@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781968353659,
+  "lastUpdate": 1781986973347,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -18048,6 +18048,84 @@ window.BENCHMARK_DATA = {
             "value": 775878.2794706734,
             "unit": "ops/sec",
             "extra": "P50: 1.1us | P99: 4.5us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.13s | num: 100000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b54e3f9e25d4d3ffc0b78cebfc8adeea1d1a3987",
+          "message": "feat: per-block zone-map section (#511)\n\n## Summary\n\nAdds the optional per-SST **zone-map section**: per-data-block,\nper-column statistics (for row blocks, one synthetic column with the\nblock's key min/max + row count) kept **parallel to the index** like\n`seqno_bounds`, so a point read never loads it. Wired end-to-end through\nthe runtime config → flush / compaction → table writer. Off by default.\n\nThis is the foundation for predicate-based block-skip; the **live\npredicate-driven skip** itself lands in #506 (it needs a column/value\npredicate — for row blocks the index already skips by key range). Reader\nAPI (`columns_for` + a forward cursor) is ready for #503 / #506 to\nconsume.\n\n## What\n\n- New `BlockType::ZoneMap` + `src/table/zone_map.rs` codec\n(`ColumnStats`, `encode`/`decode`, binary-search lookup + forward\ncursor).\n- `ParsedRegions.zone_map` recognized in the TOC; loaded on table open\ninto `Inner.zone_map` (graceful-empty when absent).\n- Writer accumulates per-block stats (first key threaded through both\nserial + parallel paths) and emits the section at finish; `use_zone_map`\nbuilder on `Writer` + `MultiWriter` (rotation-carried).\n- `RuntimeConfig.zone_map` flag (default off) wired through ingest,\nflush, and compaction.\n\n## Integrity\n\n- **AAD:** the block type is bound into the AEAD AAD, so a `ZoneMap`\nblock cannot be substituted for another type.\n- **ECC / checksum:** flows through the same `BlockTransform` as\n`seqno_bounds` (XXH3-128 + optional Reed-Solomon parity).\n- **Recovery:** derived / non-authoritative; a missing or unreadable\nsection defaults to empty (no skip), never a load failure.\n\n## Tests\n\n- Codec unit tests (round-trip, empty, cursor vs binary-search, reject\nnon-ascending / trailing / truncated).\n- Table-level round-trip\n(`zone_map_section_roundtrips_one_entry_per_block`,\n`zone_map_absent_without_policy`).\n- Tree-level integration round-trip through flush + reopen\n(`zone_map_round_trips_through_disk_and_reopen`).\n- Full suite green (2041 tests), `clippy --all-features --all-targets`\nclean, no-std errcount 0, doctests green.\n\n## Also in this PR\n\n- `ci(bench)`: cap the compare-rocksdb head-to-head size sweep at 70k\n(the 100k sweep overran the 60-minute CI job timeout so the overlay\nreports never published) + single-pass db_bench.\n- `docs`: resolve ~80 pre-existing broken intra-doc links crate-wide so\n`cargo doc --document-private-items --all-features -D warnings` is clean\n(documentation only).\n\nCloses #502\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added zone-map support for tables, including an optional SST\n“zone-map” section with per-data-block per-column min/max and row/null\ncounts.\n* Introduced `zone_map` configuration, propagated via table writers, and\nnew block type to store/recognize zone-map data.\n* **Bug Fixes**\n* Improved recovery behavior: corrupted or missing zone-map data now\ndegrades gracefully instead of failing open.\n* **Tests**\n* Added unit tests and an end-to-end integration test to verify zone-map\nround-trips through disk and reopen.\n* **Chores**\n* Simplified benchmark runner to emit a single result file; updated\nbenchmark naming and workload coverage.\n* **Documentation**\n* Refreshed many rustdoc/intra-doc links and formatting across the\ncodebase.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-20T23:21:58+03:00",
+          "tree_id": "ca522bc5cee4ea8e900324b86df081c4f3243c19",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b54e3f9e25d4d3ffc0b78cebfc8adeea1d1a3987"
+        },
+        "date": 1781986972115,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2041552.11857988,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1223216.0635277752,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 918879.3633974366,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 3.9us | P99.9: 6.4us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3844985.044642295,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 2.9us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 440264.67338538147,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.4us | P99.9: 9.0us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 231162.85291918818,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 8.7us | P99.9: 11.0us\nthreads: 1 | elapsed: 0.87s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1244647.2234764462,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.5us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1059532.7002014453,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 703739.4646155644,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 5.3us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
         ]
       }
