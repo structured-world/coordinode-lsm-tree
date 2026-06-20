@@ -141,6 +141,7 @@ pub(super) fn prepare_table_writer(
         // output SSTs in the new index format (compaction is the migration
         // mechanism for the on-disk index layout).
         .use_seqno_in_index(rc.seqno_in_index)
+        .use_zone_map(rc.zone_map)
         .use_disable_cow_on_sst(rc.disable_cow_on_sst_files)
         .use_bloom_policy({
             use crate::config::FilterPolicyEntry::{Bloom, None};
