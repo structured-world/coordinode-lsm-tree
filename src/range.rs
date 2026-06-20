@@ -1157,18 +1157,44 @@ impl SeekableTreeIter {
     }
 
     /// Reposition so the next [`Iterator::next`] yields the first entry with
-    /// user key `>= key` (`RocksDB` `Seek`). The upper bound stays the union upper.
+    /// user key `>= key` (`RocksDB` `Seek`).
+    ///
+    /// The new lower bound is clamped to the iterator's collected window: Phase 1
+    /// only gathered sources overlapping the original range, so seeking below the
+    /// window lower would scan outside it (leaking rows below the window, or
+    /// missing rows from sources that were skipped during collection). A `key`
+    /// below the window lower positions at the window start; the upper bound
+    /// stays the window upper.
     pub fn seek_to(&mut self, key: &[u8]) {
-        let upper = self.borrow_owner().collected.union.1.clone();
-        self.reposition(Bound::Included(UserKey::from(key)), upper);
+        let (lower, upper) = {
+            let union = &self.borrow_owner().collected.union;
+            let lower = match &union.0 {
+                Bound::Included(floor) if floor.as_ref() > key => union.0.clone(),
+                Bound::Excluded(floor) if floor.as_ref() >= key => union.0.clone(),
+                _ => Bound::Included(UserKey::from(key)),
+            };
+            (lower, union.1.clone())
+        };
+        self.reposition(lower, upper);
     }
 
     /// Reposition so the next [`DoubleEndedIterator::next_back`] yields the last
-    /// entry with user key `<= key` (`RocksDB` `SeekForPrev`). The lower bound
-    /// stays the union lower.
+    /// entry with user key `<= key` (`RocksDB` `SeekForPrev`).
+    ///
+    /// The new upper bound is clamped to the iterator's collected window (see
+    /// [`seek_to`](Self::seek_to) for why): a `key` above the window upper
+    /// positions at the window end; the lower bound stays the window lower.
     pub fn seek_to_for_prev(&mut self, key: &[u8]) {
-        let lower = self.borrow_owner().collected.union.0.clone();
-        self.reposition(lower, Bound::Included(UserKey::from(key)));
+        let (lower, upper) = {
+            let union = &self.borrow_owner().collected.union;
+            let upper = match &union.1 {
+                Bound::Included(ceil) if ceil.as_ref() < key => union.1.clone(),
+                Bound::Excluded(ceil) if ceil.as_ref() <= key => union.1.clone(),
+                _ => Bound::Included(UserKey::from(key)),
+            };
+            (union.0.clone(), upper)
+        };
+        self.reposition(lower, upper);
     }
 
     /// The version snapshot this iterator reads from. Used by KV-separated trees
