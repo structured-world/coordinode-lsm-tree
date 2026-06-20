@@ -1957,39 +1957,49 @@ impl Table {
 
         // Load the optional zone-map section (parallel to the index; powers the
         // predicate-based block-skip). Absent unless the zone-map policy was on.
+        //
+        // Best-effort: the zone map is DERIVED, non-authoritative metadata. A
+        // corrupt or unreadable section disables block-skip for this table (an
+        // empty map) rather than failing the whole `Table::recover` — turning an
+        // optimization's bit-rot into a hard availability loss would be wrong.
         let zone_map = if let Some(zm_handle) = regions.zone_map {
-            let block = Block::from_file(
-                file_handle.as_ref(),
-                zm_handle,
-                crate::table::block::BlockIdentity {
-                    table_id: metadata.id,
-                    block_type: BlockType::ZoneMap,
-                    dict_id: 0,
-                    window_log: 0,
-                },
-                &{
-                    let t = match encryption.as_deref() {
-                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
-                        None => crate::table::block::BlockTransform::PLAIN,
-                    };
-                    if let Some(ecc) = metadata.ecc_params {
-                        t.with_ecc(ecc)
-                    } else {
-                        t
-                    }
-                },
-            )?;
-            if block.header.block_type != BlockType::ZoneMap {
-                return Err(crate::Error::InvalidTag((
-                    "BlockType",
-                    block.header.block_type.into(),
-                )));
-            }
-            let map = crate::table::zone_map::ZoneMap::decode(&block.data)?;
-            if !map.is_empty() {
-                log::trace!("Loaded zone-map for {} blocks", map.len());
-            }
-            map
+            let load = || -> crate::Result<crate::table::zone_map::ZoneMap> {
+                let block = Block::from_file(
+                    file_handle.as_ref(),
+                    zm_handle,
+                    crate::table::block::BlockIdentity {
+                        table_id: metadata.id,
+                        block_type: BlockType::ZoneMap,
+                        dict_id: 0,
+                        window_log: 0,
+                    },
+                    &{
+                        let t = match encryption.as_deref() {
+                            Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                            None => crate::table::block::BlockTransform::PLAIN,
+                        };
+                        if let Some(ecc) = metadata.ecc_params {
+                            t.with_ecc(ecc)
+                        } else {
+                            t
+                        }
+                    },
+                )?;
+                if block.header.block_type != BlockType::ZoneMap {
+                    return Err(crate::Error::InvalidTag((
+                        "BlockType",
+                        block.header.block_type.into(),
+                    )));
+                }
+                crate::table::zone_map::ZoneMap::decode(&block.data)
+            };
+            load().unwrap_or_else(|e| {
+                log::warn!(
+                    "zone-map section for table {:?} is unreadable ({e}); disabling block-skip",
+                    metadata.id
+                );
+                crate::table::zone_map::ZoneMap::default()
+            })
         } else {
             crate::table::zone_map::ZoneMap::default()
         };
