@@ -35,6 +35,11 @@ thread_local! {
 
 struct CountingAllocator;
 
+// SAFETY: every method forwards its arguments unchanged to the matching `System`
+// allocator method, so this allocator upholds exactly the contract `System`
+// already guarantees (valid layout in, allocator-owned pointer out). The only
+// added behaviour is a thread-local counter bump, which performs no allocation,
+// introduces no aliasing, and does not affect the returned pointer.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         bump_if_measuring();
@@ -534,7 +539,14 @@ fn seek_loop_alloc_count(tree: &lsm_tree::AnyTree, targets: &[Vec<u8>]) -> usize
     it.seek_to(&targets[0]);
     let _ = it.next();
 
-    // Measure only this thread's allocations during the tight seek loop.
+    // Measure ONLY the repositioning (`seek_to`), not a subsequent pull. The
+    // first pull after a reseek is lazy and legitimately loads one data block
+    // per leaf to rebuild the tournament — that cost scales with the source
+    // count by design, so folding it in would swamp the width-invariance signal
+    // (the very thing this bench isolates). The loser-tree storage reuse on
+    // refill is instead a structural invariant of `SeekingMerger`'s reseek +
+    // `LoserTree::refill_with` (which mutate in place and never allocate) and is
+    // exercised for correctness by `backward_scan_then_seek_reseek_matches_range`.
     MEASURED_ALLOCS.with(|c| c.set(0));
     MEASURING.with(|m| m.set(true));
     for target in targets {
@@ -666,10 +678,13 @@ fn reseek_unbounded_lower_after_forward_advance_resets_index_cursor() -> lsm_tre
     tree.flush_active_memtable(0)?;
 
     let mut it = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, None);
-    // Advance the index well into a late block.
+    // Advance the index well into a late block (propagate any setup error).
     it.seek_to(&key(360));
-    let _ = it.next();
-    let _ = it.next();
+    for _ in 0..2 {
+        if let Some(g) = it.next() {
+            g.into_inner()?;
+        }
+    }
 
     // Reposition to an unbounded-lower window and scan forward.
     it.seek_to_for_prev(&key(40));
@@ -682,5 +697,47 @@ fn reseek_unbounded_lower_after_forward_advance_resets_index_cursor() -> lsm_tre
         "forward scan after an unbounded-lower reseek must equal range(..=k40), \
          not start from the stale post-seek_to index position",
     );
+    Ok(())
+}
+
+/// Backward iteration over every leaf kind, plus a reseek that must clear an
+/// already-built merger backward tournament: exercises each leaf's
+/// `next_back_filtered` (table / run / memtable) and the merger's
+/// backward-tree clear-on-reseek path.
+#[test]
+fn backward_scan_then_seek_reseek_matches_range() -> lsm_tree::Result<()> {
+    for kv_sep in [false, true] {
+        let (tree, _folder) = build_tree(kv_sep)?;
+
+        // Full backward scan over the multi-SST run + memtable, reversed, must
+        // equal the forward range.
+        let mut it = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, None);
+        let mut back: Vec<_> = std::iter::from_fn(|| it.next_back()).map(kv).collect();
+        back.reverse();
+        let fwd: Vec<_> = tree
+            .range::<&[u8], _>(.., SeqNo::MAX, None)
+            .map(kv)
+            .collect();
+        assert_eq!(
+            back, fwd,
+            "full backward scan equals forward (kv_sep={kv_sep})"
+        );
+
+        // Build the backward tournament (a couple of next_back), then seek_to:
+        // the reseek must clear the backward tournament before serving forward.
+        let mut it2 = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, None);
+        for _ in 0..2 {
+            if let Some(g) = it2.next_back() {
+                g.into_inner()?;
+            }
+        }
+        it2.seek_to(&key(50));
+        let got: Vec<_> = (&mut it2).map(kv).collect();
+        let expected: Vec<_> = tree.range(key(50).., SeqNo::MAX, None).map(kv).collect();
+        assert_eq!(
+            got, expected,
+            "seek_to after backward iteration must equal range(k50..) (kv_sep={kv_sep})",
+        );
+    }
     Ok(())
 }

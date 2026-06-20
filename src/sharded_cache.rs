@@ -313,6 +313,14 @@ where
             let Some((_, slot)) = self.map.find_mut(hash, |(k, _)| *k == key) else {
                 continue; // stale tombstone — already removed
             };
+            if slot.loc != Location::Small {
+                // Stale small-queue node: the entry was promoted to main
+                // out-of-band (a High-priority replace). Its weight already moved
+                // to `main_bytes` and a live main-queue node exists, so skip this
+                // node without touching tallies — otherwise it would double-count
+                // the move (and could underflow `small_bytes`).
+                continue;
+            }
             let w = slot.weight;
             if slot.freq.load(Ordering::Relaxed) > 0 {
                 // Hot: promote to main, reset frequency.
@@ -664,6 +672,43 @@ mod tests {
             Some(vec![0u8; 100]),
             "High-priority replace must promote the entry to main and protect it",
         );
+    }
+
+    #[test]
+    fn high_priority_replace_keeps_per_queue_tallies_consistent() {
+        // One shard, small capacity so eviction runs and pops the stale node.
+        let c: ShardedCache<u64, alloc::vec::Vec<u8>, LenWeighter, FxBuildHasher> =
+            ShardedCache::with_weighter(250, 1, 1024, LenWeighter, FxBuildHasher);
+
+        // Admit normal then promote via High replace: the entry moves to main
+        // but a stale node is left in the small queue.
+        c.insert(0, vec![0u8; 100]);
+        c.insert_with_priority(0, vec![0u8; 100], Priority::High);
+
+        // Churn so `evict_from_small` pops the stale small-queue node for key 0.
+        // If that node is mistaken for a live small entry, the per-queue byte
+        // tallies double-count (small loses bytes it never held, main gains a
+        // duplicate node) and drift from the true resident weight by location.
+        for i in 1..20u64 {
+            c.insert(i, vec![0u8; 100]);
+        }
+
+        // Recompute the per-queue tallies from the map and compare to the
+        // running counters: they must match exactly. Read everything under a
+        // tightly-scoped guard, then assert after it is dropped.
+        let (small_bytes, main_bytes, small, main) = {
+            let shard = c.shards[0].0.read();
+            let (mut small, mut main) = (0u64, 0u64);
+            for (_, slot) in &shard.map {
+                match slot.loc {
+                    Location::Small => small += slot.weight,
+                    Location::Main => main += slot.weight,
+                }
+            }
+            (shard.small_bytes, shard.main_bytes, small, main)
+        };
+        assert_eq!(small_bytes, small, "small_bytes tally drifted");
+        assert_eq!(main_bytes, main, "main_bytes tally drifted");
     }
 
     #[test]
