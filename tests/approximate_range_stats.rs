@@ -198,7 +198,10 @@ fn all_bound_kinds_are_handled() {
             SeqNo::MAX,
         )
         .expect("stats");
-    assert!(excl_incl.key_count > 0, "excluded..=included over SSTs");
+    assert!(
+        excl_incl.key_count > 0 && excl_incl.bytes > 0,
+        "excluded..=included over SSTs"
+    );
     let to = tree
         .approximate_range_stats(..key(500), SeqNo::MAX)
         .expect("stats");
@@ -206,7 +209,7 @@ fn all_bound_kinds_are_handled() {
         .approximate_range_stats(key(500).., SeqNo::MAX)
         .expect("stats");
     assert!(
-        to.key_count > 0 && from.key_count > 0,
+        to.key_count > 0 && to.bytes > 0 && from.key_count > 0 && from.bytes > 0,
         "half-bounded over SSTs"
     );
     // The two halves together cover at least the full count.
@@ -234,7 +237,7 @@ fn all_bound_kinds_are_handled() {
         )
         .expect("stats");
     assert!(
-        m_excl_incl.key_count > 0,
+        m_excl_incl.key_count > 0 && m_excl_incl.bytes > 0,
         "excluded..=included over memtable"
     );
     let m_to = mt
@@ -244,7 +247,7 @@ fn all_bound_kinds_are_handled() {
         .approximate_range_stats(key(50).., SeqNo::MAX)
         .expect("stats");
     assert!(
-        m_to.key_count > 0 && m_from.key_count > 0,
+        m_to.key_count > 0 && m_to.bytes > 0 && m_from.key_count > 0 && m_from.bytes > 0,
         "half-bounded over memtable"
     );
     // A non-empty memtable queried past every key contributes nothing.

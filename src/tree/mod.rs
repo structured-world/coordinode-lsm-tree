@@ -1080,6 +1080,14 @@ impl AbstractTree for Tree {
                 Bound::Included(k) | Bound::Excluded(k) => block_start(k)?,
                 Bound::Unbounded => 0,
             };
+            // Tight-space restriction: a restricted table view serves only keys
+            // at or above its lower bound, with the punched-out prefix served by
+            // the replacement table. Raise the lower offset to that bound so the
+            // prefix is not double-counted (matching how scans skip it).
+            let off_lo = match table.restrict_lower_bound() {
+                Some(rb) => off_lo.max(block_start(rb.as_ref())?),
+                None => off_lo,
+            };
             let off_hi = match hi {
                 Bound::Included(k) | Bound::Excluded(k) => block_end(k)?,
                 Bound::Unbounded => data_end,
