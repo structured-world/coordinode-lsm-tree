@@ -158,7 +158,7 @@ pub struct Inner {
     /// [`Table::install_deletion_pause`](super::Table::install_deletion_pause)
     /// after the table is registered with a tree. When `Some` and active,
     /// the [`Drop`] impl defers the underlying `remove_file` call so that
-    /// an in-progress [`Tree::create_checkpoint`](crate::Tree::create_checkpoint)
+    /// an in-progress [`Tree::create_checkpoint`](crate::AbstractTree::create_checkpoint)
     /// can hard-link the file before it disappears.
     // `once_cell::race::OnceBox` rather than `std::sync::OnceLock` so
     // this field doesn't pin the type to `std` — OnceBox is no-std +

@@ -27,7 +27,7 @@
 //! **Field requirements.** Production call sites SHOULD populate
 //! every field with the real value from their local context. Test
 //! call sites that don't exercise AAD-sensitive paths may use
-//! [`BlockIdentity::for_test`] which defaults `dict_id` and
+//! `BlockIdentity::for_test` which defaults `dict_id` and
 //! `window_log` to zero.
 //!
 //! **Allowed zero exceptions in production code** (each individually

@@ -130,7 +130,7 @@ fn parse_restrictions_section(
 /// here too — a torn or corrupted trailing size-hint can be
 /// recovered through the head mirror without first tripping the
 /// CURRENT-pointer validation), then recomputes the canonical
-/// footer digest via [`current_digest::compute`] over the parsed
+/// footer digest via [`current_digest::compute`](crate::manifest_blocks::current_digest::compute) over the parsed
 /// footer payload and compares it against the stamped checksum.
 /// Mismatch surfaces as [`crate::Error::ChecksumMismatch`].
 ///

@@ -27,7 +27,7 @@
 //! latest entry below the watermark (no snapshot reads below the watermark), and
 //! a newer version (real seqno > 0) always wins the merge over the zeroed one.
 //! Older-version ambiguity cannot arise at the last level for the same reason
-//! [`CompactionStream::evict_tombstones`] relies on: the last level is the
+//! [`CompactionStream::evict_tombstones`](crate::compaction::stream::CompactionStream::evict_tombstones) relies on: the last level is the
 //! authoritative bottom.
 
 use crate::active_tombstone_set::ActiveTombstoneSet;

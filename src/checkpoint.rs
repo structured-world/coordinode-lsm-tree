@@ -15,7 +15,7 @@
 //!    removal are held back until the checkpoint is complete.
 //! 2. Flush the active memtable so all live data is in SSTs.
 //! 3. Snapshot the current `Version`; iterate its tables (and blob files,
-//!    for [`BlobTree`]) and hard-link each one into `target/tables/` (or
+//!    for [`BlobTree`](crate::blob_tree::BlobTree)) and hard-link each one into `target/tables/` (or
 //!    `target/blobs/`).
 //! 4. Copy the manifest, version file (`v<id>`), and `current` pointer.
 //! 5. Drop the pause guard — queued deletions run.

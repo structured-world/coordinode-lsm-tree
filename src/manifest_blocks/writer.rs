@@ -71,7 +71,7 @@ pub struct ManifestArchiveWriter {
     /// opened without `Config::encryption`.
     encryption: Option<Arc<dyn EncryptionProvider>>,
 
-    /// Section currently open via [`start`]. Buffered in memory
+    /// Section currently open via [`Self::start`]. Buffered in memory
     /// until the next `start` or `finish` flushes it into a Block.
     current_section: Option<CurrentSection>,
 

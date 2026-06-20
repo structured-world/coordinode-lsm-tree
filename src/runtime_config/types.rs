@@ -866,9 +866,9 @@ pub struct RuntimeConfig {
     /// computes an admission state and the gated write path always admits, so
     /// there is zero overhead and behaviour is unchanged. When `true`, the
     /// engine maintains a cached read-only predicate (see
-    /// [`crate::Tree::write_admission`]) driven by [`Self::storage_limit_bytes`]
+    /// [`crate::AbstractTree::write_admission`]) driven by [`Self::storage_limit_bytes`]
     /// (and, once wired, the filesystem free-space probe), and the gated write
-    /// path ([`crate::Tree::try_insert`] / batch apply) declines writes with
+    /// path ([`crate::AbstractTree::try_insert`] / batch apply) declines writes with
     /// [`crate::Error::StorageFull`] while the tree is over budget.
     ///
     /// Toggle takes effect on the next admission check.

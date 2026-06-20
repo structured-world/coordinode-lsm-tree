@@ -255,7 +255,7 @@ enum SpaceGate {
 /// **Layer 2 (physical free space, per destination volume).** SST output lands
 /// in `sst_dest_level`'s volume; KV-separated blob relocation lands in the
 /// primary blobs volume. The two are budgeted **independently only when they are
-/// proven to be on different physical volumes** ([`Fs::volume_id`] reports
+/// proven to be on different physical volumes** ([`Fs::volume_id`](crate::fs::Fs::volume_id) reports
 /// distinct device ids) — then a full cold-tier route never stalls a hot-level
 /// merge. Otherwise (same volume, or independence not proven) their transient
 /// peak is the **combined sum** on the tighter volume: checking them

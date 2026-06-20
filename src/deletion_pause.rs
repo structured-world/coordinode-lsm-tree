@@ -5,7 +5,7 @@
 //!
 //! While a [`DeletionPause`] is *active* (refcount ≥ 1), the [`Drop`]
 //! implementations on tables and blob files do not call
-//! [`Fs::remove_file`](crate::fs::Fs::remove_file) immediately. Instead they
+//! [`Fs::remove_file`] immediately. Instead they
 //! enqueue `(fs, path)` for later removal. Compaction may continue producing
 //! obsolete files; their physical deletion is just deferred.
 //!

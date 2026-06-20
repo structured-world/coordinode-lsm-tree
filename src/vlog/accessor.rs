@@ -26,7 +26,7 @@ impl<'a> Accessor<'a> {
         }
     }
 
-    /// Supplies the zstd dictionary for [`CompressionType::ZstdDict`] blob reads.
+    /// Supplies the zstd dictionary for [`CompressionType::ZstdDict`](crate::CompressionType::ZstdDict) blob reads.
     #[cfg(zstd_any)]
     #[must_use]
     pub fn with_dict(mut self, dict: Option<&'a crate::compression::ZstdDictionary>) -> Self {

@@ -202,7 +202,7 @@ impl BlobTree {
         })
     }
 
-    /// Resolves a single key against a pre-acquired [`SuperVersion`].
+    /// Resolves a single key against a pre-acquired [`SuperVersion`](crate::version::SuperVersion).
     fn resolve_key(
         &self,
         super_version: &crate::version::SuperVersion,
@@ -296,7 +296,7 @@ fn blob_guard(
 }
 
 /// Wraps a [`SeekableTreeIter`](crate::range::SeekableTreeIter) over the index
-/// tree so a KV-separated tree can expose it as a [`SeekableGuardIter`].
+/// tree so a KV-separated tree can expose it as a [`SeekableGuardIter`](crate::iter_guard::SeekableGuardIter).
 struct BlobSeekable {
     inner: crate::range::SeekableTreeIter,
     tree: crate::BlobTree,

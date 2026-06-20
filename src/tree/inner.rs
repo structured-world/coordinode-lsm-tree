@@ -125,7 +125,7 @@ pub struct TreeInner {
     pub(crate) _directory_lock: Option<Box<dyn crate::fs::FsFile>>,
 
     /// Tree-wide gate that defers SST / blob-file deletions while a
-    /// [`Tree::create_checkpoint`](crate::Tree::create_checkpoint) is in
+    /// [`Tree::create_checkpoint`](crate::AbstractTree::create_checkpoint) is in
     /// flight. Acquired by checkpoint code via
     /// [`DeletionPause::acquire`]; consulted by [`Drop`] impls on
     /// [`Table`](crate::Table) and [`BlobFile`](crate::BlobFile).

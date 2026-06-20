@@ -31,7 +31,7 @@
 //! # Wire format
 //!
 //! A `VersionEdit` is serialized as the payload of a single
-//! [`framing`](super::framing) record (`len + xxh3_64 + payload`), so a
+//! [`framing`] record (`len + xxh3_64 + payload`), so a
 //! power-loss-truncated or bit-flipped trailing edit is detected and dropped on
 //! replay (the torn tail is never applied). The payload is:
 //!

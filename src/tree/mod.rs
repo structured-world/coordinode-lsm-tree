@@ -221,7 +221,7 @@ pub(crate) fn range_to_user_bounds<K: AsRef<[u8]>, R: RangeBounds<K>>(
 }
 
 /// Wraps a [`SeekableTreeIter`](crate::range::SeekableTreeIter) so a standard
-/// tree can expose it as a [`SeekableGuardIter`].
+/// tree can expose it as a [`SeekableGuardIter`](crate::iter_guard::SeekableGuardIter).
 struct StandardSeekable {
     inner: crate::range::SeekableTreeIter,
 }
@@ -1636,7 +1636,7 @@ impl Tree {
         Ok(Some(wrap(entry.value)))
     }
 
-    /// Like [`Tree::resolve_or_passthrough`], but returns a [`PinnableSlice`]
+    /// Like [`Tree::resolve_or_passthrough`], but returns a [`PinnableSlice`](crate::PinnableSlice)
     /// that may keep the decompressed block buffer alive.
     fn resolve_or_passthrough_pinned(
         super_version: &SuperVersion,
@@ -2036,7 +2036,7 @@ impl Tree {
     /// Resolves a single internal entry into a user value, handling tombstones,
     /// range tombstone suppression, and merge operand resolution.
     /// Resolves an entry for `multi_get`: tombstone filter, RT suppression,
-    /// merge operand resolution. Delegates to [`resolve_pinned_entry`] with
+    /// merge operand resolution. Delegates to [`Self::resolve_pinned_entry`] with
     /// `Owned` wrapping, then extracts the value.
     fn resolve_entry(
         super_version: &SuperVersion,
@@ -2294,7 +2294,7 @@ impl Tree {
     /// occupied by an LSM-tree, including the previous configuration.
     /// If not, a new tree will be initialized with the given config.
     ///
-    /// After recovering a previous state, use [`Tree::set_active_memtable`]
+    /// After recovering a previous state, use `Tree::set_active_memtable`
     /// to fill the memtable with data from a write-ahead log for full durability.
     ///
     /// # Errors
@@ -2424,7 +2424,7 @@ impl Tree {
     }
 
     /// Computed storage admission predicate backing
-    /// [`AbstractTree::write_admission`](crate::AbstractTree::write_admission).
+    /// [`AbstractTree::write_admission`].
     ///
     /// Cheap: reads in-memory size accounting only (no syscall). Returns
     /// `Ok(())` unless admission control is enabled AND a budget is set AND the
@@ -3326,7 +3326,7 @@ impl Tree {
     ///
     /// The previous implementation used `std::fs::read_dir` + `to_string_lossy()`,
     /// which silently skipped non-UTF-8 filenames. `Fs::read_dir` returns
-    /// `InvalidData` for such entries instead (see [`FsDirEntry`] docs), so this
+    /// `InvalidData` for such entries instead (see [`FsDirEntry`](crate::fs::FsDirEntry) docs), so this
     /// function now fails fast on non-UTF-8 names. This is intentional: version
     /// files are always `v{u64}` — any non-UTF-8 entry indicates filesystem
     /// corruption and should surface as an error rather than be silently ignored.

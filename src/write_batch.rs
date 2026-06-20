@@ -16,7 +16,7 @@
 //! and become individually visible to concurrent readers as they are written.
 //! Atomic batch visibility requires the **caller** to publish the batch seqno
 //! (via `visible_seqno.fetch_max(batch_seqno + 1)`) only **after**
-//! [`AbstractTree::apply_batch`] returns. This is the same pattern used by
+//! [`AbstractTree::apply_batch`](crate::AbstractTree::apply_batch) returns. This is the same pattern used by
 //! fjall's keyspace for single-writer batches.
 
 use crate::{UserKey, UserValue, ValueType, value::InternalValue};

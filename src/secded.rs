@@ -11,9 +11,9 @@
 //!
 //! # Pluggable shapes
 //!
-//! [`SecdedCodec`] abstracts the word geometry so alternative shapes (wider
+//! [`SecdedCodec`](crate::secded::SecdedCodec) abstracts the word geometry so alternative shapes (wider
 //! words for lower overhead, narrower for denser correction) can be added
-//! without touching the read/write paths. The default, [`Hsiao7264`], is the
+//! without touching the read/write paths. The default, [`Hsiao7264`](crate::secded::Hsiao7264), is the
 //! industry-standard DRAM ECC shape: 8 check bits protect a 64-bit data word
 //! (12.5% overhead), with a Hsiao parity-check matrix (all columns odd-weight
 //! and distinct) so a single-bit error yields an odd nonzero syndrome that

@@ -34,7 +34,7 @@ pub struct InternalValue {
 }
 
 impl InternalValue {
-    /// Creates a new [`Value`].
+    /// Creates a new [`Self`].
     ///
     /// # Panics
     ///
@@ -51,7 +51,7 @@ impl InternalValue {
         Self { key, value }
     }
 
-    /// Creates a new [`Value`].
+    /// Creates a new [`Self`].
     ///
     /// # Panics
     ///

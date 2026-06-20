@@ -203,7 +203,7 @@ pub struct Writer {
     /// When `Some((policy, algo))`, each data block whose `(level,
     /// table_id)` satisfies `policy.applies` is emitted with a per-entry
     /// checksum footer under `algo` and the `KV_CHECKSUM_FOOTER` flag set
-    /// (the block role stays [`BlockType::Data`]). Wired from the tree's
+    /// (the block role stays [`BlockType::Data`](crate::table::block::BlockType::Data)). Wired from the tree's
     /// runtime `kv_checksums` config via [`Self::use_kv_checksums`].
     kv_checksum: Option<(
         crate::runtime_config::KvChecksumPolicy,

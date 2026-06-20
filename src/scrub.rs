@@ -19,12 +19,12 @@
 //!
 //! # Layering: a primitive, not a daemon
 //!
-//! This module exposes the scrub *pass* ([`patrol_scrub`]); it does not own a
+//! This module exposes the scrub *pass* ([`patrol_scrub`](crate::scrub::patrol_scrub)); it does not own a
 //! timer thread or any cluster awareness. Like the auto-heal rewrite it feeds
 //! (drive with [`EccHeal`](crate::compaction::EccHeal) over
 //! [`Tree::heal_hints`](crate::Tree::heal_hints)), the *cadence* and the
 //! *leader-only* gating in a clustered deployment are the caller's concern: run
-//! [`patrol_scrub`] on a schedule from the cluster leader only, since a healing
+//! [`patrol_scrub`](crate::scrub::patrol_scrub) on a schedule from the cluster leader only, since a healing
 //! recompaction is a background mutation. The pass is off by default; it costs
 //! nothing until called.
 //!
@@ -36,8 +36,8 @@
 //! # Throttle
 //!
 //! A scrub competes with production reads for disk bandwidth, so
-//! [`PatrolScrubOptions::throttle`] makes each worker pause between SSTs to cap
-//! I/O pressure, and [`PatrolScrubOptions::parallelism`] bounds how many SSTs
+//! [`PatrolScrubOptions::throttle`](crate::scrub::PatrolScrubOptions::throttle) makes each worker pause between SSTs to cap
+//! I/O pressure, and [`PatrolScrubOptions::parallelism`](crate::scrub::PatrolScrubOptions::parallelism) bounds how many SSTs
 //! are scrubbed concurrently. The pass deliberately bypasses the block cache in
 //! both directions: it re-reads the medium (a cached clean copy would hide an
 //! on-disk fault) and never evicts the live working set with cold blocks.

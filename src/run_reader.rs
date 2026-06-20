@@ -43,7 +43,7 @@ pub struct RunReader {
 impl RunReader {
     /// Creates a new `RunReader` using default lexicographic key ordering.
     ///
-    /// For trees with a custom [`crate::comparator::UserComparator`], use [`new_cmp`] instead.
+    /// For trees with a custom [`crate::comparator::UserComparator`], use [`Self::new_cmp`] instead.
     #[must_use]
     #[cfg_attr(
         not(test),
@@ -56,7 +56,7 @@ impl RunReader {
         Self::new_cmp(run, range, &crate::comparator::DefaultUserComparator)
     }
 
-    /// Like [`new`], but uses a custom comparator for key ordering.
+    /// Like [`Self::new`], but uses a custom comparator for key ordering.
     #[must_use]
     pub fn new_cmp<R: RangeBounds<UserKey> + Clone + Send + 'static>(
         run: Arc<Run<Table>>,

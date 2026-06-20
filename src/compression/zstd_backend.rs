@@ -20,8 +20,8 @@ use std::io::Read;
 ///
 /// A dictionary blob that begins with these four bytes is a fully trained,
 /// finalized zstd dictionary containing entropy tables and must be parsed
-/// with [`Dictionary::decode_dict`]. A blob without this prefix is treated
-/// as raw content and is loaded via [`Dictionary::from_raw_content`].
+/// with `Dictionary::decode_dict`. A blob without this prefix is treated
+/// as raw content and is loaded via `Dictionary::from_raw_content`.
 const DICT_MAGIC: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
 
 /// Read at most `capacity` bytes from `reader` into a pre-allocated buffer,
@@ -306,7 +306,7 @@ fn do_decompress_with_dict(
 }
 
 /// Extract the inner-block layout (cumulative decompressed END offsets) from a
-/// just-emitted frame's [`FrameEmitInfo`].
+/// just-emitted frame's `FrameEmitInfo`.
 ///
 /// Returns an empty `Vec` when the frame has fewer than two inner blocks
 /// (nothing to partial-decode), when the encoder did not capture layout
@@ -334,7 +334,7 @@ fn inner_block_layout(
     ends
 }
 
-/// Runs `f` with a thread-local [`FrameCompressor`] cached by `level` (rebuilt
+/// Runs `f` with a thread-local `FrameCompressor` cached by `level` (rebuilt
 /// only on a level change). Shared by [`ZstdProvider::compress`] and
 /// `compress_with_layout` so interleaving them at the same level reuses one
 /// compressor instead of maintaining two separate thread-local caches.
