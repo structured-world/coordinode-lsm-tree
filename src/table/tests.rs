@@ -3606,7 +3606,7 @@ fn zone_map_corrupt_section_falls_back_instead_of_failing_open() -> crate::Resul
     // Corrupt one byte inside the zone-map section block on disk so its
     // checksum / AEAD rejects it on the next open.
     let mut bytes = std::fs::read(&file)?;
-    let corrupt_at = (zm_handle.offset().0 as usize) + 4;
+    let corrupt_at = usize::try_from(zm_handle.offset().0).expect("offset fits usize") + 4;
     *bytes
         .get_mut(corrupt_at)
         .expect("corruption offset within file") ^= 0xFF;
