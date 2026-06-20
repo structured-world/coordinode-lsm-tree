@@ -446,7 +446,7 @@ mod tests {
         // Open over the full range, consume one key, then reseek to a disjoint
         // sub-window: the reader must serve exactly that window from a fresh
         // position (boundary readers re-open lazily against the new bounds).
-        let mut reader = RunReader::new(level.clone(), ..).unwrap();
+        let mut reader = RunReader::new(level, ..).unwrap();
         assert_eq!(Slice::from(*b"a"), reader.next().unwrap()?.key.user_key);
 
         reader.reseek(UserKey::from("e")..=UserKey::from("h"), &cmp);
