@@ -19,18 +19,45 @@ use std::collections::BTreeMap;
 type VersionedKey = (Vec<u8>, Reverse<u64>);
 type VersionedValue = Option<Vec<u8>>;
 
-/// Simplified MVCC oracle without range tombstones.
-/// Range tombstone testing is in prop_range_tombstone.rs.
+/// One change-data-capture event, the comparable form of a `ScanSinceEvent`.
+#[derive(Debug, PartialEq, Eq)]
+enum CdcEvent {
+    /// A point write (put when `value` is `Some`, tombstone when `None`).
+    Point {
+        seqno: u64,
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    },
+    /// A range tombstone over `[start, end)`.
+    Range {
+        seqno: u64,
+        start: Vec<u8>,
+        end: Vec<u8>,
+    },
+}
+
+impl CdcEvent {
+    fn seqno(&self) -> u64 {
+        match self {
+            Self::Point { seqno, .. } | Self::Range { seqno, .. } => *seqno,
+        }
+    }
+}
+
+/// MVCC oracle covering point writes and range tombstones.
 #[derive(Debug, Clone)]
 struct Oracle {
     /// (key, Reverse(seqno)) -> Some(value) for puts, None for tombstones.
     data: BTreeMap<VersionedKey, VersionedValue>,
+    /// Range tombstones as `(start, end, seqno)` over the half-open `[start, end)`.
+    range_tombstones: Vec<(Vec<u8>, Vec<u8>, u64)>,
 }
 
 impl Oracle {
     fn new() -> Self {
         Self {
             data: BTreeMap::new(),
+            range_tombstones: Vec::new(),
         }
     }
 
@@ -40,6 +67,22 @@ impl Oracle {
 
     fn remove(&mut self, key: Vec<u8>, seqno: u64) {
         self.data.insert((key, Reverse(seqno)), None);
+    }
+
+    fn delete_range(&mut self, start: Vec<u8>, end: Vec<u8>, seqno: u64) {
+        self.range_tombstones.push((start, end, seqno));
+    }
+
+    /// Highest seqno of a range tombstone covering `key` and visible at
+    /// `read_seqno` (exclusive upper bound), or `None` if none applies.
+    fn covering_range_tombstone(&self, key: &[u8], read_seqno: u64) -> Option<u64> {
+        self.range_tombstones
+            .iter()
+            .filter(|(start, end, seqno)| {
+                *seqno < read_seqno && key >= start.as_slice() && key < end.as_slice()
+            })
+            .map(|(_, _, seqno)| *seqno)
+            .max()
     }
 
     /// Point read: return the latest visible value at read_seqno.
@@ -52,12 +95,20 @@ impl Oracle {
         let start = (key.to_vec(), Reverse(read_seqno - 1));
         let end_inclusive = (key.to_vec(), Reverse(0));
 
-        self.data
+        // Latest point version visible at read_seqno.
+        let (point_seqno, point_value) = self
+            .data
             .range(start..=end_inclusive)
             .take_while(|((k, _), _)| k == key)
-            .map(|(_, val)| val.clone())
-            .next()
-            .flatten()
+            .map(|((_, Reverse(seqno)), val)| (*seqno, val.clone()))
+            .next()?;
+        // A range tombstone newer than that point version hides the key.
+        if let Some(rt_seqno) = self.covering_range_tombstone(key, read_seqno)
+            && rt_seqno > point_seqno
+        {
+            return None;
+        }
+        point_value
     }
 
     /// Full scan: return all visible (key, value) pairs at read_seqno, sorted by key.
@@ -75,6 +126,12 @@ impl Oracle {
             }
             last_key = Some(key);
 
+            // A range tombstone newer than this latest point version hides it.
+            if let Some(rt_seqno) = self.covering_range_tombstone(key, read_seqno)
+                && rt_seqno > *entry_seqno
+            {
+                continue;
+            }
             if let Some(value) = val {
                 result.push((key.clone(), value.clone()));
             }
@@ -93,16 +150,29 @@ impl Oracle {
 
     /// Change-data-capture: every write at `seqno >= target`, un-collapsed (a key
     /// written N times yields N events) and ordered by ascending seqno, as
-    /// `(seqno, key, value)` where `value` is `None` for a point tombstone. This
-    /// mirrors `Tree::scan_since_seqno`, whose lower bound is inclusive.
-    fn scan_since(&self, target: u64) -> Vec<(u64, Vec<u8>, Option<Vec<u8>>)> {
-        let mut events: Vec<(u64, Vec<u8>, Option<Vec<u8>>)> = self
+    /// [`CdcEvent`]s (point writes and range tombstones). This mirrors
+    /// `Tree::scan_since_seqno`, whose lower bound is inclusive.
+    fn scan_since(&self, target: u64) -> Vec<CdcEvent> {
+        let mut events: Vec<CdcEvent> = self
             .data
             .iter()
             .filter(|((_, Reverse(seqno)), _)| *seqno >= target)
-            .map(|((key, Reverse(seqno)), val)| (*seqno, key.clone(), val.clone()))
+            .map(|((key, Reverse(seqno)), val)| CdcEvent::Point {
+                seqno: *seqno,
+                key: key.clone(),
+                value: val.clone(),
+            })
             .collect();
-        events.sort_by_key(|(seqno, _, _)| *seqno);
+        for (start, end, seqno) in &self.range_tombstones {
+            if *seqno >= target {
+                events.push(CdcEvent::Range {
+                    seqno: *seqno,
+                    start: start.clone(),
+                    end: end.clone(),
+                });
+            }
+        }
+        events.sort_by_key(CdcEvent::seqno);
         events
     }
 }
@@ -118,28 +188,35 @@ fn key_from_idx(idx: u8) -> Vec<u8> {
     vec![idx]
 }
 
-// NOTE: RemoveRange is excluded from this oracle because it only models
-// point operations. Range tombstone semantics (including interaction with
-// point tombstones across SSTs) are covered by prop_range_tombstone.rs
-// and related regression tests instead.
 #[derive(Debug, Clone)]
 enum Op {
-    Insert { key_idx: u8, value: Vec<u8> },
-    Remove { key_idx: u8 },
+    Insert {
+        key_idx: u8,
+        value: Vec<u8>,
+    },
+    Remove {
+        key_idx: u8,
+    },
+    /// Range tombstone over the half-open `[start_idx, end_idx)`.
+    DeleteRange {
+        start_idx: u8,
+        end_idx: u8,
+    },
     Flush,
     Compact,
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
-        // 50% inserts
         5 => (0..KEY_SPACE, prop::collection::vec(any::<u8>(), 1..32))
             .prop_map(|(key_idx, value)| Op::Insert { key_idx, value }),
-        // 20% removes
         2 => (0..KEY_SPACE).prop_map(|key_idx| Op::Remove { key_idx }),
-        // 20% flushes
+        // A non-empty half-open range: low..=high spans low..(high + 1).
+        1 => (0..KEY_SPACE, 0..KEY_SPACE).prop_map(|(a, b)| {
+            let (low, high) = if a <= b { (a, b) } else { (b, a) };
+            Op::DeleteRange { start_idx: low, end_idx: high + 1 }
+        }),
         2 => Just(Op::Flush),
-        // 10% compactions
         1 => Just(Op::Compact),
     ]
 }
@@ -193,6 +270,14 @@ fn run_oracle_test(ops: Vec<Op>) -> Result<(), TestCaseError> {
                 tree.remove(key, seqno);
                 visible_seqno.fetch_max(seqno + 1);
             }
+            Op::DeleteRange { start_idx, end_idx } => {
+                let start = key_from_idx(*start_idx);
+                let end = key_from_idx(*end_idx);
+                let seqno = seqno_counter.next();
+                oracle.delete_range(start.clone(), end.clone(), seqno);
+                let _ = tree.remove_range(start, end, seqno);
+                visible_seqno.fetch_max(seqno + 1);
+            }
             Op::Flush => {
                 tree.flush_active_memtable(0)
                     .map_err(|e| TestCaseError::fail(format!("flush failed: {e}")))?;
@@ -223,17 +308,31 @@ fn run_oracle_test(ops: Vec<Op>) -> Result<(), TestCaseError> {
     // such version is preserved. Both sides map to (seqno, key, value).
     let cdc_target = gc_floor.max(1);
     let expected_cdc = oracle.scan_since(cdc_target);
-    let actual_cdc: Vec<(u64, Vec<u8>, Option<Vec<u8>>)> = tree
+    let actual_cdc: Vec<CdcEvent> = tree
         .scan_since_seqno(cdc_target)
         .map_err(|e| TestCaseError::fail(format!("scan_since_seqno failed: {e}")))?
         .filter_map(|event| match event {
-            ScanSinceEvent::Insert { key, value, seqno } => {
-                Some((seqno, key.to_vec(), Some(value.to_vec())))
-            }
-            ScanSinceEvent::PointTombstone { key, seqno } => Some((seqno, key.to_vec(), None)),
-            // No range tombstones or merge operands are produced by the point
-            // ops above.
-            ScanSinceEvent::RangeTombstone { .. } | ScanSinceEvent::MergeOperand { .. } => None,
+            ScanSinceEvent::Insert { key, value, seqno } => Some(CdcEvent::Point {
+                seqno,
+                key: key.to_vec(),
+                value: Some(value.to_vec()),
+            }),
+            ScanSinceEvent::PointTombstone { key, seqno } => Some(CdcEvent::Point {
+                seqno,
+                key: key.to_vec(),
+                value: None,
+            }),
+            ScanSinceEvent::RangeTombstone {
+                start_key,
+                end_key,
+                seqno,
+            } => Some(CdcEvent::Range {
+                seqno,
+                start: start_key.to_vec(),
+                end: end_key.to_vec(),
+            }),
+            // No merge operands are produced by the ops above.
+            ScanSinceEvent::MergeOperand { .. } => None,
         })
         .collect();
     prop_assert_eq!(
