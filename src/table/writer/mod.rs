@@ -230,6 +230,14 @@ pub struct Writer {
     /// [`Self::use_zone_map`] before the first key is added.
     use_zone_map: bool,
 
+    /// Columnar opt-in. When `true`, each spilled data block stores its entries
+    /// column-organized (a PAX row-group of the intrinsic fields) instead of
+    /// row-major, tagged [`BlockType::Columnar`](crate::table::block::BlockType::Columnar)
+    /// so the reader reconstructs the exact entries. Default `false` (row-major).
+    /// Caller wires the live runtime config in via [`Self::use_columnar`] before
+    /// the first key is added.
+    use_columnar: bool,
+
     /// Pre-trained zstd dictionary for dictionary compression
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
@@ -350,6 +358,7 @@ impl Writer {
             kv_checksum: None,
             use_seqno_in_index: false,
             use_zone_map: false,
+            use_columnar: false,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -680,6 +689,15 @@ impl Writer {
         self
     }
 
+    /// Enables column-organized data blocks (see [`Self::use_columnar`] field).
+    /// Must be set before the first key is written.
+    #[must_use]
+    pub fn use_columnar(mut self, columnar: bool) -> Self {
+        self.assert_not_started("use_columnar");
+        self.use_columnar = columnar;
+        self
+    }
+
     /// Wires the resolved per-level retrieval-ribbon locator policy entry.
     ///
     /// `Enabled` makes the writer accumulate a per-key `(block_id, slot)`
@@ -883,6 +901,20 @@ impl Writer {
             .then(|| self.chunk.first().map(|e| e.key.user_key.clone()))
             .flatten();
 
+        // Columnar layout: transpose the chunk into a PAX block rather than a
+        // row-major data block. Serial path only for now (the parallel pipeline
+        // assumes a Data block); columnar is opt-in.
+        #[cfg(feature = "columnar")]
+        if self.use_columnar {
+            return self.spill_columnar_block(
+                last_key,
+                last_seqno,
+                seqno_bounds,
+                item_count,
+                zone_block_min,
+            );
+        }
+
         // Decide per-block whether to emit the per-KV checksum footer.
         // `kv_checksum` is None unless the tree opted in; even then only blocks
         // whose (level, table_id) satisfy the policy carry the footer. A
@@ -987,6 +1019,61 @@ impl Writer {
         self.chunk.clear();
         self.chunk_size = 0;
 
+        Ok(())
+    }
+
+    /// Spills the current chunk as a columnar (PAX) block: transpose the entries
+    /// into a `ColumnBatch`, encode it, and write + register it like a data block
+    /// (same index handle, seqno bounds, and zone-map key range). Serial path
+    /// only; the parallel pipeline keeps producing row blocks.
+    #[cfg(feature = "columnar")]
+    fn spill_columnar_block(
+        &mut self,
+        last_key: crate::UserKey,
+        last_seqno: crate::SeqNo,
+        seqno_bounds: Option<(u64, u64)>,
+        item_count: usize,
+        zone_block_min: Option<crate::UserKey>,
+    ) -> crate::Result<()> {
+        let batch = crate::table::columnar::entries_to_column_batch(&self.chunk)?;
+        let payload = batch.encode(crate::table::columnar::CodecId::Plain)?;
+        let transform = {
+            let t = crate::table::block::BlockTransform::from_parts(
+                self.data_block_compression,
+                self.encryption.as_deref(),
+                #[cfg(zstd_any)]
+                self.zstd_dictionary.as_deref(),
+            )?;
+            if let Some(ecc) = self.ecc {
+                t.with_ecc(ecc)
+            } else {
+                t
+            }
+        };
+        let mut prepared = Block::prepare_with_flags(
+            &payload,
+            super::block::BlockIdentity {
+                table_id: self.table_id,
+                block_type: super::block::BlockType::Columnar,
+                dict_id: self.data_block_compression.dict_id(),
+                window_log: 0,
+            },
+            &transform,
+            0, // columnar blocks carry no per-KV checksum footer
+        )?;
+        let layout = core::mem::take(&mut prepared.layout);
+        let header = prepared.write_to(&mut self.file_writer)?;
+        self.register_written_block(
+            header,
+            layout,
+            last_key,
+            last_seqno,
+            seqno_bounds,
+            item_count,
+            zone_block_min,
+        )?;
+        self.chunk.clear();
+        self.chunk_size = 0;
         Ok(())
     }
 
