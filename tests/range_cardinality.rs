@@ -76,15 +76,17 @@ fn empty_range_is_zero() {
 #[test]
 fn range_in_a_data_gap_with_zone_map_is_zero() {
     // A single SST with a hole in the key space: keys 0..100 and 300..400, none
-    // in 100..300. With the zone map present, a query that falls entirely in the
-    // gap must report zero rows, NOT fall back to a byte-fraction estimate.
+    // in 100..300. With one key per data block (block target below the value
+    // size, so no block straddles the gap) and the zone map present, a query
+    // that falls entirely in the gap must report zero rows, NOT fall back to a
+    // byte-fraction estimate.
     let folder = get_tmp_folder();
     let any = Config::new(
         folder.path(),
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .data_block_size_policy(BlockSizePolicy::all(512))
+    .data_block_size_policy(BlockSizePolicy::all(64))
     .open()
     .expect("open");
     let AnyTree::Standard(tree) = any else {

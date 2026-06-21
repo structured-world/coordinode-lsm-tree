@@ -1206,50 +1206,45 @@ impl AbstractTree for Tree {
             }
             let table_seqno = seqno.saturating_sub(table.global_seqno());
             let zone_map = &table.zone_map;
-
-            // Per-block row counts from the zone map: every data block from `lo`
-            // onward whose key range can still overlap the query contributes its
-            // recorded row count. A block is past the range once its minimum key
-            // is above the upper bound. The boundary block at `lo` is counted in
-            // full (block granularity) even if some of its rows sort below `lo`.
-            let reader = match lo {
-                Bound::Included(k) | Bound::Excluded(k) => {
-                    table.block_index.forward_reader(k, table_seqno)
+            if !zone_map.is_empty() {
+                // Zone map present: sum the per-block row counts of blocks whose
+                // key range overlaps the query. A block is past the range once its
+                // minimum key is above the upper bound; the boundary block at `lo`
+                // is counted in full (block granularity). A range that lands in a
+                // key-space gap legitimately yields zero, so this path is
+                // authoritative and never falls back to the byte fraction.
+                let reader = match lo {
+                    Bound::Included(k) | Bound::Excluded(k) => {
+                        table.block_index.forward_reader(k, table_seqno)
+                    }
+                    Bound::Unbounded => Some(table.block_index.iter()),
+                };
+                if let Some(reader) = reader {
+                    for handle in reader {
+                        let handle = handle?;
+                        let Some(col) = zone_map
+                            .columns_for(*handle.offset())
+                            .and_then(|c| c.first())
+                        else {
+                            continue;
+                        };
+                        let above_hi = match hi {
+                            Bound::Included(hk) => {
+                                comparator.compare(&col.min, hk) == Ordering::Greater
+                            }
+                            Bound::Excluded(hk) => {
+                                comparator.compare(&col.min, hk) != Ordering::Less
+                            }
+                            Bound::Unbounded => false,
+                        };
+                        if above_hi {
+                            break;
+                        }
+                        rows = rows.saturating_add(u64::from(col.row_count));
+                    }
                 }
-                Bound::Unbounded => Some(table.block_index.iter()),
-            };
-            let Some(reader) = reader else {
-                continue;
-            };
-            let mut table_rows: u64 = 0;
-            let mut counted = false;
-            for handle in reader {
-                let handle = handle?;
-                let Some(columns) = zone_map.columns_for(*handle.offset()) else {
-                    // No zone map for this table (or block): fall back to the
-                    // byte-fraction row estimate over the whole table below.
-                    table_rows = 0;
-                    counted = false;
-                    break;
-                };
-                let Some(col) = columns.first() else {
-                    continue;
-                };
-                let above_hi = match hi {
-                    Bound::Included(hk) => comparator.compare(&col.min, hk) == Ordering::Greater,
-                    Bound::Excluded(hk) => comparator.compare(&col.min, hk) != Ordering::Less,
-                    Bound::Unbounded => false,
-                };
-                if above_hi {
-                    break;
-                }
-                table_rows = table_rows.saturating_add(u64::from(col.row_count));
-                counted = true;
-            }
-            if counted {
-                rows = rows.saturating_add(table_rows);
             } else if let Some(last) = table.block_index.iter().next_back() {
-                // Fallback (no zone map): apportion item_count by the in-range
+                // No zone map: apportion item_count by the in-range
                 // data-block byte fraction, mirroring approximate_range_stats.
                 let last = last?;
                 let data_end = *last.offset() + u64::from(last.size());
