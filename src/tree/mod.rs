@@ -1205,15 +1205,28 @@ impl AbstractTree for Tree {
                 continue;
             }
             let table_seqno = seqno.saturating_sub(table.global_seqno());
+            // Honor a tight-space restricted view: keys below
+            // `restrict_lower_bound()` are the punched-out prefix served by the
+            // replacement table, so raise this table's effective lower bound to
+            // it (mirrors approximate_range_stats) and never charge that prefix.
+            let eff_lo: Bound<&[u8]> = match (lo, table.restrict_lower_bound()) {
+                (Bound::Unbounded, Some(rb)) => Bound::Included(rb.as_ref()),
+                (Bound::Included(k) | Bound::Excluded(k), Some(rb))
+                    if comparator.compare(rb.as_ref(), k) == Ordering::Greater =>
+                {
+                    Bound::Included(rb.as_ref())
+                }
+                _ => lo,
+            };
             let zone_map = &table.zone_map;
             if !zone_map.is_empty() {
                 // Zone map present: sum the per-block row counts of blocks whose
                 // key range overlaps the query. A block is past the range once its
-                // minimum key is above the upper bound; the boundary block at `lo`
-                // is counted in full (block granularity). A range that lands in a
-                // key-space gap legitimately yields zero, so this path is
-                // authoritative and never falls back to the byte fraction.
-                let reader = match lo {
+                // minimum key is above the upper bound; the boundary block at the
+                // effective lower bound is counted in full (block granularity). A
+                // range that lands in a key-space gap legitimately yields zero, so
+                // this path is authoritative and never falls back to the byte fraction.
+                let reader = match eff_lo {
                     Bound::Included(k) | Bound::Excluded(k) => {
                         table.block_index.forward_reader(k, table_seqno)
                     }
@@ -1265,7 +1278,7 @@ impl AbstractTree for Tree {
                             None => Ok(data_end),
                         }
                     };
-                    let off_lo = match lo {
+                    let off_lo = match eff_lo {
                         Bound::Included(k) | Bound::Excluded(k) => off(k, false)?,
                         Bound::Unbounded => 0,
                     };
