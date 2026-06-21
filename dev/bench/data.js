@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782053012611,
+  "lastUpdate": 1782064010027,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -18594,6 +18594,84 @@ window.BENCHMARK_DATA = {
             "value": 694314.8365974642,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 5.5us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "896e1d5828ac6c5f9ce64f0bc2e0c4a1f450cfdd",
+          "message": "feat(columnar): column-organized SST data blocks with on-flush transpose (#524)\n\n## Summary\n\nMakes the columnar (PAX) block format functional end to end: a tree\nopted into columnar stores its data column-organized on flush /\ncompaction and reads it back exactly through the existing row API, with\nthe seqno column delta-encoded. Builds on the merged format (#517) and\ntranspose kernel (#523).\n\n## What it does\n\n- **Per-tree toggle** `RuntimeConfig.columnar` (default off). The layout\nis recorded per SST (`descriptor#columnar`) and chosen per block from\nthe block type, so a tree can hold both row and columnar SSTs at once.\n- **Write**: when columnar, `Writer::spill_block` transposes each chunk\ninto a PAX `ColumnBatch` (intrinsic columns: user key, seqno, value\ntype, value) and writes it as a `BlockType::Columnar` block, keeping the\nsame index handle, seqno bounds, and zone-map key range.\n- **Read**: every block-load path reconstructs the row entries from a\ncolumnar block on load via a shared `DataBlock::from_columnar_block`\n(decode the `ColumnBatch`, re-encode row-major in memory). All three\npaths dispatch on the SST layout: the random-access loader (point\nreads), the streaming scanner (compaction / merge), and the range\niterator (whose inner-block partial decode is skipped for columnar\nblocks).\n- **Codec**: a Delta logical codec, auto-selected per column for the\nfixed-8 seqno column (wrapping deltas + prefix-sum), recorded per\ncolumn.\n\n## Scope\n\nThe native column-projection read (decode only the referenced columns,\nso a key-only scan never touches the value column) is the contract of\nthe vectorized columnar scan and is tracked in #506. This PR's reader\nreconstructs whole rows, so columnar storage is transparent to the\nexisting point-read / range API.\n\n## Testing\n\n- `cargo nextest run --features lz4,zstd` — 2065 passed (row-major\nunchanged by the shared read-path changes)\n- `cargo nextest run --features lz4,zstd,columnar` — 2086 passed,\nincluding round-trip-through-flush, survives-major-compaction,\ntombstone-hides-row, and Delta-codec round-trip\n- `cargo clippy --all-features --all-targets` — clean\n- no-std: `cargo check --target thumbv7em-none-eabihf\n--no-default-features --features alloc,columnar` — 0 errors (decode path\nis core + alloc)\n- `cargo test --doc --features columnar` — passes\n\nCloses #503\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added a runtime configuration toggle to write new SSTs using a\ncolumn-organized (PAX) layout (opt-in; existing SSTs remain unchanged).\n* Implemented columnar SST read/write support end-to-end, including\nmetadata-driven decoding and scanning.\n* Introduced a delta compression codec for eligible fixed-width integer\ncolumns with automatic per-column selection.\n* **Tests**\n* Added end-to-end tests covering flush, major compaction, and tombstone\nbehavior for columnar SSTs.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-21T20:45:58+03:00",
+          "tree_id": "d20b4d3ec1fdcd8e26e090c3b213c2dfd7776340",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/896e1d5828ac6c5f9ce64f0bc2e0c4a1f450cfdd"
+        },
+        "date": 1782064008865,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2002612.468042936,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1179082.1581146345,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 891616.4227809691,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.0us | P99.9: 6.4us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3833353.5414954196,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 460259.9436778987,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.1us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 236770.59147871,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 4.9us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.84s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1189458.1700450114,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1056983.7596453598,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 2.6us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 698404.2217808866,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 5.3us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
