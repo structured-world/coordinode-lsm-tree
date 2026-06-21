@@ -61,6 +61,14 @@ pub enum BlockType {
     /// [`Self::SeqnoBounds`]) so point reads never load it. Off by default;
     /// absent unless the zone-map policy is enabled.
     ZoneMap,
+    /// A PAX / rowgroup columnar block: a row-group laid out as per-column
+    /// chunks rather than row-major key/value entries. Each chunk is a typed,
+    /// codec-tagged opaque byte array plus a validity bitmap. Produced by the
+    /// transpose on flush / major-compaction for a columnar tree / CF and read
+    /// as a `ColumnBatch`. The wire tag is reserved unconditionally; the codec
+    /// framework that fills these blocks is built only with the `columnar`
+    /// feature.
+    Columnar,
 }
 
 // Wire tags are renumbered contiguously `0..=6` for V5. The previous
@@ -85,6 +93,7 @@ impl From<BlockType> for u8 {
             BlockType::Locator => 8,
             BlockType::SeqnoBounds => 9,
             BlockType::ZoneMap => 10,
+            BlockType::Columnar => 11,
         }
     }
 }
@@ -105,6 +114,7 @@ impl TryFrom<u8> for BlockType {
             8 => Ok(Self::Locator),
             9 => Ok(Self::SeqnoBounds),
             10 => Ok(Self::ZoneMap),
+            11 => Ok(Self::Columnar),
             _ => Err(crate::Error::InvalidTag(("BlockType", value))),
         }
     }
@@ -134,6 +144,7 @@ mod tests {
             (8, BlockType::Locator),
             (9, BlockType::SeqnoBounds),
             (10, BlockType::ZoneMap),
+            (11, BlockType::Columnar),
         ] {
             assert_eq!(
                 u8::from(variant),
@@ -152,9 +163,9 @@ mod tests {
     fn block_type_rejects_unknown_wire_tag() {
         // Forward-incompatibility guard: a tag this build doesn't know
         // (newer writer, older reader) must surface as a typed error,
-        // not a silent coercion to a known variant. 11 is the first
+        // not a silent coercion to a known variant. 12 is the first
         // unused tag past the contiguous range.
-        assert!(BlockType::try_from(11).is_err());
+        assert!(BlockType::try_from(12).is_err());
         assert!(BlockType::try_from(255).is_err());
     }
 }

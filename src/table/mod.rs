@@ -5,6 +5,8 @@
 pub mod block;
 pub(crate) mod block_index;
 pub(crate) mod block_layout;
+#[cfg(feature = "columnar")]
+pub mod columnar;
 pub mod data_block;
 pub mod filter;
 mod id;
