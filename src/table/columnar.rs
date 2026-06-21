@@ -561,9 +561,30 @@ pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>
             "columnar: unexpected intrinsic column layout",
         ));
     }
+    // Intrinsic fields are never null, and a hand-built `ColumnBatch` must clear
+    // the same framing checks a decoded one does. Running `validate` here also
+    // bounds `row_count` against the fixed-width column lengths before the
+    // allocation below, so a malformed batch claiming a huge row count is
+    // rejected instead of reserving for billions of rows.
+    for col in [key_col, seqno_col, vt_col, value_col] {
+        if col.validity.is_some() {
+            return Err(Error::InvalidHeader(
+                "columnar: intrinsic columns must not be nullable",
+            ));
+        }
+        col.validate(batch.row_count)?;
+    }
     let mut out = Vec::with_capacity(batch.row_count as usize);
     for i in 0..batch.row_count {
         let user_key = bytes_column_row(&key_col.data, batch.row_count, i)?;
+        // Match the engine's key invariants (non-empty, fits the u16 length the
+        // table encoder casts to) so a malformed row cannot become an entry that
+        // corrupts later block encoding.
+        if user_key.is_empty() || user_key.len() > u16::MAX as usize {
+            return Err(Error::InvalidHeader(
+                "columnar: user key is empty or longer than u16::MAX",
+            ));
+        }
         let seqno = fixed_u64_row(&seqno_col.data, i)?;
         let vt_byte = vt_col
             .data
@@ -651,6 +672,60 @@ mod tests {
                 validity: None,
                 data: vec![0; 4],
             }],
+        };
+        assert!(column_batch_to_entries(&bad).is_err());
+    }
+
+    #[test]
+    fn intrinsic_untranspose_rejects_nullable_intrinsic() {
+        // Intrinsic fields are never null; a validity bitmap on one marks a
+        // malformed batch even if it is otherwise well-framed.
+        let mut batch =
+            entries_to_column_batch(&[entry(b"k", 1, ValueType::Value, b"v")]).expect("transpose");
+        batch.columns[0].validity = Some(vec![0b1]); // one valid row, but nullable
+        assert!(column_batch_to_entries(&batch).is_err());
+    }
+
+    #[test]
+    fn intrinsic_untranspose_rejects_empty_key() {
+        // An empty user key violates the engine's key invariant.
+        let batch =
+            entries_to_column_batch(&[entry(b"", 1, ValueType::Value, b"v")]).expect("transpose");
+        assert!(column_batch_to_entries(&batch).is_err());
+    }
+
+    #[test]
+    fn intrinsic_untranspose_rejects_huge_row_count() {
+        // A hand-built batch claiming billions of rows but carrying tiny columns
+        // is rejected by per-column validation before any allocation.
+        let bad = ColumnBatch {
+            row_count: u32::MAX,
+            columns: vec![
+                Column {
+                    column_id: 0,
+                    type_tag: TypeTag::Bytes,
+                    validity: None,
+                    data: 0u32.to_le_bytes().to_vec(),
+                },
+                Column {
+                    column_id: 1,
+                    type_tag: TypeTag::Fixed(8),
+                    validity: None,
+                    data: Vec::new(),
+                },
+                Column {
+                    column_id: 2,
+                    type_tag: TypeTag::Fixed(1),
+                    validity: None,
+                    data: Vec::new(),
+                },
+                Column {
+                    column_id: 3,
+                    type_tag: TypeTag::Bytes,
+                    validity: None,
+                    data: 0u32.to_le_bytes().to_vec(),
+                },
+            ],
         };
         assert!(column_batch_to_entries(&bad).is_err());
     }
