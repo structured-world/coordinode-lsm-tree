@@ -27,7 +27,7 @@
 //!         data: vec![1, 0, 0, 0, 0, 0, 0, 0],
 //!     }],
 //! };
-//! let bytes = batch.encode(CodecId::Plain);
+//! let bytes = batch.encode(CodecId::Plain).unwrap();
 //! assert_eq!(ColumnBatch::decode(&bytes).unwrap(), batch);
 //! ```
 
@@ -64,7 +64,14 @@ impl TypeTag {
                 }
                 Ok(Self::Fixed(width))
             }
-            1 => Ok(Self::Bytes),
+            1 => {
+                if width != 0 {
+                    return Err(Error::InvalidHeader(
+                        "columnar: bytes column width must be zero",
+                    ));
+                }
+                Ok(Self::Bytes)
+            }
             _ => Err(Error::InvalidTag(("ColumnTypeTag", tag))),
         }
     }
@@ -130,20 +137,136 @@ const fn validity_len(row_count: u32) -> usize {
     (row_count as usize).div_ceil(8)
 }
 
+/// Validates a validity bitmap: it must be exactly `ceil(row_count / 8)` bytes,
+/// and every padding bit above `row_count` in the final byte must be zero (so a
+/// consumer that pop-counts the byte cannot read an impossible row count).
+fn check_validity(v: &[u8], row_count: u32) -> Result<()> {
+    if v.len() != validity_len(row_count) {
+        return Err(Error::InvalidHeader(
+            "columnar: validity bitmap length is not ceil(row_count / 8)",
+        ));
+    }
+    let used = row_count % 8;
+    if used != 0 {
+        // The length check above guarantees a final byte exists here.
+        let last = v.last().copied().unwrap_or(0);
+        let valid_mask = (1u8 << used) - 1;
+        if last & !valid_mask != 0 {
+            return Err(Error::InvalidHeader(
+                "columnar: validity padding bits above row_count must be zero",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validates the framing of a [`TypeTag::Bytes`] column: a `(row_count + 1)`
+/// little-endian `u32` offset table followed by the payload, where the first
+/// offset is `0`, offsets are non-decreasing, and the last offset equals the
+/// payload length (so `offset[i]..offset[i + 1]` slicing by a consumer is
+/// always in bounds).
+fn check_bytes_framing(data: &[u8], row_count: u32) -> Result<()> {
+    let off_count = (row_count as usize)
+        .checked_add(1)
+        .ok_or(Error::InvalidHeader(
+            "columnar: bytes offset count overflow",
+        ))?;
+    let off_bytes = off_count.checked_mul(4).ok_or(Error::InvalidHeader(
+        "columnar: bytes offset table overflow",
+    ))?;
+    let table = data.get(..off_bytes).ok_or(Error::InvalidHeader(
+        "columnar: bytes column shorter than its offset table",
+    ))?;
+    let payload_len = data.len() - off_bytes;
+    let mut prev = 0usize;
+    for (i, chunk) in table.chunks_exact(4).enumerate() {
+        let off = u32::from_le_bytes(
+            chunk
+                .try_into()
+                .map_err(|_| Error::InvalidHeader("columnar: short bytes offset"))?,
+        ) as usize;
+        if i == 0 && off != 0 {
+            return Err(Error::InvalidHeader(
+                "columnar: first bytes offset must be zero",
+            ));
+        }
+        if off < prev {
+            return Err(Error::InvalidHeader(
+                "columnar: bytes offsets must be non-decreasing",
+            ));
+        }
+        if off > payload_len {
+            return Err(Error::InvalidHeader(
+                "columnar: bytes offset past payload end",
+            ));
+        }
+        prev = off;
+    }
+    // The last offset must reach exactly the payload end (no trailing payload).
+    if prev != payload_len {
+        return Err(Error::InvalidHeader(
+            "columnar: final bytes offset must equal the payload length",
+        ));
+    }
+    Ok(())
+}
+
+impl Column {
+    /// Validates that the column is well-formed for `row_count` rows: a nonzero
+    /// fixed width with `row_count * width` data bytes, a correctly framed
+    /// `Bytes` offset table, and a correctly sized / padded validity bitmap.
+    /// `encode` and `decode` both run this so a payload is accepted by one iff
+    /// it is accepted by the other.
+    fn validate(&self, row_count: u32) -> Result<()> {
+        match self.type_tag {
+            TypeTag::Fixed(0) => {
+                return Err(Error::InvalidHeader("columnar: fixed column width is zero"));
+            }
+            TypeTag::Fixed(w) => {
+                let expected =
+                    (row_count as usize)
+                        .checked_mul(w as usize)
+                        .ok_or(Error::InvalidHeader(
+                            "columnar: fixed column length overflow",
+                        ))?;
+                if self.data.len() != expected {
+                    return Err(Error::InvalidHeader(
+                        "columnar: fixed column byte length is not row_count * width",
+                    ));
+                }
+            }
+            TypeTag::Bytes => check_bytes_framing(&self.data, row_count)?,
+        }
+        if let Some(v) = &self.validity {
+            check_validity(v, row_count)?;
+        }
+        Ok(())
+    }
+}
+
 impl ColumnBatch {
     /// Encodes the batch into a columnar block payload using `codec` for every
     /// column. The returned bytes are the block payload (without the surrounding
     /// block header / checksum, which the writer adds).
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any column is malformed for the batch's `row_count`:
+    /// a zero fixed width, a fixed column whose byte length is not
+    /// `row_count * width`, a mis-framed `Bytes` offset table, or a validity
+    /// bitmap of the wrong length or with non-zero padding bits. This makes the
+    /// encoder's accepted set exactly match the decoder's, so every produced
+    /// payload round-trips.
     #[expect(
         clippy::cast_possible_truncation,
         reason = "column count and per-column chunk length are bounded by the block size policy, far below u32::MAX"
     )]
-    pub fn encode(&self, codec: CodecId) -> Vec<u8> {
+    pub fn encode(&self, codec: CodecId) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         out.extend_from_slice(&self.row_count.to_le_bytes());
         out.extend_from_slice(&(self.columns.len() as u32).to_le_bytes());
         for col in &self.columns {
+            col.validate(self.row_count)?;
             let (type_tag, width) = col.type_tag.to_wire();
             out.extend_from_slice(&col.column_id.to_le_bytes());
             out.push(type_tag);
@@ -157,27 +280,48 @@ impl ColumnBatch {
             }
             out.extend_from_slice(&col.data);
         }
-        out
+        Ok(out)
     }
 
     /// Decodes a columnar block payload produced by [`ColumnBatch::encode`].
     ///
     /// # Errors
     ///
-    /// Returns an error if the payload is truncated, carries an unknown type /
-    /// codec tag, or describes a fixed-width column whose byte length is not a
-    /// whole number of rows.
+    /// Returns an error if the payload is truncated, has trailing bytes after
+    /// the last declared column, declares more columns than the remaining bytes
+    /// could hold, carries an unknown type / codec tag, a non-canonical width /
+    /// validity flag, or any column that fails [`Column::validate`] (fixed-width
+    /// length, `Bytes` offset framing, validity bitmap length / padding).
     pub fn decode(bytes: &[u8]) -> Result<Self> {
+        // Smallest possible column: id(2) + type(1) + width(1) + codec(1) +
+        // has_validity(1) + data_len(4), with empty validity + data.
+        const MIN_COLUMN_BYTES: usize = 10;
         let mut cur = Cursor::new(bytes);
         let row_count = cur.read_u32()?;
-        let column_count = cur.read_u32()?;
-        let mut columns = Vec::with_capacity(column_count as usize);
+        let column_count = cur.read_u32()? as usize;
+        // Bound the declared column count by the bytes that remain before
+        // reserving, so a tiny payload claiming a huge count cannot trigger a
+        // giant allocation ahead of the per-column truncation checks.
+        if column_count > cur.remaining() / MIN_COLUMN_BYTES {
+            return Err(Error::InvalidHeader(
+                "columnar: declared column count exceeds payload size",
+            ));
+        }
+        let mut columns = Vec::with_capacity(column_count);
         for _ in 0..column_count {
             let column_id = cur.read_u16()?;
             let type_tag = cur.read_u8()?;
             let width = cur.read_u8()?;
             let codec = CodecId::try_from(cur.read_u8()?)?;
-            let has_validity = cur.read_u8()? != 0;
+            let has_validity = match cur.read_u8()? {
+                0 => false,
+                1 => true,
+                _ => {
+                    return Err(Error::InvalidHeader(
+                        "columnar: validity flag must be 0 or 1",
+                    ));
+                }
+            };
             let data_len = cur.read_u32()? as usize;
             let type_tag = TypeTag::from_wire(type_tag, width)?;
             let validity = if has_validity {
@@ -189,25 +333,21 @@ impl ColumnBatch {
             // Plain codec is the identity, so the stored bytes are already the
             // decoded column bytes; structure-aware codecs decode here.
             let CodecId::Plain = codec;
-            if let TypeTag::Fixed(w) = type_tag {
-                let expected =
-                    (row_count as usize)
-                        .checked_mul(w as usize)
-                        .ok_or(Error::InvalidHeader(
-                            "columnar: fixed column length overflow",
-                        ))?;
-                if data.len() != expected {
-                    return Err(Error::InvalidHeader(
-                        "columnar: fixed column byte length is not row_count * width",
-                    ));
-                }
-            }
-            columns.push(Column {
+            let column = Column {
                 column_id,
                 type_tag,
                 validity,
                 data,
-            });
+            };
+            // Same well-formedness gate the encoder runs, so a payload decodes
+            // iff it could have been produced by `encode`.
+            column.validate(row_count)?;
+            columns.push(column);
+        }
+        if !cur.is_empty() {
+            return Err(Error::InvalidHeader(
+                "columnar: trailing bytes after the last column",
+            ));
         }
         Ok(Self { row_count, columns })
     }
@@ -222,6 +362,16 @@ struct Cursor<'a> {
 impl<'a> Cursor<'a> {
     const fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
+    }
+
+    /// Bytes not yet consumed.
+    const fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+
+    /// Whether every byte has been consumed.
+    const fn is_empty(&self) -> bool {
+        self.pos == self.buf.len()
     }
 
     fn read_bytes(&mut self, n: usize) -> Result<&'a [u8]> {
@@ -299,22 +449,23 @@ mod tests {
     #[test]
     fn columnar_batch_round_trips_through_plain_codec() {
         let batch = sample_batch();
-        let encoded = batch.encode(CodecId::Plain);
+        let encoded = batch.encode(CodecId::Plain).expect("encode");
         let decoded = ColumnBatch::decode(&encoded).expect("decode");
         assert_eq!(decoded, batch, "columnar batch must survive a round-trip");
     }
 
     #[test]
     fn columnar_decode_rejects_truncated_payload() {
-        let encoded = sample_batch().encode(CodecId::Plain);
+        let encoded = sample_batch().encode(CodecId::Plain).expect("encode");
         // Drop the last byte: the final column's data is now short.
         let truncated = &encoded[..encoded.len() - 1];
         assert!(ColumnBatch::decode(truncated).is_err());
     }
 
     #[test]
-    fn columnar_decode_rejects_fixed_width_length_mismatch() {
-        // A fixed(4) column claiming 3 rows but carrying 8 bytes (= 2 rows).
+    fn columnar_encode_rejects_fixed_width_length_mismatch() {
+        // A fixed(4) column claiming 3 rows but carrying 8 bytes (= 2 rows) is
+        // rejected at encode, so no non-round-trippable payload is produced.
         let bad = ColumnBatch {
             row_count: 3,
             columns: vec![Column {
@@ -324,16 +475,102 @@ mod tests {
                 data: vec![0; 8],
             }],
         };
-        let encoded = bad.encode(CodecId::Plain);
-        assert!(ColumnBatch::decode(&encoded).is_err());
+        assert!(bad.encode(CodecId::Plain).is_err());
     }
 
     #[test]
     fn columnar_decode_rejects_unknown_codec_tag() {
-        let mut encoded = sample_batch().encode(CodecId::Plain);
+        let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
         // Codec byte of the first column sits after row_count(4) + col_count(4)
         // + column_id(2) + type_tag(1) + width(1) = offset 12.
         encoded[12] = 0xFF;
+        assert!(ColumnBatch::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn columnar_encode_rejects_zero_width_fixed_column() {
+        // Fixed(0) is publicly constructible but cannot round-trip; encode must
+        // reject it rather than emit bytes decode would refuse.
+        let bad = ColumnBatch {
+            row_count: 1,
+            columns: vec![Column {
+                column_id: 1,
+                type_tag: TypeTag::Fixed(0),
+                validity: None,
+                data: Vec::new(),
+            }],
+        };
+        assert!(bad.encode(CodecId::Plain).is_err());
+    }
+
+    #[test]
+    fn columnar_encode_rejects_wrong_validity_length() {
+        // 1 row needs a 1-byte bitmap; a 2-byte bitmap is rejected.
+        let bad = ColumnBatch {
+            row_count: 1,
+            columns: vec![Column {
+                column_id: 1,
+                type_tag: TypeTag::Fixed(1),
+                validity: Some(vec![0, 0]),
+                data: vec![7],
+            }],
+        };
+        assert!(bad.encode(CodecId::Plain).is_err());
+    }
+
+    #[test]
+    fn columnar_encode_rejects_validity_padding_bits() {
+        // 1 row: only bit 0 is meaningful; a set padding bit (0xFF) is rejected.
+        let bad = ColumnBatch {
+            row_count: 1,
+            columns: vec![Column {
+                column_id: 1,
+                type_tag: TypeTag::Fixed(1),
+                validity: Some(vec![0xFF]),
+                data: vec![7],
+            }],
+        };
+        assert!(bad.encode(CodecId::Plain).is_err());
+    }
+
+    #[test]
+    fn columnar_decode_rejects_bytes_offset_out_of_bounds() {
+        let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
+        // The Bytes column's first offset (must be 0) is at byte 41: col1 starts
+        // at 31 (id 2 + type 1 + width 1 + codec 1 + has_validity 1 + len 4 = 10
+        // header bytes), so its data / offset table begins at 41.
+        encoded[41] = 9;
+        assert!(ColumnBatch::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn columnar_decode_rejects_trailing_bytes() {
+        let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
+        encoded.push(0); // one byte past the last declared column
+        assert!(ColumnBatch::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn columnar_decode_rejects_huge_column_count() {
+        // row_count = 0, column_count = u32::MAX, but no column bytes follow.
+        let mut payload = 0u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(ColumnBatch::decode(&payload).is_err());
+    }
+
+    #[test]
+    fn columnar_decode_rejects_non_boolean_validity_flag() {
+        let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
+        // has_validity flag of the first column is at byte 13.
+        encoded[13] = 2;
+        assert!(ColumnBatch::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn columnar_decode_rejects_non_zero_bytes_width() {
+        let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
+        // The Bytes column's width byte (must be 0) is at byte 34.
+        encoded[34] = 5;
         assert!(ColumnBatch::decode(&encoded).is_err());
     }
 }
