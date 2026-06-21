@@ -193,6 +193,27 @@ pub struct LevelStats {
     pub segments: Vec<SegmentStats>,
 }
 
+/// Approximate cardinality and selectivity of a key range, for cost-based query
+/// planning (join ordering, scan-vs-seek).
+///
+/// Both figures derive from the per-data-block zone map (per-block row counts +
+/// key ranges) when present, falling back to the byte-fraction estimate of
+/// [`ApproximateRangeStats`] otherwise. They are estimates at block granularity,
+/// never exact.
+#[must_use]
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct RangeCardinality {
+    /// Estimated number of rows (entry versions) the range covers: the sum of
+    /// the per-block row counts of every data block whose key range overlaps the
+    /// query range, plus each memtable's in-range count. `0` for an empty range.
+    pub rows: u64,
+
+    /// Estimated fraction of the tree's rows the range selects, in `0.0..=1.0`:
+    /// `rows / total_rows`. Monotonic in predicate tightness (a narrower range
+    /// never yields a larger selectivity). `0.0` when the tree is empty.
+    pub selectivity: f64,
+}
+
 impl StorageStats {
     /// Approximately how many more average-shaped entries fit in `budget_bytes`,
     /// using [`Self::avg_entry_on_disk_bytes`].

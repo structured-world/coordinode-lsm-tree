@@ -1169,6 +1169,178 @@ impl AbstractTree for Tree {
         Ok(crate::ApproximateRangeStats { bytes, key_count })
     }
 
+    fn approximate_range_cardinality<K: AsRef<[u8]>, R: core::ops::RangeBounds<K>>(
+        &self,
+        range: R,
+        seqno: SeqNo,
+    ) -> crate::Result<crate::RangeCardinality> {
+        use crate::table::block_index::BlockIndex;
+        use core::cmp::Ordering;
+        use core::ops::Bound;
+
+        let lo: Bound<&[u8]> = match range.start_bound() {
+            Bound::Included(k) => Bound::Included(k.as_ref()),
+            Bound::Excluded(k) => Bound::Excluded(k.as_ref()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let hi: Bound<&[u8]> = match range.end_bound() {
+            Bound::Included(k) => Bound::Included(k.as_ref()),
+            Bound::Excluded(k) => Bound::Excluded(k.as_ref()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let bounds = (lo, hi);
+        let comparator = self.config.comparator.as_ref();
+        let super_version = self.version_history.read().get_version_for_snapshot(seqno);
+
+        let mut rows: u64 = 0;
+        let mut total_rows: u64 = 0;
+
+        for table in super_version.version.iter_tables() {
+            total_rows = total_rows.saturating_add(table.metadata.item_count);
+            if !table
+                .metadata
+                .key_range
+                .overlaps_with_bounds_cmp(&bounds, comparator)
+            {
+                continue;
+            }
+            let table_seqno = seqno.saturating_sub(table.global_seqno());
+            let zone_map = &table.zone_map;
+
+            // Per-block row counts from the zone map: every data block from `lo`
+            // onward whose key range can still overlap the query contributes its
+            // recorded row count. A block is past the range once its minimum key
+            // is above the upper bound. The boundary block at `lo` is counted in
+            // full (block granularity) even if some of its rows sort below `lo`.
+            let reader = match lo {
+                Bound::Included(k) | Bound::Excluded(k) => {
+                    table.block_index.forward_reader(k, table_seqno)
+                }
+                Bound::Unbounded => Some(table.block_index.iter()),
+            };
+            let Some(reader) = reader else {
+                continue;
+            };
+            let mut table_rows: u64 = 0;
+            let mut counted = false;
+            for handle in reader {
+                let handle = handle?;
+                let Some(columns) = zone_map.columns_for(*handle.offset()) else {
+                    // No zone map for this table (or block): fall back to the
+                    // byte-fraction row estimate over the whole table below.
+                    table_rows = 0;
+                    counted = false;
+                    break;
+                };
+                let Some(col) = columns.first() else {
+                    continue;
+                };
+                let above_hi = match hi {
+                    Bound::Included(hk) => comparator.compare(&col.min, hk) == Ordering::Greater,
+                    Bound::Excluded(hk) => comparator.compare(&col.min, hk) != Ordering::Less,
+                    Bound::Unbounded => false,
+                };
+                if above_hi {
+                    break;
+                }
+                table_rows = table_rows.saturating_add(u64::from(col.row_count));
+                counted = true;
+            }
+            if counted {
+                rows = rows.saturating_add(table_rows);
+            } else if let Some(last) = table.block_index.iter().next_back() {
+                // Fallback (no zone map): apportion item_count by the in-range
+                // data-block byte fraction, mirroring approximate_range_stats.
+                let last = last?;
+                let data_end = *last.offset() + u64::from(last.size());
+                if data_end > 0 {
+                    let off = |key: &[u8], end: bool| -> crate::Result<u64> {
+                        match table.block_index.forward_reader(key, table_seqno) {
+                            Some(mut it) => match it.next() {
+                                Some(h) => {
+                                    let h = h?;
+                                    Ok(if end {
+                                        (*h.offset() + u64::from(h.size())).min(data_end)
+                                    } else {
+                                        *h.offset()
+                                    })
+                                }
+                                None => Ok(data_end),
+                            },
+                            None => Ok(data_end),
+                        }
+                    };
+                    let off_lo = match lo {
+                        Bound::Included(k) | Bound::Excluded(k) => off(k, false)?,
+                        Bound::Unbounded => 0,
+                    };
+                    let off_hi = match hi {
+                        Bound::Included(k) | Bound::Excluded(k) => off(k, true)?,
+                        Bound::Unbounded => data_end,
+                    };
+                    let idx_bytes = off_hi.saturating_sub(off_lo);
+                    if idx_bytes > 0 {
+                        let est = u64::try_from(
+                            u128::from(table.metadata.item_count) * u128::from(idx_bytes)
+                                / u128::from(data_end),
+                        )
+                        .unwrap_or(u64::MAX)
+                        .max(1);
+                        rows = rows.saturating_add(est);
+                    }
+                }
+            }
+        }
+
+        // Memtables: count the in-range, snapshot-visible entries and add them to
+        // both the matched rows and the total (matching the SST accounting).
+        let mt_range = (
+            match lo {
+                Bound::Included(k) => {
+                    Bound::Included(InternalKey::new(k, SeqNo::MAX, crate::ValueType::Tombstone))
+                }
+                Bound::Excluded(k) => {
+                    Bound::Excluded(InternalKey::new(k, 0, crate::ValueType::Tombstone))
+                }
+                Bound::Unbounded => Bound::Unbounded,
+            },
+            match hi {
+                Bound::Included(k) => {
+                    Bound::Included(InternalKey::new(k, 0, crate::ValueType::Value))
+                }
+                Bound::Excluded(k) => {
+                    Bound::Excluded(InternalKey::new(k, SeqNo::MAX, crate::ValueType::Value))
+                }
+                Bound::Unbounded => Bound::Unbounded,
+            },
+        );
+        let mut add_memtable = |mt: &crate::Memtable| {
+            total_rows = total_rows.saturating_add(mt.len() as u64);
+            let in_range = mt
+                .range_internal(mt_range.clone())
+                .filter(|kv| kv.key.seqno < seqno)
+                .count() as u64;
+            rows = rows.saturating_add(in_range);
+        };
+        add_memtable(&super_version.active_memtable);
+        for mt in super_version.sealed_memtables.iter() {
+            add_memtable(mt);
+        }
+
+        // selectivity is an approximate ratio; u64 row counts are well within
+        // f64's exact-integer range (2^52) for any realistic table.
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "row counts never approach 2^52; the ratio is approximate anyway"
+        )]
+        let selectivity = if total_rows == 0 {
+            0.0
+        } else {
+            (rows.min(total_rows) as f64) / (total_rows as f64)
+        };
+        Ok(crate::RangeCardinality { rows, selectivity })
+    }
+
     fn get_highest_memtable_seqno(&self) -> Option<SeqNo> {
         let version = self.version_history.read().latest_version();
 

@@ -36,16 +36,17 @@
 //! Entries are strictly ascending by `block_offset` (write order == file order),
 //! enabling both a binary-search lookup and a sequential cursor.
 
-// The reader-side API (columns_for / cursor / ZoneMapCursor) has no live caller
-// until the columnar block-skip scan consumes it; the writer / table-open paths
-// already use the rest. Gated to non-test builds so the in-module tests (which
-// exercise the reader API) do not leave the expectation unfulfilled, and kept as
+// The cursor reader API (`cursor` / `ZoneMapCursor` / `len` / `is_empty`) has no
+// live caller until the columnar block-skip scan consumes it; `columns_for` and
+// the writer / table-open paths are already used (the range-cardinality estimate
+// reads `columns_for`). Gated to non-test builds so the in-module tests (which
+// exercise the cursor API) do not leave the expectation unfulfilled, and kept as
 // `expect` (not `allow`) so it self-removes once a live caller lands.
 #![cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "reader API consumed by the columnar block-skip scan"
+        reason = "cursor API consumed by the columnar block-skip scan"
     )
 )]
 

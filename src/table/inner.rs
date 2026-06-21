@@ -144,14 +144,8 @@ pub struct Inner {
 
     /// Per-data-block zone map, loaded on open from the optional `zone_map`
     /// section. Empty when the table has none (zone-map policy off), so a
-    /// predicate scan falls back to reading every block. Read only by the
-    /// block-skip scan path.
-    // Gated to non-test builds (the round-trip unit test reads it); kept as
-    // `expect` so it self-removes once the live block-skip reader reads it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the columnar block-skip scan path")
-    )]
+    /// predicate scan falls back to reading every block. Read by the
+    /// range-cardinality estimate and the block-skip scan path.
     pub(crate) zone_map: crate::table::zone_map::ZoneMap,
 
     /// Retrieval-ribbon locator, loaded on open from the optional `locator`
