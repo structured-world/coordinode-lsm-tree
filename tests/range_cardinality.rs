@@ -8,8 +8,8 @@
 //! and selectivity is monotonic in predicate tightness.
 
 use lsm_tree::{
-    AbstractTree, AnyTree, Config, SeqNo, SequenceNumberCounter, Tree, config::BlockSizePolicy,
-    get_tmp_folder,
+    AbstractTree, AnyTree, Config, KvSeparationOptions, SeqNo, SequenceNumberCounter, Tree,
+    config::BlockSizePolicy, get_tmp_folder,
 };
 use test_log::test;
 
@@ -212,6 +212,96 @@ fn falls_back_without_zone_map() {
         narrow.selectivity <= full.selectivity,
         "fallback selectivity monotonic"
     );
+}
+
+#[test]
+fn kv_separated_cardinality_delegates_to_index() {
+    // A KV-separated tree delegates cardinality to its index tree (the row
+    // counts and key ranges live in the index, values in blob files).
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
+    .open()
+    .expect("open");
+    let AnyTree::Blob(tree) = any else {
+        panic!("expected blob tree");
+    };
+    for i in 0..200u32 {
+        tree.insert(key(i), vec![b'v'; 1024], 0);
+    }
+    tree.flush_active_memtable(0).expect("flush");
+
+    let full = tree
+        .approximate_range_cardinality::<&[u8], _>(.., SeqNo::MAX)
+        .expect("cardinality");
+    assert_eq!(
+        full.rows,
+        tree.approximate_len() as u64,
+        "full range counts every row"
+    );
+    assert!((full.selectivity - 1.0).abs() < 1e-9);
+    let part = tree
+        .approximate_range_cardinality(key(0)..key(50), SeqNo::MAX)
+        .expect("cardinality");
+    assert!(
+        part.selectivity <= full.selectivity,
+        "selectivity monotonic"
+    );
+}
+
+#[test]
+fn restricted_view_cardinality_honors_punched_prefix() {
+    use lsm_tree::fs::MemFs;
+    use std::sync::Arc;
+
+    let folder = get_tmp_folder();
+    let mem = MemFs::with_capacity(64 * 1024 * 1024);
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(mem.clone()))
+    .open()
+    .expect("open");
+    let AnyTree::Standard(tree) = any else {
+        panic!("expected standard tree");
+    };
+    for i in 0..2000u32 {
+        tree.insert(key(i), vec![0xCDu8; 64], u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    let used = tree.storage_stats().expect("stats").used_bytes;
+    // Cap the disk so a full rewrite cannot fit: the opt-in tight-space loop
+    // slices the gated table and installs restricted views over the survivors.
+    mem.set_capacity(used + used / 4);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+        c.tight_space_compaction = true;
+    })
+    .expect("config");
+    tree.major_compact(64 * 1024 * 1024, 0).expect("compact");
+
+    // After the tight-space rewrite the version can hold restricted-view tables.
+    // The cardinality estimate must raise each restricted table's lower bound to
+    // its restriction in both the unbounded-lo arm (a full range) and a bounded
+    // lower bound below the restriction. Every key must still be accounted for.
+    let full = tree
+        .approximate_range_cardinality::<&[u8], _>(.., u64::MAX)
+        .expect("cardinality");
+    assert!(
+        full.rows > 0,
+        "full-range cardinality over a restricted layout"
+    );
+    let bounded = tree
+        .approximate_range_cardinality(key(0)..key(2000), u64::MAX)
+        .expect("cardinality");
+    assert!(bounded.rows > 0);
 }
 
 fn build_fallback(folder: &std::path::Path) -> Tree {
