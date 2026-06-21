@@ -46,6 +46,17 @@ fn columnar_tree_round_trips_through_flush() {
     }
     tree.flush_active_memtable(0).expect("flush");
 
+    // The write path must actually have produced columnar SSTs, else this suite
+    // could pass on a row-major regression (the reader is transparent).
+    let tables: usize = tree.current_version().iter_tables().count();
+    assert!(tables > 0, "expected at least one flushed SST");
+    assert!(
+        tree.current_version()
+            .iter_tables()
+            .all(|t| t.metadata.columnar),
+        "flushed SSTs must be columnar, not row-major"
+    );
+
     // Every key reads back its exact value through the columnar -> row reader.
     for i in 0..n {
         let got = tree
@@ -76,6 +87,12 @@ fn columnar_survives_major_compaction() {
     }
     tree.flush_active_memtable(0).expect("flush");
     tree.major_compact(64 * 1024 * 1024, 0).expect("compact");
+    assert!(
+        tree.current_version()
+            .iter_tables()
+            .all(|t| t.metadata.columnar),
+        "the compacted SST must also be columnar"
+    );
 
     for i in 0..600u32 {
         let got = tree

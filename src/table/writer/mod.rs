@@ -694,7 +694,11 @@ impl Writer {
     #[must_use]
     pub fn use_columnar(mut self, columnar: bool) -> Self {
         self.assert_not_started("use_columnar");
-        self.use_columnar = columnar;
+        // Without the `columnar` feature the spill branch is compiled out, so a
+        // requested columnar layout cannot be honored. Drop the flag here so the
+        // persisted `descriptor#columnar` never advertises a layout the blocks
+        // do not have (which would misroute the reader's block identity).
+        self.use_columnar = columnar && cfg!(feature = "columnar");
         self
     }
 
@@ -1601,11 +1605,18 @@ impl Writer {
             // table's data blocks (homogeneous SST), so it doubles as
             // the per-SST descriptor value — identical to the per-block
             // decision `spill_block` makes via the same expression.
-            kv_checksum_algo: self.kv_checksum.and_then(|(policy, algo)| {
-                policy
-                    .applies(self.initial_level, self.table_id)
-                    .then_some(algo)
-            }),
+            // Columnar blocks carry no per-KV footer (spill_columnar_block writes
+            // no footer flags), so a columnar SST must report no footer here
+            // rather than advertise one its blocks omit.
+            kv_checksum_algo: if self.use_columnar {
+                None
+            } else {
+                self.kv_checksum.and_then(|(policy, algo)| {
+                    policy
+                        .applies(self.initial_level, self.table_id)
+                        .then_some(algo)
+                })
+            },
             data_block_hash_ratio: self.data_block_hash_ratio,
             data_block_restart_interval: self.data_block_restart_interval,
             index_block_restart_interval: self.index_block_restart_interval,

@@ -177,19 +177,28 @@ fn delta_decode_u64(data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Encodes a column's decoded bytes under `codec`.
-fn codec_encode(codec: CodecId, data: &[u8]) -> Vec<u8> {
+/// Encodes a column's decoded bytes under `codec`. Delta requires a `Fixed(8)`
+/// column (it processes whole 8-byte values); applying it to any other type is
+/// rejected rather than silently truncating a partial trailing value.
+fn codec_encode(codec: CodecId, type_tag: TypeTag, data: &[u8]) -> Result<Vec<u8>> {
     match codec {
-        CodecId::Plain => data.to_vec(),
-        CodecId::Delta => delta_encode_u64(data),
+        CodecId::Plain => Ok(data.to_vec()),
+        CodecId::Delta if matches!(type_tag, TypeTag::Fixed(8)) => Ok(delta_encode_u64(data)),
+        CodecId::Delta => Err(Error::InvalidHeader(
+            "columnar: delta codec requires a fixed-8 column",
+        )),
     }
 }
 
-/// Decodes a column's stored bytes under `codec` back to the logical bytes.
-fn codec_decode(codec: CodecId, data: &[u8]) -> Result<Vec<u8>> {
+/// Decodes a column's stored bytes under `codec` back to the logical bytes,
+/// rejecting Delta on a non-`Fixed(8)` column (the inverse of [`codec_encode`]).
+fn codec_decode(codec: CodecId, type_tag: TypeTag, data: &[u8]) -> Result<Vec<u8>> {
     match codec {
         CodecId::Plain => Ok(data.to_vec()),
-        CodecId::Delta => delta_decode_u64(data),
+        CodecId::Delta if matches!(type_tag, TypeTag::Fixed(8)) => delta_decode_u64(data),
+        CodecId::Delta => Err(Error::InvalidHeader(
+            "columnar: delta codec requires a fixed-8 column",
+        )),
     }
 }
 
@@ -356,7 +365,7 @@ impl ColumnBatch {
             // Pick a type-directed codec (e.g. Delta on the seqno column),
             // falling back to the caller's default; record it per column.
             let col_codec = auto_codec(col.column_id, col.type_tag).unwrap_or(codec);
-            let encoded = codec_encode(col_codec, &col.data);
+            let encoded = codec_encode(col_codec, col.type_tag, &col.data)?;
             let (type_tag, width) = col.type_tag.to_wire();
             out.extend_from_slice(&col.column_id.to_le_bytes());
             out.push(type_tag);
@@ -421,7 +430,7 @@ impl ColumnBatch {
             let raw = cur.read_bytes(data_len)?;
             // Restore the column's logical bytes from its stored codec form
             // (Plain is identity; Delta runs the prefix-sum).
-            let data = codec_decode(codec, raw)?;
+            let data = codec_decode(codec, type_tag, raw)?;
             let column = Column {
                 column_id,
                 type_tag,
@@ -767,6 +776,37 @@ mod tests {
             u8::from(CodecId::Plain),
             "a non-seqno fixed-8 column must not auto-select Delta"
         );
+    }
+
+    #[test]
+    fn encode_rejects_delta_on_a_non_fixed8_column() {
+        // Forcing Delta on a Bytes column (via the fallback codec) is rejected
+        // rather than silently truncating its bytes.
+        let mut bytes_data = Vec::new();
+        bytes_data.extend_from_slice(&0u32.to_le_bytes());
+        bytes_data.extend_from_slice(&3u32.to_le_bytes());
+        bytes_data.extend_from_slice(b"abc");
+        let batch = ColumnBatch {
+            row_count: 1,
+            columns: vec![Column {
+                column_id: 50,
+                type_tag: TypeTag::Bytes,
+                validity: None,
+                data: bytes_data,
+            }],
+        };
+        assert!(batch.encode(CodecId::Delta).is_err());
+    }
+
+    #[test]
+    fn from_columnar_block_rejects_a_zero_row_block() {
+        // A zero-row columnar block is corrupt (the writer never spills empty);
+        // reconstructing it must error, not panic in the row encoder.
+        let empty = entries_to_column_batch(&[])
+            .expect("transpose")
+            .encode(CodecId::Plain)
+            .expect("encode");
+        assert!(crate::table::data_block::DataBlock::from_columnar_block(&empty, 16).is_err());
     }
 
     #[test]

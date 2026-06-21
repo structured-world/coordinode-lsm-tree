@@ -474,6 +474,14 @@ impl DataBlock {
     ) -> crate::Result<Self> {
         let batch = crate::table::columnar::ColumnBatch::decode(block_data)?;
         let entries = crate::table::columnar::column_batch_to_entries(&batch)?;
+        // The writer never spills an empty block, so a zero-row columnar block is
+        // corrupt; reject it before the row encoder, which has a non-empty
+        // precondition and would otherwise panic.
+        if entries.is_empty() {
+            return Err(crate::Error::InvalidHeader(
+                "columnar: empty reconstructed data block",
+            ));
+        }
         let mut buf = Vec::new();
         Self::encode_into(&mut buf, &entries, restart_interval, 0.0)?;
         let len = u32::try_from(buf.len())

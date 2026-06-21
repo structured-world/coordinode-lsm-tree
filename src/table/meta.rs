@@ -278,10 +278,15 @@ impl ParsedMeta {
             validated_restart_interval_index(read_u8!(block, b"restart_interval#data", &cmp))?;
 
         // Optional layout descriptor: absent (older / row-major SSTs) means
-        // row-major; a non-zero byte means column-organized data blocks.
-        let columnar = block
-            .point_read(b"descriptor#columnar", SeqNo::MAX, &cmp)?
-            .is_some_and(|v| v.value.first().copied().unwrap_or(0) != 0);
+        // row-major; otherwise exactly one byte, non-zero meaning columnar. An
+        // empty or overlong payload is on-disk corruption, rejected here.
+        let columnar = match block.point_read(b"descriptor#columnar", SeqNo::MAX, &cmp)? {
+            None => false,
+            Some(v) => match v.value.as_ref() {
+                [b] => *b != 0,
+                _ => return Err(crate::Error::InvalidHeader("TableMeta")),
+            },
+        };
 
         let id = read_u64!(block, b"table_id", &cmp);
         // Cross-check the payload's stored id against the caller's durable
