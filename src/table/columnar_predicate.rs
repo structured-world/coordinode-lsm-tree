@@ -234,10 +234,122 @@ fn read_u32_le(bytes: &[u8]) -> Option<u32> {
     Some(u32::from_le_bytes(arr))
 }
 
+// Cached, no-std-friendly AVX2 token for the byte-equality dispatch below.
+// `cpufeatures::new!` runs CPUID once (atomic load thereafter) and verifies OS
+// AVX-state, so the AVX2 path cannot SIGILL on a host without it.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+cpufeatures::new!(cpu_avx2_byte_eq, "avx2");
+
+/// Per-row mask marking rows of a fixed-1 (single-byte) column equal to `value`.
+///
+/// Useful e.g. on the value-type column to keep only live values. A SIMD-friendly
+/// equality scan: byte equality is endianness-independent, so it needs no
+/// comparable transform. Returns an all-true `row_count` mask when the column is
+/// absent or not fixed-1, so an inapplicable filter never drops rows.
+#[must_use]
+pub fn byte_eq_mask(batch: &ColumnBatch, column_id: u16, value: u8) -> Vec<bool> {
+    let rows = batch.row_count as usize;
+    let Some(col) = batch.columns.iter().find(|c| c.column_id == column_id) else {
+        return alloc::vec![true; rows];
+    };
+    if !matches!(col.type_tag, TypeTag::Fixed(1)) {
+        return alloc::vec![true; rows];
+    }
+    byte_eq_dispatch(&col.data, value)
+}
+
+/// Portable reference: one boolean per byte, `true` where it equals `value`.
+/// Also the scalar tail every SIMD kernel falls back to for the trailing bytes.
+fn byte_eq_scalar(data: &[u8], value: u8) -> Vec<bool> {
+    data.iter().map(|&b| b == value).collect()
+}
+
+/// Runtime-dispatched byte-equality mask: the widest kernel the host supports,
+/// each producing bit-identical output to [`byte_eq_scalar`]. Exactly one `cfg`
+/// arm compiles per target and is the function's tail.
+fn byte_eq_dispatch(data: &[u8], value: u8) -> Vec<bool> {
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    {
+        if cpu_avx2_byte_eq::get() {
+            // SAFETY: cpufeatures has just verified AVX2 is present on this host.
+            return unsafe { byte_eq_avx2(data, value) };
+        }
+        byte_eq_scalar(data, value)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is an ARMv8 baseline feature, always present on aarch64.
+        unsafe { byte_eq_neon(data, value) }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
+    {
+        byte_eq_scalar(data, value)
+    }
+}
+
+/// AVX2 byte-equality: 32 bytes per iteration, scalar tail.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "avx2")]
+unsafe fn byte_eq_avx2(data: &[u8], value: u8) -> Vec<bool> {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{
+        _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{
+        _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
+    };
+    let mut chunks = data.chunks_exact(32);
+    let mut out = Vec::with_capacity(data.len());
+    // SAFETY: the AVX2 intrinsics are enabled by `#[target_feature]`, which the
+    // caller has verified present; the load is unaligned (`loadu`) over a full
+    // 32-byte chunk, so it stays in bounds.
+    unsafe {
+        let needle = _mm256_set1_epi8(value as i8);
+        for chunk in &mut chunks {
+            let v = _mm256_loadu_si256(chunk.as_ptr().cast());
+            let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, needle)) as u32;
+            for i in 0..32u32 {
+                out.push((mask >> i) & 1 == 1);
+            }
+        }
+    }
+    out.extend(byte_eq_scalar(chunks.remainder(), value));
+    out
+}
+
+/// NEON byte-equality: 16 bytes per iteration, scalar tail.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn byte_eq_neon(data: &[u8], value: u8) -> Vec<bool> {
+    use core::arch::aarch64::{vceqq_u8, vdupq_n_u8, vld1q_u8, vst1q_u8};
+    let mut chunks = data.chunks_exact(16);
+    let mut out = Vec::with_capacity(data.len());
+    // SAFETY: the NEON intrinsics are enabled by `#[target_feature]` (a baseline
+    // aarch64 feature); the load and store cover a full 16-byte chunk / a local
+    // 16-byte array, so both stay in bounds.
+    unsafe {
+        let needle = vdupq_n_u8(value);
+        for chunk in &mut chunks {
+            let eq = vceqq_u8(vld1q_u8(chunk.as_ptr()), needle); // 0xFF where equal
+            let mut lanes = [0u8; 16];
+            vst1q_u8(lanes.as_mut_ptr(), eq);
+            for &lane in &lanes {
+                out.push(lane != 0);
+            }
+        }
+    }
+    out.extend(byte_eq_scalar(chunks.remainder(), value));
+    out
+}
+
 #[cfg(test)]
 #[expect(clippy::expect_used, clippy::indexing_slicing, reason = "test code")]
 mod tests {
-    use super::{ColumnRangePredicate, ColumnStats, filter_batch};
+    use super::{
+        Column, ColumnBatch, ColumnRangePredicate, ColumnStats, TypeTag, byte_eq_mask,
+        byte_eq_scalar, filter_batch,
+    };
     use crate::table::columnar::{column_batch_to_entries, entries_to_column_batch};
     use crate::{Slice, ValueType, key::InternalKey, value::InternalValue};
 
@@ -324,5 +436,30 @@ mod tests {
         assert_eq!(&*back[1].key.user_key, b"ccc");
         assert_eq!(back[1].key.seqno, 1);
         assert_eq!(&*back[1].value, b"vc");
+    }
+
+    #[test]
+    fn byte_eq_simd_matches_scalar_on_a_corpus() {
+        // A 1000-byte value-type corpus (values 0..3), filtered to value 1. On
+        // this host the dispatch runs the widest available kernel; it must be
+        // bit-identical to the portable scalar reference.
+        let mut data = Vec::new();
+        for i in 0..1000u32 {
+            data.push(u8::try_from(i % 4).unwrap_or(0));
+        }
+        let batch = ColumnBatch {
+            row_count: u32::try_from(data.len()).unwrap_or(0),
+            columns: vec![Column {
+                column_id: 2,
+                type_tag: TypeTag::Fixed(1),
+                validity: None,
+                data: data.clone(),
+            }],
+        };
+        assert_eq!(
+            byte_eq_mask(&batch, 2, 1),
+            byte_eq_scalar(&data, 1),
+            "the SIMD byte-eq kernel must equal the scalar reference"
+        );
     }
 }
