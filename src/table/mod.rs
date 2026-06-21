@@ -508,12 +508,26 @@ impl Table {
         Ok(BloomResult::Proceed { has_filter })
     }
 
+    /// Records a point-read probe for per-segment tiering / placement stats: a
+    /// single `Relaxed` counter bump plus, on `std`, the access time. Raw
+    /// counter; the consumer derives a rate / EMA from successive polls.
+    fn record_access(&self) {
+        self.read_count
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "std")]
+        self.last_access_secs.store(
+            crate::time::unix_timestamp().as_secs(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     pub fn get(
         &self,
         key: &[u8],
         seqno: SeqNo,
         key_hash: u64,
     ) -> crate::Result<Option<InternalValue>> {
+        self.record_access();
         // Tight-space restriction: this version sees the table only at keys
         // `>= bound` (the prefix below it is punched out and superseded by a
         // merged output table). Keys below `bound` must miss here so the read
@@ -599,6 +613,7 @@ impl Table {
         seqno: SeqNo,
         key_hash: u64,
     ) -> crate::Result<Option<(crate::ValueType, SeqNo, crate::Slice)>> {
+        self.record_access();
         // Tight-space restriction (mirrors `Table::get`): a key below the bound
         // misses so the read falls through to the superseding output.
         if self.is_below_restriction(key) {
@@ -721,6 +736,7 @@ impl Table {
         seqno: SeqNo,
         key_hash: u64,
     ) -> crate::Result<Option<(InternalValue, Block)>> {
+        self.record_access();
         // Tight-space restriction (mirrors `Table::get`): a key below the bound
         // misses so the read falls through to the superseding output and never
         // touches the punched-out prefix.
@@ -2116,6 +2132,8 @@ impl Table {
                 metrics,
 
                 cached_blob_bytes: AtomicU64::new(u64::MAX),
+                read_count: AtomicU64::new(0),
+                last_access_secs: AtomicU64::new(0),
                 range_tombstones,
                 block_layout,
                 seqno_bounds,

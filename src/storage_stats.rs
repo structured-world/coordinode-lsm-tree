@@ -152,6 +152,13 @@ pub struct SegmentStats {
     pub used_bytes: u64,
     /// Number of entry versions stored in the segment.
     pub item_count: u64,
+    /// Cumulative point-read probes served by the segment since it was created.
+    /// A monotonic counter, not a rate: derive a read-rate / EMA from the delta
+    /// between successive polls. `0` for a never-read segment.
+    pub reads: u64,
+    /// Unix seconds of the segment's most recent point-read probe, or `0` if
+    /// never read (or on a no-std build, which keeps no clock).
+    pub last_access_secs: u64,
 }
 
 /// Per-LSM-level size + entry aggregates with the contributing segments, for
@@ -174,6 +181,11 @@ pub struct LevelStats {
     pub used_bytes: u64,
     /// Entry versions summed across the level's segments.
     pub item_count: u64,
+    /// Cumulative point-read probes summed across the level's segments.
+    pub reads: u64,
+    /// Most recent point-read probe across the level's segments, in unix
+    /// seconds, or `0` if none was ever read.
+    pub last_access_secs: u64,
     /// Per-segment breakdown, in level (run / table) order.
     pub segments: Vec<SegmentStats>,
 }
@@ -360,24 +372,33 @@ pub(crate) fn compute_storage_stats(
 ///
 /// Returns an error if a segment's file size cannot be stat-ed.
 pub(crate) fn compute_level_segment_stats(version: &Version) -> crate::Result<Vec<LevelStats>> {
+    use core::sync::atomic::Ordering::Relaxed;
     let mut levels = Vec::with_capacity(version.level_count());
     for (level, run_group) in version.iter_levels().enumerate() {
         let mut segments = Vec::new();
         let mut used_bytes = 0u64;
         let mut item_count = 0u64;
+        let mut reads = 0u64;
+        let mut last_access_secs = 0u64;
         for run in run_group.iter() {
             for table in run.iter() {
                 // Physical file size, NOT m.file_size (which undercounts), to
                 // reconcile with the tree-level `used_bytes`.
                 let on_disk = table.fs.metadata(&table.path)?.len;
                 let items = table.metadata.item_count;
+                let seg_reads = table.read_count.load(Relaxed);
+                let seg_access = table.last_access_secs.load(Relaxed);
                 used_bytes += on_disk;
                 item_count += items;
+                reads = reads.saturating_add(seg_reads);
+                last_access_secs = last_access_secs.max(seg_access);
                 segments.push(SegmentStats {
                     table_id: table.metadata.id,
                     level,
                     used_bytes: on_disk,
                     item_count: items,
+                    reads: seg_reads,
+                    last_access_secs: seg_access,
                 });
             }
         }
@@ -386,6 +407,8 @@ pub(crate) fn compute_level_segment_stats(version: &Version) -> crate::Result<Ve
             segment_count: segments.len(),
             used_bytes,
             item_count,
+            reads,
+            last_access_secs,
             segments,
         });
     }

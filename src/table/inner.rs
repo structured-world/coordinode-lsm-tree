@@ -104,6 +104,17 @@ pub struct Inner {
     /// same on-disk byte counts and computes the same sum.
     pub(crate) cached_blob_bytes: AtomicU64,
 
+    /// Cumulative point-read probes served by this segment, bumped (`Relaxed`)
+    /// on every [`Table::get`]. A monotonic counter, not a rate: a tiering
+    /// consumer derives a read-rate / EMA from successive polls (delta over
+    /// elapsed time). Reset to `0` only when the segment is created.
+    pub(crate) read_count: AtomicU64,
+
+    /// Unix seconds of the most recent point-read probe, or `0` if never read.
+    /// Maintained only on `std` builds (system clock); a no-std build leaves it
+    /// at `0`. The recency signal for demotion / tiering decisions.
+    pub(crate) last_access_secs: AtomicU64,
+
     /// Range tombstones stored in this table. Loaded on open.
     pub(crate) range_tombstones: Vec<RangeTombstone>,
 

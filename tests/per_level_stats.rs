@@ -106,6 +106,41 @@ fn multiple_levels_are_reported_after_compaction() {
     assert_eq!(sum_items, tree.storage_stats().expect("agg").item_count);
 }
 
+#[test]
+fn point_reads_bump_segment_access_stats() {
+    let folder = get_tmp_folder();
+    let tree = open(folder.path());
+    for i in 0..50u32 {
+        tree.insert(key(i), vec![b'v'; 100], 0);
+    }
+    tree.flush_active_memtable(0).expect("flush");
+
+    let before: u64 = tree
+        .level_segment_stats()
+        .expect("stats")
+        .iter()
+        .map(|l| l.reads)
+        .sum();
+    for _ in 0..10 {
+        let _ = tree.get(key(5), lsm_tree::SeqNo::MAX).expect("get");
+    }
+    let levels = tree.level_segment_stats().expect("stats");
+    let after: u64 = levels.iter().map(|l| l.reads).sum();
+    assert!(
+        after >= before + 10,
+        "ten point reads must bump the segment read counter by >= 10 ({before} -> {after})"
+    );
+    // On a std build a probed segment records its last-access time.
+    assert!(
+        levels
+            .iter()
+            .flat_map(|l| &l.segments)
+            .filter(|s| s.reads > 0)
+            .all(|s| s.last_access_secs > 0),
+        "a read segment records its last-access time"
+    );
+}
+
 #[cfg(feature = "metrics")]
 #[test]
 fn reading_stats_does_not_scan_data_blocks() {
