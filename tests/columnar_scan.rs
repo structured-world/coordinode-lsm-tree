@@ -147,3 +147,29 @@ fn columnar_scan_predicate_on_an_unprojected_column_still_filters() {
         );
     }
 }
+
+#[test]
+fn columnar_scan_errors_on_a_non_columnar_sst() {
+    // A tree without the columnar layout flushes a row-major SST; columnar_scan
+    // must reject it rather than misread row blocks as column batches.
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()
+    .expect("open");
+    let AnyTree::Standard(tree) = any else {
+        panic!("expected standard tree");
+    };
+    tree.insert(key(0), vec![b'v'; 8], 0);
+    tree.flush_active_memtable(0).expect("flush");
+
+    let version = tree.current_version();
+    let table = version.iter_tables().next().expect("one flushed SST");
+    assert!(
+        table.columnar_scan(&[COL_USER_KEY], None).is_err(),
+        "scanning a row-major SST as columnar must error"
+    );
+}

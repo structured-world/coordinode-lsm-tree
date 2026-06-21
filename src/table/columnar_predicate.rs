@@ -391,6 +391,8 @@ mod tests {
         };
         // Block whose keys are [a, c]: entirely below the lower bound -> skip.
         assert!(pred.can_skip_block(&[stats(0, b"a", b"c")]));
+        // Block whose keys are [za, zz]: entirely above the upper bound -> skip.
+        assert!(pred.can_skip_block(&[stats(0, b"za", b"zz")]));
         // Block whose keys are [p, t]: overlaps -> cannot skip.
         assert!(!pred.can_skip_block(&[stats(0, b"p", b"t")]));
         // No stats for the column -> conservative, cannot skip.
@@ -470,5 +472,100 @@ mod tests {
             byte_eq_scalar(&data, 1),
             "the SIMD byte-eq kernel must equal the scalar reference"
         );
+    }
+
+    /// Builds a `Bytes` column from row values: a `(rows + 1)` u32 offset table
+    /// followed by the concatenated payload.
+    fn bytes_column(column_id: u16, validity: Option<Vec<u8>>, rows: &[&[u8]]) -> Column {
+        let mut data = Vec::new();
+        let mut acc = 0u32;
+        data.extend_from_slice(&acc.to_le_bytes());
+        for r in rows {
+            acc += u32::try_from(r.len()).unwrap_or(0);
+            data.extend_from_slice(&acc.to_le_bytes());
+        }
+        for r in rows {
+            data.extend_from_slice(r);
+        }
+        Column {
+            column_id,
+            type_tag: TypeTag::Bytes,
+            validity,
+            data,
+        }
+    }
+
+    #[test]
+    fn matching_rows_excludes_null_rows_and_respects_both_bounds() {
+        // Keys a / b / c with row 1 (b) null; predicate [a, z] keeps the two
+        // non-null in-range rows and drops the null one.
+        let batch = ColumnBatch {
+            row_count: 3,
+            // rows 0 and 2 valid, row 1 null.
+            columns: vec![bytes_column(
+                0,
+                Some(vec![0b0000_0101]),
+                &[b"a", b"b", b"c"],
+            )],
+        };
+        let pred = ColumnRangePredicate {
+            column_id: 0,
+            lower: Some(b"a".to_vec()),
+            upper: Some(b"z".to_vec()),
+        };
+        assert_eq!(pred.matching_rows(&batch), vec![true, false, true]);
+    }
+
+    #[test]
+    fn matching_rows_all_true_for_a_non_bytes_column() {
+        // A fixed-width column is not row-filterable (its stored form is not the
+        // comparable encoding), so every row passes.
+        let batch = ColumnBatch {
+            row_count: 2,
+            columns: vec![Column {
+                column_id: 1,
+                type_tag: TypeTag::Fixed(8),
+                validity: None,
+                data: vec![0u8; 16],
+            }],
+        };
+        let pred = ColumnRangePredicate {
+            column_id: 1,
+            lower: Some(vec![5]),
+            upper: None,
+        };
+        assert_eq!(pred.matching_rows(&batch), vec![true, true]);
+    }
+
+    #[test]
+    fn byte_eq_mask_all_true_when_inapplicable() {
+        let batch = ColumnBatch {
+            row_count: 2,
+            columns: vec![bytes_column(0, None, &[b"a", b"b"])],
+        };
+        // Absent column -> all true.
+        assert_eq!(byte_eq_mask(&batch, 99, 1), vec![true, true]);
+        // Present but not fixed-1 -> all true.
+        assert_eq!(byte_eq_mask(&batch, 0, 1), vec![true, true]);
+    }
+
+    #[test]
+    fn filter_batch_compacts_fixed_data_and_validity() {
+        // Fixed-1 column with row 1 null; keep rows 0 and 2.
+        let batch = ColumnBatch {
+            row_count: 3,
+            columns: vec![Column {
+                column_id: 2,
+                type_tag: TypeTag::Fixed(1),
+                validity: Some(vec![0b0000_0101]),
+                data: vec![10, 20, 30],
+            }],
+        };
+        let filtered = filter_batch(&batch, &[true, false, true]);
+        assert_eq!(filtered.row_count, 2);
+        let col = &filtered.columns[0];
+        assert_eq!(col.data, vec![10, 30], "fixed data keeps rows 0 and 2");
+        // Both kept rows were valid, compacted to the low two bits.
+        assert_eq!(col.validity, Some(vec![0b0000_0011]));
     }
 }
