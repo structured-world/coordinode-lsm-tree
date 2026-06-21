@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781986973347,
+  "lastUpdate": 1782030642117,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -18126,6 +18126,84 @@ window.BENCHMARK_DATA = {
             "value": 703739.4646155644,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 5.3us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1d872ad989d112e6b6c37bc48ee3ca95519530d1",
+          "message": "feat(tree): approximate range size/count estimate (#513)\n\n## Summary\n\nAdds `AbstractTree::approximate_range_stats(range, seqno) ->\nApproximateRangeStats { bytes, key_count }`: estimate a key range's\non-disk size and entry count **without reading any data block** (RocksDB\n`GetApproximateSizes` analog). For a query planner / sharded executor to\npick split keys for parallel scans and to cost-base plan (scan vs\npoint-lookup, join order).\n\n## How it works\n\n- **Per overlapping SST** (filtered by key range): interpolate the\ndata-block offsets at the range boundaries via the block index\n(`off(end) − off(start)`, block granularity); the SST's referenced blob\nbytes are apportioned by the same in-range fraction; the entry count is\n`item_count × fraction`.\n- **Memtables**: the active + sealed memtables add their in-range share\n(skiplist range count × the per-memtable average size).\n- Index/metadata reads only — never a data block.\n\n## KV-separation\n\nThe per-SST referenced-blob bytes are recorded at **both flush and\ncompaction** (`MultiWriter::register_blob` → `link_blob_file` → the\n`linked_blob_files` section), so the blob contribution is apportioned\nper-SST — capturing each level's value-size profile, not a tree-wide\naverage. A standard tree's blob term is zero (its offsets already cover\nthe inline values). `BlobTree` therefore just delegates to its index\ntree.\n\n## Tests\n\n- 6 integration tests: empty range → zero; full range key-count is exact\n(fraction = 1); sub-range count within ~30% of an actual scan; monotonic\nin range width; memtable-only counted; KV-separated estimate includes\nthe blob bytes (`≥` the on-disk blob footprint and `≈ disk_space`).\n- A `# Examples` doctest on the public method.\n- Full suite (2048 tests), `clippy --all-features --all-targets`, no-std\n(`alloc`) check, and doctests all green.\n\n## Notes\n\n- The estimate is block-granularity and intended for planning, not exact\naccounting (~10-15% on roughly-uniform data, per the issue).\n- The optional `range_split_points` convenience is left as a follow-up\n(the issue marks it optional).\n\nCloses #499\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added `approximate_range_stats` to estimate on-disk bytes and key\ncounts for a user key range at a specified sequence number without\nscanning SST data blocks, including consistent results for\nblob/KV-separated configurations.\n* Introduced `ApproximateRangeStats` (re-exported) to expose the\nestimates as `{ bytes, key_count }`.\n* **Tests**\n* Added integration coverage for empty/full/partial ranges,\nmonotonicity, memtable-only behavior, bounds semantics, sub-range\nqueries, and KV-separated blob scenarios.\n* **Bug Fixes / Test Reliability**\n* Broadened encryption stress-test retries to treat general OS resource\nexhaustion (not just open-file exhaustion) as transient.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-21T11:29:49+03:00",
+          "tree_id": "363a3c112a15e0f794f11f52cc3f8572c68f9b5a",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/1d872ad989d112e6b6c37bc48ee3ca95519530d1"
+        },
+        "date": 1782030640948,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2009435.4447914998,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1221557.805394933,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 918315.2353603379,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 4.0us | P99.9: 6.4us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3835894.0099523035,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 459387.5676020676,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.1us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 237883.4801682793,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 4.9us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.84s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1260597.0515391324,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.0us | P99.9: 4.1us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1096406.6833333275,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.6us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 698428.7744692994,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.5us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
