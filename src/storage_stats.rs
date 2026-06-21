@@ -10,6 +10,8 @@
 //! [`crate::AbstractTree::storage_stats`].
 
 use crate::version::Version;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 
 /// Coarse storage state of a tree.
 ///
@@ -135,6 +137,60 @@ pub struct ApproximateRangeStats {
     /// overlapping SST, of `item_count × in-range fraction`, plus each
     /// memtable's in-range skiplist count. `0` for an empty range.
     pub key_count: u64,
+}
+
+/// Size and entry count of one stored segment (SST), for per-segment tiering and
+/// erasure-coding placement decisions.
+#[must_use]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct SegmentStats {
+    /// Identifier of the segment's SST within its tree.
+    pub table_id: crate::TableId,
+    /// LSM level the segment lives in (`0` is the newest / smallest level).
+    pub level: usize,
+    /// Physical on-disk bytes of the segment's SST file.
+    pub used_bytes: u64,
+    /// Number of entry versions stored in the segment.
+    pub item_count: u64,
+    /// Cumulative point reads that consulted this segment's data since it was
+    /// created: only reads that pass the segment's seqno-range and bloom gates
+    /// count (a bloom miss is not counted), so this tracks data hotness rather
+    /// than raw probe frequency. A monotonic counter, not a rate: derive a
+    /// read-rate / EMA from the delta between successive polls. `0` when never
+    /// read.
+    pub reads: u64,
+    /// Unix seconds of the segment's most recent data-consulting read, or `0` if
+    /// never read (or on a no-std build, which keeps no clock).
+    pub last_access_secs: u64,
+}
+
+/// Per-LSM-level size + entry aggregates with the contributing segments, for
+/// tiering and erasure-coding placement (which level / segment is large enough
+/// to demote, EC-encode, or migrate).
+///
+/// Cheap to read: derived from version metadata plus one file-size stat per
+/// segment, never a data-block scan. The per-level totals reconcile with the
+/// tree-level [`StorageStats`]: summed across levels they equal the SST portion
+/// of [`StorageStats::used_bytes`] and [`StorageStats::item_count`] (blob files
+/// are tracked separately).
+#[must_use]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LevelStats {
+    /// LSM level index (`0` is the newest / smallest level).
+    pub level: usize,
+    /// Number of segments (SSTs) in the level.
+    pub segment_count: usize,
+    /// Physical on-disk bytes summed across the level's segments.
+    pub used_bytes: u64,
+    /// Entry versions summed across the level's segments.
+    pub item_count: u64,
+    /// Cumulative point-read probes summed across the level's segments.
+    pub reads: u64,
+    /// Most recent point-read probe across the level's segments, in unix
+    /// seconds, or `0` if none was ever read.
+    pub last_access_secs: u64,
+    /// Per-segment breakdown, in level (run / table) order.
+    pub segments: Vec<SegmentStats>,
 }
 
 impl StorageStats {
@@ -308,6 +364,58 @@ pub(crate) fn compute_storage_stats(
         reclaimable_bytes_estimate,
         status,
     })
+}
+
+/// Computes per-LSM-level and per-segment size + entry stats from a version.
+///
+/// Cost is O(levels x segments) plus one file-size stat per segment (the same
+/// stat [`compute_storage_stats`] already performs); it never reads a data block.
+///
+/// # Errors
+///
+/// Returns an error if a segment's file size cannot be stat-ed.
+pub(crate) fn compute_level_segment_stats(version: &Version) -> crate::Result<Vec<LevelStats>> {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut levels = Vec::with_capacity(version.level_count());
+    for (level, run_group) in version.iter_levels().enumerate() {
+        let mut segments = Vec::new();
+        let mut used_bytes = 0u64;
+        let mut item_count = 0u64;
+        let mut reads = 0u64;
+        let mut last_access_secs = 0u64;
+        for run in run_group.iter() {
+            for table in run.iter() {
+                // Physical file size, NOT m.file_size (which undercounts), to
+                // reconcile with the tree-level `used_bytes`.
+                let on_disk = table.fs.metadata(&table.path)?.len;
+                let items = table.metadata.item_count;
+                let seg_reads = table.read_count.load(Relaxed);
+                let seg_access = table.last_access_secs.load(Relaxed);
+                used_bytes += on_disk;
+                item_count += items;
+                reads = reads.saturating_add(seg_reads);
+                last_access_secs = last_access_secs.max(seg_access);
+                segments.push(SegmentStats {
+                    table_id: table.metadata.id,
+                    level,
+                    used_bytes: on_disk,
+                    item_count: items,
+                    reads: seg_reads,
+                    last_access_secs: seg_access,
+                });
+            }
+        }
+        levels.push(LevelStats {
+            level,
+            segment_count: segments.len(),
+            used_bytes,
+            item_count,
+            reads,
+            last_access_secs,
+            segments,
+        });
+    }
+    Ok(levels)
 }
 
 #[cfg(test)]

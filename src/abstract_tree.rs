@@ -144,6 +144,43 @@ pub trait AbstractTree: sealed::Sealed {
         crate::storage_stats::compute_storage_stats(&self.current_version(), false, true)
     }
 
+    /// Per-LSM-level and per-segment size + entry-count stats, for tiering and
+    /// erasure-coding placement decisions (which level / segment is large enough
+    /// to demote, EC-encode, or migrate).
+    ///
+    /// Cheap: derived from the live version's metadata plus one file-size stat
+    /// per segment (no data-block scan). The per-level totals reconcile with
+    /// [`storage_stats`](Self::storage_stats): summed across levels they equal
+    /// the SST portion of [`StorageStats::used_bytes`](crate::StorageStats::used_bytes)
+    /// and [`StorageStats::item_count`](crate::StorageStats::item_count).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lsm_tree::Error as TreeError;
+    /// use lsm_tree::{AbstractTree, Config};
+    ///
+    /// let folder = tempfile::tempdir()?;
+    /// let tree = Config::new(&folder, Default::default(), Default::default()).open()?;
+    /// for i in 0..100u32 {
+    ///     tree.insert(format!("k{i:04}"), "v", 0);
+    /// }
+    /// tree.flush_active_memtable(0)?;
+    ///
+    /// let levels = tree.level_segment_stats()?;
+    /// let total: u64 = levels.iter().map(|l| l.item_count).sum();
+    /// assert_eq!(total, tree.storage_stats()?.item_count);
+    /// #
+    /// # Ok::<(), TreeError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a segment's file size cannot be stat-ed.
+    fn level_segment_stats(&self) -> crate::Result<Vec<crate::LevelStats>> {
+        crate::storage_stats::compute_level_segment_stats(&self.current_version())
+    }
+
     /// Storage admission gate: `Ok(())` if a write may proceed, or
     /// [`Error::StorageFull`](crate::Error::StorageFull) if the tree is
     /// over budget and should be treated as read-only.

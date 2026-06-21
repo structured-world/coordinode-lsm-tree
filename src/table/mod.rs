@@ -508,6 +508,21 @@ impl Table {
         Ok(BloomResult::Proceed { has_filter })
     }
 
+    /// Records a data-consulting point read for per-segment tiering / placement
+    /// stats: a single `Relaxed` counter bump plus, on `std`, the access time.
+    /// Called only after the seqno-range + bloom gates pass, so bloom misses do
+    /// not inflate the count. Raw counter; the consumer derives a rate / EMA from
+    /// successive polls.
+    fn record_access(&self) {
+        self.read_count
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "std")]
+        self.last_access_secs.store(
+            crate::time::unix_timestamp().as_secs(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     pub fn get(
         &self,
         key: &[u8],
@@ -533,6 +548,11 @@ impl Table {
         if bloom.should_skip() {
             return Ok(None);
         }
+
+        // Access accounting after the seqno-range + bloom gates, so a segment
+        // that excludes the key (seqno range) or rejects it (bloom miss) is not
+        // counted as serving it.
+        self.record_access();
 
         // Row-cache fast path: a prior latest-version read cached this key's
         // resolved value for this (immutable) SST, so we can skip the index walk
@@ -616,6 +636,9 @@ impl Table {
         if bloom.should_skip() {
             return Ok(None);
         }
+
+        // Access accounting after the seqno-range + bloom gates (mirrors `Table::get`).
+        self.record_access();
 
         // Row-cache fast path (mirrors `Table::get`): serve the value tuple from
         // a prior cached point-read result, skipping the index walk + block
@@ -739,6 +762,9 @@ impl Table {
         if bloom.should_skip() {
             return Ok(None);
         }
+
+        // Access accounting after the seqno-range + bloom gates (mirrors `Table::get`).
+        self.record_access();
 
         let result = self.point_read_with_block(key, seqno, key_hash)?;
 
@@ -2116,6 +2142,8 @@ impl Table {
                 metrics,
 
                 cached_blob_bytes: AtomicU64::new(u64::MAX),
+                read_count: AtomicU64::new(0),
+                last_access_secs: AtomicU64::new(0),
                 range_tombstones,
                 block_layout,
                 seqno_bounds,
