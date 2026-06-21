@@ -1169,6 +1169,182 @@ impl AbstractTree for Tree {
         Ok(crate::ApproximateRangeStats { bytes, key_count })
     }
 
+    fn approximate_range_cardinality<K: AsRef<[u8]>, R: core::ops::RangeBounds<K>>(
+        &self,
+        range: R,
+        seqno: SeqNo,
+    ) -> crate::Result<crate::RangeCardinality> {
+        use crate::table::block_index::BlockIndex;
+        use core::cmp::Ordering;
+        use core::ops::Bound;
+
+        let lo: Bound<&[u8]> = match range.start_bound() {
+            Bound::Included(k) => Bound::Included(k.as_ref()),
+            Bound::Excluded(k) => Bound::Excluded(k.as_ref()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let hi: Bound<&[u8]> = match range.end_bound() {
+            Bound::Included(k) => Bound::Included(k.as_ref()),
+            Bound::Excluded(k) => Bound::Excluded(k.as_ref()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let bounds = (lo, hi);
+        let comparator = self.config.comparator.as_ref();
+        let super_version = self.version_history.read().get_version_for_snapshot(seqno);
+
+        let mut rows: u64 = 0;
+        let mut total_rows: u64 = 0;
+
+        for table in super_version.version.iter_tables() {
+            total_rows = total_rows.saturating_add(table.metadata.item_count);
+            if !table
+                .metadata
+                .key_range
+                .overlaps_with_bounds_cmp(&bounds, comparator)
+            {
+                continue;
+            }
+            let table_seqno = seqno.saturating_sub(table.global_seqno());
+            // Honor a tight-space restricted view: keys below
+            // `restrict_lower_bound()` are the punched-out prefix served by the
+            // replacement table, so raise this table's effective lower bound to
+            // it (mirrors approximate_range_stats) and never charge that prefix.
+            let eff_lo = effective_lower_bound(
+                lo,
+                table.restrict_lower_bound().map(AsRef::as_ref),
+                comparator,
+            );
+            let zone_map = &table.zone_map;
+            if !zone_map.is_empty() {
+                // Zone map present: sum the per-block row counts of blocks whose
+                // key range overlaps the query. A block is past the range once its
+                // minimum key is above the upper bound; the boundary block at the
+                // effective lower bound is counted in full (block granularity). A
+                // range that lands in a key-space gap legitimately yields zero, so
+                // this path is authoritative and never falls back to the byte fraction.
+                let reader = match eff_lo {
+                    Bound::Included(k) | Bound::Excluded(k) => {
+                        table.block_index.forward_reader(k, table_seqno)
+                    }
+                    Bound::Unbounded => Some(table.block_index.iter()),
+                };
+                if let Some(reader) = reader {
+                    for handle in reader {
+                        let handle = handle?;
+                        let Some(col) = zone_map
+                            .columns_for(*handle.offset())
+                            .and_then(|c| c.first())
+                        else {
+                            continue;
+                        };
+                        let above_hi = match hi {
+                            Bound::Included(hk) => {
+                                comparator.compare(&col.min, hk) == Ordering::Greater
+                            }
+                            Bound::Excluded(hk) => {
+                                comparator.compare(&col.min, hk) != Ordering::Less
+                            }
+                            Bound::Unbounded => false,
+                        };
+                        if above_hi {
+                            break;
+                        }
+                        rows = rows.saturating_add(u64::from(col.row_count));
+                    }
+                }
+            } else if let Some(last) = table.block_index.iter().next_back() {
+                // No zone map: apportion item_count by the in-range
+                // data-block byte fraction, mirroring approximate_range_stats.
+                let last = last?;
+                let data_end = *last.offset() + u64::from(last.size());
+                if data_end > 0 {
+                    let off = |key: &[u8], end: bool| -> crate::Result<u64> {
+                        match table.block_index.forward_reader(key, table_seqno) {
+                            Some(mut it) => match it.next() {
+                                Some(h) => {
+                                    let h = h?;
+                                    Ok(if end {
+                                        (*h.offset() + u64::from(h.size())).min(data_end)
+                                    } else {
+                                        *h.offset()
+                                    })
+                                }
+                                None => Ok(data_end),
+                            },
+                            None => Ok(data_end),
+                        }
+                    };
+                    let off_lo = match eff_lo {
+                        Bound::Included(k) | Bound::Excluded(k) => off(k, false)?,
+                        Bound::Unbounded => 0,
+                    };
+                    let off_hi = match hi {
+                        Bound::Included(k) | Bound::Excluded(k) => off(k, true)?,
+                        Bound::Unbounded => data_end,
+                    };
+                    let idx_bytes = off_hi.saturating_sub(off_lo);
+                    if idx_bytes > 0 {
+                        let est = u64::try_from(
+                            u128::from(table.metadata.item_count) * u128::from(idx_bytes)
+                                / u128::from(data_end),
+                        )
+                        .unwrap_or(u64::MAX)
+                        .max(1);
+                        rows = rows.saturating_add(est);
+                    }
+                }
+            }
+        }
+
+        // Memtables: count the in-range, snapshot-visible entries and add them to
+        // both the matched rows and the total (matching the SST accounting).
+        let mt_range = (
+            match lo {
+                Bound::Included(k) => {
+                    Bound::Included(InternalKey::new(k, SeqNo::MAX, crate::ValueType::Tombstone))
+                }
+                Bound::Excluded(k) => {
+                    Bound::Excluded(InternalKey::new(k, 0, crate::ValueType::Tombstone))
+                }
+                Bound::Unbounded => Bound::Unbounded,
+            },
+            match hi {
+                Bound::Included(k) => {
+                    Bound::Included(InternalKey::new(k, 0, crate::ValueType::Value))
+                }
+                Bound::Excluded(k) => {
+                    Bound::Excluded(InternalKey::new(k, SeqNo::MAX, crate::ValueType::Value))
+                }
+                Bound::Unbounded => Bound::Unbounded,
+            },
+        );
+        let mut add_memtable = |mt: &crate::Memtable| {
+            total_rows = total_rows.saturating_add(mt.len() as u64);
+            let in_range = mt
+                .range_internal(mt_range.clone())
+                .filter(|kv| kv.key.seqno < seqno)
+                .count() as u64;
+            rows = rows.saturating_add(in_range);
+        };
+        add_memtable(&super_version.active_memtable);
+        for mt in super_version.sealed_memtables.iter() {
+            add_memtable(mt);
+        }
+
+        // selectivity is an approximate ratio; u64 row counts are well within
+        // f64's exact-integer range (2^52) for any realistic table.
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "row counts never approach 2^52; the ratio is approximate anyway"
+        )]
+        let selectivity = if total_rows == 0 {
+            0.0
+        } else {
+            (rows.min(total_rows) as f64) / (total_rows as f64)
+        };
+        Ok(crate::RangeCardinality { rows, selectivity })
+    }
+
     fn get_highest_memtable_seqno(&self) -> Option<SeqNo> {
         let version = self.version_history.read().latest_version();
 
@@ -3572,4 +3748,72 @@ fn has_existing_version_state(folder: &Path, fs: &dyn Fs) -> crate::Result<bool>
         }
     }
     Ok(false)
+}
+
+/// Raises a query's lower bound to a table's tight-space restriction, if any.
+///
+/// Keys below `restriction` are the punched-out prefix served by the
+/// replacement table, so a range estimate must not charge them to the
+/// restricted view. Returns `lo` unchanged when the table is unrestricted or
+/// the restriction is at or below `lo`.
+fn effective_lower_bound<'a>(
+    lo: core::ops::Bound<&'a [u8]>,
+    restriction: Option<&'a [u8]>,
+    cmp: &dyn crate::comparator::UserComparator,
+) -> core::ops::Bound<&'a [u8]> {
+    use core::cmp::Ordering;
+    use core::ops::Bound;
+    match (lo, restriction) {
+        (Bound::Unbounded, Some(rb)) => Bound::Included(rb),
+        (Bound::Included(k) | Bound::Excluded(k), Some(rb))
+            if cmp.compare(rb, k) == Ordering::Greater =>
+        {
+            Bound::Included(rb)
+        }
+        _ => lo,
+    }
+}
+
+#[cfg(test)]
+mod cardinality_tests {
+    use super::effective_lower_bound;
+    use core::ops::Bound;
+
+    #[test]
+    fn effective_lower_bound_raises_to_restriction() {
+        let cmp = crate::comparator::default_comparator();
+        let cmp = cmp.as_ref();
+        let a: &[u8] = b"a";
+        let m: &[u8] = b"m";
+        let z: &[u8] = b"z";
+        // Unbounded lower bound + a restriction: raise to the restriction.
+        assert_eq!(
+            effective_lower_bound(Bound::Unbounded, Some(m), cmp),
+            Bound::Included(m)
+        );
+        // A lower bound below the restriction is raised to it.
+        assert_eq!(
+            effective_lower_bound(Bound::Included(a), Some(m), cmp),
+            Bound::Included(m)
+        );
+        assert_eq!(
+            effective_lower_bound(Bound::Excluded(a), Some(m), cmp),
+            Bound::Included(m)
+        );
+        // A lower bound at or above the restriction is left unchanged.
+        assert_eq!(
+            effective_lower_bound(Bound::Included(z), Some(m), cmp),
+            Bound::Included(z)
+        );
+        // No restriction: the lower bound is returned unchanged.
+        assert_eq!(
+            effective_lower_bound(Bound::Included(a), None, cmp),
+            Bound::Included(a)
+        );
+        let unbounded: Bound<&[u8]> = Bound::Unbounded;
+        assert_eq!(
+            effective_lower_bound(unbounded, None, cmp),
+            Bound::Unbounded
+        );
+    }
 }

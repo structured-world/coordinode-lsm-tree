@@ -425,7 +425,7 @@ pub mod scrub;
 
 pub mod storage_stats;
 pub use storage_stats::{
-    ApproximateRangeStats, LevelStats, SegmentStats, StorageStats, StorageStatus,
+    ApproximateRangeStats, LevelStats, RangeCardinality, SegmentStats, StorageStats, StorageStatus,
 };
 
 mod version;

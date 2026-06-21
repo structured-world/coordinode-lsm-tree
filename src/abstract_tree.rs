@@ -758,6 +758,53 @@ pub trait AbstractTree: sealed::Sealed {
         seqno: SeqNo,
     ) -> crate::Result<crate::ApproximateRangeStats>;
 
+    /// Estimates the row cardinality and selectivity of `range` at `seqno`,
+    /// WITHOUT reading any data block.
+    ///
+    /// Uses the per-data-block zone map (per-block row counts + key ranges) for a
+    /// block-granularity row count: every data block whose key range overlaps the
+    /// query contributes its recorded row count, plus the active + sealed
+    /// memtables' in-range counts. When a table has no zone map the row count
+    /// falls back to the byte-fraction estimate of [`approximate_range_stats`].
+    /// Selectivity is `rows / total_rows`, monotonic in predicate tightness, for
+    /// cost-based planning (join ordering, scan-vs-seek). Not exact accounting.
+    ///
+    /// [`approximate_range_stats`]: AbstractTree::approximate_range_stats
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lsm_tree::Error as TreeError;
+    /// use lsm_tree::{AbstractTree, Config};
+    ///
+    /// let folder = tempfile::tempdir()?;
+    /// let tree = Config::new(&folder, Default::default(), Default::default()).open()?;
+    /// for i in 0..100u32 {
+    ///     tree.insert(format!("k{i:04}"), "v", 0);
+    /// }
+    /// tree.flush_active_memtable(0)?;
+    ///
+    /// // The full range covers every row; selectivity is 1.0.
+    /// let all = tree.approximate_range_cardinality::<&str, _>(.., 1)?;
+    /// assert_eq!(all.rows, tree.approximate_len() as u64);
+    /// assert!((all.selectivity - 1.0).abs() < 1e-9);
+    ///
+    /// // A tighter range selects fewer rows.
+    /// let part = tree.approximate_range_cardinality("k0000".."k0050", 1)?;
+    /// assert!(part.selectivity <= all.selectivity);
+    /// #
+    /// # Ok::<(), TreeError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a block index, zone map, or table metadata read fails.
+    fn approximate_range_cardinality<K: AsRef<[u8]>, R: RangeBounds<K>>(
+        &self,
+        range: R,
+        seqno: SeqNo,
+    ) -> crate::Result<crate::RangeCardinality>;
+
     /// Returns the highest sequence number of the active memtable.
     fn get_highest_memtable_seqno(&self) -> Option<SeqNo>;
 

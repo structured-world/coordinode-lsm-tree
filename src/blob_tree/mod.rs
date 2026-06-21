@@ -1008,6 +1008,17 @@ impl AbstractTree for BlobTree {
         self.index.approximate_range_stats(range, seqno)
     }
 
+    fn approximate_range_cardinality<K: AsRef<[u8]>, R: core::ops::RangeBounds<K>>(
+        &self,
+        range: R,
+        seqno: SeqNo,
+    ) -> crate::Result<crate::RangeCardinality> {
+        // Cardinality counts rows (index entries) and their key ranges, both of
+        // which live entirely in the index tree; blob files hold only the
+        // separated values, so the index tree's zone map and counts are authoritative.
+        self.index.approximate_range_cardinality(range, seqno)
+    }
+
     fn get_highest_memtable_seqno(&self) -> Option<SeqNo> {
         self.index.get_highest_memtable_seqno()
     }
