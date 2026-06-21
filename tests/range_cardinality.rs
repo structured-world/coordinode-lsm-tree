@@ -74,6 +74,43 @@ fn empty_range_is_zero() {
 }
 
 #[test]
+fn range_in_a_data_gap_with_zone_map_is_zero() {
+    // A single SST with a hole in the key space: keys 0..100 and 300..400, none
+    // in 100..300. With the zone map present, a query that falls entirely in the
+    // gap must report zero rows, NOT fall back to a byte-fraction estimate.
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .open()
+    .expect("open");
+    let AnyTree::Standard(tree) = any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.zone_map = true)
+        .expect("enable zone map");
+    for i in 0..100u32 {
+        tree.insert(key(i), vec![b'v'; 200], 0);
+    }
+    for i in 300..400u32 {
+        tree.insert(key(i), vec![b'v'; 200], 0);
+    }
+    tree.flush_active_memtable(0).expect("flush");
+
+    let card = tree
+        .approximate_range_cardinality(key(150)..key(250), SeqNo::MAX)
+        .expect("cardinality");
+    assert_eq!(
+        card.rows, 0,
+        "a range in a data gap has no rows, got {card:?}"
+    );
+    assert_eq!(card.selectivity, 0.0);
+}
+
+#[test]
 fn subrange_rows_within_bounded_error() {
     let folder = get_tmp_folder();
     let tree = build_zonemapped(folder.path());
