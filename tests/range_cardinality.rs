@@ -213,3 +213,89 @@ fn falls_back_without_zone_map() {
         "fallback selectivity monotonic"
     );
 }
+
+fn build_fallback(folder: &std::path::Path) -> Tree {
+    // Zone map OFF (default), small blocks: exercises the byte-fraction branch.
+    let any = Config::new(
+        folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .open()
+    .expect("open");
+    let AnyTree::Standard(tree) = any else {
+        panic!("expected standard tree");
+    };
+    for i in 0..400u32 {
+        tree.insert(key(i), vec![b'v'; 200], 0);
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    tree
+}
+
+fn build_memtable_only(folder: &std::path::Path) -> Tree {
+    let any = Config::new(
+        folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()
+    .expect("open");
+    let AnyTree::Standard(tree) = any else {
+        panic!("expected standard tree");
+    };
+    for i in 0..100u32 {
+        tree.insert(key(i), vec![b'v'; 64], 0);
+    }
+    tree
+}
+
+#[test]
+fn all_bound_kinds_in_cardinality() {
+    use std::ops::Bound;
+
+    // Run the excluded-lower / included-upper / half-bounded RangeTo / RangeFrom
+    // bound arms through every branch: zone-map, byte-fraction fallback, memtable.
+    let check = |tree: &Tree, a: u32, b: u32| {
+        let excl_incl = tree
+            .approximate_range_cardinality(
+                (Bound::Excluded(key(a)), Bound::Included(key(b))),
+                SeqNo::MAX,
+            )
+            .expect("cardinality");
+        assert!(excl_incl.rows > 0, "excluded..=included is non-empty");
+        let to = tree
+            .approximate_range_cardinality(..key(b), SeqNo::MAX)
+            .expect("cardinality");
+        let from = tree
+            .approximate_range_cardinality(key(a).., SeqNo::MAX)
+            .expect("cardinality");
+        assert!(to.rows > 0 && from.rows > 0, "half-bounded is non-empty");
+        assert!(to.selectivity <= 1.0 && from.selectivity <= 1.0);
+    };
+
+    let f1 = get_tmp_folder();
+    check(&build_zonemapped(f1.path()), 300, 700);
+    let f2 = get_tmp_folder();
+    check(&build_fallback(f2.path()), 50, 150);
+    let f3 = get_tmp_folder();
+    let mt = build_memtable_only(f3.path());
+    check(&mt, 10, 50);
+    // A non-empty memtable queried past every key contributes nothing.
+    let empty = mt
+        .approximate_range_cardinality(key(900)..key(999), SeqNo::MAX)
+        .expect("cardinality");
+    assert_eq!(empty.rows, 0);
+    assert_eq!(empty.selectivity, 0.0);
+
+    // Byte-fraction (no zone map) branch where the upper bound runs past the
+    // last key while the table still overlaps: the block-offset lookup for the
+    // upper bound falls through to the data-section end.
+    let f4 = get_tmp_folder();
+    let fb = build_fallback(f4.path());
+    let spill = fb
+        .approximate_range_cardinality(key(50)..key(99_999), SeqNo::MAX)
+        .expect("cardinality");
+    assert!(spill.rows > 0, "an in-range lower bound still selects rows");
+}
