@@ -424,7 +424,9 @@ pub mod inspect;
 pub mod scrub;
 
 pub mod storage_stats;
-pub use storage_stats::{ApproximateRangeStats, StorageStats, StorageStatus};
+pub use storage_stats::{
+    ApproximateRangeStats, LevelStats, SegmentStats, StorageStats, StorageStatus,
+};
 
 mod version;
 mod vlog;
