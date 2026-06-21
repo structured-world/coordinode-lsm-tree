@@ -119,9 +119,13 @@ impl TryFrom<u8> for CodecId {
 /// column (the seqno column) delta-encodes well; other columns get the caller's
 /// default. More type-directed choices (dictionary on keys, FOR on small
 /// widths) join here as they land.
-const fn auto_codec(type_tag: TypeTag) -> Option<CodecId> {
-    match type_tag {
-        TypeTag::Fixed(8) => Some(CodecId::Delta),
+const fn auto_codec(column_id: u16, type_tag: TypeTag) -> Option<CodecId> {
+    // Delta suits the near-monotonic seqno column specifically. Selecting by
+    // column id (not just the 8-byte width) keeps a future unrelated Fixed(8)
+    // column (hashes, random ids) from being delta-encoded by accident, which
+    // would only inflate its size.
+    match (column_id, type_tag) {
+        (COL_SEQNO, TypeTag::Fixed(8)) => Some(CodecId::Delta),
         _ => None,
     }
 }
@@ -139,6 +143,14 @@ fn read_u64_le(chunk: &[u8]) -> u64 {
 /// Delta-encodes a fixed 8-byte integer column: each value becomes its wrapping
 /// difference from the previous one (the first from zero). Same length.
 fn delta_encode_u64(data: &[u8]) -> Vec<u8> {
+    // A Fixed(8) column's length is a multiple of 8 (Column::validate enforces
+    // it before encode). Assert it so a future caller that bypasses validation
+    // fails loudly instead of silently dropping a trailing partial chunk (the
+    // decoder already rejects the same condition).
+    debug_assert!(
+        data.len().is_multiple_of(8),
+        "delta_encode_u64: input length is not a multiple of 8"
+    );
     let mut out = Vec::with_capacity(data.len());
     let mut prev = 0u64;
     for chunk in data.chunks_exact(8) {
@@ -343,7 +355,7 @@ impl ColumnBatch {
             col.validate(self.row_count)?;
             // Pick a type-directed codec (e.g. Delta on the seqno column),
             // falling back to the caller's default; record it per column.
-            let col_codec = auto_codec(col.type_tag).unwrap_or(codec);
+            let col_codec = auto_codec(col.column_id, col.type_tag).unwrap_or(codec);
             let encoded = codec_encode(col_codec, &col.data);
             let (type_tag, width) = col.type_tag.to_wire();
             out.extend_from_slice(&col.column_id.to_le_bytes());
@@ -733,6 +745,27 @@ mod tests {
         assert_eq!(
             decoded.columns[0].data, data,
             "delta column must round-trip"
+        );
+    }
+
+    #[test]
+    fn auto_codec_is_delta_only_for_the_seqno_column() {
+        // A fixed-8 column that is not the seqno column keeps the default codec
+        // (Plain): delta-encoding a non-monotonic column would only inflate it.
+        let batch = ColumnBatch {
+            row_count: 2,
+            columns: vec![Column {
+                column_id: 99, // not the intrinsic seqno column
+                type_tag: TypeTag::Fixed(8),
+                validity: None,
+                data: vec![0u8; 16],
+            }],
+        };
+        let encoded = batch.encode(CodecId::Plain).expect("encode");
+        assert_eq!(
+            encoded[12],
+            u8::from(CodecId::Plain),
+            "a non-seqno fixed-8 column must not auto-select Delta"
         );
     }
 
