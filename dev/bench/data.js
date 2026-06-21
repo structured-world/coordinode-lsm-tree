@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782036266511,
+  "lastUpdate": 1782040213659,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -18282,6 +18282,84 @@ window.BENCHMARK_DATA = {
             "value": 700511.7224121987,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 5.4us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "688eb5c2e8361cbde2ac9655c61435c42bf01248",
+          "message": "feat(tree): approximate range row-count + selectivity (#514)\n\n## Summary\n\nAdds `AbstractTree::approximate_range_cardinality(range, seqno) ->\nRangeCardinality { rows, selectivity }`: a row-count and selectivity\nestimate for a key range, computed **without reading any data block**.\nFor cost-based query planning (join ordering, scan-vs-seek).\n\n## How it works\n\n- **rows**: each overlapping SST's per-data-block zone-map (#502) row\ncounts are summed for every block whose key range overlaps the query\n(block granularity). A table written without a zone map falls back to\nthe byte-fraction row estimate (the `approximate_range_stats` path). The\nactive + sealed memtables add their in-range, snapshot-visible counts.\n- **selectivity**: `rows / total_rows`, in `0.0..=1.0`, monotonic in\npredicate tightness.\n- Snapshot/visibility, per-table seqno translation, and comparator-aware\noverlap match the read path (and `approximate_range_stats`).\n\nThe zone-map reader (`ZoneMap::columns_for`) now has a live caller, so\nits dead-code suppression on the table field is removed; the cursor API\nstays gated for the future columnar block-skip scan (#503).\n\n## Tests\n\n6 integration tests: full range = exact total + selectivity 1.0; empty\nrange = 0; sub-range row count within a bounded (block-granularity)\nerror of an actual scan; selectivity monotonic across widening ranges;\nmemtable-only counted; fallback path without a zone map. Plus a `#\nExamples` doctest. Full suite (2056), `clippy --all-features\n--all-targets`, no-std (`alloc`), and doctests green.\n\n## Stacking\n\nBranched from `feat/#499-approximate-range-stats` (PR #513) since it\nextends `approximate_range_stats`. Base retargets to `main` after #513\nmerges.\n\nCloses #505\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n## Release Notes\n\n* **New Features**\n* Added key-range cardinality estimation to the public tree API,\nreturning estimated row counts and selectivity for cost-based query\nplanning at a specified snapshot.\n* Uses zone-map metadata when available; otherwise falls back to a\nbyte-fraction approximation while maintaining monotonic selectivity as\nranges widen.\n* Supported for SSTs and memtables, including restricted-view behavior.\n\n* **Documentation**\n* Added and exported `RangeCardinality` to expose the estimation\nresults.\n\n* **Tests**\n* Added integration tests covering zone-map precision, fallback\nbehavior, empty/full ranges, monotonicity, and boundary cases.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-21T13:43:46+03:00",
+          "tree_id": "037e705f779fed26d9a38c37c1e90667938707e7",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/688eb5c2e8361cbde2ac9655c61435c42bf01248"
+        },
+        "date": 1782040212504,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1949497.8488314725,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 3.9us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1162436.1478909622,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 879213.9096142077,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.1us | P99.9: 6.6us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3793182.3464686684,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.0us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 459427.6596773163,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.4us | P99.9: 8.9us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 234281.20533641137,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 8.7us | P99.9: 11.0us\nthreads: 1 | elapsed: 0.85s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1190135.4221177967,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1068399.719275837,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 694298.1620896617,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.5us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
