@@ -115,6 +115,12 @@ bytes_1 = ["dep:bytes"]
 # at runtime returns "not compiled in" so callers can fall back or error.
 crc32c = ["dep:crc32c"]
 metrics = []
+# Columnar (PAX / rowgroup) SST block type: per-column codecs + transpose on
+# compaction. The decode read-path is core + alloc (runtime-SIMD with a scalar
+# fallback), so this feature does NOT pull `std`; the selection + transpose
+# paths used on flush / compaction are std-only and gated inside the module.
+# Off by default; codec-framework deps are pulled only when set.
+columnar = ["alloc"]
 # Vendored Ribbon filter retains its `#[cfg(feature = "ribbon-serde")]`
 # guards (renamed from upstream's bare `serde` feature to avoid clashing
 # with any future top-level serde feature in this crate). We do not
