@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782040213659,
+  "lastUpdate": 1782044833247,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -18360,6 +18360,84 @@ window.BENCHMARK_DATA = {
             "value": 694298.1620896617,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 4.5us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "065ee60dc766ddf2b6d043b832a2b87bd75114b7",
+          "message": "test(cache): demonstrate metadata-priority pin cuts filter reloads under churn (#516)\n\n## Summary\n\nCompletes the bench-demonstration acceptance for the block-cache\nmetadata-priority pin. The pin itself (high-priority caching of index /\nfilter / range-tombstone blocks, default-on, with a\n`with_metadata_priority` opt-out) already shipped; what was missing was\na committed artifact proving the motivating signal.\n\nAdds a metrics-gated integration test that reproduces the eviction\nregime and asserts the pin's effect:\n\n- **Regime:** 30 SSTs, a data working set (~780 KB) that exceeds a 256\nKB block cache, index / filter blocks unpinned-in-reader so they live in\nthe shared cache, then scattered point reads churn the data blocks.\n- **Signal:** with the pin OFF the shared queue lets data churn evict\nthe cold per-SST filter blocks; with the pin ON they stay in the\nprotected tier. Measured filter-block disk re-reads drop from ~3054\n(off) to ~999 (on), a ~67% reduction; the test asserts a material (>1/3)\ncut plus a non-empty baseline.\n- The single tiny index block per small SST stays resident in either\nmode (it never loses the eviction race), so the filter block is the\ndemonstrable metadata signal here; the test also asserts the pin never\nmakes index reloads worse.\n\n## Testing\n\n- `cargo nextest run --features lz4,zstd,metrics` — 2081 passed (new\ntest included)\n- `cargo clippy --all-features --all-targets` — clean\n- no-std `alloc` check — errcount 0\n\nPart of #509\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Tests**\n* Added integration test validating cache metadata priority\noptimization, measuring performance impact under high-churn data access\npatterns.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-21T15:03:36+03:00",
+          "tree_id": "38f31e03feac08ef387e8ce9b536432d1a36ccad",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/065ee60dc766ddf2b6d043b832a2b87bd75114b7"
+        },
+        "date": 1782044832143,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2071184.9061405798,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1222446.484104553,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 877719.5179257205,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.0us | P99.9: 6.5us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3846321.161124355,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 468426.57011720526,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.1us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 237680.25939748497,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 4.8us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.84s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1259989.8055484823,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.0us | P99.9: 4.1us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1106619.7105791073,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.5us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 712997.8542721724,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.4us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
         ]
       }
