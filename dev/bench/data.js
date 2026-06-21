@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782064010027,
+  "lastUpdate": 1782074781279,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -18672,6 +18672,84 @@ window.BENCHMARK_DATA = {
             "value": 698404.2217808866,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 5.3us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1e6d97315a0962f93b6e2b8d5a25e619d1cb2c59",
+          "message": "feat(columnar): vectorized columnar scan with projection and predicate pushdown (#525)\n\n## Summary\n\nAdds the read-side benefit of the columnar storage format (#503): a scan\nthat decodes only the columns it needs, skips blocks a predicate proves\nout of range, and filters the rest, returning column batches. Builds on\nthe columnar block format (#503) and the per-block zone-map (#502).\n\n## What it does\n\n- **Projection** (`ColumnBatch::decode_projected`): decodes only the\nrequested columns, stepping over the rest without allocating or running\ntheir codec. A key-only scan never touches the value column.\n- **Range predicate** (`ColumnRangePredicate`): an inclusive byte-range\nfilter. `can_skip_block` proves a block is out of range from its\nzone-map min / max and skips it without loading; `matching_rows`\nevaluates the predicate over a decoded batch.\n- **Row compaction** (`filter_batch`): rebuilds a batch keeping only the\nmatched rows (fixed chunks copied, Bytes offset table + payload\nrepacked, validity compacted).\n- **SIMD equality** (`byte_eq_mask`): a per-row equality mask over a\nfixed-1 column (e.g. value-type to keep only live values),\nruntime-dispatched to AVX2 / NEON with a portable scalar fallback. Byte\nequality is endianness-independent, so no comparable transform is\nneeded.\n- **Scan API** (`Table::columnar_scan`): walks a columnar SST block by\nblock, applies the zone-map skip and the projection, and yields one\n`ColumnBatch` per surviving block.\n\n## Acceptance\n\n- A subset projection decodes only those columns (verified: a key-only\nscan over a multi-block SST returns batches carrying only the key\ncolumn).\n- A selective predicate skips out-of-range blocks via the zone-map and\nthe result equals a naive row scan filtered by the same bounds\n(equivalence test over a multi-block SST).\n- The SIMD and scalar paths are bit-identical on a corpus (NEON\nexercised on aarch64; the AVX2 path cross-compiles for x86_64 and is\nexercised on x86 CI).\n\n## Scope\n\nThe scan operates per SST (the columnar reader unit). Composing it\nacross SSTs + the memtable at the tree level, and fixed-width numeric\nrange predicates (which need a comparable transform), are later\nrefinements. The existing row read API (point reads, range) is\nunchanged: it still reconstructs whole rows from columnar blocks.\n\n## Testing\n\n- `cargo nextest run --features lz4,zstd` — 2065 passed (row read paths\nunchanged)\n- `cargo nextest run --features lz4,zstd,columnar` — 2097 passed,\nincluding projection, predicate-equals-naive, filter round-trip, and the\nSIMD bit-identity corpus test\n- `cargo clippy --all-features --all-targets` — clean\n- no-std: `cargo check --target thumbv7em-none-eabihf\n--no-default-features --features alloc,columnar` — 0 errors\n- AVX2 path cross-compiles for `x86_64-unknown-linux-gnu`\n- `cargo test --doc --features columnar` — passes\n\nCloses #506\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n## Release Notes\n\n* **New Features**\n* Added a columnar scan API that supports projecting specific columns\nduring scan, reducing decoded data to only what’s requested.\n* Introduced inclusive byte-range predicates for columnar scans,\nincluding block skipping via per-block stats and row-level filtering\nwith accurate null handling.\n* **Bug Fixes**\n* Ensured predicates continue to filter correctly even when scanning\nprojects different columns.\n* **Tests**\n* Added integration coverage for projection, predicate filtering, and\nexpected errors when scanning non-columnar SSTs.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-21T23:45:27+03:00",
+          "tree_id": "e05ff127934fb10251cfadded72c3b7a64fdf405",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/1e6d97315a0962f93b6e2b8d5a25e619d1cb2c59"
+        },
+        "date": 1782074780130,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2058530.1888598523,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1219569.6784976511,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 891000.599910704,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.0us | P99.9: 6.5us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3837640.483545771,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 469687.23482412775,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.1us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 238440.29043281573,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 4.9us | P99.9: 9.7us\nthreads: 1 | elapsed: 0.84s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1273802.3746695176,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1097704.926224185,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.5us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 688609.561535884,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.4us | P99.9: 6.8us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
