@@ -391,6 +391,27 @@ impl ColumnBatch {
     /// validity flag, or any column that fails [`Column::validate`] (fixed-width
     /// length, `Bytes` offset framing, validity bitmap length / padding).
     pub fn decode(bytes: &[u8]) -> Result<Self> {
+        Self::decode_inner(bytes, None)
+    }
+
+    /// Decodes only the columns whose id is in `wanted`, advancing past every
+    /// other column's bytes without allocating or running its codec. This is the
+    /// projection read: a scan asking for a subset of the columns never pays to
+    /// decode the rest (e.g. a key-only scan does not decode the value column).
+    /// The returned batch carries only the projected columns, in write order.
+    ///
+    /// # Errors
+    ///
+    /// As [`ColumnBatch::decode`], evaluated only for the projected columns
+    /// (the headers of skipped columns are still framing-checked).
+    pub fn decode_projected(bytes: &[u8], wanted: &[u16]) -> Result<Self> {
+        Self::decode_inner(bytes, Some(wanted))
+    }
+
+    /// Shared decode body. `wanted == None` decodes every column; `Some(ids)`
+    /// decodes only the listed columns and skips the rest (their validity + data
+    /// bytes are stepped over, never allocated or codec-decoded).
+    fn decode_inner(bytes: &[u8], wanted: Option<&[u16]>) -> Result<Self> {
         // Smallest possible column: id(2) + type(1) + width(1) + codec(1) +
         // has_validity(1) + data_len(4), with empty validity + data.
         const MIN_COLUMN_BYTES: usize = 10;
@@ -422,12 +443,19 @@ impl ColumnBatch {
             };
             let data_len = cur.read_u32()? as usize;
             let type_tag = TypeTag::from_wire(type_tag, width)?;
+            // A skipped column's validity + data are stepped over (the cursor
+            // still bounds-checks the lengths) but never copied or codec-decoded.
+            let want = wanted.is_none_or(|w| w.contains(&column_id));
             let validity = if has_validity {
-                Some(cur.read_bytes(validity_len(row_count))?.to_vec())
+                let v = cur.read_bytes(validity_len(row_count))?;
+                if want { Some(v.to_vec()) } else { None }
             } else {
                 None
             };
             let raw = cur.read_bytes(data_len)?;
+            if !want {
+                continue;
+            }
             // Restore the column's logical bytes from its stored codec form
             // (Plain is identity; Delta runs the prefix-sum).
             let data = codec_decode(codec, type_tag, raw)?;
@@ -706,7 +734,8 @@ pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>
 #[cfg(test)]
 mod tests {
     use super::{
-        CodecId, Column, ColumnBatch, TypeTag, column_batch_to_entries, entries_to_column_batch,
+        COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, CodecId, Column, ColumnBatch, TypeTag,
+        column_batch_to_entries, entries_to_column_batch,
     };
     use crate::{Slice, ValueType, key::InternalKey, value::InternalValue};
 
@@ -807,6 +836,41 @@ mod tests {
             .encode(CodecId::Plain)
             .expect("encode");
         assert!(crate::table::data_block::DataBlock::from_columnar_block(&empty, 16).is_err());
+    }
+
+    #[test]
+    fn decode_projected_decodes_only_the_wanted_columns() {
+        // Project just the user-key column: the result carries ONLY that column,
+        // proving the value / seqno / value-type columns were never decoded.
+        let entries = vec![
+            entry(b"alpha", 10, ValueType::Value, b"v1"),
+            entry(b"bravo", 9, ValueType::Value, b"v2"),
+        ];
+        let bytes = entries_to_column_batch(&entries)
+            .expect("transpose")
+            .encode(CodecId::Plain)
+            .expect("encode");
+
+        let projected =
+            ColumnBatch::decode_projected(&bytes, &[COL_USER_KEY]).expect("decode_projected");
+        assert_eq!(projected.row_count, 2);
+        assert_eq!(
+            projected.columns.len(),
+            1,
+            "only the projected column is decoded"
+        );
+        assert_eq!(projected.columns[0].column_id, COL_USER_KEY);
+        assert!(
+            !projected.columns.iter().any(|c| c.column_id == COL_VALUE),
+            "a key-only projection must not decode the value column"
+        );
+
+        // Projecting every column equals a full decode.
+        let all = [COL_USER_KEY, COL_SEQNO, COL_VALUE_TYPE, COL_VALUE];
+        assert_eq!(
+            ColumnBatch::decode_projected(&bytes, &all).expect("decode_projected all"),
+            ColumnBatch::decode(&bytes).expect("decode"),
+        );
     }
 
     #[test]
