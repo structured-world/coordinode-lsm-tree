@@ -1209,15 +1209,11 @@ impl AbstractTree for Tree {
             // `restrict_lower_bound()` are the punched-out prefix served by the
             // replacement table, so raise this table's effective lower bound to
             // it (mirrors approximate_range_stats) and never charge that prefix.
-            let eff_lo: Bound<&[u8]> = match (lo, table.restrict_lower_bound()) {
-                (Bound::Unbounded, Some(rb)) => Bound::Included(rb.as_ref()),
-                (Bound::Included(k) | Bound::Excluded(k), Some(rb))
-                    if comparator.compare(rb.as_ref(), k) == Ordering::Greater =>
-                {
-                    Bound::Included(rb.as_ref())
-                }
-                _ => lo,
-            };
+            let eff_lo = effective_lower_bound(
+                lo,
+                table.restrict_lower_bound().map(AsRef::as_ref),
+                comparator,
+            );
             let zone_map = &table.zone_map;
             if !zone_map.is_empty() {
                 // Zone map present: sum the per-block row counts of blocks whose
@@ -3752,4 +3748,72 @@ fn has_existing_version_state(folder: &Path, fs: &dyn Fs) -> crate::Result<bool>
         }
     }
     Ok(false)
+}
+
+/// Raises a query's lower bound to a table's tight-space restriction, if any.
+///
+/// Keys below `restriction` are the punched-out prefix served by the
+/// replacement table, so a range estimate must not charge them to the
+/// restricted view. Returns `lo` unchanged when the table is unrestricted or
+/// the restriction is at or below `lo`.
+fn effective_lower_bound<'a>(
+    lo: core::ops::Bound<&'a [u8]>,
+    restriction: Option<&'a [u8]>,
+    cmp: &dyn crate::comparator::UserComparator,
+) -> core::ops::Bound<&'a [u8]> {
+    use core::cmp::Ordering;
+    use core::ops::Bound;
+    match (lo, restriction) {
+        (Bound::Unbounded, Some(rb)) => Bound::Included(rb),
+        (Bound::Included(k) | Bound::Excluded(k), Some(rb))
+            if cmp.compare(rb, k) == Ordering::Greater =>
+        {
+            Bound::Included(rb)
+        }
+        _ => lo,
+    }
+}
+
+#[cfg(test)]
+mod cardinality_tests {
+    use super::effective_lower_bound;
+    use core::ops::Bound;
+
+    #[test]
+    fn effective_lower_bound_raises_to_restriction() {
+        let cmp = crate::comparator::default_comparator();
+        let cmp = cmp.as_ref();
+        let a: &[u8] = b"a";
+        let m: &[u8] = b"m";
+        let z: &[u8] = b"z";
+        // Unbounded lower bound + a restriction: raise to the restriction.
+        assert_eq!(
+            effective_lower_bound(Bound::Unbounded, Some(m), cmp),
+            Bound::Included(m)
+        );
+        // A lower bound below the restriction is raised to it.
+        assert_eq!(
+            effective_lower_bound(Bound::Included(a), Some(m), cmp),
+            Bound::Included(m)
+        );
+        assert_eq!(
+            effective_lower_bound(Bound::Excluded(a), Some(m), cmp),
+            Bound::Included(m)
+        );
+        // A lower bound at or above the restriction is left unchanged.
+        assert_eq!(
+            effective_lower_bound(Bound::Included(z), Some(m), cmp),
+            Bound::Included(z)
+        );
+        // No restriction: the lower bound is returned unchanged.
+        assert_eq!(
+            effective_lower_bound(Bound::Included(a), None, cmp),
+            Bound::Included(a)
+        );
+        let unbounded: Bound<&[u8]> = Bound::Unbounded;
+        assert_eq!(
+            effective_lower_bound(unbounded, None, cmp),
+            Bound::Unbounded
+        );
+    }
 }
