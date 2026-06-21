@@ -815,6 +815,18 @@ pub struct RuntimeConfig {
     /// written with, and a missing section just means no block-skip for that SST.
     pub zone_map: bool,
 
+    /// Whether new SSTs store their data column-organized (a PAX row-group per
+    /// block) instead of row-major. The entry's intrinsic fields (user key,
+    /// seqno, value type, value) become separate per-block columns, so a scan
+    /// can read keys without decoding values and each field compresses with a
+    /// structure-aware codec. Reads reconstruct the exact entries.
+    ///
+    /// Explicit opt-in, default `false` (row-major). Takes effect on the next
+    /// compaction / flush; existing SSTs keep their original layout, and the
+    /// reader picks the layout per block from the block type, so a tree can hold
+    /// both row and columnar SSTs at once.
+    pub columnar: bool,
+
     /// Index-size threshold (bytes) at or below which an SST's block index
     /// is written single-level; above it the index spills to a two-level
     /// (partitioned) layout. A single-level index is one block reached by a
@@ -923,6 +935,7 @@ impl Default for RuntimeConfig {
             auto_heal: false,
             seqno_in_index: false,
             zone_map: false,
+            columnar: false,
             index_partition_spill_threshold: crate::table::writer::DEFAULT_SPILL_THRESHOLD,
             disable_cow_on_sst_files: true,
             use_reflink_for_checkpoint: true,
