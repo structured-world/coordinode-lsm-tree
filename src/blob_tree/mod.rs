@@ -990,6 +990,24 @@ impl AbstractTree for BlobTree {
         self.index.disk_space() + version.blob_files.on_disk_size()
     }
 
+    fn approximate_range_stats<K: AsRef<[u8]>, R: core::ops::RangeBounds<K>>(
+        &self,
+        range: R,
+        seqno: SeqNo,
+    ) -> crate::Result<crate::ApproximateRangeStats> {
+        // The index tree's SSTs record their referenced blob bytes per-SST (at
+        // both flush and compaction), so its estimate already apportions the
+        // blob bytes by the in-range fraction. Delegating keeps the
+        // KV-separated estimate unified with the standard path.
+        //
+        // The figure tracks the value's CURRENT physical location: an unflushed
+        // value still lives inline in the index memtable, so the memtable share
+        // counts its full size there; once flushed it is separated into a blob
+        // file and counted via the SST's referenced-blob bytes. Both reflect the
+        // real footprint at the requested snapshot.
+        self.index.approximate_range_stats(range, seqno)
+    }
+
     fn get_highest_memtable_seqno(&self) -> Option<SeqNo> {
         self.index.get_highest_memtable_seqno()
     }

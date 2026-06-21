@@ -112,6 +112,31 @@ pub struct StorageStats {
     pub status: StorageStatus,
 }
 
+/// Approximate size of a key range, estimated from SST block-index offsets and
+/// the active memtable WITHOUT reading any data block. Returned by
+/// [`crate::AbstractTree::approximate_range_stats`].
+///
+/// Both figures are estimates from the same in-range fraction per source: each
+/// overlapping SST's data-block offsets are interpolated at the range
+/// boundaries (block granularity) and that fraction is applied to the SST's
+/// byte span and its entry count, while each memtable contributes its in-range
+/// skiplist count and the matching share of its size. Accuracy is typically
+/// within ~10-15% on roughly-uniform data; it is intended for query planning
+/// (split-point selection, cost-based join ordering), not exact accounting.
+#[must_use]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct ApproximateRangeStats {
+    /// Estimated on-disk bytes occupied by the range across all overlapping
+    /// SSTs (key + pointer + apportioned blob bytes) plus the active and sealed
+    /// memtables' in-range share. `0` for an empty range.
+    pub bytes: u64,
+
+    /// Estimated number of entry versions in the range: the sum, over each
+    /// overlapping SST, of `item_count × in-range fraction`, plus each
+    /// memtable's in-range skiplist count. `0` for an empty range.
+    pub key_count: u64,
+}
+
 impl StorageStats {
     /// Approximately how many more average-shaped entries fit in `budget_bytes`,
     /// using [`Self::avg_entry_on_disk_bytes`].

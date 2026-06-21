@@ -54,25 +54,28 @@ fn raise_fd_limit() {
     let _ = rlimit::increase_nofile_limit(u64::MAX);
 }
 
-/// `true` when an error is transient file-descriptor exhaustion (`EMFILE` /
-/// `ENFILE` — "too many open files"): an environment limit, not an encryption or
-/// data-integrity fault. Under a heavily parallel test run the system-wide file
-/// table can exhaust even after [`raise_fd_limit`] lifts this process's soft
-/// limit, surfacing as an `open()` failure on flush / read. The crate's
-/// `io::Error` carries no errno, so match the stable OS message (identical on
-/// Linux and macOS for both `EMFILE` and `ENFILE`).
-fn is_fd_exhaustion(err: &lsm_tree::Error) -> bool {
-    err.to_string().contains("Too many open files")
+/// `true` when an error is a transient OS resource limit rather than an
+/// encryption or data-integrity fault: file-descriptor exhaustion (`EMFILE` /
+/// `ENFILE` — "too many open files") under heavy parallelism even after
+/// [`raise_fd_limit`], or the disk filling up (`ENOSPC` — "no space left on
+/// device"). These environment limits are tolerated by the stress loops; a
+/// genuine I/O fault is not. The crate's `io::Error` carries no errno, so match
+/// the stable OS messages (identical on Linux and macOS).
+fn is_resource_exhaustion(err: &lsm_tree::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("Too many open files") || msg.contains("No space left on device")
 }
 
-/// Retries `op` while it fails with transient fd exhaustion (an environment
-/// limit under parallel test load), briefly yielding so descriptors free. A real
-/// (non-resource) fault surfaces immediately; only "too many open files" is
-/// retried, bounded so a persistent shortage still fails rather than hangs.
-fn retry_on_fd_exhaustion<T>(mut op: impl FnMut() -> lsm_tree::Result<T>) -> lsm_tree::Result<T> {
+/// Retries `op` while it fails with a transient OS resource limit (fd
+/// exhaustion or a full disk under parallel test load), briefly yielding so the
+/// resource frees. A real (non-resource) fault surfaces immediately; the retry
+/// is bounded so a persistent shortage still fails rather than hangs.
+fn retry_on_resource_exhaustion<T>(
+    mut op: impl FnMut() -> lsm_tree::Result<T>,
+) -> lsm_tree::Result<T> {
     for _ in 0..50 {
         match op() {
-            Err(e) if is_fd_exhaustion(&e) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) if is_resource_exhaustion(&e) => std::thread::sleep(Duration::from_millis(20)),
             other => return other,
         }
     }
@@ -599,11 +602,11 @@ fn concurrent_encrypted_no_corruption() -> lsm_tree::Result<()> {
                     // would mask SST-write bugs, so propagate to the main
                     // thread instead of swallowing.
                     if let Err(e) = tree.flush_active_memtable(seqno) {
-                        // A real SST-write fault must surface; transient fd
-                        // exhaustion under massive test parallelism is an
+                        // A real SST-write fault must surface; a transient OS
+                        // resource limit (fd exhaustion or a full disk) is an
                         // environment limit, not a bug — skip this flush and keep
                         // writing (a later flush retries once descriptors free).
-                        if !is_fd_exhaustion(&e) {
+                        if !is_resource_exhaustion(&e) {
                             errors.fetch_add(1, Ordering::Relaxed);
                             return;
                         }
@@ -649,11 +652,11 @@ fn concurrent_encrypted_no_corruption() -> lsm_tree::Result<()> {
                         // key not yet written by its writer — fine
                     }
                     Err(e) => {
-                        // Transient fd exhaustion under parallelism is an
-                        // environment limit, not a bug; any OTHER error is a real
-                        // decrypt / AAD / I/O fault and must surface to the main
+                        // A transient OS resource limit (fd exhaustion or a full
+                        // disk) is an environment limit, not a bug; any OTHER
+                        // error is a real decrypt / AAD / I/O fault and must surface to the main
                         // thread. Wrong DATA is still caught by the value check.
-                        if !is_fd_exhaustion(&e) {
+                        if !is_resource_exhaustion(&e) {
                             errors.fetch_add(1, Ordering::Relaxed);
                             return;
                         }
@@ -677,13 +680,13 @@ fn concurrent_encrypted_no_corruption() -> lsm_tree::Result<()> {
     assert_eq!(
         errors_seen, 0,
         "concurrent workers reported {errors_seen} non-resource flush/read errors — \
-         encrypted I/O under contention must not return Err (fd exhaustion is tolerated)"
+         encrypted I/O under contention must not return Err (fd exhaustion / full disk tolerated)"
     );
 
     // Final verification — flush remaining memtable then sample-read
     // every 50th key written and confirm presence.
     let final_seqno = seqno_gen.load(Ordering::Relaxed);
-    retry_on_fd_exhaustion(|| tree.flush_active_memtable(final_seqno))?;
+    retry_on_resource_exhaustion(|| tree.flush_active_memtable(final_seqno))?;
     let total_written = writes_committed.load(Ordering::Relaxed);
     assert!(
         total_written > 0,
@@ -702,7 +705,7 @@ fn concurrent_encrypted_no_corruption() -> lsm_tree::Result<()> {
     // covered exactly.
     drop(tree);
     let tree =
-        retry_on_fd_exhaustion(|| open_tree(dir.path(), CompressionType::None, true, false))?;
+        retry_on_resource_exhaustion(|| open_tree(dir.path(), CompressionType::None, true, false))?;
     let mut found = 0u64;
     for writer_id in 0u32..4 {
         #[expect(
@@ -712,7 +715,9 @@ fn concurrent_encrypted_no_corruption() -> lsm_tree::Result<()> {
         let upper = writer_max_idx[writer_id as usize].load(Ordering::Relaxed);
         for i in 0u32..upper {
             let key = format!("w{writer_id}_k{i:06}");
-            if retry_on_fd_exhaustion(|| tree.get(key.as_bytes(), lsm_tree::MAX_SEQNO))?.is_some() {
+            if retry_on_resource_exhaustion(|| tree.get(key.as_bytes(), lsm_tree::MAX_SEQNO))?
+                .is_some()
+            {
                 found += 1;
             }
         }

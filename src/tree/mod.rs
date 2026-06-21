@@ -991,6 +991,184 @@ impl AbstractTree for Tree {
             .sum()
     }
 
+    fn approximate_range_stats<K: AsRef<[u8]>, R: core::ops::RangeBounds<K>>(
+        &self,
+        range: R,
+        seqno: SeqNo,
+    ) -> crate::Result<crate::ApproximateRangeStats> {
+        use crate::table::block_index::BlockIndex;
+        use core::ops::Bound;
+
+        let lo: Bound<&[u8]> = match range.start_bound() {
+            Bound::Included(k) => Bound::Included(k.as_ref()),
+            Bound::Excluded(k) => Bound::Excluded(k.as_ref()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let hi: Bound<&[u8]> = match range.end_bound() {
+            Bound::Included(k) => Bound::Included(k.as_ref()),
+            Bound::Excluded(k) => Bound::Excluded(k.as_ref()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let bounds = (lo, hi);
+
+        let mut bytes: u64 = 0;
+        let mut key_count: u64 = 0;
+
+        // Use ONE snapshot at the requested seqno for both the SST and memtable
+        // contributions, so the estimate reflects the same visibility as a read
+        // at `seqno` (no entries newer than the snapshot, and a consistent set of
+        // tables + memtables even during a concurrent flush / compaction).
+        let comparator = self.config.comparator.as_ref();
+        let super_version = self.version_history.read().get_version_for_snapshot(seqno);
+
+        // SST contribution: interpolate data-block offsets at the boundaries
+        // (block granularity), no data-block reads. For a KV-separated SST the
+        // referenced blob bytes are apportioned by the same in-range fraction.
+        for table in super_version.version.iter_tables() {
+            // Comparator-aware overlap: a custom user comparator orders keys
+            // differently from raw bytes, so use the same comparison the read
+            // path does instead of default byte ordering.
+            if !table
+                .metadata
+                .key_range
+                .overlaps_with_bounds_cmp(&bounds, comparator)
+            {
+                continue;
+            }
+            // The block index is keyed by the table-LOCAL seqno; a bulk-ingested
+            // table carries a non-zero global seqno, so translate the snapshot
+            // seqno the same way the read path does before seeking it.
+            let table_seqno = seqno.saturating_sub(table.global_seqno());
+
+            // data_end = the data section's byte extent = last data block's end.
+            let Some(last) = table.block_index.iter().next_back() else {
+                continue;
+            };
+            let last = last?;
+            let data_end = *last.offset() + u64::from(last.size());
+            if data_end == 0 {
+                continue;
+            }
+
+            // The data block that would contain `key`, as (start, end) byte
+            // offsets, or `None` when `key` is past the last block. The full
+            // extent is returned so the lower bound counts from the block start
+            // and the upper bound INCLUDES it (a range inside a single block must
+            // not collapse to zero bytes).
+            let block_span = |key: &[u8]| -> crate::Result<Option<(u64, u64)>> {
+                let Some(mut iter) = table.block_index.forward_reader(key, table_seqno) else {
+                    return Ok(None);
+                };
+                let Some(handle) = iter.next() else {
+                    return Ok(None);
+                };
+                let h = handle?;
+                let start = *h.offset();
+                Ok(Some((start, (start + u64::from(h.size())).min(data_end))))
+            };
+            let off_lo = match lo {
+                Bound::Included(k) | Bound::Excluded(k) => {
+                    block_span(k)?.map_or(data_end, |(start, _)| start)
+                }
+                Bound::Unbounded => 0,
+            };
+            // Tight-space restriction: a restricted table view serves only keys
+            // at or above its lower bound, with the punched-out prefix served by
+            // the replacement table. Raise the lower offset to that bound so the
+            // prefix is not double-counted (matching how scans skip it).
+            let off_lo = match table.restrict_lower_bound() {
+                Some(rb) => {
+                    off_lo.max(block_span(rb.as_ref())?.map_or(data_end, |(start, _)| start))
+                }
+                None => off_lo,
+            };
+            let off_hi = match hi {
+                Bound::Included(k) | Bound::Excluded(k) => {
+                    block_span(k)?.map_or(data_end, |(_, end)| end)
+                }
+                Bound::Unbounded => data_end,
+            };
+            let idx_bytes = off_hi.saturating_sub(off_lo);
+            if idx_bytes == 0 {
+                continue;
+            }
+
+            // fraction = idx_bytes / data_end, in u128 to avoid overflow. For a
+            // standard tree `idx_bytes` already includes the inline values. For a
+            // KV-separated SST it covers only the key + pointer bytes, so the
+            // SST's referenced blob bytes (recorded per-SST at both flush and
+            // compaction) are apportioned by the same in-range fraction; blob
+            // files are not key-indexed, so this fraction is the finest estimate
+            // possible without reading data blocks.
+            let num = u128::from(idx_bytes);
+            let den = u128::from(data_end);
+            let blob_bytes = table.referenced_blob_bytes()?;
+            let sst_blob = u64::try_from(u128::from(blob_bytes) * num / den).unwrap_or(u64::MAX);
+            // Round up to at least one entry: a non-empty byte span over a
+            // non-empty SST always covers at least one row, so a narrow range
+            // never reports bytes with a zero key count.
+            let in_range_entries = u64::try_from(u128::from(table.metadata.item_count) * num / den)
+                .unwrap_or(u64::MAX)
+                .max(1);
+            bytes = bytes.saturating_add(idx_bytes).saturating_add(sst_blob);
+            key_count = key_count.saturating_add(in_range_entries);
+        }
+
+        // Memtable contribution: the in-range fraction of each memtable's
+        // approximate size. Built from the SAME snapshot and the SAME
+        // `range_internal` + internal-key bounds the read path uses (range.rs),
+        // so the counted slice matches what a read at `seqno` would traverse.
+        let mt_range = (
+            match lo {
+                Bound::Included(k) => {
+                    Bound::Included(InternalKey::new(k, SeqNo::MAX, crate::ValueType::Tombstone))
+                }
+                Bound::Excluded(k) => {
+                    Bound::Excluded(InternalKey::new(k, 0, crate::ValueType::Tombstone))
+                }
+                Bound::Unbounded => Bound::Unbounded,
+            },
+            match hi {
+                Bound::Included(k) => {
+                    Bound::Included(InternalKey::new(k, 0, crate::ValueType::Value))
+                }
+                Bound::Excluded(k) => {
+                    Bound::Excluded(InternalKey::new(k, SeqNo::MAX, crate::ValueType::Value))
+                }
+                Bound::Unbounded => Bound::Unbounded,
+            },
+        );
+        let estimate = |mt: &crate::Memtable| -> (u64, u64) {
+            let total = mt.len() as u64;
+            if total == 0 {
+                return (0, 0);
+            }
+            // Count only entries visible at the snapshot (the same seqno cutoff
+            // reads apply), so the estimate excludes writes newer than `seqno`.
+            let count = mt
+                .range_internal(mt_range.clone())
+                .filter(|kv| kv.key.seqno < seqno)
+                .count() as u64;
+            if count == 0 {
+                return (0, 0);
+            }
+            let mt_bytes =
+                u64::try_from(u128::from(mt.size()) * u128::from(count) / u128::from(total))
+                    .unwrap_or(u64::MAX);
+            (mt_bytes, count)
+        };
+        let (b, c) = estimate(&super_version.active_memtable);
+        bytes = bytes.saturating_add(b);
+        key_count = key_count.saturating_add(c);
+        for mt in super_version.sealed_memtables.iter() {
+            let (b, c) = estimate(mt);
+            bytes = bytes.saturating_add(b);
+            key_count = key_count.saturating_add(c);
+        }
+
+        Ok(crate::ApproximateRangeStats { bytes, key_count })
+    }
+
     fn get_highest_memtable_seqno(&self) -> Option<SeqNo> {
         let version = self.version_history.read().latest_version();
 
