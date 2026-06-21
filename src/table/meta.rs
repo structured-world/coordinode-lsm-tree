@@ -113,6 +113,12 @@ pub struct ParsedMeta {
     /// positional restart index when partial-decoding a block on the lazy read
     /// path (the restart heads sit every `data_block_restart_interval` entries).
     pub data_block_restart_interval: u8,
+
+    /// Whether this SST's data blocks are column-organized (PAX) rather than
+    /// row-major. Read from the optional `descriptor#columnar` property;
+    /// defaults to `false` for SSTs written without it (row-major). The reader
+    /// reconstructs row entries from a columnar block on load.
+    pub columnar: bool,
 }
 
 macro_rules! read_u8 {
@@ -270,6 +276,17 @@ impl ParsedMeta {
         // index when partial-decoding a block (lazy read path).
         let data_block_restart_interval =
             validated_restart_interval_index(read_u8!(block, b"restart_interval#data", &cmp))?;
+
+        // Optional layout descriptor: absent (older / row-major SSTs) means
+        // row-major; otherwise exactly one byte, non-zero meaning columnar. An
+        // empty or overlong payload is on-disk corruption, rejected here.
+        let columnar = match block.point_read(b"descriptor#columnar", SeqNo::MAX, &cmp)? {
+            None => false,
+            Some(v) => match v.value.as_ref() {
+                [b] => *b != 0,
+                _ => return Err(crate::Error::InvalidHeader("TableMeta")),
+            },
+        };
 
         let id = read_u64!(block, b"table_id", &cmp);
         // Cross-check the payload's stored id against the caller's durable
@@ -450,6 +467,7 @@ impl ParsedMeta {
             ecc_params,
             ecc_unrecognized,
             data_block_restart_interval,
+            columnar,
         })
     }
 }

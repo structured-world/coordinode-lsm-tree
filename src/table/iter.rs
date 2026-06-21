@@ -148,6 +148,10 @@ fn create_data_block_reader(
     OwnedDataBlockIter::try_new(block, |b| b.try_iter(comparator))
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent per-SST read-path flag (kv footer, columnar, init, poisoned), not a state enum"
+)]
 pub struct Iter {
     table_id: GlobalTableId,
     path: Arc<PathBuf>,
@@ -187,6 +191,10 @@ pub struct Iter {
     #[cfg(feature = "zstd")]
     data_block_restart_interval: u8,
 
+    /// Whether this SST's data blocks are columnar (PAX); when set, each block is
+    /// read as `BlockType::Columnar` and reconstructed into a row block.
+    columnar: bool,
+
     index_initialized: bool,
 
     lo_offset: BlockOffset,
@@ -223,6 +231,7 @@ impl Iter {
         ecc: Option<crate::table::block::EccParams>,
         heal_hints: Option<Arc<crate::heal_hints::HealHints>>,
         has_kv_footer: bool,
+        columnar: bool,
         #[cfg(zstd_any)] zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
         comparator: SharedComparator,
         #[cfg(feature = "zstd")] block_layout: crate::table::block_layout::BlockLayoutMap,
@@ -243,6 +252,7 @@ impl Iter {
             ecc,
             heal_hints,
             has_kv_footer,
+            columnar,
             #[cfg(zstd_any)]
             zstd_dictionary,
             comparator,
@@ -266,6 +276,47 @@ impl Iter {
             #[cfg(feature = "metrics")]
             metrics,
         }
+    }
+
+    /// Loads and resolves a data block by handle, dispatching on the SST layout:
+    /// a columnar SST's block is read as `BlockType::Columnar` and reconstructed
+    /// into a row-major block; a row SST's block is loaded directly. The
+    /// reconstructed block is in-memory, so a fixed restart interval yields a
+    /// correct, iterable block regardless of the SST's recorded value.
+    fn load_and_resolve(&self, handle: &BlockHandle) -> crate::Result<DataBlock> {
+        let block_type = if self.columnar {
+            crate::table::block::BlockType::Columnar
+        } else {
+            crate::table::block::BlockType::Data
+        };
+        let raw = load_block(
+            self.table_id,
+            &self.path,
+            &self.file_accessor,
+            &self.cache,
+            handle,
+            block_type,
+            self.compression,
+            self.encryption.as_deref(),
+            self.ecc,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+            self.heal_hints.as_ref().map(AsRef::as_ref),
+            #[cfg(feature = "metrics")]
+            &self.metrics,
+        )?;
+        if self.columnar {
+            #[cfg(feature = "columnar")]
+            {
+                const REENCODE_RESTART_INTERVAL: u8 = 16;
+                return DataBlock::from_columnar_block(&raw.data, REENCODE_RESTART_INTERVAL);
+            }
+            #[cfg(not(feature = "columnar"))]
+            {
+                return Err(crate::Error::FeatureUnsupported("columnar"));
+            }
+        }
+        DataBlock::from_loaded(raw, self.has_kv_footer)
     }
 
     pub fn set_lower_bound(&mut self, bound: Bound) {
@@ -330,6 +381,10 @@ impl Iter {
         if !partial_decode_enabled()
             || !matches!(self.compression, CompressionType::Zstd(_))
             || self.encryption.is_some()
+            // Columnar blocks have a different on-disk shape and are
+            // reconstructed whole, so the inner-block partial decode never
+            // applies to them.
+            || self.columnar
         {
             return Ok(None);
         }
@@ -591,26 +646,7 @@ impl Iterator for Iter {
             let block = if let Some(db) = partial {
                 db
             } else {
-                let raw = match load_block(
-                    self.table_id,
-                    &self.path,
-                    &self.file_accessor,
-                    &self.cache,
-                    &BlockHandle::new(handle.offset(), handle.size()),
-                    crate::table::block::BlockType::Data,
-                    self.compression,
-                    self.encryption.as_deref(),
-                    self.ecc,
-                    #[cfg(zstd_any)]
-                    self.zstd_dictionary.as_deref(),
-                    self.heal_hints.as_ref().map(AsRef::as_ref),
-                    #[cfg(feature = "metrics")]
-                    &self.metrics,
-                ) {
-                    Ok(b) => b,
-                    Err(e) => return self.poison(e),
-                };
-                match DataBlock::from_loaded(raw, self.has_kv_footer) {
+                match self.load_and_resolve(&BlockHandle::new(handle.offset(), handle.size())) {
                     Ok(b) => b,
                     Err(e) => return self.poison(e),
                 }
@@ -738,26 +774,7 @@ impl DoubleEndedIterator for Iter {
             let block = if let Some(db) = partial {
                 db
             } else {
-                let raw = match load_block(
-                    self.table_id,
-                    &self.path,
-                    &self.file_accessor,
-                    &self.cache,
-                    &BlockHandle::new(handle.offset(), handle.size()),
-                    crate::table::block::BlockType::Data,
-                    self.compression,
-                    self.encryption.as_deref(),
-                    self.ecc,
-                    #[cfg(zstd_any)]
-                    self.zstd_dictionary.as_deref(),
-                    self.heal_hints.as_ref().map(AsRef::as_ref),
-                    #[cfg(feature = "metrics")]
-                    &self.metrics,
-                ) {
-                    Ok(b) => b,
-                    Err(e) => return self.poison(e),
-                };
-                match DataBlock::from_loaded(raw, self.has_kv_footer) {
+                match self.load_and_resolve(&BlockHandle::new(handle.offset(), handle.size())) {
                     Ok(b) => b,
                     Err(e) => return self.poison(e),
                 }

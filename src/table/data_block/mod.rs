@@ -462,6 +462,47 @@ impl DataBlock {
     ///
     /// Returns [`crate::Error::InvalidTrailer`] if a footer-bearing block's
     /// footer is structurally malformed.
+    /// Reconstructs a row-major data block from a loaded columnar (PAX) block:
+    /// decode the `ColumnBatch`, rebuild the entries, and re-encode them
+    /// row-major in memory so every existing row read path is reused unchanged.
+    /// The caller must have loaded `block` with `BlockType::Columnar` (its AAD /
+    /// descriptor), so this is shared by both the random-access and scan paths.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn from_columnar_block(
+        block_data: &[u8],
+        restart_interval: u8,
+    ) -> crate::Result<Self> {
+        let batch = crate::table::columnar::ColumnBatch::decode(block_data)?;
+        let entries = crate::table::columnar::column_batch_to_entries(&batch)?;
+        // The writer never spills an empty block, so a zero-row columnar block is
+        // corrupt; reject it before the row encoder, which has a non-empty
+        // precondition and would otherwise panic.
+        if entries.is_empty() {
+            return Err(crate::Error::InvalidHeader(
+                "columnar: empty reconstructed data block",
+            ));
+        }
+        let mut buf = Vec::new();
+        Self::encode_into(&mut buf, &entries, restart_interval, 0.0)?;
+        let len = u32::try_from(buf.len())
+            .map_err(|_| crate::Error::InvalidHeader("columnar: re-encoded block exceeds u32"))?;
+        let header = crate::table::block::Header {
+            block_type: crate::table::block::BlockType::Data,
+            block_flags: 0,
+            checksum: crate::checksum::Checksum::from_raw(crate::hash::hash128(&buf)),
+            data_length: len,
+            uncompressed_length: len,
+        };
+        // Columnar blocks carry no per-KV checksum footer.
+        Self::from_loaded(
+            crate::table::block::Block {
+                header,
+                data: crate::Slice::from(buf),
+            },
+            false,
+        )
+    }
+
     pub(crate) fn from_loaded(block: Block, has_kv_footer: bool) -> crate::Result<Self> {
         use crate::table::block::kv_checksum;
 

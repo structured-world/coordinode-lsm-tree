@@ -230,6 +230,14 @@ pub struct Writer {
     /// [`Self::use_zone_map`] before the first key is added.
     use_zone_map: bool,
 
+    /// Columnar opt-in. When `true`, each spilled data block stores its entries
+    /// column-organized (a PAX row-group of the intrinsic fields) instead of
+    /// row-major, tagged [`BlockType::Columnar`](crate::table::block::BlockType::Columnar)
+    /// so the reader reconstructs the exact entries. Default `false` (row-major).
+    /// Caller wires the live runtime config in via [`Self::use_columnar`] before
+    /// the first key is added.
+    use_columnar: bool,
+
     /// Pre-trained zstd dictionary for dictionary compression
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
@@ -350,6 +358,7 @@ impl Writer {
             kv_checksum: None,
             use_seqno_in_index: false,
             use_zone_map: false,
+            use_columnar: false,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -680,6 +689,19 @@ impl Writer {
         self
     }
 
+    /// Enables column-organized data blocks (see [`Self::use_columnar`] field).
+    /// Must be set before the first key is written.
+    #[must_use]
+    pub fn use_columnar(mut self, columnar: bool) -> Self {
+        self.assert_not_started("use_columnar");
+        // Without the `columnar` feature the spill branch is compiled out, so a
+        // requested columnar layout cannot be honored. Drop the flag here so the
+        // persisted `descriptor#columnar` never advertises a layout the blocks
+        // do not have (which would misroute the reader's block identity).
+        self.use_columnar = columnar && cfg!(feature = "columnar");
+        self
+    }
+
     /// Wires the resolved per-level retrieval-ribbon locator policy entry.
     ///
     /// `Enabled` makes the writer accumulate a per-key `(block_id, slot)`
@@ -883,6 +905,20 @@ impl Writer {
             .then(|| self.chunk.first().map(|e| e.key.user_key.clone()))
             .flatten();
 
+        // Columnar layout: transpose the chunk into a PAX block rather than a
+        // row-major data block. Serial path only for now (the parallel pipeline
+        // assumes a Data block); columnar is opt-in.
+        #[cfg(feature = "columnar")]
+        if self.use_columnar {
+            return self.spill_columnar_block(
+                last_key,
+                last_seqno,
+                seqno_bounds,
+                item_count,
+                zone_block_min,
+            );
+        }
+
         // Decide per-block whether to emit the per-KV checksum footer.
         // `kv_checksum` is None unless the tree opted in; even then only blocks
         // whose (level, table_id) satisfy the policy carry the footer. A
@@ -987,6 +1023,61 @@ impl Writer {
         self.chunk.clear();
         self.chunk_size = 0;
 
+        Ok(())
+    }
+
+    /// Spills the current chunk as a columnar (PAX) block: transpose the entries
+    /// into a `ColumnBatch`, encode it, and write + register it like a data block
+    /// (same index handle, seqno bounds, and zone-map key range). Serial path
+    /// only; the parallel pipeline keeps producing row blocks.
+    #[cfg(feature = "columnar")]
+    fn spill_columnar_block(
+        &mut self,
+        last_key: crate::UserKey,
+        last_seqno: crate::SeqNo,
+        seqno_bounds: Option<(u64, u64)>,
+        item_count: usize,
+        zone_block_min: Option<crate::UserKey>,
+    ) -> crate::Result<()> {
+        let batch = crate::table::columnar::entries_to_column_batch(&self.chunk)?;
+        let payload = batch.encode(crate::table::columnar::CodecId::Plain)?;
+        let transform = {
+            let t = crate::table::block::BlockTransform::from_parts(
+                self.data_block_compression,
+                self.encryption.as_deref(),
+                #[cfg(zstd_any)]
+                self.zstd_dictionary.as_deref(),
+            )?;
+            if let Some(ecc) = self.ecc {
+                t.with_ecc(ecc)
+            } else {
+                t
+            }
+        };
+        let mut prepared = Block::prepare_with_flags(
+            &payload,
+            super::block::BlockIdentity {
+                table_id: self.table_id,
+                block_type: super::block::BlockType::Columnar,
+                dict_id: self.data_block_compression.dict_id(),
+                window_log: 0,
+            },
+            &transform,
+            0, // columnar blocks carry no per-KV checksum footer
+        )?;
+        let layout = core::mem::take(&mut prepared.layout);
+        let header = prepared.write_to(&mut self.file_writer)?;
+        self.register_written_block(
+            header,
+            layout,
+            last_key,
+            last_seqno,
+            seqno_bounds,
+            item_count,
+            zone_block_min,
+        )?;
+        self.chunk.clear();
+        self.chunk_size = 0;
         Ok(())
     }
 
@@ -1514,15 +1605,23 @@ impl Writer {
             // table's data blocks (homogeneous SST), so it doubles as
             // the per-SST descriptor value — identical to the per-block
             // decision `spill_block` makes via the same expression.
-            kv_checksum_algo: self.kv_checksum.and_then(|(policy, algo)| {
-                policy
-                    .applies(self.initial_level, self.table_id)
-                    .then_some(algo)
-            }),
+            // Columnar blocks carry no per-KV footer (spill_columnar_block writes
+            // no footer flags), so a columnar SST must report no footer here
+            // rather than advertise one its blocks omit.
+            kv_checksum_algo: if self.use_columnar {
+                None
+            } else {
+                self.kv_checksum.and_then(|(policy, algo)| {
+                    policy
+                        .applies(self.initial_level, self.table_id)
+                        .then_some(algo)
+                })
+            },
             data_block_hash_ratio: self.data_block_hash_ratio,
             data_block_restart_interval: self.data_block_restart_interval,
             index_block_restart_interval: self.index_block_restart_interval,
             initial_level: self.initial_level,
+            use_columnar: self.use_columnar,
             range_tombstone_count,
             created_at_nanos,
         };
@@ -1741,6 +1840,7 @@ struct MetaSectionParams<'a> {
     data_block_restart_interval: u8,
     index_block_restart_interval: u8,
     initial_level: u8,
+    use_columnar: bool,
     range_tombstone_count: u64,
     /// `created_at` snapshot taken once in `finish()`. Both MID and
     /// TAIL writes consume this same value; generating it inside
@@ -1876,6 +1976,11 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
             "data_block_hash_ratio",
             &p.data_block_hash_ratio.to_le_bytes(),
         ),
+        // Per-SST layout descriptor: whether every data block in this table is
+        // column-organized (PAX) rather than row-major. One byte for the whole
+        // homogeneous SST, so the read path learns the layout from the
+        // descriptor instead of inspecting a block header.
+        meta("descriptor#columnar", &[u8::from(p.use_columnar)]),
         // Per-SST transform descriptor: per-KV-footer presence + algorithm
         // as one byte (0 = no footer, else 1 + algo wire tag). Lets the
         // reader know the whole table's footer state without inspecting any

@@ -115,6 +115,10 @@ pub struct MultiWriter {
     /// flush / compaction uniformly emits (or omits) the `zone_map` section.
     use_zone_map: bool,
 
+    /// Preserved across writer rotation so every successor [`Writer`] of one
+    /// flush / compaction uniformly writes columnar (or row-major) data blocks.
+    use_columnar: bool,
+
     /// When `true`, each output SST has per-file copy-on-write cleared at
     /// creation (Btrfs `FS_NOCOW_FL`) so write-once SSTs avoid the
     /// copy-on-write fragmentation penalty. Preserved across rotations so every successor
@@ -195,6 +199,7 @@ impl MultiWriter {
             kv_checksum: None,
             use_seqno_in_index: false,
             use_zone_map: false,
+            use_columnar: false,
             disable_cow_on_sst: false,
             locator_entry: crate::config::LocatorPolicyEntry::None,
 
@@ -561,6 +566,13 @@ impl MultiWriter {
         self
     }
 
+    #[must_use]
+    pub fn use_columnar(mut self, columnar: bool) -> Self {
+        self.use_columnar = columnar;
+        self.writer = self.writer.use_columnar(columnar);
+        self
+    }
+
     /// Wires the resolved retrieval-ribbon locator policy entry through to the
     /// inner [`Writer`] and preserves it across rotations, so every successor
     /// table in the run emits its own per-SST locator section (or none, when
@@ -626,6 +638,7 @@ impl MultiWriter {
         }
         new_writer = new_writer.use_seqno_in_index(self.use_seqno_in_index);
         new_writer = new_writer.use_zone_map(self.use_zone_map);
+        new_writer = new_writer.use_columnar(self.use_columnar);
         new_writer = new_writer.use_disable_cow(self.disable_cow_on_sst);
         new_writer = new_writer.use_locator(self.locator_entry);
 
