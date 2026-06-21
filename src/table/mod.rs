@@ -316,6 +316,27 @@ impl Table {
         DataBlock::from_columnar_block(&block.data, self.metadata.data_block_restart_interval)
     }
 
+    /// Loads a columnar data block and decodes only the projected columns,
+    /// stepping over the rest without decoding them. The returned batch carries
+    /// the requested columns for this block's rows. This is the projection read
+    /// the vectorized scan uses, distinct from the whole-block reconstruction
+    /// that the row read paths use.
+    #[cfg(feature = "columnar")]
+    fn load_columnar_block_projected(
+        &self,
+        handle: &BlockHandle,
+        projection: &[u16],
+    ) -> crate::Result<crate::table::columnar::ColumnBatch> {
+        let block = self.load_block(
+            handle,
+            BlockType::Columnar,
+            self.metadata.data_block_compression,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+        )?;
+        crate::table::columnar::ColumnBatch::decode_projected(&block.data, projection)
+    }
+
     /// Returns the (possibly compressed) file size.
     pub(crate) fn file_size(&self) -> u64 {
         self.metadata.file_size
@@ -1243,6 +1264,55 @@ impl Table {
             self.metadata.columnar,
             self.metadata.data_block_restart_interval,
         )
+    }
+
+    /// Scans this columnar SST block by block, returning one [`ColumnBatch`] per
+    /// data block that survives the optional predicate, each carrying only the
+    /// projected columns.
+    ///
+    /// `projection` lists the column ids to decode; every other column is
+    /// stepped over without decoding. When `predicate` is set, a block whose
+    /// zone-map proves it out of range is skipped without being loaded, and each
+    /// surviving block is filtered to the rows that match.
+    ///
+    /// [`ColumnBatch`]: crate::table::columnar::ColumnBatch
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this SST is not columnar, or on a block read / decode
+    /// failure.
+    #[cfg(feature = "columnar")]
+    pub fn columnar_scan(
+        &self,
+        projection: &[u16],
+        predicate: Option<&crate::table::columnar_predicate::ColumnRangePredicate>,
+    ) -> crate::Result<Vec<crate::table::columnar::ColumnBatch>> {
+        if !self.metadata.columnar {
+            return Err(crate::Error::FeatureUnsupported("columnar"));
+        }
+        let mut out = Vec::new();
+        for keyed in self.block_index.iter() {
+            let keyed = keyed?;
+            // Zone-map block skip: prove the block is out of range and never
+            // load it. A missing entry is conservative (cannot skip).
+            if let Some(pred) = predicate
+                && let Some(stats) = self.zone_map.columns_for(*keyed.offset())
+                && pred.can_skip_block(stats)
+            {
+                continue;
+            }
+            let handle = BlockHandle::new(keyed.offset(), keyed.size());
+            let batch = self.load_columnar_block_projected(&handle, projection)?;
+            let batch = match predicate {
+                Some(pred) => {
+                    let mask = pred.matching_rows(&batch);
+                    crate::table::columnar_predicate::filter_batch(&batch, &mask)
+                }
+                None => batch,
+            };
+            out.push(batch);
+        }
+        Ok(out)
     }
 
     /// Creates an iterator over the `Table`.
