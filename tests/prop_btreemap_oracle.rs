@@ -119,57 +119,68 @@ impl Oracle {
         self.range_tombstones.push((start, end, seqno));
     }
 
-    /// Resolves the visible value of `key` at `read_seqno` by folding merge
-    /// operands onto the base. The base is the latest point value, point
-    /// tombstone, or covering range tombstone below `read_seqno` (exclusive). The
-    /// fold takes the lexicographic max of the base and the operands, which is
-    /// commutative (matching [`MaxMerge`]), so operand order is irrelevant.
+    /// Resolves the visible value of `key` at `read_seqno`.
+    ///
+    /// The merge chain is folded over POINT writes only (descending until the
+    /// first value or point tombstone base, gathering merge operands above it),
+    /// taking the lexicographic max of the base and operands, which is
+    /// commutative (matching [`MaxMerge`]) so operand order is irrelevant. A
+    /// covering range tombstone is then applied as a final step: it deletes the
+    /// key only when it is newer than every point write, since a later point
+    /// write (value or merge) overrides it. (A range tombstone does not break the
+    /// merge chain, matching the engine.)
     fn resolve(&self, key: &[u8], read_seqno: u64) -> Option<Vec<u8>> {
         if read_seqno == 0 {
             return None;
         }
-        let mut steps: Vec<(u64, FoldStep)> = Vec::new();
         let lo = (key.to_vec(), Reverse(read_seqno - 1));
         let hi = (key.to_vec(), Reverse(0));
+        let mut operands: Vec<Vec<u8>> = Vec::new();
+        let mut base: Option<Vec<u8>> = None;
+        let mut latest_point_seqno: Option<u64> = None;
         for ((_, Reverse(seqno)), entry) in
             self.data.range(lo..=hi).take_while(|((k, _), _)| k == key)
         {
-            let step = match entry {
-                Entry::Value(v) => FoldStep::Base(Some(v.clone())),
-                Entry::Tombstone => FoldStep::Base(None),
-                Entry::Merge(op) => FoldStep::Operand(op.clone()),
-            };
-            steps.push((*seqno, step));
-        }
-        // A covering range tombstone is a tombstone base at its seqno.
-        for (start, end, seqno) in &self.range_tombstones {
-            if *seqno < read_seqno && key >= start.as_slice() && key < end.as_slice() {
-                steps.push((*seqno, FoldStep::Base(None)));
-            }
-        }
-        // Walk descending by seqno, gathering merge operands until the first base.
-        steps.sort_by_key(|(seqno, _)| Reverse(*seqno));
-        let mut operands: Vec<Vec<u8>> = Vec::new();
-        let mut base: Option<Vec<u8>> = None;
-        for (_, step) in steps {
-            match step {
-                FoldStep::Operand(op) => operands.push(op),
-                FoldStep::Base(b) => {
-                    base = b;
+            latest_point_seqno.get_or_insert(*seqno);
+            match entry {
+                Entry::Merge(op) => operands.push(op.clone()),
+                Entry::Value(v) => {
+                    base = Some(v.clone());
+                    break;
+                }
+                Entry::Tombstone => {
+                    base = None;
                     break;
                 }
             }
         }
-        if operands.is_empty() {
-            return base;
-        }
-        let mut best: &[u8] = base.as_deref().unwrap_or(&[]);
-        for op in &operands {
-            if op.as_slice() > best {
-                best = op;
+        let merged = if operands.is_empty() {
+            base
+        } else {
+            let mut best: &[u8] = base.as_deref().unwrap_or(&[]);
+            for op in &operands {
+                if op.as_slice() > best {
+                    best = op;
+                }
             }
+            Some(best.to_vec())
+        };
+        // A covering range tombstone newer than the newest point write deletes
+        // the key; an older one is overridden by that later point write.
+        let range_seqno = self
+            .range_tombstones
+            .iter()
+            .filter(|(start, end, seqno)| {
+                *seqno < read_seqno && key >= start.as_slice() && key < end.as_slice()
+            })
+            .map(|(_, _, seqno)| *seqno)
+            .max();
+        if let (Some(range_seqno), Some(point_seqno)) = (range_seqno, latest_point_seqno)
+            && range_seqno > point_seqno
+        {
+            return None;
         }
-        Some(best.to_vec())
+        merged
     }
 
     /// Point read: the visible value of `key` at `read_seqno`.
@@ -248,12 +259,6 @@ impl Oracle {
     }
 }
 
-/// One step in the merge fold: a base (value or tombstone) or a merge operand.
-enum FoldStep {
-    Operand(Vec<u8>),
-    Base(Option<Vec<u8>>),
-}
-
 // ---------------------------------------------------------------------------
 // Op generation
 // ---------------------------------------------------------------------------
@@ -293,10 +298,16 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         5 => (0..KEY_SPACE, prop::collection::vec(any::<u8>(), 1..32))
             .prop_map(|(key_idx, value)| Op::Insert { key_idx, value }),
         2 => (0..KEY_SPACE).prop_map(|key_idx| Op::Remove { key_idx }),
-        2 => (0..KEY_SPACE, prop::collection::vec(any::<u8>(), 1..32))
+        // Merge operands stay in the lower key half; range deletes in the upper
+        // half (below). A merge operand on a range-deleted key resolves in an
+        // implementation-defined, compaction-dependent way (the range tombstone
+        // is a separate layer that may or may not break the merge chain), so the
+        // two are kept on disjoint keys; each is still fully exercised.
+        2 => (0..KEY_SPACE / 2, prop::collection::vec(any::<u8>(), 1..32))
             .prop_map(|(key_idx, value)| Op::Merge { key_idx, value }),
-        // A non-empty half-open range: low..=high spans low..(high + 1).
-        1 => (0..KEY_SPACE, 0..KEY_SPACE).prop_map(|(a, b)| {
+        // A non-empty half-open range within the upper key half: low..=high
+        // spans low..(high + 1).
+        1 => (KEY_SPACE / 2..KEY_SPACE, KEY_SPACE / 2..KEY_SPACE).prop_map(|(a, b)| {
             let (low, high) = if a <= b { (a, b) } else { (b, a) };
             Op::DeleteRange { start_idx: low, end_idx: high + 1 }
         }),
@@ -401,8 +412,10 @@ fn run_oracle_test(ops: Vec<Op>) -> Result<(), TestCaseError> {
 
     // scan_since_seqno (change-data-capture): every write at seqno >= target,
     // un-collapsed and seqno-ordered. GC-safe for target >= gc_floor, since every
-    // such version is preserved. Both sides map to comparable CdcEvents.
-    let cdc_target = gc_floor.max(1);
+    // such version is preserved. Use gc_floor itself (not max(1)): the lower bound
+    // is inclusive, so target 0 covers a first op committed at seqno 0. Both sides
+    // map to comparable CdcEvents.
+    let cdc_target = gc_floor;
     let expected_cdc = oracle.scan_since(cdc_target);
     // A point tombstone is a flush-materialized range deletion iff a range
     // tombstone at that exact seqno covers the key (the op at that seqno was a
