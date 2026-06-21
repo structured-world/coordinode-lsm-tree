@@ -152,11 +152,14 @@ pub struct SegmentStats {
     pub used_bytes: u64,
     /// Number of entry versions stored in the segment.
     pub item_count: u64,
-    /// Cumulative point-read probes served by the segment since it was created.
-    /// A monotonic counter, not a rate: derive a read-rate / EMA from the delta
-    /// between successive polls. `0` for a never-read segment.
+    /// Cumulative point reads that consulted this segment's data since it was
+    /// created: only reads that pass the segment's seqno-range and bloom gates
+    /// count (a bloom miss is not counted), so this tracks data hotness rather
+    /// than raw probe frequency. A monotonic counter, not a rate: derive a
+    /// read-rate / EMA from the delta between successive polls. `0` when never
+    /// read.
     pub reads: u64,
-    /// Unix seconds of the segment's most recent point-read probe, or `0` if
+    /// Unix seconds of the segment's most recent data-consulting read, or `0` if
     /// never read (or on a no-std build, which keeps no clock).
     pub last_access_secs: u64,
 }

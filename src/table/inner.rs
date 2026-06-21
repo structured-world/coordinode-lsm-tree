@@ -104,15 +104,18 @@ pub struct Inner {
     /// same on-disk byte counts and computes the same sum.
     pub(crate) cached_blob_bytes: AtomicU64,
 
-    /// Cumulative point-read probes served by this segment, bumped (`Relaxed`)
-    /// on every [`Table::get`]. A monotonic counter, not a rate: a tiering
-    /// consumer derives a read-rate / EMA from successive polls (delta over
-    /// elapsed time). Reset to `0` only when the segment is created.
+    /// Cumulative point reads that consulted this segment's data, bumped
+    /// (`Relaxed`) once a read passes the segment's seqno-range and bloom gates
+    /// (a bloom miss or out-of-seqno-range probe is NOT counted, so the figure
+    /// tracks data hotness, not raw probe frequency). A monotonic counter, not a
+    /// rate: a tiering consumer derives a read-rate / EMA from successive polls
+    /// (delta over elapsed time). Reset to `0` only when the segment is created.
     pub(crate) read_count: AtomicU64,
 
-    /// Unix seconds of the most recent point-read probe, or `0` if never read.
-    /// Maintained only on `std` builds (system clock); a no-std build leaves it
-    /// at `0`. The recency signal for demotion / tiering decisions.
+    /// Unix seconds of the most recent data-consulting read (same gating as
+    /// [`Self::read_count`]), or `0` if never read. Maintained only on `std`
+    /// builds (system clock); a no-std build leaves it at `0`. The recency
+    /// signal for demotion / tiering decisions.
     pub(crate) last_access_secs: AtomicU64,
 
     /// Range tombstones stored in this table. Loaded on open.
