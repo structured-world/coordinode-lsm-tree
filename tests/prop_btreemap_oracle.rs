@@ -178,6 +178,10 @@ impl Oracle {
     }
 
     /// Full scan: every visible `(key, value)` at `read_seqno`, sorted by key.
+    ///
+    /// Only keys with a point write are considered: a key that was solely a
+    /// range-tombstone target has no value (range tombstones never create one),
+    /// which matches the engine, so iterating `data` keys is complete.
     fn scan(&self, read_seqno: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut result = Vec::new();
         let mut last_key: Option<&Vec<u8>> = None;
@@ -237,6 +241,8 @@ impl Oracle {
                 });
             }
         }
+        // Each op takes a unique seqno via `seqno_counter.next()`, so sorting by
+        // seqno is a total order that matches the engine's seqno-ordered output.
         events.sort_by_key(CdcEvent::seqno);
         events
     }
@@ -386,7 +392,11 @@ fn run_oracle_test(ops: Vec<Op>) -> Result<(), TestCaseError> {
     // [gc_floor, read_seqno]: the engine and oracle agree on the visible state at
     // any past snapshot whose versions a compaction could not have dropped.
     for snapshot_seqno in [gc_floor.max(1), gc_floor.midpoint(read_seqno)] {
-        verify_against_oracle(&tree, &oracle, snapshot_seqno)?;
+        // Stay within observable history: with only Flush / Compact ops,
+        // read_seqno is 0 and gc_floor.max(1) would read past the end.
+        if snapshot_seqno <= read_seqno {
+            verify_against_oracle(&tree, &oracle, snapshot_seqno)?;
+        }
     }
 
     // scan_since_seqno (change-data-capture): every write at seqno >= target,
@@ -394,14 +404,19 @@ fn run_oracle_test(ops: Vec<Op>) -> Result<(), TestCaseError> {
     // such version is preserved. Both sides map to comparable CdcEvents.
     let cdc_target = gc_floor.max(1);
     let expected_cdc = oracle.scan_since(cdc_target);
-    // A point tombstone whose seqno is a range tombstone's seqno is the engine
-    // materializing that range deletion onto a covered key during flush, not a
-    // logical op; drop it (the op at that seqno was a DeleteRange, not a Remove).
-    let range_seqnos: Vec<u64> = oracle
-        .range_tombstones
-        .iter()
-        .map(|(_, _, seqno)| *seqno)
-        .collect();
+    // A point tombstone is a flush-materialized range deletion iff a range
+    // tombstone at that exact seqno covers the key (the op at that seqno was a
+    // DeleteRange, not a Remove, since seqnos are unique). Checking the key, not
+    // just the seqno, keeps the filter self-validating if the engine's
+    // materialization detail ever changes.
+    let is_materialized_range = |key: &[u8], seqno: u64| {
+        oracle
+            .range_tombstones
+            .iter()
+            .any(|(start, end, rt_seqno)| {
+                *rt_seqno == seqno && key >= start.as_slice() && key < end.as_slice()
+            })
+    };
     let actual_cdc: Vec<CdcEvent> = tree
         .scan_since_seqno(cdc_target)
         .map_err(|e| TestCaseError::fail(format!("scan_since_seqno failed: {e}")))?
@@ -411,7 +426,9 @@ fn run_oracle_test(ops: Vec<Op>) -> Result<(), TestCaseError> {
                 key: key.to_vec(),
                 value: Some(value.to_vec()),
             }),
-            ScanSinceEvent::PointTombstone { key, seqno } if !range_seqnos.contains(&seqno) => {
+            ScanSinceEvent::PointTombstone { key, seqno }
+                if !is_materialized_range(&key, seqno) =>
+            {
                 Some(CdcEvent::Point {
                     seqno,
                     key: key.to_vec(),
