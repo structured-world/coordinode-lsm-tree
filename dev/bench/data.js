@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782048828433,
+  "lastUpdate": 1782053012611,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -18516,6 +18516,84 @@ window.BENCHMARK_DATA = {
             "value": 707423.9745956693,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.4us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "43a5b0d55faffbc686c8bb0ce03564960c228fd8",
+          "message": "feat(columnar): intrinsic-field transpose between entries and ColumnBatch (#523)\n\n## Summary\n\nThe engine-side, schema-free transpose kernel for the columnar feature:\nit lays a run of entries out as a PAX row-group of the entry's intrinsic\nfields, and reconstructs the exact entries back. This is the reusable\nprimitive the flush / compaction wiring (a follow-up) and the\nconsumer-provided columnar path (#522) both build on.\n\n- `entries_to_column_batch(&[InternalValue]) -> Result<ColumnBatch>`:\none column each for `user_key` (0, Bytes), `seqno` (1, Fixed8 LE),\n`value_type` (2, Fixed1), and the opaque `value` (3, Bytes). The value\nstays a single opaque column here; splitting it into per-field\nsub-columns is the consumer's concern (#522), since a semantics-free\nengine cannot derive them.\n- `column_batch_to_entries(&ColumnBatch) -> Result<Vec<InternalValue>>`:\nvalidates the four-column layout and reconstructs the entries,\nbounds-checked (no panics on a malformed batch).\n- This is PAX (Ailamaki et al., VLDB 2001) applied to the engine's\nintrinsic fields: zero storage / IO penalty, cache-friendly, trivial\nreconstruction. Value opaqueness at the engine layer follows WiscKey.\n\nThe kernel is `core` + `alloc` (no std); only the later flush /\ncompaction wiring around it is std.\n\n## Testing\n\n- `cargo nextest run --features lz4,zstd,columnar` — 2079 passed\n(round-trip directly and through the block encode / decode; wrong-layout\nrejection)\n- `cargo clippy --all-features --all-targets` — clean\n- `cargo test --doc --features columnar` — passes\n- no-std: `cargo check --target thumbv7em-none-eabihf\n--no-default-features --features alloc,columnar` — 0 errors\n\nPart of #503. Follow-up: wire the transpose into the flush / compaction\nwriter (selectable per-CF) so a columnar tree stores and reads back\ncolumnar SSTs.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Enhanced columnar storage with improved serialization and validation\nfor internal data structures.\n\n* **Tests**\n* Expanded test coverage for columnar data operations, including\nround-trip conversion and validation scenarios.\n\n* **Documentation**\n* Updated module documentation to clarify implementation details and\narchitecture.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-21T17:42:42+03:00",
+          "tree_id": "cc84575f9b13a01768a2764b69c4558391a46c51",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/43a5b0d55faffbc686c8bb0ce03564960c228fd8"
+        },
+        "date": 1782053011493,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2054049.646174543,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1180552.1598284403,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.7us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 869468.16206264,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.1us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3710637.7174338615,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.0us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 470257.1233808395,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.3us | P99.9: 9.0us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 243089.52541759575,
+            "unit": "ops/sec",
+            "extra": "P50: 3.8us | P99: 4.8us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.82s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1282340.5649305193,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.0us | P99.9: 4.1us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1105363.9615612114,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.3us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 694314.8365974642,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 5.5us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
