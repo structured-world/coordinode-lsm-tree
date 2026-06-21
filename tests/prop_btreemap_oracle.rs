@@ -7,7 +7,7 @@
 mod common;
 
 use common::guard_to_kv;
-use lsm_tree::{AbstractTree, Config, SequenceNumberCounter};
+use lsm_tree::{AbstractTree, AnyTree, Config, ScanSinceEvent, SequenceNumberCounter, Tree};
 use proptest::prelude::*;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -90,6 +90,21 @@ impl Oracle {
             .filter(|(k, _)| k.starts_with(prefix))
             .collect()
     }
+
+    /// Change-data-capture: every write at `seqno >= target`, un-collapsed (a key
+    /// written N times yields N events) and ordered by ascending seqno, as
+    /// `(seqno, key, value)` where `value` is `None` for a point tombstone. This
+    /// mirrors `Tree::scan_since_seqno`, whose lower bound is inclusive.
+    fn scan_since(&self, target: u64) -> Vec<(u64, Vec<u8>, Option<Vec<u8>>)> {
+        let mut events: Vec<(u64, Vec<u8>, Option<Vec<u8>>)> = self
+            .data
+            .iter()
+            .filter(|((_, Reverse(seqno)), _)| *seqno >= target)
+            .map(|((key, Reverse(seqno)), val)| (*seqno, key.clone(), val.clone()))
+            .collect();
+        events.sort_by_key(|(seqno, _, _)| *seqno);
+        events
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -141,11 +156,21 @@ fn run_oracle_test(ops: Vec<Op>) -> Result<(), TestCaseError> {
     let tmpdir = lsm_tree::get_tmp_folder();
     let seqno_counter = SequenceNumberCounter::default();
     let visible_seqno = SequenceNumberCounter::default();
-    let tree = Config::new(&tmpdir, seqno_counter.clone(), visible_seqno.clone())
-        .open()
-        .map_err(|e| TestCaseError::fail(format!("failed to open tree: {e}")))?;
+    let AnyTree::Standard(tree) =
+        Config::new(&tmpdir, seqno_counter.clone(), visible_seqno.clone())
+            .open()
+            .map_err(|e| TestCaseError::fail(format!("failed to open tree: {e}")))?
+    else {
+        return Err(TestCaseError::fail("expected a standard tree"));
+    };
 
     let mut oracle = Oracle::new();
+    // Highest GC watermark passed to any compaction. A compaction at watermark
+    // W may drop versions shadowed below W, but preserves, for every key, all
+    // versions at seqno >= W plus the single latest version below W. So a read
+    // at any seqno >= W still matches the full-history oracle, while a read below
+    // W may not. Snapshot reads are therefore only verified at seqnos >= gc_floor.
+    let mut gc_floor = 0u64;
 
     // Apply all ops.
     // Data seqnos come from the shared counter (as required by the API).
@@ -174,16 +199,75 @@ fn run_oracle_test(ops: Vec<Op>) -> Result<(), TestCaseError> {
             }
             Op::Compact => {
                 let gc_watermark = seqno_counter.get();
+                gc_floor = gc_floor.max(gc_watermark);
                 tree.major_compact(common::COMPACTION_TARGET, gc_watermark)
                     .map_err(|e| TestCaseError::fail(format!("compact failed: {e}")))?;
             }
         }
     }
 
-    // Verify point reads.
-    // Use visible_seqno — it tracks the visibility watermark and won't
-    // drift ahead of what the tree considers readable.
+    // Read seqno: the visibility watermark, which won't drift ahead of what the
+    // tree considers readable.
     let read_seqno = visible_seqno.get();
+    verify_against_oracle(&tree, &oracle, read_seqno)?;
+
+    // Snapshot reads at historical seqnos within the GC-safe window
+    // [gc_floor, read_seqno]: the engine and oracle agree on the visible state at
+    // any past snapshot whose versions a compaction could not have dropped.
+    for snapshot_seqno in [gc_floor.max(1), gc_floor.midpoint(read_seqno)] {
+        verify_against_oracle(&tree, &oracle, snapshot_seqno)?;
+    }
+
+    // scan_since_seqno (change-data-capture): every write at seqno >= target,
+    // un-collapsed and seqno-ordered. GC-safe for target >= gc_floor, since every
+    // such version is preserved. Both sides map to (seqno, key, value).
+    let cdc_target = gc_floor.max(1);
+    let expected_cdc = oracle.scan_since(cdc_target);
+    let actual_cdc: Vec<(u64, Vec<u8>, Option<Vec<u8>>)> = tree
+        .scan_since_seqno(cdc_target)
+        .map_err(|e| TestCaseError::fail(format!("scan_since_seqno failed: {e}")))?
+        .filter_map(|event| match event {
+            ScanSinceEvent::Insert { key, value, seqno } => {
+                Some((seqno, key.to_vec(), Some(value.to_vec())))
+            }
+            ScanSinceEvent::PointTombstone { key, seqno } => Some((seqno, key.to_vec(), None)),
+            // No range tombstones or merge operands are produced by the point
+            // ops above.
+            ScanSinceEvent::RangeTombstone { .. } | ScanSinceEvent::MergeOperand { .. } => None,
+        })
+        .collect();
+    prop_assert_eq!(
+        actual_cdc,
+        expected_cdc,
+        "scan_since_seqno CDC mismatch at target {}",
+        cdc_target,
+    );
+
+    // Checkpoint + reopen: flush everything to disk, drop the tree (releasing the
+    // directory lock), recover from disk, and re-verify the full visible state
+    // survives the round-trip.
+    tree.flush_active_memtable(0)
+        .map_err(|e| TestCaseError::fail(format!("flush before reopen failed: {e}")))?;
+    drop(tree);
+    let AnyTree::Standard(tree) =
+        Config::new(&tmpdir, seqno_counter.clone(), visible_seqno.clone())
+            .open()
+            .map_err(|e| TestCaseError::fail(format!("reopen failed: {e}")))?
+    else {
+        return Err(TestCaseError::fail("expected a standard tree after reopen"));
+    };
+    verify_against_oracle(&tree, &oracle, read_seqno)?;
+
+    Ok(())
+}
+
+/// Verifies the engine agrees with the oracle on every point read, the full
+/// scan, and each single-byte prefix scan, at `read_seqno`.
+fn verify_against_oracle(
+    tree: &Tree,
+    oracle: &Oracle,
+    read_seqno: u64,
+) -> Result<(), TestCaseError> {
     for idx in 0..KEY_SPACE {
         let key = key_from_idx(idx);
         let expected = oracle.get(&key, read_seqno);
@@ -200,7 +284,6 @@ fn run_oracle_test(ops: Vec<Op>) -> Result<(), TestCaseError> {
         );
     }
 
-    // Verify full scan.
     let expected_scan = oracle.scan(read_seqno);
     let actual_scan: Vec<(Vec<u8>, Vec<u8>)> = tree
         .iter(read_seqno, None)
@@ -220,10 +303,9 @@ fn run_oracle_test(ops: Vec<Op>) -> Result<(), TestCaseError> {
         prop_assert_eq!(actual, expected, "Scan entry mismatch");
     }
 
-    // Verify prefix scans for each possible prefix byte.
-    // With single-byte keys each prefix matches exactly one key — this is
-    // intentional: it validates the prefix() API contract and oracle agreement.
-    // Multi-key prefix grouping is exercised by the db_bench prefixscan workload.
+    // With single-byte keys each prefix matches exactly one key — this validates
+    // the prefix() API contract and oracle agreement. Multi-key prefix grouping
+    // is exercised by the db_bench prefixscan workload.
     for prefix_byte in 0..KEY_SPACE {
         let prefix = vec![prefix_byte];
         let expected_prefix = oracle.prefix_scan(&prefix, read_seqno);
