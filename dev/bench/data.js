@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782044833247,
+  "lastUpdate": 1782048828433,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -18436,6 +18436,84 @@ window.BENCHMARK_DATA = {
           {
             "name": "readwhilewriting",
             "value": 712997.8542721724,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.4us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "be2a67e5efe5ff036848eedcf5db7549634b9c64",
+          "message": "feat(columnar): PAX columnar block format and ColumnBatch read unit (#517)\n\n## Summary\n\nFirst slice of the columnar (PAX / rowgroup) SST block type: the on-disk\nblock format and the `ColumnBatch` read unit. This lands the wire-format\ncontract early so the codecs, transpose, and reader / writer wiring in\nlater slices build on a reviewed foundation.\n\n- New `columnar` feature. It depends on `alloc` only (not `std`): the\nencode / decode path is `core` + `alloc`, so a no-std consumer can read\ncolumnar blocks; the std-only transpose lands later, gated inside the\nmodule.\n- Reserved `BlockType::Columnar` wire tag (11). A columnar block is\ndata-bearing, so it is counted as a data-block read in the metrics.\n- `ColumnBatch` (a row-group as per-column chunks) with `Column` /\n`TypeTag` (`Fixed`, `Bytes`) / `CodecId` (`Plain`). Each column is a\ntyped, codec-tagged opaque byte array plus an optional 1-bit-per-row\nvalidity bitmap; the engine attaches no relational meaning.\n- Block-payload `encode` / `decode` over a bounds-checked little-endian\ncursor. `decode` rejects truncation, unknown type / codec tags, and a\nfixed-width column whose byte length is not `row_count * width`.\n\n## Wire format\n\n```\n[u32 row_count][u32 column_count]\nper column: [u16 column_id][u8 type_tag][u8 width][u8 codec_id][u8 has_validity][u32 data_len][validity?][data]\n```\n\n`Fixed(w)`: `row_count * w` contiguous bytes. `Bytes`: a `(row_count +\n1)` little-endian `u32` offset array followed by the concatenated value\nbytes.\n\n## Testing\n\n- `cargo nextest run --features lz4,zstd,columnar,metrics` — 2085 passed\n(round-trip + truncation / fixed-width-length / unknown-codec rejection)\n- `cargo test --doc --features columnar` — module doctest passes\n- `cargo clippy --all-features --all-targets` — clean\n- no-std: `cargo check --target thumbv7em-none-eabihf\n--no-default-features --features alloc,columnar` — 0 errors (decode path\nis no-std clean)\n\nPart of #503. Follow-up slices: row-to-column transpose on flush /\ncompaction, structure-aware codecs (delta, dictionary), zone-map\nintegration, and the columnar blob value-class.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Introduced a columnar storage block format with `ColumnBatch`\nencode/decode for fixed-width and variable-length (`Bytes`) columns,\nincluding optional validity bitmap support.\n* Added a new columnar block type and extended wire tag\nencoding/decoding for it.\n* Added an optional `columnar` feature flag to enable the new columnar\nfunctionality.\n\n* **Enhancements**\n* Improved block load metrics so columnar blocks are accounted for in\ncache-hit and I/O counters.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-21T16:07:03+03:00",
+          "tree_id": "bc60c189e667d977d071c139b748c9ab91472c40",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/be2a67e5efe5ff036848eedcf5db7549634b9c64"
+        },
+        "date": 1782048827278,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2048770.5737541015,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1203931.0950745349,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 883978.5842928276,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.1us | P99.9: 6.5us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3816973.3782901545,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 465393.1176246317,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.4us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 237967.24486293952,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.84s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1255701.6467453472,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1082855.5183727636,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 2.4us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 707423.9745956693,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.4us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
