@@ -7,6 +7,8 @@ pub(crate) mod block_index;
 pub(crate) mod block_layout;
 #[cfg(feature = "columnar")]
 pub mod columnar;
+#[cfg(feature = "columnar")]
+pub mod columnar_predicate;
 pub mod data_block;
 pub mod filter;
 mod id;
@@ -312,6 +314,27 @@ impl Table {
             self.zstd_dictionary.as_deref(),
         )?;
         DataBlock::from_columnar_block(&block.data, self.metadata.data_block_restart_interval)
+    }
+
+    /// Loads a columnar data block and decodes only the projected columns,
+    /// stepping over the rest without decoding them. The returned batch carries
+    /// the requested columns for this block's rows. This is the projection read
+    /// the vectorized scan uses, distinct from the whole-block reconstruction
+    /// that the row read paths use.
+    #[cfg(feature = "columnar")]
+    fn load_columnar_block_projected(
+        &self,
+        handle: &BlockHandle,
+        projection: &[u16],
+    ) -> crate::Result<crate::table::columnar::ColumnBatch> {
+        let block = self.load_block(
+            handle,
+            BlockType::Columnar,
+            self.metadata.data_block_compression,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+        )?;
+        crate::table::columnar::ColumnBatch::decode_projected(&block.data, projection)
     }
 
     /// Returns the (possibly compressed) file size.
@@ -1241,6 +1264,70 @@ impl Table {
             self.metadata.columnar,
             self.metadata.data_block_restart_interval,
         )
+    }
+
+    /// Scans this columnar SST block by block, returning one [`ColumnBatch`] per
+    /// data block that survives the optional predicate, each carrying only the
+    /// projected columns.
+    ///
+    /// `projection` lists the column ids to decode; every other column is
+    /// stepped over without decoding. When `predicate` is set, a block whose
+    /// zone-map proves it out of range is skipped without being loaded, and each
+    /// surviving block is filtered to the rows that match.
+    ///
+    /// [`ColumnBatch`]: crate::table::columnar::ColumnBatch
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this SST is not columnar, or on a block read / decode
+    /// failure.
+    #[cfg(feature = "columnar")]
+    pub fn columnar_scan(
+        &self,
+        projection: &[u16],
+        predicate: Option<&crate::table::columnar_predicate::ColumnRangePredicate>,
+    ) -> crate::Result<Vec<crate::table::columnar::ColumnBatch>> {
+        if !self.metadata.columnar {
+            return Err(crate::Error::FeatureUnsupported("columnar"));
+        }
+        // The predicate must see its own column, even when the caller did not
+        // project it; decode it too and drop it from each output batch, so a
+        // predicate on an unprojected column still filters instead of matching
+        // every row.
+        let mut decode_projection = projection.to_vec();
+        let added_predicate_column = match predicate {
+            Some(pred) if !decode_projection.contains(&pred.column_id) => {
+                decode_projection.push(pred.column_id);
+                Some(pred.column_id)
+            }
+            _ => None,
+        };
+        let mut out = Vec::new();
+        for keyed in self.block_index.iter() {
+            let keyed = keyed?;
+            // Zone-map block skip: prove the block is out of range and never
+            // load it. A missing entry is conservative (cannot skip).
+            if let Some(pred) = predicate
+                && let Some(stats) = self.zone_map.columns_for(*keyed.offset())
+                && pred.can_skip_block(stats)
+            {
+                continue;
+            }
+            let handle = BlockHandle::new(keyed.offset(), keyed.size());
+            let batch = self.load_columnar_block_projected(&handle, &decode_projection)?;
+            let mut batch = match predicate {
+                Some(pred) => {
+                    let mask = pred.matching_rows(&batch);
+                    crate::table::columnar_predicate::filter_batch(&batch, &mask)
+                }
+                None => batch,
+            };
+            if let Some(column_id) = added_predicate_column {
+                batch.columns.retain(|c| c.column_id != column_id);
+            }
+            out.push(batch);
+        }
+        Ok(out)
     }
 
     /// Creates an iterator over the `Table`.
