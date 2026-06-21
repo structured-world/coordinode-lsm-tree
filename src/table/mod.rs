@@ -276,6 +276,12 @@ impl Table {
     }
 
     fn load_data_block(&self, handle: &BlockHandle) -> crate::Result<DataBlock> {
+        // Columnar SSTs store each data block as a PAX `ColumnBatch`; reconstruct
+        // the row entries on load so every row read path works unchanged.
+        #[cfg(feature = "columnar")]
+        if self.metadata.columnar {
+            return self.load_columnar_data_block(handle);
+        }
         // `from_loaded` transparently strips the per-KV checksum footer when
         // this SST carries one. Footer presence is a per-SST property
         // (`kv_checksum_algo`), not a per-block header flag — data blocks omit
@@ -289,6 +295,23 @@ impl Table {
             self.zstd_dictionary.as_deref(),
         )
         .and_then(|block| DataBlock::from_loaded(block, has_kv_footer))
+    }
+
+    /// Loads a columnar data block and reconstructs it as a row-major
+    /// [`DataBlock`]: decode the `ColumnBatch`, rebuild the entries, and
+    /// re-encode them row-major in memory so the existing point-read / iterator
+    /// machinery is reused verbatim. The native column-projection read path
+    /// (decode only the referenced columns) is a later optimization.
+    #[cfg(feature = "columnar")]
+    fn load_columnar_data_block(&self, handle: &BlockHandle) -> crate::Result<DataBlock> {
+        let block = self.load_block(
+            handle,
+            BlockType::Columnar,
+            self.metadata.data_block_compression,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+        )?;
+        DataBlock::from_columnar_block(&block.data, self.metadata.data_block_restart_interval)
     }
 
     /// Returns the (possibly compressed) file size.
@@ -1215,6 +1238,8 @@ impl Table {
             self.zstd_dictionary.clone(),
             self.comparator.clone(),
             self.metadata.id,
+            self.metadata.columnar,
+            self.metadata.data_block_restart_interval,
         )
     }
 
@@ -1380,6 +1405,7 @@ impl Table {
             self.metadata.ecc_params,
             self.heal_hints.get().cloned(),
             self.metadata.kv_checksum_algo.is_some(),
+            self.metadata.columnar,
             #[cfg(zstd_any)]
             self.zstd_dictionary.clone(),
             self.comparator.clone(),

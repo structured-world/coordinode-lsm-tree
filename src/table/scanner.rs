@@ -44,6 +44,14 @@ pub struct Scanner {
     /// Table id of the SST being scanned; threaded through to
     /// per-block reads via `BlockIdentity`.
     table_id: crate::TableId,
+
+    /// Whether this SST stores columnar (PAX) data blocks. When set, each
+    /// fetched block is read as `BlockType::Columnar` and reconstructed into a
+    /// row-major block so the scan iterator is unchanged.
+    columnar: bool,
+    /// Data-block restart interval, used to re-encode a reconstructed columnar
+    /// block (matches the value the SST recorded).
+    restart_interval: u8,
 }
 
 impl Scanner {
@@ -66,6 +74,8 @@ impl Scanner {
         #[cfg(zstd_any)] zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
         comparator: SharedComparator,
         table_id: crate::TableId,
+        columnar: bool,
+        restart_interval: u8,
     ) -> crate::Result<Self> {
         // 2 MiB buffer matches RocksDB's `compaction_readahead_size`
         // default and is large enough that the kernel can fold the
@@ -95,6 +105,8 @@ impl Scanner {
             encryption.as_deref(),
             ecc,
             has_kv_footer,
+            columnar,
+            restart_interval,
             #[cfg(zstd_any)]
             zstd_dictionary.as_deref(),
         )?;
@@ -120,9 +132,15 @@ impl Scanner {
             zstd_dictionary,
 
             table_id,
+            columnar,
+            restart_interval,
         })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "per-block read threads each SST-level read parameter through; a config struct would add indirection without removing a caller decision"
+    )]
     fn fetch_next_block(
         reader: &mut BufReader<Box<dyn FsFile>>,
         table_id: crate::TableId,
@@ -130,13 +148,22 @@ impl Scanner {
         encryption: Option<&dyn EncryptionProvider>,
         ecc: Option<crate::table::block::EccParams>,
         has_kv_footer: bool,
+        columnar: bool,
+        restart_interval: u8,
         #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     ) -> crate::Result<DataBlock> {
+        // A columnar SST's blocks are tagged (and AAD-bound) as Columnar; read
+        // them under that identity so verification / decryption matches.
+        let block_type = if columnar {
+            BlockType::Columnar
+        } else {
+            BlockType::Data
+        };
         let block = Block::from_reader(
             reader,
             crate::table::block::BlockIdentity {
                 table_id,
-                block_type: BlockType::Data,
+                block_type,
                 dict_id: compression.dict_id(),
                 window_log: 0,
             },
@@ -162,10 +189,13 @@ impl Scanner {
 
         match block {
             Ok(block) => {
-                // A data block is always BlockType::Data; `from_loaded`
-                // strips the per-KV checksum footer when this SST carries one
-                // (per-SST `has_kv_footer`, since data blocks omit the byte),
-                // so the scan path is unchanged.
+                // Columnar blocks are reconstructed into row blocks; a row block
+                // must be BlockType::Data. `from_loaded` strips the per-KV
+                // checksum footer when this SST carries one (per-SST
+                // `has_kv_footer`, since data blocks omit the byte).
+                if columnar {
+                    return Self::reconstruct_columnar(&block, restart_interval);
+                }
                 if block.header.block_type != BlockType::Data {
                     return Err(crate::Error::InvalidTag((
                         "BlockType",
@@ -176,6 +206,21 @@ impl Scanner {
                 DataBlock::from_loaded(block, has_kv_footer)
             }
             Err(e) => Err(e),
+        }
+    }
+
+    /// Reconstructs a row-major [`DataBlock`] from a loaded columnar block. With
+    /// the `columnar` feature this re-encodes the PAX block; without the feature
+    /// a columnar SST cannot be read.
+    fn reconstruct_columnar(block: &Block, restart_interval: u8) -> crate::Result<DataBlock> {
+        #[cfg(feature = "columnar")]
+        {
+            DataBlock::from_columnar_block(&block.data, restart_interval)
+        }
+        #[cfg(not(feature = "columnar"))]
+        {
+            let _ = (block, restart_interval);
+            Err(crate::Error::FeatureUnsupported("columnar"))
         }
     }
 }
@@ -202,6 +247,8 @@ impl Iterator for Scanner {
                 self.encryption.as_deref(),
                 self.ecc,
                 self.has_kv_footer,
+                self.columnar,
+                self.restart_interval,
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.as_deref(),
             ) {

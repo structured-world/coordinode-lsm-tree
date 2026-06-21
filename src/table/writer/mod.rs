@@ -1610,6 +1610,7 @@ impl Writer {
             data_block_restart_interval: self.data_block_restart_interval,
             index_block_restart_interval: self.index_block_restart_interval,
             initial_level: self.initial_level,
+            use_columnar: self.use_columnar,
             range_tombstone_count,
             created_at_nanos,
         };
@@ -1828,6 +1829,7 @@ struct MetaSectionParams<'a> {
     data_block_restart_interval: u8,
     index_block_restart_interval: u8,
     initial_level: u8,
+    use_columnar: bool,
     range_tombstone_count: u64,
     /// `created_at` snapshot taken once in `finish()`. Both MID and
     /// TAIL writes consume this same value; generating it inside
@@ -1963,6 +1965,11 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
             "data_block_hash_ratio",
             &p.data_block_hash_ratio.to_le_bytes(),
         ),
+        // Per-SST layout descriptor: whether every data block in this table is
+        // column-organized (PAX) rather than row-major. One byte for the whole
+        // homogeneous SST, so the read path learns the layout from the
+        // descriptor instead of inspecting a block header.
+        meta("descriptor#columnar", &[u8::from(p.use_columnar)]),
         // Per-SST transform descriptor: per-KV-footer presence + algorithm
         // as one byte (0 = no footer, else 1 + algo wire tag). Lets the
         // reader know the whole table's footer state without inspecting any
