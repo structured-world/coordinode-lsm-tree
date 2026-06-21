@@ -156,15 +156,21 @@ fn filter_column(col: &Column, rows: usize, mask: &[bool], kept: usize) -> Colum
             let mut acc: u32 = 0;
             offsets.extend_from_slice(&acc.to_le_bytes());
             for (row, &keep) in mask.iter().enumerate() {
-                if keep && let Some(value) = bytes_row(&col.data, rows, row) {
-                    payload.extend_from_slice(value);
-                    // The kept payload is a subset of the original, whose offsets
-                    // already fit u32, so the length and the running sum both fit
-                    // u32 and cannot overflow.
-                    let len = u32::try_from(value.len()).unwrap_or(u32::MAX);
-                    acc += len;
-                    offsets.extend_from_slice(&acc.to_le_bytes());
+                if !keep {
+                    continue;
                 }
+                // Every kept row writes exactly one offset, so the table stays in
+                // lockstep with the kept row count even if a row's bytes are
+                // unreadable: a corrupt slice degrades to empty rather than
+                // leaving a missing offset and malformed framing.
+                let value = bytes_row(&col.data, rows, row).unwrap_or(&[]);
+                payload.extend_from_slice(value);
+                // The kept payload is a subset of the original, whose offsets
+                // already fit u32. The caps only guard the unreachable overflow
+                // and keep the offsets monotonically non-decreasing.
+                let len = u32::try_from(value.len()).unwrap_or(u32::MAX);
+                acc = acc.saturating_add(len);
+                offsets.extend_from_slice(&acc.to_le_bytes());
             }
             offsets.extend_from_slice(&payload);
             offsets
