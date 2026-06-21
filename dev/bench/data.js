@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782030642117,
+  "lastUpdate": 1782036266511,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -18204,6 +18204,84 @@ window.BENCHMARK_DATA = {
             "value": 698428.7744692994,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.5us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "84a7b09b49ea133941a39c6086d75068be77b2af",
+          "message": "feat(tree): per-level / per-segment storage + access stats (#515)\n\n## Summary\n\nAdds `AbstractTree::level_segment_stats() -> Vec<LevelStats>`:\nper-LSM-level and per-segment size + entry counts + read-access stats,\nfor tiering and erasure-coding placement decisions (which level /\nsegment is large / hot enough to demote, EC-encode, or migrate).\n\n## How it works\n\n- **Size + count** (`LevelStats` / `SegmentStats`): per-level and\nper-segment physical on-disk bytes + entry count, derived from version\nmetadata plus one file-size stat per segment. Never reads a data block.\nThe per-level totals reconcile with the tree-level `StorageStats` (their\nsum equals the SST portion of `used_bytes` / `item_count`).\n- **Access stats**: a `Relaxed` `AtomicU64` `read_count` bumped on every\npoint-read funnel (`get` / `get_value` / `get_with_block`), plus the\nlast-access unix time on std builds. The engine keeps a monotonic\ncounter only; a tiering consumer derives a read-rate / EMA from the\ndelta between successive polls (no decay constant in the engine, no\nhot-path float). The clock store is std-gated, so a no-std build keeps\nthe counter and leaves last-access at zero.\n\n## Tests\n\n- `per_level_totals_reconcile_with_tree_aggregate` (sum across levels =\ntree-level total), `multiple_levels_are_reported_after_compaction`,\n`empty_tree_has_no_segments`, `point_reads_bump_segment_access_stats`\n(point reads bump the per-segment counter + last-access), and\n`reading_stats_does_not_scan_data_blocks` (metrics-gated: zero\ndata-block loads). Full suite (2054), `clippy --all-features\n--all-targets`, no-std (`alloc`), and doctests green.\n\nCloses #508\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n## New Features\n* Added `level_segment_stats` to provide detailed per-LSM-level and\nper-segment storage statistics (sizes and item counts), reconciling with\nexisting storage statistics.\n* Exposed new public statistics types (`LevelStats`, `SegmentStats`) for\nricher introspection.\n* Segments now track read activity via per-segment counters and (when\navailable) last-access timestamps, updated on relevant point reads.\n\n## Tests\n* Added integration coverage to validate stat correctness after\ninserts/flush/compaction and to confirm metrics builds avoid unnecessary\ndata-block loading.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-21T12:39:51+03:00",
+          "tree_id": "d6d1588ffd4644414505329f71e8b506206185c6",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/84a7b09b49ea133941a39c6086d75068be77b2af"
+        },
+        "date": 1782036265357,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2062777.0509410943,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1171327.1940639198,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 901485.420799151,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.1us | P99.9: 6.5us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3810198.033137673,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.0us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 464259.18212216627,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.2us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 238108.48146220704,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 4.8us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.84s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1198642.039255455,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1104812.9530126697,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.3us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 700511.7224121987,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 5.4us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
