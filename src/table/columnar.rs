@@ -8,9 +8,11 @@
 //! The engine attaches no relational or graph meaning to a column; it knows
 //! only the physical [`TypeTag`], the [`CodecId`] used to encode the bytes, and
 //! a caller-assigned `column_id`. This is the payload of a
-//! [`BlockType::Columnar`](crate::table::block::BlockType::Columnar) block; the
-//! transpose that produces it on flush / compaction is std-only and lives in
-//! the writer, while this encode / decode path is `core` + `alloc`.
+//! [`BlockType::Columnar`](crate::table::block::BlockType::Columnar) block. The
+//! intrinsic-field transpose ([`entries_to_column_batch`] and back), the
+//! encode, and the decode path are all `core` + `alloc` and live here; wiring
+//! the transpose into the flush / compaction writer is std-only and lands
+//! separately.
 //!
 //! # Examples
 //!
@@ -31,7 +33,7 @@
 //! assert_eq!(ColumnBatch::decode(&bytes).unwrap(), batch);
 //! ```
 
-use crate::{Error, Result};
+use crate::{Error, Result, Slice, ValueType, key::InternalKey, value::InternalValue};
 use alloc::vec::Vec;
 
 /// Physical layout category of a column's values. Drives codec selection and
@@ -411,10 +413,322 @@ impl<'a> Cursor<'a> {
     }
 }
 
+// --- Intrinsic-field transpose (engine-side, schema-free) ------------------
+//
+// The engine's columnar foundation lays each entry's intrinsic fields out as a
+// PAX row-group: one column for the user key, the seqno, the value type, and
+// the (opaque) value. This is schema-free and works for any tree; splitting the
+// value into per-field sub-columns is the consumer's concern and lives behind a
+// separate columnar ingest path, not here.
+
+/// Column id of the user-key column in the intrinsic transpose.
+pub const COL_USER_KEY: u16 = 0;
+/// Column id of the seqno column.
+pub const COL_SEQNO: u16 = 1;
+/// Column id of the value-type column.
+pub const COL_VALUE_TYPE: u16 = 2;
+/// Column id of the (opaque) value column.
+pub const COL_VALUE: u16 = 3;
+
+/// Builds a [`TypeTag::Bytes`] column body from per-row byte slices: a
+/// `(rows + 1)` little-endian `u32` offset table followed by the concatenated
+/// payload.
+fn build_bytes_column<'a>(rows: impl Iterator<Item = &'a [u8]>) -> Result<Vec<u8>> {
+    let mut offsets = Vec::new();
+    let mut payload = Vec::new();
+    let mut off: u32 = 0;
+    offsets.extend_from_slice(&off.to_le_bytes());
+    for r in rows {
+        let len = u32::try_from(r.len())
+            .map_err(|_| Error::InvalidHeader("columnar: column value exceeds u32"))?;
+        off = off
+            .checked_add(len)
+            .ok_or(Error::InvalidHeader("columnar: column payload exceeds u32"))?;
+        payload.extend_from_slice(r);
+        offsets.extend_from_slice(&off.to_le_bytes());
+    }
+    offsets.extend_from_slice(&payload);
+    Ok(offsets)
+}
+
+/// Reads row `i` of a [`TypeTag::Bytes`] column body (offset table + payload),
+/// bounds-checked.
+fn bytes_column_row(data: &[u8], row_count: u32, i: u32) -> Result<&[u8]> {
+    let off_bytes = (row_count as usize + 1) * 4;
+    let read_off = |idx: u32| -> Result<usize> {
+        let base = idx as usize * 4;
+        let b = data
+            .get(base..base + 4)
+            .ok_or(Error::InvalidHeader("columnar: bytes offset truncated"))?;
+        let arr: [u8; 4] = b
+            .try_into()
+            .map_err(|_| Error::InvalidHeader("columnar: short bytes offset"))?;
+        Ok(u32::from_le_bytes(arr) as usize)
+    };
+    let start = read_off(i)?;
+    let end = read_off(i + 1)?;
+    let payload = data
+        .get(off_bytes..)
+        .ok_or(Error::InvalidHeader("columnar: bytes payload truncated"))?;
+    payload
+        .get(start..end)
+        .ok_or(Error::InvalidHeader("columnar: bytes row out of range"))
+}
+
+/// Reads row `i` of a `Fixed(8)` column body as a little-endian `u64`.
+fn fixed_u64_row(data: &[u8], i: u32) -> Result<u64> {
+    let base = i as usize * 8;
+    let b = data
+        .get(base..base + 8)
+        .ok_or(Error::InvalidHeader("columnar: fixed8 row truncated"))?;
+    let arr: [u8; 8] = b
+        .try_into()
+        .map_err(|_| Error::InvalidHeader("columnar: short fixed8 row"))?;
+    Ok(u64::from_le_bytes(arr))
+}
+
+/// Transposes a run of entries into the engine's intrinsic columnar layout: one
+/// column each for `user_key`, `seqno`, `value_type`, and the opaque `value`.
+///
+/// # Errors
+///
+/// Returns an error if a column's total byte length or the row count exceeds the
+/// `u32` wire limits.
+pub fn entries_to_column_batch(entries: &[InternalValue]) -> Result<ColumnBatch> {
+    let row_count = u32::try_from(entries.len())
+        .map_err(|_| Error::InvalidHeader("columnar: row count exceeds u32"))?;
+    let key_data = build_bytes_column(entries.iter().map(|e| e.key.user_key.as_ref()))?;
+    let value_data = build_bytes_column(entries.iter().map(|e| e.value.as_ref()))?;
+    let mut seqno_data = Vec::with_capacity(entries.len() * 8);
+    let mut vt_data = Vec::with_capacity(entries.len());
+    for e in entries {
+        seqno_data.extend_from_slice(&e.key.seqno.to_le_bytes());
+        vt_data.push(u8::from(e.key.value_type));
+    }
+    let columns = alloc::vec![
+        Column {
+            column_id: COL_USER_KEY,
+            type_tag: TypeTag::Bytes,
+            validity: None,
+            data: key_data,
+        },
+        Column {
+            column_id: COL_SEQNO,
+            type_tag: TypeTag::Fixed(8),
+            validity: None,
+            data: seqno_data,
+        },
+        Column {
+            column_id: COL_VALUE_TYPE,
+            type_tag: TypeTag::Fixed(1),
+            validity: None,
+            data: vt_data,
+        },
+        Column {
+            column_id: COL_VALUE,
+            type_tag: TypeTag::Bytes,
+            validity: None,
+            data: value_data,
+        },
+    ];
+    Ok(ColumnBatch { row_count, columns })
+}
+
+/// Reconstructs the entries from an intrinsic columnar batch produced by
+/// [`entries_to_column_batch`].
+///
+/// # Errors
+///
+/// Returns an error if the batch does not carry exactly the four intrinsic
+/// columns in order with the expected type tags, or if a row is truncated or
+/// carries an unknown value type.
+pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>> {
+    let [key_col, seqno_col, vt_col, value_col] = batch.columns.as_slice() else {
+        return Err(Error::InvalidHeader(
+            "columnar: expected four intrinsic columns",
+        ));
+    };
+    if key_col.column_id != COL_USER_KEY
+        || key_col.type_tag != TypeTag::Bytes
+        || seqno_col.column_id != COL_SEQNO
+        || seqno_col.type_tag != TypeTag::Fixed(8)
+        || vt_col.column_id != COL_VALUE_TYPE
+        || vt_col.type_tag != TypeTag::Fixed(1)
+        || value_col.column_id != COL_VALUE
+        || value_col.type_tag != TypeTag::Bytes
+    {
+        return Err(Error::InvalidHeader(
+            "columnar: unexpected intrinsic column layout",
+        ));
+    }
+    // Intrinsic fields are never null, and a hand-built `ColumnBatch` must clear
+    // the same framing checks a decoded one does. Running `validate` here also
+    // bounds `row_count` against the fixed-width column lengths before the
+    // allocation below, so a malformed batch claiming a huge row count is
+    // rejected instead of reserving for billions of rows.
+    for col in [key_col, seqno_col, vt_col, value_col] {
+        if col.validity.is_some() {
+            return Err(Error::InvalidHeader(
+                "columnar: intrinsic columns must not be nullable",
+            ));
+        }
+        col.validate(batch.row_count)?;
+    }
+    let mut out = Vec::with_capacity(batch.row_count as usize);
+    for i in 0..batch.row_count {
+        let user_key = bytes_column_row(&key_col.data, batch.row_count, i)?;
+        // Match the engine's key invariants (non-empty, fits the u16 length the
+        // table encoder casts to) so a malformed row cannot become an entry that
+        // corrupts later block encoding.
+        if user_key.is_empty() || user_key.len() > u16::MAX as usize {
+            return Err(Error::InvalidHeader(
+                "columnar: user key is empty or longer than u16::MAX",
+            ));
+        }
+        let seqno = fixed_u64_row(&seqno_col.data, i)?;
+        let vt_byte = vt_col
+            .data
+            .get(i as usize)
+            .copied()
+            .ok_or(Error::InvalidHeader("columnar: value-type row truncated"))?;
+        let value_type =
+            ValueType::try_from(vt_byte).map_err(|()| Error::InvalidTag(("ValueType", vt_byte)))?;
+        let value = bytes_column_row(&value_col.data, batch.row_count, i)?;
+        out.push(InternalValue {
+            key: InternalKey {
+                user_key: Slice::from(user_key),
+                seqno,
+                value_type,
+            },
+            value: Slice::from(value),
+        });
+    }
+    Ok(out)
+}
+
 #[expect(clippy::expect_used, clippy::indexing_slicing, reason = "test code")]
 #[cfg(test)]
 mod tests {
-    use super::{CodecId, Column, ColumnBatch, TypeTag};
+    use super::{
+        CodecId, Column, ColumnBatch, TypeTag, column_batch_to_entries, entries_to_column_batch,
+    };
+    use crate::{Slice, ValueType, key::InternalKey, value::InternalValue};
+
+    fn entry(user_key: &[u8], seqno: u64, value_type: ValueType, value: &[u8]) -> InternalValue {
+        InternalValue {
+            key: InternalKey {
+                user_key: Slice::from(user_key),
+                seqno,
+                value_type,
+            },
+            value: Slice::from(value),
+        }
+    }
+
+    fn assert_entries_eq(a: &[InternalValue], b: &[InternalValue]) {
+        assert_eq!(a.len(), b.len(), "entry count mismatch");
+        for (x, y) in a.iter().zip(b) {
+            assert_eq!(x.key.user_key.as_ref(), y.key.user_key.as_ref());
+            assert_eq!(x.key.seqno, y.key.seqno);
+            assert!(x.key.value_type == y.key.value_type, "value_type mismatch");
+            assert_eq!(x.value.as_ref(), y.value.as_ref());
+        }
+    }
+
+    #[test]
+    fn intrinsic_transpose_round_trips_entries() {
+        // A mix of value kinds, including a tombstone (empty value) and a merge
+        // operand, exercises the value column's variable width and the
+        // value-type column.
+        let entries = vec![
+            entry(b"alpha", 10, ValueType::Value, b"v1"),
+            entry(b"bravo", 9, ValueType::Tombstone, b""),
+            entry(b"charlie", 8, ValueType::MergeOperand, b"+1"),
+        ];
+        let batch = entries_to_column_batch(&entries).expect("transpose");
+        assert_eq!(batch.row_count, 3);
+        assert_eq!(batch.columns.len(), 4, "four intrinsic columns");
+
+        // Direct reconstruction.
+        let back = column_batch_to_entries(&batch).expect("untranspose");
+        assert_entries_eq(&entries, &back);
+
+        // And through the block encode / decode, so the transpose composes with
+        // the on-disk columnar format.
+        let bytes = batch.encode(CodecId::Plain).expect("encode");
+        let decoded = ColumnBatch::decode(&bytes).expect("decode");
+        let back2 = column_batch_to_entries(&decoded).expect("untranspose decoded");
+        assert_entries_eq(&entries, &back2);
+    }
+
+    #[test]
+    fn intrinsic_untranspose_rejects_wrong_layout() {
+        // A batch whose columns are not the four intrinsic columns is refused.
+        let bad = ColumnBatch {
+            row_count: 1,
+            columns: vec![Column {
+                column_id: 0,
+                type_tag: TypeTag::Fixed(4),
+                validity: None,
+                data: vec![0; 4],
+            }],
+        };
+        assert!(column_batch_to_entries(&bad).is_err());
+    }
+
+    #[test]
+    fn intrinsic_untranspose_rejects_nullable_intrinsic() {
+        // Intrinsic fields are never null; a validity bitmap on one marks a
+        // malformed batch even if it is otherwise well-framed.
+        let mut batch =
+            entries_to_column_batch(&[entry(b"k", 1, ValueType::Value, b"v")]).expect("transpose");
+        batch.columns[0].validity = Some(vec![0b1]); // one valid row, but nullable
+        assert!(column_batch_to_entries(&batch).is_err());
+    }
+
+    #[test]
+    fn intrinsic_untranspose_rejects_empty_key() {
+        // An empty user key violates the engine's key invariant.
+        let batch =
+            entries_to_column_batch(&[entry(b"", 1, ValueType::Value, b"v")]).expect("transpose");
+        assert!(column_batch_to_entries(&batch).is_err());
+    }
+
+    #[test]
+    fn intrinsic_untranspose_rejects_huge_row_count() {
+        // A hand-built batch claiming billions of rows but carrying tiny columns
+        // is rejected by per-column validation before any allocation.
+        let bad = ColumnBatch {
+            row_count: u32::MAX,
+            columns: vec![
+                Column {
+                    column_id: 0,
+                    type_tag: TypeTag::Bytes,
+                    validity: None,
+                    data: 0u32.to_le_bytes().to_vec(),
+                },
+                Column {
+                    column_id: 1,
+                    type_tag: TypeTag::Fixed(8),
+                    validity: None,
+                    data: Vec::new(),
+                },
+                Column {
+                    column_id: 2,
+                    type_tag: TypeTag::Fixed(1),
+                    validity: None,
+                    data: Vec::new(),
+                },
+                Column {
+                    column_id: 3,
+                    type_tag: TypeTag::Bytes,
+                    validity: None,
+                    data: 0u32.to_le_bytes().to_vec(),
+                },
+            ],
+        };
+        assert!(column_batch_to_entries(&bad).is_err());
+    }
 
     fn sample_batch() -> ColumnBatch {
         // 3 rows: a fixed u32 column (row 1 null) and a variable-width Bytes
