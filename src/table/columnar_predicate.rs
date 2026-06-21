@@ -110,6 +110,98 @@ impl ColumnRangePredicate {
     }
 }
 
+/// Compacts a decoded batch down to the rows a predicate matched.
+///
+/// Returns a new batch keeping only the rows where `mask[i]` is true, preserving
+/// column order and per-column framing, so the scan yields only matching rows. A
+/// mask shorter than `row_count` drops the unspecified trailing rows.
+#[must_use]
+pub fn filter_batch(batch: &ColumnBatch, mask: &[bool]) -> ColumnBatch {
+    let kept = mask.iter().filter(|&&m| m).count();
+    let rows = batch.row_count as usize;
+    let columns = batch
+        .columns
+        .iter()
+        .map(|c| filter_column(c, rows, mask, kept))
+        .collect();
+    // kept <= row_count, which is a u32, so the count fits.
+    let row_count = u32::try_from(kept).unwrap_or(batch.row_count);
+    ColumnBatch { row_count, columns }
+}
+
+/// Compacts one column to the rows selected by `mask`, rebuilding its framing
+/// (fixed chunks copied through, `Bytes` offset table + payload rebuilt) and its
+/// validity bitmap.
+fn filter_column(col: &Column, rows: usize, mask: &[bool], kept: usize) -> Column {
+    let data = match col.type_tag {
+        TypeTag::Fixed(width) => {
+            let width = width as usize;
+            // Bounded by a block's row count and the fixed width, so no overflow.
+            let mut out = Vec::with_capacity(kept * width);
+            for (row, &keep) in mask.iter().enumerate() {
+                if keep
+                    && let Some(start) = row.checked_mul(width)
+                    && let Some(end) = start.checked_add(width)
+                    && let Some(chunk) = col.data.get(start..end)
+                {
+                    out.extend_from_slice(chunk);
+                }
+            }
+            out
+        }
+        TypeTag::Bytes => {
+            // Rebuild the (kept + 1) u32 offset table and the packed payload.
+            let mut offsets = Vec::with_capacity((kept + 1) * 4);
+            let mut payload = Vec::new();
+            let mut acc: u32 = 0;
+            offsets.extend_from_slice(&acc.to_le_bytes());
+            for (row, &keep) in mask.iter().enumerate() {
+                if keep && let Some(value) = bytes_row(&col.data, rows, row) {
+                    payload.extend_from_slice(value);
+                    // The kept payload is a subset of the original, whose offsets
+                    // already fit u32, so the length and the running sum both fit
+                    // u32 and cannot overflow.
+                    let len = u32::try_from(value.len()).unwrap_or(u32::MAX);
+                    acc += len;
+                    offsets.extend_from_slice(&acc.to_le_bytes());
+                }
+            }
+            offsets.extend_from_slice(&payload);
+            offsets
+        }
+    };
+    let validity = col
+        .validity
+        .as_ref()
+        .map(|bits| compact_validity(bits, mask, kept));
+    Column {
+        column_id: col.column_id,
+        type_tag: col.type_tag,
+        validity,
+        data,
+    }
+}
+
+/// Rebuilds a validity bitmap for the rows selected by `mask`, preserving each
+/// kept row's null bit in compacted order.
+fn compact_validity(bits: &[u8], mask: &[bool], kept: usize) -> Vec<u8> {
+    let mut out = alloc::vec![0u8; kept.div_ceil(8)];
+    let mut o = 0usize;
+    for (row, &keep) in mask.iter().enumerate() {
+        if !keep {
+            continue;
+        }
+        let valid = bits
+            .get(row / 8)
+            .is_some_and(|b| b & (1u8 << (row % 8)) != 0);
+        if valid && let Some(byte) = out.get_mut(o / 8) {
+            *byte |= 1u8 << (o % 8);
+        }
+        o += 1;
+    }
+    out
+}
+
 /// Whether row `row` is valid (non-null) per the column's validity bitmap. A
 /// column with no bitmap has every row valid; otherwise a set bit means valid.
 fn row_valid(col: &Column, row: usize) -> bool {
@@ -143,10 +235,10 @@ fn read_u32_le(bytes: &[u8]) -> Option<u32> {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, reason = "test code")]
+#[expect(clippy::expect_used, clippy::indexing_slicing, reason = "test code")]
 mod tests {
-    use super::{ColumnRangePredicate, ColumnStats};
-    use crate::table::columnar::entries_to_column_batch;
+    use super::{ColumnRangePredicate, ColumnStats, filter_batch};
+    use crate::table::columnar::{column_batch_to_entries, entries_to_column_batch};
     use crate::{Slice, ValueType, key::InternalKey, value::InternalValue};
 
     fn entry(key: &[u8], seqno: u64, value: &[u8]) -> InternalValue {
@@ -208,5 +300,29 @@ mod tests {
             upper: None,
         };
         assert_eq!(pred.matching_rows(&batch), vec![true]);
+    }
+
+    #[test]
+    fn filter_batch_keeps_only_masked_rows() {
+        // Three rows; keep rows 0 and 2. The round trip through the transpose
+        // checks every intrinsic column (key, seqno, value type, value) is
+        // compacted correctly.
+        let entries = vec![
+            entry(b"aaa", 3, b"va"),
+            entry(b"bbb", 2, b"vb"),
+            entry(b"ccc", 1, b"vc"),
+        ];
+        let batch = entries_to_column_batch(&entries).expect("transpose");
+        let filtered = filter_batch(&batch, &[true, false, true]);
+        assert_eq!(filtered.row_count, 2);
+
+        let back = column_batch_to_entries(&filtered).expect("untranspose");
+        assert_eq!(back.len(), 2);
+        assert_eq!(&*back[0].key.user_key, b"aaa");
+        assert_eq!(back[0].key.seqno, 3);
+        assert_eq!(&*back[0].value, b"va");
+        assert_eq!(&*back[1].key.user_key, b"ccc");
+        assert_eq!(back[1].key.seqno, 1);
+        assert_eq!(&*back[1].value, b"vc");
     }
 }
