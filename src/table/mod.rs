@@ -1290,6 +1290,18 @@ impl Table {
         if !self.metadata.columnar {
             return Err(crate::Error::FeatureUnsupported("columnar"));
         }
+        // The predicate must see its own column, even when the caller did not
+        // project it; decode it too and drop it from each output batch, so a
+        // predicate on an unprojected column still filters instead of matching
+        // every row.
+        let mut decode_projection = projection.to_vec();
+        let added_predicate_column = match predicate {
+            Some(pred) if !decode_projection.contains(&pred.column_id) => {
+                decode_projection.push(pred.column_id);
+                Some(pred.column_id)
+            }
+            _ => None,
+        };
         let mut out = Vec::new();
         for keyed in self.block_index.iter() {
             let keyed = keyed?;
@@ -1302,14 +1314,17 @@ impl Table {
                 continue;
             }
             let handle = BlockHandle::new(keyed.offset(), keyed.size());
-            let batch = self.load_columnar_block_projected(&handle, projection)?;
-            let batch = match predicate {
+            let batch = self.load_columnar_block_projected(&handle, &decode_projection)?;
+            let mut batch = match predicate {
                 Some(pred) => {
                     let mask = pred.matching_rows(&batch);
                     crate::table::columnar_predicate::filter_batch(&batch, &mask)
                 }
                 None => batch,
             };
+            if let Some(column_id) = added_predicate_column {
+                batch.columns.retain(|c| c.column_id != column_id);
+            }
             out.push(batch);
         }
         Ok(out)

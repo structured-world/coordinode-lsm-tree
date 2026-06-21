@@ -109,3 +109,41 @@ fn columnar_scan_predicate_equals_a_naive_filter() {
     let expected: Vec<Vec<u8>> = (1000..=1999u32).map(key).collect();
     assert_eq!(got, expected, "predicate scan must equal the naive filter");
 }
+
+#[test]
+fn columnar_scan_predicate_on_an_unprojected_column_still_filters() {
+    // Project only the value column, but filter on the (unprojected) key column.
+    // The predicate must still apply, not be silently bypassed, and the output
+    // must carry only the projected value column.
+    let folder = get_tmp_folder();
+    let tree = open_columnar(folder.path());
+    let n = 4000u32;
+    for i in 0..n {
+        tree.insert(key(i), vec![b'v'; 80], 0);
+    }
+    tree.flush_active_memtable(0).expect("flush");
+
+    let version = tree.current_version();
+    let table = version.iter_tables().next().expect("one flushed SST");
+
+    let pred = ColumnRangePredicate {
+        column_id: COL_USER_KEY,
+        lower: Some(key(1000)),
+        upper: Some(key(1999)),
+    };
+    let batches = table
+        .columnar_scan(&[COL_VALUE], Some(&pred))
+        .expect("columnar scan");
+
+    let total: usize = batches.iter().map(|b| b.row_count as usize).sum();
+    assert_eq!(
+        total, 1000,
+        "a predicate on an unprojected column must still filter the rows"
+    );
+    for batch in &batches {
+        assert!(
+            batch.columns.iter().all(|c| c.column_id == COL_VALUE),
+            "the output must carry only the projected value column"
+        );
+    }
+}

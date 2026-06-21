@@ -305,10 +305,13 @@ unsafe fn byte_eq_avx2(data: &[u8], value: u8) -> Vec<bool> {
     // caller has verified present; the load is unaligned (`loadu`) over a full
     // 32-byte chunk, so it stays in bounds.
     unsafe {
-        let needle = _mm256_set1_epi8(value as i8);
+        // Reinterpret the byte as i8 and the movemask as u32 (bit-preserving,
+        // since the comparison and the lane mask are width-exact).
+        let needle = _mm256_set1_epi8(i8::from_ne_bytes([value]));
         for chunk in &mut chunks {
             let v = _mm256_loadu_si256(chunk.as_ptr().cast());
-            let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, needle)) as u32;
+            let cmp = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, needle));
+            let mask = u32::from_ne_bytes(cmp.to_ne_bytes());
             for i in 0..32u32 {
                 out.push((mask >> i) & 1 == 1);
             }
