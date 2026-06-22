@@ -1380,7 +1380,7 @@ mod tests {
         COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, CodecId, Column, ColumnBatch, TypeTag,
         column_batch_to_entries, entries_to_column_batch, frame_value_cells,
         frame_value_cells_nullable, unframe_value_cells, unframe_value_cells_nullable,
-        unframe_value_cells_with_defaults,
+        unframe_value_cells_with_defaults, validate_columnar_ingest_batch,
     };
     use crate::{Slice, ValueType, key::InternalKey, value::InternalValue};
 
@@ -1890,6 +1890,20 @@ mod tests {
         assert!(
             column_batch_to_entries(&duplicate).is_err(),
             "duplicate value sub-column ids must be rejected",
+        );
+    }
+
+    #[test]
+    fn validate_ingest_rejects_an_invalid_value_type() {
+        // The eager ingest validation must reject a malformed value-type byte on
+        // the submitting call, not defer it to the flush-time decode.
+        let mut batch =
+            entries_to_column_batch(&[entry(b"k0", 0, ValueType::Value, b"v")]).expect("transpose");
+        batch.columns[2].data[0] = 99; // not a valid ValueType tag
+        assert!(
+            validate_columnar_ingest_batch(&batch, &crate::comparator::default_comparator())
+                .is_err(),
+            "an invalid value-type tag must be rejected during eager validation",
         );
     }
 
