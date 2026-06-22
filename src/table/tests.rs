@@ -3657,6 +3657,14 @@ fn zone_map_absent_without_policy() -> crate::Result<()> {
 
 /// Helper: recover a freshly written table from `file` with default test config.
 fn recover_test_table(file: &std::path::Path, checksum: Checksum) -> crate::Result<Table> {
+    recover_test_table_with_id(file, checksum, 0)
+}
+
+fn recover_test_table_with_id(
+    file: &std::path::Path,
+    checksum: Checksum,
+    table_id: TableId,
+) -> crate::Result<Table> {
     #[cfg(feature = "metrics")]
     let metrics = Arc::new(Metrics::default());
     Table::recover(
@@ -3664,7 +3672,7 @@ fn recover_test_table(file: &std::path::Path, checksum: Checksum) -> crate::Resu
         checksum,
         0,
         0,
-        0,
+        table_id,
         Arc::new(Cache::with_capacity_bytes(1_000_000)),
         Some(Arc::new(DescriptorTable::new(10))),
         Arc::new(StdFs),
@@ -3973,5 +3981,117 @@ fn write_columnar_batch_stores_value_subcolumns_and_round_trips() -> crate::Resu
         unframe_value_cells(v1.value.as_ref(), &tags)?,
         vec![&[2, 0, 0, 0][..], &b"bbb"[..]],
     );
+    Ok(())
+}
+
+/// A positional delete-bitmap masks whole rows of a value-sub-column segment in
+/// both the point and the projection read paths: the mask is value-agnostic, so
+/// deleting by position hides each row's intrinsic key and every sub-column
+/// while survivors keep their reconstructed sub-cells and projected bytes.
+#[cfg(feature = "columnar")]
+#[test]
+fn delete_bitmap_masks_value_subcolumns_in_point_and_projection_reads() -> crate::Result<()> {
+    use crate::fs::SyncMode;
+    use crate::table::columnar::{Column, TypeTag, entries_to_column_batch, unframe_value_cells};
+    use crate::table::delete_bitmap::DeleteBitmap;
+
+    let dir = tempdir()?;
+    let src = dir.path().join("src");
+    let out = dir.path().join("out");
+
+    // Five rows; the value is split into a fixed-4 (col 3) and a bytes (col 4)
+    // sub-column. fixed values 10,20,30,40,50; bytes "a","bb","ccc","dddd","eeeee".
+    let fixed: [u32; 5] = [10, 20, 30, 40, 50];
+    let payloads: [&[u8]; 5] = [b"a", b"bb", b"ccc", b"dddd", b"eeeee"];
+    let mut batch = entries_to_column_batch(
+        &(0..5u32)
+            .map(|i| {
+                crate::InternalValue::from_components(
+                    format!("k{i}").into_bytes(),
+                    b"x",
+                    1,
+                    crate::ValueType::Value,
+                )
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    batch.columns.pop();
+    batch.columns.push(Column {
+        column_id: 3,
+        type_tag: TypeTag::Fixed(4),
+        validity: None,
+        data: fixed.iter().flat_map(|v| v.to_le_bytes()).collect(),
+    });
+    let mut bytes_data = Vec::new();
+    let mut acc = 0u32;
+    bytes_data.extend_from_slice(&acc.to_le_bytes());
+    for p in payloads {
+        acc += u32::try_from(p.len()).unwrap();
+        bytes_data.extend_from_slice(&acc.to_le_bytes());
+    }
+    for p in payloads {
+        bytes_data.extend_from_slice(p);
+    }
+    batch.columns.push(Column {
+        column_id: 4,
+        type_tag: TypeTag::Bytes,
+        validity: None,
+        data: bytes_data,
+    });
+
+    let mut writer = Writer::new(src.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    writer.write_columnar_batch(&batch)?;
+    let (_, checksum) = writer.finish()?.expect("source written");
+    let source = recover_test_table(&src, checksum)?;
+
+    // Mask rows 1 and 3 by position (value-agnostic) and relocate.
+    let mut bitmap = DeleteBitmap::new();
+    bitmap.insert(1);
+    bitmap.insert(3);
+    let out_checksum =
+        source.relocate_columnar_with_deletes(&out, &StdFs, 1, &bitmap, SyncMode::Normal)?;
+    let relocated = recover_test_table_with_id(&out, out_checksum, 1)?;
+
+    // Point path: masked rows read absent; survivors reconstruct their sub-cells.
+    let tags = [TypeTag::Fixed(4), TypeTag::Bytes];
+    for i in 0..5u32 {
+        let key = format!("k{i}").into_bytes();
+        let got = relocated.get(&key, SeqNo::MAX, hash64(&key))?;
+        if i == 1 || i == 3 {
+            assert!(got.is_none(), "masked row {i} must read absent");
+        } else {
+            let v = got.expect("survivor present");
+            assert_eq!(
+                unframe_value_cells(v.value.as_ref(), &tags)?,
+                vec![&fixed[i as usize].to_le_bytes()[..], payloads[i as usize]],
+                "survivor {i} sub-cells",
+            );
+        }
+    }
+
+    // Projection path: a scan over sub-column 3 yields the survivors only, with
+    // their fixed bytes; the masked rows never appear.
+    let batches = relocated.columnar_scan(&[3], None)?;
+    let mut col3 = Vec::new();
+    let mut rows = 0u32;
+    for b in &batches {
+        assert!(
+            b.columns.iter().all(|c| c.column_id == 3),
+            "projection decodes only sub-column 3",
+        );
+        rows += b.row_count;
+        for c in b.columns.iter().filter(|c| c.column_id == 3) {
+            col3.extend_from_slice(&c.data);
+        }
+    }
+    assert_eq!(rows, 3, "two of five rows masked out of the projection");
+    let want: Vec<u8> = [10u32, 30, 50]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    assert_eq!(col3, want, "projected fixed bytes are the survivors");
+
     Ok(())
 }
