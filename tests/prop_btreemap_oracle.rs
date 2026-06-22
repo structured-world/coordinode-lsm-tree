@@ -378,6 +378,8 @@ fn run_oracle_test(ops: Vec<Op>) -> Result<(), TestCaseError> {
                 let end = key_from_idx(*end_idx);
                 let seqno = seqno_counter.next();
                 oracle.delete_range(start.clone(), end.clone(), seqno);
+                // remove_range returns the count of range tombstones written, not
+                // a Result; it is infallible, so the count is intentionally unused.
                 let _ = tree.remove_range(start, end, seqno);
                 visible_seqno.fetch_max(seqno + 1);
             }
