@@ -7,6 +7,8 @@
 pub(crate) mod fifo;
 pub(crate) mod leveled;
 // pub(crate) mod maintenance;
+#[cfg(feature = "std")]
+pub(crate) mod delete_materialize;
 pub(crate) mod drop_range;
 pub mod filter;
 mod flavour;
