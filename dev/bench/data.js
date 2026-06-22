@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782074781279,
+  "lastUpdate": 1782102532084,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -18750,6 +18750,84 @@ window.BENCHMARK_DATA = {
             "value": 688609.561535884,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 4.4us | P99.9: 6.8us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c7fafb0251e9332792acf852e3e0f47648a23865",
+          "message": "test(oracle): extend the BTreeMap-oracle model harness to the full operation set (#526)\n\n## Summary\n\nExtends the BTreeMap-oracle property test from put / remove / flush /\ncompact / scan to the full operation set, so the engine is checked\nagainst an independent reference model across every correctness-critical\npath. Lands a model gate ahead of the positional delete-bitmap work.\n\n## What it adds\n\n- **checkpoint + reopen**: flush, drop the tree (releasing the directory\nlock), recover from disk, and re-verify the full visible state (a shared\n`verify_against_oracle` helper runs point reads, full scan, and prefix\nscans).\n- **snapshot reads** at historical seqnos within the GC-safe window\n`[gc_floor, read_seqno]`, where `gc_floor` is the highest compaction\nwatermark. A compaction at watermark W preserves, for every key, all\nversions at seqno >= W plus the latest below W, so any read at seqno >=\nW still matches the full-history oracle.\n- **scan_since_seqno** change-data-capture: every write at `seqno >=\ntarget`, un-collapsed and seqno-ordered, modeled as comparable\n`CdcEvent`s (point writes, range tombstones, merge operands). Point\ntombstones the engine materializes from a range deletion on flush are\nrecognized and dropped.\n- **delete_range**: range tombstones modeled as half-open `[start, end)`\nintervals, consulted by reads and scans and emitted from scan_since.\n- **merge**: a `Merge` op driving `tree.merge` with a commutative\n`MaxMerge` operator (lexicographic max of base and operands), so the\noracle models the fold without tracking operand order. Per-version state\nbecomes an `Entry` enum (value / tombstone / merge operand), and reads /\nscans resolve through a single fold unifying point versions, range\ntombstones, and merge operands.\n\n## Testing\n\nRandomized op sequences are applied to both the engine and the oracle;\nagreement is asserted after the run and across each flush / compaction /\nreopen.\n\n- `cargo nextest run --features lz4,zstd` — 2065 passed (the enhanced\n`prop_btreemap_oracle` included)\n- `PROPTEST_CASES=400` on the oracle test — passes\n- `cargo clippy --all-features --all-targets` — clean\n- no-std: `cargo check --target thumbv7em-none-eabihf\n--no-default-features --features alloc` — 0 errors (test-only change)\n- `cargo test --doc --features lz4,zstd` — passes\n\nCloses #519\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Tests**\n* Enhanced property-based MVCC oracle coverage to validate commutative\nmerge behavior (operand order independence) and range tombstones,\nincluding correct visibility resolution at specific sequence numbers.\n* Expanded change-data-capture verification to include merge operands\nand range deletions, with adjusted event ordering and filtering to match\nthe engine’s emitted stream.\n* Added coverage for reopen/persistence and a deterministic regression\nscenario ensuring merges over range-deleted keys resolve correctly.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-22T07:28:00+03:00",
+          "tree_id": "91948cd70c88bc446ebe09e828f2461c110c8079",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/c7fafb0251e9332792acf852e3e0f47648a23865"
+        },
+        "date": 1782102530922,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1957257.1827717682,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1235165.1722156215,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 906530.9686503235,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.0us | P99.9: 6.5us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3816063.4519766537,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 462763.936977614,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.2us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 238322.30591397232,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 4.8us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.84s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1292159.7400174602,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.0us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.15s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1084117.1423480879,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 2.8us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 698696.6125612662,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 5.6us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
