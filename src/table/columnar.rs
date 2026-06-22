@@ -411,11 +411,17 @@ impl ColumnBatch {
                 .all(|(a, b)| a.column_id == b.column_id && a.type_tag == b.type_tag)
     }
 
-    /// Total size of the column data, used to decide when an accumulated
-    /// rowgroup has reached the target block size.
+    /// Total size of the column bytes (data plus any validity bitmap), used to
+    /// decide when an accumulated rowgroup has reached the target block size. The
+    /// validity bitmap is `ceil(row_count / 8)` bytes per nullable column, so
+    /// omitting it would let a nullable-heavy rowgroup overrun the target before
+    /// the flush threshold trips.
     #[must_use]
     pub(crate) fn data_size(&self) -> usize {
-        self.columns.iter().map(|c| c.data.len()).sum()
+        self.columns
+            .iter()
+            .map(|c| c.data.len() + c.validity.as_ref().map_or(0, Vec::len))
+            .sum()
     }
 
     /// Appends `other`'s rows after this batch's, in place, so a sequence of
@@ -915,7 +921,14 @@ fn reconstruct_row_value(value_cols: &[Column], row_count: u32, row: u32) -> Res
     Ok(Slice::from(frame_value_cells(&cells)?))
 }
 
-pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>> {
+/// Validates the intrinsic + value column layout and per-column framing of a
+/// columnar batch, returning the destructured columns. Shared by
+/// [`column_batch_to_entries`] (which then decodes every row) and
+/// [`validate_columnar_ingest_batch`] (which checks the ingest contract without
+/// decoding), so the structural checks cannot diverge between the two paths.
+fn validate_columnar_columns(
+    batch: &ColumnBatch,
+) -> Result<(&Column, &Column, &Column, &[Column])> {
     let [key_col, seqno_col, vt_col, value_cols @ ..] = batch.columns.as_slice() else {
         return Err(Error::InvalidHeader(
             "columnar: batch missing the intrinsic columns",
@@ -938,9 +951,9 @@ pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>
         ));
     }
     // The three intrinsic fields are never null. Running `validate` also bounds
-    // `row_count` against the fixed-width column lengths before the allocation
-    // below, so a malformed batch claiming a huge row count is rejected instead
-    // of reserving for billions of rows.
+    // `row_count` against the fixed-width column lengths, so a malformed batch
+    // claiming a huge row count is rejected instead of reserving for billions of
+    // rows.
     for col in [key_col, seqno_col, vt_col] {
         if col.validity.is_some() {
             return Err(Error::InvalidHeader(
@@ -965,6 +978,58 @@ pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>
         seen_value_column_ids.push(col.column_id);
         col.validate(batch.row_count)?;
     }
+    Ok((key_col, seqno_col, vt_col, value_cols))
+}
+
+/// Validates a columnar batch against the ingest contract without decoding every
+/// row into an [`InternalValue`].
+///
+/// The column layout / framing must be valid, every row's seqno `0` (the
+/// ingestion assigns the sequence number), and keys strictly increasing within
+/// the batch. The full decode runs once at flush on the accumulated rowgroup, so
+/// this lets the ingestion reject a bad batch eagerly without deserialising every
+/// submitted row twice. Cross-batch ordering is the caller's responsibility (it
+/// tracks the last key written).
+///
+/// # Errors
+///
+/// Returns an error if the layout / framing is invalid, a row carries a non-zero
+/// seqno, or the keys are empty / oversized / not strictly increasing within the
+/// batch.
+pub fn validate_columnar_ingest_batch(
+    batch: &ColumnBatch,
+    comparator: &crate::SharedComparator,
+) -> Result<()> {
+    let (key_col, seqno_col, _vt_col, _value_cols) = validate_columnar_columns(batch)?;
+    for i in 0..batch.row_count {
+        if fixed_u64_row(&seqno_col.data, i)? != 0 {
+            return Err(Error::FeatureUnsupported(
+                "columnar batch ingest requires every row seqno to be 0 (the ingestion assigns the sequence number)",
+            ));
+        }
+    }
+    let mut prev: Option<&[u8]> = None;
+    for i in 0..batch.row_count {
+        let key = bytes_column_row(&key_col.data, batch.row_count, i)?;
+        if key.is_empty() || key.len() > u16::MAX as usize {
+            return Err(Error::InvalidHeader(
+                "columnar: user key is empty or longer than u16::MAX",
+            ));
+        }
+        if let Some(p) = prev
+            && comparator.compare(p, key) != core::cmp::Ordering::Less
+        {
+            return Err(Error::InvalidHeader(
+                "columnar batch ingest requires strictly increasing keys",
+            ));
+        }
+        prev = Some(key);
+    }
+    Ok(())
+}
+
+pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>> {
+    let (key_col, seqno_col, vt_col, value_cols) = validate_columnar_columns(batch)?;
     let mut out = Vec::with_capacity(batch.row_count as usize);
     for i in 0..batch.row_count {
         let user_key = bytes_column_row(&key_col.data, batch.row_count, i)?;

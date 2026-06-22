@@ -1138,23 +1138,6 @@ impl Writer {
         )
     }
 
-    /// Writes a consumer-provided [`ColumnBatch`](crate::table::columnar::ColumnBatch)
-    /// as a single columnar block, storing its value sub-columns directly instead
-    /// of re-transposing the intrinsic value. The batch must carry the three
-    /// intrinsic columns plus one or more value sub-columns; the columnar layout
-    /// must be enabled. Keys must be strictly increasing by `comparator` (within
-    /// the batch and across successive batches / row writes on this writer), and
-    /// every per-row seqno must be `0` (the ingestion assigns one sequence
-    /// number). Each call appends one block.
-    ///
-    /// Returns the batch's last user key (or `None` for an empty batch) so a
-    /// caller can track the ingest ordering across batches.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the batch shape is malformed, the layout is not
-    /// columnar, the keys are not strictly increasing, a row carries a non-zero
-    /// seqno, or the block write fails.
     /// Validates a columnar batch against the ingest contract without writing
     /// anything: the layout must be columnar, the batch shape valid, every per-row
     /// seqno `0`, and the keys strictly increasing within the batch. This lets the
@@ -1179,27 +1162,31 @@ impl Writer {
                 "columnar batch ingest requires the columnar layout",
             ));
         }
-        let entries = crate::table::columnar::column_batch_to_entries(batch)?;
-        if entries.iter().any(|e| e.key.seqno != 0) {
-            return Err(crate::Error::FeatureUnsupported(
-                "columnar batch ingest requires every row seqno to be 0 (the ingestion assigns the sequence number)",
-            ));
-        }
-        let mut prev: Option<&crate::UserKey> = None;
-        for e in &entries {
-            if let Some(p) = prev
-                && comparator.compare(p.as_ref(), e.key.user_key.as_ref())
-                    != core::cmp::Ordering::Less
-            {
-                return Err(crate::Error::InvalidHeader(
-                    "columnar batch ingest requires strictly increasing keys",
-                ));
-            }
-            prev = Some(&e.key.user_key);
-        }
-        Ok(())
+        // Validate the layout, framing, seqno-zero, and intra-batch key order
+        // without decoding every row into an `InternalValue`: the batch is
+        // re-validated and fully decoded once at flush (on the accumulated
+        // rowgroup), so an eager full decode here would deserialise every
+        // submitted row twice.
+        crate::table::columnar::validate_columnar_ingest_batch(batch, comparator)
     }
 
+    /// Writes a consumer-provided [`ColumnBatch`](crate::table::columnar::ColumnBatch)
+    /// as a single columnar block, storing its value sub-columns directly instead
+    /// of re-transposing the intrinsic value. The batch must carry the three
+    /// intrinsic columns plus one or more value sub-columns; the columnar layout
+    /// must be enabled. Keys must be strictly increasing by `comparator` (within
+    /// the batch and across successive batches / row writes on this writer), and
+    /// every per-row seqno must be `0` (the ingestion assigns one sequence
+    /// number). Each call appends one block.
+    ///
+    /// Returns the batch's last user key (or `None` for an empty batch) so a
+    /// caller can track the ingest ordering across batches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the batch shape is malformed, the layout is not
+    /// columnar, the keys are not strictly increasing, a row carries a non-zero
+    /// seqno, or the block write fails.
     #[cfg(feature = "columnar")]
     pub(crate) fn write_columnar_batch(
         &mut self,
