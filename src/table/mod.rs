@@ -22,6 +22,8 @@ pub(crate) mod locator;
 pub(crate) mod meta;
 pub(crate) mod multi_writer;
 pub(crate) mod regions;
+#[cfg(feature = "std")]
+mod relocate;
 mod scanner;
 pub(crate) mod seqno_bounds;
 pub mod util;
