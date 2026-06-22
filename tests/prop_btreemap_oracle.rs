@@ -291,6 +291,8 @@ enum Op {
     },
     Flush,
     Compact,
+    /// Flush, drop, and recover the tree from disk mid-sequence.
+    Reopen,
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
@@ -315,6 +317,7 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         }),
         2 => Just(Op::Flush),
         1 => Just(Op::Compact),
+        1 => Just(Op::Reopen),
     ]
 }
 
@@ -330,14 +333,7 @@ fn run_oracle_test(ops: Vec<Op>) -> Result<(), TestCaseError> {
     let tmpdir = lsm_tree::get_tmp_folder();
     let seqno_counter = SequenceNumberCounter::default();
     let visible_seqno = SequenceNumberCounter::default();
-    let AnyTree::Standard(tree) =
-        Config::new(&tmpdir, seqno_counter.clone(), visible_seqno.clone())
-            .with_merge_operator(Some(Arc::new(MaxMerge)))
-            .open()
-            .map_err(|e| TestCaseError::fail(format!("failed to open tree: {e}")))?
-    else {
-        return Err(TestCaseError::fail("expected a standard tree"));
-    };
+    let mut tree = open_tree(tmpdir.path(), &seqno_counter, &visible_seqno)?;
 
     let mut oracle = Oracle::new();
     // Highest GC watermark passed to any compaction. A compaction at watermark
@@ -395,7 +391,17 @@ fn run_oracle_test(ops: Vec<Op>) -> Result<(), TestCaseError> {
                 tree.major_compact(common::COMPACTION_TARGET, gc_watermark)
                     .map_err(|e| TestCaseError::fail(format!("compact failed: {e}")))?;
             }
+            Op::Reopen => {
+                // Recover mid-sequence so the following ops exercise writes,
+                // merges, deletes, flushes, and compactions against a recovered
+                // tree, not only the final reads.
+                tree = reopen_tree(tree, tmpdir.path(), &seqno_counter, &visible_seqno)?;
+            }
         }
+        // Verify the visible state immediately after each op, so a Flush /
+        // Compact / Reopen that corrupts it is caught here rather than masked by a
+        // later write before the final check.
+        verify_against_oracle(&tree, &oracle, visible_seqno.get())?;
     }
 
     // Read seqno: the visibility watermark, which won't drift ahead of what the
@@ -414,87 +420,19 @@ fn run_oracle_test(ops: Vec<Op>) -> Result<(), TestCaseError> {
         }
     }
 
-    // scan_since_seqno (change-data-capture): every write at seqno >= target,
-    // un-collapsed and seqno-ordered. GC-safe for target >= gc_floor, since every
-    // such version is preserved. Use gc_floor itself (not max(1)): the lower bound
-    // is inclusive, so target 0 covers a first op committed at seqno 0. Both sides
-    // map to comparable CdcEvents.
-    let cdc_target = gc_floor;
-    let expected_cdc = oracle.scan_since(cdc_target);
-    // A point tombstone is a flush-materialized range deletion iff a range
-    // tombstone at that exact seqno covers the key (the op at that seqno was a
-    // DeleteRange, not a Remove, since seqnos are unique). Checking the key, not
-    // just the seqno, keeps the filter self-validating if the engine's
-    // materialization detail ever changes.
-    let is_materialized_range = |key: &[u8], seqno: u64| {
-        oracle
-            .range_tombstones
-            .iter()
-            .any(|(start, end, rt_seqno)| {
-                *rt_seqno == seqno && key >= start.as_slice() && key < end.as_slice()
-            })
-    };
-    let actual_cdc: Vec<CdcEvent> = tree
-        .scan_since_seqno(cdc_target)
-        .map_err(|e| TestCaseError::fail(format!("scan_since_seqno failed: {e}")))?
-        .filter_map(|event| match event {
-            ScanSinceEvent::Insert { key, value, seqno } => Some(CdcEvent::Point {
-                seqno,
-                key: key.to_vec(),
-                value: Some(value.to_vec()),
-            }),
-            ScanSinceEvent::PointTombstone { key, seqno }
-                if !is_materialized_range(&key, seqno) =>
-            {
-                Some(CdcEvent::Point {
-                    seqno,
-                    key: key.to_vec(),
-                    value: None,
-                })
-            }
-            ScanSinceEvent::PointTombstone { .. } => None,
-            ScanSinceEvent::RangeTombstone {
-                start_key,
-                end_key,
-                seqno,
-            } => Some(CdcEvent::Range {
-                seqno,
-                start: start_key.to_vec(),
-                end: end_key.to_vec(),
-            }),
-            ScanSinceEvent::MergeOperand {
-                key,
-                operand,
-                seqno,
-            } => Some(CdcEvent::Merge {
-                seqno,
-                key: key.to_vec(),
-                operand: operand.to_vec(),
-            }),
-        })
-        .collect();
-    prop_assert_eq!(
-        actual_cdc,
-        expected_cdc,
-        "scan_since_seqno CDC mismatch at target {}",
-        cdc_target,
-    );
+    // scan_since_seqno (change-data-capture): every write at seqno >= gc_floor,
+    // un-collapsed and seqno-ordered. The lower bound is inclusive, so gc_floor
+    // (which may be 0) covers a first op committed at seqno 0.
+    verify_cdc(&tree, &oracle, gc_floor)?;
 
     // Checkpoint + reopen: flush everything to disk, drop the tree (releasing the
-    // directory lock), recover from disk, and re-verify the full visible state
-    // survives the round-trip.
-    tree.flush_active_memtable(0)
-        .map_err(|e| TestCaseError::fail(format!("flush before reopen failed: {e}")))?;
-    drop(tree);
-    let AnyTree::Standard(tree) =
-        Config::new(&tmpdir, seqno_counter.clone(), visible_seqno.clone())
-            .with_merge_operator(Some(Arc::new(MaxMerge)))
-            .open()
-            .map_err(|e| TestCaseError::fail(format!("reopen failed: {e}")))?
-    else {
-        return Err(TestCaseError::fail("expected a standard tree after reopen"));
-    };
+    // directory lock), recover from disk, and re-verify both the full visible
+    // state and the CDC stream survive the round-trip (so a recovery that keeps
+    // values but loses range tombstones / merge operands / seqno bounds is
+    // caught).
+    let tree = reopen_tree(tree, tmpdir.path(), &seqno_counter, &visible_seqno)?;
     verify_against_oracle(&tree, &oracle, read_seqno)?;
+    verify_cdc(&tree, &oracle, gc_floor)?;
 
     Ok(())
 }
@@ -570,6 +508,100 @@ fn verify_against_oracle(
         }
     }
 
+    Ok(())
+}
+
+/// Opens (or recovers) the standard tree with the merge operator configured.
+fn open_tree(
+    path: &std::path::Path,
+    seqno_counter: &SequenceNumberCounter,
+    visible_seqno: &SequenceNumberCounter,
+) -> Result<Tree, TestCaseError> {
+    let AnyTree::Standard(tree) = Config::new(path, seqno_counter.clone(), visible_seqno.clone())
+        .with_merge_operator(Some(Arc::new(MaxMerge)))
+        .open()
+        .map_err(|e| TestCaseError::fail(format!("open tree failed: {e}")))?
+    else {
+        return Err(TestCaseError::fail("expected a standard tree"));
+    };
+    Ok(tree)
+}
+
+/// Flushes, drops (releasing the directory lock), and recovers the tree from
+/// disk, returning the recovered handle.
+fn reopen_tree(
+    tree: Tree,
+    path: &std::path::Path,
+    seqno_counter: &SequenceNumberCounter,
+    visible_seqno: &SequenceNumberCounter,
+) -> Result<Tree, TestCaseError> {
+    tree.flush_active_memtable(0)
+        .map_err(|e| TestCaseError::fail(format!("flush before reopen failed: {e}")))?;
+    drop(tree);
+    open_tree(path, seqno_counter, visible_seqno)
+}
+
+/// Verifies the engine's change-data-capture output matches the oracle from
+/// `gc_floor` (the inclusive, GC-safe lower bound).
+fn verify_cdc(tree: &Tree, oracle: &Oracle, gc_floor: u64) -> Result<(), TestCaseError> {
+    let expected_cdc = oracle.scan_since(gc_floor);
+    // A point tombstone is a flush-materialized range deletion iff a range
+    // tombstone at that exact seqno covers the key (the op at that seqno was a
+    // DeleteRange, not a Remove, since seqnos are unique). Checking the key keeps
+    // the filter self-validating if the engine's materialization detail changes.
+    let is_materialized_range = |key: &[u8], seqno: u64| {
+        oracle
+            .range_tombstones
+            .iter()
+            .any(|(start, end, rt_seqno)| {
+                *rt_seqno == seqno && key >= start.as_slice() && key < end.as_slice()
+            })
+    };
+    let actual_cdc: Vec<CdcEvent> = tree
+        .scan_since_seqno(gc_floor)
+        .map_err(|e| TestCaseError::fail(format!("scan_since_seqno failed: {e}")))?
+        .filter_map(|event| match event {
+            ScanSinceEvent::Insert { key, value, seqno } => Some(CdcEvent::Point {
+                seqno,
+                key: key.to_vec(),
+                value: Some(value.to_vec()),
+            }),
+            ScanSinceEvent::PointTombstone { key, seqno }
+                if !is_materialized_range(&key, seqno) =>
+            {
+                Some(CdcEvent::Point {
+                    seqno,
+                    key: key.to_vec(),
+                    value: None,
+                })
+            }
+            ScanSinceEvent::PointTombstone { .. } => None,
+            ScanSinceEvent::RangeTombstone {
+                start_key,
+                end_key,
+                seqno,
+            } => Some(CdcEvent::Range {
+                seqno,
+                start: start_key.to_vec(),
+                end: end_key.to_vec(),
+            }),
+            ScanSinceEvent::MergeOperand {
+                key,
+                operand,
+                seqno,
+            } => Some(CdcEvent::Merge {
+                seqno,
+                key: key.to_vec(),
+                operand: operand.to_vec(),
+            }),
+        })
+        .collect();
+    prop_assert_eq!(
+        actual_cdc,
+        expected_cdc,
+        "scan_since_seqno CDC mismatch at target {}",
+        gc_floor,
+    );
     Ok(())
 }
 
