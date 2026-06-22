@@ -286,7 +286,10 @@ impl Table {
         )
     }
 
-    fn load_data_block(&self, handle: &BlockHandle) -> crate::Result<DataBlock> {
+    /// Loads (and, for columnar SSTs, reconstructs + delete-masks) a data block.
+    /// Returns `Ok(None)` when a columnar block is wholly deleted by the
+    /// positional mask, so the caller treats it as carrying no keys.
+    fn load_data_block(&self, handle: &BlockHandle) -> crate::Result<Option<DataBlock>> {
         // Columnar SSTs store each data block as a PAX `ColumnBatch`; reconstruct
         // the row entries on load so every row read path works unchanged.
         #[cfg(feature = "columnar")]
@@ -306,6 +309,7 @@ impl Table {
             self.zstd_dictionary.as_deref(),
         )
         .and_then(|block| DataBlock::from_loaded(block, has_kv_footer))
+        .map(Some)
     }
 
     /// Loads a columnar data block and reconstructs it as a row-major
@@ -313,8 +317,11 @@ impl Table {
     /// re-encode them row-major in memory so the existing point-read / iterator
     /// machinery is reused verbatim. The native column-projection read path
     /// (decode only the referenced columns) is a later optimization.
+    ///
+    /// Returns `Ok(None)` when the positional delete-bitmap deletes every row of
+    /// the block, so the caller treats it as carrying no keys.
     #[cfg(feature = "columnar")]
-    fn load_columnar_data_block(&self, handle: &BlockHandle) -> crate::Result<DataBlock> {
+    fn load_columnar_data_block(&self, handle: &BlockHandle) -> crate::Result<Option<DataBlock>> {
         let block = self.load_block(
             handle,
             BlockType::Columnar,
@@ -322,7 +329,23 @@ impl Table {
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
         )?;
-        DataBlock::from_columnar_block(&block.data, self.metadata.data_block_restart_interval)
+        let restart = self.metadata.data_block_restart_interval;
+        match self
+            .delete_block_starts
+            .as_ref()
+            .and_then(|starts| starts.get(&handle.offset().0))
+        {
+            // The segment has materialized deletes and this block has a recorded
+            // start position: drop the deleted rows during reconstruction.
+            Some(&start) => DataBlock::from_columnar_block_masked(
+                &block.data,
+                restart,
+                &self.delete_bitmap,
+                start,
+            ),
+            // No deletes (or, unreachably, an unmapped block): reconstruct whole.
+            None => DataBlock::from_columnar_block(&block.data, restart).map(Some),
+        }
     }
 
     /// Loads a columnar data block and decodes only the projected columns,
@@ -752,8 +775,9 @@ impl Table {
         // Fast path: retrieval-ribbon locator (see `point_read_inner` for the
         // MVCC-correctness argument). A located-block miss falls through to the
         // index walk below.
-        if let Some((handle, hint)) = self.locator_block(key_hash)? {
-            let data_block = self.load_data_block(&handle)?;
+        if let Some((handle, hint)) = self.locator_block(key_hash)?
+            && let Some(data_block) = self.load_data_block(&handle)?
+        {
             let found = match hint {
                 Some((slot, is_entry)) => data_block.point_read_value_at_slot(
                     slot,
@@ -776,7 +800,10 @@ impl Table {
         for block_handle in iter {
             let block_handle = block_handle?;
 
-            let data_block = self.load_data_block(block_handle.as_ref())?;
+            // A wholly-deleted columnar block carries no keys; skip it.
+            let Some(data_block) = self.load_data_block(block_handle.as_ref())? else {
+                continue;
+            };
 
             if let Some(found) = data_block.point_read_value(key, seqno, &self.comparator)? {
                 return Ok(Some(found));
@@ -871,8 +898,9 @@ impl Table {
         // hit returns the correct MVCC answer and a miss (absent key, or the
         // visible version lives in a later block) safely falls through to the
         // index walk below.
-        if let Some((handle, hint)) = self.locator_block(key_hash)? {
-            let data_block = self.load_data_block(&handle)?;
+        if let Some((handle, hint)) = self.locator_block(key_hash)?
+            && let Some(data_block) = self.load_data_block(&handle)?
+        {
             let found = match hint {
                 Some((slot, is_entry)) => {
                     data_block.point_read_at_slot(slot, is_entry, key, seqno, &self.comparator)?
@@ -894,7 +922,10 @@ impl Table {
         for block_handle in iter {
             let block_handle = block_handle?;
 
-            let data_block = self.load_data_block(block_handle.as_ref())?;
+            // A wholly-deleted columnar block carries no keys; skip it.
+            let Some(data_block) = self.load_data_block(block_handle.as_ref())? else {
+                continue;
+            };
 
             if let Some(item) = data_block.point_read(key, seqno, &self.comparator)? {
                 return Ok(Some((item, data_block)));
@@ -1149,7 +1180,10 @@ impl Table {
                 continue;
             }
 
-            let data_block = self.load_data_block(block_handle.as_ref())?;
+            // A wholly-deleted columnar block carries no keys; skip it.
+            let Some(data_block) = self.load_data_block(block_handle.as_ref())? else {
+                continue;
+            };
 
             // Drain passing keys that fall inside [..end_key].
             //
@@ -1470,7 +1504,10 @@ impl Table {
                 continue;
             }
 
-            let block = self.load_data_block(handle.as_ref())?;
+            // A wholly-deleted columnar block carries no keys; skip it.
+            let Some(block) = self.load_data_block(handle.as_ref())? else {
+                continue;
+            };
             let data = &block.inner.data;
             for item in block.iter(self.comparator.clone()) {
                 let mut value = item.materialize(data);

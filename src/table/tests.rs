@@ -3871,3 +3871,45 @@ fn delete_bitmap_masks_rows_in_range_scan() -> crate::Result<()> {
     );
     Ok(())
 }
+
+#[cfg(feature = "columnar")]
+#[test]
+fn delete_bitmap_masks_deleted_key_in_point_read() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+
+    let n = 64u32;
+    // Row positions follow write (= key) order: keys k0003 / k0010 / k0050.
+    let deleted = [3u32, 10, 50];
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    for i in 0..n {
+        let key = format!("k{i:04}").into_bytes();
+        writer.write(crate::InternalValue::from_components(
+            key,
+            b"v",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    for &row in &deleted {
+        writer.delete_bitmap_mut().insert(row);
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+
+    // A deleted key reads as absent; a live key is still found.
+    for i in 0..n {
+        let key = format!("k{i:04}").into_bytes();
+        let got = table.get(&key, SeqNo::MAX, hash64(&key))?;
+        if deleted.contains(&i) {
+            assert!(got.is_none(), "deleted key {i} must read as absent");
+        } else {
+            assert!(got.is_some(), "live key {i} must be found");
+        }
+    }
+    Ok(())
+}
