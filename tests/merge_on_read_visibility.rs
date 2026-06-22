@@ -93,11 +93,11 @@ fn merge_on_read_delete_is_hidden_on_point_and_range_paths() {
 
     // Range path: the deleted keys never appear; every survivor does, once, with
     // its exact value.
-    let mut seen = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
     for guard in tree.range(key(0)..key(999_999), SeqNo::MAX, None) {
         let (k, v) = guard.into_inner().expect("range item");
-        seen.push(k.clone());
         let i: u32 = std::str::from_utf8(&k).unwrap()[1..].parse().unwrap();
+        assert!(seen.insert(i), "range: duplicate key index {i} yielded");
         assert!(i >= 50, "range: deleted key index {i} must not be yielded");
         assert_eq!(&*v, value(i).as_slice(), "range: value for key {i}");
     }
@@ -106,6 +106,9 @@ fn merge_on_read_delete_is_hidden_on_point_and_range_paths() {
         (n - 50) as usize,
         "range yields exactly the survivors"
     );
+    for i in 50..n {
+        assert!(seen.contains(&i), "range: missing survivor key index {i}");
+    }
 }
 
 #[test]

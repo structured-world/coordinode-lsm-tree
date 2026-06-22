@@ -46,12 +46,18 @@ use alloc::vec::Vec;
 /// to match. It un-gates trivially alongside that layer.
 // `pub` (not `pub(crate)`) inside this crate-private module: clippy flags the
 // redundant restriction since the module itself is already crate-scoped.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidHeader`] if the row count exceeds `u32::MAX`:
+/// positions are u32 by the bitmap's design, so a larger segment cannot be
+/// addressed without aliasing earlier rows.
 pub fn build_position_bitmap<'a, I>(
     rows: I,
     tombstones: &[RangeTombstone],
     watermark: SeqNo,
     comparator: &SharedComparator,
-) -> DeleteBitmap
+) -> crate::Result<DeleteBitmap>
 where
     I: IntoIterator<Item = (&'a [u8], SeqNo)>,
 {
@@ -86,13 +92,17 @@ where
         }
         active.expire_until(user_key);
         if active.is_suppressed(seqno) {
-            // Positions are u32 by the bitmap's design; a segment past u32 rows
-            // cannot be addressed, matching `from_columnar_block_masked`.
+            // Positions are u32 by the bitmap's design, matching
+            // `from_columnar_block_masked`.
             bitmap.insert(pos);
         }
-        pos = pos.wrapping_add(1);
+        // Fail loudly rather than wrapping back to 0 (which would mark unrelated
+        // earlier rows): a segment past u32 rows cannot be addressed positionally.
+        pos = pos.checked_add(1).ok_or(crate::Error::InvalidHeader(
+            "delete-bitmap position exceeds u32::MAX",
+        ))?;
     }
-    bitmap
+    Ok(bitmap)
 }
 
 #[cfg(test)]
@@ -106,13 +116,18 @@ mod tests {
 
     /// Collects the marked positions of a build over `rows` as a sorted Vec, so
     /// each test asserts the exact membership set.
+    #[expect(
+        clippy::expect_used,
+        reason = "test inputs are far below the u32::MAX row limit, so the build cannot overflow"
+    )]
     fn marked(
         rows: &[(&[u8], SeqNo)],
         tombstones: &[RangeTombstone],
         watermark: SeqNo,
     ) -> Vec<u32> {
         let cmp = crate::comparator::default_comparator();
-        let bitmap = build_position_bitmap(rows.iter().copied(), tombstones, watermark, &cmp);
+        let bitmap = build_position_bitmap(rows.iter().copied(), tombstones, watermark, &cmp)
+            .expect("position bitmap build");
         let mut out: Vec<u32> = bitmap.iter().collect();
         out.sort_unstable();
         out

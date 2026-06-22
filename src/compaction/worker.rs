@@ -1555,6 +1555,11 @@ fn plan_merge_on_read(
         || source.metadata.ecc_params.is_some()
         || source.metadata.ecc_unrecognized
         || source.zone_map.is_empty()
+        // A source that already carries a delete bitmap reads through the mask,
+        // so `scan()` below yields the surviving rows under renumbered ordinals
+        // that no longer line up with the verbatim-copied physical blocks. Relocating
+        // it would alias the wrong rows; fall back to copy-on-write instead.
+        || !source.delete_bitmap().is_empty()
     {
         return Ok(None);
     }
@@ -1570,7 +1575,7 @@ fn plan_merge_on_read(
         input_range_tombstones,
         opts.mvcc_gc_watermark,
         &opts.config.comparator,
-    );
+    )?;
     if bitmap.is_empty() {
         return Ok(None);
     }
@@ -1609,8 +1614,15 @@ fn run_merge_on_read_relocation(
     let (folder, level_fs) = opts.config.tables_folder_for_level(payload.dest_level);
     let new_path = folder.join(new_id.to_string());
 
-    let checksum =
-        source.relocate_columnar_with_deletes(&new_path, new_id, bitmap, opts.config.sync_mode)?;
+    // Write the relocated SST through the DESTINATION level's filesystem (the
+    // same one that recovers and installs it below), not the source table's.
+    let checksum = source.relocate_columnar_with_deletes(
+        &new_path,
+        &*level_fs,
+        new_id,
+        bitmap,
+        opts.config.sync_mode,
+    )?;
 
     let relocated = Table::recover(
         new_path,

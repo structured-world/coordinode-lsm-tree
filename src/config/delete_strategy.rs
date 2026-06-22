@@ -52,6 +52,19 @@ impl DeleteStrategy {
     pub const fn writes_bitmap(self) -> bool {
         matches!(self, Self::MergeOnRead | Self::Adaptive { .. })
     }
+
+    /// Whether an [`Adaptive`](Self::Adaptive) threshold is within its documented
+    /// `0..=100` range. A threshold above 100 can never be reached (deleted
+    /// percent caps at 100), so the segment would never purge.
+    #[must_use]
+    const fn has_valid_threshold(self) -> bool {
+        match self {
+            Self::Adaptive {
+                purge_threshold_percent,
+            } => purge_threshold_percent <= 100,
+            Self::CopyOnWrite | Self::MergeOnRead => true,
+        }
+    }
 }
 
 impl Default for DeleteStrategy {
@@ -87,8 +100,17 @@ impl DeleteStrategyPolicy {
     }
 
     /// Uses the same strategy in every level.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an [`Adaptive`](DeleteStrategy::Adaptive) purge threshold is
+    /// above 100 (outside its documented `0..=100` range).
     #[must_use]
     pub fn all(strategy: DeleteStrategy) -> Self {
+        assert!(
+            strategy.has_valid_threshold(),
+            "adaptive purge threshold must be in 0..=100"
+        );
         Self(vec![strategy])
     }
 
@@ -96,7 +118,8 @@ impl DeleteStrategyPolicy {
     ///
     /// # Panics
     ///
-    /// Panics if the policy is empty or contains more than 255 elements.
+    /// Panics if the policy is empty, contains more than 255 elements, or any
+    /// [`Adaptive`](DeleteStrategy::Adaptive) purge threshold is above 100.
     #[must_use]
     pub fn new(policy: impl Into<Vec<DeleteStrategy>>) -> Self {
         let policy = policy.into();
@@ -105,6 +128,13 @@ impl DeleteStrategyPolicy {
             "delete strategy policy may not be empty"
         );
         assert!(policy.len() <= 255, "delete strategy policy is too large");
+        assert!(
+            policy
+                .iter()
+                .copied()
+                .all(DeleteStrategy::has_valid_threshold),
+            "adaptive purge threshold must be in 0..=100"
+        );
         Self(policy)
     }
 }
@@ -159,5 +189,38 @@ mod tests {
     #[should_panic(expected = "may not be empty")]
     fn new_rejects_empty_policy() {
         let _ = DeleteStrategyPolicy::new(Vec::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "adaptive purge threshold must be in 0..=100")]
+    fn all_rejects_threshold_above_100() {
+        let _ = DeleteStrategyPolicy::all(DeleteStrategy::Adaptive {
+            purge_threshold_percent: 101,
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "adaptive purge threshold must be in 0..=100")]
+    fn new_rejects_threshold_above_100() {
+        let _ = DeleteStrategyPolicy::new([
+            DeleteStrategy::MergeOnRead,
+            DeleteStrategy::Adaptive {
+                purge_threshold_percent: 200,
+            },
+        ]);
+    }
+
+    #[test]
+    fn threshold_100_is_accepted() {
+        // The documented upper bound is inclusive.
+        let policy = DeleteStrategyPolicy::all(DeleteStrategy::Adaptive {
+            purge_threshold_percent: 100,
+        });
+        assert_eq!(
+            policy.get(0),
+            DeleteStrategy::Adaptive {
+                purge_threshold_percent: 100
+            }
+        );
     }
 }

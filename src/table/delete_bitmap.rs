@@ -291,11 +291,27 @@ impl DeleteBitmap {
     /// strictly ascending.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut cur = Cursor::new(bytes);
-        let chunk_count = cur.u32()?;
-        let mut chunks = Vec::with_capacity(chunk_count as usize);
+        let chunk_count = usize::try_from(cur.u32()?)
+            .map_err(|_| Error::InvalidHeader("delete_bitmap: chunk count does not fit usize"))?;
+        // Bound the preallocation by the smallest a chunk can be (index u32 +
+        // kind u8 + sparse count u16 = 7 bytes), so a corrupt header cannot
+        // request a huge `Vec` before the loop fails on a truncated buffer.
+        if chunk_count > cur.remaining_len() / 7 {
+            return Err(Error::InvalidHeader(
+                "delete_bitmap: chunk count exceeds encoded payload",
+            ));
+        }
+        let mut chunks = Vec::with_capacity(chunk_count);
         let mut last_chunk: Option<u32> = None;
         for _ in 0..chunk_count {
             let chunk = cur.u32()?;
+            // The chunk's base row is `chunk * CHUNK_ROWS`; reject an index whose
+            // base would overflow the u32 position space the mask addresses.
+            if chunk > u32::MAX / CHUNK_ROWS {
+                return Err(Error::InvalidHeader(
+                    "delete_bitmap: chunk index out of row-position range",
+                ));
+            }
             if last_chunk.is_some_and(|p| chunk <= p) {
                 return Err(Error::InvalidHeader(
                     "delete_bitmap: chunk indices not strictly ascending",
@@ -305,6 +321,11 @@ impl DeleteBitmap {
             let container = match cur.u8()? {
                 KIND_SPARSE => {
                     let count = cur.u16()? as usize;
+                    if count == 0 || count > CHUNK_ROWS as usize {
+                        return Err(Error::InvalidHeader(
+                            "delete_bitmap: sparse count out of range",
+                        ));
+                    }
                     let mut offs = Vec::with_capacity(count);
                     let mut last: Option<u16> = None;
                     for _ in 0..count {
@@ -337,7 +358,17 @@ impl DeleteBitmap {
                     ));
                 }
             };
+            // `encode` never emits an empty container; an empty one is malformed.
+            if container.cardinality() == 0 {
+                return Err(Error::InvalidHeader("delete_bitmap: empty container"));
+            }
             chunks.push((chunk, container));
+        }
+        // The section must decode exactly, with nothing left over.
+        if cur.remaining_len() != 0 {
+            return Err(Error::InvalidHeader(
+                "delete_bitmap: trailing bytes after chunks",
+            ));
         }
         Ok(Self { chunks })
     }
@@ -352,6 +383,13 @@ struct Cursor<'a> {
 impl<'a> Cursor<'a> {
     fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
+    }
+
+    /// Bytes not yet consumed. `pos` never exceeds `buf.len()` (every read goes
+    /// through bounds-checked `take`), so the floor at 0 only guards against a
+    /// future bug rather than a reachable underflow.
+    fn remaining_len(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
     }
 
     fn take<const N: usize>(&mut self) -> Result<[u8; N]> {
@@ -553,27 +591,69 @@ mod tests {
 
     #[test]
     fn decode_rejects_non_ascending_chunks() {
-        // 2 chunks both index 0 (not strictly ascending).
+        // 2 chunks both index 0 (not strictly ascending). Each is a non-empty
+        // sparse chunk (count 1, offset 0) so the count check passes and the
+        // ascending check is the one that fires.
         let bytes = [
             2,
             0,
             0,
-            0, // count
+            0, // chunk_count = 2
             0,
             0,
             0,
             0,
             KIND_SPARSE,
+            1,
             0,
-            0, // chunk 0, empty sparse
+            0,
+            0, // chunk 0: count 1, offset 0
             0,
             0,
             0,
             0,
             KIND_SPARSE,
+            1,
+            0,
             0,
             0, // chunk 0 again
         ];
+        assert!(DeleteBitmap::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_chunk_count_exceeding_payload() {
+        // chunk_count claims a huge number of chunks but the buffer holds none,
+        // so the header is rejected before any large allocation.
+        let bytes = u32::MAX.to_le_bytes();
+        assert!(DeleteBitmap::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_empty_sparse_container() {
+        // 1 chunk, index 0, sparse, count 0 (an empty container `encode` never
+        // emits).
+        let bytes = [1, 0, 0, 0, 0, 0, 0, 0, KIND_SPARSE, 0, 0];
+        assert!(DeleteBitmap::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_chunk_index_out_of_range() {
+        // 1 chunk whose index * CHUNK_ROWS would overflow the u32 position space.
+        let mut bytes = alloc::vec![1, 0, 0, 0];
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // chunk index = u32::MAX
+        bytes.extend_from_slice(&[KIND_SPARSE, 1, 0, 0, 0]);
+        assert!(DeleteBitmap::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes() {
+        // A valid encoding with one extra byte appended must fail (the section
+        // decodes exactly).
+        let mut dv = DeleteBitmap::new();
+        dv.insert(7);
+        let mut bytes = dv.encode();
+        bytes.push(0);
         assert!(DeleteBitmap::decode(&bytes).is_err());
     }
 }

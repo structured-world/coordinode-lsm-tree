@@ -48,6 +48,7 @@ impl Table {
     pub(crate) fn relocate_columnar_with_deletes(
         &self,
         new_path: &Path,
+        out_fs: &dyn crate::fs::Fs,
         new_table_id: TableId,
         delete_bitmap: &DeleteBitmap,
         sync_mode: SyncMode,
@@ -67,6 +68,9 @@ impl Table {
             ));
         }
 
+        // Read the source through ITS filesystem; write the output through the
+        // destination level's `out_fs` (the same one that recovers and installs
+        // the relocated table), so level routing stays consistent.
         let mut src = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
         let reader = crate::sfa::Reader::from_reader(&mut src)?;
 
@@ -75,67 +79,76 @@ impl Table {
         // payload is written to both sections below.
         let meta_payload = self.repoint_meta_block(&*src, new_table_id)?;
 
-        let out = self
-            .fs
-            .open(new_path, &FsOpenOptions::new().write(true).create_new(true))?;
-        let out = BufWriter::with_capacity(u16::MAX.into(), out);
-        let out = ChecksummedWriter::new(out);
-        let mut writer = crate::sfa::Writer::from_writer(out);
+        let out = out_fs.open(new_path, &FsOpenOptions::new().write(true).create_new(true))?;
 
-        let meta_identity = BlockIdentity {
-            table_id: new_table_id,
-            block_type: BlockType::Meta,
-            dict_id: 0,
-            window_log: 0,
-        };
-        for entry in reader.toc().iter() {
-            let name = entry.name();
-            writer.start(name)?;
-            if name == b"meta_mid" || name == b"meta" {
-                // Re-encoded copy (new id), not the source bytes. Non-encrypted
-                // segment, so the two copies are byte-identical (no nonce).
-                Block::write_into(
-                    &mut writer,
-                    &meta_payload,
-                    meta_identity,
-                    &BlockTransform::PLAIN,
-                )?;
-            } else {
-                copy_section(&*src, &mut writer, entry.pos(), entry.len())?;
-            }
-        }
+        // Once the output file exists, any later failure (section copy, bitmap
+        // write, sync, directory fsync) must not leave a partial, uninstalled SST
+        // behind. Best-effort remove it before propagating the error.
+        let result = (|| -> crate::Result<Checksum> {
+            let out = BufWriter::with_capacity(u16::MAX.into(), out);
+            let out = ChecksummedWriter::new(out);
+            let mut writer = crate::sfa::Writer::from_writer(out);
 
-        // Inject the positional delete-bitmap. Its position is free (addressed by
-        // name through the table of contents); appended after the copied
-        // sections. Same uncompressed envelope as the other meta sections.
-        writer.start(b"delete_bitmap")?;
-        let encoded = delete_bitmap.encode();
-        Block::write_into(
-            &mut writer,
-            &encoded,
-            BlockIdentity {
+            let meta_identity = BlockIdentity {
                 table_id: new_table_id,
-                block_type: BlockType::DeleteBitmap,
+                block_type: BlockType::Meta,
                 dict_id: 0,
                 window_log: 0,
-            },
-            &BlockTransform::PLAIN,
-        )?;
+            };
+            for entry in reader.toc().iter() {
+                let name = entry.name();
+                writer.start(name)?;
+                if name == b"meta_mid" || name == b"meta" {
+                    // Re-encoded copy (new id), not the source bytes. Non-encrypted
+                    // segment, so the two copies are byte-identical (no nonce).
+                    Block::write_into(
+                        &mut writer,
+                        &meta_payload,
+                        meta_identity,
+                        &BlockTransform::PLAIN,
+                    )?;
+                } else {
+                    copy_section(&*src, &mut writer, entry.pos(), entry.len())?;
+                }
+            }
 
-        let mut checksummed = writer.into_inner()?;
-        let checksum = checksummed.checksum();
-        let file = checksummed.inner_mut().get_mut();
-        FsFile::sync_all_with(&**file, sync_mode)?;
-        #[expect(
-            clippy::expect_used,
-            reason = "an SST path always has a parent directory (the table folder)"
-        )]
-        crate::file::fsync_directory(
-            new_path.parent().expect("table file has a parent folder"),
-            &*self.fs,
-            sync_mode,
-        )?;
-        Ok(checksum)
+            // Inject the positional delete-bitmap. Its position is free (addressed
+            // by name through the table of contents); appended after the copied
+            // sections. Same uncompressed envelope as the other meta sections.
+            writer.start(b"delete_bitmap")?;
+            let encoded = delete_bitmap.encode();
+            Block::write_into(
+                &mut writer,
+                &encoded,
+                BlockIdentity {
+                    table_id: new_table_id,
+                    block_type: BlockType::DeleteBitmap,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                &BlockTransform::PLAIN,
+            )?;
+
+            let mut checksummed = writer.into_inner()?;
+            let checksum = checksummed.checksum();
+            let file = checksummed.inner_mut().get_mut();
+            FsFile::sync_all_with(&**file, sync_mode)?;
+            #[expect(
+                clippy::expect_used,
+                reason = "an SST path always has a parent directory (the table folder)"
+            )]
+            crate::file::fsync_directory(
+                new_path.parent().expect("table file has a parent folder"),
+                out_fs,
+                sync_mode,
+            )?;
+            Ok(checksum)
+        })();
+
+        if result.is_err() {
+            let _ = out_fs.remove_file(new_path);
+        }
+        result
     }
 
     /// Loads this segment's meta KV block, replaces the `table_id` entry's value
@@ -213,13 +226,18 @@ fn copy_section<W: crate::io::Write>(
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, clippy::expect_used)]
+#[expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "tests intentionally unwrap setup failures to keep assertions focused"
+)]
 mod tests {
     use super::*;
     use crate::cache::Cache;
     use crate::descriptor_table::DescriptorTable;
     use crate::fs::StdFs;
     use crate::table::Writer;
+    #[cfg(feature = "columnar")]
     use crate::{SeqNo, hash::hash64};
     use alloc::sync::Arc;
     use test_log::test;
@@ -282,8 +300,13 @@ mod tests {
         for &row in &deleted {
             bitmap.insert(row);
         }
-        let out_checksum =
-            source.relocate_columnar_with_deletes(&out_path, 1, &bitmap, SyncMode::Normal)?;
+        let out_checksum = source.relocate_columnar_with_deletes(
+            &out_path,
+            &StdFs,
+            1,
+            &bitmap,
+            SyncMode::Normal,
+        )?;
 
         let relocated = recover_at(&out_path, out_checksum, 1)?;
 
@@ -326,7 +349,7 @@ mod tests {
         let mut bitmap = DeleteBitmap::new();
         bitmap.insert(0);
         let err = source
-            .relocate_columnar_with_deletes(&out_path, 1, &bitmap, SyncMode::Normal)
+            .relocate_columnar_with_deletes(&out_path, &StdFs, 1, &bitmap, SyncMode::Normal)
             .unwrap_err();
         assert!(
             matches!(err, crate::Error::FeatureUnsupported(_)),

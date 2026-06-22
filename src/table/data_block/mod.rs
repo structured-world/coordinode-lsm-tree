@@ -502,24 +502,35 @@ impl DataBlock {
         block_start_row: u32,
     ) -> crate::Result<Option<Self>> {
         let batch = crate::table::columnar::ColumnBatch::decode(block_data)?;
-        let mut entries = crate::table::columnar::column_batch_to_entries(&batch)?;
+        let entries = crate::table::columnar::column_batch_to_entries(&batch)?;
         if entries.is_empty() {
             return Err(crate::Error::InvalidHeader(
                 "columnar: empty reconstructed data block",
             ));
         }
-        // Positions are `block_start_row + index`; the bitmap is u32-positional,
-        // and a segment past u32 rows cannot be addressed by it.
-        let mut pos = block_start_row;
-        entries.retain(|_| {
-            let keep = !deletes.contains(pos);
-            pos = pos.wrapping_add(1);
-            keep
-        });
-        if entries.is_empty() {
+        // Each row's position is `block_start_row + index`. The bitmap is
+        // u32-positional and `build_position_bitmap` rejects segments past
+        // u32::MAX rows at write time, but a corrupt zone-map `block_start_row`
+        // could still push the sum over, so fail explicitly rather than wrapping
+        // back to 0 (which would mask the wrong rows).
+        let mut kept = Vec::with_capacity(entries.len());
+        for (index, entry) in entries.into_iter().enumerate() {
+            let offset = u32::try_from(index).map_err(|_| {
+                crate::Error::InvalidHeader("columnar: block row index exceeds u32::MAX")
+            })?;
+            let pos = block_start_row
+                .checked_add(offset)
+                .ok_or(crate::Error::InvalidHeader(
+                    "columnar: row position exceeds u32::MAX",
+                ))?;
+            if !deletes.contains(pos) {
+                kept.push(entry);
+            }
+        }
+        if kept.is_empty() {
             return Ok(None);
         }
-        Self::encode_entries_to_block(&entries, restart_interval).map(Some)
+        Self::encode_entries_to_block(&kept, restart_interval).map(Some)
     }
 
     /// Re-encodes reconstructed columnar `entries` into a row-major data block.
