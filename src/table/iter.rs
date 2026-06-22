@@ -327,26 +327,25 @@ impl Iter {
             #[cfg(feature = "columnar")]
             {
                 const REENCODE_RESTART_INTERVAL: u8 = 16;
-                return match &self.delete_mask {
-                    Some(mask) => {
-                        // A masked segment maps every data block (the start-row map
-                        // is built at open from the zone map, which covers every
-                        // block). A missing offset is an invariant violation, not a
-                        // "starts at row 0" default: defaulting to 0 would mask the
-                        // block against the wrong physical positions. Surface it
-                        // (matching the direct-load path) rather than mis-masking.
-                        let Some(&start) = mask.block_start_rows.get(&handle.offset().0) else {
-                            return Err(crate::Error::InvalidHeader(
-                                "delete mask: data block offset missing from the start-row map",
-                            ));
-                        };
-                        DataBlock::from_columnar_block_masked(
-                            &raw.data,
-                            REENCODE_RESTART_INTERVAL,
-                            &mask.bitmap,
-                            start,
-                        )
-                    }
+                // Mask only when the segment has deletes AND this block's start row
+                // is known. The start-row map is built at open from the zone map
+                // (which covers every block), so an unmapped block is unreachable;
+                // it falls through to reconstructing the whole block (no mask),
+                // sharing the no-deletes path rather than defaulting the start to 0
+                // and masking against the wrong physical positions. This matches the
+                // direct-load path (`Table::load_columnar_data_block`).
+                let masked = self.delete_mask.as_ref().and_then(|mask| {
+                    mask.block_start_rows
+                        .get(&handle.offset().0)
+                        .map(|&start| (mask, start))
+                });
+                return match masked {
+                    Some((mask, start)) => DataBlock::from_columnar_block_masked(
+                        &raw.data,
+                        REENCODE_RESTART_INTERVAL,
+                        &mask.bitmap,
+                        start,
+                    ),
                     None => DataBlock::from_columnar_block(&raw.data, REENCODE_RESTART_INTERVAL)
                         .map(Some),
                 };

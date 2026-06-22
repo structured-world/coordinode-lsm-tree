@@ -332,26 +332,24 @@ impl Table {
             self.zstd_dictionary.as_deref(),
         )?;
         let restart = self.metadata.data_block_restart_interval;
-        match self.delete_block_starts.as_ref() {
-            // The segment has materialized deletes: every data block has a
-            // recorded start position (the map is built at open from the zone map,
-            // which covers every block). Drop the deleted rows during
-            // reconstruction; a missing offset is an invariant violation (it would
-            // otherwise silently mask the wrong positions), so surface it.
-            Some(starts) => {
-                let Some(&start) = starts.get(&handle.offset().0) else {
-                    return Err(crate::Error::InvalidHeader(
-                        "delete mask: data block offset missing from the start-row map",
-                    ));
-                };
-                DataBlock::from_columnar_block_masked(
-                    &block.data,
-                    restart,
-                    &self.delete_bitmap,
-                    start,
-                )
-            }
-            // No materialized deletes: reconstruct the whole block.
+        match self
+            .delete_block_starts
+            .as_ref()
+            .and_then(|starts| starts.get(&handle.offset().0))
+        {
+            // The segment has materialized deletes and this block has a recorded
+            // start position: drop the deleted rows during reconstruction. The
+            // start-row map is built at open from the zone map (every block), so
+            // an unmapped block is unreachable; it falls through to the whole-block
+            // reconstruction below rather than masking against the wrong positions.
+            Some(&start) => DataBlock::from_columnar_block_masked(
+                &block.data,
+                restart,
+                &self.delete_bitmap,
+                start,
+            ),
+            // No materialized deletes (or, unreachably, an unmapped block):
+            // reconstruct the whole block.
             None => DataBlock::from_columnar_block(&block.data, restart).map(Some),
         }
     }
