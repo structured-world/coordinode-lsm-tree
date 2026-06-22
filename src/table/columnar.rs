@@ -1320,6 +1320,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn untranspose_rejects_value_subcolumn_id_collisions() {
+        // Projection selects value sub-columns by id, so a value sub-column that
+        // reuses an intrinsic id (0/1/2) or duplicates another value id would make
+        // projected results ambiguous. The untranspose must reject both.
+        let make = |value_cols: Vec<Column>| -> ColumnBatch {
+            let mut batch =
+                entries_to_column_batch(&[entry(b"k0", 1, ValueType::Value, b"ignored")])
+                    .expect("transpose");
+            batch.columns.pop(); // drop the single opaque value column
+            batch.columns.extend(value_cols);
+            batch
+        };
+
+        // A value sub-column reusing COL_USER_KEY (0).
+        let collide_intrinsic = make(vec![Column {
+            column_id: COL_USER_KEY,
+            type_tag: TypeTag::Fixed(4),
+            validity: None,
+            data: vec![0, 0, 0, 0],
+        }]);
+        assert!(
+            column_batch_to_entries(&collide_intrinsic).is_err(),
+            "a value sub-column reusing an intrinsic id must be rejected",
+        );
+
+        // Two value sub-columns sharing id 5.
+        let duplicate = make(vec![
+            Column {
+                column_id: 5,
+                type_tag: TypeTag::Fixed(4),
+                validity: None,
+                data: vec![0, 0, 0, 0],
+            },
+            Column {
+                column_id: 5,
+                type_tag: TypeTag::Fixed(4),
+                validity: None,
+                data: vec![1, 0, 0, 0],
+            },
+        ]);
+        assert!(
+            column_batch_to_entries(&duplicate).is_err(),
+            "duplicate value sub-column ids must be rejected",
+        );
+    }
+
     fn sample_batch() -> ColumnBatch {
         // 3 rows: a fixed u32 column (row 1 null) and a variable-width Bytes
         // column (all valid). Bytes data = offset array [0,2,2,5] + payload.
