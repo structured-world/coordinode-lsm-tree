@@ -1259,6 +1259,17 @@ mod tests {
     }
 
     #[test]
+    fn nullable_framing_rejects_a_fixed_cell_length_mismatch() {
+        // A Fixed(4) tag with a 3-byte present cell would misframe (and shift
+        // later cells), so the nullable framing rejects it like the non-nullable
+        // path does.
+        assert!(
+            frame_value_cells_nullable(&[(TypeTag::Fixed(4), Some(&[1, 2, 3][..]))]).is_err(),
+            "a present fixed cell whose length differs from its tag width must be rejected",
+        );
+    }
+
+    #[test]
     fn unframe_with_defaults_substitutes_for_null_cells() {
         let blob = frame_value_cells_nullable(&[
             (TypeTag::Fixed(2), Some(&[7, 7][..])),
