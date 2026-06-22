@@ -4,6 +4,7 @@
 
 mod block_size;
 mod compression;
+mod delete_strategy;
 mod filter;
 mod hash_ratio;
 mod locator;
@@ -12,6 +13,7 @@ mod restart_interval;
 
 pub use block_size::BlockSizePolicy;
 pub use compression::CompressionPolicy;
+pub use delete_strategy::{DeleteStrategy, DeleteStrategyPolicy};
 pub use filter::{BloomConstructionPolicy, FilterPolicy, FilterPolicyEntry};
 pub use hash_ratio::HashRatioPolicy;
 pub use locator::{LocatorPolicy, LocatorPolicyEntry, LocatorPrecision};
