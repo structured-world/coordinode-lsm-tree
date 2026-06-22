@@ -768,10 +768,20 @@ pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>
         }
         col.validate(batch.row_count)?;
     }
-    // Value sub-columns are consumer-defined (id / type / count). Nullable value
-    // sub-columns are a later slice, so reject a validity bitmap for now; the
-    // per-column `validate` bounds each against `row_count` like the intrinsics.
+    // Value sub-columns are consumer-defined (id / type / count). Their ids must
+    // be unique and must not overlap the intrinsic columns (`< COL_VALUE`), since
+    // projection later selects columns by id and a collision would make the
+    // result ambiguous. Nullable value sub-columns are a later slice, so reject a
+    // validity bitmap for now; the per-column `validate` bounds each against
+    // `row_count` like the intrinsics.
+    let mut seen_value_column_ids = Vec::with_capacity(value_cols.len());
     for col in value_cols {
+        if col.column_id < COL_VALUE || seen_value_column_ids.contains(&col.column_id) {
+            return Err(Error::InvalidHeader(
+                "columnar: value sub-column ids must be unique and must not overlap intrinsic columns",
+            ));
+        }
+        seen_value_column_ids.push(col.column_id);
         if col.validity.is_some() {
             return Err(Error::InvalidHeader(
                 "columnar: nullable value sub-columns are not supported yet",
