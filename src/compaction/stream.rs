@@ -1268,6 +1268,57 @@ mod tests {
 
         #[test]
         #[expect(clippy::unwrap_used, reason = "test assertion")]
+        fn compaction_merge_drops_operands_below_range_tombstone() -> crate::Result<()> {
+            // M@100 is above the range tombstone; M@80 and the base V@70 are below
+            // it (and deleted by it). Only M@100 survives, folding onto an empty
+            // base, so the result is just that operand. Built with explicit seqnos
+            // because the range tombstone must sit between the operands.
+            let entries = vec![
+                InternalValue::from_components(
+                    b"a".as_ref(),
+                    b"hi".as_ref(),
+                    100,
+                    ValueType::MergeOperand,
+                ),
+                InternalValue::from_components(
+                    b"a".as_ref(),
+                    b"lo".as_ref(),
+                    80,
+                    ValueType::MergeOperand,
+                ),
+                InternalValue::from_components(
+                    b"a".as_ref(),
+                    b"base".as_ref(),
+                    70,
+                    ValueType::Value,
+                ),
+            ];
+
+            let cmp = crate::comparator::default_comparator();
+            let rt = RangeTombstone::new(
+                UserKey::from(b"a".as_ref()),
+                UserKey::from(b"b".as_ref()),
+                90,
+            );
+
+            let iter = entries.into_iter().map(Ok);
+            let mut iter = CompactionStream::new(iter, 1_000)
+                .with_merge_operator(Some(merge_op()))
+                .with_range_tombstone_application(vec![rt], cmp);
+
+            let item = iter.next().unwrap()?;
+            assert_eq!(item.key.value_type, ValueType::Value);
+            assert_eq!(
+                &*item.value, b"hi",
+                "only the operand above the range tombstone survives"
+            );
+            assert!(iter.next().is_none());
+
+            Ok(())
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used, reason = "test assertion")]
         fn compaction_merge_with_tombstone_below_gc() -> crate::Result<()> {
             // Merge operand above tombstone → merge with no base
             #[rustfmt::skip]
