@@ -103,7 +103,10 @@ fn columnar_ingest_rejected_without_columnar_layout() -> lsm_tree::Result<()> {
     let batch = two_subcolumn_batch();
     let mut ingest = any.ingestion()?;
     assert!(
-        ingest.write_columnar_batch(&batch).is_err(),
+        matches!(
+            ingest.write_columnar_batch(&batch),
+            Err(lsm_tree::Error::FeatureUnsupported(_))
+        ),
         "columnar ingest must be rejected when the layout is not columnar",
     );
     Ok(())
@@ -222,7 +225,10 @@ fn columnar_ingest_rejects_unsorted_keys() -> lsm_tree::Result<()> {
 
     let mut ingest = any.ingestion()?;
     assert!(
-        ingest.write_columnar_batch(&batch).is_err(),
+        matches!(
+            ingest.write_columnar_batch(&batch),
+            Err(lsm_tree::Error::InvalidHeader(_))
+        ),
         "descending keys must be rejected",
     );
     Ok(())
@@ -247,9 +253,10 @@ fn columnar_ingest_rejects_nonzero_seqno() -> lsm_tree::Result<()> {
 
     let mut ingest = any.ingestion()?;
     assert!(
-        ingest
-            .write_columnar_batch(&one_fixed_subcolumn_batch(b"k0", 5))
-            .is_err(),
+        matches!(
+            ingest.write_columnar_batch(&one_fixed_subcolumn_batch(b"k0", 5)),
+            Err(lsm_tree::Error::FeatureUnsupported(_))
+        ),
         "a non-zero row seqno must be rejected",
     );
     Ok(())
@@ -276,9 +283,10 @@ fn columnar_ingest_rejects_batch_out_of_order_with_a_prior_write() -> lsm_tree::
     let mut ingest = any.ingestion()?;
     ingest.write(b"z".to_vec(), b"v".to_vec())?;
     assert!(
-        ingest
-            .write_columnar_batch(&one_fixed_subcolumn_batch(b"a", 0))
-            .is_err(),
+        matches!(
+            ingest.write_columnar_batch(&one_fixed_subcolumn_batch(b"a", 0)),
+            Err(lsm_tree::Error::InvalidHeader(_))
+        ),
         "a batch whose first key precedes a prior write must be rejected",
     );
     Ok(())
@@ -332,9 +340,10 @@ fn columnar_ingest_rejected_on_a_blob_tree() -> lsm_tree::Result<()> {
 
     let mut ingest = any.ingestion()?;
     assert!(
-        ingest
-            .write_columnar_batch(&one_fixed_subcolumn_batch(b"k0", 0))
-            .is_err(),
+        matches!(
+            ingest.write_columnar_batch(&one_fixed_subcolumn_batch(b"k0", 0)),
+            Err(lsm_tree::Error::FeatureUnsupported(_))
+        ),
         "columnar ingest is not supported on a blob tree",
     );
     Ok(())
