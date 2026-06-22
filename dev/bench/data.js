@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782102532084,
+  "lastUpdate": 1782108580760,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -18828,6 +18828,84 @@ window.BENCHMARK_DATA = {
             "value": 698696.6125612662,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 5.6us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "46c49628683e141419196b3a01dbd29b8f9d8a3d",
+          "message": "fix(compaction): keep a range tombstone deleting a key with a later merge operand (#528)\n\n## Summary\n\nFixes an MVCC correctness bug: a range delete could be silently undone\nby a later merge operand after a major compaction. The visible value\nmust not depend on whether compaction has run.\n\n## The bug\n\nFor `Insert(key, value)` then `remove_range` covering the key then\n`merge(key, operand)`:\n\n- Before compaction (memtable / flush / reopen): the range tombstone\nclears the base, so the operand folds onto an empty base. Correct.\n- After a major compaction: the range tombstone was dropped while the\noperand still depended on it, so the operand folded onto the pre-delete\nvalue, resurrecting the deleted key.\n\n## The fix\n\nIn the compaction stream's `resolve_merge_operands`, when a base `Value`\nis reached, a covering applied range tombstone newer than that value now\ndeletes it, so the operands fold onto an empty base instead of the value\nbeing physically dropped. This matches the pre-compaction read path. The\nchange is one branch where a `Value` boundary is collected.\n\n## Testing\n\n- New regression test `tests/rt_merge_compaction.rs` (committed first,\nfailing): asserts the operand folds onto an empty base after compaction.\nIt returned the pre-delete value before the fix and the operand value\nafter.\n- `cargo nextest run --features lz4,zstd` — 2066 passed, including the\nfull compaction / range-tombstone / merge suites (393 of them) with no\nregression.\n- `cargo clippy --all-features --all-targets` — clean\n- no-std: `cargo check --target thumbv7em-none-eabihf\n--no-default-features --features alloc` — 0 errors\n- `cargo test --doc --features lz4,zstd` — passes\n\nFound while extending the BTreeMap-oracle property test to merge /\nrange-delete overlap. With this fix, that overlap can be enabled in the\nharness.\n\nCloses #527\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n**Bug Fixes**\n- Fixed merge-compaction behavior to correctly honor range deletes when\nchoosing the merge base. If a range tombstone covers the would-be base\nentry, merge operands now fold onto an empty base, preventing deleted\nkeys from resurfacing with pre-delete values after compaction.\n\n**Tests**\n- Added regression tests covering merge compaction with a range delete\nfollowed by a merge operand, ensuring the delete remains effective after\nflush and major compaction.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-22T07:46:24+03:00",
+          "tree_id": "ef60640336df29289c4748819bc81ae91ec51ced",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/46c49628683e141419196b3a01dbd29b8f9d8a3d"
+        },
+        "date": 1782108579533,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2073071.7362115723,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1196491.8881768493,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 883991.3997360711,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.2us | P99.9: 6.7us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3783540.6861818037,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 454057.78100940795,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.3us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 235785.48071914335,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 7.3us | P99.9: 10.1us\nthreads: 1 | elapsed: 0.85s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1222264.989274197,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1092958.676571313,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.6us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 693246.8460752069,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.5us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
