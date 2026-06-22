@@ -254,3 +254,32 @@ fn columnar_ingest_rejects_nonzero_seqno() -> lsm_tree::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn columnar_ingest_rejects_batch_out_of_order_with_a_prior_write() -> lsm_tree::Result<()> {
+    // A columnar batch whose first key precedes a key already written through the
+    // same ingestion must be rejected, not silently produce an unsorted run (this
+    // cross-call guard holds even across writer table rotations).
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+
+    let mut ingest = any.ingestion()?;
+    ingest.write(b"z".to_vec(), b"v".to_vec())?;
+    assert!(
+        ingest
+            .write_columnar_batch(&one_fixed_subcolumn_batch(b"a", 0))
+            .is_err(),
+        "a batch whose first key precedes a prior write must be rejected",
+    );
+    Ok(())
+}

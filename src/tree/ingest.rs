@@ -306,6 +306,20 @@ impl<'a> Ingestion<'a> {
         &mut self,
         batch: &crate::table::columnar::ColumnBatch,
     ) -> crate::Result<()> {
+        // Cross-call ordering guard, like the row write methods: the batch's
+        // first key must strictly follow the last key written through this
+        // ingestion. The inner writer also rejects unsorted keys, but its running
+        // key resets on table rotation, so this `last_key` check (which persists
+        // across rotations) is what catches a batch that interleaves out of order
+        // with a previous write or batch.
+        if let Some(prev) = &self.last_key
+            && let Some(first) = batch.first_user_key()?
+            && self.tree.config.comparator.compare(prev, first) != Ordering::Less
+        {
+            return Err(crate::Error::InvalidHeader(
+                "columnar batch ingest: first key must follow the last written key",
+            ));
+        }
         // Carry the batch's last key forward: it both records the ordering
         // boundary for any later write and signals `finish` that data was
         // written (it installs nothing when `last_key` is `None`).

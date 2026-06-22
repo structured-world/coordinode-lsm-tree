@@ -340,6 +340,28 @@ impl Column {
 }
 
 impl ColumnBatch {
+    /// The first row's user key, or `None` for an empty batch. Reads only the
+    /// intrinsic key column, so the ingest ordering guard can check a batch
+    /// against the previously written key without decoding the whole batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the first column is not the intrinsic user-key column
+    /// or its row framing is malformed.
+    pub(crate) fn first_user_key(&self) -> Result<Option<&[u8]>> {
+        if self.row_count == 0 {
+            return Ok(None);
+        }
+        let key_col = self
+            .columns
+            .first()
+            .filter(|c| c.column_id == COL_USER_KEY)
+            .ok_or(Error::InvalidHeader(
+                "columnar: first column is not the user-key column",
+            ))?;
+        bytes_column_row(&key_col.data, self.row_count, 0).map(Some)
+    }
+
     /// Encodes the batch into a columnar block payload using `codec` for every
     /// column. The returned bytes are the block payload (without the surrounding
     /// block header / checksum, which the writer adds).
