@@ -163,14 +163,31 @@ fn columnar_ingest_projects_individual_value_subcolumns() -> lsm_tree::Result<()
         "fixed-4 sub-column bytes"
     );
 
-    // Project only the bytes sub-column (id 4): again decoded in isolation.
+    // Project only the bytes sub-column (id 4): again decoded in isolation, and
+    // its payload is the two ingested values verbatim (asserting the id alone
+    // would also pass for an empty or wrong-row column).
     let batches = table.columnar_scan(&[4], None)?;
+    let mut col4_data = Vec::new();
+    let mut rows = 0u32;
     for b in &batches {
         assert!(
             b.columns.iter().all(|c| c.column_id == 4),
             "a sub-column-4 projection must not decode any other column",
         );
+        rows += b.row_count;
+        for col in b.columns.iter().filter(|c| c.column_id == 4) {
+            col4_data.extend_from_slice(&col.data);
+        }
     }
+    assert_eq!(rows, 2, "projection still sees every row");
+    // The bytes column body: (row_count + 1) little-endian u32 offsets [0, 2, 5]
+    // followed by the concatenated payload "aabbb" (row 0 = "aa", row 1 = "bbb").
+    let mut want_col4 = Vec::new();
+    for off in [0u32, 2, 5] {
+        want_col4.extend_from_slice(&off.to_le_bytes());
+    }
+    want_col4.extend_from_slice(b"aabbb");
+    assert_eq!(col4_data, want_col4, "projected bytes sub-column payload");
     Ok(())
 }
 

@@ -4139,6 +4139,15 @@ fn write_columnar_batch_accounts_tombstones_seqno_bounds_and_restart_locator() -
     // is_tombstone covers Tombstone + WeakTombstone; weak count is just the latter.
     assert_eq!(table.metadata.tombstone_count, 2, "two tombstone-kind rows");
     assert_eq!(table.metadata.weak_tombstone_count, 1, "one weak tombstone");
+    // The seqno-bounds section is written and loaded: every ingested row carries
+    // seqno 0, so the recovered bounds are exactly (0, 0). This proves the
+    // use_seqno_in_index path ran rather than relying on the point read alone
+    // (which can succeed through the normal index path regardless).
+    assert_eq!(
+        table.metadata.seqnos,
+        (0, 0),
+        "columnar ingest writes local seqno bounds of (0, 0)",
+    );
     assert!(
         table.get(b"k0", SeqNo::MAX, hash64(b"k0"))?.is_some(),
         "the live row reads back",
@@ -4192,6 +4201,13 @@ fn write_columnar_batch_on_an_empty_batch_writes_no_block() -> crate::Result<()>
             .write_columnar_batch(&empty, &crate::comparator::default_comparator())?
             .is_none(),
         "an empty batch yields no last key",
+    );
+    // Finishing must also produce no SST: a None last key alone does not prove
+    // the "writes no block" contract (a buggy writer could emit a table yet
+    // still return None).
+    assert!(
+        writer.finish()?.is_none(),
+        "an empty batch must not produce an SST",
     );
     Ok(())
 }
