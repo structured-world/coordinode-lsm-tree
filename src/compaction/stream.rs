@@ -285,8 +285,20 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                     collected.push(next);
                 }
                 ValueType::Value => {
-                    base_value = Some(next.value);
                     found_boundary = true;
+                    // A covering applied range tombstone newer than this value
+                    // deletes it, so the merge operands must fold onto an empty
+                    // base instead of the value being physically dropped. Without
+                    // this, a compaction resurrects a range-deleted key whenever a
+                    // later merge operand exists (the read path before compaction
+                    // already folds onto the empty base).
+                    if self.covered_by_applied_tombstone(user_key.as_ref(), next.key.seqno) {
+                        if let Some(watcher) = &mut self.dropped_callback {
+                            watcher.on_dropped(&next);
+                        }
+                    } else {
+                        base_value = Some(next.value);
+                    }
                     self.drain_key(&user_key)?;
                     break;
                 }
