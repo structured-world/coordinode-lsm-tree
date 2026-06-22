@@ -720,6 +720,22 @@ impl MultiWriter {
         Ok(())
     }
 
+    /// Writes a consumer-provided columnar batch as one columnar block, rotating
+    /// to a fresh table first if the current one has reached the target size (a
+    /// batch is a block boundary, mirroring the new-key rotation in
+    /// [`Self::write`]). Forwards to the inner writer's columnar-ingest path.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn write_columnar_batch(
+        &mut self,
+        batch: &crate::table::columnar::ColumnBatch,
+    ) -> crate::Result<Option<crate::UserKey>> {
+        if self.writer.output_size_hint() >= self.target_size {
+            self.rotate()?;
+        }
+        let comparator = self.comparator.clone();
+        self.writer.write_columnar_batch(batch, &comparator)
+    }
+
     /// Finishes the last table, making sure all data is written durably
     ///
     /// Returns the metadata of created tables

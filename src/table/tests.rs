@@ -3657,6 +3657,14 @@ fn zone_map_absent_without_policy() -> crate::Result<()> {
 
 /// Helper: recover a freshly written table from `file` with default test config.
 fn recover_test_table(file: &std::path::Path, checksum: Checksum) -> crate::Result<Table> {
+    recover_test_table_with_id(file, checksum, 0)
+}
+
+fn recover_test_table_with_id(
+    file: &std::path::Path,
+    checksum: Checksum,
+    table_id: TableId,
+) -> crate::Result<Table> {
     #[cfg(feature = "metrics")]
     let metrics = Arc::new(Metrics::default());
     Table::recover(
@@ -3664,7 +3672,7 @@ fn recover_test_table(file: &std::path::Path, checksum: Checksum) -> crate::Resu
         checksum,
         0,
         0,
-        0,
+        table_id,
         Arc::new(Cache::with_capacity_bytes(1_000_000)),
         Some(Arc::new(DescriptorTable::new(10))),
         Arc::new(StdFs),
@@ -3911,5 +3919,295 @@ fn delete_bitmap_masks_deleted_key_in_point_read() -> crate::Result<()> {
             assert!(got.is_some(), "live key {i} must be found");
         }
     }
+    Ok(())
+}
+
+#[cfg(feature = "columnar")]
+#[test]
+fn write_columnar_batch_stores_value_subcolumns_and_round_trips() -> crate::Result<()> {
+    use crate::table::columnar::{Column, TypeTag, entries_to_column_batch, unframe_value_cells};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+
+    // A consumer batch: the intrinsic columns for two sorted keys, with the
+    // single value column replaced by two value sub-columns (a fixed-4 + a bytes).
+    // Per-row seqnos are 0 (the ingest contract; the table assigns the seqno).
+    let mut batch = entries_to_column_batch(&[
+        crate::InternalValue::from_components(b"k0", b"ignored", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"k1", b"ignored", 0, crate::ValueType::Value),
+    ])?;
+    batch.columns.pop();
+    batch.columns.push(Column {
+        column_id: 3,
+        type_tag: TypeTag::Fixed(4),
+        validity: None,
+        data: vec![1, 0, 0, 0, 2, 0, 0, 0],
+    });
+    let mut bytes_data = Vec::new();
+    for off in [0u32, 2, 5] {
+        bytes_data.extend_from_slice(&off.to_le_bytes());
+    }
+    bytes_data.extend_from_slice(b"aabbb");
+    batch.columns.push(Column {
+        column_id: 4,
+        type_tag: TypeTag::Bytes,
+        validity: None,
+        data: bytes_data,
+    });
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    writer.write_columnar_batch(&batch, &crate::comparator::default_comparator())?;
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    assert!(table.metadata.columnar, "segment must be columnar");
+
+    // Point reads reconstruct the framed value, which unframes to the original
+    // sub-cells.
+    let tags = [TypeTag::Fixed(4), TypeTag::Bytes];
+    let v0 = table
+        .get(b"k0", SeqNo::MAX, hash64(b"k0"))?
+        .expect("k0 present");
+    assert_eq!(
+        unframe_value_cells(v0.value.as_ref(), &tags)?,
+        vec![&[1, 0, 0, 0][..], &b"aa"[..]],
+    );
+    let v1 = table
+        .get(b"k1", SeqNo::MAX, hash64(b"k1"))?
+        .expect("k1 present");
+    assert_eq!(
+        unframe_value_cells(v1.value.as_ref(), &tags)?,
+        vec![&[2, 0, 0, 0][..], &b"bbb"[..]],
+    );
+    Ok(())
+}
+
+/// A positional delete-bitmap masks whole rows of a value-sub-column segment in
+/// both the point and the projection read paths: the mask is value-agnostic, so
+/// deleting by position hides each row's intrinsic key and every sub-column
+/// while survivors keep their reconstructed sub-cells and projected bytes.
+#[cfg(feature = "columnar")]
+#[test]
+fn delete_bitmap_masks_value_subcolumns_in_point_and_projection_reads() -> crate::Result<()> {
+    use crate::fs::SyncMode;
+    use crate::table::columnar::{Column, TypeTag, entries_to_column_batch, unframe_value_cells};
+    use crate::table::delete_bitmap::DeleteBitmap;
+
+    let dir = tempdir()?;
+    let src = dir.path().join("src");
+    let out = dir.path().join("out");
+
+    // Five rows; the value is split into a fixed-4 (col 3) and a bytes (col 4)
+    // sub-column. fixed values 10,20,30,40,50; bytes "a","bb","ccc","dddd","eeeee".
+    let fixed: [u32; 5] = [10, 20, 30, 40, 50];
+    let payloads: [&[u8]; 5] = [b"a", b"bb", b"ccc", b"dddd", b"eeeee"];
+    let mut batch = entries_to_column_batch(
+        &(0..5u32)
+            .map(|i| {
+                crate::InternalValue::from_components(
+                    format!("k{i}").into_bytes(),
+                    b"x",
+                    0, // ingest contract: per-row seqno is 0
+                    crate::ValueType::Value,
+                )
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    batch.columns.pop();
+    batch.columns.push(Column {
+        column_id: 3,
+        type_tag: TypeTag::Fixed(4),
+        validity: None,
+        data: fixed.iter().flat_map(|v| v.to_le_bytes()).collect(),
+    });
+    let mut bytes_data = Vec::new();
+    let mut acc = 0u32;
+    bytes_data.extend_from_slice(&acc.to_le_bytes());
+    for p in payloads {
+        acc += u32::try_from(p.len()).unwrap();
+        bytes_data.extend_from_slice(&acc.to_le_bytes());
+    }
+    for p in payloads {
+        bytes_data.extend_from_slice(p);
+    }
+    batch.columns.push(Column {
+        column_id: 4,
+        type_tag: TypeTag::Bytes,
+        validity: None,
+        data: bytes_data,
+    });
+
+    let mut writer = Writer::new(src.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    writer.write_columnar_batch(&batch, &crate::comparator::default_comparator())?;
+    let (_, checksum) = writer.finish()?.expect("source written");
+    let source = recover_test_table(&src, checksum)?;
+
+    // Mask rows 1 and 3 by position (value-agnostic) and relocate.
+    let mut bitmap = DeleteBitmap::new();
+    bitmap.insert(1);
+    bitmap.insert(3);
+    let out_checksum =
+        source.relocate_columnar_with_deletes(&out, &StdFs, 1, &bitmap, SyncMode::Normal)?;
+    let relocated = recover_test_table_with_id(&out, out_checksum, 1)?;
+
+    // Point path: masked rows read absent; survivors reconstruct their sub-cells.
+    let tags = [TypeTag::Fixed(4), TypeTag::Bytes];
+    for i in 0..5u32 {
+        let key = format!("k{i}").into_bytes();
+        let got = relocated.get(&key, SeqNo::MAX, hash64(&key))?;
+        if i == 1 || i == 3 {
+            assert!(got.is_none(), "masked row {i} must read absent");
+        } else {
+            let v = got.expect("survivor present");
+            assert_eq!(
+                unframe_value_cells(v.value.as_ref(), &tags)?,
+                vec![&fixed[i as usize].to_le_bytes()[..], payloads[i as usize]],
+                "survivor {i} sub-cells",
+            );
+        }
+    }
+
+    // Projection path: a scan over sub-column 3 yields the survivors only, with
+    // their fixed bytes; the masked rows never appear.
+    let batches = relocated.columnar_scan(&[3], None)?;
+    let mut col3 = Vec::new();
+    let mut rows = 0u32;
+    for b in &batches {
+        assert!(
+            b.columns.iter().all(|c| c.column_id == 3),
+            "projection decodes only sub-column 3",
+        );
+        rows += b.row_count;
+        for c in b.columns.iter().filter(|c| c.column_id == 3) {
+            col3.extend_from_slice(&c.data);
+        }
+    }
+    assert_eq!(rows, 3, "two of five rows masked out of the projection");
+    let want: Vec<u8> = [10u32, 30, 50]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    assert_eq!(col3, want, "projected fixed bytes are the survivors");
+
+    Ok(())
+}
+
+#[cfg(feature = "columnar")]
+#[test]
+fn write_columnar_batch_accounts_tombstones_seqno_bounds_and_restart_locator() -> crate::Result<()>
+{
+    use crate::config::{LocatorPolicyEntry, LocatorPrecision};
+    use crate::table::columnar::{Column, TypeTag, entries_to_column_batch};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("t");
+    // Distinct keys with mixed value types plus one fixed value sub-column,
+    // written with seqno-in-index and restart-precision locator enabled so the
+    // tombstone / weak-tombstone accounting, the seqno-bounds, and the
+    // restart-precision locator branches all run.
+    let mut batch = entries_to_column_batch(&[
+        crate::InternalValue::from_components(b"k0", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"k1", b"", 0, crate::ValueType::Tombstone),
+        crate::InternalValue::from_components(b"k2", b"", 0, crate::ValueType::WeakTombstone),
+    ])?;
+    batch.columns.pop();
+    batch.columns.push(Column {
+        column_id: 3,
+        type_tag: TypeTag::Fixed(2),
+        validity: None,
+        data: vec![1, 1, 2, 2, 3, 3],
+    });
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_seqno_in_index(true)
+        .use_locator(LocatorPolicyEntry::Enabled {
+            precision: LocatorPrecision::Restart,
+            block_id_bits: None,
+            slot_bits: None,
+        });
+    writer.write_columnar_batch(&batch, &crate::comparator::default_comparator())?;
+    let (_, checksum) = writer.finish()?.expect("table written");
+    let table = recover_test_table(&file, checksum)?;
+
+    // is_tombstone covers Tombstone + WeakTombstone; weak count is just the latter.
+    assert_eq!(table.metadata.tombstone_count, 2, "two tombstone-kind rows");
+    assert_eq!(table.metadata.weak_tombstone_count, 1, "one weak tombstone");
+    // The seqno-bounds section is written and loaded: every ingested row carries
+    // seqno 0, so the recovered bounds are exactly (0, 0). This proves the
+    // use_seqno_in_index path ran rather than relying on the point read alone
+    // (which can succeed through the normal index path regardless).
+    assert_eq!(
+        table.metadata.seqnos,
+        (0, 0),
+        "columnar ingest writes local seqno bounds of (0, 0)",
+    );
+    assert!(
+        table.get(b"k0", SeqNo::MAX, hash64(b"k0"))?.is_some(),
+        "the live row reads back",
+    );
+    Ok(())
+}
+
+#[cfg(feature = "columnar")]
+#[test]
+fn write_columnar_batch_on_an_empty_batch_writes_no_block() -> crate::Result<()> {
+    use crate::table::columnar::{Column, TypeTag};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("t");
+    // An empty batch (zero rows) carrying the intrinsic columns plus a value
+    // sub-column writes no block and returns no last key.
+    let empty = crate::table::columnar::ColumnBatch {
+        row_count: 0,
+        columns: vec![
+            Column {
+                column_id: 0,
+                type_tag: TypeTag::Bytes,
+                validity: None,
+                data: 0u32.to_le_bytes().to_vec(),
+            },
+            Column {
+                column_id: 1,
+                type_tag: TypeTag::Fixed(8),
+                validity: None,
+                data: Vec::new(),
+            },
+            Column {
+                column_id: 2,
+                type_tag: TypeTag::Fixed(1),
+                validity: None,
+                data: Vec::new(),
+            },
+            Column {
+                column_id: 3,
+                type_tag: TypeTag::Fixed(4),
+                validity: None,
+                data: Vec::new(),
+            },
+        ],
+    };
+    let mut writer = Writer::new(file, 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    assert!(
+        writer
+            .write_columnar_batch(&empty, &crate::comparator::default_comparator())?
+            .is_none(),
+        "an empty batch yields no last key",
+    );
+    // Finishing must also produce no SST: a None last key alone does not prove
+    // the "writes no block" contract (a buggy writer could emit a table yet
+    // still return None).
+    assert!(
+        writer.finish()?.is_none(),
+        "an empty batch must not produce an SST",
+    );
     Ok(())
 }

@@ -58,10 +58,11 @@ jobs:
     # self-hosted runners (if added later) without the label
     # won't pick the job up.
     runs-on: [self-hosted, gpu-private-systems]
-    # 60 (was 30): absorbs the compare-rocksdb head-to-head pass added
-    # below (bounded criterion settings, but the zstd22/10k write points
-    # are seconds each) plus the first-run librocksdb-sys C++ compile.
-    timeout-minutes: 60
+    # The db_bench pass is seconds; the compare-rocksdb head-to-head pass
+    # uses a half-second criterion window per scenario (a few minutes for
+    # the whole matrix). The cap mainly bounds the first-run librocksdb-sys
+    # C++ compile and catches a runaway regression early.
+    timeout-minutes: 30
     steps:
       # v6 requires runner ≥2.327.1 (node24 runtime) — the self-hosted
       # runner has a current runner agent that satisfies this.
@@ -145,11 +146,14 @@ jobs:
       # is a ratio measured on one host in one run, it stays meaningful
       # even if this runner's CPU changes between runs.
       #
-      # Bounded criterion settings keep the heavy zstd22/10k write points
-      # from dominating the timeout: a small sample count with a short
-      # measurement window still yields a stable median for the dashboard
-      # without the default 100-sample sweep (which on a multi-second-per
-      # -iteration point would run for many minutes each).
+      # Bounded criterion settings keep the harness fast: this is a
+      # ratio comparison (both engines in one process per scenario), so a
+      # short warm-up + measurement window per scenario still yields a
+      # stable median while keeping the whole matrix (5 workloads x sizes x
+      # engines) well under the timeout. The default 100-sample, multi-second
+      # sweep ran for ~60 min across the matrix and timed out, producing no
+      # dashboard at all; a half-second window per scenario brings it to a
+      # few minutes.
       #
       # Runner requirement: librocksdb-sys builds from source via bindgen,
       # so the host must have a C/C++ toolchain + libclang. On Linux
@@ -187,7 +191,7 @@ jobs:
         run: |
           cd tools/compare-rocksdb
           cargo bench --bench compare -- \
-            --sample-size 10 --warm-up-time 1 --measurement-time 5
+            --sample-size 10 --warm-up-time 0.5 --measurement-time 0.5
 
       # Publish the criterion HTML report tree (per-group overlay charts)
       # to gh-pages under dev/compare, alongside the db_bench dashboard at

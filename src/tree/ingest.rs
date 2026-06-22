@@ -145,6 +145,10 @@ impl<'a> Ingestion<'a> {
 
         writer = writer.use_seqno_in_index(rc.seqno_in_index);
         writer = writer.use_zone_map(rc.zone_map);
+        // Match the flush writer: when the columnar layout is enabled, ingested
+        // tables are columnar too (a row ingest is transposed at spill, a
+        // columnar batch is stored directly via `write_columnar_batch`).
+        writer = writer.use_columnar(rc.columnar);
         writer = writer.use_disable_cow_on_sst(rc.disable_cow_on_sst_files);
         writer = writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
         writer = writer.use_locator(tree.config.locator_policy.get(INITIAL_CANONICAL_LEVEL));
@@ -274,6 +278,54 @@ impl<'a> Ingestion<'a> {
         // Remember the last user key to validate the next call's ordering
         self.last_key = Some(key);
 
+        Ok(())
+    }
+
+    /// Writes a consumer-provided columnar batch (its value sub-columns) as one
+    /// columnar block.
+    ///
+    /// The batch carries the three intrinsic columns ([key, seqno, value-type])
+    /// plus one or more value sub-columns. Its keys must be strictly increasing
+    /// (by the tree comparator) within the batch and after any previously written
+    /// data, and every per-row seqno must be `0`: the ingestion assigns the atomic
+    /// global sequence number at [`finish`](Self::finish), shared by every
+    /// ingested table.
+    ///
+    /// Requires the columnar layout (enable `columnar` in the runtime config
+    /// before opening the ingestion); a row-mode ingestion rejects the batch. An
+    /// ingestion is either row-oriented (via [`write`](Self::write)) or
+    /// columnar, not both.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the batch shape is invalid, the keys are not strictly
+    /// increasing, any row carries a non-zero seqno, the layout is not columnar,
+    /// or a block write fails.
+    #[cfg(feature = "columnar")]
+    pub fn write_columnar_batch(
+        &mut self,
+        batch: &crate::table::columnar::ColumnBatch,
+    ) -> crate::Result<()> {
+        // Cross-call ordering guard, like the row write methods: the batch's
+        // first key must strictly follow the last key written through this
+        // ingestion. The inner writer also rejects unsorted keys, but its running
+        // key resets on table rotation, so this `last_key` check (which persists
+        // across rotations) is what catches a batch that interleaves out of order
+        // with a previous write or batch.
+        if let Some(prev) = &self.last_key
+            && let Some(first) = batch.first_user_key()?
+            && self.tree.config.comparator.compare(prev, first) != Ordering::Less
+        {
+            return Err(crate::Error::InvalidHeader(
+                "columnar batch ingest: first key must follow the last written key",
+            ));
+        }
+        // Carry the batch's last key forward: it both records the ordering
+        // boundary for any later write and signals `finish` that data was
+        // written (it installs nothing when `last_key` is `None`).
+        if let Some(last) = self.writer.write_columnar_batch(batch)? {
+            self.last_key = Some(last);
+        }
         Ok(())
     }
 
