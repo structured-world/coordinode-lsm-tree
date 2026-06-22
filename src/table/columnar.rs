@@ -666,34 +666,84 @@ pub fn entries_to_column_batch(entries: &[InternalValue]) -> Result<ColumnBatch>
 /// Returns an error if the batch does not carry exactly the four intrinsic
 /// columns in order with the expected type tags, or if a row is truncated or
 /// carries an unknown value type.
+/// Returns row `row`'s `width`-byte cell from a fixed-width column's data.
+fn fixed_column_row(data: &[u8], width: u8, row: u32) -> Result<&[u8]> {
+    let w = width as usize;
+    let start = (row as usize).checked_mul(w).ok_or(Error::InvalidHeader(
+        "columnar: fixed column offset overflow",
+    ))?;
+    let end = start.checked_add(w).ok_or(Error::InvalidHeader(
+        "columnar: fixed column offset overflow",
+    ))?;
+    data.get(start..end)
+        .ok_or(Error::InvalidHeader("columnar: fixed column row truncated"))
+}
+
+/// Returns row `row`'s cell bytes from `col`, dispatching on the column's type.
+fn column_cell(col: &Column, row_count: u32, row: u32) -> Result<&[u8]> {
+    match col.type_tag {
+        TypeTag::Fixed(width) => fixed_column_row(&col.data, width, row),
+        TypeTag::Bytes => bytes_column_row(&col.data, row_count, row),
+    }
+}
+
+/// Reconstructs a row's value from its value sub-columns. A single sub-column
+/// yields the cell verbatim (the intrinsic opaque value, or a degenerate
+/// one-column consumer value); two or more are joined by [`frame_value_cells`]
+/// into one self-describing blob the consumer reverses with
+/// [`unframe_value_cells`].
+fn reconstruct_row_value(value_cols: &[Column], row_count: u32, row: u32) -> Result<Slice> {
+    if let [single] = value_cols {
+        return Ok(Slice::from(column_cell(single, row_count, row)?));
+    }
+    let mut cells = Vec::with_capacity(value_cols.len());
+    for col in value_cols {
+        cells.push((col.type_tag, column_cell(col, row_count, row)?));
+    }
+    Ok(Slice::from(frame_value_cells(&cells)?))
+}
+
 pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>> {
-    let [key_col, seqno_col, vt_col, value_col] = batch.columns.as_slice() else {
+    let [key_col, seqno_col, vt_col, value_cols @ ..] = batch.columns.as_slice() else {
         return Err(Error::InvalidHeader(
-            "columnar: expected four intrinsic columns",
+            "columnar: batch missing the intrinsic columns",
         ));
     };
+    if value_cols.is_empty() {
+        return Err(Error::InvalidHeader(
+            "columnar: batch carries no value column",
+        ));
+    }
     if key_col.column_id != COL_USER_KEY
         || key_col.type_tag != TypeTag::Bytes
         || seqno_col.column_id != COL_SEQNO
         || seqno_col.type_tag != TypeTag::Fixed(8)
         || vt_col.column_id != COL_VALUE_TYPE
         || vt_col.type_tag != TypeTag::Fixed(1)
-        || value_col.column_id != COL_VALUE
-        || value_col.type_tag != TypeTag::Bytes
     {
         return Err(Error::InvalidHeader(
             "columnar: unexpected intrinsic column layout",
         ));
     }
-    // Intrinsic fields are never null, and a hand-built `ColumnBatch` must clear
-    // the same framing checks a decoded one does. Running `validate` here also
-    // bounds `row_count` against the fixed-width column lengths before the
-    // allocation below, so a malformed batch claiming a huge row count is
-    // rejected instead of reserving for billions of rows.
-    for col in [key_col, seqno_col, vt_col, value_col] {
+    // The three intrinsic fields are never null. Running `validate` also bounds
+    // `row_count` against the fixed-width column lengths before the allocation
+    // below, so a malformed batch claiming a huge row count is rejected instead
+    // of reserving for billions of rows.
+    for col in [key_col, seqno_col, vt_col] {
         if col.validity.is_some() {
             return Err(Error::InvalidHeader(
                 "columnar: intrinsic columns must not be nullable",
+            ));
+        }
+        col.validate(batch.row_count)?;
+    }
+    // Value sub-columns are consumer-defined (id / type / count). Nullable value
+    // sub-columns are a later slice, so reject a validity bitmap for now; the
+    // per-column `validate` bounds each against `row_count` like the intrinsics.
+    for col in value_cols {
+        if col.validity.is_some() {
+            return Err(Error::InvalidHeader(
+                "columnar: nullable value sub-columns are not supported yet",
             ));
         }
         col.validate(batch.row_count)?;
@@ -717,14 +767,14 @@ pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>
             .ok_or(Error::InvalidHeader("columnar: value-type row truncated"))?;
         let value_type =
             ValueType::try_from(vt_byte).map_err(|()| Error::InvalidTag(("ValueType", vt_byte)))?;
-        let value = bytes_column_row(&value_col.data, batch.row_count, i)?;
+        let value = reconstruct_row_value(value_cols, batch.row_count, i)?;
         out.push(InternalValue {
             key: InternalKey {
                 user_key: Slice::from(user_key),
                 seqno,
                 value_type,
             },
-            value: Slice::from(value),
+            value,
         });
     }
     Ok(out)
@@ -1127,6 +1177,53 @@ mod tests {
             ],
         };
         assert!(column_batch_to_entries(&bad).is_err());
+    }
+
+    #[test]
+    fn untranspose_frames_multiple_value_subcolumns() {
+        // A consumer batch: the three intrinsic columns plus two value
+        // sub-columns (a fixed-4 and a variable-width bytes). Each row's
+        // reconstructed value is the framed concat of its two sub-cells, which
+        // unframe_value_cells reverses.
+        let mut batch = entries_to_column_batch(&[
+            entry(b"k0", 1, ValueType::Value, b"ignored"),
+            entry(b"k1", 2, ValueType::Value, b"ignored"),
+        ])
+        .expect("transpose");
+        // Replace the single opaque value column with two value sub-columns.
+        batch.columns.pop();
+        batch.columns.push(Column {
+            column_id: 3,
+            type_tag: TypeTag::Fixed(4),
+            validity: None,
+            data: vec![1, 0, 0, 0, 2, 0, 0, 0], // row 0 = 1, row 1 = 2
+        });
+        let mut bytes_data = Vec::new();
+        for off in [0u32, 2, 5] {
+            bytes_data.extend_from_slice(&off.to_le_bytes());
+        }
+        bytes_data.extend_from_slice(b"aabbb"); // row 0 = "aa", row 1 = "bbb"
+        batch.columns.push(Column {
+            column_id: 4,
+            type_tag: TypeTag::Bytes,
+            validity: None,
+            data: bytes_data,
+        });
+
+        let entries = column_batch_to_entries(&batch).expect("untranspose");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].key.user_key.as_ref(), b"k0");
+        assert_eq!(entries[1].key.seqno, 2);
+
+        let tags = [TypeTag::Fixed(4), TypeTag::Bytes];
+        assert_eq!(
+            unframe_value_cells(entries[0].value.as_ref(), &tags).expect("unframe 0"),
+            vec![&[1, 0, 0, 0][..], &b"aa"[..]],
+        );
+        assert_eq!(
+            unframe_value_cells(entries[1].value.as_ref(), &tags).expect("unframe 1"),
+            vec![&[2, 0, 0, 0][..], &b"bbb"[..]],
+        );
     }
 
     fn sample_batch() -> ColumnBatch {
