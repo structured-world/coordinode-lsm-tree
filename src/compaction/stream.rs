@@ -285,8 +285,20 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                     collected.push(next);
                 }
                 ValueType::Value => {
-                    base_value = Some(next.value);
                     found_boundary = true;
+                    // A covering applied range tombstone newer than this value
+                    // deletes it, so the merge operands must fold onto an empty
+                    // base instead of the value being physically dropped. Without
+                    // this, a compaction resurrects a range-deleted key whenever a
+                    // later merge operand exists (the read path before compaction
+                    // already folds onto the empty base).
+                    if self.covered_by_applied_tombstone(user_key.as_ref(), next.key.seqno) {
+                        if let Some(watcher) = &mut self.dropped_callback {
+                            watcher.on_dropped(&next);
+                        }
+                    } else {
+                        base_value = Some(next.value);
+                    }
                     self.drain_key(&user_key)?;
                     break;
                 }
@@ -305,6 +317,18 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                 }
             }
         }
+
+        // Drop collected operands that a covering applied range tombstone deletes
+        // (they are pre-delete state): only operands newer than the tombstone fold
+        // onto the now-empty base. Without this, an operand below the tombstone
+        // would resurrect deleted state across compaction.
+        collected.retain(|e| {
+            let covered = self.covered_by_applied_tombstone(e.key.user_key.as_ref(), e.key.seqno);
+            if covered && let Some(watcher) = &mut self.dropped_callback {
+                watcher.on_dropped(e);
+            }
+            !covered
+        });
 
         // Extract operand values for merge
         let operands: Vec<UserValue> = collected.into_iter().map(|e| e.value).collect();
@@ -1207,6 +1231,99 @@ mod tests {
             let item = iter.next().unwrap()?;
             assert_eq!(item.key.value_type, ValueType::Value);
             assert_eq!(&*item.value, b"base,op1,op2");
+            assert!(iter.next().is_none());
+
+            Ok(())
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used, reason = "test assertion")]
+        fn compaction_merge_base_deleted_by_range_tombstone() -> crate::Result<()> {
+            // op@999 and mid@998 operands above a base@997; a range tombstone over
+            // the key at seqno 998 deletes the base (997 < 998), while the operands
+            // survive (999, 998 are not below 998). The operands fold onto an empty
+            // base, and the dropped base value reaches the callback.
+            #[rustfmt::skip]
+            let vec = stream![
+                "a", "op", "M",
+                "a", "mid", "M",
+                "a", "base", "V",
+            ];
+
+            let mut callback = TrackCallback::default();
+            let cmp = crate::comparator::default_comparator();
+            let rt = RangeTombstone::new(
+                UserKey::from(b"a".as_ref()),
+                UserKey::from(b"b".as_ref()),
+                998,
+            );
+
+            let iter = vec.iter().cloned().map(Ok);
+            {
+                let mut iter = CompactionStream::new(iter, 1_000)
+                    .with_merge_operator(Some(merge_op()))
+                    .with_range_tombstone_application(vec![rt], cmp)
+                    .with_drop_callback(&mut callback);
+
+                let item = iter.next().unwrap()?;
+                assert_eq!(item.key.value_type, ValueType::Value);
+                assert_eq!(&*item.value, b"mid,op");
+                assert!(iter.next().is_none());
+            }
+            assert!(
+                callback.items.iter().any(|kv| &*kv.value == b"base"),
+                "the range-deleted base value must reach the drop callback"
+            );
+
+            Ok(())
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used, reason = "test assertion")]
+        fn compaction_merge_drops_operands_below_range_tombstone() -> crate::Result<()> {
+            // M@100 is above the range tombstone; M@80 and the base V@70 are below
+            // it (and deleted by it). Only M@100 survives, folding onto an empty
+            // base, so the result is just that operand. Built with explicit seqnos
+            // because the range tombstone must sit between the operands.
+            let entries = vec![
+                InternalValue::from_components(
+                    b"a".as_ref(),
+                    b"hi".as_ref(),
+                    100,
+                    ValueType::MergeOperand,
+                ),
+                InternalValue::from_components(
+                    b"a".as_ref(),
+                    b"lo".as_ref(),
+                    80,
+                    ValueType::MergeOperand,
+                ),
+                InternalValue::from_components(
+                    b"a".as_ref(),
+                    b"base".as_ref(),
+                    70,
+                    ValueType::Value,
+                ),
+            ];
+
+            let cmp = crate::comparator::default_comparator();
+            let rt = RangeTombstone::new(
+                UserKey::from(b"a".as_ref()),
+                UserKey::from(b"b".as_ref()),
+                90,
+            );
+
+            let iter = entries.into_iter().map(Ok);
+            let mut iter = CompactionStream::new(iter, 1_000)
+                .with_merge_operator(Some(merge_op()))
+                .with_range_tombstone_application(vec![rt], cmp);
+
+            let item = iter.next().unwrap()?;
+            assert_eq!(item.key.value_type, ValueType::Value);
+            assert_eq!(
+                &*item.value, b"hi",
+                "only the operand above the range tombstone survives"
+            );
             assert!(iter.next().is_none());
 
             Ok(())
