@@ -150,8 +150,15 @@ pub struct Inner {
 
     /// Per-segment positional delete-bitmap, loaded on open from the optional
     /// `delete_bitmap` section. Empty when the segment has no materialized
-    /// deletes, so a scan applies no mask. Read by the columnar scan path.
-    pub(crate) delete_bitmap: crate::table::delete_bitmap::DeleteBitmap,
+    /// deletes, so a read applies no mask. `Arc` so a reader can hold it cheaply.
+    pub(crate) delete_bitmap: alloc::sync::Arc<crate::table::delete_bitmap::DeleteBitmap>,
+
+    /// Each data block's first global row position (file offset -> start row, in
+    /// block-index = writer order), built on open from the zone map when the
+    /// delete-bitmap is non-empty. `None` when there are no deletes. Lets the
+    /// read paths resolve a block's start position in O(1) for positional
+    /// masking, instead of recomputing the cumulative row counts per read.
+    pub(crate) delete_block_starts: Option<alloc::sync::Arc<crate::HashMap<u64, u32>>>,
 
     /// Retrieval-ribbon locator, loaded on open from the optional `locator`
     /// section. `Some` only when the table was written with a locator policy

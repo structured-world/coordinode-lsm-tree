@@ -152,8 +152,8 @@ fn create_data_block_reader(
 /// plus each data block's first global row position (block-index order), so a
 /// reconstructed block can drop its deleted rows by position.
 pub struct DeleteMask {
-    pub(crate) bitmap: crate::table::delete_bitmap::DeleteBitmap,
-    pub(crate) block_start_rows: crate::HashMap<u64, u32>,
+    pub(crate) bitmap: Arc<crate::table::delete_bitmap::DeleteBitmap>,
+    pub(crate) block_start_rows: Arc<crate::HashMap<u64, u32>>,
 }
 
 #[expect(
