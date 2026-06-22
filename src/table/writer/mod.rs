@@ -1155,6 +1155,51 @@ impl Writer {
     /// Returns an error if the batch shape is malformed, the layout is not
     /// columnar, the keys are not strictly increasing, a row carries a non-zero
     /// seqno, or the block write fails.
+    /// Validates a columnar batch against the ingest contract without writing
+    /// anything: the layout must be columnar, the batch shape valid, every per-row
+    /// seqno `0`, and the keys strictly increasing within the batch. This lets the
+    /// ingestion reject a bad batch eagerly even though the block emission is
+    /// deferred (batches accumulate into one rowgroup). Cross-batch / cross-block
+    /// ordering is the caller's responsibility (it tracks the last key); the check
+    /// here starts fresh, so it is independent of any not-yet-flushed rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the layout is not columnar, the batch shape is
+    /// malformed, a row carries a non-zero seqno, or the keys are not strictly
+    /// increasing within the batch.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn validate_columnar_batch(
+        &self,
+        batch: &crate::table::columnar::ColumnBatch,
+        comparator: &crate::SharedComparator,
+    ) -> crate::Result<()> {
+        if !self.use_columnar {
+            return Err(crate::Error::FeatureUnsupported(
+                "columnar batch ingest requires the columnar layout",
+            ));
+        }
+        let entries = crate::table::columnar::column_batch_to_entries(batch)?;
+        if entries.iter().any(|e| e.key.seqno != 0) {
+            return Err(crate::Error::FeatureUnsupported(
+                "columnar batch ingest requires every row seqno to be 0 (the ingestion assigns the sequence number)",
+            ));
+        }
+        let mut prev: Option<&crate::UserKey> = None;
+        for e in &entries {
+            if let Some(p) = prev
+                && comparator.compare(p.as_ref(), e.key.user_key.as_ref())
+                    != core::cmp::Ordering::Less
+            {
+                return Err(crate::Error::InvalidHeader(
+                    "columnar batch ingest requires strictly increasing keys",
+                ));
+            }
+            prev = Some(&e.key.user_key);
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "columnar")]
     pub(crate) fn write_columnar_batch(
         &mut self,

@@ -30,6 +30,11 @@ pub struct Ingestion<'a> {
     pub(crate) writer: MultiWriter,
     seqno: SeqNo,
     last_key: Option<UserKey>,
+    /// Successive columnar batches with the same layout accumulate here into one
+    /// rowgroup, flushed to a block once they reach the target data-block size or
+    /// the layout changes, so many small ingest batches become few large blocks.
+    #[cfg(feature = "columnar")]
+    pending_columnar: Option<crate::table::columnar::ColumnBatch>,
 }
 
 impl<'a> Ingestion<'a> {
@@ -165,6 +170,8 @@ impl<'a> Ingestion<'a> {
             writer,
             seqno: 0,
             last_key: None,
+            #[cfg(feature = "columnar")]
+            pending_columnar: None,
         })
     }
 
@@ -320,11 +327,51 @@ impl<'a> Ingestion<'a> {
                 "columnar batch ingest: first key must follow the last written key",
             ));
         }
+        // Validate the batch eagerly (layout, shape, seqno, within-batch order) so
+        // a malformed batch is rejected on the call that submits it, even though
+        // the block emission is deferred by the accumulation below.
+        self.writer.validate_columnar_batch(batch)?;
+        // Accumulate into the pending rowgroup. A batch with the same column
+        // layout extends the current rowgroup; a different layout (or none yet)
+        // flushes what is pending and starts a fresh rowgroup. The block is
+        // emitted lazily, once the rowgroup reaches the target data-block size
+        // (below) or at `finish`, so a stream of small batches becomes a few
+        // large columnar blocks instead of one block per call.
+        match &mut self.pending_columnar {
+            Some(pending) if pending.same_layout(batch) => pending.append(batch)?,
+            _ => {
+                self.flush_pending_columnar()?;
+                self.pending_columnar = Some(batch.clone());
+            }
+        }
         // Carry the batch's last key forward: it both records the ordering
         // boundary for any later write and signals `finish` that data was
         // written (it installs nothing when `last_key` is `None`).
-        if let Some(last) = self.writer.write_columnar_batch(batch)? {
-            self.last_key = Some(last);
+        if let Some(last) = batch.last_user_key()? {
+            self.last_key = Some(crate::UserKey::from(last));
+        }
+        let target = self
+            .tree
+            .config
+            .data_block_size_policy
+            .get(INITIAL_CANONICAL_LEVEL) as usize;
+        if self
+            .pending_columnar
+            .as_ref()
+            .is_some_and(|p| p.data_size() >= target)
+        {
+            self.flush_pending_columnar()?;
+        }
+        Ok(())
+    }
+
+    /// Writes the accumulated columnar rowgroup as one block, if any is pending.
+    /// The inner writer reports the last key it wrote, but the ingestion already
+    /// tracks `last_key` per accepted batch, so the return value is discarded.
+    #[cfg(feature = "columnar")]
+    fn flush_pending_columnar(&mut self) -> crate::Result<()> {
+        if let Some(batch) = self.pending_columnar.take() {
+            self.writer.write_columnar_batch(&batch)?;
         }
         Ok(())
     }
@@ -335,13 +382,19 @@ impl<'a> Ingestion<'a> {
     ///
     /// Will return `Err` if an IO error occurs.
     #[allow(clippy::significant_drop_tightening)]
-    pub fn finish(self) -> crate::Result<()> {
+    #[cfg_attr(not(feature = "columnar"), allow(unused_mut))]
+    pub fn finish(mut self) -> crate::Result<()> {
         use crate::{AbstractTree, Table};
 
         if self.last_key.is_none() {
             log::trace!("No data written to Ingestion, returning early");
             return Ok(());
         }
+
+        // Emit the final accumulated columnar rowgroup (if any) before the
+        // writer is finalized below.
+        #[cfg(feature = "columnar")]
+        self.flush_pending_columnar()?;
 
         // CRITICAL SECTION: Atomic flush + seqno allocation + registration
         //

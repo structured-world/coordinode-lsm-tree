@@ -736,6 +736,18 @@ impl MultiWriter {
         self.writer.write_columnar_batch(batch, &comparator)
     }
 
+    /// Validates a columnar batch against the ingest contract without writing,
+    /// so the ingestion can reject a malformed batch eagerly while block emission
+    /// stays deferred. Forwards to the inner writer's validation.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn validate_columnar_batch(
+        &self,
+        batch: &crate::table::columnar::ColumnBatch,
+    ) -> crate::Result<()> {
+        let comparator = self.comparator.clone();
+        self.writer.validate_columnar_batch(batch, &comparator)
+    }
+
     /// Finishes the last table, making sure all data is written durably
     ///
     /// Returns the metadata of created tables
