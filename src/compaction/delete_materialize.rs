@@ -45,16 +45,7 @@ use alloc::vec::Vec;
 /// stream, which is currently `std`-gated in the worker, so this module is gated
 /// to match. It un-gates trivially alongside that layer.
 // `pub` (not `pub(crate)`) inside this crate-private module: clippy flags the
-// redundant restriction since the module itself is already crate-scoped. Wired
-// by the merge-on-read delete-application path (a follow-up increment in this
-// change); the dead-code scaffold is removed once that caller lands.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired by the merge-on-read compaction delete-application path"
-    )
-)]
+// redundant restriction since the module itself is already crate-scoped.
 pub fn build_position_bitmap<'a, I>(
     rows: I,
     tombstones: &[RangeTombstone],

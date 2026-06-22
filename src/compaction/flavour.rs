@@ -267,6 +267,23 @@ impl ProducedOutput {
             blob_file.mark_as_deleted();
         }
     }
+
+    /// Builds the output for a merge-on-read relocation: the `created` segment
+    /// (the source's blocks reused verbatim plus a delete-bitmap) replaces the
+    /// `deleted` source segment, with no blob files and no fragmentation. Lets
+    /// the relocation path reuse [`install_merge`]'s atomic version edit instead
+    /// of hand-rolling one.
+    #[cfg(feature = "std")]
+    pub(super) fn for_relocation(created: Table, deleted: Table) -> Self {
+        Self {
+            created_tables: vec![created],
+            created_blob_files: Vec::new(),
+            rewritten_blob_files_to_drop: Vec::new(),
+            tables_to_delete: vec![deleted],
+            blob_frag_map: FragmentationMap::default(),
+            consumed_through: crate::HashMap::default(),
+        }
+    }
 }
 
 // TODO: find a better name

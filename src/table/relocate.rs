@@ -45,10 +45,6 @@ impl Table {
     /// segment, or one without a zone map (the positional mask needs the
     /// per-block row counts the zone map carries). The caller falls back to a
     /// copy-on-write rewrite in those cases.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wired by the merge-on-read compaction path")
-    )]
     pub(crate) fn relocate_columnar_with_deletes(
         &self,
         new_path: &Path,
