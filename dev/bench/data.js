@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782108580760,
+  "lastUpdate": 1782132847426,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -18906,6 +18906,84 @@ window.BENCHMARK_DATA = {
             "value": 693246.8460752069,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 4.5us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9fa5819cefe9c4869f19a197d7f47358e23611c5",
+          "message": "feat: positional delete-bitmap MVCC for columnar segments (#530)\n\n## Summary\n\nPositional delete-bitmap MVCC for columnar segments: immutable columnar\nSSTs gain row-level deletes/updates without rewriting the whole segment\nper change, reconciled to the native seqno MVCC and applied as a row\nmask at read time, with a configurable choice between rewriting eagerly\n(copy-on-write) and reusing the blocks (merge-on-read).\n\n## What landed\n\n- **In-tree `DeleteBitmap`** — chunked, roaring-inspired positional\nbitmap (2048-row chunks, sparse array promoting to a dense bitset).\n`core` + `alloc` on both build and read, so an embedded / WASM reader\napplies deletes without `std`. Encode/decode round-trip; a bulk delete\nof a whole chunk is O(1) space.\n- **`delete_bitmap` SST section** — a parallel named section in the\ncolumnar SST (sibling to `seqno_bounds` / `zone_map`), same per-block\nchecksum / ECC / AEAD. An unreadable section fails recovery rather than\ndegrading to empty (dropping it would resurrect deleted rows).\n- **Read masking on every path** — vectorized columnar scan, the\nkey-based point read, and the range iterator all apply the positional\nmask; a block whose rows are all deleted is skipped. A segment with no\ndeletes carries no bitmap and pays nothing.\n- **`DeleteStrategy` config** — per-level policy + global default +\nper-SST override + the `delete_strategy` runtime knob. `CopyOnWrite` |\n`MergeOnRead` | `Adaptive { purge_threshold_percent }` (default adaptive\nat 5%).\n- **Merge-on-read materialization at compaction** — when a merge reduces\nto a single columnar segment whose own below-watermark range tombstones\ndelete some of its rows, the segment is relocated: its data / index /\nfilter / zone-map / seqno-bounds sections are copied verbatim, only the\nmeta block is re-pointed to the new table id, and the delete-bitmap is\nadded. This reuses the blocks instead of re-transposing them (no bloom\nrehash, no index rebuild). Detection is read-only under the version read\nlock; the relocation installs its own version edit.\n- **Adaptive purge** — once the deleted fraction crosses the threshold,\nthe plan declines and the copy-on-write merge drops the rows and writes\nno bitmap, bounding read amplification.\n\n## Tests\n\nBitmap unit tests (sparse/dense, chunk skip, encode/decode, O(1) bulk\nchunk); table-level masking on the scan / range / point paths;\nend-to-end MVCC visibility (`tests/merge_on_read_visibility.rs`): a\nbelow-watermark delete is hidden on the point and range paths with the\nbitmap materialized; an above-watermark delete is not materialized and\nkeeps seqno-aware visibility (visible below the delete seqno, hidden at\nor above it); the adaptive strategy purges copy-on-write over the\nthreshold; plus `tests/merge_on_read_relocation.rs` for the relocation\npath.\n\nFull gate green: `clippy --all-features --all-targets`, `no-std-check`\nerrcount 0, `nextest` on `lz4,zstd` and `lz4,zstd,columnar`, doctests.\n\n## Conservative v1 scope (follow-ups)\n\nThese keep the first cut provably safe; each is a tracked optimization,\nnot a correctness gap:\n\n- **Single-input trigger only.** Merge-on-read fires when the merge\nreduces to one relocatable columnar segment with its own covering\ntombstones. A single input means no foreign live key can be lost and no\nforeign point tombstone can be missed. Multi-input merges fall through\nto the existing copy-on-write path. Broadening to the multi-input\ndelete-only case needs explicit surviving-tombstone preservation.\n- **Tombstones kept verbatim.** The relocated segment keeps its range\ntombstones, so the bitmap is redundant with them (safe: a later\ncopy-on-write re-compaction re-applies the still-present tombstones, no\nresurrection) but they are not yet garbage-collected. Consuming them so\nthe bitmap is the sole record needs the compaction scan to apply the\nmask first.\n- **Per-row marking.** Building the bitmap marks each covered position\nindividually; a whole-chunk bulk-mark (O(1)) is not yet wired into the\nmaterialization (the dense storage is already O(1)).\n\n> The on-disk format is pre-stable: there are no external consumers, so\nold data is not supported across format changes (regenerate instead).\n\nCloses #507\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added configurable per-level row-delete strategies for columnar\nsegments: copy-on-write, merge-on-read, and adaptive purge.\n* Introduced positional delete bitmaps for columnar SSTs, enabling both\npoint-read and scan-time masking of deleted rows.\n* Enabled merge-on-read relocation during compactions to reuse\nmaterialized delete information when possible.\n* **Bug Fixes**\n  * Columnar reads now correctly omit blocks that are entirely deleted.\n* **Tests**\n* Added integration and recovery/masking coverage for delete-bitmap\npersistence and MVCC visibility across strategies (including adaptive\nbehavior).\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-22T15:53:15+03:00",
+          "tree_id": "e08b00e44b27155642eb9501ffa09f1c70e6cb0e",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/9fa5819cefe9c4869f19a197d7f47358e23611c5"
+        },
+        "date": 1782132846140,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2009776.941790961,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1197708.4961967366,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.5us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 909880.8014295611,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.2us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3740723.9164885627,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.2us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 463741.3248663937,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.2us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 240846.65247635118,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 4.8us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.83s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1246573.659847458,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1050935.2919488256,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 704928.6773254749,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.6us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
         ]
       }
