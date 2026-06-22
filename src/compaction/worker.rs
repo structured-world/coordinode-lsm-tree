@@ -1523,6 +1523,168 @@ fn hidden_guard<T>(
     })
 }
 
+/// Decides whether the merge reduces to a merge-on-read relocation and, if so,
+/// returns the positional delete-bitmap to materialize.
+///
+/// The conservative, provably-safe trigger: a SINGLE input segment that is
+/// columnar, relocatable (non-encrypted, non-ECC, carries a zone map), under a
+/// bitmap-writing strategy, whose own below-watermark range tombstones delete at
+/// least one row. A single input means no foreign live keys can be lost and no
+/// foreign point tombstone can be missed. The bitmap is built over the segment's
+/// own scan (every version in block-index = position order) so it matches the
+/// read mask. `None` falls through to the normal copy-on-write merge, including
+/// the adaptive purge once the deleted fraction crosses the threshold.
+#[cfg(feature = "std")]
+fn plan_merge_on_read(
+    opts: &Options,
+    payload: &CompactionPayload,
+    tables: &[Table],
+    input_range_tombstones: &[crate::range_tombstone::RangeTombstone],
+) -> crate::Result<Option<(Table, crate::table::delete_bitmap::DeleteBitmap)>> {
+    let dst_lvl: usize = payload.canonical_level.into();
+    let strategy = opts.runtime_config.load_full().delete_strategy.get(dst_lvl);
+    if !strategy.writes_bitmap() {
+        return Ok(None);
+    }
+    // Single relocatable columnar segment only; anything else is copy-on-write.
+    let [source] = tables else {
+        return Ok(None);
+    };
+    if !source.metadata.columnar
+        || source.encryption.is_some()
+        || source.metadata.ecc_params.is_some()
+        || source.metadata.ecc_unrecognized
+        || source.zone_map.is_empty()
+        // A source that already carries a delete bitmap reads through the mask,
+        // so `scan()` below yields the surviving rows under renumbered ordinals
+        // that no longer line up with the verbatim-copied physical blocks. Relocating
+        // it would alias the wrong rows; fall back to copy-on-write instead.
+        || !source.delete_bitmap().is_empty()
+    {
+        return Ok(None);
+    }
+
+    // Positional bitmap from the segment's own below-watermark range tombstones,
+    // over every stored version in block-index order (scan order = the writer's
+    // position numbering = the read mask's expectation). Keep only the key and
+    // seqno per row, dropping each scanned value so planning does not retain a
+    // whole segment's values in memory.
+    let keys = source
+        .scan()?
+        .map(|entry| {
+            let entry = entry?;
+            Ok((entry.key.user_key, entry.key.seqno))
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    let bitmap = super::delete_materialize::build_position_bitmap(
+        keys.iter()
+            .map(|(user_key, seqno)| (user_key.as_ref(), *seqno)),
+        input_range_tombstones,
+        opts.mvcc_gc_watermark,
+        &opts.config.comparator,
+    )?;
+    if bitmap.is_empty() {
+        return Ok(None);
+    }
+
+    // Adaptive: once the deleted fraction crosses the threshold, purge instead
+    // (fall through to the copy-on-write merge, which drops the rows and clears
+    // the bitmap).
+    if let crate::config::DeleteStrategy::Adaptive {
+        purge_threshold_percent,
+    } = strategy
+    {
+        let item_count = source.metadata.item_count.max(1);
+        // `bitmap.len() <= item_count`, both far below `u64::MAX / 100`.
+        let deleted_percent = bitmap.len() * 100 / item_count;
+        if deleted_percent >= u64::from(purge_threshold_percent) {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some((source.clone(), bitmap)))
+}
+
+/// Relocates `source` into a new segment that reuses its data blocks verbatim
+/// plus `bitmap`, then installs the version edit replacing `source`. The caller
+/// has already released the version read lock (the install takes the write lock).
+#[cfg(feature = "std")]
+fn run_merge_on_read_relocation(
+    compaction_state: &mut CompactionGuard<'_>,
+    opts: &Options,
+    payload: &CompactionPayload,
+    source: &Table,
+    bitmap: &crate::table::delete_bitmap::DeleteBitmap,
+) -> crate::Result<CompactionResult> {
+    let dst_lvl: usize = payload.canonical_level.into();
+    let new_id = opts.table_id_generator.next();
+    let (folder, level_fs) = opts.config.tables_folder_for_level(payload.dest_level);
+    let new_path = folder.join(new_id.to_string());
+
+    // Write the relocated SST through the DESTINATION level's filesystem (the
+    // same one that recovers and installs it below), not the source table's.
+    let checksum = source.relocate_columnar_with_deletes(
+        &new_path,
+        &*level_fs,
+        new_id,
+        bitmap,
+        opts.config.sync_mode,
+    )?;
+
+    let relocated = Table::recover(
+        new_path,
+        checksum,
+        0,
+        opts.tree_id,
+        new_id,
+        opts.config.cache.clone(),
+        opts.config.descriptor_table.clone(),
+        level_fs,
+        opts.config.filter_block_pinning_policy.get(dst_lvl),
+        opts.config.index_block_pinning_policy.get(dst_lvl),
+        opts.config.encryption.clone(),
+        #[cfg(zstd_any)]
+        opts.config.zstd_dictionary.clone(),
+        opts.config.comparator.clone(),
+        #[cfg(feature = "metrics")]
+        opts.metrics.clone(),
+    )?;
+
+    compaction_state
+        .hidden_set_mut()
+        .hide(payload.table_ids.iter().copied());
+
+    let produced = super::flavour::ProducedOutput::for_relocation(relocated, source.clone());
+    let result = (|| -> crate::Result<usize> {
+        let mut version_history_lock = opts.version_history.write();
+        let tables_out = super::flavour::install_merge(
+            &mut version_history_lock,
+            opts,
+            payload,
+            vec![produced],
+        )?;
+        version_history_lock.maintenance(
+            &opts.config.path,
+            opts.mvcc_gc_watermark,
+            &*opts.config.fs,
+        )?;
+        drop(version_history_lock);
+        Ok(tables_out)
+    })();
+
+    compaction_state
+        .hidden_set_mut()
+        .show(payload.table_ids.iter().copied());
+
+    let tables_out = result?;
+    Ok(CompactionResult {
+        action: CompactionAction::Merged,
+        dest_level: Some(payload.dest_level),
+        tables_in: 1,
+        tables_out,
+    })
+}
+
 #[expect(clippy::too_many_lines)]
 fn merge_tables(
     mut compaction_state: CompactionGuard<'_>,
@@ -1575,6 +1737,28 @@ fn merge_tables(
         .collect();
     input_range_tombstones.sort();
     input_range_tombstones.dedup();
+
+    // Merge-on-read fast path: a lone columnar segment whose own range
+    // tombstones (below the watermark) delete some of its rows is relocated (its
+    // data blocks reused verbatim plus a positional delete-bitmap) instead of
+    // being re-transposed. Detection is read-only, so it runs under the held
+    // read lock; on a hit the lock is released before the relocation installs
+    // its own version edit. Multi-input merges and any non-relocatable segment
+    // fall through to the normal copy-on-write merge below.
+    #[cfg(feature = "std")]
+    if let Some((source, bitmap)) =
+        plan_merge_on_read(opts, payload, &tables, &input_range_tombstones)?
+    {
+        drop(current_super_version);
+        drop(version_history_lock);
+        return run_merge_on_read_relocation(
+            &mut compaction_state,
+            opts,
+            payload,
+            &source,
+            &bitmap,
+        );
+    }
 
     // ---- Parallel sub-compaction (std only) ----
     // A non-relocating compaction can be split into disjoint key ranges that

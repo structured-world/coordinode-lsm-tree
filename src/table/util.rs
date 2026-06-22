@@ -114,7 +114,8 @@ pub fn load_block(
             | BlockType::BlockLayout
             | BlockType::Locator
             | BlockType::SeqnoBounds
-            | BlockType::ZoneMap => {}
+            | BlockType::ZoneMap
+            | BlockType::DeleteBitmap => {}
         }
 
         return Ok(block);
@@ -209,7 +210,8 @@ pub fn load_block(
         | BlockType::BlockLayout
         | BlockType::Locator
         | BlockType::SeqnoBounds
-        | BlockType::ZoneMap => {}
+        | BlockType::ZoneMap
+        | BlockType::DeleteBitmap => {}
     }
 
     // ECC recovered this block's payload from parity. The bytes returned below

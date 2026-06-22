@@ -3654,3 +3654,262 @@ fn zone_map_absent_without_policy() -> crate::Result<()> {
         None::<fn(Writer) -> Writer>,
     )
 }
+
+/// Helper: recover a freshly written table from `file` with default test config.
+fn recover_test_table(file: &std::path::Path, checksum: Checksum) -> crate::Result<Table> {
+    #[cfg(feature = "metrics")]
+    let metrics = Arc::new(Metrics::default());
+    Table::recover(
+        file.to_path_buf(),
+        checksum,
+        0,
+        0,
+        0,
+        Arc::new(Cache::with_capacity_bytes(1_000_000)),
+        Some(Arc::new(DescriptorTable::new(10))),
+        Arc::new(StdFs),
+        false,
+        false,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        crate::comparator::default_comparator(),
+        #[cfg(feature = "metrics")]
+        metrics,
+    )
+}
+
+#[test]
+fn delete_bitmap_section_round_trips() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+
+    let keys: [&[u8]; 8] = [b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h"];
+    // Row positions follow write order: rows 0, 2, 5 are keys a, c, f.
+    let deleted_rows = [0u32, 2, 5];
+
+    // A delete-bitmap SST must carry a zone map (per-block row counts power the
+    // positional masking; recovery enforces this).
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_zone_map(true);
+    for key in keys {
+        writer.write(crate::InternalValue::from_components(
+            key,
+            b"v",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    for &row in &deleted_rows {
+        writer.delete_bitmap_mut().insert(row);
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    assert!(
+        table.regions.delete_bitmap.is_some(),
+        "delete-bitmap section must be present when rows are deleted"
+    );
+    let dv = table.delete_bitmap();
+    assert_eq!(dv.len(), deleted_rows.len() as u64);
+    for row in 0..8u32 {
+        assert_eq!(
+            dv.contains(row),
+            deleted_rows.contains(&row),
+            "row {row} membership mismatch after reopen"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn delete_bitmap_section_absent_when_no_deletes() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    writer.write(crate::InternalValue::from_components(
+        b"a",
+        b"v",
+        1,
+        crate::ValueType::Value,
+    ))?;
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    assert!(
+        table.regions.delete_bitmap.is_none(),
+        "no delete-bitmap section when the segment has no deletes"
+    );
+    assert!(table.delete_bitmap().is_empty());
+    Ok(())
+}
+
+#[cfg(feature = "columnar")]
+#[test]
+fn delete_bitmap_masks_rows_in_columnar_scan() -> crate::Result<()> {
+    use crate::table::columnar::{
+        COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, column_batch_to_entries,
+    };
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+
+    let n = 64u32;
+    // Row positions follow write (= key) order: these are keys k0003/k0010/k0050.
+    let deleted = [3u32, 10, 50];
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    for i in 0..n {
+        let key = format!("k{i:04}").into_bytes();
+        writer.write(crate::InternalValue::from_components(
+            key,
+            b"v",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    for &row in &deleted {
+        writer.delete_bitmap_mut().insert(row);
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    let batches =
+        table.columnar_scan(&[COL_USER_KEY, COL_SEQNO, COL_VALUE_TYPE, COL_VALUE], None)?;
+
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    for batch in &batches {
+        for entry in column_batch_to_entries(batch)? {
+            got.push(entry.key.user_key.to_vec());
+        }
+    }
+
+    let expected: Vec<Vec<u8>> = (0..n)
+        .filter(|i| !deleted.contains(i))
+        .map(|i| format!("k{i:04}").into_bytes())
+        .collect();
+    assert_eq!(
+        got, expected,
+        "deleted row positions must be masked out of the columnar scan"
+    );
+    Ok(())
+}
+
+#[test]
+fn copy_on_write_strategy_suppresses_the_delete_bitmap_section() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .delete_strategy(crate::config::DeleteStrategy::CopyOnWrite);
+    for key in [b"a".as_ref(), b"b", b"c"] {
+        writer.write(crate::InternalValue::from_components(
+            key,
+            b"v",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    // Mark a row deleted; copy-on-write drops rows instead of masking, so it must
+    // not persist a bitmap section even though a position was marked.
+    writer.delete_bitmap_mut().insert(1);
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    assert!(
+        table.regions.delete_bitmap.is_none(),
+        "copy-on-write must not persist a delete-bitmap section"
+    );
+    assert!(table.delete_bitmap().is_empty());
+    Ok(())
+}
+
+#[cfg(feature = "columnar")]
+#[test]
+fn delete_bitmap_masks_rows_in_range_scan() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+
+    let n = 64u32;
+    // Row positions follow write (= key) order: keys k0003 / k0010 / k0050.
+    let deleted = [3u32, 10, 50];
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    for i in 0..n {
+        let key = format!("k{i:04}").into_bytes();
+        writer.write(crate::InternalValue::from_components(
+            key,
+            b"v",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    for &row in &deleted {
+        writer.delete_bitmap_mut().insert(row);
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    // A full forward range scan goes through the columnar reconstruction +
+    // positional mask; deleted positions must never be yielded.
+    let got: Vec<Vec<u8>> = table
+        .range_iter(..)
+        .map(|r| r.map(|kv| kv.key.user_key.to_vec()))
+        .collect::<crate::Result<Vec<_>>>()?;
+
+    let expected: Vec<Vec<u8>> = (0..n)
+        .filter(|i| !deleted.contains(i))
+        .map(|i| format!("k{i:04}").into_bytes())
+        .collect();
+    assert_eq!(
+        got, expected,
+        "deleted row positions must be masked out of the range scan"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "columnar")]
+#[test]
+fn delete_bitmap_masks_deleted_key_in_point_read() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+
+    let n = 64u32;
+    // Row positions follow write (= key) order: keys k0003 / k0010 / k0050.
+    let deleted = [3u32, 10, 50];
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    for i in 0..n {
+        let key = format!("k{i:04}").into_bytes();
+        writer.write(crate::InternalValue::from_components(
+            key,
+            b"v",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    for &row in &deleted {
+        writer.delete_bitmap_mut().insert(row);
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+
+    // A deleted key reads as absent; a live key is still found.
+    for i in 0..n {
+        let key = format!("k{i:04}").into_bytes();
+        let got = table.get(&key, SeqNo::MAX, hash64(&key))?;
+        if deleted.contains(&i) {
+            assert!(got.is_none(), "deleted key {i} must read as absent");
+        } else {
+            assert!(got.is_some(), "live key {i} must be found");
+        }
+    }
+    Ok(())
+}

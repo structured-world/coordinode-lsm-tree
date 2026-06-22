@@ -827,6 +827,15 @@ pub struct RuntimeConfig {
     /// both row and columnar SSTs at once.
     pub columnar: bool,
 
+    /// Per-level row-level delete strategy for columnar segments: copy-on-write
+    /// (rewrite and drop deleted rows), merge-on-read (record deletes in the
+    /// positional delete-bitmap and defer the rewrite), or adaptive (merge-on-read
+    /// until a purge threshold). Read-heavy lower levels can favour copy-on-write
+    /// while write-heavy upper levels favour merge-on-read; changing the policy
+    /// migrates segments at the next compaction. Default: adaptive (5% purge
+    /// threshold) in every level.
+    pub delete_strategy: crate::config::DeleteStrategyPolicy,
+
     /// Index-size threshold (bytes) at or below which an SST's block index
     /// is written single-level; above it the index spills to a two-level
     /// (partitioned) layout. A single-level index is one block reached by a
@@ -936,6 +945,7 @@ impl Default for RuntimeConfig {
             seqno_in_index: false,
             zone_map: false,
             columnar: false,
+            delete_strategy: crate::config::DeleteStrategyPolicy::default(),
             index_partition_spill_threshold: crate::table::writer::DEFAULT_SPILL_THRESHOLD,
             disable_cow_on_sst_files: true,
             use_reflink_for_checkpoint: true,

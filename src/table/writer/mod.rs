@@ -158,6 +158,17 @@ pub struct Writer {
     /// `use_zone_map` is off (section absent, zero extra bytes).
     zone_map_section: Vec<(BlockOffset, Vec<crate::table::zone_map::ColumnStats>)>,
 
+    /// Positional delete-bitmap accumulated for this segment, serialized into
+    /// the optional `delete_bitmap` SST section at finish when non-empty. Empty
+    /// by default (section absent, zero extra bytes).
+    delete_bitmap: crate::table::delete_bitmap::DeleteBitmap,
+
+    /// This segment's delete strategy (the per-SST resolution of the level
+    /// policy). Under copy-on-write the bitmap is not persisted (deleted rows are
+    /// dropped instead); under merge-on-read / adaptive a non-empty bitmap is
+    /// written. Default: adaptive (writes the bitmap).
+    delete_strategy: crate::config::DeleteStrategy,
+
     /// Resolved retrieval-ribbon locator settings for this table, or `None`
     /// (default) when the level's [`crate::config::LocatorPolicy`] is disabled.
     /// `Some` makes the writer accumulate a per-key locator and emit the
@@ -326,6 +337,8 @@ impl Writer {
             block_layouts: Vec::new(),
             seqno_bounds_section: Vec::new(),
             zone_map_section: Vec::new(),
+            delete_bitmap: crate::table::delete_bitmap::DeleteBitmap::new(),
+            delete_strategy: crate::config::DeleteStrategy::default(),
 
             locator: None,
             locators: Vec::new(),
@@ -686,6 +699,26 @@ impl Writer {
     pub fn use_zone_map(mut self, zone_map: bool) -> Self {
         self.assert_not_started("use_zone_map");
         self.use_zone_map = zone_map;
+        self
+    }
+
+    /// Mutable access to this segment's positional delete-bitmap, so a caller
+    /// (e.g. compaction materialization) can mark rows deleted by position
+    /// before [`finish`](Self::finish). A non-empty bitmap is serialized into
+    /// the optional `delete_bitmap` SST section.
+    pub fn delete_bitmap_mut(&mut self) -> &mut crate::table::delete_bitmap::DeleteBitmap {
+        &mut self.delete_bitmap
+    }
+
+    /// Sets this segment's delete strategy (the per-SST resolution of the level
+    /// policy). Under [`DeleteStrategy::CopyOnWrite`] the delete-bitmap is not
+    /// persisted even if rows were marked, since copy-on-write drops deleted rows
+    /// rather than masking them. Default: adaptive.
+    ///
+    /// [`DeleteStrategy::CopyOnWrite`]: crate::config::DeleteStrategy::CopyOnWrite
+    #[must_use]
+    pub fn delete_strategy(mut self, strategy: crate::config::DeleteStrategy) -> Self {
+        self.delete_strategy = strategy;
         self
     }
 
@@ -1460,6 +1493,47 @@ impl Writer {
             )?;
         }
 
+        // Write the optional positional delete-bitmap section (only when the
+        // segment has materialized deletes AND the strategy keeps a bitmap;
+        // copy-on-write drops rows instead). Applied as a row mask at scan time;
+        // absent otherwise, so a read without deletes pays nothing.
+        if !self.delete_bitmap.is_empty() && self.delete_strategy.writes_bitmap() {
+            // Co-write invariant: the positional mask resolves each block's start
+            // row from the zone map, and recovery rejects a delete-bitmap SST that
+            // lacks one. Fail here at the write site (a clear misconfiguration)
+            // rather than letting the SST be written and then fail to open.
+            if self.zone_map_section.is_empty() {
+                return Err(crate::Error::InvalidHeader(
+                    "delete-bitmap requires the zone map (use_zone_map(true))",
+                ));
+            }
+            self.file_writer.start("delete_bitmap")?;
+            self.block_buffer.clear();
+            self.block_buffer
+                .extend_from_slice(&self.delete_bitmap.encode());
+            Block::write_into(
+                &mut self.file_writer,
+                &self.block_buffer,
+                crate::table::block::BlockIdentity {
+                    table_id: self.table_id,
+                    block_type: crate::table::block::BlockType::DeleteBitmap,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                &{
+                    let t = match self.encryption.as_deref() {
+                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                        None => crate::table::block::BlockTransform::PLAIN,
+                    };
+                    if let Some(ecc) = self.ecc {
+                        t.with_ecc(ecc)
+                    } else {
+                        t
+                    }
+                },
+            )?;
+        }
+
         // Write the optional retrieval-ribbon locator section. Emitted only when
         // the level's locator policy is enabled AND the per-SST widths fit the
         // actual layout (`build_locator_section` returns `None` to skip
@@ -2094,6 +2168,33 @@ mod tests {
     use super::*;
     use crate::fs::StdFs;
     use test_log::test;
+
+    #[test]
+    fn finish_rejects_a_delete_bitmap_without_a_zone_map() -> crate::Result<()> {
+        // The positional mask resolves each block's start row from the zone map,
+        // so a segment that marks deletes must also carry one. The writer must
+        // reject the misconfiguration at finish() rather than emit an SST that
+        // then fails to open.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("1");
+        let mut writer = Writer::new(path, 1, 0, Arc::new(StdFs))?;
+        writer.write(InternalValue::from_components(
+            b"a",
+            b"v",
+            1,
+            ValueType::Value,
+        ))?;
+        // Mark a delete, but never enable the zone map.
+        writer.delete_bitmap_mut().insert(0);
+        match writer.finish() {
+            Ok(_) => panic!("must reject a delete-bitmap without a zone map"),
+            Err(err) => assert!(
+                matches!(err, crate::Error::InvalidHeader(_)),
+                "expected an InvalidHeader error, got {err:?}",
+            ),
+        }
+        Ok(())
+    }
 
     #[test]
     fn table_writer_count() -> crate::Result<()> {

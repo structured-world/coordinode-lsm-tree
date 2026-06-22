@@ -482,8 +482,66 @@ impl DataBlock {
                 "columnar: empty reconstructed data block",
             ));
         }
+        Self::encode_entries_to_block(&entries, restart_interval)
+    }
+
+    /// As [`Self::from_columnar_block`], but drops rows whose global position is
+    /// marked deleted in `deletes`. `block_start_row` is the position of this
+    /// block's first row within the segment (block-index order).
+    ///
+    /// Returns `Ok(None)` when every row in the block is deleted: the row encoder
+    /// has a non-empty precondition, so a fully-deleted block is reported as
+    /// "nothing to yield" and the caller skips it.
+    // Reconstruction-side masking primitive used by the iterator's columnar
+    // delete-masking path (see `Iter::load_and_resolve`).
+    #[cfg(feature = "columnar")]
+    pub(crate) fn from_columnar_block_masked(
+        block_data: &[u8],
+        restart_interval: u8,
+        deletes: &crate::table::delete_bitmap::DeleteBitmap,
+        block_start_row: u32,
+    ) -> crate::Result<Option<Self>> {
+        let batch = crate::table::columnar::ColumnBatch::decode(block_data)?;
+        let entries = crate::table::columnar::column_batch_to_entries(&batch)?;
+        if entries.is_empty() {
+            return Err(crate::Error::InvalidHeader(
+                "columnar: empty reconstructed data block",
+            ));
+        }
+        // Each row's position is `block_start_row + index`. The bitmap is
+        // u32-positional and `build_position_bitmap` rejects segments past
+        // u32::MAX rows at write time, but a corrupt zone-map `block_start_row`
+        // could still push the sum over, so fail explicitly rather than wrapping
+        // back to 0 (which would mask the wrong rows).
+        let mut kept = Vec::with_capacity(entries.len());
+        for (index, entry) in entries.into_iter().enumerate() {
+            let offset = u32::try_from(index).map_err(|_| {
+                crate::Error::InvalidHeader("columnar: block row index exceeds u32::MAX")
+            })?;
+            let pos = block_start_row
+                .checked_add(offset)
+                .ok_or(crate::Error::InvalidHeader(
+                    "columnar: row position exceeds u32::MAX",
+                ))?;
+            if !deletes.contains(pos) {
+                kept.push(entry);
+            }
+        }
+        if kept.is_empty() {
+            return Ok(None);
+        }
+        Self::encode_entries_to_block(&kept, restart_interval).map(Some)
+    }
+
+    /// Re-encodes reconstructed columnar `entries` into a row-major data block.
+    /// In-memory, so a fixed restart interval yields a correct iterable block.
+    #[cfg(feature = "columnar")]
+    fn encode_entries_to_block(
+        entries: &[InternalValue],
+        restart_interval: u8,
+    ) -> crate::Result<Self> {
         let mut buf = Vec::new();
-        Self::encode_into(&mut buf, &entries, restart_interval, 0.0)?;
+        Self::encode_into(&mut buf, entries, restart_interval, 0.0)?;
         let len = u32::try_from(buf.len())
             .map_err(|_| crate::Error::InvalidHeader("columnar: re-encoded block exceeds u32"))?;
         let header = crate::table::block::Header {
@@ -2495,5 +2553,86 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[cfg(feature = "columnar")]
+    #[test]
+    #[expect(clippy::unwrap_used)]
+    fn from_columnar_block_masked_drops_deleted_positions() {
+        use crate::table::columnar::{CodecId, entries_to_column_batch};
+        use crate::table::delete_bitmap::DeleteBitmap;
+
+        // A 4-row block (in-block positions 0..4): keys a, b, c, d.
+        let entries = [
+            InternalValue::from_components(Slice::from(b"a".as_slice()), Slice::from([]), 1, Value),
+            InternalValue::from_components(Slice::from(b"b".as_slice()), Slice::from([]), 1, Value),
+            InternalValue::from_components(Slice::from(b"c".as_slice()), Slice::from([]), 1, Value),
+            InternalValue::from_components(Slice::from(b"d".as_slice()), Slice::from([]), 1, Value),
+        ];
+        let data = entries_to_column_batch(&entries)
+            .unwrap()
+            .encode(CodecId::Plain)
+            .unwrap();
+
+        // The block starts at global row 10, so delete global positions 10 (a)
+        // and 12 (c); b and d must survive.
+        let mut dv = DeleteBitmap::new();
+        dv.insert(10);
+        dv.insert(12);
+        let block = DataBlock::from_columnar_block_masked(&data, 16, &dv, 10)
+            .unwrap()
+            .expect("not all rows deleted");
+
+        assert_eq!(block.len(), 2);
+        assert!(
+            block
+                .point_read(b"a", SeqNo::MAX, &default_comparator())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            block
+                .point_read(b"b", SeqNo::MAX, &default_comparator())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            block
+                .point_read(b"c", SeqNo::MAX, &default_comparator())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            block
+                .point_read(b"d", SeqNo::MAX, &default_comparator())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[cfg(feature = "columnar")]
+    #[test]
+    #[expect(clippy::unwrap_used)]
+    fn from_columnar_block_masked_returns_none_when_all_deleted() {
+        use crate::table::columnar::{CodecId, entries_to_column_batch};
+        use crate::table::delete_bitmap::DeleteBitmap;
+
+        let entries = [
+            InternalValue::from_components(Slice::from(b"a".as_slice()), Slice::from([]), 1, Value),
+            InternalValue::from_components(Slice::from(b"b".as_slice()), Slice::from([]), 1, Value),
+        ];
+        let data = entries_to_column_batch(&entries)
+            .unwrap()
+            .encode(CodecId::Plain)
+            .unwrap();
+
+        let mut dv = DeleteBitmap::new();
+        dv.insert(0);
+        dv.insert(1);
+        assert!(
+            DataBlock::from_columnar_block_masked(&data, 16, &dv, 0)
+                .unwrap()
+                .is_none()
+        );
     }
 }

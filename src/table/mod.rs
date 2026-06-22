@@ -10,6 +10,7 @@ pub mod columnar;
 #[cfg(feature = "columnar")]
 pub mod columnar_predicate;
 pub mod data_block;
+pub mod delete_bitmap;
 pub mod filter;
 mod id;
 mod index_block;
@@ -21,6 +22,8 @@ pub(crate) mod locator;
 pub(crate) mod meta;
 pub(crate) mod multi_writer;
 pub(crate) mod regions;
+#[cfg(feature = "std")]
+mod relocate;
 mod scanner;
 pub(crate) mod seqno_bounds;
 pub mod util;
@@ -252,6 +255,14 @@ impl Table {
         self.metadata.id
     }
 
+    /// This segment's positional delete-bitmap (rows deleted by position),
+    /// loaded on open. Empty when the segment has no materialized deletes, in
+    /// which case a scan applies no mask.
+    #[must_use]
+    pub fn delete_bitmap(&self) -> &crate::table::delete_bitmap::DeleteBitmap {
+        self.delete_bitmap.as_ref()
+    }
+
     fn load_block(
         &self,
         handle: &BlockHandle,
@@ -277,7 +288,10 @@ impl Table {
         )
     }
 
-    fn load_data_block(&self, handle: &BlockHandle) -> crate::Result<DataBlock> {
+    /// Loads (and, for columnar SSTs, reconstructs + delete-masks) a data block.
+    /// Returns `Ok(None)` when a columnar block is wholly deleted by the
+    /// positional mask, so the caller treats it as carrying no keys.
+    fn load_data_block(&self, handle: &BlockHandle) -> crate::Result<Option<DataBlock>> {
         // Columnar SSTs store each data block as a PAX `ColumnBatch`; reconstruct
         // the row entries on load so every row read path works unchanged.
         #[cfg(feature = "columnar")]
@@ -297,6 +311,7 @@ impl Table {
             self.zstd_dictionary.as_deref(),
         )
         .and_then(|block| DataBlock::from_loaded(block, has_kv_footer))
+        .map(Some)
     }
 
     /// Loads a columnar data block and reconstructs it as a row-major
@@ -304,8 +319,11 @@ impl Table {
     /// re-encode them row-major in memory so the existing point-read / iterator
     /// machinery is reused verbatim. The native column-projection read path
     /// (decode only the referenced columns) is a later optimization.
+    ///
+    /// Returns `Ok(None)` when the positional delete-bitmap deletes every row of
+    /// the block, so the caller treats it as carrying no keys.
     #[cfg(feature = "columnar")]
-    fn load_columnar_data_block(&self, handle: &BlockHandle) -> crate::Result<DataBlock> {
+    fn load_columnar_data_block(&self, handle: &BlockHandle) -> crate::Result<Option<DataBlock>> {
         let block = self.load_block(
             handle,
             BlockType::Columnar,
@@ -313,7 +331,27 @@ impl Table {
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
         )?;
-        DataBlock::from_columnar_block(&block.data, self.metadata.data_block_restart_interval)
+        let restart = self.metadata.data_block_restart_interval;
+        match self
+            .delete_block_starts
+            .as_ref()
+            .and_then(|starts| starts.get(&handle.offset().0))
+        {
+            // The segment has materialized deletes and this block has a recorded
+            // start position: drop the deleted rows during reconstruction. The
+            // start-row map is built at open from the zone map (every block), so
+            // an unmapped block is unreachable; it falls through to the whole-block
+            // reconstruction below rather than masking against the wrong positions.
+            Some(&start) => DataBlock::from_columnar_block_masked(
+                &block.data,
+                restart,
+                &self.delete_bitmap,
+                start,
+            ),
+            // No materialized deletes (or, unreachably, an unmapped block):
+            // reconstruct the whole block.
+            None => DataBlock::from_columnar_block(&block.data, restart).map(Some),
+        }
     }
 
     /// Loads a columnar data block and decodes only the projected columns,
@@ -743,8 +781,9 @@ impl Table {
         // Fast path: retrieval-ribbon locator (see `point_read_inner` for the
         // MVCC-correctness argument). A located-block miss falls through to the
         // index walk below.
-        if let Some((handle, hint)) = self.locator_block(key_hash)? {
-            let data_block = self.load_data_block(&handle)?;
+        if let Some((handle, hint)) = self.locator_block(key_hash)?
+            && let Some(data_block) = self.load_data_block(&handle)?
+        {
             let found = match hint {
                 Some((slot, is_entry)) => data_block.point_read_value_at_slot(
                     slot,
@@ -767,7 +806,10 @@ impl Table {
         for block_handle in iter {
             let block_handle = block_handle?;
 
-            let data_block = self.load_data_block(block_handle.as_ref())?;
+            // A wholly-deleted columnar block carries no keys; skip it.
+            let Some(data_block) = self.load_data_block(block_handle.as_ref())? else {
+                continue;
+            };
 
             if let Some(found) = data_block.point_read_value(key, seqno, &self.comparator)? {
                 return Ok(Some(found));
@@ -862,8 +904,9 @@ impl Table {
         // hit returns the correct MVCC answer and a miss (absent key, or the
         // visible version lives in a later block) safely falls through to the
         // index walk below.
-        if let Some((handle, hint)) = self.locator_block(key_hash)? {
-            let data_block = self.load_data_block(&handle)?;
+        if let Some((handle, hint)) = self.locator_block(key_hash)?
+            && let Some(data_block) = self.load_data_block(&handle)?
+        {
             let found = match hint {
                 Some((slot, is_entry)) => {
                     data_block.point_read_at_slot(slot, is_entry, key, seqno, &self.comparator)?
@@ -885,7 +928,10 @@ impl Table {
         for block_handle in iter {
             let block_handle = block_handle?;
 
-            let data_block = self.load_data_block(block_handle.as_ref())?;
+            // A wholly-deleted columnar block carries no keys; skip it.
+            let Some(data_block) = self.load_data_block(block_handle.as_ref())? else {
+                continue;
+            };
 
             if let Some(item) = data_block.point_read(key, seqno, &self.comparator)? {
                 return Ok(Some((item, data_block)));
@@ -1140,7 +1186,10 @@ impl Table {
                 continue;
             }
 
-            let data_block = self.load_data_block(block_handle.as_ref())?;
+            // A wholly-deleted columnar block carries no keys; skip it.
+            let Some(data_block) = self.load_data_block(block_handle.as_ref())? else {
+                continue;
+            };
 
             // Drain passing keys that fall inside [..end_key].
             //
@@ -1302,6 +1351,11 @@ impl Table {
             }
             _ => None,
         };
+        // Positional deletes are masked at scan time. The block index yields
+        // blocks in key (= write) order, the same order the writer assigned row
+        // positions, so `row_base` is each block's first global row position.
+        let has_deletes = !self.delete_bitmap.is_empty();
+        let mut row_base: u32 = 0;
         let mut out = Vec::new();
         for keyed in self.block_index.iter() {
             let keyed = keyed?;
@@ -1311,17 +1365,37 @@ impl Table {
                 && let Some(stats) = self.zone_map.columns_for(*keyed.offset())
                 && pred.can_skip_block(stats)
             {
+                // Advance the position cursor by the skipped block's row count
+                // (from its zone-map stats) so later blocks still map to the
+                // right delete positions. Skipped rows are predicate-excluded, so
+                // whether they are deleted does not affect the output.
+                if has_deletes && let Some(first) = stats.first() {
+                    row_base = row_base.wrapping_add(first.row_count);
+                }
                 continue;
             }
             let handle = BlockHandle::new(keyed.offset(), keyed.size());
             let batch = self.load_columnar_block_projected(&handle, &decode_projection)?;
-            let mut batch = match predicate {
-                Some(pred) => {
-                    let mask = pred.matching_rows(&batch);
-                    crate::table::columnar_predicate::filter_batch(&batch, &mask)
+            let row_count = batch.row_count;
+            let mut batch = if predicate.is_some() || has_deletes {
+                let mut keep = match predicate {
+                    Some(pred) => pred.matching_rows(&batch),
+                    None => alloc::vec![true; row_count as usize],
+                };
+                if has_deletes {
+                    let mut pos = row_base;
+                    for k in &mut keep {
+                        if self.delete_bitmap.contains(pos) {
+                            *k = false;
+                        }
+                        pos = pos.wrapping_add(1);
+                    }
                 }
-                None => batch,
+                crate::table::columnar_predicate::filter_batch(&batch, &keep)
+            } else {
+                batch
             };
+            row_base = row_base.wrapping_add(row_count);
             if let Some(column_id) = added_predicate_column {
                 batch.columns.retain(|c| c.column_id != column_id);
             }
@@ -1436,7 +1510,10 @@ impl Table {
                 continue;
             }
 
-            let block = self.load_data_block(handle.as_ref())?;
+            // A wholly-deleted columnar block carries no keys; skip it.
+            let Some(block) = self.load_data_block(handle.as_ref())? else {
+                continue;
+            };
             let data = &block.inner.data;
             for item in block.iter(self.comparator.clone()) {
                 let mut value = item.materialize(data);
@@ -1473,6 +1550,19 @@ impl Table {
         self.range_iter(range)
     }
 
+    /// Builds the positional delete mask for a columnar iterator from the
+    /// on-open cache: the delete-bitmap plus each block's first global row
+    /// position. `None` when the segment has no deletes, so a delete-free table
+    /// pays nothing. Cheap (two `Arc` clones); the cumulative row counts were
+    /// computed once on open.
+    fn build_delete_mask(&self) -> Option<iter::DeleteMask> {
+        let block_start_rows = self.delete_block_starts.clone()?;
+        Some(iter::DeleteMask {
+            bitmap: self.delete_bitmap.clone(),
+            block_start_rows,
+        })
+    }
+
     /// Like [`Self::range`] but returns the concrete [`iter::Iter`] reader.
     ///
     /// The seekable range pipeline holds the concrete type so it can re-position
@@ -1493,6 +1583,7 @@ impl Table {
             self.heal_hints.get().cloned(),
             self.metadata.kv_checksum_algo.is_some(),
             self.metadata.columnar,
+            self.build_delete_mask(),
             #[cfg(zstd_any)]
             self.zstd_dictionary.clone(),
             self.comparator.clone(),
@@ -2158,6 +2249,77 @@ impl Table {
             crate::table::zone_map::ZoneMap::default()
         };
 
+        // Load the optional positional delete-bitmap section. Unlike the zone
+        // map (a skip optimization that degrades safely to empty), the delete
+        // bitmap is correctness data: silently dropping an unreadable one would
+        // resurrect deleted rows. The block already carries checksum / ECC /
+        // AEAD, so if it still cannot be decoded the error is propagated and
+        // table recovery fails rather than returning deleted data.
+        let delete_bitmap = if let Some(db_handle) = regions.delete_bitmap {
+            let block = Block::from_file(
+                file_handle.as_ref(),
+                db_handle,
+                crate::table::block::BlockIdentity {
+                    table_id: metadata.id,
+                    block_type: BlockType::DeleteBitmap,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                &{
+                    let t = match encryption.as_deref() {
+                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                        None => crate::table::block::BlockTransform::PLAIN,
+                    };
+                    if let Some(ecc) = metadata.ecc_params {
+                        t.with_ecc(ecc)
+                    } else {
+                        t
+                    }
+                },
+            )?;
+            if block.header.block_type != BlockType::DeleteBitmap {
+                return Err(crate::Error::InvalidTag((
+                    "BlockType",
+                    block.header.block_type.into(),
+                )));
+            }
+            crate::table::delete_bitmap::DeleteBitmap::decode(&block.data)?
+        } else {
+            crate::table::delete_bitmap::DeleteBitmap::default()
+        };
+
+        // A delete-bitmap is positional; masking it on the read path needs each
+        // block's row count, which comes from the zone map. The writer co-writes
+        // both, so a bitmap without a zone map is a malformed SST (masking would
+        // resolve every block to position 0 and corrupt visibility).
+        if !delete_bitmap.is_empty() && zone_map.is_empty() {
+            return Err(crate::Error::InvalidHeader(
+                "delete-bitmap SST is missing its zone map",
+            ));
+        }
+
+        // Cache each data block's first global row position (file offset -> start
+        // row) once on open, so positional delete masking is O(1) per block on
+        // every read instead of recomputing cumulative row counts. Empty when the
+        // segment has no deletes.
+        let delete_block_starts = if delete_bitmap.is_empty() {
+            None
+        } else {
+            let mut map = crate::HashMap::default();
+            let mut start: u32 = 0;
+            for keyed in block_index.iter() {
+                let keyed = keyed?;
+                map.insert(keyed.offset().0, start);
+                let row_count = zone_map
+                    .columns_for(keyed.offset().0)
+                    .and_then(|stats| stats.first())
+                    .map_or(0, |col| col.row_count);
+                start = start.wrapping_add(row_count);
+            }
+            Some(alloc::sync::Arc::new(map))
+        };
+        let delete_bitmap = alloc::sync::Arc::new(delete_bitmap);
+
         // Load the optional retrieval-ribbon locator section and pair it with an
         // ordinal → data-block-handle map (the index yields handles in key/write
         // order, which is the writer's block_id ordering). Only when the section
@@ -2263,6 +2425,8 @@ impl Table {
                 block_layout,
                 seqno_bounds,
                 zone_map,
+                delete_bitmap,
+                delete_block_starts,
                 locator_index,
                 encryption,
 
