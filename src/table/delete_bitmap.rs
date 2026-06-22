@@ -434,6 +434,18 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::*;
 
+    /// Asserts that decoding `bytes` fails with exactly the expected
+    /// `InvalidHeader` message, proving the intended validation path fired rather
+    /// than some other error a generic `is_err()` would also accept.
+    fn assert_decode_rejects(bytes: &[u8], expected: &str) {
+        match DeleteBitmap::decode(bytes) {
+            Err(Error::InvalidHeader(msg)) => {
+                assert_eq!(msg, expected, "decode failed on the wrong validation path");
+            }
+            other => panic!("expected InvalidHeader({expected:?}), got {other:?}"),
+        }
+    }
+
     #[test]
     fn insert_and_contains_across_chunks() {
         let mut dv = DeleteBitmap::new();
@@ -576,9 +588,10 @@ mod tests {
 
     #[test]
     fn decode_rejects_unknown_kind() {
-        // 1 chunk, index 0, kind 99.
-        let bytes = [1, 0, 0, 0, 0, 0, 0, 0, 99];
-        assert!(DeleteBitmap::decode(&bytes).is_err());
+        // 1 chunk, index 0, kind 99. Pad to the minimum per-chunk length so the
+        // payload-size guard passes and the unknown-kind check is what fires.
+        let bytes = [1, 0, 0, 0, 0, 0, 0, 0, 99, 0, 0];
+        assert_decode_rejects(&bytes, "delete_bitmap: unknown container kind");
     }
 
     #[test]
@@ -586,7 +599,7 @@ mod tests {
         // 1 chunk, index 0, sparse, count 1, offset = CHUNK_ROWS (out of range).
         let mut bytes = alloc::vec![1, 0, 0, 0, 0, 0, 0, 0, KIND_SPARSE, 1, 0];
         bytes.extend_from_slice(&(CHUNK_ROWS as u16).to_le_bytes());
-        assert!(DeleteBitmap::decode(&bytes).is_err());
+        assert_decode_rejects(&bytes, "delete_bitmap: sparse offset out of range");
     }
 
     #[test]
@@ -618,7 +631,10 @@ mod tests {
             0,
             0, // chunk 0 again
         ];
-        assert!(DeleteBitmap::decode(&bytes).is_err());
+        assert_decode_rejects(
+            &bytes,
+            "delete_bitmap: chunk indices not strictly ascending",
+        );
     }
 
     #[test]
@@ -626,7 +642,7 @@ mod tests {
         // chunk_count claims a huge number of chunks but the buffer holds none,
         // so the header is rejected before any large allocation.
         let bytes = u32::MAX.to_le_bytes();
-        assert!(DeleteBitmap::decode(&bytes).is_err());
+        assert_decode_rejects(&bytes, "delete_bitmap: chunk count exceeds encoded payload");
     }
 
     #[test]
@@ -634,7 +650,7 @@ mod tests {
         // 1 chunk, index 0, sparse, count 0 (an empty container `encode` never
         // emits).
         let bytes = [1, 0, 0, 0, 0, 0, 0, 0, KIND_SPARSE, 0, 0];
-        assert!(DeleteBitmap::decode(&bytes).is_err());
+        assert_decode_rejects(&bytes, "delete_bitmap: sparse count out of range");
     }
 
     #[test]
@@ -643,7 +659,10 @@ mod tests {
         let mut bytes = alloc::vec![1, 0, 0, 0];
         bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // chunk index = u32::MAX
         bytes.extend_from_slice(&[KIND_SPARSE, 1, 0, 0, 0]);
-        assert!(DeleteBitmap::decode(&bytes).is_err());
+        assert_decode_rejects(
+            &bytes,
+            "delete_bitmap: chunk index out of row-position range",
+        );
     }
 
     #[test]
@@ -654,6 +673,6 @@ mod tests {
         dv.insert(7);
         let mut bytes = dv.encode();
         bytes.push(0);
-        assert!(DeleteBitmap::decode(&bytes).is_err());
+        assert_decode_rejects(&bytes, "delete_bitmap: trailing bytes after chunks");
     }
 }

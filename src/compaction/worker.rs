@@ -1566,12 +1566,19 @@ fn plan_merge_on_read(
 
     // Positional bitmap from the segment's own below-watermark range tombstones,
     // over every stored version in block-index order (scan order = the writer's
-    // position numbering = the read mask's expectation).
-    let entries = source.scan()?.collect::<crate::Result<Vec<_>>>()?;
+    // position numbering = the read mask's expectation). Keep only the key and
+    // seqno per row, dropping each scanned value so planning does not retain a
+    // whole segment's values in memory.
+    let keys = source
+        .scan()?
+        .map(|entry| {
+            let entry = entry?;
+            Ok((entry.key.user_key, entry.key.seqno))
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
     let bitmap = super::delete_materialize::build_position_bitmap(
-        entries
-            .iter()
-            .map(|e| (e.key.user_key.as_ref(), e.key.seqno)),
+        keys.iter()
+            .map(|(user_key, seqno)| (user_key.as_ref(), *seqno)),
         input_range_tombstones,
         opts.mvcc_gc_watermark,
         &opts.config.comparator,
