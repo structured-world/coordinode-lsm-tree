@@ -359,6 +359,15 @@ impl ColumnBatch {
             .ok_or(Error::InvalidHeader(
                 "columnar: first column is not the user-key column",
             ))?;
+        // This runs before the full `column_batch_to_entries` validation, so
+        // confirm the intrinsic key column's shape (non-null `Bytes`, correctly
+        // framed for `row_count`) before the low-level offset read.
+        if key_col.type_tag != TypeTag::Bytes || key_col.validity.is_some() {
+            return Err(Error::InvalidHeader(
+                "columnar: first column is not the non-null user-key column",
+            ));
+        }
+        key_col.validate(self.row_count)?;
         bytes_column_row(&key_col.data, self.row_count, 0).map(Some)
     }
 
@@ -842,7 +851,16 @@ pub fn frame_value_cells(cells: &[(TypeTag, &[u8])]) -> Result<Vec<u8>> {
     for (tag, cell) in cells {
         match tag {
             // Width recoverable from the tag: append verbatim, no length prefix.
-            TypeTag::Fixed(_) => out.extend_from_slice(cell),
+            // The cell length must equal the tag width, or the blob would not
+            // un-frame with the same tags (and would shift later cells).
+            TypeTag::Fixed(width) => {
+                if cell.len() != usize::from(*width) {
+                    return Err(Error::InvalidHeader(
+                        "columnar: fixed value sub-cell length does not match its type tag",
+                    ));
+                }
+                out.extend_from_slice(cell);
+            }
             TypeTag::Bytes => {
                 let len = u32::try_from(cell.len()).map_err(|_| {
                     Error::InvalidHeader("columnar: framed value sub-cell exceeds u32")
@@ -970,6 +988,60 @@ mod tests {
         // One fixed(2) cell, but the blob carries an extra byte the tags do not
         // cover: the blob and the tag list disagree.
         assert!(unframe_value_cells(&[1, 2, 3], &[TypeTag::Fixed(2)]).is_err());
+    }
+
+    #[test]
+    fn frame_rejects_fixed_cell_length_mismatch() {
+        // A fixed(4) tag with a 3-byte cell would misframe (and shift later cells),
+        // so framing rejects it.
+        assert!(frame_value_cells(&[(TypeTag::Fixed(4), &[1, 2, 3][..])]).is_err());
+    }
+
+    #[test]
+    fn first_user_key_rejects_a_non_key_first_column() {
+        // A first column that is not the non-null bytes user-key column is
+        // rejected before any low-level offset read.
+        let fixed_first = ColumnBatch {
+            row_count: 1,
+            columns: alloc::vec![Column {
+                column_id: COL_USER_KEY,
+                type_tag: TypeTag::Fixed(4),
+                validity: None,
+                data: alloc::vec![0, 0, 0, 0],
+            }],
+        };
+        assert!(fixed_first.first_user_key().is_err());
+
+        let missing = ColumnBatch {
+            row_count: 1,
+            columns: alloc::vec![Column {
+                column_id: 99,
+                type_tag: TypeTag::Bytes,
+                validity: None,
+                data: alloc::vec![0, 0, 0, 0, 0, 0, 0, 0],
+            }],
+        };
+        assert!(missing.first_user_key().is_err());
+    }
+
+    #[test]
+    fn first_user_key_returns_the_first_row_key() {
+        // A two-row key column: the first key is read without decoding the batch.
+        let mut data = Vec::new();
+        for off in [0u32, 2, 5] {
+            data.extend_from_slice(&off.to_le_bytes());
+        }
+        data.extend_from_slice(b"k0k11");
+        let batch = ColumnBatch {
+            row_count: 2,
+            columns: alloc::vec![Column {
+                column_id: COL_USER_KEY,
+                type_tag: TypeTag::Bytes,
+                validity: None,
+                data,
+            }],
+        };
+        assert_eq!(batch.first_user_key().expect("first key"), Some(&b"k0"[..]));
     }
 
     fn entry(user_key: &[u8], seqno: u64, value_type: ValueType, value: &[u8]) -> InternalValue {
