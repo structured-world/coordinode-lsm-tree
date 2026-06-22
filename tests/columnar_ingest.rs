@@ -519,6 +519,54 @@ fn columnar_ingest_flushes_the_rowgroup_on_a_layout_change() -> lsm_tree::Result
 }
 
 #[test]
+fn columnar_ingest_rotates_the_rowgroup_at_the_size_threshold() -> lsm_tree::Result<()> {
+    // The third flush trigger: a same-layout stream whose accumulated size crosses
+    // the target data-block size flushes mid-ingest, so a large stream produces
+    // more than one block even though every batch shares the layout (unlike the
+    // small-batch merge, which stays one block).
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+
+    // Each row carries a 4 KiB bytes value, so a handful of same-layout batches
+    // far exceed the target data-block size and the rowgroup rotates before
+    // finish.
+    let big = vec![b'x'; 4096];
+    let mut ingest = any.ingestion()?;
+    for key in [b"k0".as_slice(), b"k1", b"k2", b"k3"] {
+        ingest.write_columnar_batch(&fixed_bytes_batch(&[(key, 1, &big)]))?;
+    }
+    ingest.finish()?;
+
+    let version = tree.current_version();
+    let table = version.iter_tables().next().expect("one ingested SST");
+    let batches = table.columnar_scan(&[3, 4], None)?;
+    assert!(
+        batches.len() >= 2,
+        "size-threshold rotation splits a large same-layout stream into multiple blocks (got {})",
+        batches.len(),
+    );
+    assert_eq!(
+        batches.iter().map(|b| b.row_count).sum::<u32>(),
+        4,
+        "every row is present across the rotated blocks",
+    );
+    for k in [b"k0".as_slice(), b"k1", b"k2", b"k3"] {
+        assert!(any.get(k, SeqNo::MAX)?.is_some(), "every key is readable");
+    }
+    Ok(())
+}
+
+#[test]
 fn columnar_ingest_round_trips_a_nullable_value_subcolumn() -> lsm_tree::Result<()> {
     // A value sub-column may be absent for some rows (a sparse field). Ingest a
     // batch whose fixed-4 sub-column is null for the second row, then read both
