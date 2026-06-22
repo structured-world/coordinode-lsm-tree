@@ -10,6 +10,7 @@ pub mod columnar;
 #[cfg(feature = "columnar")]
 pub mod columnar_predicate;
 pub mod data_block;
+pub mod delete_bitmap;
 pub mod filter;
 mod id;
 mod index_block;
