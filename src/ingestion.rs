@@ -76,13 +76,53 @@ impl AnyIngestion<'_> {
     }
 
     /// Writes a consumer-provided columnar batch (its value sub-columns) as one
-    /// columnar block. See [`Ingestion::write_columnar_batch`].
+    /// columnar block, stored directly without re-transposing the value.
+    ///
+    /// The batch carries the three intrinsic columns (`[key, seqno, value-type]`)
+    /// plus one or more value sub-columns; its keys must be sorted and order
+    /// after any previously written data. The per-row seqnos are typically `0`:
+    /// [`finish`](Self::finish) assigns the atomic global sequence number. The
+    /// columnar layout must be enabled (`columnar` in the runtime config) on a
+    /// standard tree; a row-mode or blob tree rejects the batch.
     ///
     /// # Errors
     ///
     /// Returns an error if the batch shape is invalid, the layout is not
     /// columnar, a block write fails, or the tree is a blob tree (columnar
     /// ingest does not support KV separation).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::table::columnar::{Column, TypeTag, entries_to_column_batch};
+    /// use lsm_tree::{AnyTree, Config, InternalValue, ValueType};
+    ///
+    /// let folder = tempfile::tempdir()?;
+    /// let any = Config::new(folder, Default::default(), Default::default()).open()?;
+    /// if let AnyTree::Standard(tree) = &any {
+    ///     tree.update_runtime_config(|cfg| cfg.columnar = true)?;
+    /// }
+    ///
+    /// // One row whose value is a single fixed-4 sub-column (id 3).
+    /// let mut batch = entries_to_column_batch(&[InternalValue::from_components(
+    ///     b"k0".to_vec(),
+    ///     b"x".to_vec(),
+    ///     0,
+    ///     ValueType::Value,
+    /// )])?;
+    /// batch.columns.pop();
+    /// batch.columns.push(Column {
+    ///     column_id: 3,
+    ///     type_tag: TypeTag::Fixed(4),
+    ///     validity: None,
+    ///     data: vec![1, 0, 0, 0],
+    /// });
+    ///
+    /// let mut ingestion = any.ingestion()?;
+    /// ingestion.write_columnar_batch(&batch)?;
+    /// ingestion.finish()?;
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
     #[cfg(feature = "columnar")]
     pub fn write_columnar_batch(
         &mut self,
