@@ -143,6 +143,11 @@ pub(super) fn prepare_table_writer(
         .use_seqno_in_index(rc.seqno_in_index)
         .use_zone_map(rc.zone_map)
         .use_columnar(rc.columnar)
+        // Per-level delete strategy: under copy-on-write the output SSTs persist
+        // no delete-bitmap (deleted rows are dropped); merge-on-read / adaptive
+        // keep a populated bitmap. Read off the live snapshot so a policy change
+        // migrates segments at the next compaction.
+        .delete_strategy(rc.delete_strategy.get(dst_lvl))
         .use_disable_cow_on_sst(rc.disable_cow_on_sst_files)
         .use_bloom_policy({
             use crate::config::FilterPolicyEntry::{Bloom, None};
