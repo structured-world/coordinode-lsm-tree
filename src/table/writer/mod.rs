@@ -158,6 +158,11 @@ pub struct Writer {
     /// `use_zone_map` is off (section absent, zero extra bytes).
     zone_map_section: Vec<(BlockOffset, Vec<crate::table::zone_map::ColumnStats>)>,
 
+    /// Positional delete-bitmap accumulated for this segment, serialized into
+    /// the optional `delete_bitmap` SST section at finish when non-empty. Empty
+    /// by default (section absent, zero extra bytes).
+    delete_bitmap: crate::table::delete_bitmap::DeleteBitmap,
+
     /// Resolved retrieval-ribbon locator settings for this table, or `None`
     /// (default) when the level's [`crate::config::LocatorPolicy`] is disabled.
     /// `Some` makes the writer accumulate a per-key locator and emit the
@@ -326,6 +331,7 @@ impl Writer {
             block_layouts: Vec::new(),
             seqno_bounds_section: Vec::new(),
             zone_map_section: Vec::new(),
+            delete_bitmap: crate::table::delete_bitmap::DeleteBitmap::new(),
 
             locator: None,
             locators: Vec::new(),
@@ -687,6 +693,14 @@ impl Writer {
         self.assert_not_started("use_zone_map");
         self.use_zone_map = zone_map;
         self
+    }
+
+    /// Mutable access to this segment's positional delete-bitmap, so a caller
+    /// (e.g. compaction materialization) can mark rows deleted by position
+    /// before [`finish`](Self::finish). A non-empty bitmap is serialized into
+    /// the optional `delete_bitmap` SST section.
+    pub fn delete_bitmap_mut(&mut self) -> &mut crate::table::delete_bitmap::DeleteBitmap {
+        &mut self.delete_bitmap
     }
 
     /// Enables column-organized data blocks (see [`Self::use_columnar`] field).
@@ -1443,6 +1457,37 @@ impl Writer {
                 crate::table::block::BlockIdentity {
                     table_id: self.table_id,
                     block_type: crate::table::block::BlockType::ZoneMap,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                &{
+                    let t = match self.encryption.as_deref() {
+                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                        None => crate::table::block::BlockTransform::PLAIN,
+                    };
+                    if let Some(ecc) = self.ecc {
+                        t.with_ecc(ecc)
+                    } else {
+                        t
+                    }
+                },
+            )?;
+        }
+
+        // Write the optional positional delete-bitmap section (only when the
+        // segment has materialized deletes). Applied as a row mask at scan time;
+        // absent otherwise, so a read without deletes pays nothing.
+        if !self.delete_bitmap.is_empty() {
+            self.file_writer.start("delete_bitmap")?;
+            self.block_buffer.clear();
+            self.block_buffer
+                .extend_from_slice(&self.delete_bitmap.encode());
+            Block::write_into(
+                &mut self.file_writer,
+                &self.block_buffer,
+                crate::table::block::BlockIdentity {
+                    table_id: self.table_id,
+                    block_type: crate::table::block::BlockType::DeleteBitmap,
                     dict_id: 0,
                     window_log: 0,
                 },

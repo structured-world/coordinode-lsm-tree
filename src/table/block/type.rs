@@ -69,6 +69,13 @@ pub enum BlockType {
     /// framework that fills these blocks is built only with the `columnar`
     /// feature.
     Columnar,
+    /// Optional per-table positional delete-bitmap section: marks, by row
+    /// position, which rows of the table's columnar segment are deleted. A pure
+    /// membership set (MVCC reconciled at materialization via the compaction
+    /// watermark), applied as a mask at scan time. Kept parallel to the data
+    /// (like [`Self::ZoneMap`]) so a read without deletes pays nothing. Absent
+    /// unless the segment has materialized deletes.
+    DeleteBitmap,
 }
 
 // Wire tags are renumbered contiguously `0..=6` for V5. The previous
@@ -94,6 +101,7 @@ impl From<BlockType> for u8 {
             BlockType::SeqnoBounds => 9,
             BlockType::ZoneMap => 10,
             BlockType::Columnar => 11,
+            BlockType::DeleteBitmap => 12,
         }
     }
 }
@@ -115,6 +123,7 @@ impl TryFrom<u8> for BlockType {
             9 => Ok(Self::SeqnoBounds),
             10 => Ok(Self::ZoneMap),
             11 => Ok(Self::Columnar),
+            12 => Ok(Self::DeleteBitmap),
             _ => Err(crate::Error::InvalidTag(("BlockType", value))),
         }
     }
@@ -145,6 +154,7 @@ mod tests {
             (9, BlockType::SeqnoBounds),
             (10, BlockType::ZoneMap),
             (11, BlockType::Columnar),
+            (12, BlockType::DeleteBitmap),
         ] {
             assert_eq!(
                 u8::from(variant),
@@ -163,9 +173,9 @@ mod tests {
     fn block_type_rejects_unknown_wire_tag() {
         // Forward-incompatibility guard: a tag this build doesn't know
         // (newer writer, older reader) must surface as a typed error,
-        // not a silent coercion to a known variant. 12 is the first
+        // not a silent coercion to a known variant. 13 is the first
         // unused tag past the contiguous range.
-        assert!(BlockType::try_from(12).is_err());
+        assert!(BlockType::try_from(13).is_err());
         assert!(BlockType::try_from(255).is_err());
     }
 }

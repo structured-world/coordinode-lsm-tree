@@ -253,6 +253,14 @@ impl Table {
         self.metadata.id
     }
 
+    /// This segment's positional delete-bitmap (rows deleted by position),
+    /// loaded on open. Empty when the segment has no materialized deletes, in
+    /// which case a scan applies no mask.
+    #[must_use]
+    pub fn delete_bitmap(&self) -> &crate::table::delete_bitmap::DeleteBitmap {
+        &self.delete_bitmap
+    }
+
     fn load_block(
         &self,
         handle: &BlockHandle,
@@ -2159,6 +2167,45 @@ impl Table {
             crate::table::zone_map::ZoneMap::default()
         };
 
+        // Load the optional positional delete-bitmap section. Unlike the zone
+        // map (a skip optimization that degrades safely to empty), the delete
+        // bitmap is correctness data: silently dropping an unreadable one would
+        // resurrect deleted rows. The block already carries checksum / ECC /
+        // AEAD, so if it still cannot be decoded the error is propagated and
+        // table recovery fails rather than returning deleted data.
+        let delete_bitmap = if let Some(db_handle) = regions.delete_bitmap {
+            let block = Block::from_file(
+                file_handle.as_ref(),
+                db_handle,
+                crate::table::block::BlockIdentity {
+                    table_id: metadata.id,
+                    block_type: BlockType::DeleteBitmap,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                &{
+                    let t = match encryption.as_deref() {
+                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                        None => crate::table::block::BlockTransform::PLAIN,
+                    };
+                    if let Some(ecc) = metadata.ecc_params {
+                        t.with_ecc(ecc)
+                    } else {
+                        t
+                    }
+                },
+            )?;
+            if block.header.block_type != BlockType::DeleteBitmap {
+                return Err(crate::Error::InvalidTag((
+                    "BlockType",
+                    block.header.block_type.into(),
+                )));
+            }
+            crate::table::delete_bitmap::DeleteBitmap::decode(&block.data)?
+        } else {
+            crate::table::delete_bitmap::DeleteBitmap::default()
+        };
+
         // Load the optional retrieval-ribbon locator section and pair it with an
         // ordinal → data-block-handle map (the index yields handles in key/write
         // order, which is the writer's block_id ordering). Only when the section
@@ -2264,6 +2311,7 @@ impl Table {
                 block_layout,
                 seqno_bounds,
                 zone_map,
+                delete_bitmap,
                 locator_index,
                 encryption,
 

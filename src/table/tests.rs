@@ -3654,3 +3654,90 @@ fn zone_map_absent_without_policy() -> crate::Result<()> {
         None::<fn(Writer) -> Writer>,
     )
 }
+
+/// Helper: recover a freshly written table from `file` with default test config.
+fn recover_test_table(file: &std::path::Path, checksum: Checksum) -> crate::Result<Table> {
+    #[cfg(feature = "metrics")]
+    let metrics = Arc::new(Metrics::default());
+    Table::recover(
+        file.to_path_buf(),
+        checksum,
+        0,
+        0,
+        0,
+        Arc::new(Cache::with_capacity_bytes(1_000_000)),
+        Some(Arc::new(DescriptorTable::new(10))),
+        Arc::new(StdFs),
+        false,
+        false,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        crate::comparator::default_comparator(),
+        #[cfg(feature = "metrics")]
+        metrics,
+    )
+}
+
+#[test]
+fn delete_bitmap_section_round_trips() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+
+    let keys: [&[u8]; 8] = [b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h"];
+    // Row positions follow write order: rows 0, 2, 5 are keys a, c, f.
+    let deleted_rows = [0u32, 2, 5];
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    for key in keys {
+        writer.write(crate::InternalValue::from_components(
+            key,
+            b"v",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    for &row in &deleted_rows {
+        writer.delete_bitmap_mut().insert(row);
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    assert!(
+        table.regions.delete_bitmap.is_some(),
+        "delete-bitmap section must be present when rows are deleted"
+    );
+    let dv = table.delete_bitmap();
+    assert_eq!(dv.len(), deleted_rows.len() as u64);
+    for row in 0..8u32 {
+        assert_eq!(
+            dv.contains(row),
+            deleted_rows.contains(&row),
+            "row {row} membership mismatch after reopen"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn delete_bitmap_section_absent_when_no_deletes() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    writer.write(crate::InternalValue::from_components(
+        b"a",
+        b"v",
+        1,
+        crate::ValueType::Value,
+    ))?;
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    assert!(
+        table.regions.delete_bitmap.is_none(),
+        "no delete-bitmap section when the segment has no deletes"
+    );
+    assert!(table.delete_bitmap().is_empty());
+    Ok(())
+}

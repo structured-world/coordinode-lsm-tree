@@ -98,6 +98,11 @@ pub struct ParsedRegions {
     /// per-column `(min, max, null_count, row_count)` stats for predicate-based
     /// block-skip, kept parallel to the index so point reads pay nothing for it.
     pub zone_map: Option<BlockHandle>,
+    /// Optional positional delete-bitmap section (the `delete_bitmap` section).
+    /// Present only when the segment has materialized deletes; marks deleted
+    /// rows by position, applied as a mask at scan time. Absent otherwise, so a
+    /// segment without deletes pays nothing.
+    pub delete_bitmap: Option<BlockHandle>,
     pub linked_blob_files: Option<BlockHandle>,
     pub metadata: BlockHandle,
     /// Mid-file backup of the meta block. Writer order:
@@ -155,6 +160,10 @@ impl ParsedRegions {
                 .transpose()?,
             zone_map: toc
                 .section(b"zone_map")
+                .map(toc_entry_to_handle)
+                .transpose()?,
+            delete_bitmap: toc
+                .section(b"delete_bitmap")
                 .map(toc_entry_to_handle)
                 .transpose()?,
             linked_blob_files: toc

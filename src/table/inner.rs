@@ -148,6 +148,11 @@ pub struct Inner {
     /// range-cardinality estimate and the block-skip scan path.
     pub(crate) zone_map: crate::table::zone_map::ZoneMap,
 
+    /// Per-segment positional delete-bitmap, loaded on open from the optional
+    /// `delete_bitmap` section. Empty when the segment has no materialized
+    /// deletes, so a scan applies no mask. Read by the columnar scan path.
+    pub(crate) delete_bitmap: crate::table::delete_bitmap::DeleteBitmap,
+
     /// Retrieval-ribbon locator, loaded on open from the optional `locator`
     /// section. `Some` only when the table was written with a locator policy
     /// enabled; lets a point read resolve a key to its data block in O(1),
