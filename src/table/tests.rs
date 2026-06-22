@@ -3741,3 +3741,56 @@ fn delete_bitmap_section_absent_when_no_deletes() -> crate::Result<()> {
     assert!(table.delete_bitmap().is_empty());
     Ok(())
 }
+
+#[cfg(feature = "columnar")]
+#[test]
+fn delete_bitmap_masks_rows_in_columnar_scan() -> crate::Result<()> {
+    use crate::table::columnar::{
+        COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, column_batch_to_entries,
+    };
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+
+    let n = 64u32;
+    // Row positions follow write (= key) order: these are keys k0003/k0010/k0050.
+    let deleted = [3u32, 10, 50];
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_columnar(true);
+    for i in 0..n {
+        let key = format!("k{i:04}").into_bytes();
+        writer.write(crate::InternalValue::from_components(
+            key,
+            b"v",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    for &row in &deleted {
+        writer.delete_bitmap_mut().insert(row);
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    let batches = table.columnar_scan(
+        &[COL_USER_KEY, COL_SEQNO, COL_VALUE_TYPE, COL_VALUE],
+        None,
+    )?;
+
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    for batch in &batches {
+        for entry in column_batch_to_entries(batch)? {
+            got.push(entry.key.user_key.to_vec());
+        }
+    }
+
+    let expected: Vec<Vec<u8>> = (0..n)
+        .filter(|i| !deleted.contains(i))
+        .map(|i| format!("k{i:04}").into_bytes())
+        .collect();
+    assert_eq!(
+        got, expected,
+        "deleted row positions must be masked out of the columnar scan"
+    );
+    Ok(())
+}

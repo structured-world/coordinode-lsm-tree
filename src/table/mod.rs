@@ -1311,6 +1311,11 @@ impl Table {
             }
             _ => None,
         };
+        // Positional deletes are masked at scan time. The block index yields
+        // blocks in key (= write) order, the same order the writer assigned row
+        // positions, so `row_base` is each block's first global row position.
+        let has_deletes = !self.delete_bitmap.is_empty();
+        let mut row_base: u32 = 0;
         let mut out = Vec::new();
         for keyed in self.block_index.iter() {
             let keyed = keyed?;
@@ -1320,17 +1325,37 @@ impl Table {
                 && let Some(stats) = self.zone_map.columns_for(*keyed.offset())
                 && pred.can_skip_block(stats)
             {
+                // Advance the position cursor by the skipped block's row count
+                // (from its zone-map stats) so later blocks still map to the
+                // right delete positions. Skipped rows are predicate-excluded, so
+                // whether they are deleted does not affect the output.
+                if has_deletes && let Some(first) = stats.first() {
+                    row_base = row_base.wrapping_add(first.row_count);
+                }
                 continue;
             }
             let handle = BlockHandle::new(keyed.offset(), keyed.size());
             let batch = self.load_columnar_block_projected(&handle, &decode_projection)?;
-            let mut batch = match predicate {
-                Some(pred) => {
-                    let mask = pred.matching_rows(&batch);
-                    crate::table::columnar_predicate::filter_batch(&batch, &mask)
+            let row_count = batch.row_count;
+            let mut batch = if predicate.is_some() || has_deletes {
+                let mut keep = match predicate {
+                    Some(pred) => pred.matching_rows(&batch),
+                    None => alloc::vec![true; row_count as usize],
+                };
+                if has_deletes {
+                    let mut pos = row_base;
+                    for k in &mut keep {
+                        if self.delete_bitmap.contains(pos) {
+                            *k = false;
+                        }
+                        pos = pos.wrapping_add(1);
+                    }
                 }
-                None => batch,
+                crate::table::columnar_predicate::filter_batch(&batch, &keep)
+            } else {
+                batch
             };
+            row_base = row_base.wrapping_add(row_count);
             if let Some(column_id) = added_predicate_column {
                 batch.columns.retain(|c| c.column_id != column_id);
             }
