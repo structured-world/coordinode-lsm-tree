@@ -154,13 +154,19 @@ impl BloomResult {
 /// The sum never overflows on any reachable input: a row reaches this
 /// translation only when it is visible at the query snapshot `Q`, which (by the
 /// exclusive MVCC check `local < Q - global`) requires `local + global < Q`, and
-/// `Q <= SeqNo::MAX`. Plain addition is therefore correct, and a debug build
-/// still panics loudly if that invariant is ever violated, rather than the silent
-/// clamp a `saturating_add` would produce. For a non-ingested table `global` is
-/// `0` and this is the identity.
+/// `Q <= SeqNo::MAX`. The `checked_add` therefore always succeeds; an overflow
+/// would mean the invariant was violated, so it aborts loudly in both debug and
+/// release builds rather than wrapping to a subtly wrong seqno (the silent-
+/// corruption class `saturating_add` shares). For a non-ingested table `global`
+/// is `0` and this is the identity.
 #[inline]
 fn apply_global_seqno(local: SeqNo, global: SeqNo) -> SeqNo {
-    local + global
+    local.checked_add(global).unwrap_or_else(|| {
+        unreachable!(
+            "apply_global_seqno: table-local seqno + global base overflowed SeqNo::MAX, \
+             but a row is only translated here when visible (local + global < query snapshot)"
+        )
+    })
 }
 
 impl Table {
@@ -1509,10 +1515,11 @@ impl Table {
         // offset means "start at the table's first entry", so clamping the
         // translated lower bound to 0 is exactly right.
         let local_target = target_seqno.saturating_sub(global_seqno);
-        // Upper bound in local coords. `SeqNo::MAX` (the unbounded case) stays
-        // MAX so every entry passes; a real watermark below the offset clamps to
-        // 0, which (via the empty-window check below) correctly excludes the whole
-        // table. The clamp is intentional, hence saturating rather than checked.
+        // Upper bound in local coords. `SeqNo::MAX` (the unbounded case) maps to
+        // `MAX - global_seqno`, still far above any reachable local seqno, so every
+        // entry passes (effectively unbounded); a real watermark below the offset
+        // clamps to 0, which (via the empty-window check below) correctly excludes
+        // the whole table. The clamp is intentional, hence saturating not checked.
         let local_end = end_seqno.saturating_sub(global_seqno);
 
         // Empty window (e.g. a caught-up CDC poller whose target equals the
