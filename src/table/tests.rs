@@ -3772,10 +3772,8 @@ fn delete_bitmap_masks_rows_in_columnar_scan() -> crate::Result<()> {
     let (_, checksum) = writer.finish()?.expect("table written");
 
     let table = recover_test_table(&file, checksum)?;
-    let batches = table.columnar_scan(
-        &[COL_USER_KEY, COL_SEQNO, COL_VALUE_TYPE, COL_VALUE],
-        None,
-    )?;
+    let batches =
+        table.columnar_scan(&[COL_USER_KEY, COL_SEQNO, COL_VALUE_TYPE, COL_VALUE], None)?;
 
     let mut got: Vec<Vec<u8>> = Vec::new();
     for batch in &batches {
@@ -3792,5 +3790,34 @@ fn delete_bitmap_masks_rows_in_columnar_scan() -> crate::Result<()> {
         got, expected,
         "deleted row positions must be masked out of the columnar scan"
     );
+    Ok(())
+}
+
+#[test]
+fn copy_on_write_strategy_suppresses_the_delete_bitmap_section() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .delete_strategy(crate::config::DeleteStrategy::CopyOnWrite);
+    for key in [b"a".as_ref(), b"b", b"c"] {
+        writer.write(crate::InternalValue::from_components(
+            key,
+            b"v",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    // Mark a row deleted; copy-on-write drops rows instead of masking, so it must
+    // not persist a bitmap section even though a position was marked.
+    writer.delete_bitmap_mut().insert(1);
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    assert!(
+        table.regions.delete_bitmap.is_none(),
+        "copy-on-write must not persist a delete-bitmap section"
+    );
+    assert!(table.delete_bitmap().is_empty());
     Ok(())
 }

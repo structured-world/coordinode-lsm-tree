@@ -163,6 +163,12 @@ pub struct Writer {
     /// by default (section absent, zero extra bytes).
     delete_bitmap: crate::table::delete_bitmap::DeleteBitmap,
 
+    /// This segment's delete strategy (the per-SST resolution of the level
+    /// policy). Under copy-on-write the bitmap is not persisted (deleted rows are
+    /// dropped instead); under merge-on-read / adaptive a non-empty bitmap is
+    /// written. Default: adaptive (writes the bitmap).
+    delete_strategy: crate::config::DeleteStrategy,
+
     /// Resolved retrieval-ribbon locator settings for this table, or `None`
     /// (default) when the level's [`crate::config::LocatorPolicy`] is disabled.
     /// `Some` makes the writer accumulate a per-key locator and emit the
@@ -332,6 +338,7 @@ impl Writer {
             seqno_bounds_section: Vec::new(),
             zone_map_section: Vec::new(),
             delete_bitmap: crate::table::delete_bitmap::DeleteBitmap::new(),
+            delete_strategy: crate::config::DeleteStrategy::default(),
 
             locator: None,
             locators: Vec::new(),
@@ -701,6 +708,18 @@ impl Writer {
     /// the optional `delete_bitmap` SST section.
     pub fn delete_bitmap_mut(&mut self) -> &mut crate::table::delete_bitmap::DeleteBitmap {
         &mut self.delete_bitmap
+    }
+
+    /// Sets this segment's delete strategy (the per-SST resolution of the level
+    /// policy). Under [`DeleteStrategy::CopyOnWrite`] the delete-bitmap is not
+    /// persisted even if rows were marked, since copy-on-write drops deleted rows
+    /// rather than masking them. Default: adaptive.
+    ///
+    /// [`DeleteStrategy::CopyOnWrite`]: crate::config::DeleteStrategy::CopyOnWrite
+    #[must_use]
+    pub fn delete_strategy(mut self, strategy: crate::config::DeleteStrategy) -> Self {
+        self.delete_strategy = strategy;
+        self
     }
 
     /// Enables column-organized data blocks (see [`Self::use_columnar`] field).
@@ -1475,9 +1494,10 @@ impl Writer {
         }
 
         // Write the optional positional delete-bitmap section (only when the
-        // segment has materialized deletes). Applied as a row mask at scan time;
+        // segment has materialized deletes AND the strategy keeps a bitmap;
+        // copy-on-write drops rows instead). Applied as a row mask at scan time;
         // absent otherwise, so a read without deletes pays nothing.
-        if !self.delete_bitmap.is_empty() {
+        if !self.delete_bitmap.is_empty() && self.delete_strategy.writes_bitmap() {
             self.file_writer.start("delete_bitmap")?;
             self.block_buffer.clear();
             self.block_buffer
