@@ -285,11 +285,11 @@ impl<'a> Ingestion<'a> {
     /// columnar block.
     ///
     /// The batch carries the three intrinsic columns ([key, seqno, value-type])
-    /// plus one or more value sub-columns; its keys must be sorted and order
-    /// after any previously written data (the ingestion's sorted-input
-    /// contract). The per-row seqnos are typically `0`: the ingestion assigns
-    /// the atomic global sequence number at [`finish`](Self::finish), shared by
-    /// every ingested table.
+    /// plus one or more value sub-columns. Its keys must be strictly increasing
+    /// (by the tree comparator) within the batch and after any previously written
+    /// data, and every per-row seqno must be `0`: the ingestion assigns the atomic
+    /// global sequence number at [`finish`](Self::finish), shared by every
+    /// ingested table.
     ///
     /// Requires the columnar layout (enable `columnar` in the runtime config
     /// before opening the ingestion); a row-mode ingestion rejects the batch. An
@@ -298,8 +298,9 @@ impl<'a> Ingestion<'a> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the batch shape is invalid, the layout is not
-    /// columnar, or a block write fails.
+    /// Returns an error if the batch shape is invalid, the keys are not strictly
+    /// increasing, any row carries a non-zero seqno, the layout is not columnar,
+    /// or a block write fails.
     #[cfg(feature = "columnar")]
     pub fn write_columnar_batch(
         &mut self,

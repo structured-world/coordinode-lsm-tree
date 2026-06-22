@@ -170,3 +170,87 @@ fn columnar_ingest_projects_individual_value_subcolumns() -> lsm_tree::Result<()
     }
     Ok(())
 }
+
+/// One row whose value is a single fixed-4 sub-column (id 3), the smallest batch
+/// that still exercises the ingest contract checks.
+fn one_fixed_subcolumn_batch(key: &[u8], seqno: u64) -> ColumnBatch {
+    let mut batch = entries_to_column_batch(&[InternalValue::from_components(
+        key.to_vec(),
+        b"x".to_vec(),
+        seqno,
+        ValueType::Value,
+    )])
+    .expect("transpose");
+    batch.columns.pop();
+    batch.columns.push(Column {
+        column_id: 3,
+        type_tag: TypeTag::Fixed(4),
+        validity: None,
+        data: vec![0, 0, 0, 0],
+    });
+    batch
+}
+
+#[test]
+fn columnar_ingest_rejects_unsorted_keys() -> lsm_tree::Result<()> {
+    // Two rows in descending key order: the ingest must reject them rather than
+    // write a block whose sorted index would be corrupt.
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+
+    let mut batch = entries_to_column_batch(&[
+        InternalValue::from_components(b"k1".to_vec(), b"x".to_vec(), 0, ValueType::Value),
+        InternalValue::from_components(b"k0".to_vec(), b"x".to_vec(), 0, ValueType::Value),
+    ])?;
+    batch.columns.pop();
+    batch.columns.push(Column {
+        column_id: 3,
+        type_tag: TypeTag::Fixed(4),
+        validity: None,
+        data: vec![0, 0, 0, 0, 0, 0, 0, 0],
+    });
+
+    let mut ingest = any.ingestion()?;
+    assert!(
+        ingest.write_columnar_batch(&batch).is_err(),
+        "descending keys must be rejected",
+    );
+    Ok(())
+}
+
+#[test]
+fn columnar_ingest_rejects_nonzero_seqno() -> lsm_tree::Result<()> {
+    // A non-zero per-row seqno would read back shifted by the table's assigned
+    // sequence number, so the ingest must reject it.
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+
+    let mut ingest = any.ingestion()?;
+    assert!(
+        ingest
+            .write_columnar_batch(&one_fixed_subcolumn_batch(b"k0", 5))
+            .is_err(),
+        "a non-zero row seqno must be rejected",
+    );
+    Ok(())
+}

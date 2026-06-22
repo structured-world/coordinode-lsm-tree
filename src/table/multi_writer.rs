@@ -732,7 +732,8 @@ impl MultiWriter {
         if self.writer.output_size_hint() >= self.target_size {
             self.rotate()?;
         }
-        self.writer.write_columnar_batch(batch)
+        let comparator = self.comparator.clone();
+        self.writer.write_columnar_batch(batch, &comparator)
     }
 
     /// Finishes the last table, making sure all data is written durably

@@ -1141,22 +1141,25 @@ impl Writer {
     /// Writes a consumer-provided [`ColumnBatch`](crate::table::columnar::ColumnBatch)
     /// as a single columnar block, storing its value sub-columns directly instead
     /// of re-transposing the intrinsic value. The batch must carry the three
-    /// intrinsic columns plus one or more value sub-columns, with keys in
-    /// non-decreasing order (the writer's sorted-input contract); the columnar
-    /// layout must be enabled. Each call appends one block, so callers feed
-    /// successive batches in key order.
+    /// intrinsic columns plus one or more value sub-columns; the columnar layout
+    /// must be enabled. Keys must be strictly increasing by `comparator` (within
+    /// the batch and across successive batches / row writes on this writer), and
+    /// every per-row seqno must be `0` (the ingestion assigns one sequence
+    /// number). Each call appends one block.
     ///
     /// Returns the batch's last user key (or `None` for an empty batch) so a
     /// caller can track the ingest ordering across batches.
     ///
     /// # Errors
     ///
-    /// Propagates batch validation errors (malformed intrinsic layout, framing,
-    /// or key/value invariants) and any block write error.
+    /// Returns an error if the batch shape is malformed, the layout is not
+    /// columnar, the keys are not strictly increasing, a row carries a non-zero
+    /// seqno, or the block write fails.
     #[cfg(feature = "columnar")]
     pub(crate) fn write_columnar_batch(
         &mut self,
         batch: &crate::table::columnar::ColumnBatch,
+        comparator: &crate::SharedComparator,
     ) -> crate::Result<Option<crate::UserKey>> {
         // A columnar batch only makes sense (and only reads back correctly) when
         // the table is marked columnar; reject a row-mode writer rather than
@@ -1173,6 +1176,27 @@ impl Writer {
         let Some(last) = entries.last() else {
             return Ok(None); // empty batch: no block
         };
+
+        // Ingest contract. Unsorted keys would corrupt the sorted block index /
+        // zone map; a non-zero seqno would read back shifted by the table's
+        // assigned sequence number. Reject both before writing anything.
+        if entries.iter().any(|e| e.key.seqno != 0) {
+            return Err(crate::Error::FeatureUnsupported(
+                "columnar batch ingest requires every row seqno to be 0 (the ingestion assigns the sequence number)",
+            ));
+        }
+        let mut prev = self.current_key.as_ref();
+        for e in &entries {
+            if let Some(p) = prev
+                && comparator.compare(p.as_ref(), e.key.user_key.as_ref())
+                    != core::cmp::Ordering::Less
+            {
+                return Err(crate::Error::InvalidHeader(
+                    "columnar batch ingest requires strictly increasing keys",
+                ));
+            }
+            prev = Some(&e.key.user_key);
+        }
         let last_key = last.key.user_key.clone();
         let last_seqno = last.key.seqno;
         let item_count = entries.len();

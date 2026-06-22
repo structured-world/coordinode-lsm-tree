@@ -79,17 +79,19 @@ impl AnyIngestion<'_> {
     /// columnar block, stored directly without re-transposing the value.
     ///
     /// The batch carries the three intrinsic columns (`[key, seqno, value-type]`)
-    /// plus one or more value sub-columns; its keys must be sorted and order
-    /// after any previously written data. The per-row seqnos are typically `0`:
-    /// [`finish`](Self::finish) assigns the atomic global sequence number. The
-    /// columnar layout must be enabled (`columnar` in the runtime config) on a
-    /// standard tree; a row-mode or blob tree rejects the batch.
+    /// plus one or more value sub-columns. Its keys must be strictly increasing
+    /// (by the tree comparator) within the batch and after any previously written
+    /// data, and every per-row seqno must be `0`: [`finish`](Self::finish) assigns
+    /// the atomic global sequence number. The columnar layout must be enabled
+    /// (`columnar` in the runtime config) on a standard tree; a row-mode or blob
+    /// tree rejects the batch.
     ///
     /// # Errors
     ///
-    /// Returns an error if the batch shape is invalid, the layout is not
-    /// columnar, a block write fails, or the tree is a blob tree (columnar
-    /// ingest does not support KV separation).
+    /// Returns an error if the batch shape is invalid, the keys are not strictly
+    /// increasing, any row carries a non-zero seqno, the layout is not columnar,
+    /// a block write fails, or the tree is a blob tree (columnar ingest does not
+    /// support KV separation).
     ///
     /// # Examples
     ///

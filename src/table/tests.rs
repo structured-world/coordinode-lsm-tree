@@ -3932,9 +3932,10 @@ fn write_columnar_batch_stores_value_subcolumns_and_round_trips() -> crate::Resu
 
     // A consumer batch: the intrinsic columns for two sorted keys, with the
     // single value column replaced by two value sub-columns (a fixed-4 + a bytes).
+    // Per-row seqnos are 0 (the ingest contract; the table assigns the seqno).
     let mut batch = entries_to_column_batch(&[
-        crate::InternalValue::from_components(b"k0", b"ignored", 1, crate::ValueType::Value),
-        crate::InternalValue::from_components(b"k1", b"ignored", 2, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"k0", b"ignored", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"k1", b"ignored", 0, crate::ValueType::Value),
     ])?;
     batch.columns.pop();
     batch.columns.push(Column {
@@ -3958,7 +3959,7 @@ fn write_columnar_batch_stores_value_subcolumns_and_round_trips() -> crate::Resu
     let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
         .use_columnar(true)
         .use_zone_map(true);
-    writer.write_columnar_batch(&batch)?;
+    writer.write_columnar_batch(&batch, &crate::comparator::default_comparator())?;
     let (_, checksum) = writer.finish()?.expect("table written");
 
     let table = recover_test_table(&file, checksum)?;
@@ -4009,7 +4010,7 @@ fn delete_bitmap_masks_value_subcolumns_in_point_and_projection_reads() -> crate
                 crate::InternalValue::from_components(
                     format!("k{i}").into_bytes(),
                     b"x",
-                    1,
+                    0, // ingest contract: per-row seqno is 0
                     crate::ValueType::Value,
                 )
             })
@@ -4042,7 +4043,7 @@ fn delete_bitmap_masks_value_subcolumns_in_point_and_projection_reads() -> crate
     let mut writer = Writer::new(src.clone(), 0, 0, Arc::new(StdFs))?
         .use_columnar(true)
         .use_zone_map(true);
-    writer.write_columnar_batch(&batch)?;
+    writer.write_columnar_batch(&batch, &crate::comparator::default_comparator())?;
     let (_, checksum) = writer.finish()?.expect("source written");
     let source = recover_test_table(&src, checksum)?;
 
