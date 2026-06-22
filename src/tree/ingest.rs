@@ -371,7 +371,12 @@ impl<'a> Ingestion<'a> {
     #[cfg(feature = "columnar")]
     fn flush_pending_columnar(&mut self) -> crate::Result<()> {
         if let Some(batch) = self.pending_columnar.take() {
-            self.writer.write_columnar_batch(&batch)?;
+            // Restore the pending rowgroup if the write fails, so the buffered
+            // rows are not silently dropped from ingestion state.
+            if let Err(e) = self.writer.write_columnar_batch(&batch) {
+                self.pending_columnar = Some(batch);
+                return Err(e);
+            }
         }
         Ok(())
     }
