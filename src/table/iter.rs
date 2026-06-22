@@ -329,13 +329,17 @@ impl Iter {
                 const REENCODE_RESTART_INTERVAL: u8 = 16;
                 return match &self.delete_mask {
                     Some(mask) => {
-                        // The block-index order is the writer's row order, so the
-                        // block's first global row position comes from the map.
-                        let start = mask
-                            .block_start_rows
-                            .get(&handle.offset().0)
-                            .copied()
-                            .unwrap_or(0);
+                        // A masked segment maps every data block (the start-row map
+                        // is built at open from the zone map, which covers every
+                        // block). A missing offset is an invariant violation, not a
+                        // "starts at row 0" default: defaulting to 0 would mask the
+                        // block against the wrong physical positions. Surface it
+                        // (matching the direct-load path) rather than mis-masking.
+                        let Some(&start) = mask.block_start_rows.get(&handle.offset().0) else {
+                            return Err(crate::Error::InvalidHeader(
+                                "delete mask: data block offset missing from the start-row map",
+                            ));
+                        };
                         DataBlock::from_columnar_block_masked(
                             &raw.data,
                             REENCODE_RESTART_INTERVAL,

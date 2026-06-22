@@ -1498,6 +1498,15 @@ impl Writer {
         // copy-on-write drops rows instead). Applied as a row mask at scan time;
         // absent otherwise, so a read without deletes pays nothing.
         if !self.delete_bitmap.is_empty() && self.delete_strategy.writes_bitmap() {
+            // Co-write invariant: the positional mask resolves each block's start
+            // row from the zone map, and recovery rejects a delete-bitmap SST that
+            // lacks one. Fail here at the write site (a clear misconfiguration)
+            // rather than letting the SST be written and then fail to open.
+            if self.zone_map_section.is_empty() {
+                return Err(crate::Error::InvalidHeader(
+                    "delete-bitmap requires the zone map (use_zone_map(true))",
+                ));
+            }
             self.file_writer.start("delete_bitmap")?;
             self.block_buffer.clear();
             self.block_buffer
@@ -2159,6 +2168,33 @@ mod tests {
     use super::*;
     use crate::fs::StdFs;
     use test_log::test;
+
+    #[test]
+    fn finish_rejects_a_delete_bitmap_without_a_zone_map() -> crate::Result<()> {
+        // The positional mask resolves each block's start row from the zone map,
+        // so a segment that marks deletes must also carry one. The writer must
+        // reject the misconfiguration at finish() rather than emit an SST that
+        // then fails to open.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("1");
+        let mut writer = Writer::new(path, 1, 0, Arc::new(StdFs))?;
+        writer.write(InternalValue::from_components(
+            b"a",
+            b"v",
+            1,
+            ValueType::Value,
+        ))?;
+        // Mark a delete, but never enable the zone map.
+        writer.delete_bitmap_mut().insert(0);
+        match writer.finish() {
+            Ok(_) => panic!("must reject a delete-bitmap without a zone map"),
+            Err(err) => assert!(
+                matches!(err, crate::Error::InvalidHeader(_)),
+                "expected an InvalidHeader error, got {err:?}",
+            ),
+        }
+        Ok(())
+    }
 
     #[test]
     fn table_writer_count() -> crate::Result<()> {
