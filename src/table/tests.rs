@@ -4096,3 +4096,102 @@ fn delete_bitmap_masks_value_subcolumns_in_point_and_projection_reads() -> crate
 
     Ok(())
 }
+
+#[cfg(feature = "columnar")]
+#[test]
+fn write_columnar_batch_accounts_tombstones_seqno_bounds_and_restart_locator() -> crate::Result<()>
+{
+    use crate::config::{LocatorPolicyEntry, LocatorPrecision};
+    use crate::table::columnar::{Column, TypeTag, entries_to_column_batch};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("t");
+    // Distinct keys with mixed value types plus one fixed value sub-column,
+    // written with seqno-in-index and restart-precision locator enabled so the
+    // tombstone / weak-tombstone accounting, the seqno-bounds, and the
+    // restart-precision locator branches all run.
+    let mut batch = entries_to_column_batch(&[
+        crate::InternalValue::from_components(b"k0", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"k1", b"", 0, crate::ValueType::Tombstone),
+        crate::InternalValue::from_components(b"k2", b"", 0, crate::ValueType::WeakTombstone),
+    ])?;
+    batch.columns.pop();
+    batch.columns.push(Column {
+        column_id: 3,
+        type_tag: TypeTag::Fixed(2),
+        validity: None,
+        data: vec![1, 1, 2, 2, 3, 3],
+    });
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_seqno_in_index(true)
+        .use_locator(LocatorPolicyEntry::Enabled {
+            precision: LocatorPrecision::Restart,
+            block_id_bits: None,
+            slot_bits: None,
+        });
+    writer.write_columnar_batch(&batch, &crate::comparator::default_comparator())?;
+    let (_, checksum) = writer.finish()?.expect("table written");
+    let table = recover_test_table(&file, checksum)?;
+
+    // is_tombstone covers Tombstone + WeakTombstone; weak count is just the latter.
+    assert_eq!(table.metadata.tombstone_count, 2, "two tombstone-kind rows");
+    assert_eq!(table.metadata.weak_tombstone_count, 1, "one weak tombstone");
+    assert!(
+        table.get(b"k0", SeqNo::MAX, hash64(b"k0"))?.is_some(),
+        "the live row reads back",
+    );
+    Ok(())
+}
+
+#[cfg(feature = "columnar")]
+#[test]
+fn write_columnar_batch_on_an_empty_batch_writes_no_block() -> crate::Result<()> {
+    use crate::table::columnar::{Column, TypeTag};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("t");
+    // An empty batch (zero rows) carrying the intrinsic columns plus a value
+    // sub-column writes no block and returns no last key.
+    let empty = crate::table::columnar::ColumnBatch {
+        row_count: 0,
+        columns: vec![
+            Column {
+                column_id: 0,
+                type_tag: TypeTag::Bytes,
+                validity: None,
+                data: 0u32.to_le_bytes().to_vec(),
+            },
+            Column {
+                column_id: 1,
+                type_tag: TypeTag::Fixed(8),
+                validity: None,
+                data: Vec::new(),
+            },
+            Column {
+                column_id: 2,
+                type_tag: TypeTag::Fixed(1),
+                validity: None,
+                data: Vec::new(),
+            },
+            Column {
+                column_id: 3,
+                type_tag: TypeTag::Fixed(4),
+                validity: None,
+                data: Vec::new(),
+            },
+        ],
+    };
+    let mut writer = Writer::new(file, 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    assert!(
+        writer
+            .write_columnar_batch(&empty, &crate::comparator::default_comparator())?
+            .is_none(),
+        "an empty batch yields no last key",
+    );
+    Ok(())
+}

@@ -317,3 +317,25 @@ fn columnar_ingest_after_a_row_write_keeps_block_order() -> lsm_tree::Result<()>
     );
     Ok(())
 }
+
+#[test]
+fn columnar_ingest_rejected_on_a_blob_tree() -> lsm_tree::Result<()> {
+    // KV-separated (blob) trees do not support columnar batch ingest.
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(Default::default()))
+    .open()?;
+
+    let mut ingest = any.ingestion()?;
+    assert!(
+        ingest
+            .write_columnar_batch(&one_fixed_subcolumn_batch(b"k0", 0))
+            .is_err(),
+        "columnar ingest is not supported on a blob tree",
+    );
+    Ok(())
+}
