@@ -442,6 +442,41 @@ mod tests {
     }
 
     #[test]
+    fn full_chunk_bulk_delete_is_dense_and_compact() {
+        // A bulk delete of a whole chunk is O(1) bitmap work: the chunk collapses
+        // to a single dense bitset (O(1) space, not O(rows) sparse offsets) and is
+        // skipped / queried in O(1).
+        let mut dv = DeleteBitmap::new();
+        for off in 0..CHUNK_ROWS {
+            dv.insert(CHUNK_ROWS + off);
+        }
+        assert_eq!(
+            dv.len(),
+            u64::from(CHUNK_ROWS),
+            "every row of the chunk marked"
+        );
+        assert!(dv.chunk_has_deletes(1), "the full chunk reports deletes");
+        assert!(
+            !dv.chunk_has_deletes(0),
+            "an untouched neighbour skips in O(1)"
+        );
+        assert!(!dv.chunk_has_deletes(2));
+        // Boundary rows present; their neighbours in adjacent chunks are not.
+        assert!(dv.contains(CHUNK_ROWS));
+        assert!(dv.contains(2 * CHUNK_ROWS - 1));
+        assert!(!dv.contains(CHUNK_ROWS - 1));
+        assert!(!dv.contains(2 * CHUNK_ROWS));
+        // Dense storage: a full chunk encodes to one bounded bitset, far below the
+        // ~2 bytes/row a sparse array of CHUNK_ROWS offsets would need.
+        let encoded = dv.encode();
+        assert!(
+            encoded.len() < CHUNK_ROWS as usize,
+            "a full chunk must store densely (O(1) space), got {} bytes for {CHUNK_ROWS} rows",
+            encoded.len(),
+        );
+    }
+
+    #[test]
     fn union_is_set_union() {
         let mut a = DeleteBitmap::new();
         a.insert(1);
