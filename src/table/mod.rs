@@ -1507,6 +1507,35 @@ impl Table {
         self.range_iter(range)
     }
 
+    /// Builds the positional delete mask for a columnar iterator: clones the
+    /// delete-bitmap and maps each data block's file offset to its first global
+    /// row position (block-index = writer row order). `None` when the segment has
+    /// no deletes, so a delete-free table pays nothing. Per-block row counts come
+    /// from the zone map, which a delete-bitmap SST always carries (enforced on
+    /// open).
+    fn build_delete_mask(&self) -> Option<iter::DeleteMask> {
+        if self.delete_bitmap.is_empty() {
+            return None;
+        }
+        let mut block_start_rows = crate::HashMap::default();
+        let mut start: u32 = 0;
+        for keyed in self.block_index.iter() {
+            let Ok(keyed) = keyed else { return None };
+            let offset = keyed.offset().0;
+            block_start_rows.insert(offset, start);
+            let row_count = self
+                .zone_map
+                .columns_for(offset)
+                .and_then(|stats| stats.first())
+                .map_or(0, |col| col.row_count);
+            start = start.wrapping_add(row_count);
+        }
+        Some(iter::DeleteMask {
+            bitmap: self.delete_bitmap.clone(),
+            block_start_rows,
+        })
+    }
+
     /// Like [`Self::range`] but returns the concrete [`iter::Iter`] reader.
     ///
     /// The seekable range pipeline holds the concrete type so it can re-position
@@ -1527,6 +1556,7 @@ impl Table {
             self.heal_hints.get().cloned(),
             self.metadata.kv_checksum_algo.is_some(),
             self.metadata.columnar,
+            self.build_delete_mask(),
             #[cfg(zstd_any)]
             self.zstd_dictionary.clone(),
             self.comparator.clone(),
@@ -2230,6 +2260,16 @@ impl Table {
         } else {
             crate::table::delete_bitmap::DeleteBitmap::default()
         };
+
+        // A delete-bitmap is positional; masking it on the read path needs each
+        // block's row count, which comes from the zone map. The writer co-writes
+        // both, so a bitmap without a zone map is a malformed SST (masking would
+        // resolve every block to position 0 and corrupt visibility).
+        if !delete_bitmap.is_empty() && zone_map.is_empty() {
+            return Err(crate::Error::InvalidHeader(
+                "delete-bitmap SST is missing its zone map",
+            ));
+        }
 
         // Load the optional retrieval-ribbon locator section and pair it with an
         // ordinal → data-block-handle map (the index yields handles in key/write

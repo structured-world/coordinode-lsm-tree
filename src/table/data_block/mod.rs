@@ -492,16 +492,9 @@ impl DataBlock {
     /// Returns `Ok(None)` when every row in the block is deleted: the row encoder
     /// has a non-empty precondition, so a fully-deleted block is reported as
     /// "nothing to yield" and the caller skips it.
-    // Reconstruction-side masking primitive; the iterator wires it to the
-    // delete-bitmap + per-block start position in a follow-up change.
+    // Reconstruction-side masking primitive used by the iterator's columnar
+    // delete-masking path (see `Iter::load_and_resolve`).
     #[cfg(feature = "columnar")]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "wired into the iterator delete-masking path in a follow-up change"
-        )
-    )]
     pub(crate) fn from_columnar_block_masked(
         block_data: &[u8],
         restart_interval: u8,

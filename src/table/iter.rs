@@ -148,6 +148,14 @@ fn create_data_block_reader(
     OwnedDataBlockIter::try_new(block, |b| b.try_iter(comparator))
 }
 
+/// Per-SST positional delete state for a columnar iterator: the delete-bitmap
+/// plus each data block's first global row position (block-index order), so a
+/// reconstructed block can drop its deleted rows by position.
+pub struct DeleteMask {
+    pub(crate) bitmap: crate::table::delete_bitmap::DeleteBitmap,
+    pub(crate) block_start_rows: crate::HashMap<u64, u32>,
+}
+
 #[expect(
     clippy::struct_excessive_bools,
     reason = "each bool is an independent per-SST read-path flag (kv footer, columnar, init, poisoned), not a state enum"
@@ -195,6 +203,11 @@ pub struct Iter {
     /// read as `BlockType::Columnar` and reconstructed into a row block.
     columnar: bool,
 
+    /// Positional delete mask for a columnar SST with materialized deletes;
+    /// `None` when the segment has no deletes. Applied during block
+    /// reconstruction so deleted rows never reach the reader.
+    delete_mask: Option<DeleteMask>,
+
     index_initialized: bool,
 
     lo_offset: BlockOffset,
@@ -232,6 +245,7 @@ impl Iter {
         heal_hints: Option<Arc<crate::heal_hints::HealHints>>,
         has_kv_footer: bool,
         columnar: bool,
+        delete_mask: Option<DeleteMask>,
         #[cfg(zstd_any)] zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
         comparator: SharedComparator,
         #[cfg(feature = "zstd")] block_layout: crate::table::block_layout::BlockLayoutMap,
@@ -253,6 +267,7 @@ impl Iter {
             heal_hints,
             has_kv_footer,
             columnar,
+            delete_mask,
             #[cfg(zstd_any)]
             zstd_dictionary,
             comparator,
@@ -283,7 +298,10 @@ impl Iter {
     /// into a row-major block; a row SST's block is loaded directly. The
     /// reconstructed block is in-memory, so a fixed restart interval yields a
     /// correct, iterable block regardless of the SST's recorded value.
-    fn load_and_resolve(&self, handle: &BlockHandle) -> crate::Result<DataBlock> {
+    /// Loads, reconstructs (if columnar), and masks a data block by handle.
+    /// Returns `Ok(None)` when a columnar block is wholly deleted by the
+    /// positional mask, so the caller skips it.
+    fn load_and_resolve(&self, handle: &BlockHandle) -> crate::Result<Option<DataBlock>> {
         let block_type = if self.columnar {
             crate::table::block::BlockType::Columnar
         } else {
@@ -309,14 +327,32 @@ impl Iter {
             #[cfg(feature = "columnar")]
             {
                 const REENCODE_RESTART_INTERVAL: u8 = 16;
-                return DataBlock::from_columnar_block(&raw.data, REENCODE_RESTART_INTERVAL);
+                return match &self.delete_mask {
+                    Some(mask) => {
+                        // The block-index order is the writer's row order, so the
+                        // block's first global row position comes from the map.
+                        let start = mask
+                            .block_start_rows
+                            .get(&handle.offset().0)
+                            .copied()
+                            .unwrap_or(0);
+                        DataBlock::from_columnar_block_masked(
+                            &raw.data,
+                            REENCODE_RESTART_INTERVAL,
+                            &mask.bitmap,
+                            start,
+                        )
+                    }
+                    None => DataBlock::from_columnar_block(&raw.data, REENCODE_RESTART_INTERVAL)
+                        .map(Some),
+                };
             }
             #[cfg(not(feature = "columnar"))]
             {
                 return Err(crate::Error::FeatureUnsupported("columnar"));
             }
         }
-        DataBlock::from_loaded(raw, self.has_kv_footer)
+        DataBlock::from_loaded(raw, self.has_kv_footer).map(Some)
     }
 
     pub fn set_lower_bound(&mut self, bound: Bound) {
@@ -636,9 +672,15 @@ impl Iterator for Iter {
             // upper bound, decode only the covering prefix. Falls back to a full
             // load (which checks the block cache) otherwise.
             #[cfg(feature = "zstd")]
-            let partial = match self.try_partial_block(&handle) {
-                Ok(p) => p,
-                Err(e) => return self.poison(e),
+            let partial = if self.delete_mask.is_some() {
+                // Positional masking needs the whole block; skip the partial-decode
+                // fast path so deleted rows are dropped during reconstruction.
+                None
+            } else {
+                match self.try_partial_block(&handle) {
+                    Ok(p) => p,
+                    Err(e) => return self.poison(e),
+                }
             };
             #[cfg(not(feature = "zstd"))]
             let partial: Option<DataBlock> = None;
@@ -647,7 +689,9 @@ impl Iterator for Iter {
                 db
             } else {
                 match self.load_and_resolve(&BlockHandle::new(handle.offset(), handle.size())) {
-                    Ok(b) => b,
+                    Ok(Some(b)) => b,
+                    // The block was wholly deleted by the mask; skip to the next.
+                    Ok(None) => continue,
                     Err(e) => return self.poison(e),
                 }
             };
@@ -764,9 +808,15 @@ impl DoubleEndedIterator for Iter {
             // upper bound, decode only the covering prefix. Falls back to a full
             // load (which checks the block cache) otherwise.
             #[cfg(feature = "zstd")]
-            let partial = match self.try_partial_block(&handle) {
-                Ok(p) => p,
-                Err(e) => return self.poison(e),
+            let partial = if self.delete_mask.is_some() {
+                // Positional masking needs the whole block; skip the partial-decode
+                // fast path so deleted rows are dropped during reconstruction.
+                None
+            } else {
+                match self.try_partial_block(&handle) {
+                    Ok(p) => p,
+                    Err(e) => return self.poison(e),
+                }
             };
             #[cfg(not(feature = "zstd"))]
             let partial: Option<DataBlock> = None;
@@ -775,7 +825,9 @@ impl DoubleEndedIterator for Iter {
                 db
             } else {
                 match self.load_and_resolve(&BlockHandle::new(handle.offset(), handle.size())) {
-                    Ok(b) => b,
+                    Ok(Some(b)) => b,
+                    // The block was wholly deleted by the mask; skip to the next.
+                    Ok(None) => continue,
                     Err(e) => return self.poison(e),
                 }
             };

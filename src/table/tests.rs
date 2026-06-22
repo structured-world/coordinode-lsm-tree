@@ -3688,7 +3688,9 @@ fn delete_bitmap_section_round_trips() -> crate::Result<()> {
     // Row positions follow write order: rows 0, 2, 5 are keys a, c, f.
     let deleted_rows = [0u32, 2, 5];
 
-    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    // A delete-bitmap SST must carry a zone map (per-block row counts power the
+    // positional masking; recovery enforces this).
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_zone_map(true);
     for key in keys {
         writer.write(crate::InternalValue::from_components(
             key,
@@ -3756,7 +3758,9 @@ fn delete_bitmap_masks_rows_in_columnar_scan() -> crate::Result<()> {
     // Row positions follow write (= key) order: these are keys k0003/k0010/k0050.
     let deleted = [3u32, 10, 50];
 
-    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_columnar(true);
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true);
     for i in 0..n {
         let key = format!("k{i:04}").into_bytes();
         writer.write(crate::InternalValue::from_components(
@@ -3819,5 +3823,51 @@ fn copy_on_write_strategy_suppresses_the_delete_bitmap_section() -> crate::Resul
         "copy-on-write must not persist a delete-bitmap section"
     );
     assert!(table.delete_bitmap().is_empty());
+    Ok(())
+}
+
+#[cfg(feature = "columnar")]
+#[test]
+fn delete_bitmap_masks_rows_in_range_scan() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+
+    let n = 64u32;
+    // Row positions follow write (= key) order: keys k0003 / k0010 / k0050.
+    let deleted = [3u32, 10, 50];
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    for i in 0..n {
+        let key = format!("k{i:04}").into_bytes();
+        writer.write(crate::InternalValue::from_components(
+            key,
+            b"v",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    for &row in &deleted {
+        writer.delete_bitmap_mut().insert(row);
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    // A full forward range scan goes through the columnar reconstruction +
+    // positional mask; deleted positions must never be yielded.
+    let got: Vec<Vec<u8>> = table
+        .range_iter(..)
+        .map(|r| r.map(|kv| kv.key.user_key.to_vec()))
+        .collect::<crate::Result<Vec<_>>>()?;
+
+    let expected: Vec<Vec<u8>> = (0..n)
+        .filter(|i| !deleted.contains(i))
+        .map(|i| format!("k{i:04}").into_bytes())
+        .collect();
+    assert_eq!(
+        got, expected,
+        "deleted row positions must be masked out of the range scan"
+    );
     Ok(())
 }
