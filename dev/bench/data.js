@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782150795572,
+  "lastUpdate": 1782155496061,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -19062,6 +19062,84 @@ window.BENCHMARK_DATA = {
             "value": 698844.2074225794,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.6us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "dcc8f4cd2dc90e574619061932d55a983863f09a",
+          "message": "feat(columnar): nullable value sub-columns and default values (#536)\n\n## Summary\n\nBuilds on #522 (consumer value sub-columns) to let a value sub-column be\nabsent for some rows (a sparse field), with caller-supplied defaults on\nread. The base of this PR is the #522 branch (stacked); it should be\nretargeted to `main` once #522 (PR #531) merges.\n\n## What it adds\n\n- **`frame_value_cells_nullable` / `unframe_value_cells_nullable`**: a\npresence-bitmap framing where a null cell takes one bit and no body (the\nblob is a `ceil(N/8)`-byte bitmap plus only the present cells). The\nper-cell encoding is the same as the non-nullable framing.\n- **`unframe_value_cells_with_defaults`**: reads each absent cell back\nas a caller-supplied per-column default, so the engine stays\nvalue-agnostic (defaults are caller bytes, not stored).\n- The columnar untranspose now accepts a validity bitmap on a value\nsub-column (validated like the intrinsic columns), and a row read frames\nnullable whenever any sub-column is nullable. The non-nullable path\nstays byte-identical (no bitmap, no overhead).\n\n## Testing\n\n- Unit: nullable framing round-trip (mixed present/null, all-null,\nall-present), truncated / trailing-byte rejection, defaults\nsubstitution, and untranspose reconstruction through\n`column_batch_to_entries`.\n- Integration: ingest a batch whose fixed sub-column is null for one\nrow, then point-read both rows back (the absent cell reconstructs as\n`None`).\n- Full gate: clippy `--all-features --all-targets`, no-std (`thumbv7em`\n+ `alloc`) errcount 0, nextest (columnar 2179 + lz4,zstd 2104), doctests\n63.\n\nCloses #532\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added comprehensive support for nullable value sub-columns in columnar\nbatch operations. System now detects nullable columns and frames them\nwith a presence bitmap for efficient null handling. Absent cells are\nproperly tracked and can have default values substituted during\nunmarshalling. Extended test coverage includes round-trip validation for\nnullable scenarios.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-22T21:58:37+03:00",
+          "tree_id": "10d75cc4116c0b0f6647314d39f3235e3294be11",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/dcc8f4cd2dc90e574619061932d55a983863f09a"
+        },
+        "date": 1782155494683,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2005045.35578011,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1184106.6762651934,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 831917.2576426616,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.3us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.24s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3676029.667397431,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.1us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 436416.0513596754,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.4us | P99.9: 9.1us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 222959.42442926482,
+            "unit": "ops/sec",
+            "extra": "P50: 4.0us | P99: 9.0us | P99.9: 11.9us\nthreads: 1 | elapsed: 0.90s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1169934.4808612291,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.9us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1075136.9857568056,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 665088.8143973158,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.7us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
           }
         ]
       }
