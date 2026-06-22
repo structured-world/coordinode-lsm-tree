@@ -11,6 +11,7 @@
 
 use lsm_tree::table::columnar::{
     Column, ColumnBatch, TypeTag, entries_to_column_batch, unframe_value_cells,
+    unframe_value_cells_nullable,
 };
 use lsm_tree::{
     AbstractTree, AnyTree, Config, InternalValue, SeqNo, SequenceNumberCounter, ValueType,
@@ -362,6 +363,68 @@ fn columnar_ingest_rejected_on_a_blob_tree() -> lsm_tree::Result<()> {
             Err(lsm_tree::Error::FeatureUnsupported(_))
         ),
         "columnar ingest is not supported on a blob tree",
+    );
+    Ok(())
+}
+
+#[test]
+fn columnar_ingest_round_trips_a_nullable_value_subcolumn() -> lsm_tree::Result<()> {
+    // A value sub-column may be absent for some rows (a sparse field). Ingest a
+    // batch whose fixed-4 sub-column is null for the second row, then read both
+    // rows back: the reconstructed value unframes to the present / absent cells.
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+
+    let mut batch = entries_to_column_batch(&[
+        InternalValue::from_components(b"k0".to_vec(), b"ignored".to_vec(), 0, ValueType::Value),
+        InternalValue::from_components(b"k1".to_vec(), b"ignored".to_vec(), 0, ValueType::Value),
+    ])?;
+    batch.columns.pop();
+    // Bytes sub-column, always present: "aa", "bbb".
+    let mut bytes_data = Vec::new();
+    for off in [0u32, 2, 5] {
+        bytes_data.extend_from_slice(&off.to_le_bytes());
+    }
+    bytes_data.extend_from_slice(b"aabbb");
+    batch.columns.push(Column {
+        column_id: 3,
+        type_tag: TypeTag::Bytes,
+        validity: None,
+        data: bytes_data,
+    });
+    // Fixed-4 sub-column, row 0 present, row 1 null (validity bit 0 set only).
+    batch.columns.push(Column {
+        column_id: 4,
+        type_tag: TypeTag::Fixed(4),
+        validity: Some(vec![0b0000_0001]),
+        data: vec![1, 0, 0, 0, 0, 0, 0, 0],
+    });
+
+    let mut ingest = any.ingestion()?;
+    ingest.write_columnar_batch(&batch)?;
+    ingest.finish()?;
+
+    let tags = [TypeTag::Bytes, TypeTag::Fixed(4)];
+    let v0 = any.get(b"k0", SeqNo::MAX)?.expect("k0 present");
+    assert_eq!(
+        unframe_value_cells_nullable(v0.as_ref(), &tags)?,
+        vec![Some(&b"aa"[..]), Some(&[1, 0, 0, 0][..])],
+    );
+    let v1 = any.get(b"k1", SeqNo::MAX)?.expect("k1 present");
+    assert_eq!(
+        unframe_value_cells_nullable(v1.as_ref(), &tags)?,
+        vec![Some(&b"bbb"[..]), None],
+        "the fixed sub-column is absent for the second row",
     );
     Ok(())
 }

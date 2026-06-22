@@ -718,12 +718,22 @@ fn column_cell(col: &Column, row_count: u32, row: u32) -> Result<&[u8]> {
     }
 }
 
-/// Reconstructs a row's value from its value sub-columns. A single sub-column
-/// yields the cell verbatim (the intrinsic opaque value, or a degenerate
-/// one-column consumer value); two or more are joined by [`frame_value_cells`]
-/// into one self-describing blob the consumer reverses with
-/// [`unframe_value_cells`].
+/// Reconstructs a row's value from its value sub-columns.
+///
+/// With no nullable sub-column: a single sub-column yields the cell verbatim (the
+/// intrinsic opaque value, or a degenerate one-column consumer value), and two or
+/// more are joined by [`frame_value_cells`]. When any sub-column carries a
+/// validity bitmap, the row is framed with [`frame_value_cells_nullable`] (a
+/// presence bitmap plus the present cells), which the consumer reverses with
+/// [`unframe_value_cells_nullable`] / [`unframe_value_cells_with_defaults`].
 fn reconstruct_row_value(value_cols: &[Column], row_count: u32, row: u32) -> Result<Slice> {
+    if value_cols.iter().any(|c| c.validity.is_some()) {
+        let mut cells = Vec::with_capacity(value_cols.len());
+        for col in value_cols {
+            cells.push((col.type_tag, column_value_cell(col, row_count, row)?));
+        }
+        return Ok(Slice::from(frame_value_cells_nullable(&cells)?));
+    }
     if let [single] = value_cols {
         return Ok(Slice::from(column_cell(single, row_count, row)?));
     }
@@ -768,12 +778,12 @@ pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>
         }
         col.validate(batch.row_count)?;
     }
-    // Value sub-columns are consumer-defined (id / type / count). Their ids must
-    // be unique and must not overlap the intrinsic columns (`< COL_VALUE`), since
-    // projection later selects columns by id and a collision would make the
-    // result ambiguous. Nullable value sub-columns are a later slice, so reject a
-    // validity bitmap for now; the per-column `validate` bounds each against
-    // `row_count` like the intrinsics.
+    // Value sub-columns are consumer-defined (id / type / count) and may be
+    // nullable. Their ids must be unique and must not overlap the intrinsic
+    // columns (`< COL_VALUE`), since projection selects columns by id and a
+    // collision would make the result ambiguous. `validate` bounds each against
+    // `row_count` and checks the validity bitmap (length + zero padding) like the
+    // intrinsics.
     let mut seen_value_column_ids = Vec::with_capacity(value_cols.len());
     for col in value_cols {
         if col.column_id < COL_VALUE || seen_value_column_ids.contains(&col.column_id) {
@@ -782,11 +792,6 @@ pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>
             ));
         }
         seen_value_column_ids.push(col.column_id);
-        if col.validity.is_some() {
-            return Err(Error::InvalidHeader(
-                "columnar: nullable value sub-columns are not supported yet",
-            ));
-        }
         col.validate(batch.row_count)?;
     }
     let mut out = Vec::with_capacity(batch.row_count as usize);
@@ -939,12 +944,207 @@ pub fn unframe_value_cells<'a>(blob: &'a [u8], type_tags: &[TypeTag]) -> Result<
     Ok(out)
 }
 
+/// Frames a row's value sub-column cells where any cell may be absent (null),
+/// into one self-describing blob.
+///
+/// Like [`frame_value_cells`] but each cell is `Option`: a `None` sub-cell is
+/// absent for this row. The blob starts with a `ceil(N / 8)`-byte presence
+/// bitmap (bit `i` set means cell `i` is present), followed by only the present
+/// cells (fixed verbatim, variable-width length-prefixed). The consumer reverses
+/// it with [`unframe_value_cells_nullable`], replaying the value sub-columns'
+/// type tags.
+///
+/// # Errors
+///
+/// Returns an error if a fixed-width present cell's length does not match its tag
+/// width, or a variable-width cell is longer than `u32::MAX`.
+///
+/// # Examples
+///
+/// ```
+/// use lsm_tree::table::columnar::{
+///     frame_value_cells_nullable, unframe_value_cells_nullable, TypeTag,
+/// };
+///
+/// let tags = [TypeTag::Fixed(4), TypeTag::Bytes];
+/// let blob = frame_value_cells_nullable(&[
+///     (TypeTag::Fixed(4), Some(&[1, 2, 3, 4][..])),
+///     (TypeTag::Bytes, None), // absent for this row
+/// ])
+/// .unwrap();
+/// let cells = unframe_value_cells_nullable(&blob, &tags).unwrap();
+/// assert_eq!(cells, vec![Some(&[1, 2, 3, 4][..]), None]);
+/// ```
+pub fn frame_value_cells_nullable(cells: &[(TypeTag, Option<&[u8]>)]) -> Result<Vec<u8>> {
+    let bitmap_len = cells.len().div_ceil(8);
+    let mut out = alloc::vec![0u8; bitmap_len];
+    for (i, (tag, cell)) in cells.iter().enumerate() {
+        let Some(c) = cell else {
+            continue; // null: leave the presence bit clear, append no bytes
+        };
+        // `i < cells.len()` and `bitmap_len = cells.len().div_ceil(8)`, so
+        // `i / 8 < bitmap_len` always. Fail loudly rather than silently skip the
+        // bit if a future refactor ever breaks that invariant: a clear bit on a
+        // present cell would desync the bitmap from the appended body below.
+        let byte = out.get_mut(i / 8).ok_or(Error::InvalidHeader(
+            "columnar: presence bitmap index out of range",
+        ))?;
+        *byte |= 1u8 << (i % 8);
+        match tag {
+            TypeTag::Fixed(width) => {
+                if c.len() != usize::from(*width) {
+                    return Err(Error::InvalidHeader(
+                        "columnar: fixed value sub-cell length does not match its type tag",
+                    ));
+                }
+                out.extend_from_slice(c);
+            }
+            TypeTag::Bytes => {
+                let len = u32::try_from(c.len()).map_err(|_| {
+                    Error::InvalidHeader("columnar: framed value sub-cell exceeds u32")
+                })?;
+                out.extend_from_slice(&len.to_le_bytes());
+                out.extend_from_slice(c);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Splits a value blob produced by [`frame_value_cells_nullable`] back into its
+/// sub-column cells, each `Some(bytes)` if present or `None` if absent.
+///
+/// Inverse of [`frame_value_cells_nullable`], given the value sub-columns'
+/// [`TypeTag`]s in column order; the returned slices borrow from `blob`.
+///
+/// # Errors
+///
+/// Returns an error if the presence bitmap or any present cell is truncated, or
+/// if bytes remain after the last cell.
+pub fn unframe_value_cells_nullable<'a>(
+    blob: &'a [u8],
+    type_tags: &[TypeTag],
+) -> Result<Vec<Option<&'a [u8]>>> {
+    let bitmap_len = type_tags.len().div_ceil(8);
+    let bitmap = blob.get(0..bitmap_len).ok_or(Error::InvalidHeader(
+        "columnar: nullable framed value truncated (presence bitmap)",
+    ))?;
+    let mut pos = bitmap_len;
+    let mut out = Vec::with_capacity(type_tags.len());
+    for (i, tag) in type_tags.iter().enumerate() {
+        let present = bitmap.get(i / 8).is_some_and(|b| (b >> (i % 8)) & 1 == 1);
+        if !present {
+            out.push(None);
+            continue;
+        }
+        match tag {
+            TypeTag::Fixed(width) => {
+                let end = pos
+                    .checked_add(*width as usize)
+                    .ok_or(Error::InvalidHeader("columnar: framed value overflow"))?;
+                let cell = blob.get(pos..end).ok_or(Error::InvalidHeader(
+                    "columnar: nullable framed value truncated (fixed)",
+                ))?;
+                out.push(Some(cell));
+                pos = end;
+            }
+            TypeTag::Bytes => {
+                let len_end = pos
+                    .checked_add(4)
+                    .ok_or(Error::InvalidHeader("columnar: framed value overflow"))?;
+                let len_bytes = blob.get(pos..len_end).ok_or(Error::InvalidHeader(
+                    "columnar: nullable framed value truncated (length)",
+                ))?;
+                let len = u32::from_le_bytes(
+                    <[u8; 4]>::try_from(len_bytes)
+                        .map_err(|_| Error::InvalidHeader("columnar: framed value length"))?,
+                ) as usize;
+                let end = len_end
+                    .checked_add(len)
+                    .ok_or(Error::InvalidHeader("columnar: framed value overflow"))?;
+                let cell = blob.get(len_end..end).ok_or(Error::InvalidHeader(
+                    "columnar: nullable framed value truncated (bytes)",
+                ))?;
+                out.push(Some(cell));
+                pos = end;
+            }
+        }
+    }
+    if pos != blob.len() {
+        return Err(Error::InvalidHeader(
+            "columnar: nullable framed value has trailing bytes",
+        ));
+    }
+    Ok(out)
+}
+
+/// Splits a nullable value blob, substituting a per-column default for every
+/// absent (null) cell.
+///
+/// `columns` gives each value sub-column's `(TypeTag, default)`; the engine is
+/// value-agnostic, so the default bytes are caller-supplied. A present cell reads
+/// back as its stored bytes, an absent one as the column's default.
+///
+/// # Errors
+///
+/// Returns an error if the blob is malformed (see [`unframe_value_cells_nullable`]).
+///
+/// # Examples
+///
+/// ```
+/// use lsm_tree::table::columnar::{
+///     frame_value_cells_nullable, unframe_value_cells_with_defaults, TypeTag,
+/// };
+///
+/// let blob = frame_value_cells_nullable(&[
+///     (TypeTag::Fixed(2), Some(&[7, 7][..])),
+///     (TypeTag::Fixed(2), None),
+/// ])
+/// .unwrap();
+/// let cells = unframe_value_cells_with_defaults(
+///     &blob,
+///     &[(TypeTag::Fixed(2), &[7, 7][..]), (TypeTag::Fixed(2), &[0, 0][..])],
+/// )
+/// .unwrap();
+/// assert_eq!(cells, vec![&[7, 7][..], &[0, 0][..]]); // second is the default
+/// ```
+pub fn unframe_value_cells_with_defaults<'a>(
+    blob: &'a [u8],
+    columns: &[(TypeTag, &'a [u8])],
+) -> Result<Vec<&'a [u8]>> {
+    let tags: Vec<TypeTag> = columns.iter().map(|(t, _)| *t).collect();
+    let cells = unframe_value_cells_nullable(blob, &tags)?;
+    Ok(cells
+        .into_iter()
+        .zip(columns)
+        .map(|(cell, (_, default))| cell.unwrap_or(default))
+        .collect())
+}
+
+/// Returns row `row`'s cell from a value sub-column, or `None` if the column is
+/// nullable and the row's presence bit is clear.
+fn column_value_cell(col: &Column, row_count: u32, row: u32) -> Result<Option<&[u8]>> {
+    if let Some(validity) = &col.validity {
+        let byte = *validity
+            .get((row / 8) as usize)
+            .ok_or(Error::InvalidHeader(
+                "columnar: validity bitmap shorter than row count",
+            ))?;
+        if (byte >> (row % 8)) & 1 == 0 {
+            return Ok(None); // null row
+        }
+    }
+    Ok(Some(column_cell(col, row_count, row)?))
+}
+
 #[expect(clippy::expect_used, clippy::indexing_slicing, reason = "test code")]
 #[cfg(test)]
 mod tests {
     use super::{
         COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, CodecId, Column, ColumnBatch, TypeTag,
-        column_batch_to_entries, entries_to_column_batch, frame_value_cells, unframe_value_cells,
+        column_batch_to_entries, entries_to_column_batch, frame_value_cells,
+        frame_value_cells_nullable, unframe_value_cells, unframe_value_cells_nullable,
+        unframe_value_cells_with_defaults,
     };
     use crate::{Slice, ValueType, key::InternalKey, value::InternalValue};
 
@@ -1005,6 +1205,86 @@ mod tests {
         // A fixed(4) tag with a 3-byte cell would misframe (and shift later cells),
         // so framing rejects it.
         assert!(frame_value_cells(&[(TypeTag::Fixed(4), &[1, 2, 3][..])]).is_err());
+    }
+
+    #[test]
+    fn nullable_framing_round_trips_mixed_present_and_null() {
+        let tags = [TypeTag::Fixed(4), TypeTag::Bytes, TypeTag::Fixed(2)];
+        let blob = frame_value_cells_nullable(&[
+            (TypeTag::Fixed(4), Some(&[1, 0, 0, 0][..])),
+            (TypeTag::Bytes, None),
+            (TypeTag::Fixed(2), Some(&[9, 9][..])),
+        ])
+        .expect("frame");
+        // Presence bitmap (1 byte): bits 0 and 2 set, bit 1 clear -> 0b101 = 5.
+        assert_eq!(blob[0], 0b0000_0101, "presence bitmap marks the null cell");
+        assert_eq!(
+            unframe_value_cells_nullable(&blob, &tags).expect("unframe"),
+            vec![Some(&[1, 0, 0, 0][..]), None, Some(&[9, 9][..])],
+        );
+    }
+
+    #[test]
+    fn nullable_framing_all_null_and_all_present() {
+        let tags = [TypeTag::Bytes, TypeTag::Fixed(1)];
+        let all_null =
+            frame_value_cells_nullable(&[(TypeTag::Bytes, None), (TypeTag::Fixed(1), None)])
+                .expect("frame");
+        assert_eq!(all_null, vec![0u8], "bitmap only, no bodies");
+        assert_eq!(
+            unframe_value_cells_nullable(&all_null, &tags).expect("unframe"),
+            vec![None, None],
+        );
+
+        let all_present = frame_value_cells_nullable(&[
+            (TypeTag::Bytes, Some(&b"ab"[..])),
+            (TypeTag::Fixed(1), Some(&[7][..])),
+        ])
+        .expect("frame");
+        assert_eq!(
+            unframe_value_cells_nullable(&all_present, &tags).expect("unframe"),
+            vec![Some(&b"ab"[..]), Some(&[7][..])],
+        );
+    }
+
+    #[test]
+    fn nullable_framing_rejects_truncated_and_trailing() {
+        // A present fixed(4) cell whose bytes are missing after the bitmap.
+        let truncated = alloc::vec![0b0000_0001u8, 1, 2]; // bit 0 set, only 2 of 4 bytes
+        assert!(unframe_value_cells_nullable(&truncated, &[TypeTag::Fixed(4)]).is_err());
+        // A valid all-null encoding with an extra trailing byte.
+        let mut trailing = frame_value_cells_nullable(&[(TypeTag::Bytes, None)]).expect("frame");
+        trailing.push(0);
+        assert!(unframe_value_cells_nullable(&trailing, &[TypeTag::Bytes]).is_err());
+    }
+
+    #[test]
+    fn nullable_framing_rejects_a_fixed_cell_length_mismatch() {
+        // A Fixed(4) tag with a 3-byte present cell would misframe (and shift
+        // later cells), so the nullable framing rejects it like the non-nullable
+        // path does.
+        assert!(
+            frame_value_cells_nullable(&[(TypeTag::Fixed(4), Some(&[1, 2, 3][..]))]).is_err(),
+            "a present fixed cell whose length differs from its tag width must be rejected",
+        );
+    }
+
+    #[test]
+    fn unframe_with_defaults_substitutes_for_null_cells() {
+        let blob = frame_value_cells_nullable(&[
+            (TypeTag::Fixed(2), Some(&[7, 7][..])),
+            (TypeTag::Fixed(2), None),
+        ])
+        .expect("frame");
+        let cells = unframe_value_cells_with_defaults(
+            &blob,
+            &[
+                (TypeTag::Fixed(2), &[7, 7][..]),
+                (TypeTag::Fixed(2), &[0, 0][..]),
+            ],
+        )
+        .expect("unframe with defaults");
+        assert_eq!(cells, vec![&[7, 7][..], &[0, 0][..]]);
     }
 
     #[test]
@@ -1374,6 +1654,89 @@ mod tests {
         assert!(
             column_batch_to_entries(&duplicate).is_err(),
             "duplicate value sub-column ids must be rejected",
+        );
+    }
+
+    #[test]
+    fn untranspose_reconstructs_nullable_value_subcolumns() {
+        // Two rows, two value sub-columns; the second (fixed-4) is nullable with
+        // row 1 absent. Each row's reconstructed value is a presence-bitmap frame
+        // that unframe_value_cells_nullable reverses to the original cells.
+        let mut batch = entries_to_column_batch(&[
+            InternalValue::from_components(b"k0", b"ignored", 0, ValueType::Value),
+            InternalValue::from_components(b"k1", b"ignored", 0, ValueType::Value),
+        ])
+        .expect("transpose");
+        batch.columns.pop();
+        // Bytes sub-column (always present): "aa", "bbb".
+        let mut bytes_data = Vec::new();
+        for off in [0u32, 2, 5] {
+            bytes_data.extend_from_slice(&off.to_le_bytes());
+        }
+        bytes_data.extend_from_slice(b"aabbb");
+        batch.columns.push(Column {
+            column_id: 3,
+            type_tag: TypeTag::Bytes,
+            validity: None,
+            data: bytes_data,
+        });
+        // Fixed-4 sub-column, row 0 present (=1), row 1 null. validity bit 0 set.
+        batch.columns.push(Column {
+            column_id: 4,
+            type_tag: TypeTag::Fixed(4),
+            validity: Some(alloc::vec![0b0000_0001]),
+            data: alloc::vec![1, 0, 0, 0, 0, 0, 0, 0],
+        });
+
+        let entries = column_batch_to_entries(&batch).expect("untranspose");
+        let tags = [TypeTag::Bytes, TypeTag::Fixed(4)];
+        assert_eq!(
+            unframe_value_cells_nullable(entries[0].value.as_ref(), &tags).expect("row 0"),
+            vec![Some(&b"aa"[..]), Some(&[1, 0, 0, 0][..])],
+        );
+        assert_eq!(
+            unframe_value_cells_nullable(entries[1].value.as_ref(), &tags).expect("row 1"),
+            vec![Some(&b"bbb"[..]), None],
+            "row 1's fixed sub-cell is absent",
+        );
+    }
+
+    #[test]
+    fn untranspose_reconstructs_a_nullable_bytes_subcolumn() {
+        // A nullable variable-width (`Bytes`) value sub-column: row 0 present,
+        // row 1 null. The null row must still carry valid offset-table entries
+        // (here equal consecutive offsets => an empty span) because `validate`
+        // frames every row regardless of the validity bitmap; the validity bit,
+        // not the offsets, is what marks the row absent.
+        let mut batch = entries_to_column_batch(&[
+            InternalValue::from_components(b"k0", b"ignored", 0, ValueType::Value),
+            InternalValue::from_components(b"k1", b"ignored", 0, ValueType::Value),
+        ])
+        .expect("transpose");
+        batch.columns.pop();
+        // Offsets [0, 2, 2]: row 0 spans 0..2 ("hi"), row 1 spans 2..2 (empty).
+        let mut data = Vec::new();
+        for off in [0u32, 2, 2] {
+            data.extend_from_slice(&off.to_le_bytes());
+        }
+        data.extend_from_slice(b"hi");
+        batch.columns.push(Column {
+            column_id: 3,
+            type_tag: TypeTag::Bytes,
+            validity: Some(alloc::vec![0b0000_0001]), // row 0 present, row 1 null
+            data,
+        });
+
+        let entries = column_batch_to_entries(&batch).expect("untranspose");
+        let tags = [TypeTag::Bytes];
+        assert_eq!(
+            unframe_value_cells_nullable(entries[0].value.as_ref(), &tags).expect("row 0"),
+            vec![Some(&b"hi"[..])],
+        );
+        assert_eq!(
+            unframe_value_cells_nullable(entries[1].value.as_ref(), &tags).expect("row 1"),
+            vec![None],
+            "the null bytes row reconstructs as absent, not as an empty cell",
         );
     }
 
