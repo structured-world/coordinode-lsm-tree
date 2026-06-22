@@ -1138,6 +1138,38 @@ impl Writer {
         )
     }
 
+    /// Validates a columnar batch against the ingest contract without writing
+    /// anything: the layout must be columnar, the batch shape valid, every per-row
+    /// seqno `0`, and the keys strictly increasing within the batch. This lets the
+    /// ingestion reject a bad batch eagerly even though the block emission is
+    /// deferred (batches accumulate into one rowgroup). Cross-batch / cross-block
+    /// ordering is the caller's responsibility (it tracks the last key); the check
+    /// here starts fresh, so it is independent of any not-yet-flushed rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the layout is not columnar, the batch shape is
+    /// malformed, a row carries a non-zero seqno, or the keys are not strictly
+    /// increasing within the batch.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn validate_columnar_batch(
+        &self,
+        batch: &crate::table::columnar::ColumnBatch,
+        comparator: &crate::SharedComparator,
+    ) -> crate::Result<()> {
+        if !self.use_columnar {
+            return Err(crate::Error::FeatureUnsupported(
+                "columnar batch ingest requires the columnar layout",
+            ));
+        }
+        // Validate the layout, framing, seqno-zero, and intra-batch key order
+        // without decoding every row into an `InternalValue`: the batch is
+        // re-validated and fully decoded once at flush (on the accumulated
+        // rowgroup), so an eager full decode here would deserialise every
+        // submitted row twice.
+        crate::table::columnar::validate_columnar_ingest_batch(batch, comparator)
+    }
+
     /// Writes a consumer-provided [`ColumnBatch`](crate::table::columnar::ColumnBatch)
     /// as a single columnar block, storing its value sub-columns directly instead
     /// of re-transposing the intrinsic value. The batch must carry the three

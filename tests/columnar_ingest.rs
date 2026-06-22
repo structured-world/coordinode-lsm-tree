@@ -367,6 +367,205 @@ fn columnar_ingest_rejected_on_a_blob_tree() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// Builds a same-layout batch (value = a fixed-4 sub-column id 3 and a bytes
+/// sub-column id 4) for the given rows, used to exercise rowgroup accumulation.
+fn fixed_bytes_batch(rows: &[(&[u8], u32, &[u8])]) -> ColumnBatch {
+    let entries: Vec<_> = rows
+        .iter()
+        .map(|(k, _, _)| {
+            InternalValue::from_components(k.to_vec(), b"x".to_vec(), 0, ValueType::Value)
+        })
+        .collect();
+    let mut batch = entries_to_column_batch(&entries).expect("transpose");
+    batch.columns.pop();
+    batch.columns.push(Column {
+        column_id: 3,
+        type_tag: TypeTag::Fixed(4),
+        validity: None,
+        data: rows.iter().flat_map(|(_, f, _)| f.to_le_bytes()).collect(),
+    });
+    let mut bytes_data = Vec::new();
+    let mut acc = 0u32;
+    bytes_data.extend_from_slice(&acc.to_le_bytes());
+    for (_, _, b) in rows {
+        acc += u32::try_from(b.len()).unwrap();
+        bytes_data.extend_from_slice(&acc.to_le_bytes());
+    }
+    for (_, _, b) in rows {
+        bytes_data.extend_from_slice(b);
+    }
+    batch.columns.push(Column {
+        column_id: 4,
+        type_tag: TypeTag::Bytes,
+        validity: None,
+        data: bytes_data,
+    });
+    batch
+}
+
+/// Builds a batch whose value is a single fixed-4 sub-column (id 3) for the given
+/// rows: a different layout from [`fixed_bytes_batch`], so the two cannot merge.
+fn fixed_only_batch(rows: &[(&[u8], u32)]) -> ColumnBatch {
+    let entries: Vec<_> = rows
+        .iter()
+        .map(|(k, _)| {
+            InternalValue::from_components(k.to_vec(), b"x".to_vec(), 0, ValueType::Value)
+        })
+        .collect();
+    let mut batch = entries_to_column_batch(&entries).expect("transpose");
+    batch.columns.pop();
+    batch.columns.push(Column {
+        column_id: 3,
+        type_tag: TypeTag::Fixed(4),
+        validity: None,
+        data: rows.iter().flat_map(|(_, f)| f.to_le_bytes()).collect(),
+    });
+    batch
+}
+
+#[test]
+fn columnar_ingest_merges_small_batches_into_one_rowgroup() -> lsm_tree::Result<()> {
+    // Three small same-layout batches accumulate into one rowgroup, written as a
+    // single columnar block (not one block per batch), and every row reads back.
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+
+    let mut ingest = any.ingestion()?;
+    ingest.write_columnar_batch(&fixed_bytes_batch(&[(b"k0", 1, b"a"), (b"k1", 2, b"bb")]))?;
+    ingest.write_columnar_batch(&fixed_bytes_batch(&[
+        (b"k2", 3, b"ccc"),
+        (b"k3", 4, b"dddd"),
+    ]))?;
+    ingest.write_columnar_batch(&fixed_bytes_batch(&[(b"k4", 5, b"e"), (b"k5", 6, b"ff")]))?;
+    ingest.finish()?;
+
+    let version = tree.current_version();
+    let table = version.iter_tables().next().expect("one ingested SST");
+    let batches = table.columnar_scan(&[3, 4], None)?;
+    assert_eq!(
+        batches.len(),
+        1,
+        "three small same-layout batches merge into a single rowgroup block",
+    );
+    assert_eq!(
+        batches.iter().map(|b| b.row_count).sum::<u32>(),
+        6,
+        "the merged rowgroup holds every row",
+    );
+
+    // Spot-check the first and last rows reconstruct to their sub-cells.
+    let tags = [TypeTag::Fixed(4), TypeTag::Bytes];
+    let v0 = any.get(b"k0", SeqNo::MAX)?.expect("k0");
+    assert_eq!(
+        unframe_value_cells(v0.as_ref(), &tags)?,
+        vec![&1u32.to_le_bytes()[..], &b"a"[..]],
+    );
+    let v5 = any.get(b"k5", SeqNo::MAX)?.expect("k5");
+    assert_eq!(
+        unframe_value_cells(v5.as_ref(), &tags)?,
+        vec![&6u32.to_le_bytes()[..], &b"ff"[..]],
+    );
+    Ok(())
+}
+
+#[test]
+fn columnar_ingest_flushes_the_rowgroup_on_a_layout_change() -> lsm_tree::Result<()> {
+    // A batch with a different column layout cannot extend the pending rowgroup,
+    // so it flushes what is buffered and starts a new block. Both blocks carry
+    // sub-column 3, so a projection over it sees two batches (two blocks).
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+
+    let mut ingest = any.ingestion()?;
+    ingest.write_columnar_batch(&fixed_only_batch(&[(b"k0", 1), (b"k1", 2)]))?;
+    ingest.write_columnar_batch(&fixed_bytes_batch(&[
+        (b"k2", 3, b"ccc"),
+        (b"k3", 4, b"dddd"),
+    ]))?;
+    ingest.finish()?;
+
+    let version = tree.current_version();
+    let table = version.iter_tables().next().expect("one ingested SST");
+    let batches = table.columnar_scan(&[3], None)?;
+    assert_eq!(
+        batches.len(),
+        2,
+        "a layout change flushes the pending rowgroup into its own block",
+    );
+    for k in [b"k0".as_slice(), b"k1", b"k2", b"k3"] {
+        assert!(any.get(k, SeqNo::MAX)?.is_some(), "every key is readable");
+    }
+    Ok(())
+}
+
+#[test]
+fn columnar_ingest_rotates_the_rowgroup_at_the_size_threshold() -> lsm_tree::Result<()> {
+    // The third flush trigger: a same-layout stream whose accumulated size crosses
+    // the target data-block size flushes mid-ingest, so a large stream produces
+    // more than one block even though every batch shares the layout (unlike the
+    // small-batch merge, which stays one block).
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+
+    // Each row carries a 4 KiB bytes value, so a handful of same-layout batches
+    // far exceed the target data-block size and the rowgroup rotates before
+    // finish.
+    let big = vec![b'x'; 4096];
+    let mut ingest = any.ingestion()?;
+    for key in [b"k0".as_slice(), b"k1", b"k2", b"k3"] {
+        ingest.write_columnar_batch(&fixed_bytes_batch(&[(key, 1, &big)]))?;
+    }
+    ingest.finish()?;
+
+    let version = tree.current_version();
+    let table = version.iter_tables().next().expect("one ingested SST");
+    let batches = table.columnar_scan(&[3, 4], None)?;
+    assert!(
+        batches.len() >= 2,
+        "size-threshold rotation splits a large same-layout stream into multiple blocks (got {})",
+        batches.len(),
+    );
+    assert_eq!(
+        batches.iter().map(|b| b.row_count).sum::<u32>(),
+        4,
+        "every row is present across the rotated blocks",
+    );
+    for k in [b"k0".as_slice(), b"k1", b"k2", b"k3"] {
+        assert!(any.get(k, SeqNo::MAX)?.is_some(), "every key is readable");
+    }
+    Ok(())
+}
+
 #[test]
 fn columnar_ingest_round_trips_a_nullable_value_subcolumn() -> lsm_tree::Result<()> {
     // A value sub-column may be absent for some rows (a sparse field). Ingest a

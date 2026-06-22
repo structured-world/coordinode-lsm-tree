@@ -371,6 +371,134 @@ impl ColumnBatch {
         bytes_column_row(&key_col.data, self.row_count, 0).map(Some)
     }
 
+    /// Returns the last row's user key, or `None` for an empty batch. Like
+    /// [`Self::first_user_key`] but for the final row, so the ingest path can
+    /// carry the ordering boundary forward after accumulating a batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the first column is not the non-null user-key column
+    /// or its row framing is malformed.
+    pub(crate) fn last_user_key(&self) -> Result<Option<&[u8]>> {
+        let Some(last) = self.row_count.checked_sub(1) else {
+            return Ok(None);
+        };
+        let key_col = self
+            .columns
+            .first()
+            .filter(|c| c.column_id == COL_USER_KEY)
+            .ok_or(Error::InvalidHeader(
+                "columnar: first column is not the user-key column",
+            ))?;
+        if key_col.type_tag != TypeTag::Bytes || key_col.validity.is_some() {
+            return Err(Error::InvalidHeader(
+                "columnar: first column is not the non-null user-key column",
+            ));
+        }
+        key_col.validate(self.row_count)?;
+        bytes_column_row(&key_col.data, self.row_count, last).map(Some)
+    }
+
+    /// Whether `other` has the same column layout (each column's id and type, in
+    /// order) as this batch, so the two can be appended into one rowgroup.
+    #[must_use]
+    pub(crate) fn same_layout(&self, other: &Self) -> bool {
+        self.columns.len() == other.columns.len()
+            && self
+                .columns
+                .iter()
+                .zip(&other.columns)
+                .all(|(a, b)| a.column_id == b.column_id && a.type_tag == b.type_tag)
+    }
+
+    /// Total size of the column bytes (data plus any validity bitmap), used to
+    /// decide when an accumulated rowgroup has reached the target block size. The
+    /// validity bitmap is `ceil(row_count / 8)` bytes per nullable column, so
+    /// omitting it would let a nullable-heavy rowgroup overrun the target before
+    /// the flush threshold trips.
+    #[must_use]
+    pub(crate) fn data_size(&self) -> usize {
+        self.columns
+            .iter()
+            .map(|c| c.data.len() + c.validity.as_ref().map_or(0, Vec::len))
+            .sum()
+    }
+
+    /// Appends `other`'s rows after this batch's, in place, so a sequence of
+    /// small ingest batches can accumulate into one rowgroup before a block is
+    /// written. The two batches must share the same columns (id + type) in the
+    /// same order; a `Fixed` column concatenates verbatim, a `Bytes` column
+    /// re-frames the merged cells, and a validity bitmap is combined across both
+    /// (a `None` bitmap on either side counts that side's rows as present).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column counts or layouts differ, the combined row
+    /// count exceeds `u32::MAX`, or either batch's columns are malformed for
+    /// their own row count.
+    pub(crate) fn append(&mut self, other: &Self) -> Result<()> {
+        if self.columns.len() != other.columns.len() {
+            return Err(Error::InvalidHeader(
+                "columnar: append column-count mismatch",
+            ));
+        }
+        let old_rows = self.row_count;
+        let combined_rows = old_rows
+            .checked_add(other.row_count)
+            .ok_or(Error::InvalidHeader(
+                "columnar: appended row count exceeds u32",
+            ))?;
+        // Validate the layout and framing of both batches before mutating, so an
+        // invalid append leaves this batch unchanged.
+        for (a, b) in self.columns.iter().zip(&other.columns) {
+            if a.column_id != b.column_id || a.type_tag != b.type_tag {
+                return Err(Error::InvalidHeader(
+                    "columnar: append column layout mismatch",
+                ));
+            }
+            a.validate(old_rows)?;
+            b.validate(other.row_count)?;
+        }
+        // Encode every merged column into temporaries first; only after all
+        // succeed do we mutate `self`. A fallible encode mid-loop would otherwise
+        // leave the batch half-appended (some columns longer) while `row_count`
+        // stays unchanged, corrupting the pending rowgroup.
+        let mut merged: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(self.columns.len());
+        for (a, b) in self.columns.iter().zip(&other.columns) {
+            let new_validity = combine_validity(
+                a.validity.as_deref(),
+                old_rows,
+                b.validity.as_deref(),
+                other.row_count,
+            )?;
+            let new_data = match a.type_tag {
+                TypeTag::Fixed(_) => {
+                    let mut data = Vec::with_capacity(a.data.len() + b.data.len());
+                    data.extend_from_slice(&a.data);
+                    data.extend_from_slice(&b.data);
+                    data
+                }
+                TypeTag::Bytes => {
+                    let mut cells: Vec<&[u8]> = Vec::with_capacity(combined_rows as usize);
+                    for i in 0..old_rows {
+                        cells.push(bytes_column_row(&a.data, old_rows, i)?);
+                    }
+                    for j in 0..other.row_count {
+                        cells.push(bytes_column_row(&b.data, other.row_count, j)?);
+                    }
+                    encode_bytes_column(&cells)?
+                }
+            };
+            merged.push((new_data, new_validity));
+        }
+        for (col, (data, validity)) in self.columns.iter_mut().zip(merged) {
+            col.data = data;
+            col.validity = validity;
+        }
+        self.row_count = combined_rows;
+        Ok(())
+    }
+
     /// Encodes the batch into a columnar block payload using `codec` for every
     /// column. The returned bytes are the block payload (without the surrounding
     /// block header / checksum, which the writer adds).
@@ -630,6 +758,67 @@ fn bytes_column_row(data: &[u8], row_count: u32, i: u32) -> Result<&[u8]> {
         .ok_or(Error::InvalidHeader("columnar: bytes row out of range"))
 }
 
+/// Encodes variable-width cells as a [`TypeTag::Bytes`] column body: a
+/// `(len + 1)`-entry little-endian `u32` offset array followed by the
+/// concatenated payload.
+fn encode_bytes_column(cells: &[&[u8]]) -> Result<Vec<u8>> {
+    let mut offsets = Vec::with_capacity((cells.len() + 1) * 4);
+    let mut acc = 0u32;
+    offsets.extend_from_slice(&acc.to_le_bytes());
+    for c in cells {
+        let len = u32::try_from(c.len())
+            .map_err(|_| Error::InvalidHeader("columnar: bytes cell exceeds u32"))?;
+        acc = acc
+            .checked_add(len)
+            .ok_or(Error::InvalidHeader("columnar: bytes payload exceeds u32"))?;
+        offsets.extend_from_slice(&acc.to_le_bytes());
+    }
+    let mut out = offsets;
+    out.reserve(acc as usize);
+    for c in cells {
+        out.extend_from_slice(c);
+    }
+    Ok(out)
+}
+
+/// Whether row `row`'s presence bit is set in a validity bitmap (set = valid).
+fn validity_bit(bitmap: &[u8], row: u32) -> bool {
+    bitmap
+        .get((row / 8) as usize)
+        .is_some_and(|b| (b >> (row % 8)) & 1 == 1)
+}
+
+/// Combines two columns' validity bitmaps for an append: the result spans
+/// `a_rows + b_rows` rows, treating a `None` bitmap as all-present. Returns
+/// `None` only when both inputs are `None` (the appended column stays non-null).
+fn combine_validity(
+    a: Option<&[u8]>,
+    a_rows: u32,
+    b: Option<&[u8]>,
+    b_rows: u32,
+) -> Result<Option<Vec<u8>>> {
+    if a.is_none() && b.is_none() {
+        return Ok(None);
+    }
+    let total = a_rows.checked_add(b_rows).ok_or(Error::InvalidHeader(
+        "columnar: combined row count exceeds u32",
+    ))?;
+    let mut out = alloc::vec![0u8; validity_len(total)];
+    for idx in 0..total {
+        let present = if idx < a_rows {
+            a.is_none_or(|v| validity_bit(v, idx))
+        } else {
+            // idx >= a_rows here, so the subtraction does not underflow and
+            // idx - a_rows < b_rows.
+            b.is_none_or(|v| validity_bit(v, idx - a_rows))
+        };
+        if present && let Some(byte) = out.get_mut((idx / 8) as usize) {
+            *byte |= 1u8 << (idx % 8);
+        }
+    }
+    Ok(Some(out))
+}
+
 /// Reads row `i` of a `Fixed(8)` column body as a little-endian `u64`.
 fn fixed_u64_row(data: &[u8], i: u32) -> Result<u64> {
     let base = i as usize * 8;
@@ -744,7 +933,14 @@ fn reconstruct_row_value(value_cols: &[Column], row_count: u32, row: u32) -> Res
     Ok(Slice::from(frame_value_cells(&cells)?))
 }
 
-pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>> {
+/// Validates the intrinsic + value column layout and per-column framing of a
+/// columnar batch, returning the destructured columns. Shared by
+/// [`column_batch_to_entries`] (which then decodes every row) and
+/// [`validate_columnar_ingest_batch`] (which checks the ingest contract without
+/// decoding), so the structural checks cannot diverge between the two paths.
+fn validate_columnar_columns(
+    batch: &ColumnBatch,
+) -> Result<(&Column, &Column, &Column, &[Column])> {
     let [key_col, seqno_col, vt_col, value_cols @ ..] = batch.columns.as_slice() else {
         return Err(Error::InvalidHeader(
             "columnar: batch missing the intrinsic columns",
@@ -767,9 +963,9 @@ pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>
         ));
     }
     // The three intrinsic fields are never null. Running `validate` also bounds
-    // `row_count` against the fixed-width column lengths before the allocation
-    // below, so a malformed batch claiming a huge row count is rejected instead
-    // of reserving for billions of rows.
+    // `row_count` against the fixed-width column lengths, so a malformed batch
+    // claiming a huge row count is rejected instead of reserving for billions of
+    // rows.
     for col in [key_col, seqno_col, vt_col] {
         if col.validity.is_some() {
             return Err(Error::InvalidHeader(
@@ -794,6 +990,63 @@ pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>
         seen_value_column_ids.push(col.column_id);
         col.validate(batch.row_count)?;
     }
+    Ok((key_col, seqno_col, vt_col, value_cols))
+}
+
+/// Validates a columnar batch against the ingest contract without decoding every
+/// row into an [`InternalValue`].
+///
+/// The column layout / framing must be valid, every row's seqno `0` (the
+/// ingestion assigns the sequence number), and keys strictly increasing within
+/// the batch. The full decode runs once at flush on the accumulated rowgroup, so
+/// this lets the ingestion reject a bad batch eagerly without deserialising every
+/// submitted row twice. Cross-batch ordering is the caller's responsibility (it
+/// tracks the last key written).
+///
+/// # Errors
+///
+/// Returns an error if the layout / framing is invalid, a row carries a non-zero
+/// seqno, or the keys are empty / oversized / not strictly increasing within the
+/// batch.
+pub fn validate_columnar_ingest_batch(
+    batch: &ColumnBatch,
+    comparator: &crate::SharedComparator,
+) -> Result<()> {
+    let (key_col, seqno_col, vt_col, _value_cols) = validate_columnar_columns(batch)?;
+    // Reject a malformed value-type tag on submit rather than letting it surface
+    // only at flush-time decode (`column_batch_to_entries`).
+    for &vt_byte in &vt_col.data {
+        ValueType::try_from(vt_byte).map_err(|()| Error::InvalidTag(("ValueType", vt_byte)))?;
+    }
+    for i in 0..batch.row_count {
+        if fixed_u64_row(&seqno_col.data, i)? != 0 {
+            return Err(Error::FeatureUnsupported(
+                "columnar batch ingest requires every row seqno to be 0 (the ingestion assigns the sequence number)",
+            ));
+        }
+    }
+    let mut prev: Option<&[u8]> = None;
+    for i in 0..batch.row_count {
+        let key = bytes_column_row(&key_col.data, batch.row_count, i)?;
+        if key.is_empty() || key.len() > u16::MAX as usize {
+            return Err(Error::InvalidHeader(
+                "columnar: user key is empty or longer than u16::MAX",
+            ));
+        }
+        if let Some(p) = prev
+            && comparator.compare(p, key) != core::cmp::Ordering::Less
+        {
+            return Err(Error::InvalidHeader(
+                "columnar batch ingest requires strictly increasing keys",
+            ));
+        }
+        prev = Some(key);
+    }
+    Ok(())
+}
+
+pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>> {
+    let (key_col, seqno_col, vt_col, value_cols) = validate_columnar_columns(batch)?;
     let mut out = Vec::with_capacity(batch.row_count as usize);
     for i in 0..batch.row_count {
         let user_key = bytes_column_row(&key_col.data, batch.row_count, i)?;
@@ -1144,7 +1397,7 @@ mod tests {
         COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, CodecId, Column, ColumnBatch, TypeTag,
         column_batch_to_entries, entries_to_column_batch, frame_value_cells,
         frame_value_cells_nullable, unframe_value_cells, unframe_value_cells_nullable,
-        unframe_value_cells_with_defaults,
+        unframe_value_cells_with_defaults, validate_columnar_ingest_batch,
     };
     use crate::{Slice, ValueType, key::InternalKey, value::InternalValue};
 
@@ -1658,6 +1911,20 @@ mod tests {
     }
 
     #[test]
+    fn validate_ingest_rejects_an_invalid_value_type() {
+        // The eager ingest validation must reject a malformed value-type byte on
+        // the submitting call, not defer it to the flush-time decode.
+        let mut batch =
+            entries_to_column_batch(&[entry(b"k0", 0, ValueType::Value, b"v")]).expect("transpose");
+        batch.columns[2].data[0] = 99; // not a valid ValueType tag
+        assert!(
+            validate_columnar_ingest_batch(&batch, &crate::comparator::default_comparator())
+                .is_err(),
+            "an invalid value-type tag must be rejected during eager validation",
+        );
+    }
+
+    #[test]
     fn untranspose_reconstructs_nullable_value_subcolumns() {
         // Two rows, two value sub-columns; the second (fixed-4) is nullable with
         // row 1 absent. Each row's reconstructed value is a presence-bitmap frame
@@ -1738,6 +2005,89 @@ mod tests {
             vec![None],
             "the null bytes row reconstructs as absent, not as an empty cell",
         );
+    }
+
+    #[test]
+    fn append_concatenates_fixed_bytes_and_nullable_columns() {
+        // Build a two-row consumer batch with a fixed-4 (id 3), a bytes (id 4),
+        // and a nullable fixed-2 (id 5) value sub-column.
+        let build = |keys: [&[u8]; 2],
+                     fixed: [u32; 2],
+                     bytes: [&[u8]; 2],
+                     nf2: [Option<[u8; 2]>; 2]|
+         -> ColumnBatch {
+            let mut batch = entries_to_column_batch(&[
+                InternalValue::from_components(keys[0], b"x", 0, ValueType::Value),
+                InternalValue::from_components(keys[1], b"x", 0, ValueType::Value),
+            ])
+            .expect("transpose");
+            batch.columns.pop();
+            batch.columns.push(Column {
+                column_id: 3,
+                type_tag: TypeTag::Fixed(4),
+                validity: None,
+                data: fixed.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            });
+            let mut bytes_data = Vec::new();
+            let mut acc = 0u32;
+            bytes_data.extend_from_slice(&acc.to_le_bytes());
+            for c in bytes {
+                acc += u32::try_from(c.len()).expect("bytes cell length fits u32");
+                bytes_data.extend_from_slice(&acc.to_le_bytes());
+            }
+            for c in bytes {
+                bytes_data.extend_from_slice(c);
+            }
+            batch.columns.push(Column {
+                column_id: 4,
+                type_tag: TypeTag::Bytes,
+                validity: None,
+                data: bytes_data,
+            });
+            let mut nf2_data = Vec::new();
+            let mut nf2_valid = 0u8;
+            for (i, v) in nf2.iter().enumerate() {
+                nf2_data.extend_from_slice(&v.unwrap_or([0, 0]));
+                if v.is_some() {
+                    nf2_valid |= 1 << i;
+                }
+            }
+            batch.columns.push(Column {
+                column_id: 5,
+                type_tag: TypeTag::Fixed(2),
+                validity: Some(alloc::vec![nf2_valid]),
+                data: nf2_data,
+            });
+            batch
+        };
+
+        let mut a = build([b"k0", b"k1"], [1, 2], [b"a", b"bb"], [Some([9, 9]), None]);
+        let b = build(
+            [b"k2", b"k3"],
+            [3, 4],
+            [b"ccc", b"dddd"],
+            [Some([7, 7]), None],
+        );
+        a.append(&b).expect("append");
+        assert_eq!(a.row_count, 4);
+
+        let entries = column_batch_to_entries(&a).expect("untranspose combined");
+        let tags = [TypeTag::Fixed(4), TypeTag::Bytes, TypeTag::Fixed(2)];
+        let check = |entry: &InternalValue,
+                     key: &[u8],
+                     fixed: [u8; 4],
+                     bytes: &[u8],
+                     nf2: Option<[u8; 2]>| {
+            assert_eq!(entry.key.user_key.as_ref(), key);
+            let cells = unframe_value_cells_nullable(entry.value.as_ref(), &tags).expect("unframe");
+            assert_eq!(cells[0], Some(&fixed[..]));
+            assert_eq!(cells[1], Some(bytes));
+            assert_eq!(cells[2], nf2.as_ref().map(|n| &n[..]));
+        };
+        check(&entries[0], b"k0", [1, 0, 0, 0], b"a", Some([9, 9]));
+        check(&entries[1], b"k1", [2, 0, 0, 0], b"bb", None);
+        check(&entries[2], b"k2", [3, 0, 0, 0], b"ccc", Some([7, 7]));
+        check(&entries[3], b"k3", [4, 0, 0, 0], b"dddd", None);
     }
 
     fn sample_batch() -> ColumnBatch {
