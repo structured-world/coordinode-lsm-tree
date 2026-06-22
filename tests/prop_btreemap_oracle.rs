@@ -299,10 +299,12 @@ fn op_strategy() -> impl Strategy<Value = Op> {
             .prop_map(|(key_idx, value)| Op::Insert { key_idx, value }),
         2 => (0..KEY_SPACE).prop_map(|key_idx| Op::Remove { key_idx }),
         // Merge operands stay in the lower key half; range deletes in the upper
-        // half (below). A merge operand on a range-deleted key resolves in an
-        // implementation-defined, compaction-dependent way (the range tombstone
-        // is a separate layer that may or may not break the merge chain), so the
-        // two are kept on disjoint keys; each is still fully exercised.
+        // half (below). A merge operand on a range-deleted key currently resolves
+        // differently with vs without compaction (the range tombstone is dropped
+        // during compaction while a later operand still depends on it), tracked as
+        // a separate engine bug in #527. The two are kept on disjoint keys until
+        // that is fixed, after which the overlap should be enabled; each op is
+        // still fully exercised in isolation here.
         2 => (0..KEY_SPACE / 2, prop::collection::vec(any::<u8>(), 1..32))
             .prop_map(|(key_idx, value)| Op::Merge { key_idx, value }),
         // A non-empty half-open range within the upper key half: low..=high
