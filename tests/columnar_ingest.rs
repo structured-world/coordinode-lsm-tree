@@ -108,3 +108,65 @@ fn columnar_ingest_rejected_without_columnar_layout() -> lsm_tree::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn columnar_ingest_projects_individual_value_subcolumns() -> lsm_tree::Result<()> {
+    // A projection scan over a consumer-ingested segment decodes only the
+    // requested value sub-column, never the others or the intrinsic value.
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+    })
+    .expect("enable columnar");
+
+    {
+        let mut ingest = any.ingestion()?;
+        ingest.write_columnar_batch(&two_subcolumn_batch())?;
+        ingest.finish()?;
+    }
+
+    let version = tree.current_version();
+    let table = version.iter_tables().next().expect("one ingested SST");
+
+    // Project only the fixed-4 sub-column (id 3): every batch carries it alone,
+    // and its bytes are the two ingested values verbatim.
+    let batches = table.columnar_scan(&[3], None)?;
+    let mut col3_data = Vec::new();
+    let mut rows = 0u32;
+    for b in &batches {
+        assert!(
+            b.columns.iter().all(|c| c.column_id == 3),
+            "a sub-column-3 projection must not decode any other column",
+        );
+        rows += b.row_count;
+        for col in b.columns.iter().filter(|c| c.column_id == 3) {
+            col3_data.extend_from_slice(&col.data);
+        }
+    }
+    assert_eq!(rows, 2, "projection still sees every row");
+    assert_eq!(
+        col3_data,
+        vec![1, 0, 0, 0, 2, 0, 0, 0],
+        "fixed-4 sub-column bytes"
+    );
+
+    // Project only the bytes sub-column (id 4): again decoded in isolation.
+    let batches = table.columnar_scan(&[4], None)?;
+    for b in &batches {
+        assert!(
+            b.columns.iter().all(|c| c.column_id == 4),
+            "a sub-column-4 projection must not decode any other column",
+        );
+    }
+    Ok(())
+}
