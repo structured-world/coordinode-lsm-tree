@@ -1226,6 +1226,48 @@ mod tests {
 
         #[test]
         #[expect(clippy::unwrap_used, reason = "test assertion")]
+        fn compaction_merge_base_deleted_by_range_tombstone() -> crate::Result<()> {
+            // op@999 and mid@998 operands above a base@997; a range tombstone over
+            // the key at seqno 998 deletes the base (997 < 998), while the operands
+            // survive (999, 998 are not below 998). The operands fold onto an empty
+            // base, and the dropped base value reaches the callback.
+            #[rustfmt::skip]
+            let vec = stream![
+                "a", "op", "M",
+                "a", "mid", "M",
+                "a", "base", "V",
+            ];
+
+            let mut callback = TrackCallback::default();
+            let cmp = crate::comparator::default_comparator();
+            let rt = RangeTombstone::new(
+                UserKey::from(b"a".as_ref()),
+                UserKey::from(b"b".as_ref()),
+                998,
+            );
+
+            let iter = vec.iter().cloned().map(Ok);
+            {
+                let mut iter = CompactionStream::new(iter, 1_000)
+                    .with_merge_operator(Some(merge_op()))
+                    .with_range_tombstone_application(vec![rt], cmp)
+                    .with_drop_callback(&mut callback);
+
+                let item = iter.next().unwrap()?;
+                assert_eq!(item.key.value_type, ValueType::Value);
+                assert_eq!(&*item.value, b"mid,op");
+                assert!(iter.next().is_none());
+            }
+            assert!(
+                callback.items.iter().any(|kv| &*kv.value == b"base"),
+                "the range-deleted base value must reach the drop callback"
+            );
+
+            Ok(())
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used, reason = "test assertion")]
         fn compaction_merge_with_tombstone_below_gc() -> crate::Result<()> {
             // Merge operand above tombstone → merge with no base
             #[rustfmt::skip]
