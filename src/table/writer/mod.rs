@@ -1146,36 +1146,32 @@ impl Writer {
     /// layout must be enabled. Each call appends one block, so callers feed
     /// successive batches in key order.
     ///
+    /// Returns the batch's last user key (or `None` for an empty batch) so a
+    /// caller can track the ingest ordering across batches.
+    ///
     /// # Errors
     ///
     /// Propagates batch validation errors (malformed intrinsic layout, framing,
     /// or key/value invariants) and any block write error.
     #[cfg(feature = "columnar")]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "wired by the columnar ingest path (a follow-up slice)"
-        )
-    )]
     pub(crate) fn write_columnar_batch(
         &mut self,
         batch: &crate::table::columnar::ColumnBatch,
-    ) -> crate::Result<()> {
-        debug_assert!(
-            self.use_columnar,
-            "write_columnar_batch requires use_columnar(true)"
-        );
-        debug_assert!(
-            self.locator.is_none(),
-            "columnar ingest does not record retrieval-ribbon locators yet"
-        );
+    ) -> crate::Result<Option<crate::UserKey>> {
+        // A columnar batch only makes sense (and only reads back correctly) when
+        // the table is marked columnar; reject a row-mode writer rather than
+        // writing a columnar block under a row descriptor.
+        if !self.use_columnar {
+            return Err(crate::Error::FeatureUnsupported(
+                "columnar batch ingest requires the columnar layout",
+            ));
+        }
         // Validate the batch shape and obtain per-row keys / seqnos / value-types.
         // The framed values feed the shape accounting; the block stores the
         // consumer's sub-columns (not a re-transpose).
         let entries = crate::table::columnar::column_batch_to_entries(batch)?;
         let Some(last) = entries.last() else {
-            return Ok(()); // empty batch: no block
+            return Ok(None); // empty batch: no block
         };
         let last_key = last.key.user_key.clone();
         let last_seqno = last.key.seqno;
@@ -1191,8 +1187,10 @@ impl Writer {
             .flatten();
 
         // Per-row shape / seqno / key accounting, mirroring `write()` minus the
-        // chunk push and the locator (the direct columnar block uses neither).
-        for e in &entries {
+        // chunk push (the direct columnar block holds all rows already). The
+        // locator records each new key's position within this single block, the
+        // same as the flush path does for a transposed columnar block.
+        for (row, e) in entries.iter().enumerate() {
             let user_key = &e.key.user_key;
             self.meta.sum_user_key_bytes += user_key.len() as u64;
             self.meta.sum_value_bytes += e.value.len() as u64;
@@ -1215,6 +1213,23 @@ impl Writer {
                 if self.bloom_policy.is_active() {
                     self.filter_writer.register_key(user_key)?;
                 }
+                if let Some(spec) = self.locator {
+                    // `row` is this key's item index within the forming columnar
+                    // block; `locator_block_id` is the block's ordinal.
+                    let pos = row as u64;
+                    let slot = match spec.precision {
+                        crate::config::LocatorPrecision::Block => 0,
+                        crate::config::LocatorPrecision::Restart => {
+                            pos / u64::from(self.data_block_restart_interval)
+                        }
+                        crate::config::LocatorPrecision::Entry => pos,
+                    };
+                    self.locators.push((
+                        crate::hash::hash64(user_key),
+                        self.locator_block_id,
+                        slot,
+                    ));
+                }
             }
             if self.meta.first_key.is_none() {
                 self.meta.first_key = Some(user_key.clone());
@@ -1227,12 +1242,19 @@ impl Writer {
 
         self.encode_columnar_batch_block(
             batch,
-            last_key,
+            last_key.clone(),
             last_seqno,
             seqno_bounds,
             item_count,
             zone_block_min,
-        )
+        )?;
+        // This block's keys were recorded with the current locator ordinal;
+        // advance it so a following batch's keys belong to the next block (the
+        // chunk-based path does this in `spill_block`).
+        if self.locator.is_some() {
+            self.locator_block_id += 1;
+        }
+        Ok(Some(last_key))
     }
 
     /// Encodes `chunk` into `buf`, returning the `block_flags` bits the transform

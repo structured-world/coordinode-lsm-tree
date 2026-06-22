@@ -75,6 +75,27 @@ impl AnyIngestion<'_> {
         }
     }
 
+    /// Writes a consumer-provided columnar batch (its value sub-columns) as one
+    /// columnar block. See [`Ingestion::write_columnar_batch`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the batch shape is invalid, the layout is not
+    /// columnar, a block write fails, or the tree is a blob tree (columnar
+    /// ingest does not support KV separation).
+    #[cfg(feature = "columnar")]
+    pub fn write_columnar_batch(
+        &mut self,
+        batch: &crate::table::columnar::ColumnBatch,
+    ) -> crate::Result<()> {
+        match self {
+            Self::Standard(i) => i.write_columnar_batch(batch),
+            Self::Blob(_) => Err(crate::Error::FeatureUnsupported(
+                "columnar batch ingest is not supported for blob trees",
+            )),
+        }
+    }
+
     /// Finalizes ingestion and registers created tables (and blob files if present).
     ///
     /// # Errors
