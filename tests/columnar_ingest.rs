@@ -283,3 +283,37 @@ fn columnar_ingest_rejects_batch_out_of_order_with_a_prior_write() -> lsm_tree::
     );
     Ok(())
 }
+
+#[test]
+fn columnar_ingest_after_a_row_write_keeps_block_order() -> lsm_tree::Result<()> {
+    // A row write buffers a chunk; a following (in-order) columnar batch must not
+    // register its block before that buffered chunk is spilled, or the sorted
+    // block index is left out of order and the row-written key is lost.
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+
+    let mut ingest = any.ingestion()?;
+    ingest.write(b"a".to_vec(), b"va".to_vec())?;
+    ingest.write_columnar_batch(&one_fixed_subcolumn_batch(b"b", 0))?;
+    ingest.finish()?;
+
+    assert!(
+        any.get(b"a", SeqNo::MAX)?.is_some(),
+        "the row-written key must survive the following columnar batch",
+    );
+    assert!(
+        any.get(b"b", SeqNo::MAX)?.is_some(),
+        "the columnar-batch key must be present",
+    );
+    Ok(())
+}
