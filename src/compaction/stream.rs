@@ -318,6 +318,18 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
             }
         }
 
+        // Drop collected operands that a covering applied range tombstone deletes
+        // (they are pre-delete state): only operands newer than the tombstone fold
+        // onto the now-empty base. Without this, an operand below the tombstone
+        // would resurrect deleted state across compaction.
+        collected.retain(|e| {
+            let covered = self.covered_by_applied_tombstone(e.key.user_key.as_ref(), e.key.seqno);
+            if covered && let Some(watcher) = &mut self.dropped_callback {
+                watcher.on_dropped(e);
+            }
+            !covered
+        });
+
         // Extract operand values for merge
         let operands: Vec<UserValue> = collected.into_iter().map(|e| e.value).collect();
 
