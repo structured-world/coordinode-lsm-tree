@@ -459,15 +459,25 @@ impl ColumnBatch {
             a.validate(old_rows)?;
             b.validate(other.row_count)?;
         }
-        for (a, b) in self.columns.iter_mut().zip(&other.columns) {
+        // Encode every merged column into temporaries first; only after all
+        // succeed do we mutate `self`. A fallible encode mid-loop would otherwise
+        // leave the batch half-appended (some columns longer) while `row_count`
+        // stays unchanged, corrupting the pending rowgroup.
+        let mut merged: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(self.columns.len());
+        for (a, b) in self.columns.iter().zip(&other.columns) {
             let new_validity = combine_validity(
                 a.validity.as_deref(),
                 old_rows,
                 b.validity.as_deref(),
                 other.row_count,
             )?;
-            match a.type_tag {
-                TypeTag::Fixed(_) => a.data.extend_from_slice(&b.data),
+            let new_data = match a.type_tag {
+                TypeTag::Fixed(_) => {
+                    let mut data = Vec::with_capacity(a.data.len() + b.data.len());
+                    data.extend_from_slice(&a.data);
+                    data.extend_from_slice(&b.data);
+                    data
+                }
                 TypeTag::Bytes => {
                     let mut cells: Vec<&[u8]> = Vec::with_capacity(combined_rows as usize);
                     for i in 0..old_rows {
@@ -476,12 +486,14 @@ impl ColumnBatch {
                     for j in 0..other.row_count {
                         cells.push(bytes_column_row(&b.data, other.row_count, j)?);
                     }
-                    let encoded = encode_bytes_column(&cells)?;
-                    drop(cells); // end the borrow of `a.data` before replacing it
-                    a.data = encoded;
+                    encode_bytes_column(&cells)?
                 }
-            }
-            a.validity = new_validity;
+            };
+            merged.push((new_data, new_validity));
+        }
+        for (col, (data, validity)) in self.columns.iter_mut().zip(merged) {
+            col.data = data;
+            col.validity = validity;
         }
         self.row_count = combined_rows;
         Ok(())
@@ -1000,7 +1012,12 @@ pub fn validate_columnar_ingest_batch(
     batch: &ColumnBatch,
     comparator: &crate::SharedComparator,
 ) -> Result<()> {
-    let (key_col, seqno_col, _vt_col, _value_cols) = validate_columnar_columns(batch)?;
+    let (key_col, seqno_col, vt_col, _value_cols) = validate_columnar_columns(batch)?;
+    // Reject a malformed value-type tag on submit rather than letting it surface
+    // only at flush-time decode (`column_batch_to_entries`).
+    for &vt_byte in &vt_col.data {
+        ValueType::try_from(vt_byte).map_err(|()| Error::InvalidTag(("ValueType", vt_byte)))?;
+    }
     for i in 0..batch.row_count {
         if fixed_u64_row(&seqno_col.data, i)? != 0 {
             return Err(Error::FeatureUnsupported(
