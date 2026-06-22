@@ -1073,6 +1073,33 @@ impl Writer {
         zone_block_min: Option<crate::UserKey>,
     ) -> crate::Result<()> {
         let batch = crate::table::columnar::entries_to_column_batch(&self.chunk)?;
+        self.encode_columnar_batch_block(
+            &batch,
+            last_key,
+            last_seqno,
+            seqno_bounds,
+            item_count,
+            zone_block_min,
+        )?;
+        self.chunk.clear();
+        self.chunk_size = 0;
+        Ok(())
+    }
+
+    /// Encodes a `ColumnBatch` as a columnar (PAX) block and registers it like a
+    /// data block (index handle, seqno bounds, zone-map key range). Shared by the
+    /// intrinsic transpose spill ([`Self::spill_columnar_block`]) and the
+    /// consumer columnar-ingest path ([`Self::write_columnar_batch`]).
+    #[cfg(feature = "columnar")]
+    fn encode_columnar_batch_block(
+        &mut self,
+        batch: &crate::table::columnar::ColumnBatch,
+        last_key: crate::UserKey,
+        last_seqno: crate::SeqNo,
+        seqno_bounds: Option<(u64, u64)>,
+        item_count: usize,
+        zone_block_min: Option<crate::UserKey>,
+    ) -> crate::Result<()> {
         let payload = batch.encode(crate::table::columnar::CodecId::Plain)?;
         let transform = {
             let t = crate::table::block::BlockTransform::from_parts(
@@ -1108,10 +1135,104 @@ impl Writer {
             seqno_bounds,
             item_count,
             zone_block_min,
-        )?;
-        self.chunk.clear();
-        self.chunk_size = 0;
-        Ok(())
+        )
+    }
+
+    /// Writes a consumer-provided [`ColumnBatch`](crate::table::columnar::ColumnBatch)
+    /// as a single columnar block, storing its value sub-columns directly instead
+    /// of re-transposing the intrinsic value. The batch must carry the three
+    /// intrinsic columns plus one or more value sub-columns, with keys in
+    /// non-decreasing order (the writer's sorted-input contract); the columnar
+    /// layout must be enabled. Each call appends one block, so callers feed
+    /// successive batches in key order.
+    ///
+    /// # Errors
+    ///
+    /// Propagates batch validation errors (malformed intrinsic layout, framing,
+    /// or key/value invariants) and any block write error.
+    #[cfg(feature = "columnar")]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "wired by the columnar ingest path (a follow-up slice)"
+        )
+    )]
+    pub(crate) fn write_columnar_batch(
+        &mut self,
+        batch: &crate::table::columnar::ColumnBatch,
+    ) -> crate::Result<()> {
+        debug_assert!(
+            self.use_columnar,
+            "write_columnar_batch requires use_columnar(true)"
+        );
+        debug_assert!(
+            self.locator.is_none(),
+            "columnar ingest does not record retrieval-ribbon locators yet"
+        );
+        // Validate the batch shape and obtain per-row keys / seqnos / value-types.
+        // The framed values feed the shape accounting; the block stores the
+        // consumer's sub-columns (not a re-transpose).
+        let entries = crate::table::columnar::column_batch_to_entries(batch)?;
+        let Some(last) = entries.last() else {
+            return Ok(()); // empty batch: no block
+        };
+        let last_key = last.key.user_key.clone();
+        let last_seqno = last.key.seqno;
+        let item_count = entries.len();
+        let seqno_bounds = self.use_seqno_in_index.then(|| {
+            entries.iter().fold((u64::MAX, u64::MIN), |(mn, mx), e| {
+                (mn.min(e.key.seqno), mx.max(e.key.seqno))
+            })
+        });
+        let zone_block_min = self
+            .use_zone_map
+            .then(|| entries.first().map(|e| e.key.user_key.clone()))
+            .flatten();
+
+        // Per-row shape / seqno / key accounting, mirroring `write()` minus the
+        // chunk push and the locator (the direct columnar block uses neither).
+        for e in &entries {
+            let user_key = &e.key.user_key;
+            self.meta.sum_user_key_bytes += user_key.len() as u64;
+            self.meta.sum_value_bytes += e.value.len() as u64;
+            if e.is_tombstone() {
+                self.meta.tombstone_count += 1;
+            }
+            if e.key.value_type == ValueType::WeakTombstone {
+                self.meta.weak_tombstone_count += 1;
+            }
+            if e.key.value_type == ValueType::Value
+                && let Some((prev_key, prev_type)) = &self.previous_item
+                && prev_type == &ValueType::WeakTombstone
+                && prev_key.as_ref() == user_key.as_ref()
+            {
+                self.meta.weak_tombstone_reclaimable_count += 1;
+            }
+            if Some(user_key) != self.current_key.as_ref() {
+                self.meta.key_count += 1;
+                self.current_key = Some(user_key.clone());
+                if self.bloom_policy.is_active() {
+                    self.filter_writer.register_key(user_key)?;
+                }
+            }
+            if self.meta.first_key.is_none() {
+                self.meta.first_key = Some(user_key.clone());
+            }
+            self.previous_item = Some((user_key.clone(), e.key.value_type));
+            self.meta.lowest_seqno = self.meta.lowest_seqno.min(e.key.seqno);
+            self.meta.highest_seqno = self.meta.highest_seqno.max(e.key.seqno);
+            self.meta.highest_kv_seqno = self.meta.highest_kv_seqno.max(e.key.seqno);
+        }
+
+        self.encode_columnar_batch_block(
+            batch,
+            last_key,
+            last_seqno,
+            seqno_bounds,
+            item_count,
+            zone_block_min,
+        )
     }
 
     /// Encodes `chunk` into `buf`, returning the `block_flags` bits the transform

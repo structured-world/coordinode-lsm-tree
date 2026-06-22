@@ -3913,3 +3913,65 @@ fn delete_bitmap_masks_deleted_key_in_point_read() -> crate::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(feature = "columnar")]
+#[test]
+fn write_columnar_batch_stores_value_subcolumns_and_round_trips() -> crate::Result<()> {
+    use crate::table::columnar::{Column, TypeTag, entries_to_column_batch, unframe_value_cells};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+
+    // A consumer batch: the intrinsic columns for two sorted keys, with the
+    // single value column replaced by two value sub-columns (a fixed-4 + a bytes).
+    let mut batch = entries_to_column_batch(&[
+        crate::InternalValue::from_components(b"k0", b"ignored", 1, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"k1", b"ignored", 2, crate::ValueType::Value),
+    ])?;
+    batch.columns.pop();
+    batch.columns.push(Column {
+        column_id: 3,
+        type_tag: TypeTag::Fixed(4),
+        validity: None,
+        data: vec![1, 0, 0, 0, 2, 0, 0, 0],
+    });
+    let mut bytes_data = Vec::new();
+    for off in [0u32, 2, 5] {
+        bytes_data.extend_from_slice(&off.to_le_bytes());
+    }
+    bytes_data.extend_from_slice(b"aabbb");
+    batch.columns.push(Column {
+        column_id: 4,
+        type_tag: TypeTag::Bytes,
+        validity: None,
+        data: bytes_data,
+    });
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    writer.write_columnar_batch(&batch)?;
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    assert!(table.metadata.columnar, "segment must be columnar");
+
+    // Point reads reconstruct the framed value, which unframes to the original
+    // sub-cells.
+    let tags = [TypeTag::Fixed(4), TypeTag::Bytes];
+    let v0 = table
+        .get(b"k0", SeqNo::MAX, hash64(b"k0"))?
+        .expect("k0 present");
+    assert_eq!(
+        unframe_value_cells(v0.value.as_ref(), &tags)?,
+        vec![&[1, 0, 0, 0][..], &b"aa"[..]],
+    );
+    let v1 = table
+        .get(b"k1", SeqNo::MAX, hash64(b"k1"))?
+        .expect("k1 present");
+    assert_eq!(
+        unframe_value_cells(v1.value.as_ref(), &tags)?,
+        vec![&[2, 0, 0, 0][..], &b"bbb"[..]],
+    );
+    Ok(())
+}
