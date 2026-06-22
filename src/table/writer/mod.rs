@@ -1210,6 +1210,13 @@ impl Writer {
             .then(|| entries.first().map(|e| e.key.user_key.clone()))
             .flatten();
 
+        // Flush any row chunk buffered by prior `write()` calls before this
+        // direct block, so its block (and locator ordinal) is registered first
+        // and the sorted block / index order is preserved. The validation above
+        // ran first, so an invalid batch never forces a spill. A no-op when the
+        // chunk is empty (the columnar-only ingest path).
+        self.spill_block()?;
+
         // Per-row shape / seqno / key accounting, mirroring `write()` minus the
         // chunk push (the direct columnar block holds all rows already). The
         // locator records each new key's position within this single block, the
