@@ -730,14 +730,175 @@ pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>
     Ok(out)
 }
 
+/// Frames one row's value sub-column cells into a single self-describing value
+/// blob.
+///
+/// This is the form the row read paths (point / range / merge-on-read) return for
+/// a row whose value the consumer split into sub-columns (the read-path model:
+/// reconstruct from sub-columns on read, no opaque copy).
+///
+/// A fixed-width cell is stored verbatim: its width is recoverable from the
+/// column's [`TypeTag`], so a fixed sub-column (e.g. a vector dimension) carries
+/// no per-cell framing overhead. A variable-width ([`TypeTag::Bytes`]) cell is
+/// length-prefixed (`u32` little-endian). The consumer recovers the sub-columns
+/// with [`unframe_value_cells`], replaying the value sub-columns' type tags; the
+/// engine never interprets the cell bytes.
+///
+/// # Errors
+///
+/// Returns an error if a variable-width cell is longer than `u32::MAX` (a cell is
+/// block-bounded to at most a few MiB, so this is a structural impossibility, not
+/// an expected case).
+///
+/// # Examples
+///
+/// ```
+/// use lsm_tree::table::columnar::{frame_value_cells, unframe_value_cells, TypeTag};
+///
+/// let tags = [TypeTag::Fixed(4), TypeTag::Bytes, TypeTag::Fixed(2)];
+/// let blob = frame_value_cells(&[
+///     (TypeTag::Fixed(4), &[1, 2, 3, 4][..]),
+///     (TypeTag::Bytes, b"hello"),
+///     (TypeTag::Fixed(2), &[9, 9][..]),
+/// ])
+/// .unwrap();
+/// let cells = unframe_value_cells(&blob, &tags).unwrap();
+/// assert_eq!(cells, vec![&[1, 2, 3, 4][..], b"hello", &[9, 9][..]]);
+/// ```
+pub fn frame_value_cells(cells: &[(TypeTag, &[u8])]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for (tag, cell) in cells {
+        match tag {
+            // Width recoverable from the tag: append verbatim, no length prefix.
+            TypeTag::Fixed(_) => out.extend_from_slice(cell),
+            TypeTag::Bytes => {
+                let len = u32::try_from(cell.len()).map_err(|_| {
+                    Error::InvalidHeader("columnar: framed value sub-cell exceeds u32")
+                })?;
+                out.extend_from_slice(&len.to_le_bytes());
+                out.extend_from_slice(cell);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Splits a value blob produced by [`frame_value_cells`] back into its sub-column
+/// cells.
+///
+/// Given the value sub-columns' [`TypeTag`]s in column order; the returned slices
+/// borrow from `blob`. Inverse of [`frame_value_cells`].
+///
+/// # Errors
+///
+/// Returns an error if the blob is truncated relative to `type_tags` (a fixed
+/// cell or a length-prefixed cell runs past the end), or if bytes remain after
+/// the last cell (the blob and the tag list disagree).
+pub fn unframe_value_cells<'a>(blob: &'a [u8], type_tags: &[TypeTag]) -> Result<Vec<&'a [u8]>> {
+    let mut out = Vec::with_capacity(type_tags.len());
+    let mut pos = 0usize;
+    for tag in type_tags {
+        match tag {
+            TypeTag::Fixed(width) => {
+                let end = pos
+                    .checked_add(*width as usize)
+                    .ok_or(Error::InvalidHeader("columnar: framed value overflow"))?;
+                let cell = blob.get(pos..end).ok_or(Error::InvalidHeader(
+                    "columnar: framed value truncated (fixed)",
+                ))?;
+                out.push(cell);
+                pos = end;
+            }
+            TypeTag::Bytes => {
+                let len_end = pos
+                    .checked_add(4)
+                    .ok_or(Error::InvalidHeader("columnar: framed value overflow"))?;
+                let len_bytes = blob.get(pos..len_end).ok_or(Error::InvalidHeader(
+                    "columnar: framed value truncated (length)",
+                ))?;
+                let len = u32::from_le_bytes(
+                    <[u8; 4]>::try_from(len_bytes)
+                        .map_err(|_| Error::InvalidHeader("columnar: framed value length"))?,
+                ) as usize;
+                let end = len_end
+                    .checked_add(len)
+                    .ok_or(Error::InvalidHeader("columnar: framed value overflow"))?;
+                let cell = blob.get(len_end..end).ok_or(Error::InvalidHeader(
+                    "columnar: framed value truncated (bytes)",
+                ))?;
+                out.push(cell);
+                pos = end;
+            }
+        }
+    }
+    if pos != blob.len() {
+        return Err(Error::InvalidHeader(
+            "columnar: framed value has trailing bytes",
+        ));
+    }
+    Ok(out)
+}
+
 #[expect(clippy::expect_used, clippy::indexing_slicing, reason = "test code")]
 #[cfg(test)]
 mod tests {
     use super::{
         COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, CodecId, Column, ColumnBatch, TypeTag,
-        column_batch_to_entries, entries_to_column_batch,
+        column_batch_to_entries, entries_to_column_batch, frame_value_cells, unframe_value_cells,
     };
     use crate::{Slice, ValueType, key::InternalKey, value::InternalValue};
+
+    #[test]
+    fn fixed_only_value_framing_has_no_overhead_and_round_trips() {
+        // Fixed-width cells are stored verbatim (width recoverable from the tag),
+        // so the framed blob is the bare concatenation: zero per-cell overhead.
+        let tags = [TypeTag::Fixed(4), TypeTag::Fixed(4)];
+        let blob = frame_value_cells(&[
+            (TypeTag::Fixed(4), &[1, 0, 0, 0][..]),
+            (TypeTag::Fixed(4), &[2, 0, 0, 0][..]),
+        ])
+        .expect("frame");
+        assert_eq!(blob, vec![1, 0, 0, 0, 2, 0, 0, 0], "no length prefixes");
+        let cells = unframe_value_cells(&blob, &tags).expect("unframe");
+        assert_eq!(cells, vec![&[1, 0, 0, 0][..], &[2, 0, 0, 0][..]]);
+    }
+
+    #[test]
+    fn mixed_value_framing_round_trips() {
+        let tags = [TypeTag::Bytes, TypeTag::Fixed(1), TypeTag::Bytes];
+        let blob = frame_value_cells(&[
+            (TypeTag::Bytes, b"abc"),
+            (TypeTag::Fixed(1), &[7][..]),
+            (TypeTag::Bytes, b""),
+        ])
+        .expect("frame");
+        let cells = unframe_value_cells(&blob, &tags).expect("unframe");
+        assert_eq!(cells, vec![&b"abc"[..], &[7][..], &b""[..]]);
+    }
+
+    #[test]
+    fn empty_value_framing_round_trips() {
+        let blob = frame_value_cells(&[]).expect("frame");
+        assert!(blob.is_empty());
+        assert!(unframe_value_cells(&blob, &[]).expect("unframe").is_empty());
+    }
+
+    #[test]
+    fn unframe_rejects_truncated_blob() {
+        // A fixed(4) tag over a 2-byte blob is truncated.
+        assert!(unframe_value_cells(&[1, 2], &[TypeTag::Fixed(4)]).is_err());
+        // A bytes tag whose declared length runs past the end.
+        let mut blob = 8u32.to_le_bytes().to_vec();
+        blob.extend_from_slice(b"abc"); // 3 bytes present, length claims 8
+        assert!(unframe_value_cells(&blob, &[TypeTag::Bytes]).is_err());
+    }
+
+    #[test]
+    fn unframe_rejects_trailing_bytes() {
+        // One fixed(2) cell, but the blob carries an extra byte the tags do not
+        // cover: the blob and the tag list disagree.
+        assert!(unframe_value_cells(&[1, 2, 3], &[TypeTag::Fixed(2)]).is_err());
+    }
 
     fn entry(user_key: &[u8], seqno: u64, value_type: ValueType, value: &[u8]) -> InternalValue {
         InternalValue {
