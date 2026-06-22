@@ -1038,8 +1038,12 @@ impl AbstractTree for Tree {
             }
             // The block index is keyed by the table-LOCAL seqno; a bulk-ingested
             // table carries a non-zero global seqno, so translate the snapshot
-            // seqno the same way the read path does before seeking it.
-            let table_seqno = seqno.saturating_sub(table.global_seqno());
+            // seqno the same way the read path does before seeking it. A snapshot
+            // below the table's base means the table postdates it and contributes
+            // nothing to the estimate, so skip it (`checked_sub` yields `None`).
+            let Some(table_seqno) = seqno.checked_sub(table.global_seqno()) else {
+                continue;
+            };
 
             // data_end = the data section's byte extent = last data block's end.
             let Some(last) = table.block_index.iter().next_back() else {
@@ -1205,7 +1209,11 @@ impl AbstractTree for Tree {
             {
                 continue;
             }
-            let table_seqno = seqno.saturating_sub(table.global_seqno());
+            // A snapshot below the table's base means the table postdates it and
+            // contributes nothing here, so skip it (`checked_sub` yields `None`).
+            let Some(table_seqno) = seqno.checked_sub(table.global_seqno()) else {
+                continue;
+            };
             // Honor a tight-space restricted view: keys below
             // `restrict_lower_bound()` are the punched-out prefix served by the
             // replacement table, so raise this table's effective lower bound to
