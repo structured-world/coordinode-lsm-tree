@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782155496061,
+  "lastUpdate": 1782166153966,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -19140,6 +19140,84 @@ window.BENCHMARK_DATA = {
             "value": 665088.8143973158,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 4.7us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "32aba1393dc2d7faca7eea7eb4bb0aa27c5476ac",
+          "message": "feat(columnar): accumulate ingest batches into one rowgroup (#537)\n\n## Summary\n\nBuilds on #532 (which builds on #522) to accumulate consumer columnar\ningest batches into larger rowgroups. The base of this PR is the #532\nbranch (stacked); it should be retargeted to `main` once #532 / #522\nmerge.\n\nPreviously each `write_columnar_batch` call emitted its own columnar\nblock, so a stream of small batches produced many tiny blocks (poor\ncompression, more block-index entries, more per-block overhead on scan).\nNow successive batches with the same column layout accumulate into one\nrowgroup, written as a single block.\n\n## What it adds\n\n- **`ColumnBatch::append`**: concatenates another batch's rows in place:\nfixed columns extend verbatim, bytes columns re-frame with rebased\noffsets, and validity bitmaps are combined (a `None` bitmap counts that\nside's rows as present). Helpers `same_layout`, `data_size`, and\n`last_user_key` support the accumulation.\n- **Ingestion accumulation**: the ingestion buffers a pending rowgroup\nand flushes it as one block when it reaches the target data-block size,\nwhen a batch's layout differs from the pending one, or at `finish`.\n- **Eager validation**: a batch is still validated when it is submitted\n(layout is columnar, shape valid, every per-row seqno `0`, keys strictly\nincreasing within the batch), so a malformed batch is rejected on the\ncall that submits it even though block emission is deferred. Cross-batch\nordering is enforced by the ingestion's last-key guard.\n\n## Testing\n\n- Unit: `ColumnBatch::append` over fixed + bytes + nullable columns\nreconstructs every row (through `column_batch_to_entries`).\n- Integration: three small same-layout batches merge into a single\nrowgroup block (projection sees one block, all rows readable); a layout\nchange flushes the pending rowgroup into its own block (projection sees\ntwo blocks, all keys readable); the existing eager-rejection tests\n(non-columnar layout, non-zero seqno, unsorted keys) still reject on\nsubmit.\n- Full gate: clippy `--all-features --all-targets` clean, no-std\n(`thumbv7em` + `alloc`) errcount 0, nextest (columnar 2182 + lz4,zstd\n2104), doctests 63.\n\nCloses #534\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Columnar batches with matching layouts are now appended and merged\ninto single rowgroups, with support for correctly reconstructing\nrow-boundary user keys across fixed and variable-width data.\n* Added eager columnar ingestion validation before writing: checks\nfeature support, batch framing/layout consistency, rejects non-zero\nseqnos, enforces strictly increasing user keys, and validates value-type\ntags.\n* Ingestion now accumulates pending columnar data and flushes/rotates\nrowgroups when layout changes or when the configured size threshold is\nreached.\n* **Tests**\n* Added end-to-end coverage for rowgroup merging, flushing on layout\nchanges, and rotation at size thresholds, plus eager rejection of\ninvalid value-type tags.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-23T01:08:19+03:00",
+          "tree_id": "ab2e5673a70bc04f5b58d40cb1f6eb06e16ad832",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/32aba1393dc2d7faca7eea7eb4bb0aa27c5476ac"
+        },
+        "date": 1782166152760,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1694813.8383007438,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.12s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 941363.5516430562,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.9us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 676899.3587860985,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.7us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3662521.6992965303,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.3us | P99.9: 6.3us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 410938.38167792925,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 5.6us | P99.9: 9.7us\nthreads: 1 | elapsed: 0.49s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 228093.73902245422,
+            "unit": "ops/sec",
+            "extra": "P50: 4.0us | P99: 7.6us | P99.9: 10.5us\nthreads: 1 | elapsed: 0.88s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1008439.0566974338,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.6us | P99.9: 5.3us\nthreads: 1 | elapsed: 0.20s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1061013.1359792312,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 3.2us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 587040.9782399202,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 5.0us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.34s | num: 200000 | iterations: 3"
           }
         ]
       }
