@@ -605,20 +605,25 @@ fn verify_cdc(tree: &Tree, oracle: &Oracle, gc_floor: u64) -> Result<(), TestCas
     Ok(())
 }
 
-/// A range tombstone between a base value and a later merge operand: without
-/// compaction the range delete clears the base, so the operand folds onto an
-/// empty value, matching the oracle's fold.
-///
-/// The same history after a major compaction currently resolves onto the
-/// pre-delete value instead, a separate compaction-dependent engine bug tracked
-/// in #527, which is why the property generator keeps merge and range-delete
-/// keys disjoint until that is fixed.
-#[test]
-fn merge_onto_a_range_deleted_key_folds_onto_empty() {
+/// Where the base value, range tombstone, and merge operand live when read, each
+/// a distinct encoding / recovery path.
+#[derive(Debug, Clone, Copy)]
+enum Persist {
+    /// Read straight from the active memtable.
+    Memtable,
+    /// Flush to an SST first, then read.
+    Flushed,
+    /// Flush, drop, and recover from disk, then read.
+    Reopened,
+}
+
+/// Resolves `Insert(value) -> DeleteRange(covers key) -> Merge(operand)` for one
+/// key at the given persistence stage.
+fn merge_after_range_delete(persist: Persist) -> Option<Vec<u8>> {
     let tmpdir = lsm_tree::get_tmp_folder();
     let seqno_counter = SequenceNumberCounter::default();
     let visible_seqno = SequenceNumberCounter::default();
-    let tree = open_tree(tmpdir.path(), &seqno_counter, &visible_seqno).expect("open");
+    let mut tree = open_tree(tmpdir.path(), &seqno_counter, &visible_seqno).expect("open");
 
     let key = key_from_idx(6);
     tree.insert(key.clone(), vec![54u8], seqno_counter.next()); // @0 base value
@@ -626,12 +631,34 @@ fn merge_onto_a_range_deleted_key_folds_onto_empty() {
     tree.merge(key.clone(), vec![0u8], seqno_counter.next()); // @2 merge operand
     visible_seqno.fetch_max(3);
 
-    let got = tree.get(&key, 5).expect("get").map(|v| v.to_vec());
-    assert_eq!(
-        got,
-        Some(vec![0u8]),
-        "the range delete clears the base, so the merge operand folds onto empty"
-    );
+    match persist {
+        Persist::Memtable => {}
+        Persist::Flushed => tree.flush_active_memtable(0).expect("flush"),
+        Persist::Reopened => {
+            tree =
+                reopen_tree(tree, tmpdir.path(), &seqno_counter, &visible_seqno).expect("reopen");
+        }
+    }
+    tree.get(&key, 5).expect("get").map(|v| v.to_vec())
+}
+
+/// A range tombstone between a base value and a later merge operand: the range
+/// delete clears the base, so the operand folds onto an empty value (matching the
+/// oracle's fold), from the active memtable, after a flush, and after a reopen.
+///
+/// The same history after a major compaction currently resolves onto the
+/// pre-delete value instead, a separate compaction-dependent engine bug tracked
+/// in #527, which is why the property generator keeps merge and range-delete
+/// keys disjoint until that is fixed.
+#[test]
+fn merge_onto_a_range_deleted_key_folds_onto_empty() {
+    for persist in [Persist::Memtable, Persist::Flushed, Persist::Reopened] {
+        assert_eq!(
+            merge_after_range_delete(persist),
+            Some(vec![0u8]),
+            "the range delete must clear the base for {persist:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
