@@ -982,9 +982,14 @@ pub fn frame_value_cells_nullable(cells: &[(TypeTag, Option<&[u8]>)]) -> Result<
         let Some(c) = cell else {
             continue; // null: leave the presence bit clear, append no bytes
         };
-        if let Some(b) = out.get_mut(i / 8) {
-            *b |= 1u8 << (i % 8);
-        }
+        // `i < cells.len()` and `bitmap_len = cells.len().div_ceil(8)`, so
+        // `i / 8 < bitmap_len` always. Fail loudly rather than silently skip the
+        // bit if a future refactor ever breaks that invariant: a clear bit on a
+        // present cell would desync the bitmap from the appended body below.
+        let byte = out.get_mut(i / 8).ok_or(Error::InvalidHeader(
+            "columnar: presence bitmap index out of range",
+        ))?;
+        *byte |= 1u8 << (i % 8);
         match tag {
             TypeTag::Fixed(width) => {
                 if c.len() != usize::from(*width) {
@@ -1682,6 +1687,45 @@ mod tests {
             unframe_value_cells_nullable(entries[1].value.as_ref(), &tags).expect("row 1"),
             vec![Some(&b"bbb"[..]), None],
             "row 1's fixed sub-cell is absent",
+        );
+    }
+
+    #[test]
+    fn untranspose_reconstructs_a_nullable_bytes_subcolumn() {
+        // A nullable variable-width (`Bytes`) value sub-column: row 0 present,
+        // row 1 null. The null row must still carry valid offset-table entries
+        // (here equal consecutive offsets => an empty span) because `validate`
+        // frames every row regardless of the validity bitmap; the validity bit,
+        // not the offsets, is what marks the row absent.
+        let mut batch = entries_to_column_batch(&[
+            InternalValue::from_components(b"k0", b"ignored", 0, ValueType::Value),
+            InternalValue::from_components(b"k1", b"ignored", 0, ValueType::Value),
+        ])
+        .expect("transpose");
+        batch.columns.pop();
+        // Offsets [0, 2, 2]: row 0 spans 0..2 ("hi"), row 1 spans 2..2 (empty).
+        let mut data = Vec::new();
+        for off in [0u32, 2, 2] {
+            data.extend_from_slice(&off.to_le_bytes());
+        }
+        data.extend_from_slice(b"hi");
+        batch.columns.push(Column {
+            column_id: 3,
+            type_tag: TypeTag::Bytes,
+            validity: Some(alloc::vec![0b0000_0001]), // row 0 present, row 1 null
+            data,
+        });
+
+        let entries = column_batch_to_entries(&batch).expect("untranspose");
+        let tags = [TypeTag::Bytes];
+        assert_eq!(
+            unframe_value_cells_nullable(entries[0].value.as_ref(), &tags).expect("row 0"),
+            vec![Some(&b"hi"[..])],
+        );
+        assert_eq!(
+            unframe_value_cells_nullable(entries[1].value.as_ref(), &tags).expect("row 1"),
+            vec![None],
+            "the null bytes row reconstructs as absent, not as an empty cell",
         );
     }
 
