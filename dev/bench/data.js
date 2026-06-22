@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782132847426,
+  "lastUpdate": 1782150795572,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -18984,6 +18984,84 @@ window.BENCHMARK_DATA = {
             "value": 704928.6773254749,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.6us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ea230556c46b5b3cced4de29afe1fdcacef54083",
+          "message": "feat(columnar): consumer value sub-columns via columnar ingest (#531)\n\n## Summary\n\nLets a consumer split a value into typed sub-columns and ingest a\npre-transposed `ColumnBatch` directly, so analytical scans project\nindividual sub-columns without decoding the whole value. The engine\nstays value-agnostic: it stores the sub-columns verbatim and\nreconstructs a row's value through a self-describing framing, never\ninterpreting cell bytes.\n\n## What it adds\n\n- **Reversible value framing** (`frame_value_cells` /\n`unframe_value_cells`): a row's value sub-cells join into one\nself-describing blob (fixed-width cells verbatim, variable-width\nlength-prefixed) that the consumer reverses by type tag. Fixed\nsub-columns carry no per-cell overhead.\n- **Row reconstruction**: the columnar untranspose now accepts the three\nintrinsic columns plus one or more value sub-columns; a single value\ncolumn round-trips byte-for-byte, two or more are framed. All existing\ncorruption guards are preserved.\n- **Writer + ingest path**: `Writer::write_columnar_batch` stores a\nconsumer batch as one columnar block (keeping the sub-columns), wired\nthrough `MultiWriter` up to the public\n`tree.ingestion()?.write_columnar_batch(...).finish()`. The ingestion\nenables the columnar layout when the runtime config asks for it; a\nrow-mode or blob tree rejects the batch.\n- **Projection + MVCC composition**: the vectorized\n`columnar_scan(projection, predicate)` projects individual sub-columns,\nand the positional delete-bitmap masks sub-column rows in both point and\nprojection reads (the mask is value-agnostic).\n\n## v1 constraints\n\nOne batch is one block, keys must be sorted, value sub-columns are\nnon-nullable, and per-row seqnos are `0` (the ingestion assigns the\natomic global sequence number). Nullable value sub-columns and\ncustom-comparator sorted-input validation are follow-ups.\n\n## Testing\n\n- Unit: framing round-trip plus edge cases, N-sub-column untranspose,\ndecode guards.\n- Integration (`tests/columnar_ingest.rs`): ingest round-trip through\nthe public API, layout-required rejection, per-sub-column projection.\n- Composition: the delete-bitmap masks value sub-columns in point and\nprojection reads.\n- Full gate: clippy `--all-features --all-targets`, no-std (`thumbv7em`\n+ `alloc`) errcount 0, nextest (columnar 2163 + lz4,zstd 2104), doctests\n61.\n\nCloses #522\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n## Release Notes\n\n* **New Features**\n* Added feature-gated columnar batch ingest for pre-transposed batches,\nincluding validation of intrinsic/value sub-column layout, strict key\nordering, and proper behavior for empty batches.\n* Added utilities for framing/unframing multi-sub-column values to\nsupport correct reconstruction and projection/scans.\n* **Bug Fixes**\n* Improved columnar batch encoding/recovery to correctly account for\ntombstones/weak-tombstones, deletes masking, and seqno bounds.\n* **Tests**\n* Expanded end-to-end columnar ingest tests covering round-trips,\nprojections, ordering/seqno rejection, and unsupported configurations.\n* **Chores**\n* Reduced benchmark workflow timeout and shortened benchmark timing\nwindows.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-22T20:52:21+03:00",
+          "tree_id": "dc9378fd651d49ef58b6ef40c246520450debfac",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/ea230556c46b5b3cced4de29afe1fdcacef54083"
+        },
+        "date": 1782150794327,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2023413.97528327,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1212270.100930881,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 877635.5763868795,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.2us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3700324.6220784457,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 445665.89979301183,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.4us | P99.9: 9.0us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 238311.41065955142,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 7.3us | P99.9: 11.3us\nthreads: 1 | elapsed: 0.84s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1281465.7754097828,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1084045.4590560691,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.4us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 698844.2074225794,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.6us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
