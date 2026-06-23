@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782195107163,
+  "lastUpdate": 1782215375564,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -19374,6 +19374,84 @@ window.BENCHMARK_DATA = {
             "value": 687764.5219725015,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 5.6us | P99.9: 9.0us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e17f25e79c30a0d3b95c50c33b30c58b5be8b472",
+          "message": "feat(no_std): bottommost compaction GC + verify scrub on the no_std path (#541)\n\n## Summary\n\nExtends the `no_std` + `alloc` reach of the storage engine across the\ncompaction and verification paths, closes #529, and refreshes the zstd\ndependency.\n\n## Changes\n\n### Bottommost compaction GC on `no_std` (#529)\nLast-level range-tombstone application and sequence-number zeroing were\ngated behind `std`, so a `no_std` build applied tombstones at read time\nbut never physically dropped covered keys or packed seqnos to one byte.\nThe gate was incidental (the seqno-zeroer and the whole-version\ntombstone scan are `core` + `alloc`). The `seqno_zeroer` module,\n`collect_version_tombstones`, and the serial merge path's RT-application\n+ `BottommostSeqnoZeroer` wrap are now un-gated.\n`range_tombstones_after_gc` stays `std`-gated: its only caller is the\nparallel sub-compaction path, and the serial path deliberately keeps all\ninput tombstones (partial-commit safety).\n\n### `verify` block-level scrub on `no_std`\nIntegrity verification was gated behind `std` wholesale even though the\nblock-level scrub already reads through the injected `Fs` backend. Split\nthe surface: block walking (`scan_sst_blocks` / `walk_block_region` /\n`verify_block_checksums` / `verify_kv_checksums`) now uses `crate::io`\n(Read / Seek / SeekFrom / BufReader / Error) over the `Fs` handle, so it\nruns on any backend including the raw-syscall one. The genuinely\n`std`-only pieces stay gated: the multi-threaded scrub fan-out, the\nfull-file hash-by-path convenience (`verify_integrity` /\n`stream_checksum`, which open via `std::fs`), and the `StdFs`\nout-of-band entry point. A `no_std` build always takes the serial scan.\n\n### `no_std` warning cleanup\nThe remaining `no_std` dead-code warnings were all `no_std`-capable leaf\nitems whose only consumers are gated (the rate limiter's blocking\nwrapper, the checkpoint deletion-pause, per-KV scrub helpers, parallel\nsub-compaction output, single-file blob recovery, tight-space punch\nhooks, directory-lock constants). Each is annotated `allow(dead_code)`\nunder `not(std)` with a reason so the `no_std`-capable code stays\npresent and ready, rather than being gated out; the delete-bitmap\niterator state is `columnar`-gated. `cargo check` for `thumbv7em` +\n`alloc` now reports zero warnings.\n\n### Dependency\n`structured-zstd` 0.0.41 -> 0.0.43 (API-compatible).\n\n## Testing\n\nFull gate green on both feature sets: clippy `--all-features\n--all-targets` clean, `no_std` check (`thumbv7em` + `alloc`) zero errors\nand zero warnings, nextest (lz4,zstd 2105 + columnar 2189), doctests 63,\nverify suite 33.\n\nCloses #529\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Expanded `no_std` support for compaction (including bottommost\nseqno-zeroing) and checksum/scrub verification paths.\n* Verification throttling now uses `core::time::Duration` for\n`no_std`-friendly configurations.\n\n* **Bug Fixes**\n* Improved verification portability and error classification for\nparity-trailer truncation and related read conditions.\n\n* **Chores**\n  * Bumped optional `structured-zstd` dependency.\n* Reduced `no_std` dead-code warnings via targeted `cfg_attr`\nallowances.\n* Reorganized unit tests into dedicated module files (better compilation\nhygiene).\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-23T14:48:42+03:00",
+          "tree_id": "e308f95bf12f3d52df23d161c0239b2797d78cac",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/e17f25e79c30a0d3b95c50c33b30c58b5be8b472"
+        },
+        "date": 1782215374406,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2026295.9517696986,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1217612.4005251003,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 887399.4421691744,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.1us | P99.9: 6.7us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3821540.5528030377,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 457622.7470282596,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.2us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 237332.97402703288,
+            "unit": "ops/sec",
+            "extra": "P50: 3.8us | P99: 8.7us | P99.9: 11.0us\nthreads: 1 | elapsed: 0.84s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1239229.469422044,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.7us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1081586.199375425,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 3.0us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 689676.6570307573,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.6us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
