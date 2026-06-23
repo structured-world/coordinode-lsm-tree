@@ -29,8 +29,10 @@ persisted".
 
 MVCC visibility follows the seqno: a read at snapshot `N` sees the newest version
 of each key with `seqno <= N` (see [INVARIANTS.md](INVARIANTS.md), Snapshot /
-seqno). Re-applying a record with its original seqno reproduces the same
-version, which is what makes replay idempotent.
+seqno). Re-applying a put or delete at its original seqno reproduces the same
+version (an overwrite); a merge operand is the exception — re-applying folds it
+twice — so replay must apply each record exactly once (see
+[Recovery replay](#3-recovery-replay)).
 
 ## 1. Log before apply
 
@@ -92,8 +94,11 @@ has no log of its own to replay). After open:
 
 1. Read the durable watermark: `let durable = tree.get_highest_persisted_seqno();`
    (`None` ⇒ empty tree ⇒ replay everything).
-2. Replay your WAL **strictly from `durable + 1`** forward, re-applying each record
-   with `insert(key, value, seqno)` at its original seqno.
+2. Replay every WAL record with **`seqno > durable`** (a strict lower bound — phrase
+   it as `> durable`, not a literal `durable + 1`, which would overflow at the top
+   of the seqno range), re-applying each with its **original operation** and seqno:
+   a logged put via `insert`, a delete via `remove`, a merge via `merge`. Never
+   collapse every record to `insert` — that loses deletes and merge semantics.
 3. Do NOT re-apply records at or below `durable`. For put / delete that would be
    harmless (re-applying at the original seqno reproduces the same MVCC version, an
    overwrite), but a **merge operand** re-applied on top of its already-persisted

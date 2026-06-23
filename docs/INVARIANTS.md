@@ -197,10 +197,13 @@ matching entry (and add one for a new subsystem).
   sub-columns; a read at snapshot `N` sees a row only if its seqno `<= N`. Enforced
   in `src/table/columnar.rs`.
 
-- **The positional delete bitmap is applied by row position, MVCC-correctly.** A
-  set bit hides the row at that position for reads at or after the deleting seqno;
-  the original row stays on disk until compaction materializes the deletion.
-  Enforced in `src/table/delete_bitmap.rs`.
+- **The positional delete bitmap is a pure membership set; MVCC correctness is
+  established when it is built, not at read time.** The bitmap carries no per-row
+  seqno — a set bit unconditionally hides the row at that position for every reader
+  of the segment. The MVCC reconciliation happens at materialization time: a row's
+  bit is set only once its deleting tombstone is visible to every live snapshot
+  (its seqno below the compaction threshold), so a still-visible older version is
+  never masked. Enforced in `src/table/delete_bitmap.rs`.
 
 - **Sub-column framing is self-describing and bounds-checked.** Each sub-column's
   offset / length is validated against the block before decode; a truncated or
