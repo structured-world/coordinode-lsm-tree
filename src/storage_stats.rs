@@ -214,6 +214,143 @@ pub struct RangeCardinality {
     pub selectivity: f64,
 }
 
+/// Grouped, object-safe read-only storage-statistics surface.
+///
+/// A coherent view over a tree's non-query statistics: on-disk footprint
+/// ([`storage_stats`](Self::storage_stats)), per-level / per-segment sizing
+/// ([`level_segment_stats`](Self::level_segment_stats)), compaction debt
+/// ([`compaction_debt`](Self::compaction_debt)), and block-cache health
+/// ([`cache_stats`](Self::cache_stats)). A planner / tiering / capacity consumer
+/// bounds on `T: StorageStatistics` (or `&dyn StorageStatistics`) and a test can
+/// supply a mock. Every [`AbstractTree`](crate::AbstractTree) implements it — it
+/// is a super-trait of `AbstractTree`.
+///
+/// The per-query range estimators
+/// ([`approximate_range_stats`](crate::AbstractTree::approximate_range_stats),
+/// [`approximate_range_cardinality`](crate::AbstractTree::approximate_range_cardinality))
+/// are generic over the range type and so not object-safe; they stay on
+/// [`AbstractTree`](crate::AbstractTree) rather than joining this trait.
+pub trait StorageStatistics {
+    /// On-disk footprint and average entry shape: used / capacity / available
+    /// bytes, item & table counts, average entry size, reclaimable-bytes
+    /// estimate, and a coarse [`StorageStatus`]. See
+    /// [`StorageStats::estimated_remaining_entries`] for a budget projection.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lsm_tree::Error as TreeError;
+    /// use lsm_tree::{AbstractTree, Config, StorageStatistics};
+    ///
+    /// let folder = tempfile::tempdir()?;
+    /// let tree = Config::new(&folder, Default::default(), Default::default()).open()?;
+    /// for i in 0..100u32 {
+    ///     tree.insert(format!("k{i:04}"), "v", 0);
+    /// }
+    /// tree.flush_active_memtable(0)?;
+    ///
+    /// // Both traits are in scope, so disambiguate the shared method name.
+    /// let stats = StorageStatistics::storage_stats(&tree)?;
+    /// assert_eq!(stats.item_count, 100);
+    /// // Roughly how many more average-shaped entries fit in another 1 MiB.
+    /// let _headroom = stats.estimated_remaining_entries(1024 * 1024);
+    /// #
+    /// # Ok::<(), TreeError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a live file's size cannot be stat-ed.
+    fn storage_stats(&self) -> crate::Result<StorageStats>;
+
+    /// Per-LSM-level and per-segment size + entry-count stats, for tiering and
+    /// erasure-coding placement decisions (which level / segment is large enough
+    /// to demote, EC-encode, or migrate).
+    ///
+    /// Cheap: derived from the live version's metadata plus one file-size stat
+    /// per segment (no data-block scan). The per-level totals reconcile with
+    /// [`storage_stats`](Self::storage_stats): summed across levels they equal
+    /// the SST portion of [`StorageStats::used_bytes`] and
+    /// [`StorageStats::item_count`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lsm_tree::Error as TreeError;
+    /// use lsm_tree::{AbstractTree, Config, StorageStatistics};
+    ///
+    /// let folder = tempfile::tempdir()?;
+    /// let tree = Config::new(&folder, Default::default(), Default::default()).open()?;
+    /// for i in 0..100u32 {
+    ///     tree.insert(format!("k{i:04}"), "v", 0);
+    /// }
+    /// tree.flush_active_memtable(0)?;
+    ///
+    /// // Both traits are in scope, so disambiguate the shared method names.
+    /// let levels = StorageStatistics::level_segment_stats(&tree)?;
+    /// let total: u64 = levels.iter().map(|l| l.item_count).sum();
+    /// assert_eq!(total, StorageStatistics::storage_stats(&tree)?.item_count);
+    /// #
+    /// # Ok::<(), TreeError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a segment's file size cannot be stat-ed.
+    fn level_segment_stats(&self) -> crate::Result<Vec<LevelStats>>;
+
+    /// Estimated bytes pending compaction under `strategy`: on-disk data above
+    /// its level's target that must eventually be rewritten downward (a `RocksDB`
+    /// `estimate-pending-compaction-bytes` analog), a compaction-debt signal for a
+    /// scheduler / tiering consumer.
+    ///
+    /// The strategy is a caller argument because the engine does not own a
+    /// configured compaction strategy (it is injected per compaction run); a
+    /// `&dyn` keeps this object-safe. Returns `0` for strategies without a
+    /// size-target notion of debt (FIFO, drop-range), or when the tree is at or
+    /// below its target shape. See
+    /// [`CompactionStrategy::pending_compaction_bytes`](crate::compaction::CompactionStrategy::pending_compaction_bytes).
+    fn compaction_debt(&self, strategy: &dyn crate::compaction::CompactionStrategy) -> u64;
+
+    /// A point-in-time [`CacheStats`](crate::CacheStats) snapshot of block-cache
+    /// effectiveness (cumulative hit / miss counts and rate) and occupancy
+    /// (current size against capacity).
+    ///
+    /// The stable, owned observability view over the block cache, so a consumer
+    /// reads cache health without holding the mutable
+    /// [`metrics`](crate::AbstractTree::metrics) handle. Counts are cumulative
+    /// since process start; derive a rate over an interval from the delta between
+    /// two polls.
+    #[cfg(feature = "metrics")]
+    fn cache_stats(&self) -> crate::CacheStats;
+}
+
+/// Every [`AbstractTree`](crate::AbstractTree) is a [`StorageStatistics`] by
+/// delegating to its own inherent stats methods, so a `Tree` / `BlobTree` can be
+/// used directly as `&dyn StorageStatistics`. The logic lives once on
+/// `AbstractTree`; this is a thin object-safe re-exposure for the grouped /
+/// mockable surface (a test mock implements `StorageStatistics` directly without
+/// being an `AbstractTree`). When both traits are in scope, disambiguate a bare
+/// `tree.storage_stats()` with `StorageStatistics::storage_stats(&tree)`.
+impl<T: crate::AbstractTree + ?Sized> StorageStatistics for T {
+    fn storage_stats(&self) -> crate::Result<StorageStats> {
+        crate::AbstractTree::storage_stats(self)
+    }
+
+    fn level_segment_stats(&self) -> crate::Result<Vec<LevelStats>> {
+        crate::AbstractTree::level_segment_stats(self)
+    }
+
+    fn compaction_debt(&self, strategy: &dyn crate::compaction::CompactionStrategy) -> u64 {
+        crate::AbstractTree::compaction_debt(self, strategy)
+    }
+
+    #[cfg(feature = "metrics")]
+    fn cache_stats(&self) -> crate::CacheStats {
+        crate::AbstractTree::cache_stats(self)
+    }
+}
+
 impl StorageStats {
     /// Approximately how many more average-shaped entries fit in `budget_bytes`,
     /// using [`Self::avg_entry_on_disk_bytes`].

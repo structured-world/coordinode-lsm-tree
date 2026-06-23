@@ -64,3 +64,41 @@ fn compute_on_empty_version_maps_compaction_flag_to_status() {
     let idle = compute_storage_stats(&version, false, true).unwrap();
     assert_eq!(idle.status, StorageStatus::Healthy);
 }
+
+#[test]
+fn storage_statistics_is_object_safe_via_mock() -> crate::Result<()> {
+    // A non-tree mock implements the trait, proving it is object-safe and usable
+    // for planner / tiering tests without a real engine behind it.
+    struct MockStats;
+    impl StorageStatistics for MockStats {
+        fn storage_stats(&self) -> crate::Result<StorageStats> {
+            Ok(stats_with_avg(6))
+        }
+        fn level_segment_stats(&self) -> crate::Result<Vec<LevelStats>> {
+            Ok(Vec::new())
+        }
+        fn compaction_debt(&self, _strategy: &dyn crate::compaction::CompactionStrategy) -> u64 {
+            123
+        }
+        #[cfg(feature = "metrics")]
+        fn cache_stats(&self) -> crate::CacheStats {
+            crate::CacheStats {
+                hits: 9,
+                misses: 1,
+                hit_rate: 0.9,
+                size_bytes: 10,
+                capacity_bytes: 100,
+            }
+        }
+    }
+
+    let mock = MockStats;
+    let stats: &dyn StorageStatistics = &mock;
+    assert_eq!(stats.storage_stats()?.avg_entry_on_disk_bytes, 6);
+    assert!(stats.level_segment_stats()?.is_empty());
+    let strategy = crate::compaction::leveled::Strategy::default();
+    assert_eq!(stats.compaction_debt(&strategy), 123);
+    #[cfg(feature = "metrics")]
+    assert_eq!(stats.cache_stats().hits, 9);
+    Ok(())
+}
