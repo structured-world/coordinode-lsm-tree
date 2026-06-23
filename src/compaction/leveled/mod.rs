@@ -479,8 +479,10 @@ impl CompactionStrategy for Strategy {
             // overflow u64 — plain addition.
             if idx == 0 {
                 // L0 is count-triggered: once it reaches the L0 file threshold its
-                // whole size is pending a merge into L1.
-                if level.iter().count() >= usize::from(self.l0_threshold) {
+                // whole size is pending a merge into L1. Use the table (file)
+                // count, matching the `choose` trigger; `iter().count()` would
+                // count runs, undercounting a multi-table L0 run.
+                if level.table_count() >= usize::from(self.l0_threshold) {
                     debt += level.size();
                 }
             } else if let Some(&target) = targets.get(idx) {
