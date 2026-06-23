@@ -44,7 +44,10 @@ For each write (or batch):
    own monotonic source).
 2. Append the record (keys, values, and the seqno) to your WAL and make it
    durable (`fsync`, or your log's equivalent).
-3. Only then call `insert(key, value, seqno)` (or a `WriteBatch` at that seqno).
+3. Only then call the original write API at that seqno (`insert` for a put,
+   `remove` for a point delete, `remove_weak` for a weak/single delete,
+   `remove_range` for a range tombstone, `merge` for a merge operand, or a
+   `WriteBatch`). Apply the same operation that was logged, not always `insert`.
 
 The ordering is what guarantees recoverability: if the process dies after step 2
 but before or during step 3, the record is in your WAL and replay re-applies it.
@@ -98,21 +101,28 @@ writes). Trim against the persisted one only.
 On `Config::open` the engine recovers its state from the persisted SSTs alone (it
 has no log of its own to replay). After open:
 
-1. Read the durable watermark: `let durable = tree.get_highest_persisted_seqno();`
-   (`None` ⇒ empty tree ⇒ replay everything).
-2. Replay every WAL record with **`seqno > durable`** (a strict lower bound; phrase
-   it as `> durable`, not a literal `durable + 1`, which would overflow at the top
-   of the seqno range), re-applying each with its **original operation** and seqno:
-   the same call it was logged for (`insert` for a put, `remove` for a point
-   delete, `remove_range` for a range tombstone, `merge` for a merge operand, or
-   the original `WriteBatch` for a batch). Never collapse every record to `insert`,
-   which loses deletes, range tombstones, and merge semantics.
-3. Do NOT re-apply records at or below `durable`. For put / delete that would be
-   harmless (re-applying at the original seqno reproduces the same MVCC version, an
+1. Recover from your **trim watermark `W`**, not the raw persisted maximum. `W` is
+   the gap-free applied-and-persisted prefix you trimmed to (section 2); replay
+   every WAL record that survived the trim, i.e. `seqno > W`. With strict gap-free
+   in-order apply `W == get_highest_persisted_seqno()`, but if you retained a lower
+   record across a gap (a logged-but-unapplied seqno below a flushed higher one) it
+   is still in the WAL and MUST be replayed, so never use the raw maximum as the
+   boundary, which would skip it. (Phrase the bound as `> W`, not a literal
+   `W + 1`, which would overflow at the top of the seqno range.)
+2. Replay each surviving record with its **original operation** and seqno: the
+   same call it was logged for (`insert` for a put, `remove` for a point delete,
+   `remove_weak` for a weak/single delete, `remove_range` for a range tombstone,
+   `merge` for a merge operand, or the original `WriteBatch` for a batch). Never
+   collapse every record to `insert`, which loses deletes, range tombstones, and
+   merge semantics.
+3. Do NOT re-apply records at or below `W`. For put / delete that would be harmless
+   (re-applying at the original seqno reproduces the same MVCC version, an
    overwrite), but a **merge operand** re-applied on top of its already-persisted
    self is folded twice by merge resolution, so a counter would double-count. The
-   strict `> durable` boundary is correct for every record type, so use it
-   unconditionally rather than relying on over-replay being idempotent.
+   strict `> W` boundary is correct for every record type, so use it
+   unconditionally rather than relying on over-replay being idempotent. For
+   merge-bearing workloads, apply gap-free so that `W` equals the persisted maximum
+   and no already-persisted operand can sit above `W` to be replayed.
 
 The strict boundary still covers the crash window in step 1 of
 [Log before apply](#1-log-before-apply): a record that was logged and applied but
