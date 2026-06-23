@@ -6,7 +6,7 @@
 //!
 //! This module defines the [`EncryptionProvider`] trait for pluggable
 //! block-level encryption and, behind the `encryption` feature, ships a
-//! ready-to-use [`Aes256GcmProvider`] implementation.
+//! ready-to-use `Aes256GcmProvider` implementation.
 //!
 //! ## Pipeline order
 //!
@@ -47,7 +47,7 @@
 //! omit those features, which would break the links.)
 //!
 //! Still pending in a follow-up: replacing the legacy
-//! [`Aes256GcmProvider`] Block I/O code path below with the
+//! `Aes256GcmProvider` Block I/O code path below with the
 //! `encrypt_block` / `decrypt_block` entry points at every
 //! `Block::write_into` / `Block::from_reader` site.
 
@@ -129,7 +129,7 @@ pub trait EncryptionProvider:
     /// capability when an encryption provider is configured (see
     /// `Config::open`) and rejects an unsupported provider up front rather than
     /// failing mid-I/O. Defaults to `false`; AAD-capable providers (e.g.
-    /// [`Aes256GcmProvider`]) override it to `true`.
+    /// `Aes256GcmProvider`) override it to `true`.
     #[must_use]
     fn supports_aad_block_path(&self) -> bool {
         false
@@ -183,7 +183,7 @@ pub trait EncryptionProvider:
     ///
     /// The default returns [`crate::Error::Encrypt`]: a provider that cannot bind
     /// AAD must not serve the block path. AAD-capable providers (e.g.
-    /// [`Aes256GcmProvider`]) override this.
+    /// `Aes256GcmProvider`) override this.
     fn encrypt_block_aad(
         &self,
         _plaintext: &[u8],

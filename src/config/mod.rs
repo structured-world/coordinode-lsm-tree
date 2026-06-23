@@ -1546,7 +1546,7 @@ impl Config {
     /// [`EncryptionProvider`].
     ///
     /// The caller is responsible for key management and rotation.
-    /// See [`crate::Aes256GcmProvider`] (behind the `encryption` feature)
+    /// See `crate::Aes256GcmProvider` (behind the `encryption` feature)
     /// for a ready-to-use AES-256-GCM implementation.
     ///
     /// **Important constraints:**

@@ -91,9 +91,9 @@ pub fn unix_timestamp() -> Duration {
 /// Monotonic instant used for elapsed-time logging on the compaction / flush
 /// paths.
 ///
-/// Under `std` this is a re-export of [`std::time::Instant`]. Under `no_std`
+/// Under `std` this is a re-export of `std::time::Instant`. Under `no_std`
 /// there is no ambient monotonic clock, so this is a zero-sized stub whose
-/// [`elapsed`](Instant::elapsed) always reports [`core::time::Duration::ZERO`]
+/// `elapsed` always reports `core::time::Duration::ZERO`
 /// — the timing logs degrade to `0ns` rather than failing to compile.
 // no-std: wire a caller-provided monotonic Clock hook (mirroring the
 // `unix_timestamp` wall-clock hook) if real elapsed timing is needed.
