@@ -120,9 +120,14 @@ matching entry (and add one for a new subsystem).
   of each key. Enforced in the read path (`src/tree`, `src/mvcc_stream.rs`) and the
   seqno ordering (`src/seqno.rs`, `src/value.rs`).
 
-- **Re-applying a write at its original seqno is idempotent.** The same
-  (key, value, seqno) reproduces the same MVCC version, which is what makes
-  external-WAL replay safe (see [external-wal.md](external-wal.md)).
+- **Re-applying a put / delete at its original seqno is idempotent; a merge
+  operand is NOT.** For a put or delete, the same (key, value, seqno) reproduces
+  the same MVCC version (an overwrite), which is what makes external-WAL replay
+  safe. A merge operand re-applied on top of its already-persisted self is folded
+  a second time by merge resolution (see [Merge operators](#merge-operators)
+  below), so a counter would double-count. External-WAL replay must therefore
+  apply each record exactly once, strictly above the durable watermark, never
+  relying on over-replay being harmless (see [external-wal.md](external-wal.md)).
 
 ## Range tombstones
 
