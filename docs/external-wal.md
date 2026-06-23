@@ -9,8 +9,9 @@ your own WAL before applying it and replay the tail on restart.
 This document specifies the contract for building that external WAL on top of the
 existing public API. No engine callbacks are required (see
 [Why no hook API](#why-no-hook-api)); the contract is expressed entirely through
-the write methods (`insert`, `remove`, `remove_range`, `merge`, and `WriteBatch`),
-`flush_active_memtable`, `get_highest_persisted_seqno`, and recover-on-open.
+the write methods (`insert`, `remove`, `remove_weak`, `remove_range`, `merge`, and
+`WriteBatch`), `flush_active_memtable`, `get_highest_persisted_seqno`, and
+recover-on-open.
 
 ## The sequence number is the durability cursor
 
@@ -23,9 +24,10 @@ fn insert<K: Into<UserKey>, V: Into<UserValue>>(&self, key: K, value: V, seqno: 
 The engine does not assign seqnos; the caller does, typically by drawing
 monotonically increasing values from a [`SequenceNumberCounter`]. Because the
 seqno is an input, it is the single cursor that ties your WAL records to engine
-state: a WAL record and the `insert` it produces share one seqno, and recovery is
-expressed as "replay every WAL record with a seqno above what the engine already
-persisted".
+state: a WAL record and the write it produces share one seqno, and recovery is
+expressed as "replay every WAL record with a seqno above your trim watermark `W`"
+(the gap-free applied-and-persisted prefix defined in section 3, not the raw
+persisted maximum).
 
 MVCC visibility follows the seqno: a read at read-seqno `R` sees the newest version
 of each key with `seqno < R`: the read seqno is an *exclusive* upper bound. The
