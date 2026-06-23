@@ -222,8 +222,8 @@ pub struct RangeCardinality {
 /// ([`compaction_debt`](Self::compaction_debt)), and block-cache health
 /// ([`cache_stats`](Self::cache_stats)). A planner / tiering / capacity consumer
 /// bounds on `T: StorageStatistics` (or `&dyn StorageStatistics`) and a test can
-/// supply a mock. Every [`AbstractTree`](crate::AbstractTree) implements it — it
-/// is a super-trait of `AbstractTree`.
+/// supply a mock. Every [`AbstractTree`](crate::AbstractTree) implements it via a
+/// blanket impl (`impl<T: AbstractTree + ?Sized> StorageStatistics for T`).
 ///
 /// The per-query range estimators
 /// ([`approximate_range_stats`](crate::AbstractTree::approximate_range_stats),

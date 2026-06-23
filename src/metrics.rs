@@ -93,8 +93,10 @@ pub struct Metrics {
 /// stable owned value instead of reaching into the mutable `&Arc<Metrics>`.
 /// Counts are cumulative since process start (they reset on restart, like all of
 /// [`Metrics`]); derive a rate over an interval from the delta between two polls.
+// No `PartialEq`: `hit_rate` is an `f64`, so equality would inherit float
+// comparison semantics. Compare the integer fields explicitly instead.
 #[must_use]
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug)]
 pub struct CacheStats {
     /// Cumulative block reads served from the block cache (all block types).
     pub hits: u64,
