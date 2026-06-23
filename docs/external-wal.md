@@ -9,8 +9,8 @@ your own WAL before applying it and replay the tail on restart.
 This document specifies the contract for building that external WAL on top of the
 existing public API. No engine callbacks are required (see
 [Why no hook API](#why-no-hook-api)); the contract is expressed entirely through
-`insert`, `flush_active_memtable`, `get_highest_persisted_seqno`, and
-recover-on-open.
+the write methods (`insert`, `remove`, `remove_range`, `merge`, and `WriteBatch`),
+`flush_active_memtable`, `get_highest_persisted_seqno`, and recover-on-open.
 
 ## The sequence number is the durability cursor
 
@@ -70,14 +70,18 @@ fn get_highest_persisted_seqno(&self) -> Option<SeqNo>;
 ```
 
 This returns the highest seqno present in the persisted SSTs (`None` for an empty
-tree): the *maximum*, not a contiguity guarantee. When writes are applied in
-strict seqno order (the single-writer log-before-apply pattern above guarantees
-this), that maximum *is* a contiguous prefix: **every WAL record with
-`seqno <= get_highest_persisted_seqno()` is on disk and may be trimmed**. If you
-apply writes out of seqno order (concurrent appliers can flush a higher seqno
-while a lower one is still pending), the maximum is NOT contiguous (a delayed
-lower seqno may be absent from every SST), so trim only against a contiguous
-applied-and-persisted prefix you track yourself, never against the raw maximum.
+tree): the *maximum*, not a contiguity guarantee. A record is trimmable only once
+it has both been **applied** (its `insert` / `remove` / `merge` / ... returned)
+AND **persisted**. A record fsynced to your WAL but not yet applied (a crash
+between the log write and the apply) is absent from every SST and must stay in the
+WAL for replay, even if a later seqno was applied and flushed past it. So trim only
+a gap-free prefix of applied-and-persisted records: when you apply in strict seqno
+order and every record up to some seqno has been applied,
+`get_highest_persisted_seqno()` is that contiguous watermark and records with
+`seqno <= it` may be trimmed. If applies can be reordered or skipped (concurrent
+appliers, or a failed apply that leaves a gap), the maximum is NOT contiguous, so
+track the applied-and-persisted prefix yourself and never trim against the raw
+maximum.
 
 `create_checkpoint` gives the same guarantee for a point-in-time copy: it flushes
 the active memtable first, then hard-links every resulting SST into the checkpoint

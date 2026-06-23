@@ -84,10 +84,13 @@ matching entry (and add one for a new subsystem).
   `src/compaction/worker.rs` (merge + tombstone handling) and the compaction
   integration tests (`src/compaction/leveled`).
 
-- **A weak tombstone is dropped only below the lowest live snapshot.** Dropping a
-  delete marker that a snapshot still needs would resurrect the deleted key for
-  that snapshot. Enforced in the merge / drop logic
-  (`src/compaction`, `src/range_tombstone_filter.rs`).
+- **A weak tombstone is dropped below the lowest live snapshot, or when it
+  collapses with its matching value.** Dropping a delete marker that a snapshot
+  still needs would resurrect the deleted key for that snapshot. Beyond the
+  snapshot-watermark rule, the compaction stream also drops a weak tombstone when
+  the next entry for the same key is a `Value` (single-delete semantics: the weak
+  delete annihilates exactly that one put). Enforced in the merge / drop logic
+  (`src/compaction/stream.rs`, `src/range_tombstone_filter.rs`).
 
 - **Sequence numbers are zeroed only at the bottommost level, and only when no
   range tombstone covers the key.** Packing a seqno to zero is safe only at the
