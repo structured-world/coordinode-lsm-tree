@@ -70,10 +70,11 @@ tree). After a flush, **every WAL record with `seqno <= get_highest_persisted_se
 is redundant and may be trimmed** — its data is recoverable from the SSTs without
 the WAL.
 
-`create_checkpoint` gives the same guarantee for a point-in-time copy: the
-checkpoint directory contains every SST live at the call, so its contents are
-durable up to the persisted watermark at that moment; it does not flush the active
-memtable, so unflushed writes are not in the checkpoint.
+`create_checkpoint` gives the same guarantee for a point-in-time copy: it flushes
+the active memtable first, then hard-links every resulting SST into the checkpoint
+directory, so the checkpoint contains every write that had reached the active
+memtable at the call (the persisted watermark advances to cover the flushed
+writes).
 
 Note `get_highest_persisted_seqno` is the *persisted* watermark, distinct from
 `get_highest_seqno` (the max over memtable + SSTs, including not-yet-durable
