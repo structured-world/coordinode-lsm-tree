@@ -1344,46 +1344,39 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
             // `parity_len` bytes through a small scratch buffer.
             let mut scratch = [0u8; 512];
             let mut remaining = parity_len;
-            let drained: io::Result<u64> = loop {
+            // A short read (EOF before `parity_len`) and an underlying read error
+            // are the same outcome for the scrub: the trailer cannot be skipped,
+            // so collapse both into one `Err` and report a single DataReadError.
+            let drain: io::Result<()> = loop {
                 if remaining == 0 {
-                    break Ok(parity_len);
+                    break Ok(());
                 }
                 let want =
                     usize::try_from(remaining.min(scratch.len() as u64)).unwrap_or(scratch.len());
                 let (head, _) = scratch.split_at_mut(want);
                 match ctx.reader.read(head) {
-                    Ok(0) => break Ok(parity_len - remaining),
+                    Ok(0) => {
+                        break Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            alloc::format!(
+                                "parity trailer truncated: read {} of {parity_len} bytes",
+                                parity_len - remaining
+                            ),
+                        ));
+                    }
                     Ok(n) => remaining -= n as u64,
                     Err(e) => break Err(e.into()),
                 }
             };
-            match drained {
-                Ok(n) if n == parity_len => {}
-                Ok(n) => {
-                    ctx.errors.push(BlockVerifyError::DataReadError {
-                        table_id: ctx.table_id,
-                        path: ctx.path.to_path_buf(),
-                        offset,
-                        data_length: header.data_length,
-                        error: io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            alloc::format!(
-                                "parity trailer truncated: read {n} of {parity_len} bytes"
-                            ),
-                        ),
-                    });
-                    return;
-                }
-                Err(e) => {
-                    ctx.errors.push(BlockVerifyError::DataReadError {
-                        table_id: ctx.table_id,
-                        path: ctx.path.to_path_buf(),
-                        offset,
-                        data_length: header.data_length,
-                        error: e,
-                    });
-                    return;
-                }
+            if let Err(error) = drain {
+                ctx.errors.push(BlockVerifyError::DataReadError {
+                    table_id: ctx.table_id,
+                    path: ctx.path.to_path_buf(),
+                    offset,
+                    data_length: header.data_length,
+                    error,
+                });
+                return;
             }
         }
 
@@ -2038,6 +2031,103 @@ mod block_verify_tests {
         );
     }
 
+    /// The parity-trailer drain reports a truncated read when an SST whose ECC
+    /// descriptor claims per-block parity is missing those trailer bytes. Forges
+    /// a `data` section of header + its full payload (so the data read and its
+    /// checksum both pass), then scans it as an RS(4,2) table: the walk drains
+    /// `expected_parity_len` bytes, hits EOF after the short SFA tail, and
+    /// surfaces a `DataReadError` for the short parity read rather than
+    /// mis-reading the tail as the next block.
+    #[test]
+    #[expect(
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation,
+        reason = "synthetic SFA forgery — offsets are in-bounds by construction (we wrote the \
+                  bytes ourselves) and the archive is < 8 KiB, so the casts cannot overflow"
+    )]
+    fn walk_block_region_reports_data_read_error_on_truncated_parity_trailer() {
+        use crate::coding::Encode;
+        use crate::fs::{Fs, FsOpenOptions, MemFs};
+        use crate::table::block::{BlockType, EccParams, Header, expected_parity_len};
+
+        // Trailer layout (38 bytes at the tail of an SFA archive):
+        //   MAGIC(4) | version(1) | csum_type(1) | toc_checksum(16) | toc_pos(8) | toc_len(8)
+        const TRAILER_LEN: usize = 4 + 1 + 1 + 16 + 8 + 8;
+        const DATA_LENGTH: u32 = 4096;
+        const HEADER_LEN: u64 = Header::MIN_LEN as u64;
+
+        let data = vec![0xABu8; DATA_LENGTH as usize];
+        let header = Header {
+            checksum: Checksum::from_raw(crate::hash::hash128(&data)),
+            data_length: DATA_LENGTH,
+            uncompressed_length: DATA_LENGTH,
+            ..Header::test_dummy(BlockType::Data)
+        };
+
+        // One `data` section: header + full payload, but no parity trailer.
+        let mut archive_bytes: Vec<u8> = Vec::new();
+        {
+            let mut writer =
+                crate::sfa::Writer::from_writer(std::io::Cursor::new(&mut archive_bytes));
+            writer.start("data").unwrap();
+            writer.write_all(&header.encode_into_vec()).unwrap();
+            writer.write_all(&data).unwrap();
+            writer.finish().unwrap();
+        }
+
+        // Inflate the section length to header + payload + parity so the walker's
+        // `data_length + parity_len <= remaining` bounds check passes; the parity
+        // bytes were never written, so the drain hits EOF instead. Recompute the
+        // TOC checksum afterwards so crate::sfa::Reader still accepts the file.
+        let parity_len = u64::from(expected_parity_len(DATA_LENGTH, EccParams::RS_4_2));
+        let trailer_start = archive_bytes.len() - TRAILER_LEN;
+        let toc_pos = u64::from_le_bytes(
+            archive_bytes[trailer_start + 22..trailer_start + 30]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let toc_len = u64::from_le_bytes(
+            archive_bytes[trailer_start + 30..trailer_start + 38]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let len_field_offset = toc_pos + 4 + 4 + 8;
+        let lied_len: u64 = HEADER_LEN + u64::from(DATA_LENGTH) + parity_len;
+        archive_bytes[len_field_offset..len_field_offset + 8]
+            .copy_from_slice(&lied_len.to_le_bytes());
+        let new_toc_checksum = crate::hash::hash128(&archive_bytes[toc_pos..toc_pos + toc_len]);
+        let csum_field_offset = trailer_start + 4 + 1 + 1;
+        archive_bytes[csum_field_offset..csum_field_offset + 16]
+            .copy_from_slice(&new_toc_checksum.to_le_bytes());
+
+        let fs = MemFs::new();
+        let path = std::path::Path::new("/forged-parity.sst");
+        {
+            let mut f = fs
+                .open(
+                    path,
+                    &FsOpenOptions::new().write(true).create(true).truncate(true),
+                )
+                .unwrap();
+            f.write_all(&archive_bytes).unwrap();
+        }
+
+        // Scan as an RS(4,2) table: a non-zero parity_len is drained after the
+        // (clean) payload, hitting EOF in the short SFA tail.
+        let table_id: TableId = 7;
+        let scan = scan_sst_blocks(&fs, path, table_id, 0, Some(EccParams::RS_4_2), false)
+            .expect("forged SFA must parse cleanly");
+        assert!(
+            scan.errors.iter().any(|e| matches!(
+                e,
+                BlockVerifyError::DataReadError { table_id: t, offset: 0, error, .. }
+                    if *t == table_id && error.kind() == crate::io::ErrorKind::UnexpectedEof
+            )),
+            "expected a truncated-parity DataReadError, got {:?}",
+            scan.errors,
+        );
+    }
+
     /// A block header whose own bytes extend past the section boundary must be
     /// reported as `HeaderCorrupted`, not slip through with a clamped-to-zero
     /// remaining payload.
@@ -2196,6 +2286,26 @@ mod block_verify_tests {
             seq.is_ok() && par.is_ok(),
             "clean tree: seq={seq:?} par={par:?}"
         );
+    }
+
+    #[test]
+    fn verify_checksum_with_throttle_runs_inter_sst_pause() {
+        // A non-zero throttle on the default (serial) path exercises the
+        // inter-SST pause between tables. The smallest possible delay keeps the
+        // test fast while still hitting the sleep branch.
+        let dir = tempfile::tempdir().unwrap();
+        populate_multi_sst(dir.path(), 3, 300);
+        let tree = reopen_tree(dir.path());
+
+        let report = tree.verify_checksum_with(
+            &VerifyOptions::default().throttle(std::time::Duration::from_nanos(1)),
+        );
+        assert!(
+            report.sst_files_scanned >= 2,
+            "need >1 SST to exercise the inter-SST throttle, got {}",
+            report.sst_files_scanned,
+        );
+        assert!(report.is_ok(), "clean tree must verify clean: {report:?}");
     }
 
     #[test]
