@@ -29,7 +29,7 @@ persisted".
 
 MVCC visibility follows the seqno: a read at snapshot `N` sees the newest version
 of each key with `seqno <= N` (see [INVARIANTS.md](INVARIANTS.md), Snapshot /
-seqno). Re-applying a record with its original seqno reproduces the exact same
+seqno). Re-applying a record with its original seqno reproduces the same
 version, which is what makes replay idempotent.
 
 ## 1. Log before apply
