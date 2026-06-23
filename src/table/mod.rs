@@ -147,6 +147,28 @@ impl BloomResult {
     }
 }
 
+/// Re-applies a bulk-ingested table's base sequence number to a table-local
+/// seqno, translating it back to the global coordinate that callers compare
+/// across tables.
+///
+/// The sum never overflows on any reachable input: a row reaches this
+/// translation only when it is visible at the query snapshot `Q`, which (by the
+/// exclusive MVCC check `local < Q - global`) requires `local + global < Q`, and
+/// `Q <= SeqNo::MAX`. The `checked_add` therefore always succeeds; an overflow
+/// would mean the invariant was violated, so it aborts loudly in both debug and
+/// release builds rather than wrapping to a subtly wrong seqno (the silent-
+/// corruption class `saturating_add` shares). For a non-ingested table `global`
+/// is `0` and this is the identity.
+#[inline]
+fn apply_global_seqno(local: SeqNo, global: SeqNo) -> SeqNo {
+    local.checked_add(global).unwrap_or_else(|| {
+        unreachable!(
+            "apply_global_seqno: table-local seqno + global base overflowed SeqNo::MAX, \
+             but a row is only translated here when visible (local + global < query snapshot)"
+        )
+    })
+}
+
 impl Table {
     #[must_use]
     pub fn global_seqno(&self) -> SeqNo {
@@ -624,7 +646,13 @@ impl Table {
         }
 
         let global_seqno = self.global_seqno();
-        let seqno = seqno.saturating_sub(global_seqno);
+        // A query snapshot below this table's base seqno predates the table, so
+        // none of its rows are visible. `checked_sub` yields `None` there (where a
+        // saturating sub would silently clamp to 0); the seqno-range gate below
+        // then handles the in-range case.
+        let Some(seqno) = seqno.checked_sub(global_seqno) else {
+            return Ok(None);
+        };
 
         if self.metadata.seqnos.0 >= seqno {
             return Ok(None);
@@ -652,7 +680,7 @@ impl Table {
             // version when it is visible; otherwise fall through (an older
             // version may apply at this snapshot).
             if iv.key.seqno < seqno {
-                iv.key.seqno = iv.key.seqno.saturating_add(global_seqno);
+                iv.key.seqno = apply_global_seqno(iv.key.seqno, global_seqno);
                 return Ok(Some(iv));
             }
         }
@@ -674,7 +702,7 @@ impl Table {
         // Translate table-local seqno back to global coordinate so callers
         // can compare across tables/memtables (L0 best-selection, RT suppression).
         let item = item.map(|mut iv| {
-            iv.key.seqno = iv.key.seqno.saturating_add(global_seqno);
+            iv.key.seqno = apply_global_seqno(iv.key.seqno, global_seqno);
             iv
         });
 
@@ -712,7 +740,13 @@ impl Table {
         }
 
         let global_seqno = self.global_seqno();
-        let seqno = seqno.saturating_sub(global_seqno);
+        // A query snapshot below this table's base seqno predates the table, so
+        // none of its rows are visible. `checked_sub` yields `None` there (where a
+        // saturating sub would silently clamp to 0); the seqno-range gate below
+        // then handles the in-range case.
+        let Some(seqno) = seqno.checked_sub(global_seqno) else {
+            return Ok(None);
+        };
 
         if self.metadata.seqnos.0 >= seqno {
             return Ok(None);
@@ -733,7 +767,7 @@ impl Table {
             // Exclusive snapshot visibility (see `Table::get`): serve only when
             // the cached newest version is strictly older than the query seqno.
             if iv.key.seqno < seqno {
-                let s = iv.key.seqno.saturating_add(global_seqno);
+                let s = apply_global_seqno(iv.key.seqno, global_seqno);
                 return Ok(Some((iv.key.value_type, s, iv.value)));
             }
         }
@@ -756,7 +790,7 @@ impl Table {
 
         // Translate table-local seqno back to the global coordinate, mirroring
         // `Table::get`.
-        let item = item.map(|(vt, s, v)| (vt, s.saturating_add(global_seqno), v));
+        let item = item.map(|(vt, s, v)| (vt, apply_global_seqno(s, global_seqno), v));
 
         #[cfg(feature = "metrics")]
         {
@@ -842,7 +876,13 @@ impl Table {
         }
 
         let global_seqno = self.global_seqno();
-        let seqno = seqno.saturating_sub(global_seqno);
+        // A query snapshot below this table's base seqno predates the table, so
+        // none of its rows are visible. `checked_sub` yields `None` there (where a
+        // saturating sub would silently clamp to 0); the seqno-range gate below
+        // then handles the in-range case.
+        let Some(seqno) = seqno.checked_sub(global_seqno) else {
+            return Ok(None);
+        };
 
         if self.metadata.seqnos.0 >= seqno {
             return Ok(None);
@@ -860,7 +900,7 @@ impl Table {
 
         // Translate table-local seqno back to global coordinate (see Table::get).
         let result = result.map(|(mut iv, block)| {
-            iv.key.seqno = iv.key.seqno.saturating_add(global_seqno);
+            iv.key.seqno = apply_global_seqno(iv.key.seqno, global_seqno);
             (iv, block)
         });
 
@@ -1100,7 +1140,12 @@ impl Table {
         );
 
         let global_seqno = self.global_seqno();
-        let table_seqno = seqno.saturating_sub(global_seqno);
+        // A query snapshot below this table's base seqno predates the table, so no
+        // key is visible. `checked_sub` yields `None` there (a saturating sub would
+        // clamp to 0); the seqno-range gate below handles the in-range case.
+        let Some(table_seqno) = seqno.checked_sub(global_seqno) else {
+            return Ok(results);
+        };
 
         // Table is entirely above the snapshot — no key is visible.
         if self.metadata.seqnos.0 >= table_seqno {
@@ -1225,7 +1270,7 @@ impl Table {
                             // compare results across tables /
                             // memtables (matches Table::get's
                             // contract).
-                            item.key.seqno = item.key.seqno.saturating_add(global_seqno);
+                            item.key.seqno = apply_global_seqno(item.key.seqno, global_seqno);
                             results[key_idx] = Some(item);
                         }
                         p += 1;
@@ -1234,7 +1279,7 @@ impl Table {
                         if let Some(mut item) =
                             data_block.point_read(key, table_seqno, &self.comparator)?
                         {
-                            item.key.seqno = item.key.seqno.saturating_add(global_seqno);
+                            item.key.seqno = apply_global_seqno(item.key.seqno, global_seqno);
                             results[key_idx] = Some(item);
                             p += 1;
                         } else {
@@ -1465,10 +1510,16 @@ impl Table {
         // non-ingested table `global_seqno` is 0 and both translations are
         // no-ops.
         let global_seqno = self.global_seqno();
+        // Here the saturating clamp to 0 is the INTENDED result, not the silent
+        // overflow-masking the point-read path avoids: a lower bound below the
+        // offset means "start at the table's first entry", so clamping the
+        // translated lower bound to 0 is exactly right.
         let local_target = target_seqno.saturating_sub(global_seqno);
-        // Upper bound in local coords. `SeqNo::MAX` (the unbounded case) stays
-        // MAX so every entry passes; a real watermark maps below the offset to
-        // 0, correctly excluding the whole table.
+        // Upper bound in local coords. `SeqNo::MAX` (the unbounded case) maps to
+        // `MAX - global_seqno`, still far above any reachable local seqno, so every
+        // entry passes (effectively unbounded); a real watermark below the offset
+        // clamps to 0, which (via the empty-window check below) correctly excludes
+        // the whole table. The clamp is intentional, hence saturating not checked.
         let local_end = end_seqno.saturating_sub(global_seqno);
 
         // Empty window (e.g. a caught-up CDC poller whose target equals the
@@ -1527,7 +1578,7 @@ impl Table {
                     continue;
                 }
                 if value.key.seqno >= local_target && value.key.seqno < local_end {
-                    value.key.seqno = value.key.seqno.saturating_add(global_seqno);
+                    value.key.seqno = apply_global_seqno(value.key.seqno, global_seqno);
                     out.push(value);
                 }
             }

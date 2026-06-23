@@ -307,3 +307,67 @@ fn kv_separated_range_includes_blob_bytes() {
         stats.bytes
     );
 }
+
+/// A bulk-ingested table carries a non-zero base sequence number; at a query
+/// snapshot below that base the table postdates the snapshot and must contribute
+/// nothing to the estimate. The read path translates the snapshot with
+/// `checked_sub` and skips such a table; a saturating sub would clamp to 0 and
+/// over-count it as if every entry were visible at seqno 0.
+#[test]
+fn ingested_table_excluded_from_stats_below_its_base_seqno() {
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()
+    .expect("open");
+
+    // Bulk-ingest one run; the ingested table's base seqno becomes non-zero.
+    let mut ingestion = any.ingestion().expect("ingestion");
+    for i in 0..100u32 {
+        ingestion.write(key(i), vec![b'v'; 50]).expect("write");
+    }
+    ingestion.finish().expect("finish");
+
+    let AnyTree::Standard(tree) = any else {
+        panic!("expected standard tree");
+    };
+    let range = key(0)..=key(99);
+
+    // Snapshot 0 predates the ingested table's base seqno: it is excluded.
+    let below = tree
+        .approximate_range_stats(range.clone(), 0)
+        .expect("stats below base");
+    assert_eq!(
+        below.key_count, 0,
+        "a table postdating the query snapshot must not be counted",
+    );
+    assert_eq!(below.bytes, 0, "an excluded table contributes no bytes");
+
+    // The cardinality estimator shares the same checked_sub visibility gate.
+    let below_cardinality = tree
+        .approximate_range_cardinality(range.clone(), 0)
+        .expect("cardinality below base");
+    assert_eq!(
+        below_cardinality.rows, 0,
+        "a table postdating the query snapshot contributes no cardinality",
+    );
+
+    // At the max snapshot the ingested rows are visible and counted.
+    let visible = tree
+        .approximate_range_stats(range.clone(), SeqNo::MAX)
+        .expect("stats visible");
+    assert!(
+        visible.key_count > 0,
+        "the ingested rows are counted when visible",
+    );
+    let visible_cardinality = tree
+        .approximate_range_cardinality(range, SeqNo::MAX)
+        .expect("cardinality visible");
+    assert!(
+        visible_cardinality.rows > 0,
+        "the ingested rows contribute cardinality when visible",
+    );
+}
