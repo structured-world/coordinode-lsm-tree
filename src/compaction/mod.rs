@@ -153,4 +153,17 @@ pub trait CompactionStrategy: Send + Sync {
 
     /// Decides on what to do based on the current state of the LSM-tree's levels
     fn choose(&self, version: &Version, config: &Config, state: &CompactionState) -> Choice;
+
+    /// Estimated bytes pending compaction: on-disk data currently sitting above
+    /// its level's target size that must eventually be rewritten downward (a
+    /// `RocksDB` `estimate-pending-compaction-bytes` analog). A scheduler /
+    /// tiering consumer reads it as a compaction-debt signal; `0` means the tree
+    /// is at or below its target shape.
+    ///
+    /// The default is `0` for strategies without a size-target notion of debt
+    /// (FIFO, drop-range, major one-shot); the leveled strategy overrides it with
+    /// the per-level overflow sum.
+    fn pending_compaction_bytes(&self, _version: &Version) -> u64 {
+        0
+    }
 }
