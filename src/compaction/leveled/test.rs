@@ -184,6 +184,41 @@ fn leveled_l0_reached_limit() -> crate::Result<()> {
 }
 
 #[test]
+fn compaction_debt_flags_l0_over_threshold_then_clears() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let strategy = Arc::new(Strategy::default());
+
+    // Empty tree: no level is above target, so nothing is pending.
+    assert_eq!(tree.compaction_debt(&*strategy), 0);
+
+    // Four overlapping L0 runs reach the default L0 threshold (4): the whole of
+    // L0 is pending a merge into L1, so the debt estimate is non-zero.
+    for i in 0..4u8 {
+        tree.insert("a", "v", 0);
+        tree.insert([b'k', i].as_slice(), "v", 0);
+        tree.insert("z", "v", 0);
+        tree.flush_active_memtable(0)?;
+    }
+    assert!(
+        tree.compaction_debt(&*strategy) > 0,
+        "L0 at the file threshold should report pending compaction debt",
+    );
+
+    // After compaction the runs collapse into a single L1 table below target,
+    // clearing the debt.
+    tree.compact(strategy, 0)?;
+    assert_eq!(tree.compaction_debt(&*Arc::new(Strategy::default())), 0);
+
+    Ok(())
+}
+
+#[test]
 fn leveled_l0_reached_limit_disjoint() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
     let tree = Config::new(

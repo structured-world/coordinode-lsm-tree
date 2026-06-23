@@ -47,7 +47,9 @@ On-disk format version **V5**. V5 introduces a wire-format break for filter bloc
 - Block-based tables with optional compression (none / LZ4 / Zstd) and prefix truncation.
 - Per-table data block size policy and per-table compression policy.
 - Optional **zstd dictionary compression**, trained per-table or per-column for small (4-64 KiB) blocks and blob files.
+- Optional **columnar PAX block layout** (`columnar` feature): per-row-group column-major storage of key / seqno / value-type / value sub-columns, for column-projection pushdown, vectorized predicate scans, per-column dictionaries, and positional delete-bitmap MVCC.
 - Optional **block-level encryption at rest**: AES-256-GCM, key supplied by caller.
+- Optional **per-block error-correcting parity** (`page_ecc` feature): Reed-Solomon shards or per-word SEC-DED after each block, with on-read self-healing, three-state verification, and a patrol scrub for latent bit-rot.
 - Optional per-table block hash indexes for faster point lookups [[3]](#footnotes).
 - Optional partitioned block index & filters for better cache efficiency [[1]](#footnotes).
 - Per-level filter/index block pinning configuration.
@@ -64,9 +66,17 @@ On-disk format version **V5**. V5 introduces a wire-format break for filter bloc
   during the checkpoint (deletions are deferred), and the resulting
   directory opens as an independent tree.
 
+### Introspection
+
+- Storage footprint and entry shape (`storage_stats`): used / capacity / available bytes, item & table counts, average on-disk entry size, reclaimable-bytes estimate, and a coarse storage status.
+- Per-level and per-segment size / entry / access stats (`level_segment_stats`) for tiering and placement decisions.
+- Approximate range size (`approximate_range_stats`) and cardinality + selectivity (`approximate_range_cardinality`) for query planning, estimated from block-index offsets and per-block zone maps without reading data blocks.
+- Compaction-debt estimate (`compaction_debt`): pending-compaction bytes above each level's target, a scheduler / tiering signal.
+
 ### Internals
 
 - 100% stable Rust, MSRV 1.92.
+- `no_std` + `alloc` support: the core engine (read / write / compaction / recovery over the injected `Fs`) compiles without `std`; std-only conveniences (threaded fan-out, system clock, the std filesystem backend) stay behind the `std` feature.
 - No FFI: zstd via [`structured-zstd`](https://github.com/structured-world/structured-zstd) (pure-Rust), LZ4 via `lz4_flex`, AES via `aes-gcm`.
 - Pluggable `Fs` trait: back the engine on the standard filesystem, on `io_uring`, on an in-memory `MemFs`, or on a custom implementation.
 - Pluggable `CompressionProvider` for third-party codecs.
@@ -110,15 +120,20 @@ millisecond tailing of in-flight updates. For arbitrary historical-seqno queries
 
 ## Feature flags
 
-All optional, all off by default. The default build is the minimal core (no compression, no encryption, std filesystem). Every flag below is gated because it pulls in extra dependencies or runtime overhead.
+All optional. The default build (`std` + `parallel`) is the minimal core: no compression, no encryption, std filesystem, with the built-in parallel-compression executor. Every capability flag below is gated because it pulls in extra dependencies or runtime overhead. Turning `std` off (with `alloc`) selects the `no_std` build (see the platform note in `Cargo.toml`).
 
 | Flag | Pulls in | Enable when |
 |---|---|---|
 | `lz4` | [`lz4_flex`](https://github.com/PSeitz/lz4_flex) | Block compression wanted, decompression latency matters more than ratio. |
 | `zstd` | [`structured-zstd`](https://github.com/structured-world/structured-zstd) (pure-Rust, no FFI) | Block compression wanted, ratio matters more than absolute decompression speed. Supports `CompressionType::Zstd` and dictionary-mode `CompressionType::ZstdDict`. Decompression is ~2-3.5× slower than C reference. |
+| `columnar` | (pure code, `alloc` only) | Columnar PAX SST block layout: each row-group stores its key / seqno / value-type / value sub-columns contiguously, for column-projection pushdown, vectorized predicate scans, per-column zstd dictionaries, and positional delete-bitmap MVCC. Enable for analytical or wide-row scans where reading a subset of columns dominates. |
 | `encryption` | `aes-gcm`, `rand_chacha` | AES-256-GCM block encryption at rest. Keys are caller-managed. |
+| `page_ecc` | [`reed-solomon-simd`](https://github.com/AndersTrier/reed-solomon-simd) | Per-block error-correcting parity (Reed-Solomon shards or per-word SEC-DED) after each on-disk block, with on-read self-healing, three-state verification, and a patrol scrub. Enable for latent-bit-rot protection on long-lived cold data. |
+| `crc32c` | [`crc32c`](https://github.com/zowens/crc32c) | Selects the hardware-accelerated CRC32C block checksum (`ChecksumType::Crc32c`) over the default XXH3. Enable when interop or CPU profile favours CRC32C. |
 | `io-uring` (linux only) | [`io-uring`](https://github.com/tokio-rs/io-uring) | I/O-bound workload on a modern Linux kernel: adds an `io_uring` `Fs` backend. |
+| `io-uring-raw` (linux only) | [`syscalls`](https://github.com/jasonwhite/syscalls) | Pure-Rust `no_std` io_uring `Fs` backend on raw Linux syscalls (no libc), for embedded or sandboxed Linux targets without `std`. |
 | `bytes_1` | [`bytes`](https://github.com/tokio-rs/bytes) | Consumer already speaks `bytes::Bytes` (tokio/hyper/tonic stack) and wants zero-copy interop with engine slices. |
+| `parallel` (default-on) | [`rayon`](https://github.com/rayon-rs/rayon) | Built-in rayon-backed parallel block-compression executor. `std`-only; the `CompactionSpawner` trait lets a caller inject a custom executor without this flag. |
 | `metrics` | (none) | Production observability or profiling. Compiles in atomic counters around block I/O, filter probes, compaction, and cache hit rates (`tree.metrics()`). Small but non-zero hot-path cost. |
 | `ribbon-serde` | `serde` | Snapshotting the internal `RibbonFilterRepr` for debugging or out-of-band transport. Not used by the on-disk format. |
 

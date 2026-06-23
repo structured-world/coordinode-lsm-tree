@@ -64,3 +64,72 @@ fn compute_on_empty_version_maps_compaction_flag_to_status() {
     let idle = compute_storage_stats(&version, false, true).unwrap();
     assert_eq!(idle.status, StorageStatus::Healthy);
 }
+
+#[test]
+fn storage_statistics_is_object_safe_via_mock() -> crate::Result<()> {
+    // A non-tree mock implements the trait, proving it is object-safe and usable
+    // for planner / tiering tests without a real engine behind it.
+    struct MockStats;
+    impl StorageStatistics for MockStats {
+        fn storage_stats(&self) -> crate::Result<StorageStats> {
+            Ok(stats_with_avg(6))
+        }
+        fn level_segment_stats(&self) -> crate::Result<Vec<LevelStats>> {
+            Ok(Vec::new())
+        }
+        fn compaction_debt(&self, _strategy: &dyn crate::compaction::CompactionStrategy) -> u64 {
+            123
+        }
+        #[cfg(feature = "metrics")]
+        fn cache_stats(&self) -> crate::CacheStats {
+            crate::CacheStats {
+                hits: 9,
+                misses: 1,
+                hit_rate: 0.9,
+                size_bytes: 10,
+                capacity_bytes: 100,
+            }
+        }
+    }
+
+    let mock = MockStats;
+    let stats: &dyn StorageStatistics = &mock;
+    assert_eq!(stats.storage_stats()?.avg_entry_on_disk_bytes, 6);
+    assert!(stats.level_segment_stats()?.is_empty());
+    let strategy = crate::compaction::leveled::Strategy::default();
+    assert_eq!(stats.compaction_debt(&strategy), 123);
+    #[cfg(feature = "metrics")]
+    assert_eq!(stats.cache_stats().hits, 9);
+    Ok(())
+}
+
+#[test]
+fn storage_statistics_blanket_impl_over_real_tree() -> crate::Result<()> {
+    // Drive the blanket `impl<T: AbstractTree> StorageStatistics for T` over a
+    // real tree (the mock above bypasses it), and a non-leveled strategy through
+    // the trait-default `pending_compaction_bytes` of 0.
+    use crate::{AbstractTree, Config, SequenceNumberCounter, StorageStatistics};
+
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    for i in 0..50u32 {
+        tree.insert(format!("k{i:04}"), "v", 0);
+    }
+    tree.flush_active_memtable(0)?;
+
+    let s: &dyn StorageStatistics = &tree;
+    assert_eq!(s.storage_stats()?.item_count, 50);
+    let level_items: u64 = s.level_segment_stats()?.iter().map(|l| l.item_count).sum();
+    assert_eq!(level_items, 50);
+    // FIFO has no size-target debt notion, so the trait default 0 applies.
+    let fifo = crate::compaction::fifo::Strategy::new(u64::MAX, None);
+    assert_eq!(s.compaction_debt(&fifo), 0);
+    #[cfg(feature = "metrics")]
+    assert!(s.cache_stats().capacity_bytes > 0);
+    Ok(())
+}

@@ -181,6 +181,21 @@ pub trait AbstractTree: sealed::Sealed {
         crate::storage_stats::compute_level_segment_stats(&self.current_version())
     }
 
+    /// Estimated bytes pending compaction under `strategy`: on-disk data above
+    /// its level's target that must eventually be rewritten downward (a `RocksDB`
+    /// `estimate-pending-compaction-bytes` analog), a compaction-debt signal for a
+    /// scheduler / tiering consumer.
+    ///
+    /// The strategy is supplied by the caller because the engine does not own a
+    /// configured compaction strategy (it is injected per compaction run); a
+    /// `&dyn` keeps this object-safe. Returns `0` for strategies without a
+    /// size-target notion of debt (FIFO, drop-range), or when the tree is at or
+    /// below its target shape. See
+    /// [`CompactionStrategy::pending_compaction_bytes`](crate::compaction::CompactionStrategy::pending_compaction_bytes).
+    fn compaction_debt(&self, strategy: &dyn crate::compaction::CompactionStrategy) -> u64 {
+        strategy.pending_compaction_bytes(&self.current_version())
+    }
+
     /// Storage admission gate: `Ok(())` if a write may proceed, or
     /// [`Error::StorageFull`](crate::Error::StorageFull) if the tree is
     /// over budget and should be treated as read-only.
@@ -593,6 +608,17 @@ pub trait AbstractTree: sealed::Sealed {
     /// Returns the metrics structure.
     #[cfg(feature = "metrics")]
     fn metrics(&self) -> &Arc<crate::Metrics>;
+
+    /// A point-in-time [`CacheStats`](crate::CacheStats) snapshot of block-cache
+    /// effectiveness (cumulative hit / miss counts and rate) and occupancy
+    /// (current size against capacity).
+    ///
+    /// The stable, owned observability view over the block cache, so a consumer
+    /// can read cache health without holding the mutable
+    /// [`metrics`](Self::metrics) handle. Counts are cumulative since process
+    /// start; derive a rate over an interval from the delta between two polls.
+    #[cfg(feature = "metrics")]
+    fn cache_stats(&self) -> crate::CacheStats;
 
     /// Acquires the flush lock which is required to call [`Tree::flush`].
     fn get_flush_lock(&self) -> FlushGuard<'_>;

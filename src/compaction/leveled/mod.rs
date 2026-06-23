@@ -468,6 +468,32 @@ impl CompactionStrategy for Strategy {
         ]
     }
 
+    fn pending_compaction_bytes(&self, version: &Version) -> u64 {
+        // Read-only snapshot: an empty compaction state (nothing hidden) so the
+        // targets reflect the full current footprint; no level shift.
+        let targets = self.compute_level_targets(version, 0, &CompactionState::default());
+        let mut debt = 0u64;
+        for (idx, level) in version.iter_levels().enumerate() {
+            // Each term is at most one level's on-disk size, so the running sum is
+            // bounded by the tree's total footprint (disk capacity) and cannot
+            // overflow u64 — plain addition.
+            if idx == 0 {
+                // L0 is count-triggered: once it reaches the L0 file threshold its
+                // whole size is pending a merge into L1. Use the table (file)
+                // count, matching the `choose` trigger; `iter().count()` would
+                // count runs, undercounting a multi-table L0 run.
+                if level.table_count() >= usize::from(self.l0_threshold) {
+                    debt += level.size();
+                }
+            } else if let Some(&target) = targets.get(idx) {
+                // max(0, size - target): the bytes above this level's target are
+                // the work that must be rewritten downward.
+                debt += level.size().saturating_sub(target);
+            }
+        }
+        debt
+    }
+
     #[expect(clippy::too_many_lines)]
     fn choose(&self, version: &Version, config: &Config, state: &CompactionState) -> Choice {
         // Tie the invariant to the caller-supplied `Config::level_count`
