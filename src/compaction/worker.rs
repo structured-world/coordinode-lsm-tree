@@ -22,8 +22,12 @@ use crate::{
     stop_signal::StopSignal,
     tree::inner::TreeId,
     version::{Run, SuperVersions, Version},
-    vlog::{BlobFileId, BlobFileMergeScanner, BlobFileScanner, BlobFileWriter},
+    vlog::{BlobFileMergeScanner, BlobFileScanner, BlobFileWriter},
 };
+// `BlobFileId` only appears in the std-only parallel sub-compaction + tight-space
+// relocation paths; gate the import so the no_std build does not see it unused.
+#[cfg(feature = "std")]
+use crate::vlog::BlobFileId;
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
@@ -559,7 +563,6 @@ fn create_bounded_compaction_stream<'a>(
 /// bottommost seqno-zeroing: a key covered by any tombstone keeps its real
 /// seqno. Includes tombstones from tables NOT in the current compaction, so
 /// "beyond output level" coverage is respected.
-#[cfg(feature = "std")]
 fn collect_version_tombstones(version: &Version) -> Vec<crate::range_tombstone::RangeTombstone> {
     version
         .iter_levels()
@@ -1999,17 +2002,15 @@ fn merge_tables(
 
     // Whole-version tombstones for compaction-time RT application (drop covered
     // KVs in the merge) and the bottommost seqno-zeroing gate; gathered from
-    // every level so coverage outside this compaction is respected. Both the
-    // whole-version scan and the seqno-zeroer wrapper are std-only, so the
-    // bottommost RT-application + zeroing is gated here; without std the merge
-    // stream is iterated directly (see the zeroer wrap below).
-    #[cfg(feature = "std")]
+    // every level so coverage outside this compaction is respected. The scan and
+    // the seqno-zeroer wrapper are `core` + `alloc`, so the bottommost
+    // RT-application + zeroing runs on the `no_std` serial path too (see the
+    // zeroer wrap below).
     let zeroing_tombstones = if is_last_level {
         collect_version_tombstones(&current_super_version.version)
     } else {
         Vec::new()
     };
-    #[cfg(feature = "std")]
     if is_last_level {
         merge_iter = merge_iter.with_range_tombstone_application(
             zeroing_tombstones.clone(),
@@ -2139,10 +2140,10 @@ fn merge_tables(
             compactor.write_range_tombstones(&input_range_tombstones);
         }
 
-        // Bottommost seqno-zeroing is std-only (the zeroer and the whole-version
-        // tombstone scan live behind the std feature); without std, iterate the
-        // filtered merge stream directly.
-        #[cfg(feature = "std")]
+        // Bottommost seqno-zeroing: at the last level, entries below the GC
+        // watermark and not covered by any range tombstone get seqno 0. The
+        // zeroer and the whole-version tombstone scan are `core` + `alloc`, so
+        // this runs on the `no_std` serial path too.
         let merge_iter = super::seqno_zeroer::BottommostSeqnoZeroer::new(
             merge_iter,
             is_last_level,

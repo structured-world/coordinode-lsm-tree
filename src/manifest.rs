@@ -6,10 +6,7 @@ use crate::{
     FormatVersion, TreeType, checksum::ChecksumType, manifest_blocks::reader::ManifestArchiveReader,
 };
 #[cfg(not(feature = "std"))]
-use alloc::{
-    borrow::ToOwned,
-    string::{String, ToString},
-};
+use alloc::{borrow::ToOwned, string::String};
 
 pub struct Manifest {
     pub version: FormatVersion,

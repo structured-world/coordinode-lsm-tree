@@ -16,7 +16,6 @@ pub(crate) mod heal;
 pub(crate) mod major;
 pub(crate) mod movedown;
 pub(crate) mod pulldown;
-#[cfg(feature = "std")]
 pub(crate) mod seqno_zeroer;
 pub(crate) mod state;
 pub(crate) mod stream;
