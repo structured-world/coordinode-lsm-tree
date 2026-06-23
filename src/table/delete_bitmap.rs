@@ -14,8 +14,8 @@
 //!
 //! Rows are grouped into fixed [`CHUNK_ROWS`]-row chunks (a bulk delete of a
 //! whole chunk is therefore O(1), not O(rows)). Each non-empty chunk is stored
-//! either as a sorted [`Container::Sparse`] array of in-chunk offsets, or, once
-//! it holds more than [`SPARSE_MAX`] rows, as a [`Container::Dense`] bitset.
+//! either as a sorted `Container::Sparse` array of in-chunk offsets, or, once
+//! it holds more than `SPARSE_MAX` rows, as a `Container::Dense` bitset.
 //! This mirrors a Roaring bitmap's array/bitset containers but at a fixed
 //! 2048-row granularity tuned to the columnar block size. Empty chunks are not
 //! stored.

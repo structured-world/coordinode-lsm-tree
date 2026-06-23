@@ -7,7 +7,7 @@
 //! It drives two pushdowns:
 //!
 //! - **Block skip** ([`ColumnRangePredicate::can_skip_block`]): compare the
-//!   predicate bounds against the per-block zone-map ([`ColumnStats`]) min / max
+//!   predicate bounds against the per-block zone-map (`ColumnStats`) min / max
 //!   (#502). A block whose column range is disjoint from the predicate cannot
 //!   contain a matching row, so it is skipped without ever decoding it.
 //! - **Row filter** ([`ColumnRangePredicate::matching_rows`]): evaluate the
