@@ -151,6 +151,13 @@ fn create_data_block_reader(
 /// Per-SST positional delete state for a columnar iterator: the delete-bitmap
 /// plus each data block's first global row position (block-index order), so a
 /// reconstructed block can drop its deleted rows by position.
+#[cfg_attr(
+    not(feature = "columnar"),
+    allow(
+        dead_code,
+        reason = "read only on the columnar delete-bitmap reconstruction path"
+    )
+)]
 pub struct DeleteMask {
     pub(crate) bitmap: Arc<crate::table::delete_bitmap::DeleteBitmap>,
     pub(crate) block_start_rows: Arc<crate::HashMap<u64, u32>>,
@@ -206,6 +213,13 @@ pub struct Iter {
     /// Positional delete mask for a columnar SST with materialized deletes;
     /// `None` when the segment has no deletes. Applied during block
     /// reconstruction so deleted rows never reach the reader.
+    #[cfg_attr(
+        not(feature = "columnar"),
+        allow(
+            dead_code,
+            reason = "set + read only on the columnar delete-bitmap reconstruction path"
+        )
+    )]
     delete_mask: Option<DeleteMask>,
 
     index_initialized: bool,
@@ -867,33 +881,4 @@ impl DoubleEndedIterator for Iter {
 }
 
 #[cfg(all(test, feature = "zstd"))]
-mod promote_tests {
-    use super::promote_by_fraction;
-
-    #[test]
-    fn promote_by_fraction_triggers_at_or_above_threshold() {
-        // 75% threshold: 3 of 4 blocks == exactly 75% → promote.
-        assert!(promote_by_fraction(3, 4));
-        // 6 of 8 == 75% → promote.
-        assert!(promote_by_fraction(6, 8));
-        // Full coverage always promotes.
-        assert!(promote_by_fraction(10, 10));
-    }
-
-    #[test]
-    fn promote_by_fraction_holds_below_threshold() {
-        // 2 of 4 == 50% → keep partial.
-        assert!(!promote_by_fraction(2, 4));
-        // 1 of 8 → keep partial.
-        assert!(!promote_by_fraction(1, 8));
-        // 5 of 8 == 62.5% → keep partial.
-        assert!(!promote_by_fraction(5, 8));
-    }
-
-    #[test]
-    fn promote_by_fraction_zero_total_never_promotes() {
-        // No layout (total == 0): the partial tier does not apply, never promote.
-        assert!(!promote_by_fraction(0, 0));
-        assert!(!promote_by_fraction(5, 0));
-    }
-}
+mod promote_tests;

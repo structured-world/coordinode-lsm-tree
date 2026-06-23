@@ -2,10 +2,17 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
-use crate::{checksum::Checksum, coding::Decode, table::TableId, table::block::Header};
-use std::path::{Path, PathBuf};
+use crate::path::{Path, PathBuf};
+use crate::{checksum::Checksum, coding::Decode, io, table::TableId, table::block::Header};
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
 
 /// Describes a single integrity error found during verification.
+///
+/// Full-file integrity (hashing whole files by path) uses `std::fs` directly and
+/// is gated to `std`; the `no_std` verify path is block-level over the injected
+/// [`Fs`](crate::fs::Fs) backend (see [`verify_block_checksums`]).
+#[cfg(feature = "std")]
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum IntegrityError {
@@ -38,12 +45,13 @@ pub enum IntegrityError {
         /// Path to the file that could not be read
         path: PathBuf,
         /// The underlying I/O error
-        error: std::io::Error,
+        error: io::Error,
     },
 }
 
-impl std::fmt::Display for IntegrityError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+#[cfg(feature = "std")]
+impl core::fmt::Display for IntegrityError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::SstFileCorrupted {
                 table_id,
@@ -72,8 +80,9 @@ impl std::fmt::Display for IntegrityError {
     }
 }
 
-impl std::error::Error for IntegrityError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+#[cfg(feature = "std")]
+impl core::error::Error for IntegrityError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::IoError { error, .. } => Some(error),
             _ => None,
@@ -87,6 +96,7 @@ impl std::error::Error for IntegrityError {
 /// the number of files *attempted* — including those that produced I/O
 /// errors. This lets callers reconcile the total against the manifest
 /// even when some files were unreadable.
+#[cfg(feature = "std")]
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct IntegrityReport {
@@ -100,6 +110,7 @@ pub struct IntegrityReport {
     pub errors: Vec<IntegrityError>,
 }
 
+#[cfg(feature = "std")]
 impl IntegrityReport {
     /// Returns `true` if no errors were found.
     #[must_use]
@@ -115,6 +126,7 @@ impl IntegrityReport {
 }
 
 /// Computes a streaming XXH3 128-bit checksum for a file without loading it entirely into memory.
+#[cfg(feature = "std")]
 fn stream_checksum(path: &std::path::Path) -> std::io::Result<Checksum> {
     use std::io::Read;
 
@@ -151,6 +163,7 @@ fn stream_checksum(path: &std::path::Path) -> std::io::Result<Checksum> {
 ///
 /// Per-file errors (e.g., unreadable files, checksum mismatches) are collected
 /// into [`IntegrityReport::errors`] — the scan always runs to completion.
+#[cfg(feature = "std")]
 #[must_use]
 pub fn verify_integrity(tree: &impl crate::AbstractTree) -> IntegrityReport {
     let version = tree.current_version();
@@ -179,7 +192,7 @@ pub fn verify_integrity(tree: &impl crate::AbstractTree) -> IntegrityReport {
             Err(e) => {
                 report.errors.push(IntegrityError::IoError {
                     path: (*table.path).clone(),
-                    error: e,
+                    error: e.into(),
                 });
             }
         }
@@ -205,7 +218,7 @@ pub fn verify_integrity(tree: &impl crate::AbstractTree) -> IntegrityReport {
             Err(e) => {
                 report.errors.push(IntegrityError::IoError {
                     path: path.to_path_buf(),
-                    error: e,
+                    error: e.into(),
                 });
             }
         }
@@ -236,7 +249,7 @@ pub enum BlockVerifyError {
         /// Path to the SST file.
         path: PathBuf,
         /// Underlying I/O / format error.
-        error: std::io::Error,
+        error: io::Error,
     },
 
     /// A block header at the given offset failed to parse — either
@@ -290,7 +303,7 @@ pub enum BlockVerifyError {
         /// Kept as `std::io::Error` (matching `SstFileUnreadable`) so
         /// `ErrorKind` / OS code stay available to callers and so
         /// `Error::source()` produces a coherent chain.
-        error: std::io::Error,
+        error: io::Error,
     },
 
     /// SFA TOC-level corruption: a named section's length / position
@@ -320,8 +333,8 @@ pub enum BlockVerifyError {
     },
 }
 
-impl std::fmt::Display for BlockVerifyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for BlockVerifyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::SstFileUnreadable {
                 table_id,
@@ -384,8 +397,8 @@ impl std::fmt::Display for BlockVerifyError {
     }
 }
 
-impl std::error::Error for BlockVerifyError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for BlockVerifyError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::SstFileUnreadable { error, .. } | Self::DataReadError { error, .. } => {
                 Some(error)
@@ -411,7 +424,7 @@ pub enum BlockVerifyWarning {
         /// Table the warning applies to.
         table_id: TableId,
         /// On-disk path of the SST.
-        path: std::path::PathBuf,
+        path: PathBuf,
     },
 }
 
@@ -463,7 +476,7 @@ pub struct VerifyOptions {
     /// Minimum delay each worker waits after finishing one SST before taking
     /// the next, capping I/O pressure on a production box during a scrub.
     /// `None` (default) runs at full speed.
-    pub throttle: Option<std::time::Duration>,
+    pub throttle: Option<core::time::Duration>,
 }
 
 impl Default for VerifyOptions {
@@ -485,7 +498,7 @@ impl VerifyOptions {
 
     /// Sets the per-worker inter-SST throttle delay.
     #[must_use]
-    pub const fn throttle(mut self, delay: std::time::Duration) -> Self {
+    pub const fn throttle(mut self, delay: core::time::Duration) -> Self {
         self.throttle = Some(delay);
         self
     }
@@ -608,62 +621,75 @@ pub fn verify_block_checksums_with(
     let version = tree.current_version();
     let tables: Vec<crate::table::Table> = version.iter_tables().cloned().collect();
 
-    let workers = options.parallelism.max(1).min(tables.len().max(1));
+    // `parallelism` + `throttle` only drive the std thread-fan-out + sleep below.
+    #[cfg(not(feature = "std"))]
+    let _ = options;
 
-    // Sequential fast path: no thread spawn, deterministic table order.
-    if workers <= 1 {
-        let mut report = BlockVerifyReport::default();
-        for (idx, table) in tables.iter().enumerate() {
-            merge_report(&mut report, scan_one_table(table));
-            // Inter-SST pause only: skip the sleep after the final table so a
-            // finished scrub returns promptly instead of waiting one extra
-            // throttle interval (which makes a done single-table scrub look hung).
-            if idx + 1 < tables.len()
-                && let Some(delay) = options.throttle
-            {
-                std::thread::sleep(delay);
+    // Parallel scan (std only): up to `parallelism` worker threads pull SSTs from
+    // a shared cursor and scan them concurrently. A `no_std` build has no
+    // threads, so it always takes the serial path below.
+    #[cfg(feature = "std")]
+    {
+        let workers = options.parallelism.max(1).min(tables.len().max(1));
+        if workers > 1 {
+            let cursor = core::sync::atomic::AtomicUsize::new(0);
+            let partials = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..workers)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            let mut local = BlockVerifyReport::default();
+                            let mut idx =
+                                cursor.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            while let Some(table) = tables.get(idx) {
+                                merge_report(&mut local, scan_one_table(table));
+                                // Claim the next SST first; only pause if this
+                                // worker actually has another table to scan.
+                                idx = cursor.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                                if tables.get(idx).is_some()
+                                    && let Some(delay) = options.throttle
+                                {
+                                    std::thread::sleep(delay);
+                                }
+                            }
+                            local
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| match handle.join() {
+                        Ok(local) => local,
+                        // A scrub worker panicking is a bug, not a corruption
+                        // finding — propagate rather than drop its SSTs.
+                        Err(payload) => std::panic::resume_unwind(payload),
+                    })
+                    .collect::<Vec<_>>()
+            });
+
+            let mut report = BlockVerifyReport::default();
+            for partial in partials {
+                merge_report(&mut report, partial);
             }
+            return report;
         }
-        return report;
     }
 
-    let cursor = std::sync::atomic::AtomicUsize::new(0);
-    let partials = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut local = BlockVerifyReport::default();
-                    let mut idx = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    while let Some(table) = tables.get(idx) {
-                        merge_report(&mut local, scan_one_table(table));
-                        // Claim the next SST first; only pause if this worker
-                        // actually has another table to scan, so no worker sleeps
-                        // after its final SST.
-                        idx = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if tables.get(idx).is_some()
-                            && let Some(delay) = options.throttle
-                        {
-                            std::thread::sleep(delay);
-                        }
-                    }
-                    local
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| match handle.join() {
-                Ok(local) => local,
-                // A scrub worker panicking is a bug, not a corruption finding —
-                // propagate it rather than silently dropping that worker's SSTs.
-                Err(payload) => std::panic::resume_unwind(payload),
-            })
-            .collect::<Vec<_>>()
-    });
-
+    // Serial scan: every `no_std` build, and `std` with `parallelism <= 1`. Scans
+    // SSTs in deterministic table order, each over its own `Fs` handle.
     let mut report = BlockVerifyReport::default();
-    for partial in partials {
-        merge_report(&mut report, partial);
+    for (idx, table) in tables.iter().enumerate() {
+        merge_report(&mut report, scan_one_table(table));
+        // Inter-SST throttle (std only — `no_std` has no sleep primitive). Skip
+        // after the final table so a finished scrub returns promptly instead of
+        // waiting one extra throttle interval.
+        #[cfg(feature = "std")]
+        if idx + 1 < tables.len()
+            && let Some(delay) = options.throttle
+        {
+            std::thread::sleep(delay);
+        }
+        #[cfg(not(feature = "std"))]
+        let _ = idx;
     }
     report
 }
@@ -774,8 +800,8 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
             report.errors.push(BlockVerifyError::SstFileUnreadable {
                 table_id: 0,
                 path: path.to_path_buf(),
-                error: std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
+                error: io::Error::new(
+                    io::ErrorKind::InvalidData,
                     "could not decode the SST meta block to determine the ECC scheme \
                      (corrupt meta, or an encrypted SST with no key out-of-band); \
                      skipping the block walk — use verify_block_checksums on a live \
@@ -790,7 +816,7 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
             report.errors.push(BlockVerifyError::SstFileUnreadable {
                 table_id: 0,
                 path: path.to_path_buf(),
-                error,
+                error: error.into(),
             });
             return report;
         }
@@ -898,8 +924,12 @@ fn scan_sst_blocks(
     max_enc_overhead: u32,
     ecc: Option<crate::table::block::EccParams>,
     ecc_unrecognized: bool,
-) -> std::io::Result<PerFileScan> {
-    use std::io::{BufReader, Seek, SeekFrom};
+) -> io::Result<PerFileScan> {
+    use io::BufReader;
+    #[cfg(not(feature = "std"))]
+    use io::{Seek, SeekFrom};
+    #[cfg(feature = "std")]
+    use std::io::{Seek, SeekFrom};
 
     let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
 
@@ -908,13 +938,13 @@ fn scan_sst_blocks(
     // offset; each per-section walk below explicitly seeks to the
     // section's `pos()` first so the unknown post-trailer position
     // doesn't matter.
-    // Wrap the sfa error as the inner cause of the io::Error rather
-    // than format!-stringifying it, so the original variant
-    // (InvalidHeader / InvalidVersion / ChecksumMismatch / underlying
-    // Io) stays reachable via `Error::source()` for downstream
-    // diagnostics. crate::sfa::Error implements `std::error::Error`.
+    // Capture the sfa error's Debug form in the message. crate::io::Error is
+    // message-only (no source chain) so it stays portable on no_std; the `{:?}`
+    // repr keeps the original variant (InvalidHeader / InvalidVersion /
+    // ChecksumMismatch / underlying Io) visible for downstream diagnostics, just
+    // as a string rather than a downcastable `Error::source()`.
     let sfa_reader = crate::sfa::Reader::from_reader(&mut file)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, alloc::format!("{e:?}")))?;
     let toc = sfa_reader.toc();
     // SFA TOC layout for an SST. The writer opens the file and
     // immediately calls `crate::sfa::Writer::start("data")`, so the first
@@ -1069,7 +1099,7 @@ fn block_data_length_cap(max_enc_overhead: u32) -> u64 {
 /// buffer, counters, error sink) into one borrow so the function
 /// signature stays under clippy's argument-count cap.
 struct WalkCtx<'a> {
-    reader: &'a mut std::io::BufReader<Box<dyn crate::fs::FsFile>>,
+    reader: &'a mut io::BufReader<Box<dyn crate::fs::FsFile>>,
     table_id: TableId,
     path: &'a Path,
     data_buf: &'a mut Vec<u8>,
@@ -1099,6 +1129,9 @@ struct WalkCtx<'a> {
 }
 
 fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) {
+    #[cfg(not(feature = "std"))]
+    use io::Read;
+    #[cfg(feature = "std")]
     use std::io::Read;
 
     let mut offset = start_offset;
@@ -1283,7 +1316,7 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
                 path: ctx.path.to_path_buf(),
                 offset,
                 data_length: header.data_length,
-                error: e,
+                error: e.into(),
             });
             return;
         }
@@ -1306,34 +1339,53 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         // read path, so the scrub discards it — but it MUST still skip exactly
         // `parity_len` bytes or the next iteration mis-reads parity as a header.
         if parity_len > 0 {
-            match std::io::copy(
-                &mut ctx.reader.by_ref().take(parity_len),
-                &mut std::io::sink(),
-            ) {
-                Ok(n) if n == parity_len => {}
-                Ok(n) => {
-                    ctx.errors.push(BlockVerifyError::DataReadError {
-                        table_id: ctx.table_id,
-                        path: ctx.path.to_path_buf(),
-                        offset,
-                        data_length: header.data_length,
-                        error: std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            format!("parity trailer truncated: read {n} of {parity_len} bytes"),
-                        ),
-                    });
-                    return;
+            // Discard the parity trailer so the cursor lands on the next block's
+            // header. `crate::io` has no `copy`/`sink`, so drain exactly
+            // `parity_len` bytes through a small scratch buffer.
+            let mut scratch = [0u8; 512];
+            let mut remaining = parity_len;
+            // A short read (EOF before `parity_len`) and an underlying read error
+            // are the same outcome for the scrub: the trailer cannot be skipped,
+            // so collapse both into one `Err` and report a single DataReadError.
+            let drain: io::Result<()> = loop {
+                if remaining == 0 {
+                    break Ok(());
                 }
-                Err(e) => {
-                    ctx.errors.push(BlockVerifyError::DataReadError {
-                        table_id: ctx.table_id,
-                        path: ctx.path.to_path_buf(),
-                        offset,
-                        data_length: header.data_length,
-                        error: e,
-                    });
-                    return;
+                let want =
+                    usize::try_from(remaining.min(scratch.len() as u64)).unwrap_or(scratch.len());
+                let (head, _) = scratch.split_at_mut(want);
+                match ctx.reader.read(head) {
+                    Ok(0) => {
+                        break Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            alloc::format!(
+                                "parity trailer truncated: read {} of {parity_len} bytes",
+                                parity_len - remaining
+                            ),
+                        ));
+                    }
+                    Ok(n) => remaining -= n as u64,
+                    Err(e) => {
+                        // EINTR is transient: retry the read rather than aborting
+                        // the parity skip with a spurious DataReadError (matches
+                        // the Interrupted handling in read_exact above). Convert
+                        // first so the kind check is uniform across std/no_std.
+                        let e: io::Error = e.into();
+                        if e.kind() != io::ErrorKind::Interrupted {
+                            break Err(e);
+                        }
+                    }
                 }
+            };
+            if let Err(error) = drain {
+                ctx.errors.push(BlockVerifyError::DataReadError {
+                    table_id: ctx.table_id,
+                    path: ctx.path.to_path_buf(),
+                    offset,
+                    data_length: header.data_length,
+                    error,
+                });
+                return;
             }
         }
 
@@ -1349,873 +1401,4 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used, reason = "test assertions")]
-mod block_verify_tests {
-    use super::*;
-    // `AbstractTree` looks unused at a glance but the test bodies below
-    // call `.insert()`, `.flush_active_memtable()`, and
-    // `.current_version()` on `AnyTree` values — those are trait
-    // methods, not inherent ones, so the trait MUST be in scope for
-    // method resolution. Removing the import is a compile error, not
-    // a clippy nit.
-    use crate::{
-        AbstractTree, Config, SequenceNumberCounter, compression::CompressionType,
-        config::CompressionPolicy,
-    };
-    use std::io::{Read, Seek, SeekFrom, Write};
-    // Shadows the built-in `#[test]` so `#[test]`-annotated functions
-    // below resolve to `test_log::test` (which wires up logging for
-    // failing tests). This matches every other test module in the
-    // crate — the import looks unused at a glance but the proc-macro
-    // attribute name resolution consumes it.
-    use test_log::test;
-
-    fn populate_tree(dir: &std::path::Path, items: usize) {
-        let cfg = Config::new(
-            dir,
-            SequenceNumberCounter::default(),
-            SequenceNumberCounter::default(),
-        )
-        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None));
-        let tree = cfg.open().unwrap();
-        for i in 0u64..items as u64 {
-            let key = format!("k{i:08}");
-            let val = format!("v{i:08}");
-            tree.insert(key.as_bytes(), val.as_bytes(), 1 + i);
-        }
-        tree.flush_active_memtable(1 + items as u64).unwrap();
-        // Drop the tree so all files are closed before the test that
-        // mutates SST bytes on disk reopens them via Verify.
-        drop(tree);
-    }
-
-    fn reopen_tree(dir: &std::path::Path) -> crate::AnyTree {
-        Config::new(
-            dir,
-            SequenceNumberCounter::default(),
-            SequenceNumberCounter::default(),
-        )
-        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
-        .open()
-        .unwrap()
-    }
-
-    /// Populates a tree with per-KV checksums enabled (`AllLevels`) so the
-    /// flushed SST carries data blocks with the `KV_CHECKSUM_FOOTER` flag
-    /// set and a per-entry checksum footer.
-    fn populate_tree_kv_checked(dir: &std::path::Path, items: usize) {
-        use crate::AbstractTree;
-        use crate::runtime_config::KvChecksumPolicy;
-
-        let cfg = Config::new(
-            dir,
-            SequenceNumberCounter::default(),
-            SequenceNumberCounter::default(),
-        )
-        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None));
-        let any = cfg.open().unwrap();
-        let crate::AnyTree::Standard(tree) = any else {
-            panic!("expected Standard tree");
-        };
-        tree.update_runtime_config(|c| {
-            c.kv_checksums = KvChecksumPolicy::AllLevels;
-        })
-        .unwrap();
-        for i in 0u64..items as u64 {
-            let key = format!("k{i:08}");
-            let val = format!("v{i:08}");
-            tree.insert(key.as_bytes(), val.as_bytes(), 1 + i);
-        }
-        tree.flush_active_memtable(1 + items as u64).unwrap();
-        drop(tree);
-    }
-
-    #[test]
-    fn verify_block_checksums_clean_tree_has_no_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        populate_tree(dir.path(), 1_000);
-
-        let tree = reopen_tree(dir.path());
-        let report = verify_block_checksums(&tree);
-        assert!(
-            report.is_ok(),
-            "expected clean tree to verify with zero errors, got {:?}",
-            report.errors
-        );
-        assert!(
-            report.blocks_scanned > 0,
-            "expected at least one block scanned",
-        );
-        assert!(
-            report.sst_files_scanned >= 1,
-            "expected at least one SST scanned",
-        );
-    }
-
-    #[cfg(feature = "page_ecc")]
-    #[test]
-    fn verify_block_checksums_clean_page_ecc_tree_has_no_errors() {
-        // Regression: with page_ecc on, every SST data / index / filter block
-        // carries a Reed-Solomon parity trailer after its payload. SST blocks
-        // omit the block_flags byte, so the scrub learns parity presence from
-        // the per-SST descriptor and must skip `expected_parity_len(data_length)`
-        // bytes per block. Without that skip the walk mis-reads parity as the
-        // next block's header and reports spurious HeaderCorrupted. Enough items
-        // to spill multiple data blocks so cross-block alignment is exercised.
-        use crate::AbstractTree;
-
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let any = Config::new(
-                dir.path(),
-                SequenceNumberCounter::default(),
-                SequenceNumberCounter::default(),
-            )
-            .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
-            .page_ecc(true)
-            .ecc_scheme(crate::runtime_config::EccScheme::ReedSolomon {
-                data_shards: 4,
-                parity_shards: 2,
-            })
-            .open()
-            .unwrap();
-            for i in 0u64..2_000 {
-                let key = format!("k{i:08}");
-                let val = format!("v{i:08}");
-                any.insert(key.as_bytes(), val.as_bytes(), 1 + i);
-            }
-            any.flush_active_memtable(2_001).unwrap();
-            drop(any);
-        }
-
-        let tree = Config::new(
-            dir.path(),
-            SequenceNumberCounter::default(),
-            SequenceNumberCounter::default(),
-        )
-        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
-        .page_ecc(true)
-        .ecc_scheme(crate::runtime_config::EccScheme::ReedSolomon {
-            data_shards: 4,
-            parity_shards: 2,
-        })
-        .open()
-        .unwrap();
-        let report = verify_block_checksums(&tree);
-        assert!(
-            report.is_ok(),
-            "page_ecc tree must verify with zero errors (parity trailers skipped \
-             per block), got {:?}",
-            report.errors,
-        );
-        assert!(
-            report.blocks_scanned > 1,
-            "expected multiple blocks scanned to exercise cross-block alignment",
-        );
-    }
-
-    #[cfg(feature = "page_ecc")]
-    #[test]
-    fn verify_block_checksums_clean_nondefault_ecc_tree_has_no_errors() {
-        // Regression: the scrub must size each SST's parity trailer from the
-        // per-SST descriptor scheme, NOT a hardcoded RS(4,2). A table written
-        // with a non-default scheme (RS(8,2), different shard size → different
-        // trailer length) is mis-walked if the scrub assumes RS(4,2): the
-        // wrong trailer length mis-aligns the next block and reports spurious
-        // corruption. With descriptor-driven sizing the walk stays aligned.
-        use crate::AbstractTree;
-
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let any = Config::new(
-                dir.path(),
-                SequenceNumberCounter::default(),
-                SequenceNumberCounter::default(),
-            )
-            .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
-            .page_ecc(true)
-            .ecc_scheme(crate::runtime_config::EccScheme::ReedSolomon {
-                data_shards: 8,
-                parity_shards: 2,
-            })
-            .open()
-            .unwrap();
-            for i in 0u64..2_000 {
-                let key = format!("k{i:08}");
-                let val = format!("v{i:08}");
-                any.insert(key.as_bytes(), val.as_bytes(), 1 + i);
-            }
-            any.flush_active_memtable(2_001).unwrap();
-            drop(any);
-        }
-
-        let tree = Config::new(
-            dir.path(),
-            SequenceNumberCounter::default(),
-            SequenceNumberCounter::default(),
-        )
-        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
-        .page_ecc(true)
-        .ecc_scheme(crate::runtime_config::EccScheme::ReedSolomon {
-            data_shards: 8,
-            parity_shards: 2,
-        })
-        .open()
-        .unwrap();
-        let report = verify_block_checksums(&tree);
-        assert!(
-            report.is_ok(),
-            "non-default-scheme ECC tree must verify with zero errors \
-             (parity sized from the descriptor, not RS(4,2)), got {:?}",
-            report.errors,
-        );
-        assert!(
-            report.blocks_scanned > 1,
-            "expected multiple blocks scanned to exercise cross-block alignment",
-        );
-    }
-
-    /// Returns the on-disk path of the first SST registered with the
-    /// tree's current version. Drops the tree before returning so the
-    /// caller can mutate the file safely (no descriptor cache, no
-    /// file lock). Going through `current_version().iter_tables()`
-    /// instead of a filesystem walk keeps the test coupled to the
-    /// verifier's actual input set — a new on-disk file under the
-    /// tree directory cannot accidentally become the corruption
-    /// target.
-    fn pick_first_sst_path(dir: &std::path::Path) -> std::path::PathBuf {
-        let tree = reopen_tree(dir);
-        let path = tree
-            .current_version()
-            .iter_tables()
-            .next()
-            .map(|table| (*table.path).clone())
-            .expect("at least one populated SST file");
-        drop(tree);
-        path
-    }
-
-    #[test]
-    fn verify_block_checksums_detects_flipped_byte_in_data_block() {
-        use crate::table::block::Header;
-        let dir = tempfile::tempdir().unwrap();
-        populate_tree(dir.path(), 1_000);
-
-        let sst_path = pick_first_sst_path(dir.path());
-
-        // The flip target is the first byte AFTER the first block's
-        // Header — that lands squarely inside the data segment of the
-        // first data block, so the header's own XXH3 stays valid (no
-        // HeaderCorrupted) but the data XXH3 will now mismatch.
-        let flip_offset = Header::MIN_LEN as u64;
-        {
-            let mut f = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&sst_path)
-                .unwrap();
-            f.seek(SeekFrom::Start(flip_offset)).unwrap();
-            let mut byte = [0u8; 1];
-            f.read_exact(&mut byte).unwrap();
-            byte[0] ^= 0xFF;
-            f.seek(SeekFrom::Start(flip_offset)).unwrap();
-            f.write_all(&byte).unwrap();
-            f.sync_all().unwrap();
-        }
-
-        let tree = reopen_tree(dir.path());
-        let report = verify_block_checksums(&tree);
-        assert!(
-            !report.is_ok(),
-            "expected corruption to surface as report errors, got {report:?}",
-        );
-        let has_data_corruption = report.errors.iter().any(|e| {
-            matches!(
-                e,
-                BlockVerifyError::DataCorrupted { path, .. } if path == &sst_path,
-            )
-        });
-        assert!(
-            has_data_corruption,
-            "expected a DataCorrupted error for {}, got {:?}",
-            sst_path.display(),
-            report.errors,
-        );
-    }
-
-    #[test]
-    fn verify_kv_checksums_clean_kv_checked_tree_passes() {
-        // A tree written with per-KV checksums enabled must pass the
-        // per-KV scrub with no error.
-        let dir = tempfile::tempdir().unwrap();
-        populate_tree_kv_checked(dir.path(), 500);
-
-        let tree = reopen_tree(dir.path());
-        let crate::AnyTree::Standard(tree) = tree else {
-            panic!("expected Standard tree");
-        };
-        verify_kv_checksums(&tree).expect("clean kv-checked tree must pass per-KV scrub");
-    }
-
-    #[test]
-    fn verify_kv_checked_detects_corrupted_digest_under_valid_block_checksum() {
-        // The per-KV verifier must catch a divergence that the block-level
-        // XXH3 does NOT: corrupt a stored digest, then write the block so its
-        // block-level checksum is computed over the already-corrupted bytes.
-        // The block therefore loads cleanly (block checksum valid) and only
-        // the per-KV recompute disagrees. (Flipping a payload byte in the
-        // file without recomputing the block checksum would be caught at
-        // load, never reaching the per-KV path — which would prove nothing.)
-        use crate::InternalValue;
-        use crate::ValueType::Value;
-        use crate::comparator::default_comparator;
-        use crate::runtime_config::ChecksumAlgorithm;
-        use crate::table::block::header::block_flags;
-        use crate::table::block::{Block, BlockIdentity, BlockTransform, BlockType, kv_checksum};
-        use crate::table::data_block::DataBlock;
-
-        let algo = ChecksumAlgorithm::Xxh3_64;
-        let items = [
-            InternalValue::from_components(b"alpha".to_vec(), b"one".to_vec(), 3, Value),
-            InternalValue::from_components(b"bravo".to_vec(), b"two".to_vec(), 2, Value),
-        ];
-        let digests: Vec<u64> = items
-            .iter()
-            .map(|it| kv_checksum::kv_digest(it, algo).expect("xxh3 always available"))
-            .collect();
-
-        let mut payload = Vec::new();
-        DataBlock::encode_kv_checked_into(&mut payload, &items, &digests, algo, 2, 0.0).unwrap();
-
-        // Corrupt the first stored digest (its first byte sits right after the
-        // inner payload, where the digest array begins).
-        let inner_len = kv_checksum::split_inner(&payload).unwrap().len();
-        *payload.get_mut(inner_len).expect("digest array byte") ^= 0xFF;
-
-        // Write with a VALID block-level checksum over the corrupted payload.
-        // Data blocks omit the `block_flags` byte (footer presence is a per-SST
-        // descriptor property), so the KV_CHECKSUM_FOOTER flag passed here is
-        // dropped on encode — the footer rides inside the payload structurally,
-        // and `verify_kv_checked` splits it without consulting the header bit.
-        let id = BlockIdentity::for_test(0, BlockType::Data);
-        let mut buf = Vec::new();
-        Block::write_into_with_flags(
-            &mut buf,
-            &payload,
-            id,
-            &BlockTransform::PLAIN,
-            block_flags::KV_CHECKSUM_FOOTER,
-        )
-        .unwrap();
-
-        // Block loads fine (block-level checksum matches the corrupted bytes).
-        let block = Block::from_reader(&mut &buf[..], id, &BlockTransform::PLAIN).unwrap();
-
-        // Only the per-KV verifier catches the bad digest. `None` skips the
-        // algorithm cross-check — this test exercises the digest-mismatch path.
-        let err =
-            DataBlock::verify_kv_checked(&block.data, block.header, default_comparator(), None)
-                .expect_err("corrupted stored digest must fail the per-KV verifier");
-        assert!(
-            matches!(err, crate::Error::ChecksumMismatch { .. }),
-            "expected ChecksumMismatch, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn verify_kv_checked_rejects_non_data_block_type() {
-        // The scrub verifies only Data blocks. A header whose block_type is
-        // not Data (corruption or a caller bug) must be rejected with
-        // InvalidTag, not silently coerced to Data and verified as if it were
-        // a data block — coercion would defeat the scrub's purpose.
-        use crate::InternalValue;
-        use crate::ValueType::Value;
-        use crate::comparator::default_comparator;
-        use crate::runtime_config::ChecksumAlgorithm;
-        use crate::table::block::header::block_flags;
-        use crate::table::block::{Block, BlockIdentity, BlockTransform, BlockType, kv_checksum};
-        use crate::table::data_block::DataBlock;
-
-        let algo = ChecksumAlgorithm::Xxh3_64;
-        let items = [
-            InternalValue::from_components(b"alpha".to_vec(), b"one".to_vec(), 3, Value),
-            InternalValue::from_components(b"bravo".to_vec(), b"two".to_vec(), 2, Value),
-        ];
-        let digests: Vec<u64> = items
-            .iter()
-            .map(|it| kv_checksum::kv_digest(it, algo).expect("xxh3 always available"))
-            .collect();
-
-        let mut payload = Vec::new();
-        DataBlock::encode_kv_checked_into(&mut payload, &items, &digests, algo, 2, 0.0).unwrap();
-
-        let id = BlockIdentity::for_test(0, BlockType::Data);
-        let mut buf = Vec::new();
-        Block::write_into_with_flags(
-            &mut buf,
-            &payload,
-            id,
-            &BlockTransform::PLAIN,
-            block_flags::KV_CHECKSUM_FOOTER,
-        )
-        .unwrap();
-        let block = Block::from_reader(&mut &buf[..], id, &BlockTransform::PLAIN).unwrap();
-
-        // The footer + inner bytes form a valid data block, so only the
-        // block_type gate can catch a tampered type: flip it to a non-Data
-        // variant and require InvalidTag.
-        let mut bad_header = block.header;
-        bad_header.block_type = BlockType::Index;
-        let err = DataBlock::verify_kv_checked(&block.data, bad_header, default_comparator(), None)
-            .expect_err("non-Data block_type must be rejected, not coerced");
-        assert!(
-            matches!(err, crate::Error::InvalidTag(("BlockType", _))),
-            "expected InvalidTag(BlockType), got {err:?}"
-        );
-    }
-
-    /// Exercises the out-of-band wrapper on a real clean SST file.
-    /// `verify_sst_file` is the entry point sst-dump calls; this pins
-    /// that it stamps `sst_files_scanned = 1`, reports no errors on a
-    /// healthy file, and propagates the block count through the
-    /// `StdFs` -> `scan_sst_blocks` -> `BlockVerifyReport` path.
-    #[test]
-    fn verify_sst_file_clean_file_has_no_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        populate_tree(dir.path(), 1_000);
-        let sst_path = pick_first_sst_path(dir.path());
-
-        let report = verify_sst_file(&sst_path);
-        assert!(
-            report.is_ok(),
-            "expected clean SST to verify with zero errors, got {:?}",
-            report.errors,
-        );
-        assert_eq!(
-            report.sst_files_scanned, 1,
-            "wrapper must always stamp sst_files_scanned = 1",
-        );
-        assert!(
-            report.blocks_scanned > 0,
-            "expected at least one block scanned in a populated SST",
-        );
-    }
-
-    /// Exercises the file-open failure branch (the only path through
-    /// `verify_sst_file` that converts an underlying `io::Error` into
-    /// a `BlockVerifyError::SstFileUnreadable`). A missing file is the
-    /// simplest trigger; an unreadable-due-to-permissions trigger
-    /// would require root or chmod-induced state and is overkill for
-    /// pinning the variant routing.
-    #[test]
-    fn verify_sst_file_missing_file_reports_unreadable() {
-        // Build the missing-file path under a fresh tempdir so it
-        // resolves the same way on Linux / macOS / Windows runners.
-        // A hardcoded Unix-style absolute path would either skip the
-        // test on Windows (no `/this/...` semantics) or risk a flaky
-        // pass if the path happened to exist.
-        let dir = tempfile::tempdir().unwrap();
-        let missing_path = dir.path().join("does-not-exist-sst-12345.sst");
-        // Sanity: tempdir() guarantees the directory is empty.
-        assert!(
-            !missing_path.exists(),
-            "tempdir entry must be absent for this test to exercise the missing-file branch",
-        );
-
-        let report = verify_sst_file(&missing_path);
-        assert_eq!(
-            report.sst_files_scanned, 1,
-            "wrapper stamps sst_files_scanned = 1 even on file-open failure \
-             so callers see the attempt was made",
-        );
-        assert_eq!(
-            report.blocks_scanned, 0,
-            "no blocks could be walked because the file couldn't be opened",
-        );
-        assert_eq!(
-            report.errors.len(),
-            1,
-            "expected exactly one error, got {:?}",
-            report.errors,
-        );
-        let err = report.errors.first().unwrap();
-        assert!(
-            matches!(
-                err,
-                BlockVerifyError::SstFileUnreadable { table_id: 0, path, .. }
-                    if path == &missing_path,
-            ),
-            "expected SstFileUnreadable for {}, got {err:?}",
-            missing_path.display(),
-        );
-    }
-
-    /// Pins the routing of post-header short-read failures to
-    /// `BlockVerifyError::DataReadError`. Regression guard for #315:
-    /// a refactor that collapses the `read_exact` failure branch back
-    /// into `HeaderCorrupted` (which is what a naive "any read error
-    /// inside the walker is a header problem" cleanup would do) loses
-    /// the distinction between "the file's TOC lies about where the
-    /// section ends" and "the header itself fails its own XXH3", and
-    /// downstream tooling (`sst-dump`, `repair_db`, lazy block repair)
-    /// pattern-matches on the variant to decide whether the block is
-    /// recoverable. Demoting truncated-data to `HeaderCorrupted` would
-    /// make those tools fall back to whole-section discard instead of
-    /// per-block surgery.
-    ///
-    /// Setup forges an SFA archive whose `data` TOC entry claims a
-    /// section length large enough for one full block (header + N
-    /// bytes), but the underlying file contains only the header.
-    /// Result: `Header::decode_from` succeeds (the header's XXH3
-    /// matches its own bytes), the bounds check passes (`data_length`
-    /// fits within the lied section length), and the data-segment
-    /// `read_exact` hits EOF after consuming a handful of trailing
-    /// TOC + trailer bytes. The only valid landing variant is
-    /// `DataReadError`.
-    #[test]
-    #[expect(
-        clippy::indexing_slicing,
-        clippy::cast_possible_truncation,
-        reason = "synthetic SFA forgery — offsets are all in-bounds by \
-                  construction (we just wrote the bytes ourselves), and \
-                  the u64 -> usize cast cannot overflow on any target \
-                  the test runs on (the forged archive is < 1 KiB)"
-    )]
-    fn walk_block_region_reports_data_read_error_on_truncated_data_segment() {
-        use crate::coding::Encode;
-        use crate::fs::{Fs, FsOpenOptions, MemFs};
-        use crate::table::block::{BlockType, Header};
-
-        // Trailer layout (38 bytes at the tail of an SFA archive):
-        //   MAGIC(4) | version(1) | csum_type(1) | toc_checksum(16) | toc_pos(8) | toc_len(8)
-        const TRAILER_LEN: usize = 4 + 1 + 1 + 16 + 8 + 8;
-        const DATA_LENGTH: u32 = 4096;
-        const HEADER_LEN: u64 = Header::MIN_LEN as u64;
-
-        let header = Header {
-            // Arbitrary sentinel; the walker reaches `read_exact` and
-            // bails BEFORE any data-segment XXH3 comparison, so this
-            // value is never checked.
-            checksum: Checksum::from_raw(0xDEAD_BEEF_DEAD_BEEF),
-            data_length: DATA_LENGTH,
-            uncompressed_length: DATA_LENGTH,
-            ..Header::test_dummy(BlockType::Data)
-        };
-
-        // Build a minimal SFA archive: one section "data" containing
-        // exactly one Header (33 bytes) and zero following data bytes.
-        let mut archive_bytes: Vec<u8> = Vec::new();
-        {
-            let mut writer =
-                crate::sfa::Writer::from_writer(std::io::Cursor::new(&mut archive_bytes));
-            writer.start("data").unwrap();
-            writer.write_all(&header.encode_into_vec()).unwrap();
-            writer.finish().unwrap();
-        }
-
-        // Parse the trailer at the file tail.
-        let trailer_start = archive_bytes.len() - TRAILER_LEN;
-        let toc_pos_bytes: [u8; 8] = archive_bytes[trailer_start + 22..trailer_start + 30]
-            .try_into()
-            .unwrap();
-        let toc_len_bytes: [u8; 8] = archive_bytes[trailer_start + 30..trailer_start + 38]
-            .try_into()
-            .unwrap();
-        let toc_pos = u64::from_le_bytes(toc_pos_bytes) as usize;
-        let toc_len = u64::from_le_bytes(toc_len_bytes) as usize;
-
-        // TOC payload layout: `TOC!`(4) | entry_count(4 LE) | entries.
-        // Each entry: pos(8 LE) | len(8 LE) | name_len(2 LE) | name.
-        // The first (only) entry begins at toc_pos + 8.
-        let first_entry_offset = toc_pos + 4 + 4;
-        let len_field_offset = first_entry_offset + 8;
-
-        // Inflate the section length so end_offset = HEADER_LEN +
-        // DATA_LENGTH. The walker then computes remaining = DATA_LENGTH
-        // (passes the bounds check), tries to `read_exact(DATA_LENGTH)`,
-        // and hits EOF after the few trailing TOC + trailer bytes.
-        let lied_len: u64 = HEADER_LEN + u64::from(DATA_LENGTH);
-        archive_bytes[len_field_offset..len_field_offset + 8]
-            .copy_from_slice(&lied_len.to_le_bytes());
-
-        // Recompute the TOC checksum (xxh3_128 over the TOC payload)
-        // and patch the trailer's stored checksum so crate::sfa::Reader still
-        // accepts the file.
-        let new_toc_checksum = crate::hash::hash128(&archive_bytes[toc_pos..toc_pos + toc_len]);
-        let csum_field_offset = trailer_start + 4 + 1 + 1;
-        archive_bytes[csum_field_offset..csum_field_offset + 16]
-            .copy_from_slice(&new_toc_checksum.to_le_bytes());
-
-        // Materialize the forged archive in MemFs and run the scanner.
-        let fs = MemFs::new();
-        let path = std::path::Path::new("/forged.sst");
-        {
-            let mut f = fs
-                .open(
-                    path,
-                    &FsOpenOptions::new().write(true).create(true).truncate(true),
-                )
-                .unwrap();
-            f.write_all(&archive_bytes).unwrap();
-        }
-
-        let table_id: TableId = 42;
-        let scan = scan_sst_blocks(&fs, path, table_id, 0, None, false)
-            .expect("forged SFA must parse cleanly");
-        assert_eq!(
-            scan.errors.len(),
-            1,
-            "expected exactly one error, got {:?}",
-            scan.errors,
-        );
-        let err = scan.errors.first().unwrap();
-        assert!(
-            matches!(
-                err,
-                BlockVerifyError::DataReadError {
-                    table_id: t,
-                    offset: 0,
-                    data_length: d,
-                    ..
-                } if *t == table_id && *d == DATA_LENGTH,
-            ),
-            "expected DataReadError {{ table_id: {table_id}, offset: 0, \
-             data_length: {DATA_LENGTH}, .. }}; got {err:?}",
-        );
-        assert_eq!(
-            scan.blocks_scanned, 1,
-            "header decoded successfully, so blocks_scanned must count this block \
-             even though the data segment read failed",
-        );
-    }
-
-    /// A block header whose own bytes extend past the section boundary must be
-    /// reported as `HeaderCorrupted`, not slip through with a clamped-to-zero
-    /// remaining payload.
-    ///
-    /// Setup forges a section whose lied length is exactly `Header::MIN_LEN`
-    /// (so the `< MIN_LEN` guard passes) and stores a `Meta` block, whose
-    /// `header_len` is `MIN_LEN + 1`. `Header::decode_from` reads the full
-    /// `MIN_LEN + 1` header bytes from the file (they are physically present,
-    /// followed by the TOC), but those bytes cross the section boundary, so the
-    /// boundary guard fires.
-    #[test]
-    #[expect(
-        clippy::indexing_slicing,
-        clippy::cast_possible_truncation,
-        reason = "synthetic SFA forgery — offsets are in-bounds by construction \
-                  and the forged archive is < 1 KiB"
-    )]
-    fn walk_block_region_reports_header_crossing_section_boundary() {
-        use crate::coding::Encode;
-        use crate::fs::{Fs, FsOpenOptions, MemFs};
-        use crate::table::block::{BlockType, Header};
-
-        const TRAILER_LEN: usize = 4 + 1 + 1 + 16 + 8 + 8;
-
-        // `Meta` blocks carry the block_flags byte, so header_len == MIN_LEN + 1.
-        let header = Header {
-            checksum: Checksum::from_raw(0xDEAD_BEEF_DEAD_BEEF),
-            data_length: 0,
-            uncompressed_length: 0,
-            ..Header::test_dummy(BlockType::Meta)
-        };
-        assert_eq!(
-            Header::header_len(BlockType::Meta) as u64,
-            Header::MIN_LEN as u64 + 1,
-        );
-
-        let mut archive_bytes: Vec<u8> = Vec::new();
-        {
-            let mut writer =
-                crate::sfa::Writer::from_writer(std::io::Cursor::new(&mut archive_bytes));
-            writer.start("data").unwrap();
-            writer.write_all(&header.encode_into_vec()).unwrap();
-            writer.finish().unwrap();
-        }
-
-        let trailer_start = archive_bytes.len() - TRAILER_LEN;
-        let toc_pos_bytes: [u8; 8] = archive_bytes[trailer_start + 22..trailer_start + 30]
-            .try_into()
-            .unwrap();
-        let toc_len_bytes: [u8; 8] = archive_bytes[trailer_start + 30..trailer_start + 38]
-            .try_into()
-            .unwrap();
-        let toc_pos = u64::from_le_bytes(toc_pos_bytes) as usize;
-        let toc_len = u64::from_le_bytes(toc_len_bytes) as usize;
-
-        let first_entry_offset = toc_pos + 4 + 4;
-        let len_field_offset = first_entry_offset + 8;
-
-        // Lie that the section is exactly MIN_LEN bytes: one byte short of the
-        // Meta header, so the header decode crosses the section boundary.
-        let lied_len: u64 = Header::MIN_LEN as u64;
-        archive_bytes[len_field_offset..len_field_offset + 8]
-            .copy_from_slice(&lied_len.to_le_bytes());
-
-        let new_toc_checksum = crate::hash::hash128(&archive_bytes[toc_pos..toc_pos + toc_len]);
-        let csum_field_offset = trailer_start + 4 + 1 + 1;
-        archive_bytes[csum_field_offset..csum_field_offset + 16]
-            .copy_from_slice(&new_toc_checksum.to_le_bytes());
-
-        let fs = MemFs::new();
-        let path = std::path::Path::new("/forged-boundary.sst");
-        {
-            let mut f = fs
-                .open(
-                    path,
-                    &FsOpenOptions::new().write(true).create(true).truncate(true),
-                )
-                .unwrap();
-            f.write_all(&archive_bytes).unwrap();
-        }
-
-        let table_id: TableId = 7;
-        let scan = scan_sst_blocks(&fs, path, table_id, 0, None, false)
-            .expect("forged SFA must parse cleanly");
-        assert_eq!(
-            scan.errors.len(),
-            1,
-            "expected exactly one error, got {:?}",
-            scan.errors,
-        );
-        let err = scan.errors.first().unwrap();
-        assert!(
-            matches!(
-                err,
-                BlockVerifyError::HeaderCorrupted { table_id: t, offset: 0, reason, .. }
-                    if *t == table_id && reason.contains("extends past the section end"),
-            ),
-            "expected a section-boundary HeaderCorrupted; got {err:?}",
-        );
-    }
-
-    /// Builds a tree with `batches` separate L0 SSTs (one flush per batch) so
-    /// the parallel scrubber actually has multiple files to fan out over.
-    fn populate_multi_sst(dir: &std::path::Path, batches: usize, per_batch: usize) {
-        let cfg = Config::new(
-            dir,
-            SequenceNumberCounter::default(),
-            SequenceNumberCounter::default(),
-        )
-        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None));
-        let tree = cfg.open().unwrap();
-        let mut seqno = 1u64;
-        for b in 0..batches {
-            for i in 0..per_batch {
-                let key = format!("b{b:03}k{i:08}");
-                tree.insert(key.as_bytes(), b"v".as_slice(), seqno);
-                seqno += 1;
-            }
-            tree.flush_active_memtable(seqno).unwrap();
-            seqno += 1;
-        }
-        drop(tree);
-    }
-
-    #[test]
-    fn verify_checksum_method_on_clean_tree_is_ok() {
-        let dir = tempfile::tempdir().unwrap();
-        populate_tree(dir.path(), 500);
-        let tree = reopen_tree(dir.path());
-        let report = tree.verify_checksum();
-        assert!(report.is_ok(), "clean tree must verify clean: {report:?}");
-        assert!(report.sst_files_scanned >= 1);
-        assert!(report.blocks_scanned >= 1);
-    }
-
-    #[test]
-    fn verify_checksum_with_parallel_matches_sequential() {
-        let dir = tempfile::tempdir().unwrap();
-        populate_multi_sst(dir.path(), 5, 300);
-        let tree = reopen_tree(dir.path());
-
-        let seq = tree.verify_checksum_with(&VerifyOptions::default());
-        let par = tree.verify_checksum_with(&VerifyOptions::default().parallelism(4));
-
-        assert!(
-            seq.sst_files_scanned >= 2,
-            "need >1 SST to exercise parallelism, got {}",
-            seq.sst_files_scanned,
-        );
-        // Parallel run reports the SAME findings as sequential — only order may
-        // differ. Counts must match exactly.
-        assert_eq!(seq.sst_files_scanned, par.sst_files_scanned);
-        assert_eq!(seq.blocks_scanned, par.blocks_scanned);
-        assert_eq!(seq.errors.len(), par.errors.len());
-        assert!(
-            seq.is_ok() && par.is_ok(),
-            "clean tree: seq={seq:?} par={par:?}"
-        );
-    }
-
-    #[test]
-    fn verify_checksum_with_parallel_detects_corruption() {
-        use crate::table::block::Header;
-        let dir = tempfile::tempdir().unwrap();
-        populate_multi_sst(dir.path(), 4, 300);
-
-        let sst_path = pick_first_sst_path(dir.path());
-        let flip_offset = Header::MIN_LEN as u64;
-        {
-            let mut f = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&sst_path)
-                .unwrap();
-            f.seek(SeekFrom::Start(flip_offset)).unwrap();
-            let mut byte = [0u8; 1];
-            f.read_exact(&mut byte).unwrap();
-            byte[0] ^= 0xFF;
-            f.seek(SeekFrom::Start(flip_offset)).unwrap();
-            f.write_all(&byte).unwrap();
-            f.sync_all().unwrap();
-        }
-
-        let tree = reopen_tree(dir.path());
-        let report = tree.verify_checksum_with(&VerifyOptions::default().parallelism(4));
-        assert!(
-            !report.is_ok(),
-            "parallel scrub must surface the flipped byte: {report:?}",
-        );
-    }
-
-    #[test]
-    fn verify_checksum_with_throttle_completes_clean() {
-        let dir = tempfile::tempdir().unwrap();
-        populate_multi_sst(dir.path(), 3, 200);
-        let tree = reopen_tree(dir.path());
-        let opts = VerifyOptions::default()
-            .parallelism(2)
-            .throttle(std::time::Duration::from_millis(1));
-        let report = tree.verify_checksum_with(&opts);
-        assert!(
-            report.is_ok(),
-            "throttled scrub must still verify clean: {report:?}"
-        );
-        assert!(report.sst_files_scanned >= 2);
-    }
-
-    #[test]
-    fn verify_checksum_with_throttle_does_not_sleep_after_last_sst() {
-        // Regression: the throttle is an INTER-SST pause and must not fire after
-        // the final SST. A single-SST tree scrubbed with a large throttle must
-        // return promptly; the bug slept one full throttle interval after the
-        // only table, making a finished scrub look hung. Sequential path
-        // (parallelism 1, one table) so this pins the single-worker loop.
-        let dir = tempfile::tempdir().unwrap();
-        populate_multi_sst(dir.path(), 1, 50);
-        let tree = reopen_tree(dir.path());
-        let throttle = std::time::Duration::from_millis(400);
-        let opts = VerifyOptions::default().parallelism(1).throttle(throttle);
-        let start = std::time::Instant::now();
-        let report = tree.verify_checksum_with(&opts);
-        let elapsed = start.elapsed();
-        assert!(report.is_ok(), "clean single-SST scrub: {report:?}");
-        assert_eq!(report.sst_files_scanned, 1, "test needs exactly one SST");
-        assert!(
-            elapsed < throttle / 2,
-            "a single-SST scrub must not sleep the inter-SST throttle after the \
-             last table: took {elapsed:?} with a {throttle:?} throttle",
-        );
-    }
-}
+mod block_verify_tests;

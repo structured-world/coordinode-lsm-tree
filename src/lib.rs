@@ -397,12 +397,10 @@ mod write_batch;
 
 /// Integrity verification for SST and blob files.
 ///
-/// Gated behind `std` because the verify pipeline uses `std::fs`,
-/// `std::path::Path`, `std::io::{Read, Seek}` everywhere — full-file
-/// hashing and per-block walking both need real filesystem I/O. Once
-/// the `Fs`/`FsFile` trait surface is no-std-friendly (tracked under
-/// the no-std migration), the gate can be relaxed.
-#[cfg(feature = "std")]
+/// The block-level scrub (per-block + per-KV checksum walking) runs over the
+/// injected [`Fs`](crate::fs::Fs) backend through `crate::io`, so it compiles on
+/// `no_std` (serial path; the multi-threaded fan-out and the full-file
+/// hash-by-path convenience stay behind `std`).
 pub mod verify;
 
 /// Out-of-band inspection of a single SST file.

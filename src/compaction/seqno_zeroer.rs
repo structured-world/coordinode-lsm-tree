@@ -33,6 +33,8 @@
 use crate::active_tombstone_set::ActiveTombstoneSet;
 use crate::range_tombstone::RangeTombstone;
 use crate::{InternalValue, SeqNo, comparator::SharedComparator};
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 
 /// Wraps a sorted compaction output stream and zeroes the seqno of entries that
 /// are GC-collapsible (below the watermark) and not covered by any range
@@ -85,7 +87,7 @@ impl<I> BottommostSeqnoZeroer<I> {
             self.tombstones_sorted = true;
         }
         while let Some(rt) = self.tombstones.get(self.idx) {
-            if self.comparator.compare(&rt.start, key) == std::cmp::Ordering::Greater {
+            if self.comparator.compare(&rt.start, key) == core::cmp::Ordering::Greater {
                 break;
             }
             // cutoff = MAX so every tombstone is "visible": ANY covering

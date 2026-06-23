@@ -210,6 +210,13 @@ pub(super) fn prepare_table_writer(
 /// WITHOUT touching the shared version. Splitting "produce" from "install" lets
 /// N parallel sub-compactions each finalize their files independently, then a
 /// single atomic version upgrade ([`install_merge`]) merges all of them.
+#[cfg_attr(
+    not(feature = "std"),
+    allow(
+        dead_code,
+        reason = "parallel sub-compaction output; the threaded parallel install + tight-space consumers are std-gated, so unused under no_std"
+    )
+)]
 pub(super) struct ProducedOutput {
     created_tables: Vec<Table>,
     created_blob_files: Vec<BlobFile>,
@@ -225,6 +232,13 @@ pub(super) struct ProducedOutput {
     consumed_through: crate::HashMap<BlobFileId, u64>,
 }
 
+#[cfg_attr(
+    not(feature = "std"),
+    allow(
+        dead_code,
+        reason = "parallel sub-compaction output accessors; the threaded parallel install + tight-space consumers are std-gated, so unused under no_std"
+    )
+)]
 impl ProducedOutput {
     /// The SSTs this (sub-)compaction finalized on disk but has not installed.
     /// Used by the tight-space loop, which installs them via a custom version
@@ -716,92 +730,4 @@ impl CompactionFlavour for StandardCompaction {
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-    use crate::{UserKey, UserValue, vlog::ValueHandle};
-
-    #[expect(clippy::unnecessary_wraps)]
-    fn entry(
-        blob_file_id: BlobFileId,
-        key: &[u8],
-        offset: u64,
-    ) -> crate::Result<(ScanEntry, BlobFileId)> {
-        Ok((
-            ScanEntry {
-                key: UserKey::from(key),
-                offset,
-                seqno: 0,
-                uncompressed_len: 0,
-                value: UserValue::empty(),
-                // These fixtures use ordinal offsets (0, 1, 2, ...), not real byte
-                // positions, so the frame ends one ordinal past its start — never
-                // at the start itself, which would mislead any future test that
-                // inspects the consumed-frontier argument.
-                frame_end: offset + 1,
-            },
-            blob_file_id,
-        ))
-    }
-
-    #[test]
-    fn drain_blobs_simple() -> crate::Result<()> {
-        let mut iter = [
-            entry(0, b"a", 0),
-            entry(0, b"a", 1),
-            entry(0, b"a", 2),
-            entry(0, b"a", 3),
-            entry(0, b"a", 4),
-        ]
-        .into_iter()
-        .peekable();
-
-        drain_blobs(
-            &mut iter,
-            b"a",
-            &BlobIndirection {
-                size: 0,
-                vhandle: ValueHandle {
-                    blob_file_id: 0,
-                    offset: 4,
-                    on_disk_size: 0,
-                },
-            },
-            &mut |_, _| {},
-        )?;
-
-        assert_eq!(entry(0, b"a", 4)?, iter.next().unwrap()?);
-
-        Ok(())
-    }
-
-    #[test]
-    fn drain_blobs_multiple_keys() -> crate::Result<()> {
-        let mut iter = [
-            entry(0, b"a", 0),
-            entry(0, b"b", 0),
-            entry(0, b"c", 0),
-            entry(0, b"d", 0),
-            entry(0, b"e", 0),
-        ]
-        .into_iter()
-        .peekable();
-
-        drain_blobs(
-            &mut iter,
-            b"e",
-            &BlobIndirection {
-                size: 0,
-                vhandle: ValueHandle {
-                    blob_file_id: 0,
-                    offset: 0,
-                    on_disk_size: 0,
-                },
-            },
-            &mut |_, _| {},
-        )?;
-
-        assert_eq!(entry(0, b"e", 0)?, iter.next().unwrap()?);
-
-        Ok(())
-    }
-}
+mod tests;

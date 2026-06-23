@@ -225,6 +225,13 @@ impl TryFrom<u8> for TreeType {
     }
 }
 
+#[cfg_attr(
+    not(feature = "std"),
+    allow(
+        dead_code,
+        reason = "default data-folder path used only on the std-gated default-config path"
+    )
+)]
 const DEFAULT_FILE_FOLDER: &str = ".lsm.data";
 
 /// Options for key-value separation
@@ -746,6 +753,13 @@ impl Default for Config {
 
 /// Name of the lock file created in a tree directory for the cross-process
 /// exclusive directory lock.
+#[cfg_attr(
+    not(feature = "std"),
+    allow(
+        dead_code,
+        reason = "directory-lock filename used only by the std-gated lock-acquisition path"
+    )
+)]
 pub(crate) const DIRECTORY_LOCK_FILE: &str = "LOCK";
 
 /// Acquires the cross-process exclusive directory lock when `enabled`.
@@ -959,94 +973,7 @@ impl Config {
 }
 
 #[cfg(all(test, zstd_any))]
-mod tests {
-    use super::*;
-    use crate::{CompressionType, SequenceNumberCounter, compression::ZstdDictionary};
-    use alloc::sync::Arc;
-
-    #[test]
-    fn blob_zstd_dict_no_dict_is_rejected() {
-        // ZstdDict compression for blobs without providing a dictionary must fail.
-        let folder = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir failed: {err}"));
-        let cfg = Config::new(
-            folder.path(),
-            SequenceNumberCounter::default(),
-            SequenceNumberCounter::default(),
-        )
-        .with_kv_separation(Some(KvSeparationOptions::default().compression(
-            CompressionType::ZstdDict {
-                level: 3,
-                dict_id: 7,
-            },
-        )));
-
-        assert!(
-            matches!(
-                cfg.validate_zstd_dictionary(),
-                Err(crate::Error::ZstdDictMismatch {
-                    expected: 7,
-                    got: None
-                })
-            ),
-            "expected ZstdDictMismatch when no dictionary is supplied",
-        );
-    }
-
-    #[test]
-    fn blob_zstd_dict_id_mismatch_is_rejected() {
-        // ZstdDict compression with a dictionary whose id doesn't match the
-        // compression type's dict_id must fail.
-        let folder = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir failed: {err}"));
-        let dict = Arc::new(ZstdDictionary::new(b"sample training data for test"));
-        let wrong_dict_id = dict.id().wrapping_add(1);
-        let cfg = Config::new(
-            folder.path(),
-            SequenceNumberCounter::default(),
-            SequenceNumberCounter::default(),
-        )
-        .with_kv_separation(Some(
-            KvSeparationOptions::default()
-                .compression(CompressionType::ZstdDict {
-                    level: 3,
-                    dict_id: wrong_dict_id,
-                })
-                .dict(Arc::clone(&dict)),
-        ));
-
-        assert!(
-            matches!(
-                cfg.validate_zstd_dictionary(),
-                Err(crate::Error::ZstdDictMismatch { .. })
-            ),
-            "expected ZstdDictMismatch when dict_id doesn't match dictionary",
-        );
-    }
-
-    #[test]
-    fn blob_zstd_dict_matching_dict_is_accepted() {
-        // ZstdDict compression with a correctly matching dictionary must succeed.
-        let folder = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir failed: {err}"));
-        let dict = Arc::new(ZstdDictionary::new(b"sample training data for test"));
-        let cfg = Config::new(
-            folder.path(),
-            SequenceNumberCounter::default(),
-            SequenceNumberCounter::default(),
-        )
-        .with_kv_separation(Some(
-            KvSeparationOptions::default()
-                .compression(CompressionType::ZstdDict {
-                    level: 3,
-                    dict_id: dict.id(),
-                })
-                .dict(Arc::clone(&dict)),
-        ));
-
-        assert!(
-            cfg.validate_zstd_dictionary().is_ok(),
-            "matching dictionary must be accepted",
-        );
-    }
-}
+mod tests;
 
 impl Config {
     /// Returns the tables folder path and [`Fs`] backend for the given level.
@@ -1700,113 +1627,4 @@ impl Config {
 }
 
 #[cfg(test)]
-mod builder_tests {
-    use super::*;
-    use crate::SequenceNumberCounter;
-
-    #[test]
-    fn restart_interval_policies_can_be_overridden_independently() {
-        let folder = match tempfile::tempdir() {
-            Ok(folder) => folder,
-            Err(err) => panic!("tempdir failed: {err}"),
-        };
-        let cfg = Config::new(
-            folder.path(),
-            SequenceNumberCounter::default(),
-            SequenceNumberCounter::default(),
-        )
-        .data_block_restart_interval_policy(RestartIntervalPolicy::all(7))
-        .index_block_restart_interval_policy(RestartIntervalPolicy::all(3));
-
-        assert_eq!(cfg.data_block_restart_interval_policy.first(), Some(&7));
-        assert_eq!(cfg.index_block_restart_interval_policy.first(), Some(&3));
-    }
-
-    #[test]
-    fn fs_aware_builders_thread_to_initial_runtime_config() -> crate::Result<()> {
-        // The CoW-disable + reflink toggles default ON and flip via the builder
-        // (AC: "controlled via builder"). Verifies the builder threads to the
-        // initial RuntimeConfig the Tree opens with; a wiring regression would
-        // silently ignore the user's setting. Lives in the ungated builder
-        // tests (the behaviour is unrelated to zstd).
-        let folder = tempfile::tempdir()?;
-        let mk = || {
-            Config::new(
-                folder.path(),
-                SequenceNumberCounter::default(),
-                SequenceNumberCounter::default(),
-            )
-        };
-
-        let dflt = mk();
-        assert!(dflt.initial_runtime_config.disable_cow_on_sst_files);
-        assert!(dflt.initial_runtime_config.use_reflink_for_checkpoint);
-
-        let off = mk()
-            .disable_cow_on_sst_files(false)
-            .use_reflink_for_checkpoint(false);
-        assert!(!off.initial_runtime_config.disable_cow_on_sst_files);
-        assert!(!off.initial_runtime_config.use_reflink_for_checkpoint);
-        Ok(())
-    }
-
-    #[test]
-    #[should_panic(expected = "index block restart interval must be greater than zero")]
-    fn index_restart_interval_policy_rejects_zero_values() {
-        let folder = match tempfile::tempdir() {
-            Ok(folder) => folder,
-            Err(err) => panic!("tempdir failed: {err}"),
-        };
-        let _cfg = Config::new(
-            folder.path(),
-            SequenceNumberCounter::default(),
-            SequenceNumberCounter::default(),
-        )
-        .index_block_restart_interval_policy(RestartIntervalPolicy::all(0));
-    }
-
-    #[test]
-    #[should_panic(expected = "data block restart interval must be greater than zero")]
-    fn data_restart_interval_policy_rejects_zero_values() {
-        let folder = match tempfile::tempdir() {
-            Ok(folder) => folder,
-            Err(err) => panic!("tempdir failed: {err}"),
-        };
-        let _cfg = Config::new(
-            folder.path(),
-            SequenceNumberCounter::default(),
-            SequenceNumberCounter::default(),
-        )
-        .data_block_restart_interval_policy(RestartIntervalPolicy::all(0));
-    }
-
-    #[test]
-    #[should_panic(expected = "restart interval policy may not be empty")]
-    fn index_restart_interval_policy_rejects_empty() {
-        let folder = match tempfile::tempdir() {
-            Ok(folder) => folder,
-            Err(err) => panic!("tempdir failed: {err}"),
-        };
-        let _cfg = Config::new(
-            folder.path(),
-            SequenceNumberCounter::default(),
-            SequenceNumberCounter::default(),
-        )
-        .index_block_restart_interval_policy(RestartIntervalPolicy::new([]));
-    }
-
-    #[test]
-    #[should_panic(expected = "restart interval policy may not be empty")]
-    fn data_restart_interval_policy_rejects_empty() {
-        let folder = match tempfile::tempdir() {
-            Ok(folder) => folder,
-            Err(err) => panic!("tempdir failed: {err}"),
-        };
-        let _cfg = Config::new(
-            folder.path(),
-            SequenceNumberCounter::default(),
-            SequenceNumberCounter::default(),
-        )
-        .data_block_restart_interval_policy(RestartIntervalPolicy::new([]));
-    }
-}
+mod builder_tests;
