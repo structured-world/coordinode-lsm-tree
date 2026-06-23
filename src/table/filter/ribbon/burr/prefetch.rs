@@ -30,8 +30,9 @@
 pub(super) fn prefetch_read(ptr: *const u8) {
     #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: `_mm_prefetch` is SSE1 (baseline on x86_64) and a pure hint;
-        // the pointer need not be valid and the call cannot fault.
+        // `_mm_prefetch` takes the hint as a const generic in current Rust (not a
+        // runtime argument). SAFETY: it is SSE1 (baseline on x86_64) and a pure
+        // hint; the pointer need not be valid and the call cannot fault.
         unsafe {
             core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ptr.cast());
         }
