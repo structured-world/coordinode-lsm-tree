@@ -40,7 +40,7 @@ matching entry (and add one for a new subsystem).
 - **A per-block zone map conservatively bounds its block.** The stored
   `[min, max]` key range and row count cover every key in the block: a query key
   outside `[min, max]` is provably absent (so a range scan may skip the block),
-  but the bounds never exclude a key that is present — a false skip would lose
+  but the bounds never exclude a key that is present: a false skip would lose
   data. Enforced in `src/table/zone_map.rs` (+ the zone-map round-trip /
   selectivity tests).
 
@@ -48,19 +48,21 @@ matching entry (and add one for a new subsystem).
 
 - **The filter never produces a false negative.** A `BuRR` membership filter may
   report a key present when it is absent (a false positive, at rate ≈ 2⁻ʳ), but it
-  must NEVER report a key absent when it is present — a false negative would skip a
+  must NEVER report a key absent when it is present: a false negative would skip a
   real key and silently lose data on read. Enforced by the build / probe symmetry
   in `src/table/filter/ribbon/burr` (every built key reports present; the
   round-trip tests assert no built key is ever rejected).
 
 ## Block cache
 
-- **A cache lookup returns the same bytes a fresh read would.** A cached block /
-  point-read result is keyed by `(block_type, tree, table, offset)`; a hash
-  collision on that key is verified on lookup (the stored user key is compared) and
-  rejected rather than serving a wrong value. A cache hit is therefore
-  indistinguishable from a disk read. Enforced in `src/cache.rs` (the lookup-side
-  key verification) and the cache tests.
+- **A cache lookup returns the same bytes a fresh read would.** The block cache is
+  keyed by `(block_type, tree, table, offset)`, an exact physical address, so a
+  hit returns precisely that block, indistinguishable from a disk read (no key
+  comparison is needed because the offset is exact, not hashed). The separate
+  point-read (row) cache is keyed by a key *hash* (the same hash the bloom filter
+  uses), so on a hit it compares the stored `user_key` against the lookup key and
+  rejects a hash collision rather than serving a wrong value. Enforced in
+  `src/cache.rs` (`get_block` / `get_row`) and the cache tests.
 
 ## Manifest
 
@@ -87,10 +89,15 @@ matching entry (and add one for a new subsystem).
   that snapshot. Enforced in the merge / drop logic
   (`src/compaction`, `src/range_tombstone_filter.rs`).
 
-- **Sequence numbers are zeroed only at the bottommost level.** Packing a seqno to
-  zero is safe only once no older version and no snapshot below it can exist
-  (bottommost, no live snapshot beneath); doing it higher would collapse distinct
-  versions. Enforced in the bottommost seqno-zeroer (`src/compaction/seqno_zeroer.rs`).
+- **Sequence numbers are zeroed only at the bottommost level, and only when no
+  range tombstone covers the key.** Packing a seqno to zero is safe only at the
+  bottommost level with no live snapshot beneath. It additionally requires that no
+  range tombstone anywhere in the version covers the key: range tombstones are
+  applied by seqno comparison (`RT@r` suppresses `K@s` iff it covers `K` and
+  `s < r`), so zeroing `K@s` to `K@0` would let any covering tombstone with
+  `r > 0` wrongly suppress it, even one older than the original entry. Tombstones
+  are gathered from every level, not just this compaction's inputs. Enforced in the
+  bottommost seqno-zeroer (`src/compaction/seqno_zeroer.rs`).
 
 - **L0 compaction is triggered by table (file) count, and pending-compaction debt
   is measured the same way.** Both the `choose` trigger and `compaction_debt`
@@ -116,8 +123,10 @@ matching entry (and add one for a new subsystem).
 
 - **Sequence numbers are monotonic and caller-assigned.** The engine honors the
   seqno passed to `insert`; the caller draws them from a monotonic source. A read
-  at snapshot `N` sees only versions with `seqno <= N` — the newest such version
-  of each key. Enforced in the read path (`src/tree`, `src/mvcc_stream.rs`) and the
+  at read-seqno `R` sees only versions with `seqno < R` (the read seqno is an
+  exclusive upper bound); the newest such version of each key. The visible
+  watermark is published as the last applied seqno + 1, so a write at seqno `s` is
+  visible at read seqno `s + 1`. Enforced in the read path (`src/tree`, `src/mvcc_stream.rs`) and the
   seqno ordering (`src/seqno.rs`, `src/value.rs`).
 
 - **Re-applying a put / delete at its original seqno is idempotent; a merge
@@ -199,7 +208,7 @@ matching entry (and add one for a new subsystem).
 
 - **The positional delete bitmap is a pure membership set; MVCC correctness is
   established when it is built, not at read time.** The bitmap carries no per-row
-  seqno — a set bit unconditionally hides the row at that position for every reader
+  seqno: a set bit unconditionally hides the row at that position for every reader
   of the segment. The MVCC reconciliation happens at materialization time: a row's
   bit is set only once its deleting tombstone is visible to every live snapshot
   (its seqno below the compaction threshold), so a still-visible older version is
