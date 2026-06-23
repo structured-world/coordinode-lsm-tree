@@ -346,12 +346,28 @@ fn ingested_table_excluded_from_stats_below_its_base_seqno() {
     );
     assert_eq!(below.bytes, 0, "an excluded table contributes no bytes");
 
+    // The cardinality estimator shares the same checked_sub visibility gate.
+    let below_cardinality = tree
+        .approximate_range_cardinality(range.clone(), 0)
+        .expect("cardinality below base");
+    assert_eq!(
+        below_cardinality.rows, 0,
+        "a table postdating the query snapshot contributes no cardinality",
+    );
+
     // At the max snapshot the ingested rows are visible and counted.
     let visible = tree
-        .approximate_range_stats(range, SeqNo::MAX)
+        .approximate_range_stats(range.clone(), SeqNo::MAX)
         .expect("stats visible");
     assert!(
         visible.key_count > 0,
         "the ingested rows are counted when visible",
+    );
+    let visible_cardinality = tree
+        .approximate_range_cardinality(range, SeqNo::MAX)
+        .expect("cardinality visible");
+    assert!(
+        visible_cardinality.rows > 0,
+        "the ingested rows contribute cardinality when visible",
     );
 }
