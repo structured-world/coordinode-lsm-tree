@@ -102,3 +102,34 @@ fn storage_statistics_is_object_safe_via_mock() -> crate::Result<()> {
     assert_eq!(stats.cache_stats().hits, 9);
     Ok(())
 }
+
+#[test]
+fn storage_statistics_blanket_impl_over_real_tree() -> crate::Result<()> {
+    // Drive the blanket `impl<T: AbstractTree> StorageStatistics for T` over a
+    // real tree (the mock above bypasses it), and a non-leveled strategy through
+    // the trait-default `pending_compaction_bytes` of 0.
+    use crate::{AbstractTree, Config, SequenceNumberCounter, StorageStatistics};
+
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    for i in 0..50u32 {
+        tree.insert(format!("k{i:04}"), "v", 0);
+    }
+    tree.flush_active_memtable(0)?;
+
+    let s: &dyn StorageStatistics = &tree;
+    assert_eq!(s.storage_stats()?.item_count, 50);
+    let level_items: u64 = s.level_segment_stats()?.iter().map(|l| l.item_count).sum();
+    assert_eq!(level_items, 50);
+    // FIFO has no size-target debt notion, so the trait default 0 applies.
+    let fifo = crate::compaction::fifo::Strategy::new(u64::MAX, None);
+    assert_eq!(s.compaction_debt(&fifo), 0);
+    #[cfg(feature = "metrics")]
+    assert!(s.cache_stats().capacity_bytes > 0);
+    Ok(())
+}

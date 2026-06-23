@@ -53,3 +53,32 @@ fn cache_stats_reports_capacity_and_counts_after_reads() -> crate::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn cache_stats_works_for_kv_separated_tree() -> crate::Result<()> {
+    // A KV-separated (blob) tree dispatches cache_stats to BlobTree, which
+    // delegates to its index tree. Large values land in blob files.
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+    .open()?;
+    for i in 0..50u32 {
+        tree.insert(format!("k{i:04}"), vec![0u8; 4096], 0);
+    }
+    tree.flush_active_memtable(0)?;
+    for i in 0..50u32 {
+        assert!(tree.get(format!("k{i:04}"), MAX_SEQNO)?.is_some());
+    }
+
+    let cs = tree.cache_stats();
+    assert!(cs.capacity_bytes > 0, "the block cache has a capacity");
+    assert!(
+        cs.size_bytes <= cs.capacity_bytes,
+        "resident size stays within capacity",
+    );
+    Ok(())
+}
