@@ -110,7 +110,9 @@ compaction rewrites SSTs: no migration step, no format-version bump.
 
 The trade-off: there is no write-ahead log, so we do not offer WAL-style
 millisecond tailing of in-flight updates. For arbitrary historical-seqno queries
-(not just "since X"), pair with `Tree::create_checkpoint`.
+(not just "since X"), pair with `Tree::create_checkpoint`. To layer your own
+durability on top of the engine, see the external-WAL integration contract in
+[docs/external-wal.md](docs/external-wal.md).
 
 ## Limits
 
@@ -187,6 +189,11 @@ See **[docs/tight-space-compaction.md](docs/tight-space-compaction.md)** for the
 opt-in tight-space compaction: how a gated merge on a near-full disk is rewritten
 in key-range slices and reclaimed in place with hole punching, so a compaction
 completes on a disk far smaller than the data it rewrites.
+
+See **[docs/INVARIANTS.md](docs/INVARIANTS.md)** for the engine's load-bearing
+invariants grouped by subsystem (block layout, manifest, compaction,
+snapshot / seqno, range tombstones, recovery / ECC, columnar) — the rule, why it
+holds, and where it is enforced.
 
 ## Support the project
 
