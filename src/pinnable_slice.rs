@@ -37,7 +37,7 @@ pub enum PinnableSlice {
     ///
     /// The [`Block`] keeps the decompressed data alive via refcounted
     /// `Slice` / `ByteView`. `value` is a sub-slice created via
-    /// [`Slice::slice`], sharing the same backing allocation.
+    /// `Slice::slice`, sharing the same backing allocation.
     Pinned {
         /// Keeps the decompressed block buffer alive via refcount.
         _block: Block,

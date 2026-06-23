@@ -32,6 +32,31 @@
 //! let bytes = batch.encode(CodecId::Plain).unwrap();
 //! assert_eq!(ColumnBatch::decode(&bytes).unwrap(), batch);
 //! ```
+//!
+//! # Schema evolution
+//!
+//! The format is schema-free: each column self-describes its `column_id`,
+//! [`TypeTag`], and [`CodecId`], so segments written at different times may
+//! carry different column sets and still read back through one projection. Three
+//! consumer-facing conventions make that safe as a value sub-column schema
+//! evolves:
+//!
+//! - **Column-id stability.** A `column_id` is a stable field identifier: it
+//!   denotes the same logical field, with the same interpretation, in every
+//!   segment. A consumer must not repurpose an id for a different field across
+//!   schema versions, otherwise a projection for it would mean different things
+//!   in old and new segments. Retire an id rather than reusing it.
+//! - **Schema version.** The engine attaches no version to a batch. A consumer
+//!   that needs to tell schema versions apart tags them itself, e.g. with a
+//!   reserved `column_id` carrying a version number, which keeps the engine
+//!   schema-free.
+//! - **Projection over a missing column.** [`ColumnBatch::decode_projected`]
+//!   (and the table-level columnar scan built on it) returns only the projected
+//!   columns actually present in a block. Projecting a `column_id` absent from a
+//!   segment is not an error: that segment's batches simply omit the column and
+//!   the consumer applies its own default or treats it as null, while a newer
+//!   segment that carries the column returns it. Mixed old/new segments thus
+//!   coexist with no migration step.
 
 use crate::{Error, Result, Slice, ValueType, key::InternalKey, value::InternalValue};
 use alloc::vec::Vec;

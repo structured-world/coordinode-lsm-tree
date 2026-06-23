@@ -627,3 +627,123 @@ fn columnar_ingest_round_trips_a_nullable_value_subcolumn() -> lsm_tree::Result<
     );
     Ok(())
 }
+
+/// Like [`two_subcolumn_batch`] but for keys `k2`/`k3` and with a third value
+/// sub-column (id 5), modelling a newer schema version that added a field.
+fn three_subcolumn_batch() -> ColumnBatch {
+    let mut batch = entries_to_column_batch(&[
+        InternalValue::from_components(b"k2", b"ignored", 0, ValueType::Value),
+        InternalValue::from_components(b"k3", b"ignored", 0, ValueType::Value),
+    ])
+    .expect("transpose");
+    batch.columns.pop();
+    batch.columns.push(Column {
+        column_id: 3,
+        type_tag: TypeTag::Fixed(4),
+        validity: None,
+        data: vec![3, 0, 0, 0, 4, 0, 0, 0], // row 0 = 3, row 1 = 4
+    });
+    let mut bytes_data = Vec::new();
+    for off in [0u32, 2, 5] {
+        bytes_data.extend_from_slice(&off.to_le_bytes());
+    }
+    bytes_data.extend_from_slice(b"ccddd"); // row 0 = "cc", row 1 = "ddd"
+    batch.columns.push(Column {
+        column_id: 4,
+        type_tag: TypeTag::Bytes,
+        validity: None,
+        data: bytes_data,
+    });
+    batch.columns.push(Column {
+        column_id: 5,
+        type_tag: TypeTag::Fixed(4),
+        validity: None,
+        data: vec![5, 0, 0, 0, 6, 0, 0, 0], // the new field: row 0 = 5, row 1 = 6
+    });
+    batch
+}
+
+/// Schema-evolution read contract: two segments written at different schema
+/// versions coexist. The first carries value sub-columns {3, 4}; the second adds
+/// a new sub-column 5. A projection for column 5 across both segments returns it
+/// from the new-schema segment and omits it gracefully (no error) from the
+/// old-schema one, while the shared column 3 is satisfied by both. The storage
+/// layer is schema-free, so no migration is needed to read mixed old/new data.
+#[test]
+fn columnar_scan_spans_segments_with_evolving_schema() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+    })
+    .expect("enable columnar");
+
+    // Two ingestions, two segments: old schema {3,4} then new schema {3,4,5}.
+    {
+        let mut ingest = any.ingestion()?;
+        ingest.write_columnar_batch(&two_subcolumn_batch())?;
+        ingest.finish()?;
+    }
+    {
+        let mut ingest = any.ingestion()?;
+        ingest.write_columnar_batch(&three_subcolumn_batch())?;
+        ingest.finish()?;
+    }
+
+    let version = tree.current_version();
+    let tables: Vec<_> = version.iter_tables().collect();
+    assert_eq!(tables.len(), 2, "one segment per ingestion");
+
+    // Project the new column 5 across both segments. Exactly one carries it; the
+    // other returns batches without it (graceful omission, not an error).
+    let mut with_col5 = 0;
+    let mut without_col5 = 0;
+    let mut col5_data = Vec::new();
+    for table in &tables {
+        let batches = table.columnar_scan(&[5], None)?;
+        let present = batches
+            .iter()
+            .any(|b| b.columns.iter().any(|c| c.column_id == 5));
+        if present {
+            with_col5 += 1;
+            for b in &batches {
+                for c in b.columns.iter().filter(|c| c.column_id == 5) {
+                    col5_data.extend_from_slice(&c.data);
+                }
+            }
+        } else {
+            without_col5 += 1;
+        }
+    }
+    assert_eq!(with_col5, 1, "only the new-schema segment carries column 5");
+    assert_eq!(
+        without_col5, 1,
+        "the old-schema segment omits column 5 gracefully",
+    );
+    assert_eq!(
+        col5_data,
+        vec![5, 0, 0, 0, 6, 0, 0, 0],
+        "the new sub-column's bytes are the ingested values verbatim",
+    );
+
+    // The shared sub-column 3 is satisfied by BOTH segments.
+    for table in &tables {
+        let batches = table.columnar_scan(&[3], None)?;
+        assert!(
+            batches
+                .iter()
+                .any(|b| b.columns.iter().any(|c| c.column_id == 3)),
+            "the shared column 3 is present in every segment",
+        );
+    }
+    Ok(())
+}

@@ -202,7 +202,7 @@ impl EccParams {
 /// Codec configuration for the compression step of a block payload.
 ///
 /// Fields are private; the only way to construct a value is via
-/// [`Self::new`] (non-dict codecs) or [`Self::with_dict`]
+/// [`Self::new`] (non-dict codecs) or `Self::with_dict`
 /// (dict-required codec, takes the dictionary handle directly). Two
 /// invariants the previous open-fields shape relied on are now
 /// enforced by the constructors:
@@ -215,7 +215,7 @@ impl EccParams {
 /// 2. `kind == ZstdDict` is unreachable without an attached
 ///    dictionary: the `new()` constructor refuses `ZstdDict` (returns
 ///    [`crate::Error::FeatureUnsupported`], forcing callers through
-///    [`Self::with_dict`]), and `with_dict` takes the dictionary by
+///    `Self::with_dict`), and `with_dict` takes the dictionary by
 ///    reference and derives `dict_id` from `dict.id()` itself. There
 ///    is therefore no construction path that yields a `ZstdDict`
 ///    context without a matching dict. The runtime `ZstdDictMismatch`

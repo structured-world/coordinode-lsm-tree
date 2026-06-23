@@ -1,6 +1,6 @@
 use super::ByteView;
 
-/// A builder for a [`ByteView`] that allows mutation before freezing it.
+/// A builder for a `ByteView` that allows mutation before freezing it.
 pub struct Builder(ByteView);
 
 impl Builder {

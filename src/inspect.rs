@@ -738,9 +738,9 @@ impl Iterator for DataBlockEntryIter {
 ///
 /// **Zstd-dictionary blocks: not supported.** This facade calls
 /// [`crate::table::Block::from_file`] with no
-/// [`crate::compression::ZstdDictionary`] attached (it has no way to
+/// `crate::compression::ZstdDictionary` attached (it has no way to
 /// fetch one without a live `Tree`), so blocks compressed with
-/// [`crate::CompressionType::ZstdDict`] fail with
+/// `crate::CompressionType::ZstdDict` fail with
 /// [`crate::Error::ZstdDictMismatch`] even though they are otherwise
 /// valid. Inspect such SSTs through the owning `Tree` instead.
 ///
