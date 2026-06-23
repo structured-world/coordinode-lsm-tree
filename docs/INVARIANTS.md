@@ -203,8 +203,10 @@ matching entry (and add one for a new subsystem).
 
 - **A columnar row's visibility follows the same seqno rule as a row-oriented
   entry.** Decoding a PAX row group yields the key / seqno / value-type / value
-  sub-columns; a read at snapshot `N` sees a row only if its seqno `<= N`. Enforced
-  in `src/table/columnar.rs`.
+  sub-columns; a read at read-seqno `R` sees a row only if its seqno `< R` (the
+  same exclusive upper bound as the row-oriented path; see
+  [Snapshot / sequence number](#snapshot--sequence-number)). Enforced in
+  `src/table/columnar.rs`.
 
 - **The positional delete bitmap is a pure membership set; MVCC correctness is
   established when it is built, not at read time.** The bitmap carries no per-row
