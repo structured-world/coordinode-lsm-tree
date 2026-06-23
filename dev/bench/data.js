@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782215375564,
+  "lastUpdate": 1782237038458,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -19452,6 +19452,84 @@ window.BENCHMARK_DATA = {
             "value": 689676.6570307573,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 4.6us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "28c21e3ce51ee65e15ee06906c645ac37496dbff",
+          "message": "refactor: coherent storage-statistics surface with compaction-debt and cache snapshot (#543)\n\n## Summary\n\nGroups the scattered read-only storage statistics into a coherent,\nobject-safe surface and adds the two missing signals a planner / tiering\n/ capacity consumer needs. Closes #521.\n\n## Changes\n\n### Two new metrics (the capability gain)\n- **`compaction_debt`** — estimated pending-compaction bytes (a\n`RocksDB` `estimate-pending-compaction-bytes` analog). Added as\n`CompactionStrategy::pending_compaction_bytes(version)` (default `0`;\nthe leveled strategy sums each level's bytes above its target plus L0\nonce it reaches the file threshold) and surfaced as\n`AbstractTree::compaction_debt(strategy)`. The strategy is a caller\nargument because the engine does not own a configured compaction\nstrategy (it is injected per compaction run); a `&dyn` keeps it\nobject-safe.\n- **`CacheStats`** — an owned block-cache snapshot (hits, misses, hit\nrate, current size, capacity) built by `Metrics::cache_stats(...)`,\nsurfaced as `AbstractTree::cache_stats()` (metrics feature). Replaces\nhanding out the mutable `&Arc<Metrics>` for cache observability.\n\n### Grouping trait\n- **`StorageStatistics`** — an object-safe trait collecting the\nnon-query stats (`storage_stats`, `level_segment_stats`,\n`compaction_debt`, `cache_stats`). A consumer can bound on `&dyn\nStorageStatistics` and a test can supply a mock. It is exposed through a\nblanket impl over `AbstractTree` (the logic stays on `AbstractTree`, so\nits `enum_dispatch` surface is undisturbed and no doctests move). The\ngeneric range estimators (`approximate_range_stats` /\n`approximate_range_cardinality`) are not object-safe and stay on\n`AbstractTree`.\n\n### Docs\n- README: feature-flag table now lists `columnar`, `page_ecc`, `crc32c`,\n`io-uring-raw`, and the default-on `parallel`; added Features bullets\nfor the columnar PAX layout and per-block ECC, a new Introspection\nsection, and a `no_std` note.\n\n## Testing\n\nFull gate green: clippy `--all-features --all-targets` clean, `no_std`\ncheck (`thumbv7em` + `alloc`) zero errors / warnings, nextest (lz4,zstd\n2109 + columnar 2193), doctests 65. Three regression tests in separate\nfiles: compaction debt over a known leveled version, the cache-stats\nsnapshot after reads, and a mock proving `StorageStatistics` is\nobject-safe.\n\nCloses #521\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n## Release Notes\n\n* **Documentation**\n* Expanded “Storage & encoding” options (optional columnar PAX layout,\nAES-256-GCM at-rest encryption, and per-block ECC with\nself-healing/patrol scrubbing).\n* Added an Introspection section for new runtime statistics and\nclarified `std`/`no_std` + feature flags (including new gated\ncapabilities).\n\n* **New Features**\n* Added `CacheStats` (hit rate + cache occupancy) and `cache_stats`\nreporting when metrics are enabled.\n* Added “compaction debt” estimates to quantify pending leveled\ncompaction work.\n* Introduced a new `StorageStatistics` interface consolidating key\nstorage metrics.\n\n* **Tests**\n  * Added coverage for compaction debt behavior and cache statistics.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-23T20:49:42+03:00",
+          "tree_id": "6baa0fcfbc2e7af95cc05c07918af1e481077cb3",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/28c21e3ce51ee65e15ee06906c645ac37496dbff"
+        },
+        "date": 1782237037300,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2107635.334742442,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1186758.6689457179,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 893798.4842384335,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.1us | P99.9: 6.6us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3742311.1877702763,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 459758.8894272078,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.3us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 240905.50549602724,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 4.8us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.83s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1222931.100349195,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1095782.0216051836,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.5us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 700082.5740395254,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.5us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
