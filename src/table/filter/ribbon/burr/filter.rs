@@ -171,6 +171,15 @@ impl BurrFilter {
                 standard_equation_from_hash(hash, layer.seed, &layer_params, &mut fingerprint_buf);
             let fingerprint = fingerprint_buf[0];
 
+            let z_words = layer.ribbon.z_raw_words();
+            // Prefetch the [start, start+w) coefficient window before the
+            // threshold check so the hash-random cold miss on z_words[start]
+            // overlaps the is_bumped work. A hint only: the result is unchanged.
+            super::prefetch::prefetch_span(
+                z_words.as_ptr().wrapping_add(equation.start).cast::<u8>(),
+                usize::from(self.params.w) * 8,
+            );
+
             if is_bumped(&equation, &layer.thresholds, self.params.b) {
                 continue;
             }
@@ -178,7 +187,6 @@ impl BurrFilter {
             // GF(2) XOR-reduce. start ∈ [0, m-w] and every set bit offset
             // ∈ [0, w-1], so row_index ∈ [0, m-1] is always in-bounds
             // (proven; no per-row bounds check in the inner loop).
-            let z_words = layer.ribbon.z_raw_words();
             let mut acc: u64 = 0;
             let mut lo = equation.coeff_lo;
             while lo != 0 {
@@ -242,12 +250,19 @@ impl BurrFilter {
             // The first layer that does NOT bump this key is the layer that
             // holds it (the builder kept it at exactly that layer). Same
             // routing as `contains_hash`.
+            let z_words = layer.ribbon.z_raw_words();
+            // Prefetch the [start, start+w) window before the threshold check so
+            // the cold miss on z_words[start] overlaps the is_bumped work.
+            super::prefetch::prefetch_span(
+                z_words.as_ptr().wrapping_add(equation.start).cast::<u8>(),
+                usize::from(self.params.w) * 8,
+            );
+
             if is_bumped(&equation, &layer.thresholds, self.params.b) {
                 continue;
             }
 
             // GF(2) XOR-reduce recovers the stored RHS = the locator.
-            let z_words = layer.ribbon.z_raw_words();
             let mut acc: u64 = 0;
             let mut lo = equation.coeff_lo;
             while lo != 0 {

@@ -76,6 +76,7 @@ pub mod builder;
 pub mod error;
 pub mod filter;
 pub mod params;
+mod prefetch;
 pub(crate) mod threshold;
 pub(crate) mod wire;
 
