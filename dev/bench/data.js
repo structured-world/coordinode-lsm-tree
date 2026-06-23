@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782166153966,
+  "lastUpdate": 1782191232945,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -19218,6 +19218,84 @@ window.BENCHMARK_DATA = {
             "value": 587040.9782399202,
             "unit": "ops/sec",
             "extra": "P50: 1.5us | P99: 5.0us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.34s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c918ebb2bfe6a090dc9f17f8e437fa01faad957c",
+          "message": "fix(table): replace saturating seqno arithmetic on the read path with checked (#538)\n\n## Summary\n\nThe table read path applied a bulk-ingested segment's base sequence\nnumber with `saturating_add` / `saturating_sub`. Saturating arithmetic\nsilently clamps on overflow/underflow, which can mask a logic error\ninstead of surfacing it. This replaces it with checked arithmetic plus a\ndocumented invariant at each site.\n\n## Changes\n\n- **Re-applying the base (table-local -> global)** goes through a new\n`apply_global_seqno` helper that uses plain addition. A row is only\ntranslated here when it is visible at the query snapshot `Q`, and the\nexclusive MVCC check forces `local + global < Q <= SeqNo::MAX`, so the\nsum cannot overflow on any reachable input. A debug build still panics\nloudly if that invariant is ever violated, where a saturating add would\nhave clamped silently.\n- **Translating a query snapshot down to a table's local frame** uses\n`checked_sub`: a snapshot below the table's base means the table\npostdates it, so the table is explicitly excluded (`return None` /\n`continue`) instead of relying on a clamp-to-0 followed by a range gate.\nApplied to the point-read, batch-get, and approximate-range-stats paths.\n- **The two `scan_seqno_range` bounds keep `saturating_sub`**, because\nthere the clamp to 0 is the *intended* business logic (a lower bound\nbelow the offset means \"start at the first entry\"; an upper bound below\nmeans \"empty window, exclude the table\"). Both are documented as\nintentional at the site.\n\n## Behavior\n\nThe **read path** (`Table::get` / `get_with_block` / `batch_get`) is\nbehavior-neutral on every reachable input: the add never overflows for a\nvisible row, and `checked_sub` excludes the same pre-table snapshots\nthat the saturating-clamp-to-0 path excluded.\n\nThe **approximate-stats path** (`approximate_range_stats` + the\nrow-count estimator) has one intentional behavior fix: previously\n`saturating_sub` clamped a below-base snapshot to local 0, so a\nbulk-ingested table whose base seqno *postdates* the query snapshot was\ncounted as if all its entries were visible at seqno 0 (an over-count).\nWith `checked_sub` such a table is now correctly skipped and contributes\nnothing to the estimate. A regression test\n(`ingested_table_excluded_from_stats_below_its_base_seqno`) covers it.\n\n## Testing\n\nExisting global-seqno round-trip (`table_return_global_seqno`) and the\nfull read-path suite confirm no regression. Full gate: clippy\n`--all-features --all-targets` clean, no-std (`thumbv7em` + `alloc`)\nerrcount 0, nextest (lz4,zstd 2104 + columnar 2187), doctests 63.\n\nCloses #535\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n## Release Notes\n\n* **Bug Fixes**\n* Corrected range statistics and cardinality behavior to exclude\nbulk-ingested tables when querying at snapshots earlier than the table’s\nbase sequence number.\n* Improved sequence-number translation during point reads, batch reads,\nand range scans to avoid overflow and ensure returned results match the\nrequested snapshot semantics.\n\n* **Tests**\n* Added an integration test covering visibility gating for bulk-ingested\ntables in range estimation APIs.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-23T08:06:21+03:00",
+          "tree_id": "a399e7c458fd7f037ee8c941c09bc1af20de8474",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/c918ebb2bfe6a090dc9f17f8e437fa01faad957c"
+        },
+        "date": 1782191231773,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2066009.9688699816,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1189449.4336528704,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 893492.0926418884,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.1us | P99.9: 6.7us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3787339.7375354627,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 456437.7833537232,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.2us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 239336.57948886804,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 4.8us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.84s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1255563.401431744,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1100696.0741434598,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.5us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 696164.7036858305,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.5us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
