@@ -43,13 +43,22 @@ twice), so replay must apply each record exactly once (see
 For each write (or batch):
 
 1. Draw the seqno(s) the write will carry (`SequenceNumberCounter::next`, or your
-   own monotonic source).
+   own monotonic source). A `WriteBatch` shares a single seqno across all its
+   entries.
 2. Append the record (keys, values, and the seqno) to your WAL and make it
    durable (`fsync`, or your log's equivalent).
-3. Only then call the original write API at that seqno (`insert` for a put,
+3. Only then call the matching write API at that seqno: `insert` for a put,
    `remove` for a point delete, `remove_weak` for a weak/single delete,
    `remove_range` for a range tombstone, `merge` for a merge operand, or a
-   `WriteBatch`). Apply the same operation that was logged, not always `insert`.
+   `WriteBatch`. Use the admission-gated `try_*` variant (`try_insert`,
+   `try_merge`, ...) if you want over-budget writes refused up front. Apply the
+   same operation that was logged, never collapsing to `insert`.
+4. If the write API returns an error (an admission rejection, or `apply_batch`
+   rejecting a malformed batch), the record was NOT applied: keep it in the WAL,
+   do not advance your applied-and-persisted watermark, and retry or surface the
+   failure. On success, publish your visible watermark so reads observe the write,
+   e.g. `visible_seqno.fetch_max(seqno + 1)` (the exclusive read bound from the
+   durability-cursor section).
 
 The ordering is what guarantees recoverability: if the process dies after step 2
 but before or during step 3, the record is in your WAL and replay re-applies it.
@@ -129,7 +138,7 @@ has no log of its own to replay). After open:
 The strict boundary still covers the crash window in step 1 of
 [Log before apply](#1-log-before-apply): a record that was logged and applied but
 not yet flushed is, by definition, absent from the SSTs, so its seqno is above
-`durable` and step 2 replays it exactly once.
+your trim watermark `W` and the replay step covers it exactly once.
 
 ## Why no hook API
 
