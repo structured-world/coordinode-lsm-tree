@@ -59,6 +59,13 @@ pub struct DeletionPause {
     queue: Mutex<Vec<QueuedDeletion>>,
 }
 
+#[cfg_attr(
+    not(feature = "std"),
+    allow(
+        dead_code,
+        reason = "no_std-capable deletion gate; only the std-gated checkpoint consumer acquires a pause, so under no_std nothing is ever queued"
+    )
+)]
 struct QueuedDeletion {
     fs: Arc<dyn Fs>,
     path: PathBuf,
@@ -121,6 +128,13 @@ impl DeletionPause {
 
     /// Acquires a pause guard. While at least one guard is alive,
     /// [`try_enqueue`](Self::try_enqueue) defers deletions.
+    #[cfg_attr(
+        not(feature = "std"),
+        allow(
+            dead_code,
+            reason = "no_std-capable; only the std-gated checkpoint consumer acquires a pause"
+        )
+    )]
     pub fn acquire(self: &Arc<Self>) -> Pause {
         self.active.fetch_add(1, Ordering::AcqRel);
         Pause {
@@ -132,6 +146,13 @@ impl DeletionPause {
 /// RAII guard that keeps a [`DeletionPause`] active. Dropping the last
 /// guard drains the queue and unlinks every queued file.
 #[must_use = "deletion pause is released when this guard is dropped"]
+#[cfg_attr(
+    not(feature = "std"),
+    allow(
+        dead_code,
+        reason = "no_std-capable RAII guard; only the std-gated checkpoint consumer constructs one"
+    )
+)]
 pub struct Pause {
     inner: Arc<DeletionPause>,
 }

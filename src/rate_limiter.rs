@@ -40,10 +40,28 @@ use portable_atomic::AtomicU64;
 
 use spin::Mutex;
 
+// no_std-ready: the token-bucket core (this constant, `Bucket`, the limiter's
+// rate fields and `acquire_wait`) is clock-agnostic, but the no_std
+// `request_interruptible` is a passthrough until a caller injects a monotonic
+// clock, so under no_std these are present-but-unused rather than dead.
+#[cfg_attr(
+    not(feature = "std"),
+    allow(
+        dead_code,
+        reason = "no_std-ready token-bucket core; awaits a clock-injecting no_std caller"
+    )
+)]
 const NANOS_PER_SEC: u128 = 1_000_000_000;
 
 /// Mutable bucket state, guarded by a single lock.
 #[derive(Debug)]
+#[cfg_attr(
+    not(feature = "std"),
+    allow(
+        dead_code,
+        reason = "no_std-ready token-bucket state; awaits a clock-injecting no_std caller"
+    )
+)]
 struct Bucket {
     /// Available budget in bytes. May go negative (debt) when a request
     /// debits more than is currently available; the deficit is what the
@@ -62,6 +80,13 @@ struct Bucket {
 /// A `rate_bytes_per_sec` of `0` disables throttling entirely: every
 /// request returns immediately.
 #[derive(Debug)]
+#[cfg_attr(
+    not(feature = "std"),
+    allow(
+        dead_code,
+        reason = "no_std-ready limiter fields read only by acquire_wait, which awaits a clock-injecting no_std caller"
+    )
+)]
 pub struct RateLimiter {
     /// Refill rate in bytes per second. `0` means unlimited (disabled).
     rate_bytes_per_sec: AtomicU64,
@@ -101,6 +126,13 @@ impl RateLimiter {
     /// and reads no clock, so it is fully deterministic for a given `now`
     /// sequence and usable in `no_std` builds.
     #[must_use]
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(
+            dead_code,
+            reason = "no_std-ready token-bucket decision; awaits a clock-injecting no_std caller"
+        )
+    )]
     pub fn acquire_wait(&self, bytes: u64, now: Duration) -> Duration {
         let rate = self.rate_bytes_per_sec.load(Ordering::Relaxed);
         if rate == 0 {
