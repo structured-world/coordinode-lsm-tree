@@ -118,10 +118,20 @@ impl Metrics {
     /// the caller-supplied live cache `size_bytes` / `capacity_bytes` (the block
     /// cache owns its occupancy, [`Metrics`] owns the hit / miss tallies).
     pub fn cache_stats(&self, size_bytes: u64, capacity_bytes: u64) -> CacheStats {
+        // Read the counters once so hits / misses / hit_rate are a single
+        // consistent snapshot (block_cache_hit_rate would re-read the atomics).
+        let hits = self.block_load_cached_count() as u64;
+        let misses = self.block_load_io_count() as u64;
+        let total = hits + misses;
+        let hit_rate = if total == 0 {
+            1.0
+        } else {
+            hits as f64 / total as f64
+        };
         CacheStats {
-            hits: self.block_load_cached_count() as u64,
-            misses: self.block_load_io_count() as u64,
-            hit_rate: self.block_cache_hit_rate(),
+            hits,
+            misses,
+            hit_rate,
             size_bytes,
             capacity_bytes,
         }
