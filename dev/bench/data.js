@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782191232945,
+  "lastUpdate": 1782195107163,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -19296,6 +19296,84 @@ window.BENCHMARK_DATA = {
             "value": 696164.7036858305,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 4.5us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "92b84ddfeaaeffbde0e035687100da2041eda2a4",
+          "message": "docs(columnar): consumer sub-column schema evolution conventions (#539)\n\n## Summary\n\nDocuments the consumer-facing contract for evolving a value sub-column\nschema over time, and adds a test for the mixed old/new read path. With\nconsumer value sub-columns, different segments can carry different\ncolumn sets as a schema evolves; the storage layer is already\nschema-free (each block self-describes its columns by `column_id` + type\ntag), so what was missing is the contract and its verification.\n\n## Changes\n\n- **Schema-evolution doc section** in the columnar module docs covering:\n- **column-id stability** (a `column_id` is a stable field identifier,\nnever repurposed across schema versions),\n- **schema-version tagging is consumer-owned** (e.g. a reserved column),\nkeeping the engine schema-free,\n- **projection over a missing column** is not an error: a segment\nwithout the column returns batches that omit it (the consumer applies a\ndefault / treats it as null), while a newer segment that carries it\nreturns it. Mixed old/new segments coexist with no migration step.\n- **Mixed-schema integration test**\n(`columnar_scan_spans_segments_with_evolving_schema`): ingests two\nsegments with different value sub-column sets ({3,4} then {3,4,5}) and\nscans the new column across both, asserting it is returned from the\nsegment that carries it and gracefully omitted from the one that does\nnot, while a shared column is satisfied by both.\n- **Doc-link cleanup**: the columnar predicate and delete-bitmap module\ndocs linked to `pub(crate)` items (zone-map stats, bitmap container\nvariants, sparse threshold). rustdoc cannot resolve a public-doc link to\na private item, so it warned. These internal types stay private and are\nnow referenced as code spans. `cargo doc --all-features` builds with\nzero warnings.\n\n## Testing\n\nFull gate: clippy `--all-features --all-targets` clean, no-std\n(`thumbv7em` + `alloc`) errcount 0, `cargo doc --all-features` zero\nwarnings, nextest (lz4,zstd 2105 + columnar 2189), doctests 63.\n\nCloses #533\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Documentation**\n* Clarified columnar schema-evolution guidance: schema-free format\nexpectations, stable column IDs, consumer-managed schema versioning, and\nprojection behavior when projected columns are missing.\n\n* **Tests**\n* Added end-to-end schema-evolution coverage for columnar ingestion and\nscanning across segments, including validating omission of missing\nprojected columns and consistent presence of shared columns.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-23T09:10:56+03:00",
+          "tree_id": "0566543f7e544d5d8aee14b56c3859700c0252f5",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/92b84ddfeaaeffbde0e035687100da2041eda2a4"
+        },
+        "date": 1782195106010,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1962922.0513053648,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1207662.4418749802,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 873608.3604459872,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.2us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3682817.829986877,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.1us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 443393.74709111534,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.4us | P99.9: 8.9us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 234661.73987147515,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 8.7us | P99.9: 11.0us\nthreads: 1 | elapsed: 0.85s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1199848.2479929868,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1091568.5948227108,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 687764.5219725015,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 5.6us | P99.9: 9.0us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
