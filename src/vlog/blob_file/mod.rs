@@ -52,6 +52,13 @@ pub struct Inner {
     /// [`Fs::punch_hole`] and LEAVES the file in
     /// place (the restricted view still serves the suffix). Mirrors
     /// `table::Inner::punch_on_drop`. Distinct from [`Self::is_deleted`].
+    #[cfg_attr(
+        not(feature = "std"),
+        allow(
+            dead_code,
+            reason = "tight-space punch-on-drop frontier; the punch consumer is std-gated, so unread under no_std"
+        )
+    )]
     pub(crate) punch_on_drop: portable_atomic::AtomicU64,
 
     pub checksum: Checksum,

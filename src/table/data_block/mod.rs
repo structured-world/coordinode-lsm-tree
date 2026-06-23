@@ -1035,6 +1035,13 @@ impl DataBlock {
     /// - [`crate::Error::ChecksumMismatch`] on the first entry whose recomputed
     ///   logical-content digest disagrees with the stored one (corruption of
     ///   the entry bytes or the stored digest).
+    #[cfg_attr(
+        not(feature = "std"),
+        allow(
+            dead_code,
+            reason = "core+alloc per-KV scrub; the verify/scrub consumer is std-gated, so unused under no_std"
+        )
+    )]
     pub(crate) fn verify_kv_checked(
         footer_wrapped: &Slice,
         header: super::block::Header,

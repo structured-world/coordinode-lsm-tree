@@ -210,6 +210,13 @@ pub(super) fn prepare_table_writer(
 /// WITHOUT touching the shared version. Splitting "produce" from "install" lets
 /// N parallel sub-compactions each finalize their files independently, then a
 /// single atomic version upgrade ([`install_merge`]) merges all of them.
+#[cfg_attr(
+    not(feature = "std"),
+    allow(
+        dead_code,
+        reason = "parallel sub-compaction output; the threaded parallel install + tight-space consumers are std-gated, so unused under no_std"
+    )
+)]
 pub(super) struct ProducedOutput {
     created_tables: Vec<Table>,
     created_blob_files: Vec<BlobFile>,
@@ -225,6 +232,13 @@ pub(super) struct ProducedOutput {
     consumed_through: crate::HashMap<BlobFileId, u64>,
 }
 
+#[cfg_attr(
+    not(feature = "std"),
+    allow(
+        dead_code,
+        reason = "parallel sub-compaction output accessors; the threaded parallel install + tight-space consumers are std-gated, so unused under no_std"
+    )
+)]
 impl ProducedOutput {
     /// The SSTs this (sub-)compaction finalized on disk but has not installed.
     /// Used by the tight-space loop, which installs them via a custom version

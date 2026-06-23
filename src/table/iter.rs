@@ -151,6 +151,13 @@ fn create_data_block_reader(
 /// Per-SST positional delete state for a columnar iterator: the delete-bitmap
 /// plus each data block's first global row position (block-index order), so a
 /// reconstructed block can drop its deleted rows by position.
+#[cfg_attr(
+    not(feature = "columnar"),
+    allow(
+        dead_code,
+        reason = "read only on the columnar delete-bitmap reconstruction path"
+    )
+)]
 pub struct DeleteMask {
     pub(crate) bitmap: Arc<crate::table::delete_bitmap::DeleteBitmap>,
     pub(crate) block_start_rows: Arc<crate::HashMap<u64, u32>>,
@@ -206,6 +213,13 @@ pub struct Iter {
     /// Positional delete mask for a columnar SST with materialized deletes;
     /// `None` when the segment has no deletes. Applied during block
     /// reconstruction so deleted rows never reach the reader.
+    #[cfg_attr(
+        not(feature = "columnar"),
+        allow(
+            dead_code,
+            reason = "set + read only on the columnar delete-bitmap reconstruction path"
+        )
+    )]
     delete_mask: Option<DeleteMask>,
 
     index_initialized: bool,

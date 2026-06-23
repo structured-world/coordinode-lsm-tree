@@ -510,6 +510,13 @@ impl Table {
     ///   disagrees with the stored value (corruption of the entry bytes or
     ///   the stored digest).
     /// - Any I/O / decode error encountered while loading a block.
+    #[cfg_attr(
+        not(feature = "std"),
+        allow(
+            dead_code,
+            reason = "core+alloc per-KV scrub over the table; the verify/scrub consumer is std-gated, so unused under no_std"
+        )
+    )]
     pub(crate) fn verify_kv_checksums(&self) -> crate::Result<()> {
         // Footer presence is a per-SST property recorded in the descriptor
         // (`kv_checksum_algo`); data blocks omit the block_flags byte, so the
@@ -2542,6 +2549,13 @@ impl Table {
     /// # Errors
     ///
     /// Propagates any error from re-opening the SST file.
+    #[cfg_attr(
+        not(feature = "std"),
+        allow(
+            dead_code,
+            reason = "tight-space relocation view; its compaction consumer is std-gated, so unused under no_std"
+        )
+    )]
     pub(crate) fn reopen_restricted(&self, lower: UserKey) -> crate::Result<Self> {
         let reopened = Self::recover(
             (*self.path).clone(),
@@ -2568,6 +2582,13 @@ impl Table {
     /// [`Inner::punch_on_drop`](inner::Inner::punch_on_drop)). Set on the PRIOR
     /// unrestricted view once a tight-space slice has been installed, so the
     /// consumed prefix is reclaimed exactly when no reader can still see it.
+    #[cfg_attr(
+        not(feature = "std"),
+        allow(
+            dead_code,
+            reason = "tight-space punch hook; its compaction consumer is std-gated, so unused under no_std"
+        )
+    )]
     pub(crate) fn mark_punch_on_drop(&self, offset: u64) {
         self.0
             .punch_on_drop
@@ -2583,6 +2604,13 @@ impl Table {
     /// # Errors
     ///
     /// Propagates a block-index read error.
+    #[cfg_attr(
+        not(feature = "std"),
+        allow(
+            dead_code,
+            reason = "tight-space punch offset; its compaction consumer is std-gated, so unused under no_std"
+        )
+    )]
     pub(crate) fn punch_offset_for(&self, key: &[u8]) -> crate::Result<u64> {
         let mut data_end = 0u64;
         for handle in self.block_index.iter() {

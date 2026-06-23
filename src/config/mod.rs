@@ -225,6 +225,13 @@ impl TryFrom<u8> for TreeType {
     }
 }
 
+#[cfg_attr(
+    not(feature = "std"),
+    allow(
+        dead_code,
+        reason = "default data-folder path used only on the std-gated default-config path"
+    )
+)]
 const DEFAULT_FILE_FOLDER: &str = ".lsm.data";
 
 /// Options for key-value separation
@@ -746,6 +753,13 @@ impl Default for Config {
 
 /// Name of the lock file created in a tree directory for the cross-process
 /// exclusive directory lock.
+#[cfg_attr(
+    not(feature = "std"),
+    allow(
+        dead_code,
+        reason = "directory-lock filename used only by the std-gated lock-acquisition path"
+    )
+)]
 pub(crate) const DIRECTORY_LOCK_FILE: &str = "LOCK";
 
 /// Acquires the cross-process exclusive directory lock when `enabled`.

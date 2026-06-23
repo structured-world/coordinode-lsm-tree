@@ -218,6 +218,13 @@ pub fn split_inner(bytes: &[u8]) -> crate::Result<&[u8]> {
 /// 4-byte algorithms (`Xxh3Low32` / `Crc32c`) an owned `Vec<u64>` would
 /// double the digest-array memory; reading on demand keeps the verify path's
 /// transient footprint at zero beyond the borrowed block buffer.
+#[cfg_attr(
+    not(feature = "std"),
+    allow(
+        dead_code,
+        reason = "core+alloc per-KV scrub view; the verify/scrub consumer is std-gated, so unused under no_std"
+    )
+)]
 pub struct SplitFull<'a> {
     /// Inner payload: byte-identical to a plain `BlockType::Data` block.
     pub inner: &'a [u8],
@@ -230,6 +237,13 @@ pub struct SplitFull<'a> {
     count: usize,
 }
 
+#[cfg_attr(
+    not(feature = "std"),
+    allow(
+        dead_code,
+        reason = "core+alloc per-KV scrub accessors; the verify/scrub consumer is std-gated, so unused under no_std"
+    )
+)]
 impl SplitFull<'_> {
     /// Number of per-entry digests stored in the footer.
     #[must_use]
@@ -262,6 +276,13 @@ impl SplitFull<'_> {
 /// Returns [`crate::Error::InvalidTrailer`] when the footer is structurally
 /// malformed (too short, unknown algorithm tag, or a `count` inconsistent
 /// with the available bytes).
+#[cfg_attr(
+    not(feature = "std"),
+    allow(
+        dead_code,
+        reason = "core+alloc per-KV scrub splitter; the verify/scrub consumer is std-gated, so unused under no_std"
+    )
+)]
 pub fn split_full(bytes: &[u8]) -> crate::Result<SplitFull<'_>> {
     let total = bytes.len();
     if total < FOOTER_TAIL_LEN {

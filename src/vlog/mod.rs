@@ -184,6 +184,13 @@ pub fn recover_blob_files(
 ///
 /// Returns an error if the file cannot be opened or its `meta` section is
 /// missing / undecodable.
+#[cfg_attr(
+    not(feature = "std"),
+    allow(
+        dead_code,
+        reason = "single-file blob recovery for the std-gated repair surface; the no_std open path uses recover_blob_files"
+    )
+)]
 pub fn recover_blob_file(
     path: &Path,
     id: BlobFileId,

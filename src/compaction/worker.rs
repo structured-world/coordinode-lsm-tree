@@ -619,6 +619,13 @@ fn range_tombstones_after_gc(
         .collect()
 }
 
+#[cfg_attr(
+    not(feature = "std"),
+    allow(
+        dead_code,
+        reason = "parallel sub-compaction boundary picker; the threaded parallel path is std-gated, so unused under no_std"
+    )
+)]
 fn boundary_candidates(
     mut keys: Vec<UserKey>,
     comparator: &crate::comparator::SharedComparator,
