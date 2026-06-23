@@ -66,9 +66,14 @@ fn get_highest_persisted_seqno(&self) -> Option<SeqNo>;
 ```
 
 This returns the highest seqno present in the persisted SSTs (`None` for an empty
-tree). After a flush, **every WAL record with `seqno <= get_highest_persisted_seqno()`
-is redundant and may be trimmed** — its data is recoverable from the SSTs without
-the WAL.
+tree) — the *maximum*, not a contiguity guarantee. When writes are applied in
+strict seqno order (the single-writer log-before-apply pattern above guarantees
+this), that maximum *is* a contiguous prefix: **every WAL record with
+`seqno <= get_highest_persisted_seqno()` is on disk and may be trimmed**. If you
+apply writes out of seqno order (concurrent appliers can flush a higher seqno
+while a lower one is still pending), the maximum is NOT contiguous — a delayed
+lower seqno may be absent from every SST — so trim only against a contiguous
+applied-and-persisted prefix you track yourself, never against the raw maximum.
 
 `create_checkpoint` gives the same guarantee for a point-in-time copy: it flushes
 the active memtable first, then hard-links every resulting SST into the checkpoint
@@ -87,17 +92,19 @@ has no log of its own to replay). After open:
 
 1. Read the durable watermark: `let durable = tree.get_highest_persisted_seqno();`
    (`None` ⇒ empty tree ⇒ replay everything).
-2. Replay your WAL from `durable + 1` forward, re-applying each record with
-   `insert(key, value, seqno)` at its original seqno.
-3. Records at or below `durable` may be skipped (already persisted) or replayed
-   harmlessly — re-applying a record with its original seqno reproduces the same
-   MVCC version, so replay is idempotent and a conservative "replay from a little
-   earlier" is always safe.
+2. Replay your WAL **strictly from `durable + 1`** forward, re-applying each record
+   with `insert(key, value, seqno)` at its original seqno.
+3. Do NOT re-apply records at or below `durable`. For put / delete that would be
+   harmless (re-applying at the original seqno reproduces the same MVCC version, an
+   overwrite), but a **merge operand** re-applied on top of its already-persisted
+   self is folded twice by merge resolution — a counter would double-count. The
+   strict `> durable` boundary is correct for every record type, so use it
+   unconditionally rather than relying on over-replay being idempotent.
 
-Idempotence is the safety net for the crash window in step 1 of
-[Log before apply](#1-log-before-apply): a record that was logged, applied, but
-not yet flushed is replayed on restart and produces a byte-identical version, so
-double-apply is a no-op rather than a corruption.
+The strict boundary still covers the crash window in step 1 of
+[Log before apply](#1-log-before-apply): a record that was logged and applied but
+not yet flushed is, by definition, absent from the SSTs, so its seqno is above
+`durable` and step 2 replays it exactly once.
 
 ## Why no hook API
 
