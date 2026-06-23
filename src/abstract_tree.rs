@@ -609,6 +609,17 @@ pub trait AbstractTree: sealed::Sealed {
     #[cfg(feature = "metrics")]
     fn metrics(&self) -> &Arc<crate::Metrics>;
 
+    /// A point-in-time [`CacheStats`](crate::CacheStats) snapshot of block-cache
+    /// effectiveness (cumulative hit / miss counts and rate) and occupancy
+    /// (current size against capacity).
+    ///
+    /// The stable, owned observability view over the block cache, so a consumer
+    /// can read cache health without holding the mutable
+    /// [`metrics`](Self::metrics) handle. Counts are cumulative since process
+    /// start; derive a rate over an interval from the delta between two polls.
+    #[cfg(feature = "metrics")]
+    fn cache_stats(&self) -> crate::CacheStats;
+
     /// Acquires the flush lock which is required to call [`Tree::flush`].
     fn get_flush_lock(&self) -> FlushGuard<'_>;
 

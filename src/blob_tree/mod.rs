@@ -468,6 +468,11 @@ impl AbstractTree for BlobTree {
     }
 
     #[cfg(feature = "metrics")]
+    fn cache_stats(&self) -> crate::CacheStats {
+        self.index.cache_stats()
+    }
+
+    #[cfg(feature = "metrics")]
     fn metrics(&self) -> &Arc<crate::Metrics> {
         self.index.metrics()
     }

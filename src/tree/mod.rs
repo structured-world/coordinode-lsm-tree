@@ -453,6 +453,12 @@ impl AbstractTree for Tree {
         &self.0.metrics
     }
 
+    #[cfg(feature = "metrics")]
+    fn cache_stats(&self) -> crate::CacheStats {
+        let cache = &self.0.config.cache;
+        self.metrics().cache_stats(cache.size(), cache.capacity())
+    }
+
     fn version_free_list_len(&self) -> usize {
         self.version_history.read().free_list_len()
     }
@@ -3785,3 +3791,6 @@ fn effective_lower_bound<'a>(
 
 #[cfg(test)]
 mod cardinality_tests;
+
+#[cfg(all(test, feature = "metrics"))]
+mod cache_stats_tests;
