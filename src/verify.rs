@@ -938,11 +938,11 @@ fn scan_sst_blocks(
     // offset; each per-section walk below explicitly seeks to the
     // section's `pos()` first so the unknown post-trailer position
     // doesn't matter.
-    // Wrap the sfa error as the inner cause of the io::Error rather
-    // than format!-stringifying it, so the original variant
-    // (InvalidHeader / InvalidVersion / ChecksumMismatch / underlying
-    // Io) stays reachable via `Error::source()` for downstream
-    // diagnostics. crate::sfa::Error implements `std::error::Error`.
+    // Capture the sfa error's Debug form in the message. crate::io::Error is
+    // message-only (no source chain) so it stays portable on no_std; the `{:?}`
+    // repr keeps the original variant (InvalidHeader / InvalidVersion /
+    // ChecksumMismatch / underlying Io) visible for downstream diagnostics, just
+    // as a string rather than a downcastable `Error::source()`.
     let sfa_reader = crate::sfa::Reader::from_reader(&mut file)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, alloc::format!("{e:?}")))?;
     let toc = sfa_reader.toc();
@@ -1365,7 +1365,16 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
                         ));
                     }
                     Ok(n) => remaining -= n as u64,
-                    Err(e) => break Err(e.into()),
+                    Err(e) => {
+                        // EINTR is transient: retry the read rather than aborting
+                        // the parity skip with a spurious DataReadError (matches
+                        // the Interrupted handling in read_exact above). Convert
+                        // first so the kind check is uniform across std/no_std.
+                        let e: io::Error = e.into();
+                        if e.kind() != io::ErrorKind::Interrupted {
+                            break Err(e);
+                        }
+                    }
                 }
             };
             if let Err(error) = drain {

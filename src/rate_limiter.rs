@@ -128,7 +128,7 @@ impl RateLimiter {
     #[must_use]
     #[cfg_attr(
         not(feature = "std"),
-        expect(
+        allow(
             dead_code,
             reason = "no_std-ready token-bucket decision; awaits a clock-injecting no_std caller"
         )
