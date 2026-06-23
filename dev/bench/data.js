@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782237038458,
+  "lastUpdate": 1782244685344,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -19530,6 +19530,84 @@ window.BENCHMARK_DATA = {
             "value": 700082.5740395254,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.5us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "76e24a3865f506f7e86508d41ac0e7a4e0d91491",
+          "message": "perf(filter): prefetch the ribbon coefficient window in the BuRR probe (#545)\n\n## Summary\n\nPrefetch the ribbon coefficient window in the BuRR filter query hot\npath, mirroring the random-offset span prefetch RocksDB issues in its\nribbon filter. Closes #540.\n\n## Change\n\nEach filter probe XOR-reduces a `[start, start+w)` window of coefficient\nwords, where `start` is hash-derived (effectively random per probe), so\nthe first access is a cold cache miss on essentially every point-read\nfilter check. The probe sits on the point-read hot path (one per SST\nlookup, ahead of the data-block read), so the miss is paid before any\nuseful work.\n\nThis prefetches the window (one hint per 64-byte cache line) right after\nthe equation is computed and before the threshold check, so the miss\noverlaps the `is_bumped` work. Applied to all four reduce sites: the\nin-memory `contains_hash` / `recover_value` and the two wire-format\nprobe paths that the LSM read path actually exercises (the issue cited\nonly the in-memory path, but the point-read bench runs the wire path).\n\nThe prefetch is a pure hint: it never faults, never changes the result,\nand degrades to a no-op on targets without a prefetch intrinsic.\nArchitecture is selected by `cfg(target_arch)` (x86_64 `_mm_prefetch` /\naarch64 `prfm` / no-op); the x86_64 hint is baseline SSE1, so there is\nno runtime-feature gating or SIGILL risk.\n\n## Testing\n\nFull gate green: clippy `--all-features --all-targets` clean, `no_std`\ncheck (`thumbv7em` + `alloc`) zero errors / warnings, nextest (lz4,zstd\n2110 + columnar 2194), doctests 65. Filter answers are bit-identical\nacross the change (the 140 BuRR / ribbon round-trip tests pass\nunchanged).\n\n## Bench gate\n\nThis is a speculative micro-optimization, so it ships **only if it\nwins**: the `point_read` benchmark on the pinned bench host must show an\nimprovement above run-to-run noise, with a flamegraph / perf-stat\nconfirming the coefficient-window access is a cache-miss hotspot that\nthe prefetch reduces. If no measurable win is found, the negative result\nis recorded and this PR is closed rather than merging an unmeasurable\nhint.\n\nCloses #540\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Refactor**\n* Optimized filter query performance for membership checking and value\nrecovery by improving internal data access patterns.\n* **Performance**\n* Added cache-prefetch hints for coefficient/window reads in the hot\nprobing paths to reduce latency during repeated queries.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-23T22:57:05+03:00",
+          "tree_id": "b4d0dabf297e65f26704bdfa6226401f8072e6d5",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/76e24a3865f506f7e86508d41ac0e7a4e0d91491"
+        },
+        "date": 1782244684188,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2040437.4089754496,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1158414.7992402283,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 903972.3137868333,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.1us | P99.9: 6.6us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3825341.853109206,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 477867.19156108715,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.2us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 238747.0456679563,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 4.9us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.84s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1202223.1269619153,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1085502.8505386268,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 687331.343064621,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.6us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
