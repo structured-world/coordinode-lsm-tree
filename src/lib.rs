@@ -511,7 +511,7 @@ pub use {
 pub use compression::ZstdDictionary;
 
 #[cfg(feature = "metrics")]
-pub use metrics::Metrics;
+pub use metrics::{CacheStats, Metrics};
 
 #[cfg(feature = "std")]
 #[doc(hidden)]

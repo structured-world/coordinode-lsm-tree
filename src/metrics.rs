@@ -86,11 +86,47 @@ pub struct Metrics {
     pub(crate) ecc_shard_recovered: AtomicUsize,
 }
 
+/// A point-in-time snapshot of block-cache effectiveness and occupancy.
+///
+/// Derived from [`Metrics`] (the cumulative hit / miss counters) plus the live
+/// block cache's current size and capacity, so an observability consumer gets a
+/// stable owned value instead of reaching into the mutable `&Arc<Metrics>`.
+/// Counts are cumulative since process start (they reset on restart, like all of
+/// [`Metrics`]); derive a rate over an interval from the delta between two polls.
+#[must_use]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct CacheStats {
+    /// Cumulative block reads served from the block cache (all block types).
+    pub hits: u64,
+    /// Cumulative block reads that missed the cache and hit disk (all block types).
+    pub misses: u64,
+    /// Hit rate in `0.0..=1.0` (`hits / (hits + misses)`); `1.0` when no block
+    /// has been loaded yet (nothing has missed).
+    pub hit_rate: f64,
+    /// Current weighted bytes resident in the block cache.
+    pub size_bytes: u64,
+    /// Configured maximum bytes the block cache may hold.
+    pub capacity_bytes: u64,
+}
+
 #[expect(
     clippy::cast_precision_loss,
     reason = "metrics can accept precision loss"
 )]
 impl Metrics {
+    /// Builds a [`CacheStats`] snapshot from the cumulative cache counters and
+    /// the caller-supplied live cache `size_bytes` / `capacity_bytes` (the block
+    /// cache owns its occupancy, [`Metrics`] owns the hit / miss tallies).
+    pub fn cache_stats(&self, size_bytes: u64, capacity_bytes: u64) -> CacheStats {
+        CacheStats {
+            hits: self.block_load_cached_count() as u64,
+            misses: self.block_load_io_count() as u64,
+            hit_rate: self.block_cache_hit_rate(),
+            size_bytes,
+            capacity_bytes,
+        }
+    }
+
     /// Returns the cache hit rate for file descriptors in percent (0.0 - 1.0).
     pub fn table_file_cache_hit_rate(&self) -> f64 {
         let uncached = self.table_file_opened_uncached.load(Relaxed) as f64;
