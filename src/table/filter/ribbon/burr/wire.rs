@@ -496,6 +496,15 @@ fn walk_first_layer(bytes: &[u8], hash: u64, expected_type: u8) -> crate::Result
             standard_equation_from_hash(hash, seed, &layer_params, &mut fingerprint_buf);
         let fingerprint = fingerprint_buf[0];
 
+        // Prefetch the [start, start+w) coefficient window (w u64 rows = w*8
+        // bytes) before the threshold check so the hash-random cold miss on the
+        // first band row overlaps the is_bumped work. Hint only; clamped to `z`.
+        let win_start = equation.start * 8;
+        super::prefetch::prefetch_span(
+            z.as_ptr().wrapping_add(win_start),
+            (usize::from(w) * 8).min(z.len().saturating_sub(win_start)),
+        );
+
         if is_bumped(&equation, thresholds, b) {
             continue;
         }
@@ -614,6 +623,16 @@ pub(crate) fn contains_hash(decoded: &DecodedFilter<'_>, hash: u64) -> bool {
             standard_equation_from_hash(hash, layer.seed, &layer_params, &mut fingerprint_buf);
         let fingerprint = fingerprint_buf[0];
 
+        // Prefetch the [start, start+w) coefficient window (w u64 rows = w*8
+        // bytes) before the threshold check so the hash-random cold miss on the
+        // first band row overlaps the is_bumped work. Hint only; clamped to `z`.
+        let z = layer.z_bytes;
+        let win_start = equation.start * 8;
+        super::prefetch::prefetch_span(
+            z.as_ptr().wrapping_add(win_start),
+            (usize::from(decoded.w) * 8).min(z.len().saturating_sub(win_start)),
+        );
+
         if is_bumped(&equation, layer.thresholds, decoded.b) {
             continue;
         }
@@ -626,7 +645,6 @@ pub(crate) fn contains_hash(decoded: &DecodedFilter<'_>, hash: u64) -> bool {
         // → u64 per matched row inline (no per-call allocation, vs
         // pre-decoding into Vec<u64> which would happen on every
         // FilterBlock construction during the LSM read path).
-        let z = layer.z_bytes;
         let mut acc: u64 = 0;
         let mut lo = equation.coeff_lo;
         while lo != 0 {
