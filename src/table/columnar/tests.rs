@@ -901,3 +901,19 @@ fn column_batch_match_entries_fails_closed_when_a_delete_mask_position_overflows
         "expected an overflow InvalidHeader, got {err:?}",
     );
 }
+
+#[test]
+fn column_batch_match_entries_rejects_a_zero_row_block() {
+    // A zero-row columnar block is malformed (the writer never emits one). The
+    // point-read matcher must fail closed on it, not return an empty match that
+    // load_columnar_point_block would turn into an absent-key miss, hiding the
+    // on-disk corruption.
+    let batch = entries_to_column_batch(&[]).expect("zero-row batch");
+    let cmp = crate::comparator::default_comparator();
+    let err = column_batch_match_entries(&batch, b"x", &cmp, None)
+        .expect_err("a zero-row block must fail closed");
+    assert!(
+        matches!(err, crate::Error::InvalidHeader(m) if m.contains("empty reconstructed data block")),
+        "expected an empty-block InvalidHeader, got {err:?}",
+    );
+}
