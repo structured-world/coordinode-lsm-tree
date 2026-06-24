@@ -782,11 +782,14 @@ impl AbstractTree for BlobTree {
             }
         });
 
+        // Live runtime snapshot: a blob tree's index must honor the same
+        // per-flush SST config as a standard tree's flush, not just the
+        // structural block options above.
+        let rc = self.index.0.runtime_config.load_full();
+
         if index_partitioning {
             // Size-adaptive index: single-level for small SSTs, spill to
-            // partitioned only past the threshold (see flush path). The
-            // threshold is a live runtime config, read off the current snapshot.
-            let rc = self.index.0.runtime_config.load_full();
+            // partitioned only past the threshold (see flush path).
             table_writer = table_writer.use_adaptive_index(rc.index_partition_spill_threshold);
         }
         if filter_partitioning {
@@ -796,6 +799,17 @@ impl AbstractTree for BlobTree {
         table_writer =
             table_writer.use_prefix_extractor(self.index.config.prefix_extractor.clone());
         table_writer = table_writer.use_encryption(self.index.config.encryption.clone());
+        // Runtime-driven SST options, mirroring the standard tree's flush so a
+        // blob tree's index honors columnar, zone maps, ECC, seqno-in-index,
+        // per-KV checksums, locator policy, sync mode, and CoW disable.
+        table_writer = table_writer.use_page_ecc(self.index.config.page_ecc, rc.ecc_scheme);
+        table_writer = table_writer.use_sync_mode(self.index.config.sync_mode);
+        table_writer = table_writer.use_seqno_in_index(rc.seqno_in_index);
+        table_writer = table_writer.use_zone_map(rc.zone_map);
+        table_writer = table_writer.use_columnar(rc.columnar);
+        table_writer = table_writer.use_disable_cow_on_sst(rc.disable_cow_on_sst_files);
+        table_writer = table_writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
+        table_writer = table_writer.use_locator(self.index.config.locator_policy.get(0));
 
         #[cfg(zstd_any)]
         {
