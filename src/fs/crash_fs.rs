@@ -166,15 +166,43 @@ impl CrashFs {
             )
         });
     }
+
+    /// Reads the current content of `path` if it already exists, for use as the
+    /// initial durable baseline. Returns `None` if the file does not exist (a
+    /// brand-new file has no durable image until its first sync).
+    fn read_baseline(&self, path: &Path) -> Option<Vec<u8>> {
+        let mut f = self
+            .inner
+            .open(path, &FsOpenOptions::new().read(true))
+            .ok()?;
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut f, &mut buf).ok()?;
+        Some(buf)
+    }
 }
 
 impl Fs for CrashFs {
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
         let writable = opts.write || opts.create || opts.create_new || opts.append || opts.truncate;
-        let inner = self.inner.open(path, opts)?;
         if writable {
-            self.state.lock().touched.insert(path.to_path_buf());
+            let pb = path.to_path_buf();
+            // Honor "current contents are the initial durable image": the first
+            // time a PRE-EXISTING file is opened for writing, capture its bytes
+            // as the durable baseline BEFORE the open (which may truncate). A
+            // brand-new file captures nothing, so a crash before its first sync
+            // removes it. This also covers files materialized outside a tracked
+            // write (a hard_link / reflink destination): opening one for an
+            // unsynced write now rolls back to the linked/cloned bytes instead
+            // of vanishing.
+            let needs_baseline = !self.state.lock().durable.contains_key(&pb);
+            if needs_baseline {
+                if let Some(bytes) = self.read_baseline(path) {
+                    self.state.lock().durable.insert(pb.clone(), bytes);
+                }
+            }
+            self.state.lock().touched.insert(pb);
         }
+        let inner = self.inner.open(path, opts)?;
         Ok(Box::new(CrashFile {
             inner,
             path: path.to_path_buf(),
@@ -204,18 +232,32 @@ impl Fs for CrashFs {
     }
 
     fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
-        self.inner.remove_dir_all(path)
+        self.inner.remove_dir_all(path)?;
+        // Purge crash state for every tracked path under the removed directory,
+        // so crash() neither resurrects nor panics recreating a file whose
+        // parent is gone.
+        let mut state = self.state.lock();
+        state.durable.retain(|k, _| !k.starts_with(path));
+        state.touched.retain(|k| !k.starts_with(path));
+        Ok(())
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         self.inner.rename(from, to)?;
-        // The destination now reads as the source's content; carry its durable
-        // image and write-tracking across the rename.
         let mut state = self.state.lock();
-        if let Some(bytes) = state.durable.remove(from) {
+        // The destination is replaced on disk: drop its prior durable image and
+        // write-tracking first, then carry the source's across (the rename is
+        // as durable as the source was). Clearing `to` unconditionally is what
+        // stops a replaced, previously-synced destination from being resurrected
+        // to its stale content on crash.
+        let from_durable = state.durable.remove(from);
+        state.durable.remove(to);
+        if let Some(bytes) = from_durable {
             state.durable.insert(to.to_path_buf(), bytes);
         }
-        if state.touched.remove(from) {
+        let from_touched = state.touched.remove(from);
+        state.touched.remove(to);
+        if from_touched {
             state.touched.insert(to.to_path_buf());
         }
         Ok(())
