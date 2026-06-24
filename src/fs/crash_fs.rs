@@ -168,16 +168,50 @@ impl CrashFs {
     }
 
     /// Reads the current content of `path` if it already exists, for use as the
-    /// initial durable baseline. Returns `None` if the file does not exist (a
-    /// brand-new file has no durable image until its first sync).
-    fn read_baseline(&self, path: &Path) -> Option<Vec<u8>> {
-        let mut f = self
-            .inner
-            .open(path, &FsOpenOptions::new().read(true))
-            .ok()?;
+    /// initial durable baseline. Returns `Ok(None)` only when the file does not
+    /// exist (a brand-new file has no durable image until its first sync); any
+    /// other open/read error is propagated rather than swallowed, so a transient
+    /// read failure cannot silently drop a pre-existing file's durable image.
+    fn read_baseline(&self, path: &Path) -> io::Result<Option<Vec<u8>>> {
+        let mut f = match self.inner.open(path, &FsOpenOptions::new().read(true)) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
         let mut buf = Vec::new();
-        std::io::Read::read_to_end(&mut f, &mut buf).ok()?;
-        Some(buf)
+        std::io::Read::read_to_end(&mut f, &mut buf)?;
+        Ok(Some(buf))
+    }
+
+    /// Records `path`'s pre-existing content as its durable baseline on the FIRST
+    /// touch of this run, then marks it touched. Re-touching is a no-op for the
+    /// baseline (a file already touched is tracked by sync; re-reading it would
+    /// wrongly promote un-synced bytes to durable). Used by every entry point
+    /// that creates or mutates a file's content: `open` (writable), `punch_hole`,
+    /// `truncate_file`.
+    fn capture_first_touch(&self, path: &Path) -> io::Result<()> {
+        let pb = path.to_path_buf();
+        let first_touch = !self.state.lock().touched.contains(&pb);
+        if first_touch {
+            let baseline = self.read_baseline(path)?;
+            if let Some(bytes) = baseline {
+                self.state.lock().durable.insert(pb.clone(), bytes);
+            }
+        }
+        self.state.lock().touched.insert(pb);
+        Ok(())
+    }
+
+    /// Records the destination of a copy-style op (`hard_link` / `reflink`): it
+    /// mirrors the source's durability. Carry the source's durable image if it
+    /// has one, and mark the destination touched, so a crash either restores the
+    /// linked/cloned bytes (durable source) or removes an un-synced copy.
+    fn track_copy(&self, src: &Path, dst: &Path) {
+        let mut state = self.state.lock();
+        if let Some(bytes) = state.durable.get(src).cloned() {
+            state.durable.insert(dst.to_path_buf(), bytes);
+        }
+        state.touched.insert(dst.to_path_buf());
     }
 }
 
@@ -185,24 +219,10 @@ impl Fs for CrashFs {
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
         let writable = opts.write || opts.create || opts.create_new || opts.append || opts.truncate;
         if writable {
-            let pb = path.to_path_buf();
-            // Honor "current contents are the initial durable image": the first
-            // time a PRE-EXISTING file is opened for writing, capture its bytes
-            // as the durable baseline BEFORE the open (which may truncate). A
-            // brand-new file captures nothing, so a crash before its first sync
-            // removes it. This also covers files materialized outside a tracked
-            // write (a hard_link / reflink destination): opening one for an
-            // unsynced write now rolls back to the linked/cloned bytes instead
-            // of vanishing.
-            let needs_baseline = !self.state.lock().durable.contains_key(&pb);
-            if needs_baseline {
-                // Read outside the lock (it is I/O), then record the baseline.
-                let baseline = self.read_baseline(path);
-                if let Some(bytes) = baseline {
-                    self.state.lock().durable.insert(pb.clone(), bytes);
-                }
-            }
-            self.state.lock().touched.insert(pb);
+            // Capture the pre-existing durable image BEFORE the open (which may
+            // truncate); a brand-new file captures nothing, so a crash before its
+            // first sync removes it.
+            self.capture_first_touch(path)?;
         }
         let inner = self.inner.open(path, opts)?;
         Ok(Box::new(CrashFile {
@@ -282,7 +302,9 @@ impl Fs for CrashFs {
     }
 
     fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
-        self.inner.hard_link(src, dst)
+        self.inner.hard_link(src, dst)?;
+        self.track_copy(src, dst);
+        Ok(())
     }
 
     fn backend_id(&self) -> Option<u64> {
@@ -302,14 +324,22 @@ impl Fs for CrashFs {
     }
 
     fn punch_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<()> {
+        // Content-mutating: capture the pre-mutation durable image so an
+        // un-synced punch rolls back on crash.
+        self.capture_first_touch(path)?;
         self.inner.punch_hole(path, offset, len)
     }
 
     fn reflink_file(&self, src: &Path, dst: &Path) -> io::Result<()> {
-        self.inner.reflink_file(src, dst)
+        self.inner.reflink_file(src, dst)?;
+        self.track_copy(src, dst);
+        Ok(())
     }
 
     fn truncate_file(&self, path: &Path) -> io::Result<()> {
+        // Content-mutating: capture the pre-truncate image so an un-synced
+        // reclaim rolls back on crash.
+        self.capture_first_touch(path)?;
         self.inner.truncate_file(path)
     }
 
@@ -416,10 +446,5 @@ impl FsFile for CrashFile {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    reason = "test code"
-)]
+#[expect(clippy::unwrap_used, clippy::expect_used, reason = "test code")]
 mod tests;
