@@ -285,6 +285,16 @@ impl Table {
         self.delete_bitmap.as_ref()
     }
 
+    /// Whether this segment carries a parallel `zone_map` section, i.e. it was
+    /// written with the zone-map policy on and held at least one data block.
+    /// The section powers predicate-based block-skip; absence means scans read
+    /// every block. Read-transparent either way, so this is the only way to
+    /// observe that a flush actually persisted zone maps.
+    #[must_use]
+    pub fn has_zone_map(&self) -> bool {
+        self.regions.zone_map.is_some()
+    }
+
     fn load_block(
         &self,
         handle: &BlockHandle,

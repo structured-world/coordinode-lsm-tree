@@ -19,7 +19,7 @@
 //! skips the rest.
 
 use lsm_tree::{
-    AbstractTree, AnyTree, CompressionType, Config, KvSeparationOptions, SeqNo,
+    AbstractTree, AnyTree, CompressionType, Config, Guard, KvSeparationOptions, SeqNo,
     SequenceNumberCounter, config::CompressionPolicy, get_tmp_folder,
 };
 
@@ -213,11 +213,24 @@ fn verify(tree: &AnyTree, cell: Cell) {
             cell.label()
         );
     }
-    let scanned = tree.range(key(0)..key(1_000_000), SeqNo::MAX, None).count();
+    // Full range scan must return every (key, value) in ascending key order —
+    // not merely the right row *count*. A broken iterator that yields KEYS rows
+    // in the wrong order, or with the wrong payloads, would slip past a count
+    // check; comparing the exact sequence catches it.
+    let scanned: Vec<(Vec<u8>, Vec<u8>)> = tree
+        .range(key(0)..key(1_000_000), SeqNo::MAX, None)
+        .map(|guard| {
+            let (k, v) = guard
+                .into_inner()
+                .unwrap_or_else(|e| panic!("[{}] range guard errored: {e}", cell.label()));
+            (k.to_vec(), v.to_vec())
+        })
+        .collect();
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..KEYS).map(|i| (key(i), val(i))).collect();
     assert_eq!(
         scanned,
-        KEYS as usize,
-        "[{}] range scan must see every row",
+        expected,
+        "[{}] full range scan must return every row in key order with exact payloads",
         cell.label()
     );
 }
@@ -256,6 +269,28 @@ fn run_cell(cell: Cell) {
                     cell.label()
                 );
             }
+        }
+
+        // The zone-map axis is likewise transparent to point reads and full
+        // scans, so a flush that ignored `rc.zone_map` would still round-trip.
+        // Prove a `+zm` cell actually persisted zone maps on disk (parallel to
+        // the columnar check). zone_map is not feature-gated — it works in every
+        // build — so this assertion is unconditional.
+        if cell.zone_map {
+            let version = match &tree {
+                AnyTree::Standard(t) => t.current_version(),
+                AnyTree::Blob(t) => t.index.current_version(),
+            };
+            assert!(
+                version.iter_tables().next().is_some(),
+                "[{}] expected at least one flushed SST to check for zone maps",
+                cell.label()
+            );
+            assert!(
+                version.iter_tables().all(|x| x.has_zone_map()),
+                "[{}] zone-map cell produced SSTs without a zone-map section",
+                cell.label()
+            );
         }
 
         verify(&tree, cell);
