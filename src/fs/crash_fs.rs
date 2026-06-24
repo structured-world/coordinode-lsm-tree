@@ -196,7 +196,9 @@ impl Fs for CrashFs {
             // of vanishing.
             let needs_baseline = !self.state.lock().durable.contains_key(&pb);
             if needs_baseline {
-                if let Some(bytes) = self.read_baseline(path) {
+                // Read outside the lock (it is I/O), then record the baseline.
+                let baseline = self.read_baseline(path);
+                if let Some(bytes) = baseline {
                     self.state.lock().durable.insert(pb.clone(), bytes);
                 }
             }
