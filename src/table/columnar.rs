@@ -1216,6 +1216,83 @@ fn bytes_row_slice(data: &Slice, row_count: u32, i: u32) -> Result<Slice> {
     Ok(data.slice(payload_start..payload_end))
 }
 
+/// Reconstructs only the rows whose key equals `needle`, for the columnar
+/// point-read path.
+///
+/// Binary-searches the key column to the first row `>= needle`, then collects the
+/// contiguous `== needle` run as entries (newest-first, matching block order),
+/// skipping rows masked by the positional delete-bitmap. Returns an empty vec
+/// when the key is absent (or every matching row is deleted). The caller
+/// re-encodes this handful of rows into a tiny block and runs the normal
+/// seqno-aware point read, so a columnar point read decodes the block once and
+/// touches one key's rows instead of untransposing and re-encoding the whole
+/// block.
+pub fn column_batch_match_entries(
+    batch: &ColumnBatch,
+    needle: &[u8],
+    comparator: &crate::comparator::SharedComparator,
+    deletes: Option<(&crate::table::delete_bitmap::DeleteBitmap, u32)>,
+) -> Result<Vec<InternalValue>> {
+    let (key_col, seqno_col, vt_col, value_cols) = validate_columnar_columns(batch)?;
+    let row_count = batch.row_count;
+
+    // Lower bound: first row whose key is `>= needle` (keys are block-index
+    // sorted: user_key ASC, seqno DESC).
+    let mut lo = 0u32;
+    let mut hi = row_count;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let k = bytes_column_row(&key_col.data, row_count, mid)?;
+        if comparator.compare(k, needle) == core::cmp::Ordering::Less {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    // Collect the contiguous `== needle` run from `lo`, skipping masked rows.
+    let mut out = Vec::new();
+    let mut row = lo;
+    while row < row_count {
+        let k = bytes_column_row(&key_col.data, row_count, row)?;
+        if comparator.compare(k, needle) != core::cmp::Ordering::Equal {
+            break;
+        }
+        let masked = deletes.is_some_and(|(bitmap, start)| {
+            start
+                .checked_add(row)
+                .is_some_and(|pos| bitmap.contains(pos))
+        });
+        if !masked {
+            // Match the engine's key invariants (non-empty, u16 length).
+            if k.is_empty() || k.len() > u16::MAX as usize {
+                return Err(Error::InvalidHeader(
+                    "columnar: user key is empty or longer than u16::MAX",
+                ));
+            }
+            let seqno = fixed_u64_row(&seqno_col.data, row)?;
+            let vt_byte = vt_col
+                .data
+                .get(row as usize)
+                .copied()
+                .ok_or(Error::InvalidHeader("columnar: value-type row truncated"))?;
+            let value_type = ValueType::try_from(vt_byte)
+                .map_err(|()| Error::InvalidTag(("ValueType", vt_byte)))?;
+            let value = reconstruct_row_value(value_cols, row_count, row)?;
+            out.push(InternalValue {
+                key: InternalKey {
+                    user_key: Slice::from(k),
+                    seqno,
+                    value_type,
+                },
+                value,
+            });
+        }
+        row += 1;
+    }
+    Ok(out)
+}
+
 /// Frames one row's value sub-column cells into a single self-describing value
 /// blob.
 ///

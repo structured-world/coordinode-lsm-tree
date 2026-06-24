@@ -527,6 +527,29 @@ impl DataBlock {
         Self::encode_entries_to_block(&entries, restart_interval)
     }
 
+    /// Point-read fast path for a columnar block: reconstructs only the rows whose
+    /// key equals `needle` (skipping `deletes`-masked rows) into a tiny row block,
+    /// or `Ok(None)` when the key is absent / wholly deleted. The caller runs the
+    /// normal seqno-aware [`Self::point_read`] on the result. Avoids untransposing
+    /// and re-encoding the whole block per lookup.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn columnar_point_block(
+        block_data: &[u8],
+        needle: &[u8],
+        comparator: &crate::comparator::SharedComparator,
+        restart_interval: u8,
+        deletes: Option<(&crate::table::delete_bitmap::DeleteBitmap, u32)>,
+    ) -> crate::Result<Option<Self>> {
+        let batch = crate::table::columnar::ColumnBatch::decode(block_data)?;
+        let entries = crate::table::columnar::column_batch_match_entries(
+            &batch, needle, comparator, deletes,
+        )?;
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        Self::encode_entries_to_block(&entries, restart_interval).map(Some)
+    }
+
     /// As [`Self::from_columnar_block`], but drops rows whose global position is
     /// marked deleted in `deletes`. `block_start_row` is the position of this
     /// block's first row within the segment (block-index order).

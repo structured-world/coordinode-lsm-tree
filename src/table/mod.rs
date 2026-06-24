@@ -407,6 +407,57 @@ impl Table {
         }
     }
 
+    /// Point-read counterpart to [`Self::load_columnar_data_block`]: decodes the
+    /// columnar block once and rebuilds only `needle`'s rows (its MVCC versions,
+    /// minus any masked by the positional delete-bitmap) into a tiny row block, or
+    /// `Ok(None)` when the key is absent / wholly deleted. The caller runs the
+    /// normal seqno-aware point read on the result, so a columnar point read
+    /// touches one key's rows instead of untransposing + re-encoding the whole
+    /// block per lookup.
+    #[cfg(feature = "columnar")]
+    fn load_columnar_point_block(
+        &self,
+        handle: &BlockHandle,
+        needle: &[u8],
+    ) -> crate::Result<Option<DataBlock>> {
+        let block = self.load_block(
+            handle,
+            BlockType::Columnar,
+            self.metadata.data_block_compression,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+        )?;
+        let deletes = self
+            .delete_block_starts
+            .as_ref()
+            .and_then(|starts| starts.get(&handle.offset().0))
+            .map(|&start| (self.delete_bitmap.as_ref(), start));
+        DataBlock::columnar_point_block(
+            &block.data,
+            needle,
+            &self.comparator,
+            self.metadata.data_block_restart_interval,
+            deletes,
+        )
+    }
+
+    /// Loads the data block to point-read for `needle`: for a columnar SST the
+    /// key-aware fast path that rebuilds only the matching key's rows; for a row
+    /// SST the whole block. `Ok(None)` means the block carries no row for `needle`
+    /// (columnar: absent / wholly deleted), so the caller moves on.
+    fn load_point_block(
+        &self,
+        handle: &BlockHandle,
+        needle: &[u8],
+    ) -> crate::Result<Option<DataBlock>> {
+        #[cfg(feature = "columnar")]
+        if self.metadata.columnar {
+            return self.load_columnar_point_block(handle, needle);
+        }
+        let _ = needle;
+        self.load_data_block(handle)
+    }
+
     /// Loads a columnar data block and decodes only the projected columns,
     /// stepping over the rest without decoding them. The returned batch carries
     /// the requested columns for this block's rows. This is the projection read
@@ -854,17 +905,20 @@ impl Table {
         // MVCC-correctness argument). A located-block miss falls through to the
         // index walk below.
         if let Some((handle, hint)) = self.locator_block(key_hash)?
-            && let Some(data_block) = self.load_data_block(&handle)?
+            && let Some(data_block) = self.load_point_block(&handle, key)?
         {
+            // A columnar block is narrowed to this key's rows by load_point_block,
+            // so the full-block slot hint does not apply.
+            let is_columnar = cfg!(feature = "columnar") && self.metadata.columnar;
             let found = match hint {
-                Some((slot, is_entry)) => data_block.point_read_value_at_slot(
+                Some((slot, is_entry)) if !is_columnar => data_block.point_read_value_at_slot(
                     slot,
                     is_entry,
                     key,
                     seqno,
                     &self.comparator,
                 )?,
-                None => data_block.point_read_value(key, seqno, &self.comparator)?,
+                _ => data_block.point_read_value(key, seqno, &self.comparator)?,
             };
             if let Some(found) = found {
                 return Ok(Some(found));
@@ -878,8 +932,9 @@ impl Table {
         for block_handle in iter {
             let block_handle = block_handle?;
 
-            // A wholly-deleted columnar block carries no keys; skip it.
-            let Some(data_block) = self.load_data_block(block_handle.as_ref())? else {
+            // A columnar block carrying no row for this key (absent / wholly
+            // deleted) returns None here; skip it.
+            let Some(data_block) = self.load_point_block(block_handle.as_ref(), key)? else {
                 continue;
             };
 
@@ -983,13 +1038,16 @@ impl Table {
         // visible version lives in a later block) safely falls through to the
         // index walk below.
         if let Some((handle, hint)) = self.locator_block(key_hash)?
-            && let Some(data_block) = self.load_data_block(&handle)?
+            && let Some(data_block) = self.load_point_block(&handle, key)?
         {
+            // A columnar block is narrowed to this key's rows by load_point_block,
+            // so the full-block slot hint does not apply.
+            let is_columnar = cfg!(feature = "columnar") && self.metadata.columnar;
             let found = match hint {
-                Some((slot, is_entry)) => {
+                Some((slot, is_entry)) if !is_columnar => {
                     data_block.point_read_at_slot(slot, is_entry, key, seqno, &self.comparator)?
                 }
-                None => data_block.point_read(key, seqno, &self.comparator)?,
+                _ => data_block.point_read(key, seqno, &self.comparator)?,
             };
             if let Some(item) = found {
                 return Ok(Some((item, data_block)));
@@ -1006,8 +1064,9 @@ impl Table {
         for block_handle in iter {
             let block_handle = block_handle?;
 
-            // A wholly-deleted columnar block carries no keys; skip it.
-            let Some(data_block) = self.load_data_block(block_handle.as_ref())? else {
+            // A columnar block carrying no row for this key (absent / wholly
+            // deleted) returns None here; skip it.
+            let Some(data_block) = self.load_point_block(block_handle.as_ref(), key)? else {
                 continue;
             };
 
