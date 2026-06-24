@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782273363588,
+  "lastUpdate": 1782275773911,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -19764,6 +19764,84 @@ window.BENCHMARK_DATA = {
             "value": 688898.5480119749,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 5.6us | P99.9: 8.7us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "255865126+sw-release-bot[bot]@users.noreply.github.com",
+            "name": "sw-release-bot[bot]",
+            "username": "sw-release-bot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "995360f0825e452a60b2793c16a53582d54eb2f5",
+          "message": "chore: release v5.6.0 (#512)\n\n## 🤖 New release\n\n* `coordinode-lsm-tree`: 5.5.0 -> 5.6.0\n\n<details><summary><i><b>Changelog</b></i></summary><p>\n\n<blockquote>\n\n##\n[5.6.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.5.0...v5.6.0)\n- 2026-06-24\n\n### Added\n\n- *(no_std)* bottommost compaction GC + verify scrub on the no_std path\n([#541](https://github.com/structured-world/coordinode-lsm-tree/pull/541))\n- *(columnar)* accumulate ingest batches into one rowgroup\n([#537](https://github.com/structured-world/coordinode-lsm-tree/pull/537))\n- *(columnar)* nullable value sub-columns and default values\n([#536](https://github.com/structured-world/coordinode-lsm-tree/pull/536))\n- *(columnar)* consumer value sub-columns via columnar ingest\n([#531](https://github.com/structured-world/coordinode-lsm-tree/pull/531))\n- positional delete-bitmap MVCC for columnar segments\n([#530](https://github.com/structured-world/coordinode-lsm-tree/pull/530))\n- *(columnar)* vectorized columnar scan with projection and predicate\npushdown\n([#525](https://github.com/structured-world/coordinode-lsm-tree/pull/525))\n- *(columnar)* column-organized SST data blocks with on-flush transpose\n([#524](https://github.com/structured-world/coordinode-lsm-tree/pull/524))\n- *(columnar)* intrinsic-field transpose between entries and ColumnBatch\n([#523](https://github.com/structured-world/coordinode-lsm-tree/pull/523))\n- *(columnar)* PAX columnar block format and ColumnBatch read unit\n([#517](https://github.com/structured-world/coordinode-lsm-tree/pull/517))\n- *(tree)* approximate range row-count + selectivity\n([#514](https://github.com/structured-world/coordinode-lsm-tree/pull/514))\n- *(tree)* per-level / per-segment storage + access stats\n([#515](https://github.com/structured-world/coordinode-lsm-tree/pull/515))\n- *(tree)* approximate range size/count estimate\n([#513](https://github.com/structured-world/coordinode-lsm-tree/pull/513))\n- per-block zone-map section\n([#511](https://github.com/structured-world/coordinode-lsm-tree/pull/511))\n\n### Documentation\n\n- external WAL contract and storage invariants reference\n([#546](https://github.com/structured-world/coordinode-lsm-tree/pull/546))\n- *(columnar)* consumer sub-column schema evolution conventions\n([#539](https://github.com/structured-world/coordinode-lsm-tree/pull/539))\n\n### Fixed\n\n- *(table)* replace saturating seqno arithmetic on the read path with\nchecked\n([#538](https://github.com/structured-world/coordinode-lsm-tree/pull/538))\n- *(compaction)* keep a range tombstone deleting a key with a later\nmerge operand\n([#528](https://github.com/structured-world/coordinode-lsm-tree/pull/528))\n\n### Performance\n\n- *(filter)* prefetch the ribbon coefficient window in the BuRR probe\n([#545](https://github.com/structured-world/coordinode-lsm-tree/pull/545))\n\n### Refactored\n\n- coherent storage-statistics surface with compaction-debt and cache\nsnapshot\n([#543](https://github.com/structured-world/coordinode-lsm-tree/pull/543))\n\n### Testing\n\n- *(oracle)* extend the BTreeMap-oracle model harness to the full\noperation set\n([#526](https://github.com/structured-world/coordinode-lsm-tree/pull/526))\n- *(cache)* demonstrate metadata-priority pin cuts filter reloads under\nchurn\n([#516](https://github.com/structured-world/coordinode-lsm-tree/pull/516))\n</blockquote>\n\n\n</p></details>\n\n---\nThis PR was generated with\n[release-plz](https://github.com/release-plz/release-plz/).\n\nCo-authored-by: sw-release-bot[bot] <255865126+sw-release-bot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-06-24T07:05:27+03:00",
+          "tree_id": "2109de3eac5d3df85bedd51ab2925bd1ba4fa81a",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/995360f0825e452a60b2793c16a53582d54eb2f5"
+        },
+        "date": 1782275752217,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2052312.880680951,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1191553.191431939,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 884672.7939251818,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.2us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3748299.513645019,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 464169.58361470234,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.2us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 235018.81411976443,
+            "unit": "ops/sec",
+            "extra": "P50: 4.0us | P99: 5.0us | P99.9: 9.8us\nthreads: 1 | elapsed: 0.85s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1241549.8641902746,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1068601.6620602813,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.9us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 699533.0298738064,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.6us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
