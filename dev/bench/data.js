@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782246503734,
+  "lastUpdate": 1782273363588,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -19686,6 +19686,84 @@ window.BENCHMARK_DATA = {
             "value": 692127.4372999505,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 4.5us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0db90b6210c57692b2288aa527c19a375741b7d7",
+          "message": "docs: external WAL contract and storage invariants reference (#546)\n\n## Summary\n\nTwo documentation references for the storage engine. Docs-only (no code\nchange).\n\nCloses #520, closes #518.\n\n## docs/external-wal.md (#520)\n\nThe contract for building durability on top of the WAL-less engine:\n\n- **Log before apply** — the seqno is a caller input to `insert`, so it\nis the cursor that ties WAL records to engine state; log + sync the\nrecord, then apply.\n- **Durability points** — `flush_active_memtable` returning `Ok` makes\nevery seqno in the flushed memtable durable;\n`get_highest_persisted_seqno` is the watermark to trim the WAL against\n(distinct from `get_highest_seqno`); `create_checkpoint` for\npoint-in-time copies.\n- **Recovery replay** — on open the engine recovers from SSTs alone;\nreplay the WAL from `get_highest_persisted_seqno() + 1`, idempotent\nbecause re-applying a record at its original seqno reproduces the same\nMVCC version.\n- Resolves the open question: the existing public API expresses the full\ncontract, so no engine hook trait is added (documented why).\n\n## docs/INVARIANTS.md (#518)\n\nThe engine's load-bearing invariants, each as **rule + why + where\nenforced** (module / test), so a reviewer can check \"does this change\nviolate invariant X?\" without re-deriving the contract. Grouped by\nsubsystem: SST block layout + zone map, filter (AMQ no-false-negative),\nblock cache coherence, manifest, compaction, file lifecycle &\nconcurrency, snapshot / seqno, range tombstones, merge operators,\nrecovery / ECC, encryption-at-rest AAD binding, key-value separation\n(BlobTree), columnar / delete-bitmap.\n\nThe set goes beyond the originally enumerated subsystems: the filter\nno-false-negative property, block-cache coherence, the file-reference\nlifecycle + single-writer directory lock, the AAD position binding, and\nthe blob-pointer / GC invariant are all load-bearing correctness\ncontracts that were previously only implicit in code.\n\n## README\n\nBoth docs linked from the README (external-wal.md from the no-WAL\ntrade-off section; INVARIANTS.md alongside the data-integrity /\ntight-space references).\n\n## Testing\n\nDocs-only: pure Markdown, no `///` rustdoc touched and no\n`include_str!`, so there is no build, lint, or doctest impact.\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Documentation**\n* Added an external write-ahead log guide describing the required\nlog-before-apply workflow, durability timing, checkpoint flush behavior,\nand recovery replay/trim boundaries (including special merge replay\nhandling).\n* Introduced a living “storage engine invariants” reference with\nsubsystem-grouped correctness rules covering data layout, filters,\ncaching, compaction/MVCC, recovery/ECC, encryption authenticity,\nlifecycle, and snapshot/seqno semantics.\n* Updated the README to link to the new external-WAL and invariants\nreferences for clearer checkpointing and data integrity guidance.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-24T06:55:10+03:00",
+          "tree_id": "87876862bcbe366b4b35fec701757a73bca1d9b3",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/0db90b6210c57692b2288aa527c19a375741b7d7"
+        },
+        "date": 1782273362377,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2061912.7021832985,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1164073.5676568025,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 872691.7913004358,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.2us | P99.9: 6.7us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3756335.0355603783,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.1us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 472989.87197429413,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.1us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 237559.76424616508,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 5.9us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.84s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1176874.4292342905,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1082415.336435496,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 688898.5480119749,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 5.6us | P99.9: 8.7us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
