@@ -141,11 +141,167 @@ impl DoubleEndedIterator for OwnedDataBlockIter {
     }
 }
 
-fn create_data_block_reader(
-    block: DataBlock,
+/// In-memory cursor over a columnar block's reconstructed entries. Lets the scan
+/// path iterate a columnar block directly instead of re-encoding it into a
+/// row-major block and re-parsing it. Entries are in block-index order
+/// (`user_key` ASC, `seqno` DESC), so the bound seeks are binary searches; MVCC
+/// version selection happens in the merge layer above, so `seqno` is unused here.
+#[cfg(feature = "columnar")]
+struct ColumnarBlockIter {
+    entries: Vec<InternalValue>,
+    /// Forward cursor: next index to yield. Window is `[lo, hi)`.
+    lo: usize,
+    /// Exclusive back cursor: `next_back` yields `hi - 1`.
+    hi: usize,
     comparator: SharedComparator,
-) -> crate::Result<OwnedDataBlockIter> {
-    OwnedDataBlockIter::try_new(block, |b| b.try_iter(comparator))
+}
+
+#[cfg(feature = "columnar")]
+impl ColumnarBlockIter {
+    fn new(entries: Vec<InternalValue>, comparator: SharedComparator) -> Self {
+        let hi = entries.len();
+        Self {
+            entries,
+            lo: 0,
+            hi,
+            comparator,
+        }
+    }
+
+    /// Narrows `lo` to the first entry at/after the lower bound.
+    fn seek_lower_bound(&mut self, bound: &Bound, _seqno: SeqNo) -> bool {
+        let (key, skip_equal) = match bound {
+            Bound::Included(k) => (k, false),
+            Bound::Excluded(k) => (k, true),
+        };
+        let cmp = self.comparator.as_ref();
+        let pos = self.entries[self.lo..self.hi].partition_point(|e| {
+            match cmp.compare(e.key.user_key.as_ref(), key.as_ref()) {
+                core::cmp::Ordering::Less => true,
+                core::cmp::Ordering::Equal => skip_equal,
+                core::cmp::Ordering::Greater => false,
+            }
+        });
+        self.lo += pos;
+        self.lo < self.hi
+    }
+
+    /// Narrows `hi` to just past the last entry at/before the upper bound.
+    fn seek_upper_bound(&mut self, bound: &Bound, _seqno: SeqNo) -> bool {
+        let (key, keep_equal) = match bound {
+            Bound::Included(k) => (k, true),
+            Bound::Excluded(k) => (k, false),
+        };
+        let cmp = self.comparator.as_ref();
+        let pos = self.entries[self.lo..self.hi].partition_point(|e| {
+            match cmp.compare(e.key.user_key.as_ref(), key.as_ref()) {
+                core::cmp::Ordering::Less => true,
+                core::cmp::Ordering::Equal => keep_equal,
+                core::cmp::Ordering::Greater => false,
+            }
+        });
+        self.hi = self.lo + pos;
+        self.lo < self.hi
+    }
+}
+
+#[cfg(feature = "columnar")]
+impl Iterator for ColumnarBlockIter {
+    type Item = InternalValue;
+
+    fn next(&mut self) -> Option<InternalValue> {
+        if self.lo < self.hi {
+            let item = self.entries[self.lo].clone();
+            self.lo += 1;
+            Some(item)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(feature = "columnar")]
+impl DoubleEndedIterator for ColumnarBlockIter {
+    fn next_back(&mut self) -> Option<InternalValue> {
+        if self.lo < self.hi {
+            self.hi -= 1;
+            Some(self.entries[self.hi].clone())
+        } else {
+            None
+        }
+    }
+}
+
+/// A loaded data block ready to iterate: a row-major byte block (every row SST,
+/// and the partial-decode fast path) or a columnar block's reconstructed entries
+/// (iterated directly, skipping the re-encode round-trip).
+enum BlockSource {
+    Row(DataBlock),
+    #[cfg(feature = "columnar")]
+    Columnar(Vec<InternalValue>),
+}
+
+/// Iterator over a loaded block, dispatching to the byte-based row reader or the
+/// in-memory columnar reader. Exposes the surface the scan loop drives.
+enum BlockReader {
+    Row(OwnedDataBlockIter),
+    #[cfg(feature = "columnar")]
+    Columnar(ColumnarBlockIter),
+}
+
+impl BlockReader {
+    fn seek_lower_bound(&mut self, bound: &Bound, seqno: SeqNo) -> bool {
+        match self {
+            Self::Row(r) => r.seek_lower_bound(bound, seqno),
+            #[cfg(feature = "columnar")]
+            Self::Columnar(c) => c.seek_lower_bound(bound, seqno),
+        }
+    }
+
+    fn seek_upper_bound(&mut self, bound: &Bound, seqno: SeqNo) -> bool {
+        match self {
+            Self::Row(r) => r.seek_upper_bound(bound, seqno),
+            #[cfg(feature = "columnar")]
+            Self::Columnar(c) => c.seek_upper_bound(bound, seqno),
+        }
+    }
+}
+
+impl Iterator for BlockReader {
+    type Item = InternalValue;
+
+    fn next(&mut self) -> Option<InternalValue> {
+        match self {
+            Self::Row(r) => r.next(),
+            #[cfg(feature = "columnar")]
+            Self::Columnar(c) => c.next(),
+        }
+    }
+}
+
+impl DoubleEndedIterator for BlockReader {
+    fn next_back(&mut self) -> Option<InternalValue> {
+        match self {
+            Self::Row(r) => r.next_back(),
+            #[cfg(feature = "columnar")]
+            Self::Columnar(c) => c.next_back(),
+        }
+    }
+}
+
+fn create_data_block_reader(
+    source: BlockSource,
+    comparator: SharedComparator,
+) -> crate::Result<BlockReader> {
+    match source {
+        BlockSource::Row(block) => Ok(BlockReader::Row(OwnedDataBlockIter::try_new(block, |b| {
+            b.try_iter(comparator)
+        })?)),
+        #[cfg(feature = "columnar")]
+        BlockSource::Columnar(entries) => Ok(BlockReader::Columnar(ColumnarBlockIter::new(
+            entries, comparator,
+        ))),
+    }
 }
 
 /// Per-SST positional delete state for a columnar iterator: the delete-bitmap
@@ -225,10 +381,10 @@ pub struct Iter {
     index_initialized: bool,
 
     lo_offset: BlockOffset,
-    lo_data_block: Option<OwnedDataBlockIter>,
+    lo_data_block: Option<BlockReader>,
 
     hi_offset: BlockOffset,
-    hi_data_block: Option<OwnedDataBlockIter>,
+    hi_data_block: Option<BlockReader>,
 
     range: Bounds,
 
@@ -315,7 +471,7 @@ impl Iter {
     /// Loads, reconstructs (if columnar), and masks a data block by handle.
     /// Returns `Ok(None)` when a columnar block is wholly deleted by the
     /// positional mask, so the caller skips it.
-    fn load_and_resolve(&self, handle: &BlockHandle) -> crate::Result<Option<DataBlock>> {
+    fn load_and_resolve(&self, handle: &BlockHandle) -> crate::Result<Option<BlockSource>> {
         let block_type = if self.columnar {
             crate::table::block::BlockType::Columnar
         } else {
@@ -340,7 +496,6 @@ impl Iter {
         if self.columnar {
             #[cfg(feature = "columnar")]
             {
-                const REENCODE_RESTART_INTERVAL: u8 = 16;
                 // Mask only when the segment has deletes AND this block's start row
                 // is known. The start-row map is built at open from the zone map
                 // (which covers every block), so an unmapped block is unreachable;
@@ -348,20 +503,21 @@ impl Iter {
                 // sharing the no-deletes path rather than defaulting the start to 0
                 // and masking against the wrong physical positions. This matches the
                 // direct-load path (`Table::load_columnar_data_block`).
+                //
+                // The reconstructed entries are iterated directly (no re-encode to
+                // a row-major block + re-parse), so no restart interval is needed.
                 let masked = self.delete_mask.as_ref().and_then(|mask| {
                     mask.block_start_rows
                         .get(&handle.offset().0)
                         .map(|&start| (mask, start))
                 });
                 return match masked {
-                    Some((mask, start)) => DataBlock::from_columnar_block_masked(
-                        &raw.data,
-                        REENCODE_RESTART_INTERVAL,
-                        &mask.bitmap,
-                        start,
-                    ),
-                    None => DataBlock::from_columnar_block(&raw.data, REENCODE_RESTART_INTERVAL)
-                        .map(Some),
+                    Some((mask, start)) => {
+                        DataBlock::columnar_block_entries_masked(&raw.data, &mask.bitmap, start)
+                            .map(|opt| opt.map(BlockSource::Columnar))
+                    }
+                    None => DataBlock::columnar_block_entries(&raw.data)
+                        .map(|entries| Some(BlockSource::Columnar(entries))),
                 };
             }
             #[cfg(not(feature = "columnar"))]
@@ -369,7 +525,7 @@ impl Iter {
                 return Err(crate::Error::FeatureUnsupported("columnar"));
             }
         }
-        DataBlock::from_loaded(raw, self.has_kv_footer).map(Some)
+        DataBlock::from_loaded(raw, self.has_kv_footer).map(|db| Some(BlockSource::Row(db)))
     }
 
     pub fn set_lower_bound(&mut self, bound: Bound) {
@@ -703,7 +859,7 @@ impl Iterator for Iter {
             let partial: Option<DataBlock> = None;
 
             let block = if let Some(db) = partial {
-                db
+                BlockSource::Row(db)
             } else {
                 match self.load_and_resolve(&BlockHandle::new(handle.offset(), handle.size())) {
                     Ok(Some(b)) => b,
@@ -839,7 +995,7 @@ impl DoubleEndedIterator for Iter {
             let partial: Option<DataBlock> = None;
 
             let block = if let Some(db) = partial {
-                db
+                BlockSource::Row(db)
             } else {
                 match self.load_and_resolve(&BlockHandle::new(handle.offset(), handle.size())) {
                     Ok(Some(b)) => b,
