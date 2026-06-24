@@ -11,6 +11,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.6.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.5.0...v5.6.0) - 2026-06-24
+
+### Added
+
+- *(no_std)* bottommost compaction GC + verify scrub on the no_std path ([#541](https://github.com/structured-world/coordinode-lsm-tree/pull/541))
+- *(columnar)* accumulate ingest batches into one rowgroup ([#537](https://github.com/structured-world/coordinode-lsm-tree/pull/537))
+- *(columnar)* nullable value sub-columns and default values ([#536](https://github.com/structured-world/coordinode-lsm-tree/pull/536))
+- *(columnar)* consumer value sub-columns via columnar ingest ([#531](https://github.com/structured-world/coordinode-lsm-tree/pull/531))
+- positional delete-bitmap MVCC for columnar segments ([#530](https://github.com/structured-world/coordinode-lsm-tree/pull/530))
+- *(columnar)* vectorized columnar scan with projection and predicate pushdown ([#525](https://github.com/structured-world/coordinode-lsm-tree/pull/525))
+- *(columnar)* column-organized SST data blocks with on-flush transpose ([#524](https://github.com/structured-world/coordinode-lsm-tree/pull/524))
+- *(columnar)* intrinsic-field transpose between entries and ColumnBatch ([#523](https://github.com/structured-world/coordinode-lsm-tree/pull/523))
+- *(columnar)* PAX columnar block format and ColumnBatch read unit ([#517](https://github.com/structured-world/coordinode-lsm-tree/pull/517))
+- *(tree)* approximate range row-count + selectivity ([#514](https://github.com/structured-world/coordinode-lsm-tree/pull/514))
+- *(tree)* per-level / per-segment storage + access stats ([#515](https://github.com/structured-world/coordinode-lsm-tree/pull/515))
+- *(tree)* approximate range size/count estimate ([#513](https://github.com/structured-world/coordinode-lsm-tree/pull/513))
+- per-block zone-map section ([#511](https://github.com/structured-world/coordinode-lsm-tree/pull/511))
+
+### Documentation
+
+- external WAL contract and storage invariants reference ([#546](https://github.com/structured-world/coordinode-lsm-tree/pull/546))
+- *(columnar)* consumer sub-column schema evolution conventions ([#539](https://github.com/structured-world/coordinode-lsm-tree/pull/539))
+
+### Fixed
+
+- *(table)* replace saturating seqno arithmetic on the read path with checked ([#538](https://github.com/structured-world/coordinode-lsm-tree/pull/538))
+- *(compaction)* keep a range tombstone deleting a key with a later merge operand ([#528](https://github.com/structured-world/coordinode-lsm-tree/pull/528))
+
+### Performance
+
+- *(filter)* prefetch the ribbon coefficient window in the BuRR probe ([#545](https://github.com/structured-world/coordinode-lsm-tree/pull/545))
+
+### Refactored
+
+- coherent storage-statistics surface with compaction-debt and cache snapshot ([#543](https://github.com/structured-world/coordinode-lsm-tree/pull/543))
+
+### Testing
+
+- *(oracle)* extend the BTreeMap-oracle model harness to the full operation set ([#526](https://github.com/structured-world/coordinode-lsm-tree/pull/526))
+- *(cache)* demonstrate metadata-priority pin cuts filter reloads under churn ([#516](https://github.com/structured-world/coordinode-lsm-tree/pull/516))
+
 ## [5.5.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.4.0...v5.5.0) - 2026-06-20
 
 ### Added
