@@ -1258,11 +1258,16 @@ pub fn column_batch_match_entries(
         if comparator.compare(k, needle) != core::cmp::Ordering::Equal {
             break;
         }
-        let masked = deletes.is_some_and(|(bitmap, start)| {
-            start
-                .checked_add(row)
-                .is_some_and(|pos| bitmap.contains(pos))
-        });
+        let masked = if let Some((bitmap, start)) = deletes {
+            // Fail closed on a corrupt block_start_row: an overflowing position
+            // must error like the scan path, never silently expose the row.
+            let pos = start.checked_add(row).ok_or(Error::InvalidHeader(
+                "columnar: row position exceeds u32::MAX",
+            ))?;
+            bitmap.contains(pos)
+        } else {
+            false
+        };
         if !masked {
             // Match the engine's key invariants (non-empty, u16 length).
             if k.is_empty() || k.len() > u16::MAX as usize {
