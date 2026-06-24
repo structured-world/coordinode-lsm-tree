@@ -310,9 +310,9 @@ impl Table {
             return None;
         }
         let total = self.metadata.item_count.max(1);
-        // `deleted <= total`, both far below `u64::MAX / 100`, so the percentage
-        // is in `0..=100`; `.min(100)` is belt-and-suspenders for the cast.
-        let percent = (deleted * 100 / total).min(100);
+        // Widen to u128 so `* 100` cannot overflow regardless of the (already
+        // bounded) inputs; the quotient is clamped to the 0..=100 percentage range.
+        let percent = (u128::from(deleted) * 100 / u128::from(total)).min(100);
         Some(u8::try_from(percent).unwrap_or(100))
     }
 
