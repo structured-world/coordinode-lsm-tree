@@ -880,3 +880,24 @@ fn column_batch_match_entries_rejects_an_empty_key_row() {
         "expected an empty-key InvalidHeader, got {err:?}",
     );
 }
+
+#[test]
+fn column_batch_match_entries_fails_closed_when_a_delete_mask_position_overflows() {
+    // Two rows share a key, so both match the needle. With `block_start_row` at
+    // u32::MAX, the second matched row's position (start + 1) overflows u32. A
+    // masked point-read lookup must fail closed (error) like the scan path, never
+    // treat the overflow as "not deleted" and silently expose the row.
+    let batch = entries_to_column_batch(&[
+        entry(b"dup", 5, ValueType::Value, b"v0"),
+        entry(b"dup", 3, ValueType::Value, b"v1"),
+    ])
+    .expect("two-row same-key batch");
+    let bitmap = crate::table::delete_bitmap::DeleteBitmap::new();
+    let cmp = crate::comparator::default_comparator();
+    let err = column_batch_match_entries(&batch, b"dup", &cmp, Some((&bitmap, u32::MAX)))
+        .expect_err("an overflowing delete-mask position must fail closed");
+    assert!(
+        matches!(err, crate::Error::InvalidHeader(m) if m.contains("position exceeds u32::MAX")),
+        "expected an overflow InvalidHeader, got {err:?}",
+    );
+}
