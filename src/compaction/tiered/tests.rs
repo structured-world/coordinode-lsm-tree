@@ -467,3 +467,32 @@ fn stcs_pending_compaction_bytes_reflects_space_amplification() -> crate::Result
 
     Ok(())
 }
+
+#[test]
+fn stcs_pending_compaction_bytes_is_zero_below_two_runs() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    let strategy = Strategy::default().with_max_space_amplification_percent(0);
+
+    // Empty tree: no runs, nothing to reclaim.
+    assert_eq!(
+        strategy.pending_compaction_bytes(&tree.current_version()),
+        0
+    );
+
+    // A single run cannot be space-amplified against itself, so even a 0% budget
+    // owes nothing.
+    flush_overlapping(&tree, 1, 0)?;
+    assert_eq!(
+        strategy.pending_compaction_bytes(&tree.current_version()),
+        0
+    );
+
+    Ok(())
+}

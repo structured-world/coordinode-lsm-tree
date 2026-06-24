@@ -120,3 +120,68 @@ fn density_rewrite_materializes_an_over_threshold_bitmap_segment() {
         }
     }
 }
+
+/// The density rewrite is a no-op when no segment is over its level's threshold,
+/// and when the level does not run an Adaptive strategy at all: an idle
+/// compaction leaves a sub-threshold (and a non-Adaptive) bitmap segment alone.
+#[test]
+fn density_rewrite_skips_sub_threshold_and_non_adaptive() {
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()
+    .expect("open");
+    let AnyTree::Standard(tree) = any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+        cfg.delete_strategy = DeleteStrategyPolicy::all(DeleteStrategy::Adaptive {
+            purge_threshold_percent: 90,
+        });
+    })
+    .expect("config");
+
+    let n = 200u32;
+    for i in 0..n {
+        tree.insert(key(i), value(i), u64::from(i));
+    }
+    tree.remove_range(
+        UserKey::from(&key(0)[..]),
+        UserKey::from(&key(50)[..]),
+        1000,
+    );
+    tree.flush_active_memtable(0).expect("flush");
+    tree.major_compact(64 * 1024 * 1024, 5000)
+        .expect("relocate");
+
+    let still_dense = |label: &str| {
+        let version = tree.current_version();
+        let tables: Vec<_> = version.iter_tables().collect();
+        assert_eq!(tables.len(), 1, "{label}: one segment");
+        assert!(
+            tables[0].delete_density().is_some(),
+            "{label}: the segment keeps its delete-bitmap (no rewrite)",
+        );
+    };
+
+    // 25% density is below the 90% Adaptive threshold: an idle compaction must
+    // leave the bitmap in place (the density-rewrite fallback skips it).
+    tree.compact(Arc::new(Leveled::default()), 5000)
+        .expect("idle compaction");
+    still_dense("sub-threshold");
+
+    // A non-Adaptive (merge-on-read) level never purges via the density rewrite,
+    // so the bitmap segment is left alone regardless of how dense it is.
+    tree.update_runtime_config(|cfg| {
+        cfg.delete_strategy = DeleteStrategyPolicy::all(DeleteStrategy::MergeOnRead);
+    })
+    .expect("switch to merge-on-read");
+    tree.compact(Arc::new(Leveled::default()), 5000)
+        .expect("idle compaction");
+    still_dense("non-adaptive");
+}
