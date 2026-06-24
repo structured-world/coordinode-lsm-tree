@@ -62,7 +62,16 @@ fn level_manifest_atomicity() -> crate::Result<()> {
             .once(),
     );
 
-    assert!(tree.major_compact(u64::MAX, 4).is_err());
+    // Assert the failure is the ARMED edit-log fsync, not some earlier error:
+    // otherwise the test would pass without ever exercising the manifest-commit
+    // atomicity path it claims to cover.
+    match tree.major_compact(u64::MAX, 4) {
+        Ok(_) => panic!("the injected manifest-commit fault must fail the compaction"),
+        Err(e) => assert!(
+            format!("{e}").contains("injected fault"),
+            "compaction must fail on the armed edit-log fsync, not an earlier error: {e}"
+        ),
+    }
 
     assert!(tree.compaction_state.lock().hidden_set().is_empty());
 

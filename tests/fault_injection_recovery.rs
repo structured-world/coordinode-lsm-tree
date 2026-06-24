@@ -50,10 +50,16 @@ fn flush_with_torn_manifest_commit_recovers_to_last_durable_state() -> lsm_tree:
                 .once(),
         );
         tree.insert("c", "3", 2);
-        assert!(
-            tree.flush_active_memtable(0).is_err(),
-            "the flush's manifest commit must surface the injected fsync failure"
-        );
+        // Assert the failure is the ARMED edit-log fsync, not an earlier error:
+        // otherwise the orphaned-table recovery path below would never be
+        // exercised.
+        match tree.flush_active_memtable(0) {
+            Ok(_) => panic!("the injected manifest-commit fault must fail the flush"),
+            Err(e) => assert!(
+                format!("{e}").contains("injected fault"),
+                "flush must fail on the armed edit-log fsync, not an earlier error: {e}"
+            ),
+        }
         // Drop the tree: release the directory lock and discard in-memory state.
     }
 
