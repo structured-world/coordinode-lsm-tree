@@ -1104,6 +1104,118 @@ pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>
     Ok(out)
 }
 
+/// Consuming, allocation-light counterpart to [`column_batch_to_entries`] for
+/// the scan path.
+///
+/// The key column and a single non-nullable bytes value column are taken as
+/// shared [`Slice`]s, so each row's key / value is a view into one buffer
+/// (zero-copy for the Arc-backed large-value case) instead of a per-row copy.
+/// Any other value layout (fixed-width, multiple sub-columns, or nullable) falls
+/// back to the per-row framing reconstruction.
+pub fn column_batch_into_entries(batch: ColumnBatch) -> Result<Vec<InternalValue>> {
+    // Structural validation (intrinsic columns + framing) before we consume.
+    validate_columnar_columns(&batch)?;
+    let row_count = batch.row_count;
+    let mut cols = batch.columns.into_iter();
+    let key_col = cols
+        .next()
+        .ok_or(Error::InvalidHeader("columnar: missing key column"))?;
+    let seqno_col = cols
+        .next()
+        .ok_or(Error::InvalidHeader("columnar: missing seqno column"))?;
+    let vt_col = cols
+        .next()
+        .ok_or(Error::InvalidHeader("columnar: missing value-type column"))?;
+    let value_cols: Vec<Column> = cols.collect();
+
+    // Shared key buffer: every row's key is a view into it.
+    let key_data = Slice::from(key_col.data);
+
+    // A single non-nullable bytes value column lets every row's value be a view
+    // into one shared buffer; otherwise reconstruct (frame / fixed-width) per row.
+    let single_bytes_value = matches!(
+        value_cols.as_slice(),
+        [c] if c.type_tag == TypeTag::Bytes && c.validity.is_none()
+    );
+    let value_source = if single_bytes_value {
+        let single = value_cols
+            .into_iter()
+            .next()
+            .ok_or(Error::InvalidHeader("columnar: value column vanished"))?;
+        ValueSource::SharedBytes(Slice::from(single.data))
+    } else {
+        ValueSource::Reconstruct(value_cols)
+    };
+
+    let mut out = Vec::with_capacity(row_count as usize);
+    for i in 0..row_count {
+        let user_key = bytes_row_slice(&key_data, row_count, i)?;
+        // Same key invariants as column_batch_to_entries (non-empty, u16 length).
+        if user_key.is_empty() || user_key.len() > u16::MAX as usize {
+            return Err(Error::InvalidHeader(
+                "columnar: user key is empty or longer than u16::MAX",
+            ));
+        }
+        let seqno = fixed_u64_row(&seqno_col.data, i)?;
+        let vt_byte = vt_col
+            .data
+            .get(i as usize)
+            .copied()
+            .ok_or(Error::InvalidHeader("columnar: value-type row truncated"))?;
+        let value_type =
+            ValueType::try_from(vt_byte).map_err(|()| Error::InvalidTag(("ValueType", vt_byte)))?;
+        let value = match &value_source {
+            ValueSource::SharedBytes(data) => bytes_row_slice(data, row_count, i)?,
+            ValueSource::Reconstruct(cols) => reconstruct_row_value(cols, row_count, i)?,
+        };
+        out.push(InternalValue {
+            key: InternalKey {
+                user_key,
+                seqno,
+                value_type,
+            },
+            value,
+        });
+    }
+    Ok(out)
+}
+
+/// Per-row value source for [`column_batch_into_entries`]: a shared bytes buffer
+/// (zero-copy views) or the per-row framing reconstruction.
+enum ValueSource {
+    SharedBytes(Slice),
+    Reconstruct(Vec<Column>),
+}
+
+/// Returns row `i` of a [`TypeTag::Bytes`] column body as a zero-copy [`Slice`]
+/// view into `data` (the column's shared buffer), bounds-checked.
+fn bytes_row_slice(data: &Slice, row_count: u32, i: u32) -> Result<Slice> {
+    let bytes: &[u8] = data.as_ref();
+    let off_bytes = (row_count as usize + 1) * 4;
+    let read_off = |idx: u32| -> Result<usize> {
+        let base = idx as usize * 4;
+        let b = bytes
+            .get(base..base + 4)
+            .ok_or(Error::InvalidHeader("columnar: bytes offset truncated"))?;
+        let arr: [u8; 4] = b
+            .try_into()
+            .map_err(|_| Error::InvalidHeader("columnar: short bytes offset"))?;
+        Ok(u32::from_le_bytes(arr) as usize)
+    };
+    let start = read_off(i)?;
+    let end = read_off(i + 1)?;
+    let payload_start = off_bytes.checked_add(start).ok_or(Error::InvalidHeader(
+        "columnar: bytes payload offset overflow",
+    ))?;
+    let payload_end = off_bytes.checked_add(end).ok_or(Error::InvalidHeader(
+        "columnar: bytes payload offset overflow",
+    ))?;
+    if start > end || payload_end > bytes.len() {
+        return Err(Error::InvalidHeader("columnar: bytes row out of range"));
+    }
+    Ok(data.slice(payload_start..payload_end))
+}
+
 /// Frames one row's value sub-column cells into a single self-describing value
 /// blob.
 ///

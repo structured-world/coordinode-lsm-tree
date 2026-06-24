@@ -175,12 +175,14 @@ impl ColumnarBlockIter {
             Bound::Excluded(k) => (k, true),
         };
         let cmp = self.comparator.as_ref();
-        let pos = self.entries[self.lo..self.hi].partition_point(|e| {
-            match cmp.compare(e.key.user_key.as_ref(), key.as_ref()) {
-                core::cmp::Ordering::Less => true,
-                core::cmp::Ordering::Equal => skip_equal,
-                core::cmp::Ordering::Greater => false,
-            }
+        let pos = self.entries.get(self.lo..self.hi).map_or(0, |window| {
+            window.partition_point(
+                |e| match cmp.compare(e.key.user_key.as_ref(), key.as_ref()) {
+                    core::cmp::Ordering::Less => true,
+                    core::cmp::Ordering::Equal => skip_equal,
+                    core::cmp::Ordering::Greater => false,
+                },
+            )
         });
         self.lo += pos;
         self.lo < self.hi
@@ -193,12 +195,14 @@ impl ColumnarBlockIter {
             Bound::Excluded(k) => (k, false),
         };
         let cmp = self.comparator.as_ref();
-        let pos = self.entries[self.lo..self.hi].partition_point(|e| {
-            match cmp.compare(e.key.user_key.as_ref(), key.as_ref()) {
-                core::cmp::Ordering::Less => true,
-                core::cmp::Ordering::Equal => keep_equal,
-                core::cmp::Ordering::Greater => false,
-            }
+        let pos = self.entries.get(self.lo..self.hi).map_or(0, |window| {
+            window.partition_point(
+                |e| match cmp.compare(e.key.user_key.as_ref(), key.as_ref()) {
+                    core::cmp::Ordering::Less => true,
+                    core::cmp::Ordering::Equal => keep_equal,
+                    core::cmp::Ordering::Greater => false,
+                },
+            )
         });
         self.hi = self.lo + pos;
         self.lo < self.hi
@@ -211,9 +215,9 @@ impl Iterator for ColumnarBlockIter {
 
     fn next(&mut self) -> Option<InternalValue> {
         if self.lo < self.hi {
-            let item = self.entries[self.lo].clone();
+            let item = self.entries.get(self.lo).cloned();
             self.lo += 1;
-            Some(item)
+            item
         } else {
             None
         }
@@ -225,7 +229,7 @@ impl DoubleEndedIterator for ColumnarBlockIter {
     fn next_back(&mut self) -> Option<InternalValue> {
         if self.lo < self.hi {
             self.hi -= 1;
-            Some(self.entries[self.hi].clone())
+            self.entries.get(self.hi).cloned()
         } else {
             None
         }

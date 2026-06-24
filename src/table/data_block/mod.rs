@@ -474,7 +474,9 @@ impl DataBlock {
     #[cfg(feature = "columnar")]
     pub(crate) fn columnar_block_entries(block_data: &[u8]) -> crate::Result<Vec<InternalValue>> {
         let batch = crate::table::columnar::ColumnBatch::decode(block_data)?;
-        let entries = crate::table::columnar::column_batch_to_entries(&batch)?;
+        // Consuming, zero-copy untranspose: row keys / values are views into the
+        // batch's column buffers rather than per-row copies.
+        let entries = crate::table::columnar::column_batch_into_entries(batch)?;
         // The writer never spills an empty block, so a zero-row columnar block is
         // corrupt; reject it before any consumer with a non-empty precondition.
         if entries.is_empty() {
