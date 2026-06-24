@@ -149,6 +149,29 @@ fn stop_without_slowdown_threshold_jumps_straight_to_stop() {
 }
 
 #[test]
+fn scale_ramp_stays_proportional_for_huge_cap_and_span() {
+    // Regression: `scale` must apply the fraction without saturating the
+    // numerator first. With a near-`Duration::MAX` cap and a span wide enough
+    // that `cap_nanos * num` overflows `u128`, saturating the product first
+    // collapses the ramp far below its intended proportion. A half ramp must
+    // stay ~half the cap (and never exceed it).
+    let cap = Duration::MAX;
+    let den = u64::MAX;
+    let num = den / 2;
+
+    let got = scale(cap, num, den);
+
+    assert!(got <= cap, "a ramped delay never exceeds the cap");
+    let half_secs = cap.as_secs() / 2;
+    assert!(
+        got.as_secs() >= half_secs - 1,
+        "a half ramp stays proportional (got {}s, expected ~{}s)",
+        got.as_secs(),
+        half_secs,
+    );
+}
+
+#[test]
 fn is_throttled_reflects_tier() {
     assert!(!Backpressure::None.is_throttled());
     assert!(
