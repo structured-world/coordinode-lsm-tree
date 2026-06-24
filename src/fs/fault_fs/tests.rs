@@ -321,6 +321,19 @@ fn every_hookable_op_faults_when_armed() -> io::Result<()> {
 }
 
 #[test]
+fn path_filtered_rule_never_matches_a_pathless_op() {
+    // A rule with a path filter matches only operations that carry a path; a
+    // path-less op (none of the current hook sites produce one, but the match
+    // arm must stay correct) never matches.
+    let rule = FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::Other)).on_path("x");
+    assert!(!rule.matches(FaultOp::Write, None));
+    assert!(rule.matches(FaultOp::Write, Some(Path::new("/d/x"))));
+    // No path filter matches a path-less op.
+    let any = FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::Other));
+    assert!(any.matches(FaultOp::Write, None));
+}
+
+#[test]
 fn identity_probes_forward_to_inner_backend() {
     let mem = MemFs::new();
     let inner_id = mem.backend_id();

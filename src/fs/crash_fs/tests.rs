@@ -1,5 +1,6 @@
 use super::*;
-use crate::fs::MemFs;
+use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+use crate::io::ErrorKind;
 use std::io::{Read, Seek, SeekFrom, Write};
 use test_log::test;
 
@@ -218,6 +219,8 @@ fn delegates_the_full_surface_transparently() {
 
     // Identity / capability probes forward to the inner backend.
     assert!(fs.backend_id().is_some());
+    // `inner()` hands back the wrapped backend (used to reopen after a crash).
+    assert_eq!(fs.inner().backend_id(), fs.backend_id());
     let _ = fs.volume_id(Path::new("/d"));
     assert!(fs.capabilities(Path::new("/d")).punch_hole);
     assert_eq!(fs.available_space(Path::new("/d")).unwrap(), u64::MAX);
@@ -406,6 +409,82 @@ fn reflinked_durable_file_rolls_back_not_removed() {
         b"data",
         "a reflinked durable copy rolls back to the cloned bytes, not removed"
     );
+}
+
+// The `# Panics` contract: crash() surfaces an inner-backend failure loudly
+// rather than silently under-testing recovery. Driven by wrapping a FaultFs as
+// the inner backend and failing the operation crash() performs.
+
+#[test]
+#[should_panic(expected = "removing un-synced")]
+fn crash_panics_when_removing_an_unsynced_file_fails() {
+    let fault = FaultFs::new(MemFs::new());
+    let inj = fault.injector();
+    let fs = CrashFs::from_shared(Arc::new(fault));
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    // Unsynced file: touched, no durable image -> crash() takes the remove path.
+    let mut f = fs
+        .open(
+            Path::new("/d/ghost"),
+            &FsOpenOptions::new().write(true).create(true),
+        )
+        .unwrap();
+    f.write_all(b"x").unwrap();
+    drop(f);
+    // Make the inner remove fail with a non-NotFound error.
+    inj.arm(FaultRule::new(
+        FaultOp::RemoveFile,
+        Fault::Error(ErrorKind::Other),
+    ));
+    fs.crash();
+}
+
+#[test]
+#[should_panic(expected = "reopening")]
+fn crash_panics_when_restore_open_fails() {
+    let fault = FaultFs::new(MemFs::new());
+    let inj = fault.injector();
+    let fs = CrashFs::from_shared(Arc::new(fault));
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    let mut f = fs
+        .open(
+            Path::new("/d/f"),
+            &FsOpenOptions::new().write(true).create(true),
+        )
+        .unwrap();
+    f.write_all(b"data").unwrap();
+    f.sync_all().unwrap(); // durable image recorded
+    drop(f);
+    // The rollback reopen now fails.
+    inj.arm(FaultRule::new(
+        FaultOp::Open,
+        Fault::Error(ErrorKind::Other),
+    ));
+    fs.crash();
+}
+
+#[test]
+#[should_panic(expected = "rewriting durable image")]
+fn crash_panics_when_restore_write_fails() {
+    let fault = FaultFs::new(MemFs::new());
+    let inj = fault.injector();
+    let fs = CrashFs::from_shared(Arc::new(fault));
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    let mut f = fs
+        .open(
+            Path::new("/d/f"),
+            &FsOpenOptions::new().write(true).create(true),
+        )
+        .unwrap();
+    f.write_all(b"data").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    // Rollback reopen succeeds (Open not armed), but the rewrite fails.
+    inj.arm(FaultRule::new(
+        FaultOp::Write,
+        Fault::Error(ErrorKind::Other),
+    ));
+    fs.crash();
 }
 
 #[test]
