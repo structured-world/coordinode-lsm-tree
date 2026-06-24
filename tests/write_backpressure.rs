@@ -2,11 +2,11 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 //! End-to-end tests for the opt-in computed write-backpressure verdict
-//! ([`AbstractTree::write_backpressure`]): the L0-count signal driving the
-//! Slowdown then Stop tiers, the off-by-default no-op, live re-configuration,
-//! and BlobTree delegation. The pure tier/ramp arithmetic is unit-tested in
-//! `src/backpressure/tests.rs`; here we prove the wiring reads the live version
-//! and the runtime config.
+//! ([`AbstractTree::write_backpressure`]): the L0-count and pending-compaction-
+//! bytes signals driving the Slowdown then Stop tiers, the off-by-default no-op,
+//! live re-configuration, and BlobTree delegation. The pure tier/ramp arithmetic
+//! is unit-tested in `src/backpressure/tests.rs`; here we prove the wiring reads
+//! the live version and the runtime config.
 
 use core::time::Duration;
 use lsm_tree::compaction::Leveled;
@@ -181,6 +181,58 @@ fn draining_compaction_clears_the_verdict() -> lsm_tree::Result<()> {
         tree.write_backpressure(&*strat),
         Backpressure::Stop,
         "a draining compaction must clear the Stop verdict"
+    );
+    Ok(())
+}
+
+#[test]
+fn bytes_axis_drives_verdict_with_l0_axis_off() -> lsm_tree::Result<()> {
+    // Prove the wiring forwards `strategy.pending_compaction_bytes(&version)`
+    // into the verdict, independent of the L0-count axis. Leveled counts L0's
+    // whole size as pending once L0 reaches its file threshold (default 4), so
+    // four flushed tables give a non-zero pending-bytes signal.
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path());
+    let strat = Leveled::default();
+
+    for round in 0..4 {
+        add_l0_table(&tree, round);
+    }
+
+    // L0-count axis OFF; only the bytes axis armed. Non-zero pending bytes are
+    // past the slowdown trigger (1), with the stop trigger out of reach.
+    tree.update_runtime_config(|c| {
+        c.backpressure = BackpressureThresholds {
+            l0_slowdown: None,
+            l0_stop: None,
+            bytes_slowdown: Some(1),
+            bytes_stop: Some(u64::MAX),
+            max_slowdown: Some(Duration::from_millis(5)),
+        };
+    })?;
+    assert!(
+        matches!(
+            tree.write_backpressure(&strat),
+            Backpressure::Slowdown { .. }
+        ),
+        "non-zero pending compaction bytes must throttle via the bytes axis alone"
+    );
+
+    // Lower the stop trigger so the same pending bytes now reach Stop: the bytes
+    // axis drives both tiers, not just slowdown.
+    tree.update_runtime_config(|c| {
+        c.backpressure = BackpressureThresholds {
+            l0_slowdown: None,
+            l0_stop: None,
+            bytes_slowdown: Some(1),
+            bytes_stop: Some(1),
+            max_slowdown: Some(Duration::from_millis(5)),
+        };
+    })?;
+    assert_eq!(
+        tree.write_backpressure(&strat),
+        Backpressure::Stop,
+        "pending bytes at/above the stop trigger reach the stop tier via the bytes axis"
     );
     Ok(())
 }
