@@ -411,6 +411,74 @@ fn reflinked_durable_file_rolls_back_not_removed() {
     );
 }
 
+#[test]
+fn hard_linked_pre_existing_untouched_source_survives_crash() {
+    // A hard link whose source already existed when the wrapper was created
+    // (durable on disk, but never touched through CrashFs this run) must survive
+    // a crash carrying the source's bytes. The copy was made from durable
+    // content, so crash() must restore it, not remove it as if un-synced.
+    let mem = MemFs::new();
+    mem.create_dir_all(Path::new("/d")).unwrap();
+    {
+        let mut f = mem
+            .open(
+                Path::new("/d/src"),
+                &FsOpenOptions::new().write(true).create(true),
+            )
+            .unwrap();
+        f.write_all(b"durable").unwrap();
+    }
+    let fs = CrashFs::new(mem);
+
+    // Source is pre-existing and never touched through the wrapper, so it has
+    // no captured durable image yet; the link must still inherit its baseline.
+    fs.hard_link(Path::new("/d/src"), Path::new("/d/link"))
+        .unwrap();
+
+    fs.crash();
+    assert!(
+        fs.exists(Path::new("/d/link")).unwrap(),
+        "a hard link from a pre-existing durable source must not be removed on crash"
+    );
+    assert_eq!(
+        read(&fs, "/d/link"),
+        b"durable",
+        "the hard link rolls back to the source's durable bytes"
+    );
+}
+
+#[test]
+fn reflinked_pre_existing_untouched_source_survives_crash() {
+    // Reflink counterpart: a clone of a pre-existing durable source (never
+    // touched through the wrapper) must survive a crash with the source's bytes.
+    let mem = MemFs::new();
+    mem.create_dir_all(Path::new("/d")).unwrap();
+    {
+        let mut f = mem
+            .open(
+                Path::new("/d/src"),
+                &FsOpenOptions::new().write(true).create(true),
+            )
+            .unwrap();
+        f.write_all(b"durable").unwrap();
+    }
+    let fs = CrashFs::new(mem);
+
+    fs.reflink_file(Path::new("/d/src"), Path::new("/d/clone"))
+        .unwrap();
+
+    fs.crash();
+    assert!(
+        fs.exists(Path::new("/d/clone")).unwrap(),
+        "a reflink from a pre-existing durable source must not be removed on crash"
+    );
+    assert_eq!(
+        read(&fs, "/d/clone"),
+        b"durable",
+        "the reflink rolls back to the source's durable bytes"
+    );
+}
+
 // The `# Panics` contract: crash() surfaces an inner-backend failure loudly
 // rather than silently under-testing recovery. Driven by wrapping a FaultFs as
 // the inner backend and failing the operation crash() performs.
