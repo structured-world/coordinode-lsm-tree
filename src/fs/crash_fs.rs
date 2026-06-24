@@ -68,7 +68,7 @@ struct CrashState {
 
 /// A power-loss crash simulator wrapping an inner [`Fs`].
 ///
-/// See the [module docs](self) for the durability model. The inner backend is
+/// See the module-level documentation for the durability model. The inner backend is
 /// held as an [`Arc<dyn Fs>`]; obtain a clone with [`inner`](Self::inner) to
 /// reopen the engine directly on the post-crash store (e.g. via
 /// [`Config::with_shared_fs`](crate::Config::with_shared_fs)).
@@ -203,15 +203,34 @@ impl CrashFs {
     }
 
     /// Records the destination of a copy-style op (`hard_link` / `reflink`): it
-    /// mirrors the source's durability. Carry the source's durable image if it
-    /// has one, and mark the destination touched, so a crash either restores the
+    /// mirrors the source's durability so a crash either restores the
     /// linked/cloned bytes (durable source) or removes an un-synced copy.
-    fn track_copy(&self, src: &Path, dst: &Path) {
+    ///
+    /// The source's durable image comes from one of two places: an entry already
+    /// in `durable` (synced or captured this run), or, for a source that is
+    /// pre-existing and never touched this run, its on-disk baseline (the same
+    /// "current contents are initially durable" rule [`capture_first_touch`]
+    /// applies). A source that is touched but not durable holds un-synced bytes,
+    /// so the copy correctly inherits no durable image and a crash removes it.
+    ///
+    /// Reads the baseline outside the state lock (mirroring
+    /// [`capture_first_touch`]) so backend I/O never runs under the mutex.
+    fn track_copy(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        let (src_durable, src_touched) = {
+            let state = self.state.lock();
+            (state.durable.get(src).cloned(), state.touched.contains(src))
+        };
+        let dst_image = match src_durable {
+            Some(bytes) => Some(bytes),
+            None if !src_touched => self.read_baseline(src)?,
+            None => None,
+        };
         let mut state = self.state.lock();
-        if let Some(bytes) = state.durable.get(src).cloned() {
+        if let Some(bytes) = dst_image {
             state.durable.insert(dst.to_path_buf(), bytes);
         }
         state.touched.insert(dst.to_path_buf());
+        Ok(())
     }
 }
 
@@ -303,7 +322,7 @@ impl Fs for CrashFs {
 
     fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
         self.inner.hard_link(src, dst)?;
-        self.track_copy(src, dst);
+        self.track_copy(src, dst)?;
         Ok(())
     }
 
@@ -332,7 +351,7 @@ impl Fs for CrashFs {
 
     fn reflink_file(&self, src: &Path, dst: &Path) -> io::Result<()> {
         self.inner.reflink_file(src, dst)?;
-        self.track_copy(src, dst);
+        self.track_copy(src, dst)?;
         Ok(())
     }
 

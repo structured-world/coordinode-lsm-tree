@@ -250,7 +250,7 @@ fn fault_error_std(kind: io::ErrorKind, op: FaultOp) -> std::io::Error {
 ///
 /// Every operation consults the shared [`FaultInjector`] (obtained via
 /// [`injector`](Self::injector)) before delegating to the inner backend. Open
-/// file handles are wrapped in a [`FaultFile`] that carries the same injector,
+/// file handles are wrapped in a `FaultFile` that carries the same injector,
 /// so per-file read / write / sync faults are honoured too.
 ///
 /// Identity-bearing probes ([`Fs::backend_id`], [`Fs::volume_id`],
