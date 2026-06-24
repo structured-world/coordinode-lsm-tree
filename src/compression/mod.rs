@@ -357,7 +357,9 @@ impl CompressionType {
 
     /// Validate a zstd compression level.
     ///
-    /// Accepts levels in the range 1..=22 and returns an error otherwise.
+    /// Accepts levels in the range `-128..=22` (zstd negative "fast" levels and
+    /// `0` = default included; the on-disk format persists the level in one
+    /// signed byte) and returns an error otherwise.
     #[cfg(zstd_any)]
     fn validate_zstd_level(level: i32) -> crate::Result<()> {
         // zstd accepts negative "fast" levels (down to a very negative minimum)
