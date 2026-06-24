@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782275773911,
+  "lastUpdate": 1782283834611,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -19842,6 +19842,84 @@ window.BENCHMARK_DATA = {
             "value": 699533.0298738064,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.6us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c1481271ede23a18fd496e984cd785f597e0dbb1",
+          "message": "feat: compaction-debt write-backpressure verdict (#554)\n\n## Summary\n\nAdds an opt-in, caller-honoured write-backpressure signal.\n`write_backpressure()` computes a `Backpressure` verdict (`None` /\n`Slowdown { suggested_delay }` / `Stop`) from the live L0 table count\nand the strategy's pending-compaction bytes against configurable\n`RuntimeConfig` thresholds, mirroring the storage-admission predicate\n(#484).\n\nCloses #547.\n\n## Design (computed signal, not internal blocking)\n\nThe engine is a library: `insert` is synchronous and non-blocking, and\nflush + compaction are caller-driven. So backpressure is a verdict the\ncaller consults and honours in its own write loop (sleep at `Slowdown`,\npause / shed at `Stop`); the engine never blocks internally on debt\ndraining, which would deadlock the very thread that runs compaction.\nWith every threshold unset (default) the verdict is always `None` and\nthe write path is byte-for-byte unchanged.\n\nThe `Slowdown` delay ramps linearly from zero at the slowdown threshold\nto a configured cap at the stop threshold (no cliff). Thresholds are\nlive-toggleable; the verdict is computed, not latched. `BlobTree`\ndelegates to its index tree.\n\nObservability of time-spent-throttled is caller-owned (documented): the\nengine is pull-model and cannot observe caller-side sleep, so the caller\nadvances its own metric.\n\n## Changes\n\n- `src/backpressure.rs` (+ tests): `Backpressure` enum +\n`BackpressureThresholds` + pure `compute()`.\n- `src/runtime_config/types.rs`: `backpressure` field, default OFF.\n- `src/abstract_tree.rs`: `write_backpressure(&dyn CompactionStrategy)`\ntrait method (default `None`).\n- `src/tree/mod.rs`, `src/blob_tree/mod.rs`: overrides (Tree computes;\nBlobTree delegates).\n- `tests/write_backpressure.rs`: 5 integration tests.\n- `.github/workflows/benchmark.yml`: raise the bench timeout 30m -> 60m\nand rename the job to reflect it is the full public bench suite (cold\nlibrocksdb-sys compile was being cancelled at 30m).\n\n## Testing\n\n11 unit + 5 integration (L0 -> Slowdown -> Stop, off-by-default no-op,\nlive-toggle, BlobTree delegation, drain-clears-verdict closed loop) + 1\ndoctest. Gate: clippy `--all-features --all-targets` clean, no_std check\n0/0, nextest lz4,zstd 2126 + columnar 2210, doctests 66.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added computed write backpressure for trees using live runtime\nthresholds based on L0 buildup and pending compaction bytes (with\nslowdown delays and stop behavior).\n* Exposed new backpressure API via the main library interface, and\napplied the same behavior to blob-backed trees through delegation.\n\n* **Bug Fixes**\n* Improved benchmark workflow reliability by clarifying benchmark\nlabeling and increasing the job timeout to better accommodate cold-cache\nbuilds and both benchmark passes.\n\n* **Tests**\n* Added unit and end-to-end coverage validating verdict tiers, monotonic\ndelay behavior, live threshold updates, and blob-tree delegation.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-24T09:49:42+03:00",
+          "tree_id": "17a524f4fb333d2d443d1270f3325a0d4e1c5c42",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/c1481271ede23a18fd496e984cd785f597e0dbb1"
+        },
+        "date": 1782283833360,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2090898.8150918235,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1175666.4807722422,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 869435.187688756,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.4us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3781090.798944297,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.1us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 462256.3634499902,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.3us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 238955.81413319983,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 4.9us | P99.9: 9.9us\nthreads: 1 | elapsed: 0.84s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1208893.4592583652,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1083580.1977344234,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 680232.1185988508,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.7us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
