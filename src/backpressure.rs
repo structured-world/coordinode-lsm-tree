@@ -209,15 +209,22 @@ fn ramp_u64(value: u64, soft: u64, hard: Option<u64>, cap: Duration) -> Duration
     }
 }
 
-/// `cap * num / den` in nanoseconds, saturating, with `num < den`.
+/// `cap * num / den` in nanoseconds, exact, with `num < den`.
 fn scale(cap: Duration, num: u64, den: u64) -> Duration {
     if den == 0 {
         return cap;
     }
-    // num < den (stop tier handled before any ramp), so the result nanos are at
-    // most cap's nanos and round-trip back into a Duration. The multiply is on
-    // u128 and saturates, so it cannot overflow.
-    let nanos = cap.as_nanos().saturating_mul(u128::from(num)) / u128::from(den);
+    // Apply the fraction WITHOUT forming `cap_nanos * num` first: for a
+    // near-`Duration::MAX` cap and a wide span that product can exceed u128, and
+    // saturating it would distort the ramp (collapsing it far below the intended
+    // proportion). This mulDiv decomposition is exact and overflow-free given the
+    // `num < den` invariant: the quotient term `(cap_nanos / den) * num` is
+    // <= cap_nanos (since num <= den), and the remainder term's product
+    // `(cap_nanos % den) * num` is < den * num < u128::MAX (both factors < u64::MAX).
+    let cap_nanos = cap.as_nanos();
+    let num = u128::from(num);
+    let den = u128::from(den);
+    let nanos = (cap_nanos / den) * num + ((cap_nanos % den) * num) / den;
     // secs <= cap.as_secs() (which is a u64), so try_from never actually
     // saturates here; the fallback is defensive only.
     let secs = u64::try_from(nanos / 1_000_000_000).unwrap_or(u64::MAX);
