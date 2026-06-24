@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782302759237,
+  "lastUpdate": 1782320153439,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -19998,6 +19998,84 @@ window.BENCHMARK_DATA = {
             "value": 690734.9817378304,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.6us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "97cabf4562cb2645facd0286906d1338f27130f4",
+          "message": "feat(fs): fault-injection harness and power-loss crash simulator (#555)\n\n## Summary\n\nAdds a fault-injection + crash-simulation layer for the `Fs` trait so\nthe\nengine can be driven through I/O failures and power-loss scenarios it\ncannot\nreach against a real disk, and uses it to re-enable a previously-blocked\nrecovery test.\n\n- **`FaultFs`** — a programmable `Fs` wrapper that consults a shared\n`FaultInjector` before each operation. `FaultOp` names the hookable\npoints\n(open, rename, write, flush, read, read_at, sync_all/sync_data, set_len,\ncreate_dir(_all), remove_file, sync_directory); `Fault::Error(kind)`\ninjects an\nI/O error and `Fault::ShortWrite(n)` truncates a write (`0` models a\nstuck\n  writer, surfaced as `WriteZero`). Rules are built fluently with\n`FaultRule::new(op, fault).on_path(substr).skip(n).times(n)` /\n`.once()`; the\nfirst matching rule owns each occurrence. Identity probes (`backend_id`,\n`volume_id`, `capabilities`) forward to the inner backend so the\nengine's\n  cross-backend and FS-aware decisions stay correct.\n\n- **`CrashFs`** — a power-loss simulator. It tracks each file's durable\nimage\n(its content as of the last successful `fsync`); `crash()` rolls every\nfile\nback to that image and removes files never synced — exactly the bytes a\nreal\ncrash would lose. `inner()` hands back the wrapped backend to reopen the\nengine\non the post-crash store. It composes with `FaultFs`: fail a specific\n`fsync`,\n  then crash to discard the tail that failed sync never made durable.\n\n- **Re-enabled `level_manifest_atomicity`** — the test was `#[ignore]`d\nbecause\nthere was no way to fail the manifest commit mid-compaction. It now arms\na\none-shot fault on the edit-log `fsync` and asserts the failed commit\nleaves no\nhalf-applied state (the under-compaction set drains, the table count is\n  unchanged, the data is still readable).\n\n- **Exhaustive crash-point sweep** — for every durability barrier of a\nflush\nworkload, fail that barrier, crash, reopen, and assert recovery yields a\nconsistent prefix of the inserted keys (never a hole, never a failed\nreopen).\n\n`FaultFs` and `CrashFs` are `std`-gated test/dev surface; they do not\nparticipate\nin `no_std` builds and are not part of the production storage path.\n\n## Testing\n\n- `cargo clippy --all-features --all-targets`: clean\n- `cargo check --target thumbv7em-none-eabihf --no-default-features\n--features alloc`: 0 errors (modules are std-gated)\n- `cargo nextest run --features lz4,zstd`: 2131 passed\n- `cargo nextest run --features lz4,zstd,columnar`: 2215 passed\n- `cargo test --doc --features lz4,zstd`: 62 passed\n- 11 `FaultFs` unit tests + 7 `CrashFs` unit tests + the composed\ntorn-commit recovery test + the crash-point sweep\n\n## Notes\n\nOptional follow-up (not included): migrating the other existing\ncrash/recovery\ntests to route through this harness. They pass as-is, so that is\nopportunistic\ncleanup rather than a fix.\n\nCloses #548\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added test/dev filesystem backends to simulate power-loss durability\nand programmable I/O failures.\n* Re-exported the new backends (fault injection and crash simulation)\nfor std builds.\n* **Bug Fixes**\n* Improved recovery coverage so only fully durable state persists after\ninterrupted durability/commit points.\n* Re-enabled and strengthened compaction atomicity testing with\ndeterministic failure injection.\n* **Tests**\n* Added extensive unit and end-to-end suites for crash recovery, fault\ninjection (including rename/truncation/removal), and recovery after\ninjected flush/commit failures.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-24T19:54:59+03:00",
+          "tree_id": "b2a405f6838c1e56690db3760af19eeb10df7fc8",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/97cabf4562cb2645facd0286906d1338f27130f4"
+        },
+        "date": 1782320152243,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2073397.3970278802,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1152106.94870552,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 854975.9194536078,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.3us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3808139.0251023197,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.1us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 454709.3483294779,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.4us | P99.9: 8.7us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 231517.11823623333,
+            "unit": "ops/sec",
+            "extra": "P50: 4.0us | P99: 5.0us | P99.9: 8.9us\nthreads: 1 | elapsed: 0.86s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1241762.4891317843,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1105057.6055479196,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.5us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 697129.516235059,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.7us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
