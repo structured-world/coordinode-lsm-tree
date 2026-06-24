@@ -444,6 +444,29 @@ impl AbstractTree for Tree {
         self.compute_write_admission()
     }
 
+    fn write_backpressure(
+        &self,
+        strategy: &dyn crate::compaction::CompactionStrategy,
+    ) -> crate::Backpressure {
+        // Copy the thresholds out (BackpressureThresholds is Copy) so the
+        // arc-swap guard drops immediately; the off check short-circuits before
+        // touching the version, keeping the disabled path free.
+        let thresholds = self.0.runtime_config.load().backpressure;
+        if thresholds.is_off() {
+            return crate::Backpressure::None;
+        }
+        let version = self.current_version();
+        // L0 is the first level; its table (file) count is the count-trigger
+        // signal, matching the leveled `choose` trigger and the L0 term of
+        // `pending_compaction_bytes`.
+        let l0_count = version
+            .iter_levels()
+            .next()
+            .map_or(0, |level| level.table_count());
+        let pending = strategy.pending_compaction_bytes(&version);
+        crate::Backpressure::compute(l0_count, pending, &thresholds)
+    }
+
     fn get_flush_lock(&self) -> FlushGuard<'_> {
         self.flush_lock.lock()
     }

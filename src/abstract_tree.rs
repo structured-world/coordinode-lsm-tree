@@ -196,6 +196,29 @@ pub trait AbstractTree: sealed::Sealed {
         strategy.pending_compaction_bytes(&self.current_version())
     }
 
+    /// Computed write-backpressure verdict from the live L0 table count and the
+    /// strategy's pending-compaction bytes, against the configured
+    /// [`RuntimeConfig::backpressure`](crate::runtime_config::RuntimeConfig)
+    /// thresholds.
+    ///
+    /// Advisory, mirroring [`write_admission`](Self::write_admission): the caller
+    /// consults it and throttles in its own write loop (sleep `suggested_delay`
+    /// at [`Slowdown`](crate::Backpressure::Slowdown), pause at
+    /// [`Stop`](crate::Backpressure::Stop)). The engine never blocks on it,
+    /// because it does not own the compaction that drains the debt — an internal
+    /// stall could deadlock the very thread that would compact.
+    ///
+    /// The strategy is supplied by the caller for the same reason as
+    /// [`compaction_debt`](Self::compaction_debt). Returns
+    /// [`Backpressure::None`](crate::Backpressure::None) by default (no
+    /// thresholds configured).
+    fn write_backpressure(
+        &self,
+        _strategy: &dyn crate::compaction::CompactionStrategy,
+    ) -> crate::Backpressure {
+        crate::Backpressure::None
+    }
+
     /// Storage admission gate: `Ok(())` if a write may proceed, or
     /// [`Error::StorageFull`](crate::Error::StorageFull) if the tree is
     /// over budget and should be treated as read-only.

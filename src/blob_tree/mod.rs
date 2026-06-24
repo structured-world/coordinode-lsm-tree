@@ -467,6 +467,16 @@ impl AbstractTree for BlobTree {
         self.index.write_admission()
     }
 
+    fn write_backpressure(
+        &self,
+        strategy: &dyn crate::compaction::CompactionStrategy,
+    ) -> crate::Backpressure {
+        // Same delegation as write_admission: the index tree holds the runtime
+        // config and its version is this blob tree's version, so the L0-count
+        // and pending-compaction-bytes signals are computed on the right state.
+        self.index.write_backpressure(strategy)
+    }
+
     #[cfg(feature = "metrics")]
     fn cache_stats(&self) -> crate::CacheStats {
         self.index.cache_stats()

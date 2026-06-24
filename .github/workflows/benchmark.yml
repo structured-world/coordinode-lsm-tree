@@ -43,7 +43,12 @@ concurrency:
 
 jobs:
   benchmark:
-    name: Performance regression check
+    # Two passes in one job: (1) the single-engine db_bench trend (regression
+    # guard + dev/bench dashboard) and (2) the RocksDB head-to-head compare
+    # (public dev/compare overlay dashboard). The name reflects both so it does
+    # not read as a lightweight gate — it is the full public benchmark suite,
+    # and it builds RocksDB from C++ source, so it is minutes, not seconds.
+    name: db_bench trend + RocksDB head-to-head
     # Self-hosted bare-metal runner. Shared GitHub-hosted runners
     # have ±15-20% noise on every db_bench workload — large enough
     # to hide every win below ~20% and produce false-positive
@@ -58,11 +63,15 @@ jobs:
     # self-hosted runners (if added later) without the label
     # won't pick the job up.
     runs-on: [self-hosted, gpu-private-systems]
-    # The db_bench pass is seconds; the compare-rocksdb head-to-head pass
-    # uses a half-second criterion window per scenario (a few minutes for
-    # the whole matrix). The cap mainly bounds the first-run librocksdb-sys
-    # C++ compile and catches a runaway regression early.
-    timeout-minutes: 30
+    # The db_bench pass is seconds and the compare-rocksdb criterion matrix
+    # is a few minutes (half-second window per scenario). The dominant cost is
+    # the first-run / cold-cache librocksdb-sys C++ compile (RocksDB built from
+    # source via bindgen): on a cold rust-cache that alone is 15-25 min, so a
+    # 30 min cap was too tight and the job was cancelled mid-compile, producing
+    # no dashboard at all. 60 min leaves headroom for a cold RocksDB build plus
+    # both bench passes while still catching a genuinely runaway run. A warm
+    # cache finishes in a few minutes well under this.
+    timeout-minutes: 60
     steps:
       # v6 requires runner ≥2.327.1 (node24 runtime) — the self-hosted
       # runner has a current runner agent that satisfies this.

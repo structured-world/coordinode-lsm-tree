@@ -925,6 +925,17 @@ pub struct RuntimeConfig {
     ///
     /// Toggle takes effect on the next compaction cycle.
     pub tight_space_compaction: bool,
+
+    /// Opt-in write-backpressure thresholds. With every field `None` (default)
+    /// the verdict is always [`crate::Backpressure::None`] and the write path is
+    /// byte-for-byte unchanged. When set,
+    /// [`crate::AbstractTree::write_backpressure`] reports a `Slowdown` / `Stop`
+    /// verdict from the live L0 table count and pending compaction bytes, which
+    /// the caller honours in its own write loop (the engine never blocks
+    /// internally — it does not own the compaction that would drain the debt).
+    /// Live-toggleable: the verdict is computed, not latched, so it clears as
+    /// soon as compaction drains below the thresholds.
+    pub backpressure: crate::backpressure::BackpressureThresholds,
 }
 
 impl Default for RuntimeConfig {
@@ -952,6 +963,7 @@ impl Default for RuntimeConfig {
             storage_admission_check: false,
             storage_limit_bytes: None,
             tight_space_compaction: false,
+            backpressure: crate::backpressure::BackpressureThresholds::OFF,
         }
     }
 }
