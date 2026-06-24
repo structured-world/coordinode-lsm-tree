@@ -430,9 +430,16 @@ impl std::io::Write for FaultFile {
         match self.injector.check(FaultOp::Write, Some(&self.path)) {
             Some(Fault::Error(kind)) => Err(fault_error_std(kind, FaultOp::Write)),
             Some(Fault::ShortWrite(n)) => {
+                // Honour the contract deterministically: accept EXACTLY `take`
+                // bytes regardless of how the inner backend chunks its writes
+                // (a plain `write` may return fewer than `take`).
                 let take = n.min(buf.len());
+                if take == 0 {
+                    return Ok(0);
+                }
                 let (head, _) = buf.split_at(take);
-                self.inner.write(head)
+                self.inner.write_all(head)?;
+                Ok(take)
             }
             None => self.inner.write(buf),
         }
