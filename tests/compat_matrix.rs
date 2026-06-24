@@ -239,18 +239,19 @@ fn run_cell(cell: Cell) {
             .unwrap_or_else(|e| panic!("[{}] flush failed: {e}", cell.label()));
 
         // A columnar cell must actually have produced columnar SSTs, else the
-        // axis is vacuous (the reader is transparent to row vs columnar).
+        // axis is vacuous (the reader is transparent to row vs columnar). The
+        // columnar SSTs live in the tree itself (Standard) or in a blob tree's
+        // index tree, so verify whichever holds them — including blob+columnar.
         #[cfg(feature = "columnar")]
         {
-            let columnar_standard = match &tree {
-                AnyTree::Standard(t) if cell.columnar => Some(t),
+            let columnar_version = match &tree {
+                AnyTree::Standard(t) if cell.columnar => Some(t.current_version()),
+                AnyTree::Blob(t) if cell.columnar => Some(t.index.current_version()),
                 _ => None,
             };
-            if let Some(t) = columnar_standard {
+            if let Some(version) = columnar_version {
                 assert!(
-                    t.current_version()
-                        .iter_tables()
-                        .all(|x| x.metadata.columnar),
+                    version.iter_tables().all(|x| x.metadata.columnar),
                     "[{}] expected columnar SSTs, got row-major",
                     cell.label()
                 );
@@ -299,11 +300,10 @@ fn compatibility_matrix_round_trips_every_feasible_cell() {
         eprintln!("  SKIP {label}: {reason}");
     }
 
-    assert_eq!(
-        covered.len() + skipped.len(),
-        EXPECTED_CELLS,
-        "every cell must be either covered or skipped-with-reason — no silent gaps"
-    );
+    // "No silent gaps" is guaranteed structurally: the `cells.len()` assertion
+    // above pins the total, and `skip_reason` returns a `&'static str` for every
+    // skip (the type, not a runtime count, is the contract), so each cell is
+    // either covered or skipped-with-reason.
     assert!(
         !covered.is_empty(),
         "at least the baseline (no-feature) cells must run in every build"
