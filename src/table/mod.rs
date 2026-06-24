@@ -933,8 +933,15 @@ impl Table {
             let block_handle = block_handle?;
 
             // A columnar block carrying no row for this key (absent / wholly
-            // deleted) returns None here; skip it.
+            // deleted) returns None here; still honor the end-key cutoff before
+            // skipping, so an absent key below this block's end key stops the
+            // scan instead of probing every later candidate block.
             let Some(data_block) = self.load_point_block(block_handle.as_ref(), key)? else {
+                if self.comparator.compare(block_handle.end_key(), key)
+                    == core::cmp::Ordering::Greater
+                {
+                    return Ok(None);
+                }
                 continue;
             };
 
@@ -1065,8 +1072,15 @@ impl Table {
             let block_handle = block_handle?;
 
             // A columnar block carrying no row for this key (absent / wholly
-            // deleted) returns None here; skip it.
+            // deleted) returns None here; still honor the end-key cutoff before
+            // skipping, so an absent key below this block's end key stops the
+            // scan instead of probing every later candidate block.
             let Some(data_block) = self.load_point_block(block_handle.as_ref(), key)? else {
+                if self.comparator.compare(block_handle.end_key(), key)
+                    == core::cmp::Ordering::Greater
+                {
+                    return Ok(None);
+                }
                 continue;
             };
 
