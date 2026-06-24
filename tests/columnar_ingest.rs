@@ -779,8 +779,9 @@ fn columnar_ingest_range_scan_reconstructs_subcolumns() -> lsm_tree::Result<()> 
         (b"k0", vec![&[1, 0, 0, 0][..], &b"aa"[..]]),
         (b"k1", vec![&[2, 0, 0, 0][..], &b"bbb"[..]]),
     ];
-    let mut scanned = 0usize;
-    for (guard, (exp_key, exp_cells)) in tree.range("k0".."k2", SeqNo::MAX, None).zip(expected) {
+    let mut iter = tree.range("k0".."k2", SeqNo::MAX, None);
+    for (exp_key, exp_cells) in expected {
+        let guard = iter.next().expect("expected reconstructed row");
         let (k, val) = guard.into_inner()?;
         assert_eq!(k.as_ref(), exp_key, "scanned key");
         assert_eq!(
@@ -788,11 +789,10 @@ fn columnar_ingest_range_scan_reconstructs_subcolumns() -> lsm_tree::Result<()> 
             exp_cells,
             "the reconstructed value unframes to the original sub-cells",
         );
-        scanned += 1;
     }
-    assert_eq!(
-        scanned, 2,
-        "both ingested rows are scanned through the Reconstruct path",
+    assert!(
+        iter.next().is_none(),
+        "range scan returned extra rows through the Reconstruct path",
     );
     Ok(())
 }
