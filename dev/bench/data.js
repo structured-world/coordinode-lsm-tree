@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782283834611,
+  "lastUpdate": 1782302759237,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -19920,6 +19920,84 @@ window.BENCHMARK_DATA = {
             "value": 680232.1185988508,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 4.7us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e22a1a1c4047dc1174c235d2ce1a834b71f0cbbe",
+          "message": "test(format): cross-feature + cross-version compatibility matrix (#557)\n\n## Summary\n\nAdds a single authoritative compatibility surface for the on-disk\nformat, where\nthe existing coverage was scattered in per-feature pockets.\n\n- **Combination matrix** (`tests/compat_matrix.rs`): a generated grid\nover the\n  cross product of {compression} x {KV-sep} x {columnar} x {zone-map} x\n{encryption} x {ECC}. Each cell writes a known dataset, reopens the tree\nfrom\ndisk, and asserts an exact round-trip (point read of every key + full\nrange\nscan); columnar cells additionally assert the flushed SSTs are actually\ncolumnar. A cell whose feature is not compiled into the build is skipped\nwith\na logged reason (no silent gaps) and the covered/skipped grid is\nprinted. A\ncoverage assertion ties the generated cell count to `EXPECTED_CELLS`, so\nadding a new axis value without extending the matrix fails the test.\nUnder the\n  full matrix feature set all 144 cells round-trip.\n\n- **Cross-version golden corpus** (`tests/compat_corpus.rs` +\n`tests/fixtures/compat_v5_6_0/`): a small tree written by the v5.6.0\nrelease\nformat (plain V5: no compression / ECC / encryption, so it reads under\nany\nfeature build), checked in as a frozen binary fixture decoupled from its\ngenerator, plus a test that copies it to a tempdir and opens + reads it\nunder\n  the current code. This catches a backward-read regression that the\nself-round-tripping matrix cannot. An ignored `regenerate_golden_corpus`\ntest\nre-baselines the fixture when intentionally advancing the guarded\nversion.\n\n## Acceptance\n\n- [x] The combination matrix runs in CI (`nextest --all-features`\nexercises all\n144 cells) and every feasible cell round-trips; skipped cells log a\nreason.\n- [x] A tree written by the previous released format opens and reads\ncorrectly\n      under current code (the golden corpus).\n- [x] Adding a new format axis without extending the matrix fails the\ncoverage\n      assertion.\n- [x] The matrix and corpus are documented so a contributor adding a\nformat\n      feature knows to extend them.\n\n## Testing\n\n- Matrix under the full feature set\n(`lz4,zstd,columnar,encryption,page_ecc`): 144/144 round-trip.\n- Gate sets: `lz4,zstd` 2130 passed, `lz4,zstd,columnar` 2214 passed;\ndoctests 61.\n- `clippy --all-features --all-targets` clean; no-std check 0 errors;\ncorpus reader is feature-independent.\n\n## Fix found by the matrix\n\nExtending the matrix's columnar-SST check to a blob tree's index\nsurfaced a real\nbug: the blob index flush wired only the structural block options and\nsilently\ndropped the runtime-driven ones (`columnar`, zone maps, ECC,\nseqno-in-index,\nper-KV checksums, locator, sync mode, CoW disable), so a blob tree's\nindex\nignored them — most visibly staying row-major with columnar enabled. The\nindex\nflush now applies the same per-flush SST options a standard tree's flush\ndoes,\nwith a focused regression test (`blob_index_honors_the_columnar_flag`).\n\n## Note\n\nThe golden fixture is seeded now, while `main` is still the v5.6.0\nrelease: once\nv5.7.0 lands and changes the format, the frozen v5.6.0 bytes begin\nguarding\nbackward-read compatibility (the point of a cross-version corpus).\n\nCloses #550\nCloses #558\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added `Table::has_zone_map()` to let callers detect whether zone maps\nwere persisted.\n* Expanded storage compatibility coverage across compression,\nencryption, page ECC, columnar layout, and blob-based key separation.\n\n* **Bug Fixes**\n* Improved flush behavior so runtime storage settings are applied\nconsistently for blob-based SST/index generation (including columnar\nindex handling and related SST metadata).\n\n* **Tests**\n  * Added a columnar index regression test for blob-backed flushes.\n* Added cross-feature compatibility matrix tests and enhanced golden\ncross-version corpus checks.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-24T15:05:04+03:00",
+          "tree_id": "e0fe653d81d32cd957ab00dc41dd73c5c4b26ba9",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/e22a1a1c4047dc1174c235d2ce1a834b71f0cbbe"
+        },
+        "date": 1782302758038,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2025974.143322658,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1126864.1587005164,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.3us | P99.9: 4.5us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 813960.7255240555,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 4.3us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.25s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3658711.3780710194,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.2us | P99.9: 5.9us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 400601.5898170537,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 6.0us | P99.9: 9.6us\nthreads: 1 | elapsed: 0.50s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 205010.3693732303,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 7.5us | P99.9: 11.5us\nthreads: 1 | elapsed: 0.98s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1213137.1446325518,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1086353.2827502259,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.5us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 690734.9817378304,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.6us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
