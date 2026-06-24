@@ -488,6 +488,111 @@ fn crash_panics_when_restore_write_fails() {
 }
 
 #[test]
+fn baseline_read_failure_surfaces_from_open() {
+    // A failed baseline read must NOT be swallowed into "no durable image" (which
+    // would later remove a pre-existing file on crash); it must surface from open().
+    let fault = FaultFs::new(MemFs::new());
+    let inj = fault.injector();
+    fault.create_dir_all(Path::new("/d")).unwrap();
+    {
+        let mut f = fault
+            .open(
+                Path::new("/d/pre"),
+                &FsOpenOptions::new().write(true).create(true),
+            )
+            .unwrap();
+        std::io::Write::write_all(&mut f, b"original").unwrap();
+    }
+    let fs = CrashFs::from_shared(Arc::new(fault));
+
+    // Fail the baseline read (FsFile::read) on the first write-open of the file.
+    inj.arm(FaultRule::new(
+        FaultOp::Read,
+        Fault::Error(ErrorKind::Other),
+    ));
+    assert!(
+        fs.open(
+            Path::new("/d/pre"),
+            &FsOpenOptions::new().write(true).append(true),
+        )
+        .is_err(),
+        "a failed baseline read surfaces from open(), it is not silently dropped"
+    );
+}
+
+#[test]
+fn hard_link_of_unsynced_source_does_not_survive_crash() {
+    let fs = CrashFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    // Never-synced source.
+    let mut f = fs
+        .open(
+            Path::new("/d/src"),
+            &FsOpenOptions::new().write(true).create(true),
+        )
+        .unwrap();
+    f.write_all(b"unsynced").unwrap();
+    drop(f);
+    // Link it without ever syncing or opening the destination.
+    fs.hard_link(Path::new("/d/src"), Path::new("/d/link"))
+        .unwrap();
+
+    fs.crash();
+    assert!(
+        !fs.exists(Path::new("/d/link")).unwrap(),
+        "a link to a never-synced source carries no durable image and is removed on crash"
+    );
+}
+
+#[test]
+fn reflink_of_unsynced_source_does_not_survive_crash() {
+    let fs = CrashFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    let mut f = fs
+        .open(
+            Path::new("/d/src"),
+            &FsOpenOptions::new().write(true).create(true),
+        )
+        .unwrap();
+    f.write_all(b"unsynced").unwrap();
+    drop(f);
+    fs.reflink_file(Path::new("/d/src"), Path::new("/d/clone"))
+        .unwrap();
+
+    fs.crash();
+    assert!(
+        !fs.exists(Path::new("/d/clone")).unwrap(),
+        "a reflink of a never-synced source carries no durable image and is removed on crash"
+    );
+}
+
+#[test]
+fn reopening_an_unsynced_file_does_not_promote_it_to_durable() {
+    let fs = CrashFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    let mut f = fs
+        .open(
+            Path::new("/d/f"),
+            &FsOpenOptions::new().write(true).create(true),
+        )
+        .unwrap();
+    f.write_all(b"unsynced").unwrap();
+    drop(f);
+    // Re-open for writing WITHOUT syncing: the un-synced bytes must not be
+    // captured as a durable baseline.
+    drop(
+        fs.open(Path::new("/d/f"), &FsOpenOptions::new().write(true))
+            .unwrap(),
+    );
+
+    fs.crash();
+    assert!(
+        !fs.exists(Path::new("/d/f")).unwrap(),
+        "re-opening a never-synced file does not promote its un-synced bytes to durable"
+    );
+}
+
+#[test]
 fn independent_files_have_independent_durability() {
     let fs = CrashFs::new(MemFs::new());
     fs.create_dir_all(Path::new("/d")).unwrap();
