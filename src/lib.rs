@@ -208,6 +208,9 @@ mod abstract_tree;
 pub(crate) mod deletion_pause;
 pub mod heal_hints;
 
+/// Computed write-backpressure verdict (caller-honoured, see [`backpressure`]).
+pub mod backpressure;
+
 // `checkpoint` is `pub(crate)`: it contains internal helpers
 // (`link_or_copy_cross_fs`, `prepare_target`, `run_checkpoint`) used by
 // `Tree::create_checkpoint` and `BlobTree::create_checkpoint`. Exposing
@@ -513,6 +516,8 @@ pub use compression::ZstdDictionary;
 
 #[cfg(feature = "metrics")]
 pub use metrics::{CacheStats, Metrics};
+
+pub use backpressure::{Backpressure, BackpressureThresholds};
 
 #[cfg(feature = "std")]
 #[doc(hidden)]
