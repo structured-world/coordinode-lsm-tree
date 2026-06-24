@@ -85,7 +85,7 @@ fn build_tree(layout: Layout, n: u64) -> (TempDir, Tree) {
 /// a tail regression the aggregate would hide still surfaces.
 fn timed_with_tail<F: FnMut()>(label: &str, iters: u64, mut op: F) -> std::time::Duration {
     use std::time::Instant;
-    let mut samples = Vec::with_capacity(iters as usize);
+    let mut samples = Vec::with_capacity(usize::try_from(iters).unwrap_or(0));
     let started = Instant::now();
     for _ in 0..iters {
         let t0 = Instant::now();
