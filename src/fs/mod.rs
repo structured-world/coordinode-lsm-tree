@@ -41,6 +41,16 @@ mod direct_io;
 // `crate::io` `Fs` trait): it stays unconditional so a `no_std` consumer has a
 // working `Fs` implementation to use and to copy for a real backend.
 mod mem_fs;
+// Programmable fault-injection backend for crash / error-path testing.
+// std-gated test/dev surface: it wraps an inner Fs and implements the std
+// `io::{Read, Write, Seek}` traits on its file handle (which under `std` ARE
+// the `crate::io` trait aliases), so it does not participate in a no_std build.
+#[cfg(feature = "std")]
+mod fault_fs;
+// Power-loss crash simulator: rolls files back to their last-synced content on
+// `crash()`. Same std-gated test/dev rationale as `fault_fs`.
+#[cfg(feature = "std")]
+mod crash_fs;
 #[cfg(feature = "std")]
 mod std_fs;
 
@@ -53,6 +63,10 @@ mod io_uring_fs;
 #[cfg(all(target_os = "linux", feature = "io-uring-raw"))]
 mod io_uring_raw;
 
+#[cfg(feature = "std")]
+pub use crash_fs::CrashFs;
+#[cfg(feature = "std")]
+pub use fault_fs::{Fault, FaultFs, FaultInjector, FaultOp, FaultRule};
 pub use mem_fs::MemFs;
 #[cfg(feature = "std")]
 pub use std_fs::StdFs;
