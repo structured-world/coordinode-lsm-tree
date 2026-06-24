@@ -86,3 +86,84 @@ fn flush_with_torn_manifest_commit_recovers_to_last_durable_state() -> lsm_tree:
 
     Ok(())
 }
+
+/// Exhaustive crash-point sweep: for every durability barrier (`sync_all` on a
+/// table or the manifest edit log) of a flush workload, fail that one barrier,
+/// simulate a power loss, reopen, and assert recovery yields a *consistent
+/// prefix* of the inserted keys.
+///
+/// Each key is inserted and then flushed in order, so the only crash-consistent
+/// outcomes are "the first j keys survive, the rest are gone" for some j — never
+/// a hole (key i present while key i-1 is missing) and never a failed reopen.
+/// The workload halts at the first flush error (an application that stops on a
+/// write failure), so a later flush can't durably commit a key past the gap.
+#[test]
+fn flush_crash_point_sweep_recovers_a_consistent_prefix() -> lsm_tree::Result<()> {
+    const KEYS: usize = 4;
+    // SST sync + edit-log sync per flush, plus headroom so the tail iterations
+    // fail no barrier at all (whole workload commits -> full prefix).
+    const SWEEP: usize = 2 * KEYS + 2;
+
+    let key = |i: usize| format!("k{i:02}");
+
+    for fail_after in 0..SWEEP {
+        let crash = CrashFs::new(MemFs::new());
+        let fault = FaultFs::new(crash.clone());
+        let injector = fault.injector();
+        let db = "/db";
+
+        {
+            let tree = lsm_tree::Config::new(
+                db,
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .with_shared_fs(Arc::new(fault))
+            .open()?;
+
+            // Arm only AFTER open so the fault counts flush barriers, not the
+            // open-time syncs: fail the (fail_after + 1)-th `sync_all`.
+            injector.arm(
+                FaultRule::new(FaultOp::SyncAll, Fault::Error(ErrorKind::Other))
+                    .skip(fail_after as u64)
+                    .once(),
+            );
+
+            for i in 0..KEYS {
+                tree.insert(key(i), "v", i as u64);
+                if tree.flush_active_memtable(0).is_err() {
+                    // The application stops writing on the first durable-commit
+                    // failure; keys past this point are never attempted durably.
+                    break;
+                }
+            }
+        }
+
+        crash.crash();
+
+        let tree = lsm_tree::Config::new(
+            db,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(crash.inner())
+        .open()?;
+
+        // Count the leading run of present keys, then assert the recovered set
+        // is EXACTLY that contiguous prefix (no holes, no stragglers).
+        let mut prefix = 0;
+        while prefix < KEYS && tree.contains_key(key(prefix), u64::MAX)? {
+            prefix += 1;
+        }
+        for i in 0..KEYS {
+            assert_eq!(
+                tree.contains_key(key(i), u64::MAX)?,
+                i < prefix,
+                "fail_after={fail_after}: key {i} should be {} (recovered prefix len {prefix})",
+                if i < prefix { "present" } else { "absent" },
+            );
+        }
+    }
+
+    Ok(())
+}
