@@ -1235,6 +1235,13 @@ pub fn column_batch_match_entries(
 ) -> Result<Vec<InternalValue>> {
     let (key_col, seqno_col, vt_col, value_cols) = validate_columnar_columns(batch)?;
     let row_count = batch.row_count;
+    if row_count == 0 {
+        // A zero-row block is malformed; fail closed like the scan path rather
+        // than returning an empty match the caller reads as an absent key.
+        return Err(Error::InvalidHeader(
+            "columnar: empty reconstructed data block",
+        ));
+    }
 
     // Lower bound: first row whose key is `>= needle` (keys are block-index
     // sorted: user_key ASC, seqno DESC).
