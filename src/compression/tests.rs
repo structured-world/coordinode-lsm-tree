@@ -47,28 +47,58 @@ mod zstd {
     }
 
     #[test]
-    fn compression_zstd_rejects_invalid_level() {
-        for invalid_level in [0, 23, -1, 200] {
+    fn compression_zstd_rejects_out_of_range_level() {
+        // Above the zstd max (22), or below what one signed byte can persist
+        // (i8::MIN); negative "fast" levels and 0 are valid (see the round-trip
+        // test below).
+        for invalid_level in [23, 100, 200, -129, i32::MIN] {
             let result = CompressionType::zstd(invalid_level);
             assert!(result.is_err(), "level {invalid_level} should be rejected");
         }
     }
 
     #[test]
+    fn compression_zstd_accepts_negative_and_default_levels() {
+        // zstd negative "fast" levels, 0 (= default), and 1..=22 all serialize and
+        // round-trip through the single-signed-byte wire format.
+        for level in [-128, -22, -1, 0, 1, 3, 22] {
+            let original = CompressionType::zstd(level)
+                .unwrap_or_else(|_| panic!("level {level} must be accepted"));
+            let serialized = original.encode_into_vec();
+            let decoded =
+                CompressionType::decode_from(&mut &serialized[..]).expect("decode failed");
+            assert_eq!(original, decoded, "level {level} must round-trip");
+        }
+    }
+
+    #[test]
+    fn compression_roundtrip_zstd_negative_level() {
+        // A negative fast level must produce a valid frame that decompresses back
+        // to the original (the level only affects the compressor's strategy, not
+        // the self-describing frame format).
+        use super::CompressionProvider;
+        let data = b"the quick brown fox jumps over the lazy dog".repeat(64);
+        let compressed = super::ZstdBackend::compress(&data, -22).expect("compress at -22");
+        let back = super::ZstdBackend::decompress(&compressed, data.len()).expect("decompress");
+        assert_eq!(back, data, "a negative-level frame round-trips");
+    }
+
+    #[test]
     fn compression_zstd_decode_rejects_invalid_level() {
-        // Serialize a valid zstd value, then corrupt the level byte
+        // Serialize a valid zstd value, then corrupt the level byte to a value
+        // above the zstd max (the wire is a signed byte, so only 23..=127 are
+        // out of the accepted -128..=22 range).
         let valid = CompressionType::Zstd(3).encode_into_vec();
         assert_eq!(valid.len(), 2);
 
-        // Flip level byte to 0 (out of range 1..=22)
-        let corrupted = vec![valid[0], 0];
-        let result = CompressionType::decode_from(&mut &corrupted[..]);
-        assert!(result.is_err(), "level 0 should be rejected on decode");
-
-        // Flip level byte to 23 (out of range)
-        let corrupted = vec![valid[0], 23];
-        let result = CompressionType::decode_from(&mut &corrupted[..]);
-        assert!(result.is_err(), "level 23 should be rejected on decode");
+        for invalid in [23u8, 100] {
+            let corrupted = vec![valid[0], invalid];
+            let result = CompressionType::decode_from(&mut &corrupted[..]);
+            assert!(
+                result.is_err(),
+                "level {invalid} should be rejected on decode"
+            );
+        }
     }
 
     #[test]
@@ -110,8 +140,10 @@ mod zstd {
     }
 
     #[test]
-    fn compression_zstd_dict_rejects_invalid_level() {
-        for invalid_level in [0, 23, -1, 200] {
+    fn compression_zstd_dict_rejects_out_of_range_level() {
+        // Negative "fast" levels and 0 are valid; only above the zstd max (22) or
+        // below the i8 the wire can persist are rejected.
+        for invalid_level in [23, 100, 200, -129, i32::MIN] {
             let result = CompressionType::zstd_dict(invalid_level, 42);
             assert!(result.is_err(), "level {invalid_level} should be rejected");
         }
@@ -119,17 +151,17 @@ mod zstd {
 
     #[test]
     fn compression_zstd_dict_decode_rejects_invalid_level() {
-        // Serialize a valid ZstdDict, then corrupt the level byte to 0
+        // Serialize a valid ZstdDict, then corrupt the level byte above the max.
         let mut buf = CompressionType::ZstdDict {
             level: 3,
             dict_id: 42,
         }
         .encode_into_vec();
         assert_eq!(buf[0], 4); // tag
-        buf[1] = 0; // corrupt level to 0 (out of range 1..=22)
+        buf[1] = 100; // corrupt level to 100 (above the zstd max of 22)
 
         let result = CompressionType::decode_from(&mut &buf[..]);
-        assert!(result.is_err(), "level 0 should be rejected on decode");
+        assert!(result.is_err(), "level 100 should be rejected on decode");
     }
 
     #[test]
