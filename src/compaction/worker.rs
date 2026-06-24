@@ -142,9 +142,15 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
         "Consulting compaction strategy {:?}",
         opts.strategy.get_name(),
     );
-    let choice = opts.strategy.choose(
+    // Structural decision plus the runtime-config-driven density-rewrite
+    // fallback (applied here, where the live runtime config lives, so the
+    // structural strategies stay free of it).
+    let runtime_config = opts.runtime_config.load_full();
+    let choice = super::choose_with_density_rewrite(
+        &*opts.strategy,
         &version_history_lock.latest_version().version,
         &opts.config,
+        &runtime_config,
         &compaction_state,
     );
 

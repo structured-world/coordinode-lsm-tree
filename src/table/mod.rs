@@ -295,6 +295,27 @@ impl Table {
         self.regions.zone_map.is_some()
     }
 
+    /// The fraction of this segment's rows masked by its positional
+    /// delete-bitmap, as a percentage in `0..=100`, or `None` when the segment
+    /// carries no delete-bitmap (nothing masked).
+    ///
+    /// Drives the density-based rewrite policy: a segment whose masked fraction
+    /// has grown past the adaptive purge threshold is worth physically rewriting
+    /// (dropping the masked rows and clearing the bitmap) rather than paying the
+    /// merge-on-read mask cost on every scan.
+    #[must_use]
+    pub fn delete_density(&self) -> Option<u8> {
+        let deleted = self.delete_bitmap().len();
+        if deleted == 0 {
+            return None;
+        }
+        let total = self.metadata.item_count.max(1);
+        // `deleted <= total`, both far below `u64::MAX / 100`, so the percentage
+        // is in `0..=100`; `.min(100)` is belt-and-suspenders for the cast.
+        let percent = (deleted * 100 / total).min(100);
+        Some(u8::try_from(percent).unwrap_or(100))
+    }
+
     fn load_block(
         &self,
         handle: &BlockHandle,
