@@ -164,7 +164,10 @@ pub fn salvage_sst(
     use alloc::sync::Arc;
 
     let comparator = crate::comparator::default_comparator();
-    let checksum = crate::verify::stream_checksum(source)?;
+    // Digest the source through the injected `Fs`, not `std::fs`: salvage runs
+    // over MemFs / fault-injected / routed backends (repair passes its own `fs`),
+    // where a direct `std::fs` read would miss the file or hash the wrong bytes.
+    let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&**fs, source)?);
     let cache = Arc::new(crate::cache::Cache::with_capacity_bytes(8 * 1024 * 1024));
     let descriptor = Arc::new(crate::descriptor_table::DescriptorTable::new(64));
     #[cfg(feature = "metrics")]

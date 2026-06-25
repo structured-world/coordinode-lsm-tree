@@ -88,7 +88,10 @@ pub struct RepairReport {
 
 /// Streams `path` start to end through XXH3-128, matching the digest a normal
 /// table write accumulates via `ChecksummedWriter`.
-fn compute_table_checksum(fs: &dyn crate::fs::Fs, path: &std::path::Path) -> crate::Result<u128> {
+pub(crate) fn compute_table_checksum(
+    fs: &dyn crate::fs::Fs,
+    path: &std::path::Path,
+) -> crate::Result<u128> {
     let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
     let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
     let mut buf = vec![0u8; 256 * 1024];

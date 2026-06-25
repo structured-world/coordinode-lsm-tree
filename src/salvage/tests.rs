@@ -19,7 +19,7 @@ fn iv(i: u32) -> InternalValue {
 /// Opens an SST as a `Table`, stamping the open with the file's current digest
 /// (the source may be corrupt; per-block checksums catch the actual damage).
 fn open(path: std::path::PathBuf, fs: &Arc<dyn Fs>) -> crate::Result<Table> {
-    let checksum = crate::verify::stream_checksum(&path)?;
+    let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&**fs, &path)?);
     Table::recover(
         path,
         checksum,
