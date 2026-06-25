@@ -403,3 +403,44 @@ fn salvage_sst_recovers_nothing_when_the_only_block_is_corrupt() -> crate::Resul
     assert!(!dest.exists(), "no destination file on an empty salvage");
     Ok(())
 }
+
+/// Salvage drives every read and write through the injected `Fs`: an SST that
+/// lives only in an in-memory backend (never on the real filesystem) salvages
+/// and reopens purely through that backend. A source-digest path that bypassed
+/// `fs` and read through `std::fs` would fail to find the file at all.
+#[test]
+fn salvage_sst_reads_and_writes_through_the_injected_fs() -> crate::Result<()> {
+    use crate::fs::MemFs;
+
+    let fs: Arc<dyn Fs> = Arc::new(MemFs::new());
+    let source = std::path::PathBuf::from("/source");
+    let dest = std::path::PathBuf::from("/salvaged");
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(256);
+    let n = 200u32;
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "in-memory source SST is non-empty"
+    );
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert!(
+        report.is_complete(),
+        "a healthy in-memory SST salvages with no dropped blocks: {report:?}",
+    );
+    assert_eq!(
+        report.entries_salvaged,
+        u64::from(n),
+        "every entry is recovered through the in-memory backend",
+    );
+    assert_eq!(report.salvaged_path.as_deref(), Some(dest.as_path()));
+    assert_eq!(
+        reopen_item_count(dest, &fs)?,
+        u64::from(n),
+        "the salvaged SST reopens through the same in-memory backend",
+    );
+    Ok(())
+}
