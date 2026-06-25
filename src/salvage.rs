@@ -76,8 +76,14 @@ pub struct SalvageReport {
 }
 
 impl SalvageReport {
-    /// Returns `true` when no block had to be dropped: the SST was fully
-    /// recovered and the salvaged copy holds the complete key range.
+    /// Returns `true` when no block had to be dropped: every block the walk
+    /// inspected was either recovered or carried no live rows, so no key range
+    /// was lost.
+    ///
+    /// This is orthogonal to whether a file was written: a source whose every
+    /// block is wholly deleted drops nothing yet recovers nothing, so
+    /// `is_complete()` is `true` while [`salvaged_path`](Self::salvaged_path) is
+    /// `None`. Always check `salvaged_path` before using the recovered copy.
     ///
     /// # Examples
     ///
@@ -230,10 +236,20 @@ pub fn salvage_sst(
             // recover and nothing lost.
             Ok(None) => {}
             Err(e) => {
+                // Classify the failure so the report distinguishes a bit-rot
+                // checksum mismatch from a structural decode error from a raw
+                // read / decompress failure.
+                let reason = match &e {
+                    crate::Error::ChecksumMismatch { .. } => DropReason::ChecksumMismatch,
+                    crate::Error::InvalidHeader(_) | crate::Error::InvalidTag(_) => {
+                        DropReason::DecodeError(format!("{e:?}"))
+                    }
+                    _ => DropReason::ReadError(format!("{e:?}")),
+                };
                 dropped.push(DroppedBlock {
                     offset,
                     section: b"data".to_vec(),
-                    reason: DropReason::ReadError(format!("{e:?}")),
+                    reason,
                     key_range: Some((
                         prev_end.clone().unwrap_or_else(UserKey::empty),
                         end_key.clone(),

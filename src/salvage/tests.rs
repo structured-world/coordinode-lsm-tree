@@ -1,4 +1,4 @@
-use super::salvage_sst;
+use super::{DropReason, salvage_sst};
 use crate::comparator::default_comparator;
 use crate::fs::{Fs, StdFs};
 use crate::table::{Table, Writer};
@@ -158,11 +158,10 @@ fn salvage_drops_a_corrupted_block_and_keeps_the_rest() -> crate::Result<()> {
         report.entries_salvaged,
     );
     assert!(
-        report
-            .dropped
-            .first()
-            .is_some_and(|d| d.key_range.is_some()),
-        "the dropped block names the key range it lost",
+        report.dropped.first().is_some_and(|d| {
+            matches!(d.reason, DropReason::ChecksumMismatch) && d.key_range.is_some()
+        }),
+        "the dropped block reports a checksum mismatch and names the key range it lost: {report:?}",
     );
     assert_eq!(report.salvaged_path.as_deref(), Some(dest.as_path()));
 
