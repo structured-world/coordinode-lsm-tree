@@ -16,6 +16,7 @@ mod reference_wal;
 
 // `Guard` (the re-exported `IterGuard` trait) is required for `into_inner()` on
 // scan results.
+use lsm_tree::fs::{CrashFs, Fs, MemFs};
 use lsm_tree::{
     AbstractTree, AnyTree, Config, Guard, MAX_SEQNO, MergeOperator, SequenceNumberCounter,
     UserValue, WriteBatch,
@@ -67,6 +68,20 @@ fn open_tree(folder: &Path) -> AnyTree {
     .expect("open tree")
 }
 
+/// Opens (or reopens) a tree at `folder` on an injected filesystem, with the
+/// counter merge operator. Used by the `CrashFs` power-loss variant.
+fn open_tree_on(folder: &Path, fs: Arc<dyn Fs>) -> AnyTree {
+    Config::new(
+        folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(CounterMerge)))
+    .with_shared_fs(fs)
+    .open()
+    .expect("open tree")
+}
+
 /// Applies one logged record at its original seqno with its original operation,
 /// never collapsing to `insert`. This is the "apply" half of log-before-apply
 /// and the whole of replay.
@@ -108,7 +123,7 @@ fn apply(tree: &AnyTree, record: &WalRecord) -> lsm_tree::Result<()> {
     Ok(())
 }
 
-/// The full visible state at `MAX_SEQNO` as sorted `(key, value)` pairs — the
+/// The full visible state at `MAX_SEQNO` as sorted `(key, value)` pairs: the
 /// byte-identity fingerprint two runs must agree on.
 fn snapshot(tree: &AnyTree) -> Vec<(Vec<u8>, Vec<u8>)> {
     tree.iter(MAX_SEQNO, None)
@@ -279,7 +294,7 @@ fn external_wal_recipe_survives_crash_and_recovers_identical_state() -> lsm_tree
         let tree = open_tree(dir.path());
         let mut wal = ReferenceWal::create(&wal_path)?;
 
-        // Phase 1 — durable prefix: apply in strict seqno order through the flush.
+        // Phase 1, durable prefix: apply in strict seqno order through the flush.
         for record in work.iter().filter(|r| r.seqno <= FLUSH_AFTER) {
             wal.append(record)?; // log ...
             apply(&tree, record)?; // ... before apply
@@ -294,7 +309,7 @@ fn external_wal_recipe_survives_crash_and_recovers_identical_state() -> lsm_tree
         );
         wal.trim_through(w)?; // the prefix is durable; drop it from the WAL
 
-        // Phase 2 — post-flush writes that live only in the active memtable.
+        // Phase 2, post-flush writes that live only in the active memtable.
         for record in work.iter().filter(|r| r.seqno > FLUSH_AFTER) {
             wal.append(record)?;
             apply(&tree, record)?;
@@ -338,7 +353,7 @@ fn counter_of(tree: &AnyTree) -> Option<i64> {
         .map(|v| i64::from_le_bytes((*v).try_into().expect("8-byte counter")))
 }
 
-/// Contract guard — the **original operation** must be replayed, never collapsed
+/// Contract guard:the **original operation** must be replayed, never collapsed
 /// to `insert`. A `remove` recovered as an `insert` resurrects the key, so a
 /// collapsing recovery is detectably wrong.
 #[test]
@@ -396,13 +411,13 @@ fn collapsing_a_remove_to_insert_is_detectably_wrong() -> lsm_tree::Result<()> {
     };
     assert!(
         has_key(&wrong, b"k"),
-        "collapsing the remove to an insert resurrects k — detectably wrong",
+        "collapsing the remove to an insert resurrects k, detectably wrong",
     );
     assert_ne!(correct, wrong, "the two recoveries must diverge");
     Ok(())
 }
 
-/// Contract guard — a merge operand at or below the watermark `W` is already
+/// Contract guard:a merge operand at or below the watermark `W` is already
 /// folded into the persisted SSTs; re-applying it on recovery folds it twice.
 /// The strict `> W` boundary prevents this; replaying every record double-counts.
 #[test]
@@ -471,13 +486,13 @@ fn re_applying_a_merge_at_or_below_the_watermark_double_counts() -> lsm_tree::Re
     assert_eq!(
         wrong,
         Some(18),
-        "re-applying the at-or-below-W operands double-counts — detectably wrong",
+        "re-applying the at-or-below-W operands double-counts, detectably wrong",
     );
     assert_ne!(correct, wrong);
     Ok(())
 }
 
-/// Contract guard — replay must use the gap-free watermark `W`, not the raw
+/// Contract guard:replay must use the gap-free watermark `W`, not the raw
 /// persisted maximum. A record that was logged but not applied (a crash between
 /// the log write and the apply) sits below a higher applied-and-flushed seqno;
 /// `W` stays below the gap, so `> W` replays it, while `> raw_maximum` skips it
@@ -537,7 +552,7 @@ fn replaying_from_the_raw_maximum_skips_a_logged_but_unapplied_gap() -> lsm_tree
     let records = ReferenceWal::open(&wal_path)?.records()?;
 
     // Correct replay (> W = 0): re-applies the gap (1) and re-applies b (2,
-    // already persisted — a harmless overwrite). "gap" is recovered.
+    // already persisted, a harmless overwrite). "gap" is recovered.
     let correct = {
         let tree = open_tree(dir.path());
         for record in records.iter().filter(|r| r.seqno > 0) {
@@ -560,8 +575,77 @@ fn replaying_from_the_raw_maximum_skips_a_logged_but_unapplied_gap() -> lsm_tree
     };
     assert!(
         !has_key(&wrong, b"gap"),
-        "replaying from the raw maximum loses the gap record — detectably wrong",
+        "replaying from the raw maximum loses the gap record, detectably wrong",
     );
     assert_ne!(correct, wrong);
+    Ok(())
+}
+
+/// The recipe recovers through the fault-injection harness: the engine runs on a
+/// `CrashFs` over an in-memory disk whose `crash()` drops every unsynced write (a
+/// stronger crash than a clean drop). The reference WAL stays on the caller's
+/// real disk, unaffected by the engine's power loss, and replay above `W`
+/// reconstructs the lost tail.
+#[test]
+fn external_wal_recipe_recovers_through_the_crash_fs_harness() -> lsm_tree::Result<()> {
+    let work = workload();
+
+    // Reference: a single no-crash run on the default filesystem.
+    let ref_dir = tempfile::tempdir()?;
+    let reference = {
+        let tree = open_tree(ref_dir.path());
+        for record in &work {
+            apply(&tree, record)?;
+        }
+        snapshot(&tree)
+    };
+
+    let db_dir = tempfile::tempdir()?; // engine storage path (keys into MemFs)
+    let wal_dir = tempfile::tempdir()?; // the caller's WAL, on the real disk
+    let wal_path = wal_dir.path().join("external.wal");
+
+    // An in-memory disk under a crash-injecting wrapper. `mem` is held so the
+    // post-crash state survives the tree teardown for the reopen.
+    let mem = MemFs::new();
+    let crash = Arc::new(CrashFs::from_shared(Arc::new(mem.clone())));
+    {
+        let tree = open_tree_on(db_dir.path(), crash.clone());
+        let mut wal = ReferenceWal::create(&wal_path)?;
+
+        for record in work.iter().filter(|r| r.seqno <= FLUSH_AFTER) {
+            wal.append(record)?;
+            apply(&tree, record)?;
+        }
+        tree.flush_active_memtable(0)?;
+        let w = tree
+            .get_highest_persisted_seqno()
+            .expect("flushed tree has a persisted watermark");
+        wal.trim_through(w)?;
+        for record in work.iter().filter(|r| r.seqno > FLUSH_AFTER) {
+            wal.append(record)?;
+            apply(&tree, record)?;
+        }
+
+        // Power loss: drop every unsynced engine write, then tear the tree down.
+        // The flushed SSTs were synced, so they survive; the unflushed memtable
+        // (seqnos above W) does not.
+        crash.crash();
+        drop(tree);
+    }
+
+    // Recover on the surviving in-memory disk and replay strictly above W.
+    let recovered = {
+        let tree = open_tree_on(db_dir.path(), Arc::new(mem.clone()));
+        let wal = ReferenceWal::open(&wal_path)?;
+        for record in wal.records()? {
+            apply(&tree, &record)?;
+        }
+        snapshot(&tree)
+    };
+
+    assert_eq!(
+        recovered, reference,
+        "recovery through the crash harness reproduces the non-crashed state",
+    );
     Ok(())
 }

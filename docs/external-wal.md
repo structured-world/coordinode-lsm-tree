@@ -146,17 +146,17 @@ This recipe is not only specified here; it is executed and self-verified in the
 repository, so a future engine change that violated the contract would break a
 test rather than silently diverge from the prose:
 
-- **Reference WAL** —
+- **Reference WAL:**
   [`tests/external_wal/reference_wal.rs`](../tests/external_wal/reference_wal.rs)
   is a minimal append-only WAL: append + `fsync`, trim through a watermark, and
   replay the survivors in order. It is illustrative (a `std`-only test/dev
   surface, not the `no_std` production path), and is the worked example the spec
   refers to.
-- **Worked example** —
+- **Worked example:**
   [`examples/external_wal.rs`](../examples/external_wal.rs) runs the full recipe
   (log-before-apply, flush, trim to `W`, crash, reopen, replay above `W`) and
   asserts the recovered state. Run it with `cargo run --example external_wal`.
-- **Integration test** — [`tests/external_wal.rs`](../tests/external_wal.rs)
+- **Integration test:** [`tests/external_wal.rs`](../tests/external_wal.rs)
   drives the recipe across every write kind through a crash and asserts the
   recovered state is byte-for-byte a non-crashed run's. Its contract guards
   prove a wrong recovery is *detectably* wrong: collapsing ops to `insert`,

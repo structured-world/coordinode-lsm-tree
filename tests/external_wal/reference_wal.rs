@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Structured World Foundation
 
-//! Minimal append-only reference WAL — the worked example for the external-WAL
+//! Minimal append-only reference WAL: the worked example for the external-WAL
 //! recipe in `docs/external-wal.md`.
 //!
 //! This is **illustrative, not a production WAL**: it is `std`-only (a test/dev
@@ -115,7 +115,7 @@ impl ReferenceWal {
     /// records above it (including a logged-but-unapplied seqno that sits below
     /// a flushed higher one) are retained.
     ///
-    /// Rewrites the whole file for simplicity — a production WAL would rotate
+    /// Rewrites the whole file for simplicity; a production WAL would rotate
     /// segments instead.
     pub fn trim_through(&mut self, w: u64) -> io::Result<()> {
         let kept: Vec<WalRecord> = self
@@ -234,7 +234,7 @@ fn encode_record(record: &WalRecord, out: &mut Vec<u8>) {
 
 /// A cursor over the raw WAL bytes. Returns `None` from any read once the buffer
 /// is exhausted, so a torn tail record (a crash mid-append before fsync, or a
-/// truncated frame) is dropped rather than panicking — matching how a real WAL
+/// truncated frame) is dropped rather than panicking, matching how a real WAL
 /// discards a partial trailing record on recovery.
 struct Cursor<'a> {
     bytes: &'a [u8],

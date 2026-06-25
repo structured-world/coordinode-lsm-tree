@@ -104,7 +104,7 @@ fn main() -> lsm_tree::Result<()> {
         println!("flushed; durable watermark W = {w}");
         wal.trim_through(w)?; // 4. the prefix is on disk; drop it from the WAL
 
-        // Writes above W live only in the active memtable — lost on a crash.
+        // Writes above W live only in the active memtable, lost on a crash.
         for record in [
             WalRecord {
                 seqno: 2,
