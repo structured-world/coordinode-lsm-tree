@@ -154,6 +154,12 @@ fn build_config(dir: &std::path::Path, cell: Cell) -> Config {
     )
     .data_block_compression_policy(CompressionPolicy::all(compression_type(cell.comp)));
 
+    // `cfg` is reassigned only inside the `encryption` / `page_ecc` feature
+    // blocks below, so the binding needs `mut` only when one of them is enabled.
+    #[cfg_attr(
+        not(any(feature = "encryption", feature = "page_ecc")),
+        expect(unused_mut, reason = "mut is used only under encryption / page_ecc")
+    )]
     let mut cfg = if cell.blob {
         // threshold 1 forces every value down the blob path so the KV-sep axis
         // is actually exercised (the values here are small).

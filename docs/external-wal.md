@@ -140,6 +140,32 @@ The strict boundary still covers the crash window in step 1 of
 not yet flushed is, by definition, absent from the SSTs, so its seqno is above
 your trim watermark `W` and the replay step covers it exactly once.
 
+## Executable companion
+
+This recipe is not only specified here; it is executed and self-verified in the
+repository, so a future engine change that violated the contract would break a
+test rather than silently diverge from the prose:
+
+- **Reference WAL:**
+  [`tests/external_wal/reference_wal.rs`](../tests/external_wal/reference_wal.rs)
+  is a minimal append-only WAL: append + `fsync`, trim through a watermark, and
+  replay the survivors in order. It is illustrative (a `std`-only test/dev
+  surface, not the `no_std` production path), and is the worked example the spec
+  refers to.
+- **Worked example:**
+  [`examples/external_wal.rs`](../examples/external_wal.rs) runs the full recipe
+  (log-before-apply, flush, trim to `W`, crash, reopen, replay above `W`) and
+  asserts the recovered state. Run it with `cargo run --example external_wal`.
+- **Integration test:** [`tests/external_wal.rs`](../tests/external_wal.rs)
+  drives the recipe across every write kind through a crash and asserts the
+  recovered state is byte-for-byte a non-crashed run's. Its contract guards
+  prove a wrong recovery is *detectably* wrong: collapsing ops to `insert`,
+  re-applying a merge at or below `W`, or replaying from the raw persisted
+  maximum instead of `W` each make the recovery diverge.
+
+Keep this spec and that proof in sync: a change to the contract should update
+both.
+
 ## Why no hook API
 
 A thin observability hook surface (`before_write_batch`, `after_flush`,

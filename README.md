@@ -112,7 +112,8 @@ The trade-off: there is no write-ahead log, so we do not offer WAL-style
 millisecond tailing of in-flight updates. For arbitrary historical-seqno queries
 (not just "since X"), pair with `Tree::create_checkpoint`. To layer your own
 durability on top of the engine, see the external-WAL integration contract in
-[docs/external-wal.md](docs/external-wal.md).
+[docs/external-wal.md](docs/external-wal.md) and its runnable worked example
+(`cargo run --example external_wal`).
 
 ## Limits
 
