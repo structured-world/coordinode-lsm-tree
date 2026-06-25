@@ -123,6 +123,11 @@ impl SalvageReport {
 /// source is opened in salvage mode, so a corrupt delete-bitmap degrades to
 /// "all rows live" rather than failing the open.
 ///
+/// The positional walk re-emits only point entries, so an SST that carries
+/// range tombstones cannot be salvaged without dropping them (which would let
+/// lower-level keys they cover reappear after repair). Such a source fails
+/// closed rather than salvaging into a copy with broken merge semantics.
+///
 /// The walk is positional (block-index order): iteration is not
 /// comparator-driven, so the recovered entries keep their on-disk order. This
 /// entry point opens and rewrites under the default lexicographic comparator;
@@ -132,9 +137,10 @@ impl SalvageReport {
 /// # Errors
 ///
 /// Returns an error when `source` cannot be opened at all (its metadata, index,
-/// or SFA trailer is unreadable) or when writing `dest` fails. Per-block
-/// corruption is not an error: such blocks are dropped and listed in the
-/// returned [`SalvageReport`].
+/// or SFA trailer is unreadable), when it carries range tombstones (salvage
+/// fails closed rather than dropping them), or when writing `dest` fails.
+/// Per-block corruption is not an error: such blocks are dropped and listed in
+/// the returned [`SalvageReport`].
 ///
 /// # Examples
 ///
@@ -207,6 +213,17 @@ pub(crate) fn salvage_sst_with_comparator(
         // "all rows live" instead of failing, so a damaged sidecar still opens.
         true,
     )?;
+
+    // Fail closed on range tombstones: the positional walk re-emits only point
+    // entries, so salvaging an SST that carries range tombstones would drop them
+    // and let lower-level keys they cover reappear after repair (a merge-semantics
+    // violation). Reject until the writer path can re-emit them, the same way
+    // encrypted / dictionary SSTs fall back to quarantine.
+    if !table.range_tombstones().is_empty() {
+        return Err(crate::Error::FeatureUnsupported(
+            "salvage of an SST with range tombstones",
+        ));
+    }
 
     let writer = crate::table::Writer::new(dest.clone(), table.id(), 0, Arc::clone(fs))?
         .use_data_block_compression(table.metadata.data_block_compression)
