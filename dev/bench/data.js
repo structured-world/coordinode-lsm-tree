@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782362548412,
+  "lastUpdate": 1782387111776,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -20154,6 +20154,84 @@ window.BENCHMARK_DATA = {
             "value": 677491.7564158062,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 4.5us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ba5172c54e9d263726aa4b9a56579a7af12e2032",
+          "message": "feat(salvage): block-granular SST salvage (#560)\n\n## Summary\n\nBlock-granular SST salvage: recover the readable blocks of a corrupt SST\ninstead of losing the whole file, so a single bad block (or a damaged\ncolumnar\nsidecar) costs only its own key range.\n\nAvailable three ways:\n\n- **Library** — `salvage::salvage_sst(src, dest, &fs) -> SalvageReport`:\nwalk an\nSST block by block, re-emit every block that passes its checksum (and\nECC)\ninto a fresh, fully-valid file (new checksums / index / filter),\nquarantine\n  the corrupt ones, and report the key range each dropped.\n- **CLI** — `sst-dump salvage <file> <dest>`: the same offline, printing\na\n  per-block report.\n- **Repair** — `Config::repair_with_salvage(true)` / `sst-dump repair\n--salvage`:\n  repair block-salvages SSTs that fail verification in place rather than\n  dropping them; `RepairReport::salvaged` counts how many.\n\nColumnar segments degrade conservatively: a torn sub-column drops just\nits\nblock; a corrupt delete-bitmap reads as \"all rows live, pending\nrecompaction\"\nvia a salvage-mode `Table::recover` that still fails closed in normal\noperation,\nso it never resurrects deleted rows (the zone map already degraded to\n\"cannot\nskip\").\n\n## Limitations (tracked follow-ups)\n\nUnencrypted / non-dictionary SSTs only; a salvaged columnar source is\nrewritten\nrow-major.\n\n## Testing\n\n- Salvage unit tests: healthy round-trip, a single corrupt block drops\nonly its\nrange, a corrupt columnar block, and a corrupt delete-bitmap recovering\nall\n  rows live (while normal recovery refuses it).\n- Integration: a block-corrupt SST repairs (with salvage) to a fully\nreopenable\n  tree where every read succeeds.\n- `sst-dump salvage` and `repair` smoke tests drive the binary end to\nend.\n- Full suite 2275 passing; clippy `--all-features --all-targets` clean;\nno-std\n  check clean; doctests and cargo doc clean.\n\nCloses #549\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added block-granular SST salvage to recover usable blocks from\npartially corrupt files.\n* Added salvage-capable repair mode that extends repair results and\nreports a new “salvaged” count.\n* Extended `sst-dump` with a `salvage` command and a `repair --salvage`\noption with richer output.\n* **Bug Fixes**\n* Improved handling of corrupted positional delete-bitmap data to reduce\nunnecessary table loss (normal vs salvage behavior).\n* **Documentation**\n* Updated README and data-integrity documentation describing\nsalvage/repair capabilities.\n* **Tests**\n* Added unit and end-to-end coverage for full salvage, partial salvage,\nand unrecoverable cases.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-25T14:30:49+03:00",
+          "tree_id": "396945671c03d85036e02279c904c53cc8366067",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/ba5172c54e9d263726aa4b9a56579a7af12e2032"
+        },
+        "date": 1782387110613,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1964931.6873323282,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1132023.2021286746,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.5us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 872715.7363772914,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.2us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3742903.6885380126,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.1us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 438140.57137351093,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.6us | P99.9: 9.3us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 225265.26155927964,
+            "unit": "ops/sec",
+            "extra": "P50: 4.1us | P99: 5.3us | P99.9: 12.4us\nthreads: 1 | elapsed: 0.89s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1209473.959499531,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.5us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1053504.3574046402,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 2.6us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 700763.8771245719,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.6us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
