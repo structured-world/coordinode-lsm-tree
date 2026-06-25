@@ -467,22 +467,87 @@ impl DataBlock {
     /// row-major in memory so every existing row read path is reused unchanged.
     /// The caller must have loaded `block` with `BlockType::Columnar` (its AAD /
     /// descriptor), so this is shared by both the random-access and scan paths.
+    /// Decodes a columnar block into its reconstructed row entries (block-index
+    /// order), WITHOUT re-encoding to a row-major block. The scan path iterates
+    /// these directly (no serialize + re-parse round-trip); [`Self::from_columnar_block`]
+    /// re-encodes on top of this for the byte-based point-read path.
     #[cfg(feature = "columnar")]
-    pub(crate) fn from_columnar_block(
-        block_data: &[u8],
-        restart_interval: u8,
-    ) -> crate::Result<Self> {
+    pub(crate) fn columnar_block_entries(block_data: &[u8]) -> crate::Result<Vec<InternalValue>> {
         let batch = crate::table::columnar::ColumnBatch::decode(block_data)?;
-        let entries = crate::table::columnar::column_batch_to_entries(&batch)?;
+        // Consuming, zero-copy untranspose: row keys / values are views into the
+        // batch's column buffers rather than per-row copies.
+        let entries = crate::table::columnar::column_batch_into_entries(batch)?;
         // The writer never spills an empty block, so a zero-row columnar block is
-        // corrupt; reject it before the row encoder, which has a non-empty
-        // precondition and would otherwise panic.
+        // corrupt; reject it before any consumer with a non-empty precondition.
         if entries.is_empty() {
             return Err(crate::Error::InvalidHeader(
                 "columnar: empty reconstructed data block",
             ));
         }
+        Ok(entries)
+    }
+
+    /// As [`Self::columnar_block_entries`], but drops rows whose global position
+    /// is marked deleted in `deletes`. `block_start_row` is the block's first
+    /// row position (block-index order). Returns `Ok(None)` when every row is
+    /// deleted (the caller skips the block).
+    #[cfg(feature = "columnar")]
+    pub(crate) fn columnar_block_entries_masked(
+        block_data: &[u8],
+        deletes: &crate::table::delete_bitmap::DeleteBitmap,
+        block_start_row: u32,
+    ) -> crate::Result<Option<Vec<InternalValue>>> {
+        let entries = Self::columnar_block_entries(block_data)?;
+        let mut kept = Vec::with_capacity(entries.len());
+        for (index, entry) in entries.into_iter().enumerate() {
+            let offset = u32::try_from(index).map_err(|_| {
+                crate::Error::InvalidHeader("columnar: block row index exceeds u32::MAX")
+            })?;
+            let pos = block_start_row
+                .checked_add(offset)
+                .ok_or(crate::Error::InvalidHeader(
+                    "columnar: row position exceeds u32::MAX",
+                ))?;
+            if !deletes.contains(pos) {
+                kept.push(entry);
+            }
+        }
+        if kept.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(kept))
+    }
+
+    #[cfg(feature = "columnar")]
+    pub(crate) fn from_columnar_block(
+        block_data: &[u8],
+        restart_interval: u8,
+    ) -> crate::Result<Self> {
+        let entries = Self::columnar_block_entries(block_data)?;
         Self::encode_entries_to_block(&entries, restart_interval)
+    }
+
+    /// Point-read fast path for a columnar block: reconstructs only the rows whose
+    /// key equals `needle` (skipping `deletes`-masked rows) into a tiny row block,
+    /// or `Ok(None)` when the key is absent / wholly deleted. The caller runs the
+    /// normal seqno-aware [`Self::point_read`] on the result. Avoids untransposing
+    /// and re-encoding the whole block per lookup.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn columnar_point_block(
+        block_data: &[u8],
+        needle: &[u8],
+        comparator: &crate::comparator::SharedComparator,
+        restart_interval: u8,
+        deletes: Option<(&crate::table::delete_bitmap::DeleteBitmap, u32)>,
+    ) -> crate::Result<Option<Self>> {
+        let batch = crate::table::columnar::ColumnBatch::decode(block_data)?;
+        let entries = crate::table::columnar::column_batch_match_entries(
+            &batch, needle, comparator, deletes,
+        )?;
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        Self::encode_entries_to_block(&entries, restart_interval).map(Some)
     }
 
     /// As [`Self::from_columnar_block`], but drops rows whose global position is

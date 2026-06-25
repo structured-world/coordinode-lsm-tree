@@ -1104,6 +1104,207 @@ pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>
     Ok(out)
 }
 
+/// Consuming, allocation-light counterpart to [`column_batch_to_entries`] for
+/// the scan path.
+///
+/// The key column and a single non-nullable bytes value column are taken as
+/// shared [`Slice`]s, so each row's key / value is a view into one buffer
+/// (zero-copy for the Arc-backed large-value case) instead of a per-row copy.
+/// Any other value layout (fixed-width, multiple sub-columns, or nullable) falls
+/// back to the per-row framing reconstruction.
+pub fn column_batch_into_entries(batch: ColumnBatch) -> Result<Vec<InternalValue>> {
+    // Structural validation (intrinsic columns + framing) before we consume.
+    validate_columnar_columns(&batch)?;
+    let row_count = batch.row_count;
+    let mut cols = batch.columns.into_iter();
+    let key_col = cols
+        .next()
+        .ok_or(Error::InvalidHeader("columnar: missing key column"))?;
+    let seqno_col = cols
+        .next()
+        .ok_or(Error::InvalidHeader("columnar: missing seqno column"))?;
+    let vt_col = cols
+        .next()
+        .ok_or(Error::InvalidHeader("columnar: missing value-type column"))?;
+    let value_cols: Vec<Column> = cols.collect();
+
+    // Shared key buffer: every row's key is a view into it.
+    let key_data = Slice::from(key_col.data);
+
+    // A single non-nullable bytes value column lets every row's value be a view
+    // into one shared buffer; otherwise reconstruct (frame / fixed-width) per row.
+    let single_bytes_value = matches!(
+        value_cols.as_slice(),
+        [c] if c.type_tag == TypeTag::Bytes && c.validity.is_none()
+    );
+    let value_source = if single_bytes_value {
+        let single = value_cols
+            .into_iter()
+            .next()
+            .ok_or(Error::InvalidHeader("columnar: value column vanished"))?;
+        ValueSource::SharedBytes(Slice::from(single.data))
+    } else {
+        ValueSource::Reconstruct(value_cols)
+    };
+
+    let mut out = Vec::with_capacity(row_count as usize);
+    for i in 0..row_count {
+        let user_key = bytes_row_slice(&key_data, row_count, i)?;
+        // Same key invariants as column_batch_to_entries (non-empty, u16 length).
+        if user_key.is_empty() || user_key.len() > u16::MAX as usize {
+            return Err(Error::InvalidHeader(
+                "columnar: user key is empty or longer than u16::MAX",
+            ));
+        }
+        let seqno = fixed_u64_row(&seqno_col.data, i)?;
+        let vt_byte = vt_col
+            .data
+            .get(i as usize)
+            .copied()
+            .ok_or(Error::InvalidHeader("columnar: value-type row truncated"))?;
+        let value_type =
+            ValueType::try_from(vt_byte).map_err(|()| Error::InvalidTag(("ValueType", vt_byte)))?;
+        let value = match &value_source {
+            ValueSource::SharedBytes(data) => bytes_row_slice(data, row_count, i)?,
+            ValueSource::Reconstruct(cols) => reconstruct_row_value(cols, row_count, i)?,
+        };
+        out.push(InternalValue {
+            key: InternalKey {
+                user_key,
+                seqno,
+                value_type,
+            },
+            value,
+        });
+    }
+    Ok(out)
+}
+
+/// Per-row value source for [`column_batch_into_entries`]: a shared bytes buffer
+/// (zero-copy views) or the per-row framing reconstruction.
+enum ValueSource {
+    SharedBytes(Slice),
+    Reconstruct(Vec<Column>),
+}
+
+/// Returns row `i` of a [`TypeTag::Bytes`] column body as a zero-copy [`Slice`]
+/// view into `data` (the column's shared buffer), bounds-checked.
+fn bytes_row_slice(data: &Slice, row_count: u32, i: u32) -> Result<Slice> {
+    let bytes: &[u8] = data.as_ref();
+    let off_bytes = (row_count as usize + 1) * 4;
+    let read_off = |idx: u32| -> Result<usize> {
+        let base = idx as usize * 4;
+        let b = bytes
+            .get(base..base + 4)
+            .ok_or(Error::InvalidHeader("columnar: bytes offset truncated"))?;
+        let arr: [u8; 4] = b
+            .try_into()
+            .map_err(|_| Error::InvalidHeader("columnar: short bytes offset"))?;
+        Ok(u32::from_le_bytes(arr) as usize)
+    };
+    let start = read_off(i)?;
+    let end = read_off(i + 1)?;
+    let payload_start = off_bytes.checked_add(start).ok_or(Error::InvalidHeader(
+        "columnar: bytes payload offset overflow",
+    ))?;
+    let payload_end = off_bytes.checked_add(end).ok_or(Error::InvalidHeader(
+        "columnar: bytes payload offset overflow",
+    ))?;
+    if start > end || payload_end > bytes.len() {
+        return Err(Error::InvalidHeader("columnar: bytes row out of range"));
+    }
+    Ok(data.slice(payload_start..payload_end))
+}
+
+/// Reconstructs only the rows whose key equals `needle`, for the columnar
+/// point-read path.
+///
+/// Binary-searches the key column to the first row `>= needle`, then collects the
+/// contiguous `== needle` run as entries (newest-first, matching block order),
+/// skipping rows masked by the positional delete-bitmap. Returns an empty vec
+/// when the key is absent (or every matching row is deleted). The caller
+/// re-encodes this handful of rows into a tiny block and runs the normal
+/// seqno-aware point read, so a columnar point read decodes the block once and
+/// touches one key's rows instead of untransposing and re-encoding the whole
+/// block.
+pub fn column_batch_match_entries(
+    batch: &ColumnBatch,
+    needle: &[u8],
+    comparator: &crate::comparator::SharedComparator,
+    deletes: Option<(&crate::table::delete_bitmap::DeleteBitmap, u32)>,
+) -> Result<Vec<InternalValue>> {
+    let (key_col, seqno_col, vt_col, value_cols) = validate_columnar_columns(batch)?;
+    let row_count = batch.row_count;
+    if row_count == 0 {
+        // A zero-row block is malformed; fail closed like the scan path rather
+        // than returning an empty match the caller reads as an absent key.
+        return Err(Error::InvalidHeader(
+            "columnar: empty reconstructed data block",
+        ));
+    }
+
+    // Lower bound: first row whose key is `>= needle` (keys are block-index
+    // sorted: user_key ASC, seqno DESC).
+    let mut lo = 0u32;
+    let mut hi = row_count;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let k = bytes_column_row(&key_col.data, row_count, mid)?;
+        if comparator.compare(k, needle) == core::cmp::Ordering::Less {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    // Collect the contiguous `== needle` run from `lo`, skipping masked rows.
+    let mut out = Vec::new();
+    let mut row = lo;
+    while row < row_count {
+        let k = bytes_column_row(&key_col.data, row_count, row)?;
+        if comparator.compare(k, needle) != core::cmp::Ordering::Equal {
+            break;
+        }
+        let masked = if let Some((bitmap, start)) = deletes {
+            // Fail closed on a corrupt block_start_row: an overflowing position
+            // must error like the scan path, never silently expose the row.
+            let pos = start.checked_add(row).ok_or(Error::InvalidHeader(
+                "columnar: row position exceeds u32::MAX",
+            ))?;
+            bitmap.contains(pos)
+        } else {
+            false
+        };
+        if !masked {
+            // Match the engine's key invariants (non-empty, u16 length).
+            if k.is_empty() || k.len() > u16::MAX as usize {
+                return Err(Error::InvalidHeader(
+                    "columnar: user key is empty or longer than u16::MAX",
+                ));
+            }
+            let seqno = fixed_u64_row(&seqno_col.data, row)?;
+            let vt_byte = vt_col
+                .data
+                .get(row as usize)
+                .copied()
+                .ok_or(Error::InvalidHeader("columnar: value-type row truncated"))?;
+            let value_type = ValueType::try_from(vt_byte)
+                .map_err(|()| Error::InvalidTag(("ValueType", vt_byte)))?;
+            let value = reconstruct_row_value(value_cols, row_count, row)?;
+            out.push(InternalValue {
+                key: InternalKey {
+                    user_key: Slice::from(k),
+                    seqno,
+                    value_type,
+                },
+                value,
+            });
+        }
+        row += 1;
+    }
+    Ok(out)
+}
+
 /// Frames one row's value sub-column cells into a single self-describing value
 /// blob.
 ///

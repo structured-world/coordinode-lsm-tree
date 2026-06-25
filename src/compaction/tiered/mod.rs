@@ -237,6 +237,36 @@ impl CompactionStrategy for Strategy {
         ]
     }
 
+    fn pending_compaction_bytes(&self, version: &Version) -> u64 {
+        // Tiered debt mirrors the space-amplification trigger in `choose`: the
+        // bytes by which total L0 size exceeds the budget
+        // `largest_run * (1 + max_space_amplification_percent / 100)`. This makes
+        // the bytes-axis backpressure (bytes_slowdown / bytes_stop) engage for
+        // size-tiered trees, not only leveled. All runs are counted, including
+        // any already being compacted: the redundancy is on disk until the full
+        // compaction lands. Zero with fewer than two runs (nothing to reclaim).
+        let l0 = version.l0();
+        let mut total: u128 = 0;
+        let mut largest: u128 = 0;
+        let mut run_count = 0usize;
+        for run in l0.iter() {
+            let size: u128 = run.iter().map(|t| u128::from(Table::file_size(t))).sum();
+            total += size;
+            largest = largest.max(size);
+            run_count += 1;
+        }
+        if run_count < 2 || largest == 0 {
+            return 0;
+        }
+        // Same *100-scaled comparison as `choose` (avoids f64 precision loss);
+        // `rhs` saturates so an effectively unbounded threshold yields zero debt.
+        let lhs = total * 100;
+        let rhs = largest.saturating_mul(100 + u128::from(self.max_space_amplification_percent));
+        // saturating_sub: debt floors at zero by definition (none within budget).
+        let debt = lhs.saturating_sub(rhs) / 100;
+        u64::try_from(debt).unwrap_or(u64::MAX)
+    }
+
     fn choose(&self, version: &Version, _: &Config, state: &CompactionState) -> Choice {
         let runs = collect_available_runs(version, state);
 

@@ -14,7 +14,7 @@ use lsm_tree::table::columnar::{
     unframe_value_cells_nullable,
 };
 use lsm_tree::{
-    AbstractTree, AnyTree, Config, InternalValue, SeqNo, SequenceNumberCounter, ValueType,
+    AbstractTree, AnyTree, Config, Guard, InternalValue, SeqNo, SequenceNumberCounter, ValueType,
     get_tmp_folder,
 };
 use test_log::test;
@@ -745,5 +745,54 @@ fn columnar_scan_spans_segments_with_evolving_schema() -> lsm_tree::Result<()> {
             "the shared column 3 is present in every segment",
         );
     }
+    Ok(())
+}
+
+/// A range scan over a multi-sub-column segment reconstructs each row's value
+/// through the framing (Reconstruct) path rather than the single-bytes
+/// zero-copy fast path: the scan re-frames the two value sub-columns into the
+/// opaque per-row value, which unframes back to the original sub-cells.
+#[test]
+fn columnar_ingest_range_scan_reconstructs_subcolumns() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+    })
+    .expect("enable columnar");
+
+    let mut ingest = any.ingestion()?;
+    ingest.write_columnar_batch(&two_subcolumn_batch())?;
+    ingest.finish()?;
+
+    let tags = [TypeTag::Fixed(4), TypeTag::Bytes];
+    let expected: [(&[u8], Vec<&[u8]>); 2] = [
+        (b"k0", vec![&[1, 0, 0, 0][..], &b"aa"[..]]),
+        (b"k1", vec![&[2, 0, 0, 0][..], &b"bbb"[..]]),
+    ];
+    let mut iter = tree.range("k0".."k2", SeqNo::MAX, None);
+    for (exp_key, exp_cells) in expected {
+        let guard = iter.next().expect("expected reconstructed row");
+        let (k, val) = guard.into_inner()?;
+        assert_eq!(k.as_ref(), exp_key, "scanned key");
+        assert_eq!(
+            unframe_value_cells(val.as_ref(), &tags)?,
+            exp_cells,
+            "the reconstructed value unframes to the original sub-cells",
+        );
+    }
+    assert!(
+        iter.next().is_none(),
+        "range scan returned extra rows through the Reconstruct path",
+    );
     Ok(())
 }

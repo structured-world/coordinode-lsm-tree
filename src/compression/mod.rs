@@ -313,9 +313,11 @@ pub enum CompressionType {
     /// Recommended for cold/archival data where compression ratio
     /// matters more than raw speed.
     // NOTE: Uses i32 (not a validated newtype) to match upstream's public API and
-    // the zstd crate's compress(data, level: i32) signature. Validated levels are
-    // produced by CompressionType::zstd() and Decode::decode_from; direct construction
-    // via CompressionType::Zstd(level) must uphold the 1..=22 invariant.
+    // the zstd crate's compress(data, level: i32) signature. zstd accepts negative
+    // "fast" levels and 0 (= default) as well as 1..=22; the on-disk format stores
+    // the level in one signed byte, so the persistable range is -128..=22. Validated
+    // levels are produced by CompressionType::zstd() and Decode::decode_from; direct
+    // construction via CompressionType::Zstd(level) must uphold the -128..=22 invariant.
     #[cfg(zstd_any)]
     Zstd(i32),
 
@@ -355,14 +357,21 @@ impl CompressionType {
 
     /// Validate a zstd compression level.
     ///
-    /// Accepts levels in the range 1..=22 and returns an error otherwise.
+    /// Accepts levels in the range `-128..=22` (zstd negative "fast" levels and
+    /// `0` = default included; the on-disk format persists the level in one
+    /// signed byte) and returns an error otherwise.
     #[cfg(zstd_any)]
     fn validate_zstd_level(level: i32) -> crate::Result<()> {
-        if !(1..=22).contains(&level) {
+        // zstd accepts negative "fast" levels (down to a very negative minimum)
+        // plus 0 (= default) and 1..=22. The on-disk format stores the level as a
+        // single signed byte, so the persistable range is `i8::MIN..=22`; a level
+        // below `i8::MIN` is rejected here rather than silently truncated by the
+        // `as i8` cast in `encode_into`.
+        if !(i32::from(i8::MIN)..=22).contains(&level) {
             // NOTE: Uses Error::other (not ErrorKind::InvalidInput) to match
             // upstream's error style and minimize fork divergence.
             return Err(crate::Error::Io(crate::io::Error::other(format!(
-                "invalid zstd compression level {level}, expected 1..=22"
+                "invalid zstd compression level {level}, expected -128..=22"
             ))));
         }
         Ok(())
@@ -375,7 +384,9 @@ impl CompressionType {
     ///
     /// # Errors
     ///
-    /// Returns an error if `level` is outside the valid range `1..=22`.
+    /// Returns an error if `level` is outside the valid range `-128..=22` (zstd
+    /// negative "fast" levels and `0` = default are accepted; the on-disk format
+    /// stores the level in one signed byte).
     #[cfg(zstd_any)]
     pub fn zstd(level: i32) -> crate::Result<Self> {
         Self::validate_zstd_level(level)?;
@@ -390,7 +401,9 @@ impl CompressionType {
     ///
     /// # Errors
     ///
-    /// Returns an error if `level` is outside the valid range `1..=22`.
+    /// Returns an error if `level` is outside the valid range `-128..=22` (zstd
+    /// negative "fast" levels and `0` = default are accepted; the on-disk format
+    /// stores the level in one signed byte).
     #[cfg(zstd_any)]
     pub fn zstd_dict(level: i32, dict_id: u32) -> crate::Result<Self> {
         Self::validate_zstd_level(level)?;
@@ -437,12 +450,12 @@ impl Encode for CompressionType {
                 // Catch invalid levels in debug builds (e.g. direct Zstd(999) construction).
                 // Not a runtime error — encoding must stay infallible for encode_into_vec().
                 debug_assert!(
-                    (1..=22).contains(level),
-                    "zstd level {level} outside valid range 1..=22"
+                    (i32::from(i8::MIN)..=22).contains(level),
+                    "zstd level {level} outside valid range -128..=22"
                 );
                 #[expect(
                     clippy::cast_possible_truncation,
-                    reason = "level range 1..=22 fits i8"
+                    reason = "level range -128..=22 maps exactly to i8"
                 )]
                 writer.write_i8(*level as i8)?;
             }
@@ -451,12 +464,12 @@ impl Encode for CompressionType {
             Self::ZstdDict { level, dict_id } => {
                 writer.write_u8(4)?;
                 debug_assert!(
-                    (1..=22).contains(level),
-                    "zstd level {level} outside valid range 1..=22"
+                    (i32::from(i8::MIN)..=22).contains(level),
+                    "zstd level {level} outside valid range -128..=22"
                 );
                 #[expect(
                     clippy::cast_possible_truncation,
-                    reason = "level range 1..=22 fits i8"
+                    reason = "level range -128..=22 maps exactly to i8"
                 )]
                 writer.write_i8(*level as i8)?;
                 crate::io::WriteBytesExt::write_u32::<crate::io::LittleEndian>(writer, *dict_id)?;

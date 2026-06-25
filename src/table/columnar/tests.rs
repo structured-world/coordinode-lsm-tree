@@ -1,8 +1,9 @@
 use super::{
     COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, CodecId, Column, ColumnBatch, TypeTag,
-    column_batch_to_entries, entries_to_column_batch, frame_value_cells,
-    frame_value_cells_nullable, unframe_value_cells, unframe_value_cells_nullable,
-    unframe_value_cells_with_defaults, validate_columnar_ingest_batch,
+    column_batch_into_entries, column_batch_match_entries, column_batch_to_entries,
+    entries_to_column_batch, frame_value_cells, frame_value_cells_nullable, unframe_value_cells,
+    unframe_value_cells_nullable, unframe_value_cells_with_defaults,
+    validate_columnar_ingest_batch,
 };
 use crate::{Slice, ValueType, key::InternalKey, value::InternalValue};
 
@@ -845,4 +846,74 @@ fn columnar_decode_rejects_non_zero_bytes_width() {
     // The Bytes column's width byte (must be 0) is at byte 34.
     encoded[34] = 5;
     assert!(ColumnBatch::decode(&encoded).is_err());
+}
+
+#[test]
+fn column_batch_into_entries_rejects_an_empty_key_row() {
+    // A corrupt block can frame an empty key (offset table [0, 0], no payload) —
+    // a byte layout the structural validator accepts. The scan reconstruction
+    // must reject it rather than emit an empty-keyed entry.
+    let mut batch =
+        entries_to_column_batch(&[entry(b"k", 5, ValueType::Value, b"v")]).expect("valid batch");
+    let key_col = batch.columns.get_mut(0).expect("key column");
+    key_col.data = alloc::vec![0u8; 8];
+    let err = column_batch_into_entries(batch).expect_err("empty key must be rejected");
+    assert!(
+        matches!(err, crate::Error::InvalidHeader(m) if m.contains("user key is empty")),
+        "expected an empty-key InvalidHeader, got {err:?}",
+    );
+}
+
+#[test]
+fn column_batch_match_entries_rejects_an_empty_key_row() {
+    // The point-read matcher applies the same non-empty-key invariant as the
+    // scan path: a matched empty key in a corrupt block is an error, not a hit.
+    let mut batch =
+        entries_to_column_batch(&[entry(b"k", 5, ValueType::Value, b"v")]).expect("valid batch");
+    let key_col = batch.columns.get_mut(0).expect("key column");
+    key_col.data = alloc::vec![0u8; 8];
+    let cmp = crate::comparator::default_comparator();
+    let err = column_batch_match_entries(&batch, b"", &cmp, None)
+        .expect_err("matched empty key must be rejected");
+    assert!(
+        matches!(err, crate::Error::InvalidHeader(m) if m.contains("user key is empty")),
+        "expected an empty-key InvalidHeader, got {err:?}",
+    );
+}
+
+#[test]
+fn column_batch_match_entries_fails_closed_when_a_delete_mask_position_overflows() {
+    // Two rows share a key, so both match the needle. With `block_start_row` at
+    // u32::MAX, the second matched row's position (start + 1) overflows u32. A
+    // masked point-read lookup must fail closed (error) like the scan path, never
+    // treat the overflow as "not deleted" and silently expose the row.
+    let batch = entries_to_column_batch(&[
+        entry(b"dup", 5, ValueType::Value, b"v0"),
+        entry(b"dup", 3, ValueType::Value, b"v1"),
+    ])
+    .expect("two-row same-key batch");
+    let bitmap = crate::table::delete_bitmap::DeleteBitmap::new();
+    let cmp = crate::comparator::default_comparator();
+    let err = column_batch_match_entries(&batch, b"dup", &cmp, Some((&bitmap, u32::MAX)))
+        .expect_err("an overflowing delete-mask position must fail closed");
+    assert!(
+        matches!(err, crate::Error::InvalidHeader(m) if m.contains("position exceeds u32::MAX")),
+        "expected an overflow InvalidHeader, got {err:?}",
+    );
+}
+
+#[test]
+fn column_batch_match_entries_rejects_a_zero_row_block() {
+    // A zero-row columnar block is malformed (the writer never emits one). The
+    // point-read matcher must fail closed on it, not return an empty match that
+    // load_columnar_point_block would turn into an absent-key miss, hiding the
+    // on-disk corruption.
+    let batch = entries_to_column_batch(&[]).expect("zero-row batch");
+    let cmp = crate::comparator::default_comparator();
+    let err = column_batch_match_entries(&batch, b"x", &cmp, None)
+        .expect_err("a zero-row block must fail closed");
+    assert!(
+        matches!(err, crate::Error::InvalidHeader(m) if m.contains("empty reconstructed data block")),
+        "expected an empty-block InvalidHeader, got {err:?}",
+    );
 }

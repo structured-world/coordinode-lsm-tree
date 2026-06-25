@@ -432,3 +432,67 @@ fn stcs_dissimilar_sizes_break() -> crate::Result<()> {
     assert_eq!(2, tree.table_count());
     Ok(())
 }
+
+#[test]
+fn stcs_pending_compaction_bytes_reflects_space_amplification() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    // 5 similarly-sized overlapping runs: space_amp ~ (5S/S - 1) * 100 = 400%.
+    flush_overlapping(&tree, 5, 0)?;
+    let version = tree.current_version();
+
+    // Past the 200% budget, the size-tiered strategy owes a full compaction, so
+    // it must report non-zero pending bytes for the bytes-axis backpressure to
+    // engage (it returned a flat 0 before, leaving bytes_slowdown/bytes_stop
+    // inert for tiered).
+    let over_budget = Strategy::default().with_max_space_amplification_percent(200);
+    assert!(
+        over_budget.pending_compaction_bytes(&version) > 0,
+        "tiered must report pending bytes when over the space-amplification budget"
+    );
+
+    // A tolerant (effectively unbounded) budget owes nothing.
+    let tolerant = Strategy::default().with_max_space_amplification_percent(u64::MAX);
+    assert_eq!(
+        tolerant.pending_compaction_bytes(&version),
+        0,
+        "no debt when amplification is fully tolerated"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn stcs_pending_compaction_bytes_is_zero_below_two_runs() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    let strategy = Strategy::default().with_max_space_amplification_percent(0);
+
+    // Empty tree: no runs, nothing to reclaim.
+    assert_eq!(
+        strategy.pending_compaction_bytes(&tree.current_version()),
+        0
+    );
+
+    // A single run cannot be space-amplified against itself, so even a 0% budget
+    // owes nothing.
+    flush_overlapping(&tree, 1, 0)?;
+    assert_eq!(
+        strategy.pending_compaction_bytes(&tree.current_version()),
+        0
+    );
+
+    Ok(())
+}
