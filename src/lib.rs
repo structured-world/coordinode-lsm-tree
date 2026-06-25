@@ -355,6 +355,11 @@ pub mod runtime_config;
 #[cfg(feature = "std")]
 pub mod repair;
 
+// std-only: block-granular SST salvage; reads source blocks and writes a
+// recovered SST via std::fs (see also `crate::repair`, `crate::verify`).
+#[cfg(feature = "std")]
+pub mod salvage;
+
 pub(crate) mod active_tombstone_set;
 pub(crate) mod range_tombstone;
 pub(crate) mod range_tombstone_filter;

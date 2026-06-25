@@ -608,3 +608,148 @@ fn repair_rebuilds_blob_tree_manifest_and_preserves_values() -> lsm_tree::Result
 
     Ok(())
 }
+
+/// Returns the SST file paths under `<dir>/tables/`, sorted by id.
+fn sorted_sst_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(dir.join("tables"))
+        .expect("tables dir exists")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().parse::<u64>().is_ok())
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// Flips a byte a quarter into the file, which lands in the data-block region
+/// (data is written first; index / filter / meta live at the tail), so the SST
+/// still opens but one data block fails its checksum.
+fn corrupt_data_region(path: &std::path::Path) -> std::io::Result<()> {
+    let mut bytes = std::fs::read(path)?;
+    let at = bytes.len() / 4;
+    if let Some(b) = bytes.get_mut(at) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(path, &bytes)
+}
+
+/// `repair_with_salvage` block-salvages an SST whose data is corrupt (whole-file
+/// recovery succeeds because the data section is read lazily, but a block fails
+/// verification): the corrupt block is dropped and the rest is recovered,
+/// instead of leaving a table that errors on read.
+#[test]
+fn repair_with_salvage_recovers_a_block_corrupt_sst() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    {
+        let tree = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0..500 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+        for i in 500..1000 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let ssts = sorted_sst_paths(dir.path());
+    assert_eq!(ssts.len(), 2, "two flushes produce two SSTs");
+    let victim = ssts.first().expect("an SST to corrupt");
+    corrupt_data_region(victim)?;
+
+    nuke_manifest(dir.path())?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.salvaged, 1,
+        "the block-corrupt SST is salvaged, not dropped: {:?}",
+        report.unreadable_files,
+    );
+    assert_eq!(
+        report.recovered, 2,
+        "both tables are referenced by the rebuilt manifest",
+    );
+
+    // The tree reopens and every read succeeds: the corrupt block was dropped,
+    // so its keys read as absent rather than erroring. Most keys survive (the
+    // intact SST in full, plus every block of the corrupt SST but the dropped
+    // one).
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let mut present = 0u64;
+    for i in 0..1000 {
+        if tree.get(key(i), MAX_SEQNO)?.is_some() {
+            present += 1;
+        }
+    }
+    assert!(present > 0, "data was recovered");
+    assert!(
+        present < 1000,
+        "the corrupt block's keys are dropped, got {present}/1000",
+    );
+    Ok(())
+}
+
+/// An SST whose container (SFA trailer) is corrupt cannot be opened even in
+/// salvage mode, so repair reports it unreadable rather than salvaging it.
+#[test]
+fn repair_with_salvage_reports_an_unopenable_sst_as_unreadable() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    {
+        let tree = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0..200 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let ssts = sorted_sst_paths(dir.path());
+    let victim = ssts.first().expect("an SST to corrupt");
+    // Truncate away the tail (SFA trailer + section mirrors): the container is
+    // unparseable, so even salvage-mode recovery cannot open it.
+    let mut bytes = std::fs::read(victim)?;
+    bytes.truncate(bytes.len() / 2);
+    std::fs::write(victim, &bytes)?;
+
+    nuke_manifest(dir.path())?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair_with_salvage(true)?;
+    assert_eq!(report.salvaged, 0, "an unopenable SST cannot be salvaged");
+    assert_eq!(
+        report.recovered, 0,
+        "nothing is recovered from the only (corrupt) SST",
+    );
+    assert_eq!(
+        report.unreadable, 1,
+        "the SST is reported unreadable: {:?}",
+        report.unreadable_files,
+    );
+    Ok(())
+}

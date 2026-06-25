@@ -59,8 +59,17 @@ type UnreadableFiles = Vec<(PathBuf, String)>;
 #[derive(Debug)]
 pub struct RepairReport {
     /// Number of SSTs whose metadata parsed and that are now referenced by the
-    /// rebuilt manifest.
+    /// rebuilt manifest (including any recovered by salvage; see [`salvaged`]).
+    ///
+    /// [`salvaged`]: RepairReport::salvaged
     pub recovered: usize,
+
+    /// Of [`recovered`](RepairReport::recovered), how many were recovered by
+    /// block-level salvage (their original failed whole-file recovery, so the
+    /// salvaged copy may be missing the key ranges of corrupt blocks). Always
+    /// zero unless repair ran with salvage enabled
+    /// ([`Config::repair_with_salvage`]).
+    pub salvaged: usize,
 
     /// Number of SST-named files that could not be opened or parsed and were
     /// therefore left out of the manifest.
@@ -79,7 +88,10 @@ pub struct RepairReport {
 
 /// Streams `path` start to end through XXH3-128, matching the digest a normal
 /// table write accumulates via `ChecksummedWriter`.
-fn compute_table_checksum(fs: &dyn crate::fs::Fs, path: &std::path::Path) -> crate::Result<u128> {
+pub(crate) fn compute_table_checksum(
+    fs: &dyn crate::fs::Fs,
+    path: &std::path::Path,
+) -> crate::Result<u128> {
     let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
     let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
     let mut buf = vec![0u8; 256 * 1024];
@@ -140,6 +152,69 @@ fn quarantine_file(
     let dest = quarantine_dir.join(file_name);
     fs.rename(src, &dest)?;
     Ok(dest)
+}
+
+/// Block-salvages a corrupt SST during repair: quarantines the original (which
+/// frees its path), writes a fresh SST holding its recoverable blocks into that
+/// path, and reopens it.
+///
+/// Returns `Ok(None)` when nothing was recoverable (the original stays in
+/// quarantine and the path is left empty), or `Err` when even salvage cannot
+/// open the source (its metadata / index / SFA trailer is itself unreadable).
+fn try_salvage_table(
+    config: &Config,
+    table_base_folder: &std::path::Path,
+    fs: &Arc<dyn crate::fs::Fs>,
+    table_path: &std::path::Path,
+    file_name: &str,
+    table_id: TableId,
+) -> crate::Result<Option<Table>> {
+    // Move the corrupt original aside first: this frees `table_path` so salvage
+    // can write the recovered copy straight into it (no temp-file rename), and
+    // preserves the corrupt bytes for the operator to inspect.
+    let quarantined = quarantine_file(&**fs, table_base_folder, table_path, file_name)?;
+
+    // Salvage under the tree's configured comparator so the rewritten SST opens
+    // and orders consistently with the rest of the tree on reopen.
+    let report = crate::salvage::salvage_sst_with_comparator(
+        &quarantined,
+        table_path.to_path_buf(),
+        fs,
+        &config.comparator,
+    )?;
+    if report.salvaged_path.is_none() {
+        return Ok(None);
+    }
+    if !report.dropped.is_empty() {
+        log::warn!(
+            "salvaged table {table_id}: recovered {} block(s), dropped {} corrupt block(s)",
+            report.blocks_salvaged,
+            report.dropped.len(),
+        );
+    }
+
+    // Reopen the freshly-written (clean) salvaged SST so it joins the rebuilt
+    // manifest like any cleanly-recovered table.
+    let checksum = crate::Checksum::from_raw(compute_table_checksum(&**fs, table_path)?);
+    let table = Table::recover(
+        table_path.to_path_buf(),
+        checksum,
+        0,
+        0,
+        table_id,
+        config.cache.clone(),
+        None,
+        Arc::clone(fs),
+        false,
+        false,
+        config.encryption.clone(),
+        #[cfg(zstd_any)]
+        config.zstd_dictionary.clone(),
+        config.comparator.clone(),
+        #[cfg(feature = "metrics")]
+        Arc::new(crate::metrics::Metrics::default()),
+    )?;
+    Ok(Some(table))
 }
 
 /// Discovers the blob files of a KV-separated tree for `repair` by scanning the
@@ -271,13 +346,51 @@ impl Config {
     /// # Ok::<(), lsm_tree::Error>(())
     /// ```
     pub fn repair(&self) -> crate::Result<RepairReport> {
-        repair_tree(self)
+        repair_tree(self, false)
+    }
+
+    /// Like [`repair`](Self::repair), but when an SST fails whole-file recovery
+    /// (`salvage = true`) it is block-salvaged instead of being left out: the
+    /// corrupt original is quarantined and a fresh SST holding its recoverable
+    /// blocks is written in its place and referenced by the rebuilt manifest.
+    ///
+    /// A salvaged table may be missing the key ranges of its corrupt blocks
+    /// (reported per file via [`RepairReport::salvaged`]); use this only as a
+    /// last resort when losing the whole SST is worse than losing some keys.
+    /// SSTs whose metadata, index, or SFA trailer is itself unreadable still
+    /// cannot be salvaged and are reported unreadable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory lock cannot be taken or the rebuilt
+    /// manifest cannot be persisted; per-file recovery / salvage failures are
+    /// reported in the [`RepairReport`], not returned.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use lsm_tree::{Config, SequenceNumberCounter};
+    ///
+    /// let config = Config::new(
+    ///     "/var/lib/mydb",
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// );
+    /// let report = config.repair_with_salvage(true)?;
+    /// println!(
+    ///     "recovered {} table(s), {} of them by salvage",
+    ///     report.recovered, report.salvaged,
+    /// );
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    pub fn repair_with_salvage(&self, salvage: bool) -> crate::Result<RepairReport> {
+        repair_tree(self, salvage)
     }
 }
 
 /// Core repair routine. Separated from the [`Config::repair`] entry point so the
 /// logic is testable against a borrowed config.
-fn repair_tree(config: &Config) -> crate::Result<RepairReport> {
+fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
     // Hold the cross-process directory lock for the whole repair: it rewrites
     // CURRENT, writes a fresh snapshot, and sweeps `edits-*` in place, so a
     // concurrent open / repair of the same directory would corrupt the manifest.
@@ -289,6 +402,7 @@ fn repair_tree(config: &Config) -> crate::Result<RepairReport> {
         crate::config::acquire_directory_lock(&*config.fs, &config.path, config.directory_lock)?;
 
     let mut recovered_tables: Vec<Table> = Vec::new();
+    let mut salvaged = 0usize;
     let mut unreadable_files: Vec<(PathBuf, String)> = Vec::new();
     // Guard against the same file surfacing twice (symlinked / aliased table
     // folders) so a table is not added to two L0 runs.
@@ -373,7 +487,81 @@ fn repair_tree(config: &Config) -> crate::Result<RepairReport> {
             );
 
             match recovered {
+                // In salvage mode a table whose whole-file recovery succeeded can
+                // still hold corrupt data blocks (recovery is lazy on the data
+                // section). Block-verify it; if any block is corrupt, salvage it
+                // rather than keep a table that errors on read.
+                Ok(table)
+                    if salvage
+                        && !crate::verify::verify_sst_file_with_fs(&*folder_fs, &table_path)
+                            .is_ok() =>
+                {
+                    drop(table);
+                    match try_salvage_table(
+                        config,
+                        &table_base_folder,
+                        &folder_fs,
+                        &table_path,
+                        &file_name,
+                        table_id,
+                    ) {
+                        Ok(Some(table)) => {
+                            salvaged += 1;
+                            recovered_tables.push(table);
+                        }
+                        Ok(None) => {
+                            seen_ids.remove(&table_id);
+                            unreadable_files.push((
+                                table_path,
+                                "verify found corrupt blocks; nothing salvageable".to_string(),
+                            ));
+                        }
+                        Err(salvage_err) => {
+                            seen_ids.remove(&table_id);
+                            unreadable_files.push((
+                                table_path,
+                                format!(
+                                    "verify found corrupt blocks; salvage failed ({salvage_err})"
+                                ),
+                            ));
+                        }
+                    }
+                }
                 Ok(table) => recovered_tables.push(table),
+                Err(e) if salvage => {
+                    // Whole-file recovery failed; try block-level salvage: the
+                    // corrupt original is quarantined and a fresh SST holding
+                    // its recoverable blocks is written in its place.
+                    match try_salvage_table(
+                        config,
+                        &table_base_folder,
+                        &folder_fs,
+                        &table_path,
+                        &file_name,
+                        table_id,
+                    ) {
+                        Ok(Some(table)) => {
+                            salvaged += 1;
+                            recovered_tables.push(table);
+                        }
+                        Ok(None) => {
+                            seen_ids.remove(&table_id);
+                            unreadable_files.push((
+                                table_path,
+                                format!(
+                                    "unrecoverable ({e}); original quarantined, nothing salvageable"
+                                ),
+                            ));
+                        }
+                        Err(salvage_err) => {
+                            seen_ids.remove(&table_id);
+                            unreadable_files.push((
+                                table_path,
+                                format!("recovery failed ({e}); salvage failed ({salvage_err})"),
+                            ));
+                        }
+                    }
+                }
                 Err(e) => {
                     seen_ids.remove(&table_id);
                     unreadable_files.push((table_path, e.to_string()));
@@ -487,6 +675,7 @@ fn repair_tree(config: &Config) -> crate::Result<RepairReport> {
 
     Ok(RepairReport {
         recovered,
+        salvaged,
         unreadable: unreadable_files.len(),
         unreadable_files,
         method: "all-to-L0 with sequence-number ordering",

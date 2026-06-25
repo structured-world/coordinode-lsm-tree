@@ -316,6 +316,17 @@ impl Table {
         Some(u8::try_from(percent).unwrap_or(100))
     }
 
+    /// Iterates every data-block handle in block-index (key) order; each item
+    /// carries the block's last key. The salvage walk ([`crate::salvage`]) uses
+    /// this to enumerate the blocks to recover one at a time; a corrupt index
+    /// entry surfaces as an `Err` item rather than aborting the iteration.
+    // std-only: the sole consumer is the std-gated salvage walk.
+    #[cfg(feature = "std")]
+    pub(crate) fn data_block_handles(&self) -> block_index::BlockIndexIterImpl {
+        use block_index::BlockIndex;
+        self.block_index.iter()
+    }
+
     fn load_block(
         &self,
         handle: &BlockHandle,
@@ -344,7 +355,10 @@ impl Table {
     /// Loads (and, for columnar SSTs, reconstructs + delete-masks) a data block.
     /// Returns `Ok(None)` when a columnar block is wholly deleted by the
     /// positional mask, so the caller treats it as carrying no keys.
-    fn load_data_block(&self, handle: &BlockHandle) -> crate::Result<Option<DataBlock>> {
+    ///
+    /// `pub(crate)` so the salvage walk ([`crate::salvage`]) can attempt each
+    /// data block individually and quarantine the ones that fail to load.
+    pub(crate) fn load_data_block(&self, handle: &BlockHandle) -> crate::Result<Option<DataBlock>> {
         // Columnar SSTs store each data block as a PAX `ColumnBatch`; reconstruct
         // the row entries on load so every row read path works unchanged.
         #[cfg(feature = "columnar")]
@@ -1940,10 +1954,13 @@ impl Table {
     }
 
     /// Tries to recover a table from a file.
+    ///
+    /// A corrupt delete-bitmap fails recovery rather than silently resurrecting
+    /// deleted rows; see [`Self::recover_inner`] for the salvage variant that
+    /// degrades to "all rows live" instead.
     #[expect(
         clippy::too_many_arguments,
-        clippy::too_many_lines,
-        reason = "recovery requires many context parameters and is inherently complex"
+        reason = "recovery requires many context parameters"
     )]
     pub fn recover(
         file_path: PathBuf,
@@ -1960,6 +1977,57 @@ impl Table {
         #[cfg(zstd_any)] zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
         comparator: SharedComparator,
         #[cfg(feature = "metrics")] metrics: Arc<Metrics>,
+    ) -> crate::Result<Self> {
+        Self::recover_inner(
+            file_path,
+            checksum,
+            global_seqno,
+            tree_id,
+            table_id,
+            cache,
+            descriptor_table,
+            fs,
+            pin_filter,
+            pin_index,
+            encryption,
+            #[cfg(zstd_any)]
+            zstd_dictionary,
+            comparator,
+            #[cfg(feature = "metrics")]
+            metrics,
+            false,
+        )
+    }
+
+    /// Recovers a table, optionally in **salvage mode** (`salvage = true`).
+    ///
+    /// In salvage mode a corrupt or truncated delete-bitmap degrades to empty
+    /// ("all rows live, pending recompaction") and a delete-bitmap with an
+    /// unreadable zone map is ignored rather than erroring, so a columnar
+    /// segment with a damaged sidecar still opens and its data blocks can be
+    /// recovered. Normal recovery (`salvage = false`) fails closed on both, to
+    /// avoid resurrecting deleted rows. Used by [`crate::salvage`].
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "recovery requires many context parameters and is inherently complex"
+    )]
+    pub(crate) fn recover_inner(
+        file_path: PathBuf,
+        checksum: Checksum,
+        global_seqno: SeqNo,
+        tree_id: TreeId,
+        table_id: TableId,
+        cache: Arc<Cache>,
+        descriptor_table: Option<Arc<DescriptorTable>>,
+        fs: Arc<dyn Fs>,
+        pin_filter: bool,
+        pin_index: bool,
+        encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
+        #[cfg(zstd_any)] zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
+        comparator: SharedComparator,
+        #[cfg(feature = "metrics")] metrics: Arc<Metrics>,
+        salvage: bool,
     ) -> crate::Result<Self> {
         use core::sync::atomic::AtomicBool;
         use meta::ParsedMeta;
@@ -2414,38 +2482,51 @@ impl Table {
         // Load the optional positional delete-bitmap section. Unlike the zone
         // map (a skip optimization that degrades safely to empty), the delete
         // bitmap is correctness data: silently dropping an unreadable one would
-        // resurrect deleted rows. The block already carries checksum / ECC /
-        // AEAD, so if it still cannot be decoded the error is propagated and
-        // table recovery fails rather than returning deleted data.
-        let delete_bitmap = if let Some(db_handle) = regions.delete_bitmap {
-            let block = Block::from_file(
-                file_handle.as_ref(),
-                db_handle,
-                crate::table::block::BlockIdentity {
-                    table_id: metadata.id,
-                    block_type: BlockType::DeleteBitmap,
-                    dict_id: 0,
-                    window_log: 0,
-                },
-                &{
-                    let t = match encryption.as_deref() {
-                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
-                        None => crate::table::block::BlockTransform::PLAIN,
-                    };
-                    if let Some(ecc) = metadata.ecc_params {
-                        t.with_ecc(ecc)
-                    } else {
-                        t
-                    }
-                },
-            )?;
-            if block.header.block_type != BlockType::DeleteBitmap {
-                return Err(crate::Error::InvalidTag((
-                    "BlockType",
-                    block.header.block_type.into(),
-                )));
+        // resurrect deleted rows, so normal recovery propagates the error and
+        // fails. In salvage mode it degrades to empty ("all rows live, pending
+        // recompaction") so the segment's data is still recoverable.
+        let mut delete_bitmap = if let Some(db_handle) = regions.delete_bitmap {
+            let load = || -> crate::Result<crate::table::delete_bitmap::DeleteBitmap> {
+                let block = Block::from_file(
+                    file_handle.as_ref(),
+                    db_handle,
+                    crate::table::block::BlockIdentity {
+                        table_id: metadata.id,
+                        block_type: BlockType::DeleteBitmap,
+                        dict_id: 0,
+                        window_log: 0,
+                    },
+                    &{
+                        let t = match encryption.as_deref() {
+                            Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                            None => crate::table::block::BlockTransform::PLAIN,
+                        };
+                        if let Some(ecc) = metadata.ecc_params {
+                            t.with_ecc(ecc)
+                        } else {
+                            t
+                        }
+                    },
+                )?;
+                if block.header.block_type != BlockType::DeleteBitmap {
+                    return Err(crate::Error::InvalidTag((
+                        "BlockType",
+                        block.header.block_type.into(),
+                    )));
+                }
+                crate::table::delete_bitmap::DeleteBitmap::decode(&block.data)
+            };
+            match load() {
+                Ok(db) => db,
+                Err(e) if salvage => {
+                    log::warn!(
+                        "delete-bitmap for table {:?} is unreadable ({e}); salvaging all rows as live",
+                        metadata.id
+                    );
+                    crate::table::delete_bitmap::DeleteBitmap::default()
+                }
+                Err(e) => return Err(e),
             }
-            crate::table::delete_bitmap::DeleteBitmap::decode(&block.data)?
         } else {
             crate::table::delete_bitmap::DeleteBitmap::default()
         };
@@ -2455,9 +2536,20 @@ impl Table {
         // both, so a bitmap without a zone map is a malformed SST (masking would
         // resolve every block to position 0 and corrupt visibility).
         if !delete_bitmap.is_empty() && zone_map.is_empty() {
-            return Err(crate::Error::InvalidHeader(
-                "delete-bitmap SST is missing its zone map",
-            ));
+            if salvage {
+                // Without a readable zone map the bitmap cannot be positioned
+                // (every block would resolve to row 0), so ignore it: show all
+                // rows live rather than masking against the wrong positions.
+                log::warn!(
+                    "salvage: delete-bitmap for table {:?} has no readable zone map; ignoring it (all rows live)",
+                    metadata.id
+                );
+                delete_bitmap = crate::table::delete_bitmap::DeleteBitmap::default();
+            } else {
+                return Err(crate::Error::InvalidHeader(
+                    "delete-bitmap SST is missing its zone map",
+                ));
+            }
         }
 
         // Cache each data block's first global row position (file offset -> start
