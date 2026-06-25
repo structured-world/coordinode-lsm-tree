@@ -159,8 +159,6 @@ pub fn salvage_sst(
     dest: std::path::PathBuf,
     fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
 ) -> crate::Result<SalvageReport> {
-    use crate::table::block::ParsedItem;
-    use alloc::format;
     use alloc::sync::Arc;
 
     let comparator = crate::comparator::default_comparator();
@@ -195,9 +193,80 @@ pub fn salvage_sst(
         true,
     )?;
 
-    let mut writer = crate::table::Writer::new(dest.clone(), table.id(), 0, Arc::clone(fs))?
+    let writer = crate::table::Writer::new(dest.clone(), table.id(), 0, Arc::clone(fs))?
         .use_data_block_compression(table.metadata.data_block_compression)
         .use_ecc(table.metadata.ecc_params);
+
+    let walk = match salvage_blocks(&table, writer, &comparator) {
+        Ok(walk) => walk,
+        Err(e) => {
+            // A `write` / `finish` failure after `Writer::new` created `dest`
+            // leaves a partial SST there. Remove it before propagating: in the
+            // repair path `dest` is the original table path, so a leftover
+            // fragment would be re-opened and re-quarantined on every later run.
+            discard_partial(fs, &dest);
+            return Err(e);
+        }
+    };
+
+    let salvaged_path = if walk.wrote {
+        Some(dest)
+    } else {
+        // Nothing recoverable. `Writer::new` already created `dest` and the walk
+        // dropped the writer, so remove the empty file: a repair caller would
+        // otherwise see a stray broken table file in its place.
+        discard_partial(fs, &dest);
+        None
+    };
+
+    Ok(SalvageReport {
+        salvaged_path,
+        blocks_total: walk.blocks_total,
+        blocks_salvaged: walk.blocks_salvaged,
+        entries_salvaged: walk.entries_salvaged,
+        dropped: walk.dropped,
+    })
+}
+
+/// The tally a [`salvage_blocks`] walk returns: the report counters plus whether
+/// a destination file was actually finished (`wrote`), which the caller uses to
+/// decide between keeping `dest` and removing the empty placeholder.
+struct SalvageWalk {
+    blocks_total: usize,
+    blocks_salvaged: usize,
+    entries_salvaged: u64,
+    dropped: Vec<DroppedBlock>,
+    wrote: bool,
+}
+
+/// Best-effort removal of a destination salvage could not complete (an empty or
+/// partially-written SST). A repair caller writes the salvaged copy straight
+/// into the original table path, so a leftover fragment there would be
+/// re-quarantined on the next run; failure is logged, not propagated, so the
+/// original error stays the one the caller sees.
+fn discard_partial(fs: &alloc::sync::Arc<dyn crate::fs::Fs>, dest: &std::path::Path) {
+    if let Err(e) = fs.remove_file(dest) {
+        log::warn!(
+            "salvage: could not remove the incomplete destination {}: {e}",
+            dest.display(),
+        );
+    }
+}
+
+/// Walks `table`'s data blocks in index order, re-emitting every block that
+/// loads and decodes cleanly into `writer` and recording the rest.
+///
+/// Consumes `writer`: on success it is finished (when at least one block was
+/// emitted) or dropped (when none were). On a `write` / `finish` error the
+/// writer is dropped as the error unwinds, so the caller must remove the partial
+/// destination it left behind.
+fn salvage_blocks(
+    table: &crate::table::Table,
+    mut writer: crate::table::Writer,
+    comparator: &crate::comparator::SharedComparator,
+) -> crate::Result<SalvageWalk> {
+    use crate::table::block::ParsedItem;
+    use alloc::format;
 
     let mut blocks_total = 0usize;
     let mut blocks_salvaged = 0usize;
@@ -228,13 +297,28 @@ pub fn salvage_sst(
         let end_key = keyed.end_key().clone();
         let offset = *keyed.as_ref().offset();
         match table.load_data_block(keyed.as_ref()) {
-            Ok(Some(block)) => {
-                for parsed in block.iter(comparator.clone()) {
-                    writer.write(parsed.materialize(block.as_slice()))?;
-                    entries_salvaged += 1;
+            // `try_iter`, not `iter`: a checksum-clean but structurally malformed
+            // block (e.g. an invalid trailer) must be reported as a dropped
+            // `DecodeError`, never panic the salvage walk. `blocks_salvaged` is
+            // counted only once the whole block decoded and was written.
+            Ok(Some(block)) => match block.try_iter(comparator.clone()) {
+                Ok(iter) => {
+                    for parsed in iter {
+                        writer.write(parsed.materialize(block.as_slice()))?;
+                        entries_salvaged += 1;
+                    }
+                    blocks_salvaged += 1;
                 }
-                blocks_salvaged += 1;
-            }
+                Err(e) => dropped.push(DroppedBlock {
+                    offset,
+                    section: b"data".to_vec(),
+                    reason: DropReason::DecodeError(format!("{e:?}")),
+                    key_range: Some((
+                        prev_end.clone().unwrap_or_else(UserKey::empty),
+                        end_key.clone(),
+                    )),
+                }),
+            },
             // A wholly-deleted columnar block carries no live keys: nothing to
             // recover and nothing lost.
             Ok(None) => {}
@@ -263,30 +347,19 @@ pub fn salvage_sst(
         prev_end = Some(end_key);
     }
 
-    let salvaged_path = if blocks_salvaged > 0 {
+    let wrote = blocks_salvaged > 0;
+    if wrote {
         writer.finish()?;
-        Some(dest)
     } else {
-        // Nothing recoverable. `Writer::new` already created `dest`; drop the
-        // writer to close its handle and remove the empty file so no stray
-        // partial SST is left behind (a repair caller would otherwise see a
-        // broken table file in its place).
         drop(writer);
-        if let Err(e) = fs.remove_file(&dest) {
-            log::warn!(
-                "salvage: could not remove the empty destination {}: {e}",
-                dest.display(),
-            );
-        }
-        None
-    };
+    }
 
-    Ok(SalvageReport {
-        salvaged_path,
+    Ok(SalvageWalk {
         blocks_total,
         blocks_salvaged,
         entries_salvaged,
         dropped,
+        wrote,
     })
 }
 
