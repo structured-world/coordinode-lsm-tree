@@ -248,6 +248,17 @@ pub fn salvage_sst(
         writer.finish()?;
         Some(dest)
     } else {
+        // Nothing recoverable. `Writer::new` already created `dest`; drop the
+        // writer to close its handle and remove the empty file so no stray
+        // partial SST is left behind (a repair caller would otherwise see a
+        // broken table file in its place).
+        drop(writer);
+        if let Err(e) = fs.remove_file(&dest) {
+            log::warn!(
+                "salvage: could not remove the empty destination {}: {e}",
+                dest.display(),
+            );
+        }
         None
     };
 

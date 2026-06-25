@@ -318,3 +318,89 @@ fn salvage_tolerates_a_corrupt_delete_bitmap_as_all_live() -> crate::Result<()> 
     assert_eq!(reopen_item_count(dest, &fs)?, u64::from(n));
     Ok(())
 }
+
+/// When the source cannot be opened at all (a corrupt SFA trailer makes even
+/// salvage-mode recovery fail), `salvage_sst` returns an error rather than
+/// writing a partial file.
+#[test]
+fn salvage_sst_errors_when_the_source_cannot_be_opened() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0..50 {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Truncate away the tail (SFA trailer + section mirrors) so the container is
+    // unparseable and even salvage-mode recovery cannot open it.
+    let mut bytes = std::fs::read(&source)?;
+    bytes.truncate(bytes.len() / 2);
+    std::fs::write(&source, &bytes)?;
+
+    assert!(
+        salvage_sst(&source, dest.clone(), &fs).is_err(),
+        "an unparseable container must fail salvage, not write a partial file",
+    );
+    assert!(
+        !dest.exists(),
+        "no destination is written on an open failure"
+    );
+    Ok(())
+}
+
+/// A single-block SST whose only data block is corrupt salvages nothing: no
+/// destination file is written and the report records the dropped block.
+#[test]
+fn salvage_sst_recovers_nothing_when_the_only_block_is_corrupt() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // A handful of small keys fit in one default-sized data block.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0..8 {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Corrupt the sole data block (offset from the intact index).
+    let target = {
+        let table = open(source.clone(), &fs)?;
+        let offsets: alloc::vec::Vec<u64> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|kh| *kh.as_ref().offset())
+            .collect();
+        let Some(&only) = offsets.first() else {
+            panic!("expected a single data block, got {offsets:?}");
+        };
+        assert_eq!(
+            offsets.len(),
+            1,
+            "expected a single data block, got {offsets:?}"
+        );
+        only
+    };
+    let flip = usize::try_from(target).unwrap_or(0) + 16;
+    let mut bytes = std::fs::read(&source)?;
+    if let Some(b) = bytes.get_mut(flip) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert_eq!(report.blocks_salvaged, 0, "the only block was corrupt");
+    assert_eq!(report.entries_salvaged, 0, "no entries recovered");
+    assert_eq!(report.dropped.len(), 1, "the dropped block is reported");
+    assert!(
+        report.salvaged_path.is_none(),
+        "nothing recoverable means no file is written",
+    );
+    assert!(!dest.exists(), "no destination file on an empty salvage");
+    Ok(())
+}

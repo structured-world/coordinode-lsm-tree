@@ -706,3 +706,50 @@ fn repair_with_salvage_recovers_a_block_corrupt_sst() -> lsm_tree::Result<()> {
     );
     Ok(())
 }
+
+/// An SST whose container (SFA trailer) is corrupt cannot be opened even in
+/// salvage mode, so repair reports it unreadable rather than salvaging it.
+#[test]
+fn repair_with_salvage_reports_an_unopenable_sst_as_unreadable() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    {
+        let tree = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0..200 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let ssts = sorted_sst_paths(dir.path());
+    let victim = ssts.first().expect("an SST to corrupt");
+    // Truncate away the tail (SFA trailer + section mirrors): the container is
+    // unparseable, so even salvage-mode recovery cannot open it.
+    let mut bytes = std::fs::read(victim)?;
+    bytes.truncate(bytes.len() / 2);
+    std::fs::write(victim, &bytes)?;
+
+    nuke_manifest(dir.path())?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair_with_salvage(true)?;
+    assert_eq!(report.salvaged, 0, "an unopenable SST cannot be salvaged");
+    assert_eq!(
+        report.recovered, 0,
+        "nothing is recovered from the only (corrupt) SST",
+    );
+    assert_eq!(
+        report.unreadable, 1,
+        "the SST is reported unreadable: {:?}",
+        report.unreadable_files,
+    );
+    Ok(())
+}
