@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782320153439,
+  "lastUpdate": 1782362548412,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -20076,6 +20076,84 @@ window.BENCHMARK_DATA = {
             "value": 697129.516235059,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.7us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3f6a893bba7176977ddc333c600088acf0fede0a",
+          "message": "feat(columnar): delete-density rewrite, read-path perf, backpressure + zstd fixes (#559)\n\n## Summary\n\nColumnar delete-bitmap density rewrite and a public columnar benchmark\nmatrix\n(the headline of #551), plus the columnar read-path performance work and\ntwo\ncorrectness fixes surfaced along the way.\n\n## Delete-density rewrite (#551 Part A)\n\nA columnar segment relocated with a sub-threshold delete-bitmap\n(merge-on-read)\nwas never re-evaluated, so once its masked fraction crossed the adaptive\npurge\nthreshold (e.g. after an operator lowered it at runtime) it paid the\nmerge-on-read mask cost on every scan forever, with nothing scheduling\nthe\nphysical rewrite.\n\nThe orchestrator now layers a density-rewrite fallback on top of the\nstructural\nstrategy: when a strategy returns `DoNothing`, the densest segment whose\ndelete-bitmap fraction is at or above its level's `Adaptive` purge\nthreshold is\nscheduled for a single-input materializing rewrite (the masked scan\ndrops the\ndead rows; the fresh segment carries no bitmap). It self-gates to a\nno-op unless\na level runs `Adaptive` and holds a dense-enough live segment, applies\nuniformly\nto every strategy without preempting real work, and reads the live\nruntime\nconfig so a threshold change takes effect. `CompactionStrategy::choose`\nstays\npurely structural.\n\n## Columnar benchmark matrix (#551 Part B)\n\n`benches/columnar.rs`: row vs columnar vs columnar+zonemap, across full\nscan and\npoint lookup, through the public read API, printing P50/P99/P999. It\nproved the\nread-path gaps the rest of this PR closes.\n\n## Columnar read-path performance\n\nDriven by the new benchmark:\n\n- **Scan: iterate columnar blocks directly** instead of decode ->\nuntranspose ->\nre-encode row block -> re-parse. A new entries-backed seekable block\niterator\nreads the reconstructed rows directly (bound seeks are binary searches\nover the\n  sorted entries; MVCC version selection stays in the merge layer).\n- **Scan: zero-copy untranspose.** The key column and a single\nnon-nullable bytes\nvalue column are taken as shared slices, so a value larger than the\ninline\n  threshold becomes a zero-copy view instead of a per-row allocation.\n- **Point read: no whole-block re-encode.** A columnar point read\ndecoded and\nre-encoded the entire block per lookup just to binary-search it. It now\ndecodes\nthe block once and rebuilds only the matching key's MVCC versions\n(binary-search\nthe key column, skip masked rows) into a tiny block, then runs the\nnormal\nseqno-aware point read. The retrieval-ribbon locator still resolves the\nblock in\n  O(1).\n\nMeasured (100k entries, no compression):\n\n| Op | Columnar vs row-major before | after |\n|----|------------------------------|-------|\n| `full_scan` | ~1.67x | ~1.0x (parity) |\n| `point_lookup` | ~10x | ~2.3x |\n\n## Fixes found along the way\n\n- **`fix(tiered)`: space-amplification debt as pending compaction\nbytes.** The\nsize-tiered strategy returned a flat `0` from\n`pending_compaction_bytes`, so the\nbytes-axis write backpressure (`bytes_slowdown` / `bytes_stop`) was\ninert for\ntiered trees even when space amplification ran away. It now reports the\nbytes by\nwhich total L0 size exceeds its space-amplification budget. (Audit\nverdict: the\nL0-count axis and resume were already correct for every strategy; this\nwas the\n  one bytes-axis gap.)\n- **`fix(compression)`: accept zstd negative and default levels.** The\nlevel was\nrestricted to `1..=22`, and serializing a directly-constructed\n`Zstd(level)`\nbelow 1 hit a `debug_assert` panic. zstd accepts negative \"fast\" levels\nand `0`\n(= default), and our backend maps them through, so the range is now\n`-128..=22`\n(the on-disk format stores the level in one signed byte). Verified a\nnegative\n  level round-trips end to end.\n\n## Testing\n\n- Full suite: 2258 passed; columnar / point-read / MVCC suites green.\n- Regression tests: tiered space-amp pending bytes; columnar density\nrewrite\n(a 25% segment materialized after the threshold drops to 10%); zstd\nnegative\n  level round-trip.\n- `clippy --all-features --all-targets` clean; no-std check 0; doctests\npass;\n  `cargo doc` clean; benches compile and run.\n\nCloses #551\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added an optional Criterion benchmark (`columnar` feature) for full\nscans and point lookups.\n* Improved columnar read paths with direct in-memory iteration and\nkey-based point reads, including correct handling of positional deletes.\n* Added density-aware compaction fallback and exposed delete-density\ncalculation; tiered compaction now accounts for pending “debt” for\nbackpressure.\n* **Bug Fixes**\n* Expanded accepted Zstd compression levels to the full `-128..=22`\nsigned-byte range (including negative “fast” levels).\n* **Tests**\n* Added/updated unit and integration coverage for columnar read/write\nedge cases, density-rewrite behavior, and compression validation.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-25T07:41:35+03:00",
+          "tree_id": "cf2db672ec0d79bfde0554c63a942970f0c6dc6f",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/3f6a893bba7176977ddc333c600088acf0fede0a"
+        },
+        "date": 1782362547251,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2127207.769115847,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1214082.2787566786,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 874326.4303935592,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.1us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3658264.06699935,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 464655.51153620915,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.2us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 239211.85311094258,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 4.8us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.84s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1250267.158649294,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1093902.1523886756,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 677491.7564158062,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.5us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
           }
         ]
       }
