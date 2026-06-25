@@ -575,11 +575,13 @@ fn salvage_sst_reads_and_writes_through_the_injected_fs() -> crate::Result<()> {
     use crate::fs::MemFs;
 
     let fs: Arc<dyn Fs> = Arc::new(MemFs::new());
-    // Create the parent directory up front: a writer's parent-directory check
-    // resolves a bare `/source` against the current drive on Windows (`D:\`),
-    // which the MemFs root seed does not cover, so write under an explicit dir.
-    let dir = std::path::Path::new("/memfs");
-    fs.create_dir_all(dir)?;
+    // `Writer::new` rewrites its path through `std::path::absolute`, which on
+    // Windows resolves a `/`-rooted path against the current drive (`/memfs` ->
+    // `D:\memfs`). Create the parent under that same absolutized form so the
+    // writer's parent-directory check finds it on every platform (on Unix
+    // `absolute` is a no-op, so this is just `/memfs`).
+    let dir = std::path::absolute("/memfs")?;
+    fs.create_dir_all(&dir)?;
     let source = dir.join("source");
     let dest = dir.join("salvaged");
 
