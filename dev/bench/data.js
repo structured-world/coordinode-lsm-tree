@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782387111776,
+  "lastUpdate": 1782402766592,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -20232,6 +20232,84 @@ window.BENCHMARK_DATA = {
             "value": 700763.8771245719,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.6us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "94c489c5ece1b27f090c8daa5cceae39a74f9af5",
+          "message": "test(external-wal): reference implementation and end-to-end recipe test (#561)\n\n## Summary\n\nMakes the external-WAL contract in `docs/external-wal.md` executable and\nself-verifying, so a future engine change that violated it would break a\ntest rather than silently diverge from the prose.\n\n- **Reference WAL** (`tests/external_wal/reference_wal.rs`): a minimal\nappend-only WAL (append + fsync, trim through a watermark, replay the\nsurvivors). std-only test/dev surface, dependency-free encoding,\ntorn-tail tolerant.\n- **End-to-end recipe test** (`tests/external_wal.rs`): drives the\ndocumented recipe across every write kind (insert / remove / remove_weak\n/ remove_range / merge / `WriteBatch`) through a crash and recovery\n(log-before-apply, flush, trim to the gap-free watermark `W`, crash,\nreopen, replay strictly above `W`), asserting the recovered state is\nbyte-for-byte a non-crashed run's. A second variant runs the engine on\nthe `CrashFs` fault-injection harness (power-loss over an in-memory\ndisk).\n- **Contract guards**: three tests prove a deliberately wrong recovery\nis detectably wrong: collapsing ops to `insert`, re-applying a merge at\nor below `W`, and replaying from the raw persisted maximum instead of\n`W`.\n- **Worked example** (`examples/external_wal.rs`): runnable via `cargo\nrun --example external_wal`, reuses the same reference WAL.\n- **Docs**: `docs/external-wal.md` gains an \"Executable companion\"\nsection; the README durability note points at the example.\n\n## Testing\n\n- 6 new integration tests, all pass.\n- `cargo run --example external_wal` recovers the pre-crash state\nexactly.\n- Full suite green (2292 tests); `clippy --all-features`, no-std check,\nand `cargo doc` clean.\n\nCloses #552\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added a runnable external WAL worked example demonstrating durability\nhandled by the caller.\n* Added an accompanying reference WAL implementation used for replay and\ntrimming.\n\n* **Tests**\n* Added end-to-end external WAL recovery tests covering crash/reopen and\nmixed write operations.\n* Added guard tests that fail if recovery collapses or replays records\nincorrectly.\n\n* **Documentation**\n* Expanded the external WAL documentation with a runnable recipe and an\n“Executable companion” section pointing to the example and verification\ncoverage.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-25T18:51:46+03:00",
+          "tree_id": "363797d0dba762ac4ceb658eed30a3dac635ebe7",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/94c489c5ece1b27f090c8daa5cceae39a74f9af5"
+        },
+        "date": 1782402765412,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2058157.6488249165,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1233666.7229239254,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 887156.4182919092,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.1us | P99.9: 6.6us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3816778.9610746754,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.1us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 449089.20846356393,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.4us | P99.9: 9.1us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 233603.60830861176,
+            "unit": "ops/sec",
+            "extra": "P50: 4.0us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.86s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1242068.4381820955,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1069993.250001082,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.8us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 690554.3169965147,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.7us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
