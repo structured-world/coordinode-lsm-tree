@@ -123,9 +123,11 @@ impl SalvageReport {
 /// source is opened in salvage mode, so a corrupt delete-bitmap degrades to
 /// "all rows live" rather than failing the open.
 ///
-/// The walk is positional (block-index order), so it uses the default
-/// comparator regardless of the source's: iteration is not comparator-driven
-/// and the recovered entries keep their on-disk order.
+/// The walk is positional (block-index order): iteration is not
+/// comparator-driven, so the recovered entries keep their on-disk order. This
+/// entry point opens and rewrites under the default lexicographic comparator;
+/// [`crate::repair`] recovers under the tree's configured comparator so a
+/// custom-comparator table is rebuilt and reopened consistently.
 ///
 /// # Errors
 ///
@@ -159,9 +161,22 @@ pub fn salvage_sst(
     dest: std::path::PathBuf,
     fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
 ) -> crate::Result<SalvageReport> {
+    salvage_sst_with_comparator(source, dest, fs, &crate::comparator::default_comparator())
+}
+
+/// Salvages `source` into `dest` under a caller-supplied `comparator`.
+///
+/// [`crate::repair`] calls this with the tree's configured comparator so the
+/// rewritten SST opens and orders consistently with the rest of the tree; the
+/// public [`salvage_sst`] wraps it with the default lexicographic comparator.
+pub(crate) fn salvage_sst_with_comparator(
+    source: &std::path::Path,
+    dest: std::path::PathBuf,
+    fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
+    comparator: &crate::comparator::SharedComparator,
+) -> crate::Result<SalvageReport> {
     use alloc::sync::Arc;
 
-    let comparator = crate::comparator::default_comparator();
     // Digest the source through the injected `Fs`, not `std::fs`: salvage runs
     // over MemFs / fault-injected / routed backends (repair passes its own `fs`),
     // where a direct `std::fs` read would miss the file or hash the wrong bytes.
@@ -197,7 +212,7 @@ pub fn salvage_sst(
         .use_data_block_compression(table.metadata.data_block_compression)
         .use_ecc(table.metadata.ecc_params);
 
-    let walk = match salvage_blocks(&table, writer, &comparator) {
+    let walk = match salvage_blocks(&table, writer, comparator) {
         Ok(walk) => walk,
         Err(e) => {
             // A `write` / `finish` failure after `Writer::new` created `dest`
