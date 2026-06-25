@@ -318,6 +318,78 @@ fn salvage_tolerates_a_corrupt_delete_bitmap_as_all_live() -> crate::Result<()> 
     Ok(())
 }
 
+/// A columnar SST with deletes whose ZONE MAP is corrupt (the bitmap stays
+/// readable): the bitmap cannot be positioned without the zone map, so normal
+/// recovery fails closed, but salvage ignores the bitmap ("all rows live") and
+/// recovers every row.
+#[cfg(feature = "columnar")]
+#[test]
+fn salvage_ignores_a_delete_bitmap_without_a_readable_zone_map() -> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let n = 200u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_data_block_size(256)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    for pos in [5u32, 50, 150] {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    // Corrupt the zone_map section (the bitmap stays intact). The zone map
+    // degrades to empty, leaving a readable bitmap that cannot be positioned.
+    let (zm_pos, zm_len) = {
+        let mut f = std::fs::File::open(&source)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"zone_map") else {
+            panic!("source must carry a zone_map section");
+        };
+        (entry.pos(), entry.len())
+    };
+    let flip = usize::try_from(zm_pos + zm_len / 2).unwrap_or(0);
+    let mut bytes = std::fs::read(&source)?;
+    if let Some(b) = bytes.get_mut(flip) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&source, &bytes)?;
+
+    // Normal recovery fails closed: a bitmap with no positioning zone map.
+    assert!(
+        open(source.clone(), &fs).is_err(),
+        "normal recovery must reject a bitmap with no readable zone map",
+    );
+
+    // Salvage ignores the unpositionable bitmap and recovers every row live.
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert!(
+        report.is_complete(),
+        "the data blocks are intact; only the zone map was corrupt: {report:?}",
+    );
+    assert_eq!(
+        report.entries_salvaged,
+        u64::from(n),
+        "every row is recovered live once the unpositionable bitmap is ignored",
+    );
+    assert_eq!(reopen_item_count(dest, &fs)?, u64::from(n));
+    Ok(())
+}
+
 /// When the source cannot be opened at all (a corrupt SFA trailer makes even
 /// salvage-mode recovery fail), `salvage_sst` returns an error rather than
 /// writing a partial file.

@@ -139,6 +139,103 @@ fn repair_with_salvage_reports_a_sole_corrupt_block_as_unsalvageable() -> crate:
     Ok(())
 }
 
+/// `repair_with_salvage` on an SST that carries range tombstones and a corrupt
+/// data block: whole-file recovery opens it (data is read lazily) but
+/// verification trips on the corrupt block, and block-salvage refuses it because
+/// it cannot re-emit the range tombstones, so the table is reported unreadable.
+#[test]
+fn repair_with_salvage_reports_a_range_tombstone_sst_as_unsalvageable() -> crate::Result<()> {
+    use crate::range_tombstone::RangeTombstone;
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, UserKey, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?;
+        for i in 0..8u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        w.write_range_tombstone(RangeTombstone::new(
+            UserKey::from(b"k00002".as_slice()),
+            UserKey::from(b"k00005".as_slice()),
+            2,
+        ));
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Corrupt the sole data block (offset from the intact index) so whole-file
+    // recovery opens it but verification fails, driving repair into salvage.
+    let offset = {
+        let checksum = crate::Checksum::from_raw(compute_table_checksum(&*fs, &sst)?);
+        let table = crate::table::Table::recover(
+            sst.clone(),
+            checksum,
+            0,
+            0,
+            0,
+            Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+            None,
+            Arc::clone(&fs),
+            false,
+            false,
+            None,
+            #[cfg(zstd_any)]
+            None,
+            crate::comparator::default_comparator(),
+            #[cfg(feature = "metrics")]
+            Arc::new(crate::Metrics::default()),
+        )?;
+        let offsets: alloc::vec::Vec<u64> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|kh| *kh.as_ref().offset())
+            .collect();
+        let [only] = offsets.as_slice() else {
+            panic!("expected a single data block, got {offsets:?}");
+        };
+        *only
+    };
+    let mut bytes = std::fs::read(&sst)?;
+    if let Some(b) = bytes.get_mut(usize::try_from(offset).unwrap_or(0) + 16) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&sst, &bytes)?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.salvaged, 0,
+        "salvage refuses an SST with range tombstones",
+    );
+    assert_eq!(report.recovered, 0, "no table joins the rebuilt manifest");
+    let [(_, reason)] = report.unreadable_files.as_slice() else {
+        panic!(
+            "expected exactly one unreadable file, got {:?}",
+            report.unreadable_files,
+        );
+    };
+    assert!(
+        reason.contains("salvage failed") && reason.contains("range tombstones"),
+        "the reason names the failed salvage, got: {reason}",
+    );
+    Ok(())
+}
+
 /// `repair_with_salvage` on a columnar SST whose delete-bitmap AND sole data
 /// block are both corrupt: whole-file recovery refuses it (the corrupt bitmap
 /// would resurrect deleted rows) and block-salvage, though it opens in salvage
