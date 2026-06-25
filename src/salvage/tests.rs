@@ -404,6 +404,57 @@ fn salvage_sst_recovers_nothing_when_the_only_block_is_corrupt() -> crate::Resul
     Ok(())
 }
 
+/// A columnar source whose delete-bitmap wholly covers its leading data
+/// block(s): those blocks carry no live rows, so salvage skips them (nothing
+/// salvaged, nothing dropped) and recovers the live rows of the rest.
+#[cfg(feature = "columnar")]
+#[test]
+fn salvage_skips_a_wholly_deleted_block() -> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let n = 200u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_data_block_size(256)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    // Delete the first 60 row positions: with 256-byte blocks this wholly covers
+    // the leading data block(s), which then load as "no live rows".
+    let deleted = 60u32;
+    for pos in 0..deleted {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert!(
+        report.is_complete(),
+        "wholly-deleted blocks are skipped, not dropped: {report:?}",
+    );
+    assert!(
+        report.blocks_salvaged < report.blocks_total,
+        "at least one leading block was wholly deleted and skipped: {report:?}",
+    );
+    assert_eq!(
+        report.entries_salvaged,
+        u64::from(n - deleted),
+        "every live row is recovered, the deleted prefix is skipped",
+    );
+    assert_eq!(reopen_item_count(dest, &fs)?, u64::from(n - deleted));
+    Ok(())
+}
+
 /// Salvage drives every read and write through the injected `Fs`: an SST that
 /// lives only in an in-memory backend (never on the real filesystem) salvages
 /// and reopens purely through that backend. A source-digest path that bypassed

@@ -38,6 +38,107 @@ fn highest_existing_version_id_none_when_no_versions_present() -> crate::Result<
     Ok(())
 }
 
+/// `repair_with_salvage` on an SST whose ONLY data block is corrupt: whole-file
+/// recovery still succeeds (the data section is read lazily) but verification
+/// fails, and block-salvage finds nothing recoverable, so the table is reported
+/// unreadable rather than kept as one that errors on every read.
+#[test]
+fn repair_with_salvage_reports_a_sole_corrupt_block_as_unsalvageable() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    // A handful of short keys fit in a single data block: no second block for
+    // salvage to fall back on.
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?;
+        for i in 0..8u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Resolve the sole data block's offset from the intact index, then flip a
+    // byte just past its header so the block fails its checksum. The container,
+    // index and meta stay intact, so whole-file recovery still opens it (data is
+    // read lazily) and only verification trips.
+    let offset = {
+        let checksum = crate::Checksum::from_raw(compute_table_checksum(&*fs, &sst)?);
+        let table = crate::table::Table::recover(
+            sst.clone(),
+            checksum,
+            0,
+            0,
+            0,
+            Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+            None,
+            Arc::clone(&fs),
+            false,
+            false,
+            None,
+            #[cfg(zstd_any)]
+            None,
+            crate::comparator::default_comparator(),
+            #[cfg(feature = "metrics")]
+            Arc::new(crate::Metrics::default()),
+        )?;
+        let offsets: alloc::vec::Vec<u64> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|kh| *kh.as_ref().offset())
+            .collect();
+        let [only] = offsets.as_slice() else {
+            panic!("expected a single data block, got {offsets:?}");
+        };
+        *only
+    };
+    let flip = usize::try_from(offset).unwrap_or(0) + 16;
+    let mut bytes = std::fs::read(&sst)?;
+    if let Some(b) = bytes.get_mut(flip) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&sst, &bytes)?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.salvaged, 0,
+        "the sole block is corrupt: nothing to salvage",
+    );
+    assert_eq!(report.recovered, 0, "no table joins the rebuilt manifest");
+    assert_eq!(
+        report.unreadable, 1,
+        "the unsalvageable SST is reported: {:?}",
+        report.unreadable_files,
+    );
+    let [(_, reason)] = report.unreadable_files.as_slice() else {
+        panic!(
+            "expected exactly one unreadable file, got {:?}",
+            report.unreadable_files,
+        );
+    };
+    assert!(
+        reason.contains("nothing salvageable"),
+        "the reason names the empty salvage, got: {reason}",
+    );
+    Ok(())
+}
+
 /// `repair_with_salvage` recovers an SST that normal recovery refuses: a
 /// columnar segment whose delete-bitmap section is corrupt fails whole-file
 /// recovery (it would resurrect deleted rows), but salvage degrades it to "all
