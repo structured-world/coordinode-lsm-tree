@@ -455,6 +455,45 @@ fn salvage_skips_a_wholly_deleted_block() -> crate::Result<()> {
     Ok(())
 }
 
+/// An SST carrying range tombstones cannot be salvaged: the positional KV walk
+/// re-emits only point entries, so the tombstones would be silently dropped and
+/// lower-level keys they cover could reappear after repair. Until the writer
+/// path re-emits them, salvage fails closed.
+#[test]
+fn salvage_rejects_an_sst_with_range_tombstones() -> crate::Result<()> {
+    use crate::UserKey;
+    use crate::range_tombstone::RangeTombstone;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0..20 {
+        writer.write(iv(i))?;
+    }
+    // A range tombstone over part of the key space: the salvaged copy must not
+    // silently drop it.
+    writer.write_range_tombstone(RangeTombstone::new(
+        UserKey::from(b"key00005".as_slice()),
+        UserKey::from(b"key00010".as_slice()),
+        2,
+    ));
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    let result = salvage_sst(&source, dest.clone(), &fs);
+    assert!(
+        matches!(result, Err(crate::Error::FeatureUnsupported(_))),
+        "an SST with range tombstones must fail closed, got {result:?}",
+    );
+    assert!(
+        !dest.exists(),
+        "no salvaged file is written when salvage fails closed",
+    );
+    Ok(())
+}
+
 /// Salvage drives every read and write through the injected `Fs`: an SST that
 /// lives only in an in-memory backend (never on the real filesystem) salvages
 /// and reopens purely through that backend. A source-digest path that bypassed
