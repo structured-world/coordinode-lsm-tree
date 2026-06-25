@@ -174,7 +174,14 @@ enum Command {
     /// the library `Config::repair` API with the matching config.
     /// A KV-separated (blob) tree is detected by its `blobs/` folder and
     /// repaired with KV separation enabled so its blob files are recovered.
-    Repair,
+    Repair {
+        /// Block-salvage SSTs that fail whole-file recovery instead of leaving
+        /// them out: the corrupt original is quarantined and a fresh SST with
+        /// its recoverable blocks takes its place. A salvaged table may be
+        /// missing the key ranges of its corrupt blocks (a last-resort option).
+        #[arg(long)]
+        salvage: bool,
+    },
 
     /// Print sizing stats for the SST's BuRR filter: on-disk filter
     /// section bytes, BuRR layer count, item count from meta, and
@@ -235,6 +242,19 @@ enum Command {
         #[arg(long)]
         reconstruct_aad: bool,
     },
+
+    /// Salvage the readable data blocks of a (possibly corrupt) SST into a
+    /// fresh SST at `<dest>`. Walks every data block, re-emits the ones that
+    /// pass their checksum into a new file with fresh checksums / index /
+    /// filter, and reports the key range of every block it had to drop. A
+    /// columnar segment with a damaged sidecar (delete-bitmap / zone map)
+    /// degrades to a conservative "all rows live" state rather than failing.
+    /// The `<path>` positional is the source SST. Exits non-zero only when the
+    /// source cannot be opened or nothing was recoverable.
+    Salvage {
+        /// Destination path for the recovered SST (must not already exist).
+        dest: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -256,17 +276,18 @@ fn main() -> ExitCode {
             keys_only,
         } => run_dump(&cli.path, from.as_deref(), to.as_deref(), max, keys_only),
         Command::FilterStats => run_filter_stats(&cli.path),
-        Command::Repair => run_repair(&cli.path),
+        Command::Repair { salvage } => run_repair(&cli.path, salvage),
         Command::DumpBlock {
             offset,
             tree_id,
             table_id,
             reconstruct_aad,
         } => run_dump_block(&cli.path, offset, tree_id, table_id, reconstruct_aad),
+        Command::Salvage { dest } => run_salvage(&cli.path, &dest),
     }
 }
 
-fn run_repair(db_dir: &std::path::Path) -> ExitCode {
+fn run_repair(db_dir: &std::path::Path, salvage: bool) -> ExitCode {
     use lsm_tree::{Config, KvSeparationOptions, SequenceNumberCounter};
 
     let mut config = Config::new(
@@ -284,7 +305,7 @@ fn run_repair(db_dir: &std::path::Path) -> ExitCode {
         config = config.with_kv_separation(Some(KvSeparationOptions::default()));
     }
 
-    let report = match config.repair() {
+    let report = match config.repair_with_salvage(salvage) {
         Ok(report) => report,
         Err(err) => {
             eprintln!("repair failed: {err}");
@@ -295,6 +316,7 @@ fn run_repair(db_dir: &std::path::Path) -> ExitCode {
     println!("db dir:        {}", db_dir.display());
     println!("method:        {}", report.method);
     println!("recovered:     {}", report.recovered);
+    println!("salvaged:      {}", report.salvaged);
     println!("unreadable:    {}", report.unreadable);
     for (path, reason) in &report.unreadable_files {
         println!("  skipped {} — {reason}", path.display());
@@ -305,6 +327,59 @@ fn run_repair(db_dir: &std::path::Path) -> ExitCode {
     println!("status:        manifest rebuilt");
 
     ExitCode::SUCCESS
+}
+
+fn run_salvage(source: &std::path::Path, dest: &std::path::Path) -> ExitCode {
+    use std::sync::Arc;
+
+    let fs: Arc<dyn lsm_tree::fs::Fs> = Arc::new(lsm_tree::fs::StdFs);
+    let report = match lsm_tree::salvage::salvage_sst(source, dest.to_path_buf(), &fs) {
+        Ok(report) => report,
+        Err(err) => {
+            eprintln!("salvage failed: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("source:          {}", source.display());
+    match &report.salvaged_path {
+        Some(p) => println!("salvaged to:     {}", p.display()),
+        None => println!("salvaged to:     (nothing recoverable)"),
+    }
+    println!("blocks total:    {}", report.blocks_total);
+    println!("blocks salvaged: {}", report.blocks_salvaged);
+    println!("blocks dropped:  {}", report.dropped.len());
+    println!("entries:         {}", report.entries_salvaged);
+    for d in &report.dropped {
+        let range = match &d.key_range {
+            Some((lo, hi)) => format!(
+                "[{}..={}]",
+                String::from_utf8_lossy(lo.as_ref()),
+                String::from_utf8_lossy(hi.as_ref()),
+            ),
+            None => "(range unknown)".to_string(),
+        };
+        println!(
+            "  dropped {} block @ offset {} {range}: {:?}",
+            String::from_utf8_lossy(&d.section),
+            d.offset,
+            d.reason,
+        );
+    }
+
+    if report.is_complete() {
+        println!("status:          fully recovered");
+        ExitCode::SUCCESS
+    } else if report.salvaged_path.is_some() {
+        println!(
+            "status:          partially recovered ({} block(s) dropped)",
+            report.dropped.len(),
+        );
+        ExitCode::SUCCESS
+    } else {
+        println!("status:          nothing recoverable");
+        ExitCode::FAILURE
+    }
 }
 
 fn run_verify(path: &std::path::Path, verbose: bool) -> ExitCode {

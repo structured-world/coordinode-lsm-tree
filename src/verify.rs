@@ -126,8 +126,12 @@ impl IntegrityReport {
 }
 
 /// Computes a streaming XXH3 128-bit checksum for a file without loading it entirely into memory.
+///
+/// `pub(crate)` so [`crate::salvage`] can stamp the salvaged-source open with
+/// the file's current digest (the source may be corrupt, so its digest is
+/// whatever bytes are on disk; per-block checksums catch the actual damage).
 #[cfg(feature = "std")]
-fn stream_checksum(path: &std::path::Path) -> std::io::Result<Checksum> {
+pub(crate) fn stream_checksum(path: &std::path::Path) -> std::io::Result<Checksum> {
     use std::io::Read;
 
     let mut reader = std::fs::File::open(path)?;
@@ -756,9 +760,18 @@ pub fn verify_kv_checksums(tree: &impl crate::AbstractTree) -> crate::Result<()>
 #[cfg(feature = "std")]
 #[must_use]
 pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
-    use crate::fs::StdFs;
+    verify_sst_file_with_fs(&crate::fs::StdFs, path)
+}
 
-    let fs = StdFs;
+/// As [`verify_sst_file`], but reads `path` through the given filesystem.
+///
+/// `pub(crate)` so `repair` can block-verify an SST on the tree's own `Fs`
+/// before deciding whether to salvage it, rather than assuming `StdFs`.
+#[cfg(feature = "std")]
+pub(crate) fn verify_sst_file_with_fs(
+    fs: &dyn crate::fs::Fs,
+    path: &std::path::Path,
+) -> BlockVerifyReport {
     let mut report = BlockVerifyReport {
         sst_files_scanned: 1,
         ..BlockVerifyReport::default()
@@ -772,7 +785,7 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
     // the scan and reports spurious corruption. Surface the indeterminacy and
     // skip the walk.
     let mut ecc_unrecognized = false;
-    let ecc = match read_ecc_params_out_of_band(&fs, path) {
+    let ecc = match read_ecc_params_out_of_band(fs, path) {
         Ok(Some(ScrubEcc::Off)) => None,
         Ok(Some(ScrubEcc::Scheme(params))) => Some(params),
         // The descriptor decodes to a scheme this build can't apply: the
@@ -822,7 +835,7 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
         }
     };
 
-    match scan_sst_blocks(&fs, path, 0, 0, ecc, ecc_unrecognized) {
+    match scan_sst_blocks(fs, path, 0, 0, ecc, ecc_unrecognized) {
         Ok(per_file) => {
             report.blocks_scanned = per_file.blocks_scanned;
             report.errors = per_file.errors;
