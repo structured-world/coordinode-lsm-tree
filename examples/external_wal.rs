@@ -3,7 +3,8 @@
 
 //! Worked example for the external-WAL recipe (`docs/external-wal.md`): the
 //! engine has no internal WAL, so durability is the caller's job. This program
-//! logs each write to an [append-only reference WAL](#) **before** applying it,
+//! logs each write to an append-only reference WAL (`reference_wal`) **before**
+//! applying it,
 //! flushes to make a prefix durable, trims the WAL to that watermark, simulates
 //! a crash (drop the tree, keeping the SST directory + WAL), reopens, and
 //! replays the surviving tail strictly above the watermark.
