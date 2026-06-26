@@ -1477,6 +1477,77 @@ fn plan_block_tasks_propagates_a_faulted_bloom_probe() -> crate::Result<()> {
 }
 
 #[test]
+#[expect(clippy::unwrap_used, reason = "test code")]
+fn plan_block_tasks_propagates_a_faulted_index_read() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultInjector, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    // 500 keys + adaptive-index threshold 0 spill to a two-level (partitioned)
+    // block index whose partition blocks are read lazily, so `block_iter.next()`
+    // does a disk read that can fail. A pinned filter keeps check_bloom off disk,
+    // so the planner's first faulted positional read is the index read.
+    let items: Vec<InternalValue> = (0u32..500)
+        .map(|i| {
+            InternalValue::from_components(
+                format!("key{i:06}").into_bytes(),
+                b"v".to_vec(),
+                1,
+                crate::ValueType::Value,
+            )
+        })
+        .collect();
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let injector = Arc::new(FaultInjector::new());
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(FaultFs::with_injector(StdFs, Arc::clone(&injector)));
+
+    let checksum = {
+        let mut writer = Writer::new(file.clone(), 0, 0, Arc::clone(&fs))?.use_adaptive_index(0);
+        for item in &items {
+            writer.write(item.clone())?;
+        }
+        writer.finish()?.unwrap().1
+    };
+
+    let table = Table::recover(
+        file,
+        checksum,
+        0,
+        0,
+        0,
+        Arc::new(Cache::with_capacity_bytes(1_000_000)),
+        Some(Arc::new(DescriptorTable::new(10))),
+        Arc::clone(&fs),
+        true,  // pin filter: keep check_bloom off disk
+        false, // do not pin index: partition blocks read lazily
+        None,
+        #[cfg(zstd_any)]
+        None,
+        crate::comparator::default_comparator(),
+        #[cfg(feature = "metrics")]
+        Arc::new(Metrics::default()),
+    )?;
+
+    // Recovery is done; fail the next positional read of the table file, which
+    // the block-index walk performs.
+    injector.arm(FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other)).on_path("table"));
+
+    let key = b"key000250".as_slice();
+    let sorted = [(key, hash64(key))];
+    let result = table.plan_block_tasks(&sorted, SeqNo::MAX);
+
+    // batch_get propagates the same iterator error via `?`; the chunked planner
+    // must too, so a faulted index read surfaces as Err instead of a swallowed
+    // end-of-index that would let a stale lower level answer.
+    assert!(
+        result.is_err(),
+        "a faulted block-index read must surface as Err, not a swallowed end-of-index"
+    );
+    Ok(())
+}
+
+#[test]
 fn table_seqnos() -> crate::Result<()> {
     use crate::ValueType::Value;
 
