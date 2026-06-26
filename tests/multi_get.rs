@@ -286,6 +286,54 @@ fn multi_get_duplicate_keys_missing_to_disk_match_per_key_get() -> lsm_tree::Res
 }
 
 #[test]
+fn multi_get_blob_tree_duplicate_keys_missing_to_disk_match_per_key_get() -> lsm_tree::Result<()> {
+    // Regression: BlobTree::multi_get forwards its disk-miss keys straight to the
+    // shared batched on-disk resolver, which requires strictly-sorted-unique
+    // input. A duplicate query key that misses the memtables reaches that path as
+    // a repeat and breaks the contract (the standard Tree de-dupes; the BlobTree
+    // must do the same and fan the shared answer back to every position).
+    let folder = get_tmp_folder();
+
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(KvSeparationOptions {
+        separation_threshold: 1, // separate all values into blobs
+        ..Default::default()
+    }))
+    .open()?;
+
+    let big0 = b"0".repeat(200);
+    let big8 = b"8".repeat(200);
+    tree.insert("k0000", big0.as_slice(), 0);
+    tree.insert("k0008", big8.as_slice(), 1);
+    // Flush so both live in an SST: Phase 1 misses them and the duplicate reaches
+    // the batched on-disk path (a batch of >= 3 keys skips the per-key shortcut).
+    tree.flush_active_memtable(0)?;
+    assert!(tree.blob_file_count() > 0);
+
+    let query = ["k0008", "k0008", "k0000"];
+    let batched = tree.multi_get(query, SeqNo::MAX)?;
+    assert_eq!(batched.len(), 3);
+
+    for (i, key) in query.iter().enumerate() {
+        let single = tree.get(key, SeqNo::MAX)?;
+        assert_eq!(
+            batched[i].as_deref(),
+            single.as_deref(),
+            "blob multi_get vs get mismatch at position {i} (key {key})"
+        );
+    }
+    assert_eq!(batched[0].as_deref(), Some(big8.as_slice()));
+    assert_eq!(batched[1].as_deref(), Some(big8.as_slice()));
+    assert_eq!(batched[2].as_deref(), Some(big0.as_slice()));
+
+    Ok(())
+}
+
+#[test]
 fn multi_get_with_range_tombstones() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
 
