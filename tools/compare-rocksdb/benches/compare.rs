@@ -1039,13 +1039,20 @@ fn multi_get_variant(c: &mut Criterion, group_name: &str, compression: Compressi
                 // Build the on-disk database once (outside the timed window), so
                 // the measurement loop only ever pays for the batched read.
                 let dir = tempfile::tempdir().expect("tempdir");
+                // This measures WARM steady-state batched-MultiGet throughput, NOT
+                // cold first-touch latency: every engine populates + probes once
+                // outside the timed window, so all arms (ours, blob_tree, and the
+                // RocksDB arm below) enter the loop equally warmed. That symmetry
+                // is the point of the comparison. Cold fan-out latency is a
+                // separate, OS-cache-dropping measurement, not this bench.
                 match engine {
                     Engine::Ours | Engine::BlobTree => {
                         let tree =
                             populate_ours(dir.path(), compression, &inputs, engine.kv_separated());
                         // One-time "every key present" contract check OUTSIDE the
                         // timed window (mirrors point_read), so a setup regression
-                        // can't quietly become a miss-read benchmark.
+                        // can't quietly become a miss-read benchmark. It also warms
+                        // the cache identically to the RocksDB probe below.
                         let probe = tree
                             .multi_get(inputs.keys.iter(), MAX_SEQNO)
                             .expect("ours: verify");
