@@ -484,6 +484,44 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     /// Returns an I/O error if the read fails.
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;
 
+    /// Reads several disjoint `(offset, buf)` regions in one batched operation,
+    /// filling each `buf` completely (the regions are block reads of known size,
+    /// so a short read is treated as an error, not EOF).
+    ///
+    /// The default implementation reads the regions serially via
+    /// [`read_at`](Self::read_at). Backends with batched / asynchronous I/O
+    /// override this to submit every read at once and wait for all completions,
+    /// so a multi-block read (a `multi_get` over cold SST blocks) overlaps in
+    /// flight and costs one submission instead of one blocking read per block.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first failing region's I/O error (a partial read of any region
+    /// is reported as [`io::ErrorKind::UnexpectedEof`]). On error the contents of
+    /// every `buf` are unspecified.
+    fn read_many(&self, regions: &mut [(u64, &mut [u8])]) -> io::Result<()> {
+        for (offset, buf) in regions.iter_mut() {
+            let n = self.read_at(buf, *offset)?;
+            if n != buf.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "read_many: short read on a fixed-size block region",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The raw OS file descriptor backing this handle, or `None`.
+    ///
+    /// `None` for backends with no descriptor (in-memory) or where it is not
+    /// meaningful. [`Fs::read_blocks_batched`] uses it to submit reads across
+    /// several files to one shared `io_uring` ring; a handle returning `None`
+    /// is read serially instead.
+    fn backing_fd(&self) -> Option<i32> {
+        None
+    }
+
     /// Acquires an exclusive (write) lock on this file.
     ///
     /// Blocks until the lock is acquired.
@@ -549,6 +587,21 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     }
 }
 
+/// One block-read request for [`Fs::read_blocks_batched`]: fill `buf` with
+/// `buf.len()` bytes from `file` at `offset`.
+///
+/// Different requests may target different files (different SSTs, and on a
+/// multi-device layout different devices), which is the point: one batched
+/// submission across all of them.
+pub struct BlockRead<'a> {
+    /// File to read from.
+    pub file: &'a dyn FsFile,
+    /// Byte offset within `file`.
+    pub offset: u64,
+    /// Destination buffer; filled completely on success.
+    pub buf: &'a mut [u8],
+}
+
 /// Pluggable filesystem abstraction.
 ///
 /// Intended to cover all filesystem operations that lsm-tree performs.
@@ -575,6 +628,33 @@ pub trait Fs: Send + Sync + 'static {
     // Box<dyn FsFile> is intentionally 'static (the default) - file handles are
     // owned values that do not borrow from the Fs instance that created them.
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>>;
+
+    /// Reads several blocks, possibly from DIFFERENT files, in one batched
+    /// operation. The default reads each serially via [`FsFile::read_at`];
+    /// `io_uring` overrides it to submit every read across all the files to its
+    /// one shared ring, so reads from many SSTs (and, on a multi-device layout,
+    /// many devices) coalesce into one submission and overlap in flight, with
+    /// the kernel fanning each read out to its file's underlying device.
+    ///
+    /// Fills each `buf` completely (block reads are fixed-size); a short read on
+    /// any block is an error, leaving every `buf`'s contents unspecified.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first failing block's I/O error (a partial read of any block
+    /// is reported as [`io::ErrorKind::UnexpectedEof`]).
+    fn read_blocks_batched(&self, reqs: &mut [BlockRead<'_>]) -> io::Result<()> {
+        for req in reqs.iter_mut() {
+            let n = req.file.read_at(req.buf, req.offset)?;
+            if n != req.buf.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "read_blocks_batched: short read on a fixed-size block",
+                ));
+            }
+        }
+        Ok(())
+    }
 
     /// Recursively creates all directories leading to `path`.
     ///

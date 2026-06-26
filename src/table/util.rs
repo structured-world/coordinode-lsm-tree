@@ -240,6 +240,65 @@ pub fn load_block(
     Ok(block)
 }
 
+/// Decodes pre-read block bytes into the cache: the decode half of a batched
+/// prewarm.
+///
+/// The bytes were read in ONE cross-file
+/// [`Fs::read_blocks_batched`](crate::fs::Fs::read_blocks_batched) (the reads of
+/// many SSTs, possibly fanned out across devices, coalesced into one
+/// submission). `buffers[i]` holds the on-disk bytes of `handles[i]`.
+///
+/// Decodes each with the same path [`load_block`] uses ([`Block::from_reader`]
+/// shares the header / ECC / decrypt helpers), so the cached block is
+/// byte-identical to what the read walk would produce, then inserts it. Purely
+/// an I/O optimization: it never changes which bytes a later [`load_block`]
+/// returns. A block whose decode would need a re-read recovery is left uncached
+/// for the read walk to handle authoritatively.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors load_block's decode context (id, cache, type, compression, encryption, ecc, dict)"
+)]
+pub fn decode_prewarmed_blocks(
+    table_id: GlobalTableId,
+    cache: &Cache,
+    handles: &[BlockHandle],
+    buffers: &[Vec<u8>],
+    block_type: BlockType,
+    compression: CompressionType,
+    encryption: Option<&dyn EncryptionProvider>,
+    ecc: Option<crate::table::block::EccParams>,
+    #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+) {
+    let Ok(transform) = build_block_transform(
+        compression,
+        encryption,
+        ecc,
+        #[cfg(zstd_any)]
+        zstd_dict,
+    ) else {
+        return;
+    };
+    let identity = crate::table::block::BlockIdentity {
+        table_id: table_id.table_id(),
+        block_type,
+        dict_id: compression.dict_id(),
+        window_log: 0,
+    };
+
+    for (handle, buf) in handles.iter().zip(buffers.iter()) {
+        // Same decode as load_block (from_reader shares the header / ECC /
+        // decrypt helpers), so the cached block is byte-identical to what the
+        // read walk would produce. A decode error (e.g. a block needing a re-read
+        // recovery) just leaves it uncached for the walk to read authoritatively.
+        let mut reader = crate::io::Cursor::new(buf.as_slice());
+        if let Ok(block) = Block::from_reader(&mut reader, identity, &transform)
+            && block.header.block_type == block_type
+        {
+            cache.insert_block(table_id, handle.offset(), block);
+        }
+    }
+}
+
 /// Schedules a healing recompaction for `table_id` when a just-read block was
 /// ECC-corrected and the fault is confirmed persistent.
 ///
@@ -440,7 +499,7 @@ pub(crate) fn scrub_block(
 /// checksum, and reports
 /// [`EccStatus::Unrecognized`](crate::table::block::EccStatus::Unrecognized)),
 /// so the data still loads without ECC recovery rather than failing closed.
-fn build_block_transform<'a>(
+pub(crate) fn build_block_transform<'a>(
     compression: CompressionType,
     encryption: Option<&'a dyn EncryptionProvider>,
     ecc: Option<crate::table::block::EccParams>,
