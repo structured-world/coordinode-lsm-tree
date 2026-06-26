@@ -800,24 +800,44 @@ impl RingThread {
             receivers.push((rx, buf.len()));
         }
 
-        // Phase 2: wait for every completion. Each region must be fully read.
+        // Phase 2: drain EVERY receiver before returning, even on error. Each
+        // `recv()` blocks until that op's CQE arrives, so a short read or a
+        // negative result must NOT short-circuit the loop: any op left
+        // un-recv'd may still have the kernel writing into its Phase-1 raw-ptr
+        // buffer, and returning early lets the caller free those buffers
+        // mid-write (use-after-free). Drain all, surface the first error.
+        let mut first_err: Option<io::Error> = None;
         for (rx, expected) in receivers {
-            let result = rx
-                .recv()
-                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread exited"))?;
-            if result < 0 {
-                return Err(io::Error::from_raw_os_error(-result));
+            let recv = rx.recv();
+            if first_err.is_some() {
+                continue; // already failing; just wait this op out, do not record
             }
-            #[expect(clippy::cast_sign_loss, reason = "guarded by result < 0 above")]
-            let n = result as usize;
-            if n != expected {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "io_uring read_many: short read on a fixed-size block region",
-                ));
+            match recv {
+                Err(_) => {
+                    first_err = Some(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "io_uring thread exited",
+                    ));
+                }
+                Ok(result) if result < 0 => {
+                    first_err = Some(io::Error::from_raw_os_error(-result));
+                }
+                Ok(result) => {
+                    #[expect(clippy::cast_sign_loss, reason = "guarded by result < 0 above")]
+                    let n = result as usize;
+                    if n != expected {
+                        first_err = Some(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "io_uring read_many: short read on a fixed-size block region",
+                        ));
+                    }
+                }
             }
         }
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Like [`Self::submit_reads`], but each request carries its OWN fd, so
@@ -864,23 +884,42 @@ impl RingThread {
             receivers.push((rx, expected));
         }
 
+        // Drain EVERY receiver before returning, even on error: an un-recv'd op
+        // may still have the kernel writing into its raw-ptr buffer, so a short
+        // read or negative result must not short-circuit the loop and let the
+        // caller free those buffers mid-write (use-after-free). See `submit_reads`.
+        let mut first_err: Option<io::Error> = None;
         for (rx, expected) in receivers {
-            let result = rx
-                .recv()
-                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread exited"))?;
-            if result < 0 {
-                return Err(io::Error::from_raw_os_error(-result));
+            let recv = rx.recv();
+            if first_err.is_some() {
+                continue;
             }
-            #[expect(clippy::cast_sign_loss, reason = "guarded by result < 0 above")]
-            let n = result as usize;
-            if n != expected {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "io_uring read_blocks_batched: short read on a fixed-size block",
-                ));
+            match recv {
+                Err(_) => {
+                    first_err = Some(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "io_uring thread exited",
+                    ));
+                }
+                Ok(result) if result < 0 => {
+                    first_err = Some(io::Error::from_raw_os_error(-result));
+                }
+                Ok(result) => {
+                    #[expect(clippy::cast_sign_loss, reason = "guarded by result < 0 above")]
+                    let n = result as usize;
+                    if n != expected {
+                        first_err = Some(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "io_uring read_blocks_batched: short read on a fixed-size block",
+                        ));
+                    }
+                }
             }
         }
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Submits a pwrite to the ring and blocks until completion.
