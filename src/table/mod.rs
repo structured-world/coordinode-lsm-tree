@@ -1458,9 +1458,15 @@ impl Table {
     /// Shared setup for the prewarm and chunked block planners: rejects a table
     /// that cannot contribute (empty input, or entirely above the read snapshot),
     /// bloom-filters `sorted_keys` to the passing positions, and opens a forward
-    /// block-index reader at the first passing key. Returns those passing
-    /// positions, the reader, and the table-local read seqno, or `None` when
-    /// nothing passes.
+    /// block-index reader at the first passing key.
+    ///
+    /// `Ok(Some(..))` carries the passing positions, the reader, and the
+    /// table-local read seqno. `Ok(None)` means the table genuinely contributes no
+    /// block (nothing passes the snapshot/bloom/index). `Err` is a real
+    /// [`Table::check_bloom`] failure (a partitioned filter's block read) and is
+    /// propagated so the authoritative chunked planner surfaces it instead of
+    /// mistaking it for a miss; the best-effort prewarm planner maps it back to
+    /// `None`.
     #[expect(
         clippy::indexing_slicing,
         reason = "passing[0] is valid after the emptiness check"
@@ -1469,28 +1475,33 @@ impl Table {
         &self,
         sorted_keys: &[(&[u8], u64)],
         seqno: SeqNo,
-    ) -> Option<(Vec<usize>, block_index::BlockIndexIterImpl, SeqNo)> {
+    ) -> crate::Result<Option<(Vec<usize>, block_index::BlockIndexIterImpl, SeqNo)>> {
         if sorted_keys.is_empty() {
-            return None;
+            return Ok(None);
         }
         let global_seqno = self.global_seqno();
-        let table_seqno = seqno.checked_sub(global_seqno)?;
+        let Some(table_seqno) = seqno.checked_sub(global_seqno) else {
+            return Ok(None);
+        };
         if self.metadata.seqnos.0 >= table_seqno {
-            return None;
+            return Ok(None);
         }
         let mut passing: Vec<usize> = Vec::with_capacity(sorted_keys.len());
         for (i, (key, hash)) in sorted_keys.iter().enumerate() {
-            if !self.check_bloom(key, *hash).ok()?.should_skip() {
+            if !self.check_bloom(key, *hash)?.should_skip() {
                 passing.push(i);
             }
         }
         if passing.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let block_iter = self
+        let Some(block_iter) = self
             .block_index
-            .forward_reader(sorted_keys[passing[0]].0, table_seqno)?;
-        Some((passing, block_iter, table_seqno))
+            .forward_reader(sorted_keys[passing[0]].0, table_seqno)
+        else {
+            return Ok(None);
+        };
+        Ok(Some((passing, block_iter, table_seqno)))
     }
 
     /// Plans the COLD (uncached) data blocks [`Table::batch_get`] will read for
@@ -1519,8 +1530,13 @@ impl Table {
         if self.metadata.columnar {
             return None;
         }
-        let (passing, mut block_iter, _table_seqno) =
-            self.plan_block_walk_setup(sorted_keys, seqno)?;
+        // Best-effort warming: a bloom-probe error here just skips this table's
+        // prewarm (`.ok().flatten()` maps it to None; the authoritative resolve
+        // re-probes and surfaces it).
+        let (passing, mut block_iter, _table_seqno) = self
+            .plan_block_walk_setup(sorted_keys, seqno)
+            .ok()
+            .flatten()?;
 
         // Conservative block-boundary walk (mirrors batch_get's span-retry),
         // collecting only the COLD (uncached) blocks.
@@ -1610,6 +1626,15 @@ impl Table {
     /// boundaries: a key equal to a block's end key is listed in that block AND
     /// the next (an MVCC version of the same key can span the boundary), mirroring
     /// `batch_get`'s span-retry; the higher-seqno hit wins at resolution.
+    ///
+    /// `Ok(None)` means this table covers none of `sorted_keys`. Unlike the
+    /// best-effort prewarm planner, a bloom-probe or table-open failure is
+    /// PROPAGATED (not swallowed to `None`): the chunked resolver is authoritative
+    /// for its level, so a swallowed error would let a stale lower level answer.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a bloom-probe ([`Table::check_bloom`]) or table-open failure.
     #[expect(
         clippy::indexing_slicing,
         reason = "`passing` positions index into `sorted_keys` (< its len); `passing[p]` \
@@ -1619,9 +1644,12 @@ impl Table {
         &self,
         sorted_keys: &[(&[u8], u64)],
         seqno: SeqNo,
-    ) -> Option<BlockTaskPlan> {
-        let (passing, mut block_iter, table_seqno) =
-            self.plan_block_walk_setup(sorted_keys, seqno)?;
+    ) -> crate::Result<Option<BlockTaskPlan>> {
+        let Some((passing, mut block_iter, table_seqno)) =
+            self.plan_block_walk_setup(sorted_keys, seqno)?
+        else {
+            return Ok(None);
+        };
 
         let mut blocks: Vec<(BlockHandle, Vec<usize>)> = Vec::new();
         let mut p = 0_usize;
@@ -1655,14 +1683,13 @@ impl Table {
             blocks.push((handle, block_keys));
         }
         if blocks.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let (file, _) = self
             .file_accessor
-            .get_or_open_table(&self.global_id(), &self.path)
-            .ok()?;
-        Some((file, table_seqno, self.is_chunk_special(), blocks))
+            .get_or_open_table(&self.global_id(), &self.path)?;
+        Ok(Some((file, table_seqno, self.is_chunk_special(), blocks)))
     }
 
     /// Decodes a data block from its on-disk bytes (read by the chunked resolver),

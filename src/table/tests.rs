@@ -1406,6 +1406,77 @@ fn table_partitioned_filter() -> crate::Result<()> {
 }
 
 #[test]
+#[expect(clippy::unwrap_used, reason = "test code")]
+fn plan_block_tasks_propagates_a_faulted_bloom_probe() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultInjector, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    // A partitioned, unpinned filter makes `check_bloom` read a filter partition
+    // block from disk on lookup; that read is the planning I/O that can fail.
+    let items: Vec<InternalValue> = (0..64u32)
+        .map(|i| {
+            InternalValue::from_components(
+                format!("key{i:04}").into_bytes(),
+                b"v".to_vec(),
+                1,
+                crate::ValueType::Value,
+            )
+        })
+        .collect();
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let injector = Arc::new(FaultInjector::new());
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(FaultFs::with_injector(StdFs, Arc::clone(&injector)));
+
+    let checksum = {
+        let mut writer = Writer::new(file.clone(), 0, 0, Arc::clone(&fs))?
+            .use_partitioned_filter()
+            .use_meta_partition_size(8);
+        for item in &items {
+            writer.write(item.clone())?;
+        }
+        writer.finish()?.unwrap().1
+    };
+
+    let table = Table::recover(
+        file.clone(),
+        checksum,
+        0,
+        0,
+        0,
+        Arc::new(Cache::with_capacity_bytes(1_000_000)),
+        Some(Arc::new(DescriptorTable::new(10))),
+        Arc::clone(&fs),
+        false, // do not pin index
+        false, // do not pin filter: partition blocks read lazily
+        None,
+        #[cfg(zstd_any)]
+        None,
+        crate::comparator::default_comparator(),
+        #[cfg(feature = "metrics")]
+        Arc::new(Metrics::default()),
+    )?;
+
+    // Recovery is done (its reads passed cleanly); now fail the NEXT positional
+    // read of the table file: the filter partition block `check_bloom` loads.
+    injector.arm(FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other)).on_path("table"));
+
+    let key = b"key0000".as_slice();
+    let sorted = [(key, hash64(key))];
+    let result = table.plan_block_tasks(&sorted, SeqNo::MAX);
+
+    // The serial path propagates a bloom-probe error via `?`; the chunked planner
+    // must too, so a faulted probe surfaces as Err instead of a swallowed miss
+    // that would let a stale lower level answer.
+    assert!(
+        result.is_err(),
+        "a faulted bloom-probe read must surface as Err, not a swallowed miss"
+    );
+    Ok(())
+}
+
+#[test]
 fn table_seqnos() -> crate::Result<()> {
     use crate::ValueType::Value;
 

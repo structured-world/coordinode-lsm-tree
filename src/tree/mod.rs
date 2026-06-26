@@ -2835,6 +2835,11 @@ impl Tree {
     /// Plans every data block this level's SSTs will read for `remaining`,
     /// grouping keys by covering table per run (mirrors `resolve_run_batched`'s
     /// walk). Each task carries the ORIGINAL key indices (into `keys`).
+    ///
+    /// # Errors
+    ///
+    /// Propagates a table-side planning failure ([`Table::plan_block_tasks`]) so
+    /// the resolver surfaces it instead of letting a stale lower level answer.
     #[expect(
         clippy::indexing_slicing,
         reason = "i < remaining.len() loop-checked; idx/jdx are valid key indices; batch_idx[pos] is in range (pos came from this table's own plan)"
@@ -2845,7 +2850,7 @@ impl Tree {
         keys: &[K],
         seqno: SeqNo,
         comparator: &dyn crate::comparator::UserComparator,
-    ) -> Vec<BlockTask<'a>> {
+    ) -> crate::Result<Vec<BlockTask<'a>>> {
         let mut tasks: Vec<BlockTask<'a>> = Vec::new();
         for run in level.iter() {
             let mut i = 0;
@@ -2872,7 +2877,7 @@ impl Tree {
                     }
                 }
                 if let Some((file, table_seqno, special, blocks)) =
-                    table.plan_block_tasks(&batch, seqno)
+                    table.plan_block_tasks(&batch, seqno)?
                 {
                     for (handle, positions) in blocks {
                         let task_keys: Vec<usize> =
@@ -2889,7 +2894,7 @@ impl Tree {
                 }
             }
         }
-        tasks
+        Ok(tasks)
     }
 
     /// Resolves an ENTIRE level by reading its blocks in chunks into a scratch and
@@ -2913,7 +2918,7 @@ impl Tree {
         comparator: &dyn crate::comparator::UserComparator,
         results: &mut [Option<InternalValue>],
     ) -> crate::Result<bool> {
-        let tasks = Self::plan_level_block_tasks(level, still_remaining, keys, seqno, comparator);
+        let tasks = Self::plan_level_block_tasks(level, still_remaining, keys, seqno, comparator)?;
         let Some(first) = tasks.first() else {
             return Ok(false);
         };
