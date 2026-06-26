@@ -259,14 +259,16 @@ fn multi_get_duplicate_keys_missing_to_disk_match_per_key_get() -> lsm_tree::Res
     tree.insert("k0000", "v0", 0);
     tree.insert("k0008", "v8", 1);
     // Flush so both keys live in an SST: Phase 1 misses them and the duplicate
-    // reaches the batched on-disk path (a batch of >= 3 keys skips the per-key
-    // shortcut).
+    // reaches the batched on-disk path. Pad with absent keys so the batch stays
+    // well above the small-batch per-key shortcut even if that cutoff changes.
     tree.flush_active_memtable(0)?;
 
-    // "k0008" twice + "k0000": three keys, one duplicate, all disk misses.
-    let query = ["k0008", "k0008", "k0000"];
+    // "k0008" twice + "k0000" + absent padding: one duplicate, all disk misses.
+    let query = [
+        "k0008", "k0008", "k0000", "absent_0", "absent_1", "absent_2", "absent_3",
+    ];
     let batched = tree.multi_get(query, SeqNo::MAX)?;
-    assert_eq!(batched.len(), 3);
+    assert_eq!(batched.len(), query.len());
 
     // Each position must equal the authoritative per-key get for the same key.
     for (i, key) in query.iter().enumerate() {
@@ -310,13 +312,17 @@ fn multi_get_blob_tree_duplicate_keys_missing_to_disk_match_per_key_get() -> lsm
     tree.insert("k0000", big0.as_slice(), 0);
     tree.insert("k0008", big8.as_slice(), 1);
     // Flush so both live in an SST: Phase 1 misses them and the duplicate reaches
-    // the batched on-disk path (a batch of >= 3 keys skips the per-key shortcut).
+    // the batched on-disk path. Pad the query with absent keys so it stays well
+    // above the small-batch per-key shortcut even if that cutoff changes, keeping
+    // the duplicate fan-out exercised through the shared resolver.
     tree.flush_active_memtable(0)?;
     assert!(tree.blob_file_count() > 0);
 
-    let query = ["k0008", "k0008", "k0000"];
+    let query = [
+        "k0008", "k0008", "k0000", "absent_0", "absent_1", "absent_2", "absent_3",
+    ];
     let batched = tree.multi_get(query, SeqNo::MAX)?;
-    assert_eq!(batched.len(), 3);
+    assert_eq!(batched.len(), query.len());
 
     for (i, key) in query.iter().enumerate() {
         let single = tree.get(key, SeqNo::MAX)?;
