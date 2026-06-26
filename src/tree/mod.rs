@@ -2896,9 +2896,9 @@ impl Tree {
     /// point-reading directly (no cache, no eviction). Called after
     /// [`Tree::prewarm_level_cross_sst`] signals the cold working set is too large
     /// to warm. Returns `Ok(true)` when it resolved the level (results updated,
-    /// found keys dropped from `still_remaining`); `Ok(false)` only in the
-    /// defensive case where the planned blocks turn out to fit the half-cache
-    /// budget after all (the caller then falls through to the serial resolve).
+    /// found keys dropped from `still_remaining`); `Ok(false)` only when the level
+    /// has no blocks to read for this batch (every key bloom-skips), in which case
+    /// the caller falls through to the serial resolve.
     #[expect(
         clippy::indexing_slicing,
         reason = "start/end stay within tasks by construction"
@@ -2916,13 +2916,11 @@ impl Tree {
         let Some(first) = tasks.first() else {
             return Ok(false);
         };
-        let total: u64 = tasks.iter().map(|t| u64::from(t.handle.size())).sum();
-        // Below half the shared cache the existing prewarm fits without eviction;
-        // only above it does the chunked read-into-scratch avoid re-reads.
-        let budget = first.table.cache_capacity() / 2;
-        if budget == 0 || total <= budget {
-            return Ok(false);
-        }
+        // Read blocks in chunks of at most half the shared cache, so a chunk's
+        // scratch never dwarfs the cache it is meant to spare. `.max(1)` keeps the
+        // chunk loop's `end > start` guard the sole progress condition when the
+        // cache is disabled (capacity 0).
+        let budget = (first.table.cache_capacity() / 2).max(1);
 
         let mut start = 0;
         while start < tasks.len() {
