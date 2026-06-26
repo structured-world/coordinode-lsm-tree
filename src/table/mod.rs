@@ -1455,6 +1455,44 @@ impl Table {
         Ok(results)
     }
 
+    /// Shared setup for the prewarm and chunked block planners: rejects a table
+    /// that cannot contribute (empty input, or entirely above the read snapshot),
+    /// bloom-filters `sorted_keys` to the passing positions, and opens a forward
+    /// block-index reader at the first passing key. Returns those passing
+    /// positions, the reader, and the table-local read seqno, or `None` when
+    /// nothing passes.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "passing[0] is valid after the emptiness check"
+    )]
+    fn plan_block_walk_setup(
+        &self,
+        sorted_keys: &[(&[u8], u64)],
+        seqno: SeqNo,
+    ) -> Option<(Vec<usize>, block_index::BlockIndexIterImpl, SeqNo)> {
+        if sorted_keys.is_empty() {
+            return None;
+        }
+        let global_seqno = self.global_seqno();
+        let table_seqno = seqno.checked_sub(global_seqno)?;
+        if self.metadata.seqnos.0 >= table_seqno {
+            return None;
+        }
+        let mut passing: Vec<usize> = Vec::with_capacity(sorted_keys.len());
+        for (i, (key, hash)) in sorted_keys.iter().enumerate() {
+            if !self.check_bloom(key, *hash).ok()?.should_skip() {
+                passing.push(i);
+            }
+        }
+        if passing.is_empty() {
+            return None;
+        }
+        let block_iter = self
+            .block_index
+            .forward_reader(sorted_keys[passing[0]].0, table_seqno)?;
+        Some((passing, block_iter, table_seqno))
+    }
+
     /// Plans the COLD (uncached) data blocks [`Table::batch_get`] will read for
     /// `sorted_keys`, returning this table's file handle alongside them so the
     /// caller can read the blocks of MANY SSTs in one cross-file batch (see the
@@ -1466,9 +1504,8 @@ impl Table {
     /// query result, since `batch_get` re-reads every block authoritatively.
     #[expect(
         clippy::indexing_slicing,
-        reason = "`passing` indices come from enumerate(sorted_keys) so they are \
-                  < sorted_keys.len(); `passing[p]` is guarded by `p < passing.len()` \
-                  each iteration; `passing[0]` after the emptiness check."
+        reason = "`passing` positions index into `sorted_keys` (< its len); `passing[p]` \
+                  is guarded by `p < passing.len()` each iteration."
     )]
     pub(crate) fn plan_prewarm(
         &self,
@@ -1482,28 +1519,8 @@ impl Table {
         if self.metadata.columnar {
             return None;
         }
-        if sorted_keys.is_empty() {
-            return None;
-        }
-        let global_seqno = self.global_seqno();
-        let table_seqno = seqno.checked_sub(global_seqno)?;
-        if self.metadata.seqnos.0 >= table_seqno {
-            return None;
-        }
-
-        let mut passing: Vec<usize> = Vec::with_capacity(sorted_keys.len());
-        for (i, (key, hash)) in sorted_keys.iter().enumerate() {
-            if !self.check_bloom(key, *hash).ok()?.should_skip() {
-                passing.push(i);
-            }
-        }
-        if passing.is_empty() {
-            return None;
-        }
-
-        let mut block_iter = self
-            .block_index
-            .forward_reader(sorted_keys[passing[0]].0, table_seqno)?;
+        let (passing, mut block_iter, _table_seqno) =
+            self.plan_block_walk_setup(sorted_keys, seqno)?;
 
         // Conservative block-boundary walk (mirrors batch_get's span-retry),
         // collecting only the COLD (uncached) blocks.
@@ -1595,37 +1612,16 @@ impl Table {
     /// `batch_get`'s span-retry; the higher-seqno hit wins at resolution.
     #[expect(
         clippy::indexing_slicing,
-        reason = "`passing` indices come from enumerate(sorted_keys) so they are \
-                  < sorted_keys.len(); `passing[p]` is guarded by `p < passing.len()` \
-                  each iteration; `passing[0]` after the emptiness check."
+        reason = "`passing` positions index into `sorted_keys` (< its len); `passing[p]` \
+                  is guarded by `p < passing.len()` each iteration."
     )]
     pub(crate) fn plan_block_tasks(
         &self,
         sorted_keys: &[(&[u8], u64)],
         seqno: SeqNo,
     ) -> Option<BlockTaskPlan> {
-        if sorted_keys.is_empty() {
-            return None;
-        }
-        let global_seqno = self.global_seqno();
-        let table_seqno = seqno.checked_sub(global_seqno)?;
-        if self.metadata.seqnos.0 >= table_seqno {
-            return None;
-        }
-
-        let mut passing: Vec<usize> = Vec::with_capacity(sorted_keys.len());
-        for (i, (key, hash)) in sorted_keys.iter().enumerate() {
-            if !self.check_bloom(key, *hash).ok()?.should_skip() {
-                passing.push(i);
-            }
-        }
-        if passing.is_empty() {
-            return None;
-        }
-
-        let mut block_iter = self
-            .block_index
-            .forward_reader(sorted_keys[passing[0]].0, table_seqno)?;
+        let (passing, mut block_iter, table_seqno) =
+            self.plan_block_walk_setup(sorted_keys, seqno)?;
 
         let mut blocks: Vec<(BlockHandle, Vec<usize>)> = Vec::new();
         let mut p = 0_usize;

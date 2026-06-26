@@ -2896,9 +2896,10 @@ impl Tree {
     /// point-reading directly (no cache, no eviction). Called after
     /// [`Tree::prewarm_level_cross_sst`] signals the cold working set is too large
     /// to warm. Returns `Ok(true)` when it resolved the level (results updated,
-    /// found keys dropped from `still_remaining`); `Ok(false)` only when the level
-    /// has no blocks to read for this batch (every key bloom-skips), in which case
-    /// the caller falls through to the serial resolve.
+    /// found keys dropped from `still_remaining`); `Ok(false)` when the level has
+    /// no blocks to read for this batch (every key bloom-skips) or holds a
+    /// Page-ECC / columnar table, in which cases the caller falls through to the
+    /// serial resolve.
     #[expect(
         clippy::indexing_slicing,
         reason = "start/end stay within tasks by construction"
@@ -2916,6 +2917,14 @@ impl Tree {
         let Some(first) = tasks.first() else {
             return Ok(false);
         };
+        // A Page-ECC / columnar table covers some of these keys (only possible
+        // when the columnar/ECC policy differs between the SSTs in this level).
+        // The scratch decode path is row-format only, so hand the whole level to
+        // the serial resolve, which loads those blocks through their format-aware
+        // path. The scratch fast path stays homogeneous and row-only.
+        if tasks.iter().any(|t| t.special) {
+            return Ok(false);
+        }
         // Read blocks in chunks of at most half the shared cache, so a chunk's
         // scratch never dwarfs the cache it is meant to spare. `.max(1)` keeps the
         // chunk loop's `end > start` guard the sole progress condition when the
@@ -2941,13 +2950,13 @@ impl Tree {
         Ok(true)
     }
 
-    /// Reads one chunk of block-tasks (non-special tasks in ONE cross-file
-    /// `read_blocks_batched`; Page-ECC / columnar tasks via `load_data_block`),
-    /// decodes each, and point-reads its keys, keeping the highest-seqno hit per
-    /// key in `results`.
+    /// Reads one chunk of block-tasks in ONE cross-file `read_blocks_batched`,
+    /// decodes each from its scratch buffer, and point-reads its keys, keeping the
+    /// highest-seqno hit per key in `results`. Every task is row-format (the caller
+    /// routes any level with a Page-ECC / columnar table to the serial resolve).
     #[expect(
         clippy::indexing_slicing,
-        reason = "buffer/normal indices are built from chunk itself; key indices are valid (caller's keys/results aligned)"
+        reason = "buffers is built from chunk so indices align; key indices are valid (caller's keys/results aligned)"
     )]
     fn resolve_block_task_chunk<K: AsRef<[u8]>>(
         fs: &dyn crate::fs::Fs,
@@ -2955,45 +2964,25 @@ impl Tree {
         keys: &[K],
         results: &mut [Option<InternalValue>],
     ) -> crate::Result<()> {
-        let normal: Vec<usize> = (0..chunk.len()).filter(|&t| !chunk[t].special).collect();
-        let mut buffers: Vec<Vec<u8>> = normal
+        let mut buffers: Vec<Vec<u8>> = chunk
             .iter()
-            .map(|&t| vec![0u8; chunk[t].handle.size() as usize])
+            .map(|t| vec![0u8; t.handle.size() as usize])
             .collect();
         {
-            let mut reqs: Vec<crate::fs::BlockRead<'_>> = normal
+            let mut reqs: Vec<crate::fs::BlockRead<'_>> = chunk
                 .iter()
                 .zip(buffers.iter_mut())
-                .map(|(&t, buf)| crate::fs::BlockRead {
-                    file: chunk[t].file.as_ref(),
-                    offset: *chunk[t].handle.offset(),
+                .map(|(t, buf)| crate::fs::BlockRead {
+                    file: t.file.as_ref(),
+                    offset: *t.handle.offset(),
                     buf: buf.as_mut_slice(),
                 })
                 .collect();
-            if !reqs.is_empty() {
-                fs.read_blocks_batched(&mut reqs)?;
-            }
+            fs.read_blocks_batched(&mut reqs)?;
         }
 
-        for (ni, &t) in normal.iter().enumerate() {
-            let task = &chunk[t];
-            if let Some(block) = task.table.decode_data_block_from_bytes(&buffers[ni])? {
-                for &kidx in &task.keys {
-                    if let Some(item) = task.table.point_read_translated(
-                        &block,
-                        keys[kidx].as_ref(),
-                        task.table_seqno,
-                    )? {
-                        Self::keep_highest(results, kidx, item);
-                    }
-                }
-            }
-        }
-
-        // Special tasks (Page-ECC re-read recovery / columnar reconstruction) take
-        // the full load path, one block at a time.
-        for task in chunk.iter().filter(|t| t.special) {
-            if let Some(block) = task.table.load_data_block(&task.handle)? {
+        for (task, buf) in chunk.iter().zip(buffers.iter()) {
+            if let Some(block) = task.table.decode_data_block_from_bytes(buf)? {
                 for &kidx in &task.keys {
                     if let Some(item) = task.table.point_read_translated(
                         &block,
