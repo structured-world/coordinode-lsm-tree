@@ -1123,13 +1123,25 @@ impl AbstractTree for BlobTree {
         if !remaining.is_empty() {
             remaining.sort_by(|&a, &b| comparator.compare(keys[a].as_ref(), keys[b].as_ref()));
 
-            let miss_keys: Vec<(usize, u64)> = remaining
-                .iter()
-                .map(|&idx| {
-                    let hash = crate::hash::hash64(keys[idx].as_ref());
-                    (idx, hash)
-                })
-                .collect();
+            // De-duplicate equal query keys before the batched on-disk path: it
+            // requires strictly-sorted-unique input (a duplicate would break its
+            // two-pointer walk). Keep one representative index per distinct key
+            // and remember each duplicate, to copy the representative's resolved
+            // entry back once the batch returns.
+            let mut miss_keys: Vec<(usize, u64)> = Vec::with_capacity(remaining.len());
+            let mut duplicates: Vec<(usize, usize)> = Vec::new(); // (duplicate idx, representative idx)
+            for &idx in &remaining {
+                let key = keys[idx].as_ref();
+                match miss_keys.last() {
+                    Some(&(rep_idx, _))
+                        if comparator.compare(keys[rep_idx].as_ref(), key)
+                            == core::cmp::Ordering::Equal =>
+                    {
+                        duplicates.push((idx, rep_idx));
+                    }
+                    _ => miss_keys.push((idx, crate::hash::hash64(key))),
+                }
+            }
 
             crate::Tree::batch_get_from_tables(
                 &super_version.version,
@@ -1140,6 +1152,13 @@ impl AbstractTree for BlobTree {
                 &*self.index.config.fs,
                 &mut internal_entries,
             )?;
+
+            // Fan each representative's resolved entry out to its duplicate
+            // positions, so every input position carries the same answer.
+            for (dup_idx, rep_idx) in duplicates {
+                let resolved = internal_entries[rep_idx].clone();
+                internal_entries[dup_idx] = resolved;
+            }
         }
 
         // Phase 3: Resolve each entry (tombstones, RT suppression, merge, blob indirections)
