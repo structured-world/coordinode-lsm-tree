@@ -1548,6 +1548,59 @@ fn plan_block_tasks_propagates_a_faulted_index_read() -> crate::Result<()> {
 }
 
 #[test]
+#[expect(clippy::unwrap_used, reason = "test code")]
+fn plan_block_tasks_returns_none_for_a_table_above_the_snapshot() -> crate::Result<()> {
+    // All items live at seqno 10; a read at seqno 5 sees the whole table above
+    // the snapshot, so the planner contributes nothing (and never touches disk).
+    let items: Vec<InternalValue> = (0u32..16)
+        .map(|i| {
+            InternalValue::from_components(
+                format!("k{i:04}").into_bytes(),
+                b"v".to_vec(),
+                10,
+                crate::ValueType::Value,
+            )
+        })
+        .collect();
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = {
+        let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+        for item in &items {
+            writer.write(item.clone())?;
+        }
+        writer.finish()?.unwrap().1
+    };
+
+    let table = Table::recover(
+        file,
+        checksum,
+        0,
+        0,
+        0,
+        Arc::new(Cache::with_capacity_bytes(1_000_000)),
+        Some(Arc::new(DescriptorTable::new(10))),
+        Arc::new(StdFs),
+        false,
+        false,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        crate::comparator::default_comparator(),
+        #[cfg(feature = "metrics")]
+        Arc::new(Metrics::default()),
+    )?;
+
+    let key = b"k0000".as_slice();
+    let sorted = [(key, hash64(key))];
+    // Read seqno 5 is below the table's lowest seqno (10): entirely above the
+    // snapshot, so the planner returns Ok(None) before any bloom or index read.
+    assert!(table.plan_block_tasks(&sorted, 5)?.is_none());
+    Ok(())
+}
+
+#[test]
 fn table_seqnos() -> crate::Result<()> {
     use crate::ValueType::Value;
 

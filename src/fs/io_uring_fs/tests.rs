@@ -609,10 +609,13 @@ fn read_many_short_read_at_eof_errors() -> io::Result<()> {
     file.write_all(&[0u8; 10])?;
     file.sync_all()?;
 
-    // A region that runs past EOF cannot be filled completely; the batched
-    // submission reports the fixed-size short read as UnexpectedEof, not EOF.
-    let mut buf = [0u8; 32];
-    let mut regions: Vec<(u64, &mut [u8])> = vec![(0, &mut buf[..])];
+    // First region runs past EOF (a fixed-size short read = UnexpectedEof, not
+    // EOF); the second is in range. The first failing must NOT short-circuit the
+    // drain: every later op is still recv'd so its in-flight kernel write
+    // completes before the buffers are freed. The call surfaces the first error.
+    let mut short = [0u8; 32];
+    let mut ok = [0u8; 4];
+    let mut regions: Vec<(u64, &mut [u8])> = vec![(0, &mut short[..]), (0, &mut ok[..])];
     match file.read_many(&mut regions) {
         Ok(()) => panic!("read past EOF must fail, not report a short read as success"),
         Err(err) => assert_eq!(err.kind(), crate::io::ErrorKind::UnexpectedEof),
@@ -631,15 +634,68 @@ fn read_blocks_batched_short_read_at_eof_errors() -> io::Result<()> {
     file.write_all(&[0u8; 10])?;
     file.sync_all()?;
 
-    let mut buf = [0u8; 64];
+    // First block runs past EOF; the second is in range. The failing block must
+    // not short-circuit the drain (every later op is recv'd before return).
+    let mut short = [0u8; 64];
+    let mut ok = [0u8; 4];
     {
-        let mut reqs = vec![crate::fs::BlockRead {
-            file: file.as_ref(),
-            offset: 0,
-            buf: &mut buf,
-        }];
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: file.as_ref(),
+                offset: 0,
+                buf: &mut short,
+            },
+            crate::fs::BlockRead {
+                file: file.as_ref(),
+                offset: 0,
+                buf: &mut ok,
+            },
+        ];
         match fs.read_blocks_batched(&mut reqs) {
             Ok(()) => panic!("read past EOF must fail, not report a short read as success"),
+            Err(err) => assert_eq!(err.kind(), crate::io::ErrorKind::UnexpectedEof),
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn read_blocks_batched_fallback_short_read_errors() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&[0u8; 64])?;
+    uring_file.sync_all()?;
+
+    // A StdFs handle (no fd for the ring) forces the whole batch onto the serial
+    // read_at fallback; its block runs past EOF, so the fallback's fixed-size
+    // short read is reported as UnexpectedEof, not a silent partial fill.
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    std_file.write_all(&[0u8; 10])?;
+    std_file.sync_all()?;
+
+    let mut b0 = [0u8; 8];
+    let mut b1 = [0u8; 64]; // past EOF on the std file
+    {
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 0,
+                buf: &mut b0,
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: 0,
+                buf: &mut b1,
+            },
+        ];
+        match fs.read_blocks_batched(&mut reqs) {
+            Ok(()) => panic!("a short read in the serial fallback must fail"),
             Err(err) => assert_eq!(err.kind(), crate::io::ErrorKind::UnexpectedEof),
         }
     }
