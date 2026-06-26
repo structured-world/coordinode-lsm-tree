@@ -1550,8 +1550,11 @@ fn plan_block_tasks_propagates_a_faulted_index_read() -> crate::Result<()> {
 #[test]
 #[expect(clippy::unwrap_used, reason = "test code")]
 fn plan_block_tasks_returns_none_for_a_table_above_the_snapshot() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultInjector, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
     // All items live at seqno 10; a read at seqno 5 sees the whole table above
-    // the snapshot, so the planner contributes nothing (and never touches disk).
+    // the snapshot, so the planner contributes nothing and never touches disk.
     let items: Vec<InternalValue> = (0u32..16)
         .map(|i| {
             InternalValue::from_components(
@@ -1565,8 +1568,11 @@ fn plan_block_tasks_returns_none_for_a_table_above_the_snapshot() -> crate::Resu
 
     let dir = tempdir()?;
     let file = dir.path().join("table");
+    let injector = Arc::new(FaultInjector::new());
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(FaultFs::with_injector(StdFs, Arc::clone(&injector)));
+
     let checksum = {
-        let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+        let mut writer = Writer::new(file.clone(), 0, 0, Arc::clone(&fs))?;
         for item in &items {
             writer.write(item.clone())?;
         }
@@ -1581,7 +1587,7 @@ fn plan_block_tasks_returns_none_for_a_table_above_the_snapshot() -> crate::Resu
         0,
         Arc::new(Cache::with_capacity_bytes(1_000_000)),
         Some(Arc::new(DescriptorTable::new(10))),
-        Arc::new(StdFs),
+        Arc::clone(&fs),
         false,
         false,
         None,
@@ -1592,10 +1598,15 @@ fn plan_block_tasks_returns_none_for_a_table_above_the_snapshot() -> crate::Resu
         Arc::new(Metrics::default()),
     )?;
 
+    // Recovery is done; fail ANY further positional read of the table file. The
+    // above-snapshot guard must short-circuit before any bloom or index read, so
+    // the fault must never fire: the call returns Ok(None), not Err.
+    injector.arm(FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other)).on_path("table"));
+
     let key = b"k0000".as_slice();
     let sorted = [(key, hash64(key))];
     // Read seqno 5 is below the table's lowest seqno (10): entirely above the
-    // snapshot, so the planner returns Ok(None) before any bloom or index read.
+    // snapshot. Ok(None) despite the armed read fault proves the no-read path.
     assert!(table.plan_block_tasks(&sorted, 5)?.is_none());
     Ok(())
 }
