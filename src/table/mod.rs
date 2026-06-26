@@ -1654,9 +1654,14 @@ impl Table {
         let mut blocks: Vec<(BlockHandle, Vec<usize>)> = Vec::new();
         let mut p = 0_usize;
         while p < passing.len() {
-            let Some(Ok(block_handle)) = block_iter.next() else {
+            // None ends the index; an Err (index-read / decode failure) is
+            // PROPAGATED, not treated as end-of-index. Swallowing it would skip
+            // the rest of this table and let a lower level answer a key the
+            // failed table actually covers (same `?` contract as `batch_get`).
+            let Some(handle_result) = block_iter.next() else {
                 break;
             };
+            let block_handle = handle_result?;
             let end_key = block_handle.end_key();
             let first_in_block = sorted_keys[passing[p]].0;
             if self.comparator.compare(first_in_block, end_key) == core::cmp::Ordering::Greater {
