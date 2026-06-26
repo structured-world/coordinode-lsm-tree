@@ -598,6 +598,55 @@ fn read_blocks_batched_across_files_via_ring() -> io::Result<()> {
 }
 
 #[test]
+fn read_many_short_read_at_eof_errors() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("short_many.bin");
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+    let mut file = fs.open(&path, &opts)?;
+    file.write_all(&[0u8; 10])?;
+    file.sync_all()?;
+
+    // A region that runs past EOF cannot be filled completely; the batched
+    // submission reports the fixed-size short read as UnexpectedEof, not EOF.
+    let mut buf = [0u8; 32];
+    let mut regions: Vec<(u64, &mut [u8])> = vec![(0, &mut buf[..])];
+    match file.read_many(&mut regions) {
+        Ok(()) => panic!("read past EOF must fail, not report a short read as success"),
+        Err(err) => assert_eq!(err.kind(), crate::io::ErrorKind::UnexpectedEof),
+    }
+    Ok(())
+}
+
+#[test]
+fn read_blocks_batched_short_read_at_eof_errors() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+    let mut file = fs.open(&dir.path().join("short_block.bin"), &opts)?;
+    file.write_all(&[0u8; 10])?;
+    file.sync_all()?;
+
+    let mut buf = [0u8; 64];
+    {
+        let mut reqs = vec![crate::fs::BlockRead {
+            file: file.as_ref(),
+            offset: 0,
+            buf: &mut buf,
+        }];
+        match fs.read_blocks_batched(&mut reqs) {
+            Ok(()) => panic!("read past EOF must fail, not report a short read as success"),
+            Err(err) => assert_eq!(err.kind(), crate::io::ErrorKind::UnexpectedEof),
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn read_blocks_batched_falls_back_for_non_uring_file() -> io::Result<()> {
     let Some(fs) = try_io_uring() else {
         return Ok(());
