@@ -1440,7 +1440,7 @@ fn plan_block_tasks_propagates_a_faulted_bloom_probe() -> crate::Result<()> {
     };
 
     let table = Table::recover(
-        file.clone(),
+        file,
         checksum,
         0,
         0,
