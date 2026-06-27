@@ -11,6 +11,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.7.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.6.0...v5.7.0) - 2026-06-27
+
+### Added
+
+- *(salvage)* block-granular SST salvage ([#560](https://github.com/structured-world/coordinode-lsm-tree/pull/560))
+- *(columnar)* delete-density rewrite, read-path perf, backpressure + zstd fixes ([#559](https://github.com/structured-world/coordinode-lsm-tree/pull/559))
+- *(fs)* fault-injection harness and power-loss crash simulator ([#555](https://github.com/structured-world/coordinode-lsm-tree/pull/555))
+- compaction-debt write-backpressure verdict ([#554](https://github.com/structured-world/coordinode-lsm-tree/pull/554))
+
+### Documentation
+
+- README quick start, comparison table, and discoverability metadata ([#565](https://github.com/structured-world/coordinode-lsm-tree/pull/565))
+
+### Performance
+
+- *(multi_get)* coalesce a batch's block reads across SSTs ([#563](https://github.com/structured-world/coordinode-lsm-tree/pull/563))
+
+### Testing
+
+- *(external-wal)* reference implementation and end-to-end recipe test ([#561](https://github.com/structured-world/coordinode-lsm-tree/pull/561))
+- *(format)* cross-feature + cross-version compatibility matrix ([#557](https://github.com/structured-world/coordinode-lsm-tree/pull/557))
+
 ## [5.6.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.5.0...v5.6.0) - 2026-06-24
 
 ### Added
