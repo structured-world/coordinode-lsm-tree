@@ -1056,6 +1056,14 @@ fn multi_get_variant(c: &mut Criterion, group_name: &str, compression: Compressi
                         let probe = tree
                             .multi_get(inputs.keys.iter(), MAX_SEQNO)
                             .expect("ours: verify");
+                        // Cardinality before presence: a batched API that dropped
+                        // positions would otherwise pass the presence check while
+                        // the timed loop measures fewer than `n` lookups.
+                        assert_eq!(
+                            probe.len(),
+                            inputs.keys.len(),
+                            "ours: multi_get must return one result per input key"
+                        );
                         assert!(
                             probe.iter().all(Option::is_some),
                             "ours: key unexpectedly missing"
@@ -1097,6 +1105,11 @@ fn multi_get_variant(c: &mut Criterion, group_name: &str, compression: Compressi
                             .cf_handle(rocksdb::DEFAULT_COLUMN_FAMILY_NAME)
                             .expect("rocksdb: default cf");
                         let probe = db.batched_multi_get_cf(&cf, inputs.keys.iter(), false);
+                        assert_eq!(
+                            probe.len(),
+                            inputs.keys.len(),
+                            "rocksdb: batched_multi_get_cf must return one result per input key"
+                        );
                         assert!(
                             probe.iter().all(|r| matches!(r, Ok(Some(_)))),
                             "rocksdb: key unexpectedly missing"
