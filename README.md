@@ -25,13 +25,12 @@ coordinode-lsm-tree = "5.7"
 ```rust
 use lsm_tree::{AbstractTree, Config, SeqNo, SequenceNumberCounter};
 
-let dir = tempfile::tempdir()?;
 let seqno = SequenceNumberCounter::default();
 
-// Two counters: one hands out write sequence numbers, the other tracks the
-// persisted watermark. The default build adds no compression or encryption
-// (see the feature-flag table below to opt in).
-let tree = Config::new(dir.path(), seqno.clone(), SequenceNumberCounter::default()).open()?;
+// Point the engine at a directory on disk. Two counters: one hands out write
+// sequence numbers, the other tracks the persisted watermark. The default build
+// adds no compression or encryption (see the feature-flag table below to opt in).
+let tree = Config::new("my_db", seqno.clone(), SequenceNumberCounter::default()).open()?;
 
 tree.insert("key", "value", seqno.next());
 
