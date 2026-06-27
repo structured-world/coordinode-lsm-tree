@@ -285,6 +285,23 @@ pub fn decode_prewarmed_blocks(
         window_log: 0,
     };
 
+    // Invariant: prewarm only ever caches NON-ECC blocks. `Table::plan_prewarm`
+    // returns `None` for any table whose `ecc_params` is set, so the prewarm pass
+    // never gathers an ECC block's bytes, and `ecc` here is always `None`. This
+    // matters for data integrity: `from_reader` repairs an ECC-corrected payload
+    // silently (it returns no `EccStatus`), so caching a corrected block as clean
+    // would let later `load_block` cache hits skip `from_file_with_recovery` /
+    // `maybe_record_persistent_heal`, leaving the latent on-disk fault unscheduled
+    // for healing. With `ecc` always `None` the insert below cannot capture a
+    // corrected block. The assert pins the invariant: if prewarm is ever extended
+    // to ECC tables, this trips and the decode must first move to a
+    // status-returning path that leaves corrected blocks uncached.
+    debug_assert!(
+        ecc.is_none(),
+        "prewarm must not cache ECC blocks: plan_prewarm gates ECC tables out, and \
+         from_reader would silently cache an ECC-corrected block as if it were clean"
+    );
+
     for (handle, buf) in handles.iter().zip(buffers.iter()) {
         // Same decode as load_block (from_reader shares the header / ECC /
         // decrypt helpers), so the cached block is byte-identical to what the
