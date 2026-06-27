@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782402766592,
+  "lastUpdate": 1782555365872,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -20310,6 +20310,84 @@ window.BENCHMARK_DATA = {
             "value": 690554.3169965147,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 4.7us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "912dd0366d4d59a8872092805f85d3c682818f58",
+          "message": "perf(multi_get): coalesce a batch's block reads across SSTs (#563)\n\n## Summary\n\nResolves a `multi_get` batch through per-table batched gets and\ncoalesced cross-SST block reads instead of an independent per-key `get`:\n\n- **Batched per-table gets** — keys covered by the same table within a\nrun share one bloom probe and one data-block decode (byte-identical to\nper-key resolution).\n- **Cross-SST batched block I/O** — `Fs::read_blocks_batched` +\n`BlockRead` read a level's data blocks across all its SSTs in one\nbatched read at the `Fs` boundary. Default impls read serially; the\nio_uring backend submits them in one submit-and-wait, which the kernel\nfans out across the underlying devices.\n- **Warm prewarm** — `prewarm_level_cross_sst` warms a level's cold\nblocks in one batched read so the resolve walk hits the cache, bounded\nto half the shared cache to avoid eviction.\n- **Chunked read-into-scratch** — when the cold working set exceeds that\nbound, the level is resolved by reading its blocks in budget-sized\nchunks into a scratch and point-reading directly (no cache, no\neviction), extending the coalescing to working sets larger than the\ncache.\n\n`multi_get` de-duplicates equal query keys before the batched on-disk\npath and fans the shared answer back to every position.\n\n## Benchmarks (vs RocksDB `batched_multi_get_cf`)\n\n| batch | ours | rocksdb | delta |\n|------|------|---------|-------|\n| 1 000 | 700 µs | 771 µs | +9% |\n| 10 000 | 7.80 ms | 9.40 ms | +17% |\n| 70 000 | 78.7 ms | 112 ms | +30% |\n\nChunked oversize path (1M keys, working set larger than the cache,\nio_uring, cold real disk): ~13-14% faster than the serial fallback it\nreplaces, with non-overlapping run distributions.\n\n## Testing\n\n- Full suite green (2195 tests)\n- Parity proptests: `multi_get` equals per-key `get` across random MVCC\nstates; a tiny-cache variant forces the chunked path (447 path-hits at\n2000 cases)\n- Regression tests for duplicate disk-miss keys and oversize batches\n- clippy (default / all-features / linux io-uring / no-std target)\nclean, no-std errcount 0\n\nCloses #553\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Enhanced batched read performance, including shared io_uring batching\nacross files when supported, with improved planning for large on-disk\nworkloads.\n  * Improved prewarming so ECC-enabled tables are correctly excluded.\n* **Bug Fixes**\n* Fixed duplicate-key handling in batch lookups so results match\nsingle-key reads for every input position.\n* Improved EOF behavior for batched reads: short reads past end-of-file\nnow reliably return an error instead of succeeding.\n* **Documentation**\n* Updated slow-test timeout guidance to clarify the default threshold\nand the exceptions that intentionally run longer.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-27T13:15:14+03:00",
+          "tree_id": "5fbda755420f1a5f1692a3f58f1bc68e63466324",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/912dd0366d4d59a8872092805f85d3c682818f58"
+        },
+        "date": 1782555364540,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2079468.8354528476,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1190976.4502092972,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 871249.1260336657,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.2us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3770373.6855063443,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.0us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 458537.0192984475,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.2us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 236151.22156008697,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 4.9us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.85s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1251682.9346437387,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.1us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1081176.516824431,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.5us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 695038.709781294,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.7us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
