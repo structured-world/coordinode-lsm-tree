@@ -15,6 +15,35 @@ LSM-tree storage engine in Rust. Embedded library; provides keyed point reads, p
 
 On-disk format version **V5**. V5 introduces a wire-format break for filter blocks (BuRR replaces Bloom); V3 and V4 databases are not readable by this version and vice versa. Versioning is single-monotonic: every breaking format change bumps to the next version with explicit migration notes.
 
+## Quick start
+
+```toml
+[dependencies]
+coordinode-lsm-tree = "5.7"
+```
+
+```rust
+use lsm_tree::{AbstractTree, Config, SeqNo, SequenceNumberCounter};
+
+let dir = tempfile::tempdir()?;
+let seqno = SequenceNumberCounter::default();
+
+// Two counters: one hands out write sequence numbers, the other tracks the
+// persisted watermark. The default build adds no compression or encryption
+// (see the feature-flag table below to opt in).
+let tree = Config::new(dir.path(), seqno.clone(), SequenceNumberCounter::default()).open()?;
+
+tree.insert("key", "value", seqno.next());
+
+// Read at the latest visible snapshot. MVCC: pass any past SeqNo to read as-of.
+let value = tree.get("key", SeqNo::MAX)?;
+assert_eq!(value.as_deref(), Some(b"value".as_ref()));
+
+// No write-ahead log by design: call flush when you need durability (or layer
+// your own WAL, see docs/external-wal.md).
+tree.flush_active_memtable(0)?;
+```
+
 ## Features
 
 ### Read path
@@ -81,6 +110,56 @@ On-disk format version **V5**. V5 introduces a wire-format break for filter bloc
 - Pluggable `Fs` trait: back the engine on the standard filesystem, on `io_uring`, on an in-memory `MemFs`, or on a custom implementation.
 - Pluggable `CompressionProvider` for third-party codecs.
 
+## Comparison
+
+A factual capability matrix, not a benchmark: pick by the capabilities your
+workload needs; for throughput / latency see [Benchmarks](#benchmarks).
+
+| | coordinode-lsm-tree | RocksDB | sled | redb |
+|---|---|---|---|---|
+| Implementation | pure Rust | C++ (FFI bindings) | pure Rust | pure Rust |
+| Data structure | LSM-tree | LSM-tree | log-structured | B+tree (copy-on-write) |
+| MVCC snapshot reads | ✅ (read at any `SeqNo`) | ✅ (snapshots) | ✅ (transactions) | ✅ (read transactions) |
+| `no_std` + `alloc` | ✅ | no | no | no |
+| Encryption at rest | ✅ built-in (AES-256-GCM) | wrapper / plugin | no | no |
+| Per-block ECC + self-heal | ✅ | no | no | no |
+| Columnar (PAX) blocks | ✅ | no | no | no |
+| CDC surviving compaction | ✅ (data-block grain) | WAL tail only | no | no |
+| Built-in durability / WAL | external (caller-owned) | ✅ | ✅ | ✅ |
+| Pluggable FS / `io_uring` | ✅ | no | no | no |
+
+RocksDB is the closest peer in data model and feature breadth, but it is a C++
+library reached over FFI; this engine targets the same LSM capabilities in pure
+Rust: no C/C++ toolchain, `no_std`-capable, no FFI audit surface. sled and redb
+are pure-Rust but different shapes: sled is log-structured and pre-1.0; redb is a
+read-optimised B+tree. [Fjall](https://github.com/fjall-rs/fjall) is a
+higher-level key-value store built on `fjall-rs/lsm-tree`, the engine this crate
+was forked from, so Fjall and this crate are siblings over a shared ancestor
+(see [Credits](#credits)).
+
+## When to use
+
+Reach for this engine when you want:
+
+- a **write-optimised** embedded store (LSM beats a B+tree on write-heavy and
+  ingest workloads);
+- **pure Rust, no C/C++ toolchain** (cross-compilation, `no_std` targets,
+  reproducible builds, no FFI to audit);
+- **integrity / compliance** built in: checksums end to end, optional encryption
+  at rest and per-block ECC with on-read self-healing;
+- **change-data-capture** that survives compaction (`scan_since_seqno`);
+- to **own durability** yourself (supply your own WAL, or accept flush-on-demand).
+
+Look elsewhere when you need:
+
+- **millisecond tailing** of in-flight, not-yet-flushed writes: there is no
+  built-in WAL (pair with [docs/external-wal.md](docs/external-wal.md), or use a
+  WAL-backed engine);
+- a **read-mostly tiny dataset** where a B+tree (redb / LMDB) has lower read
+  amplification;
+- a **batteries-included database server** with a query language: this is a
+  storage engine, not a database.
+
 ## Incremental scan / CDC
 
 `Tree::scan_since_seqno(target)` streams every change committed at or after a
@@ -128,7 +207,7 @@ All optional. The default build (`std` + `parallel`) is the minimal core: no com
 | Flag | Pulls in | Enable when |
 |---|---|---|
 | `lz4` | [`lz4_flex`](https://github.com/PSeitz/lz4_flex) | Block compression wanted, decompression latency matters more than ratio. |
-| `zstd` | [`structured-zstd`](https://github.com/structured-world/structured-zstd) (pure-Rust, no FFI) | Block compression wanted, ratio matters more than absolute decompression speed. Supports `CompressionType::Zstd` and dictionary-mode `CompressionType::ZstdDict`. Decompression is ~2-3.5× slower than C reference. |
+| `zstd` | [`structured-zstd`](https://github.com/structured-world/structured-zstd) (pure-Rust, no FFI) | Block compression wanted, ratio matters more than raw decode speed (zstd trades some decode latency vs `lz4` for a better ratio). Supports `CompressionType::Zstd` and dictionary-mode `CompressionType::ZstdDict`. The pure-Rust decode is competitive with the C reference (libzstd) on the engine's small (4-64 KiB) read-path blocks (see [Benchmarks](#benchmarks)). |
 | `columnar` | (pure code, `alloc` only) | Columnar PAX SST block layout: each row-group stores its key / seqno / value-type / value sub-columns contiguously, for column-projection pushdown, vectorized predicate scans, per-column zstd dictionaries, and positional delete-bitmap MVCC. Enable for analytical or wide-row scans where reading a subset of columns dominates. |
 | `encryption` | `aes-gcm`, `rand_chacha` | AES-256-GCM block encryption at rest. Keys are caller-managed. |
 | `page_ecc` | [`reed-solomon-simd`](https://github.com/AndersTrier/reed-solomon-simd) | Per-block error-correcting parity (Reed-Solomon shards or per-word SEC-DED) after each on-disk block, with on-read self-healing, three-state verification, and a patrol scrub. Enable for latent-bit-rot protection on long-lived cold data. |

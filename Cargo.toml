@@ -25,7 +25,7 @@ repository = "https://github.com/structured-world/coordinode-lsm-tree"
 homepage = "https://github.com/structured-world/coordinode-lsm-tree"
 documentation = "https://docs.rs/coordinode-lsm-tree"
 keywords = ["lsm-tree", "storage", "database", "embedded", "key-value"]
-categories = ["data-structures", "database-implementations", "filesystem", "compression"]
+categories = ["data-structures", "database-implementations", "no-std", "compression"]
 
 [package.metadata.docs.rs]
 # Build the docs.rs page with every feature enabled so the rendered
