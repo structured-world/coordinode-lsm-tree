@@ -645,9 +645,31 @@ impl ZstdProvider {
     /// Returns an error if the frame header is invalid, an I/O error occurs, or
     /// the frame decodes to more than `dest.len()` bytes.
     pub fn decompress_into(data: &[u8], dest: &mut [u8]) -> crate::Result<usize> {
-        let mut decoder = structured_zstd::decoding::StreamingDecoder::new(data)
-            .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
-        bounded_read_into(&mut decoder, dest)
+        use structured_zstd::decoding::{FrameDecoder, StreamingDecoder};
+
+        // Reuse a per-thread `FrameDecoder` instead of building a fresh one on
+        // every call. `StreamingDecoder::new` constructs a new `FrameDecoder`,
+        // which allocates and zero-fills its window + entropy scratch each time;
+        // on the cold point-read path (one block decode per cache miss) that
+        // per-call malloc + memset is pure fixed overhead with nothing to amortise
+        // it against. `init` reuses the thread-local decoder's already-sized
+        // buffers after the first call (it only clears leftover state, no
+        // realloc) — the same trick the dictionary path uses, and the equivalent
+        // of reusing a libzstd `ZSTD_DCtx` across frames. `FrameDecoder` is not
+        // `Send`, so the cache is thread-local; this decoder is never handed a
+        // dictionary, so it stays on the plain (no-dict) frame path.
+        thread_local! {
+            static TLS_DECODER: core::cell::RefCell<FrameDecoder> =
+                core::cell::RefCell::new(FrameDecoder::new());
+        }
+
+        TLS_DECODER.with(|cell| {
+            let mut decoder = cell.borrow_mut();
+            let mut stream =
+                StreamingDecoder::new_with_decoder(std::io::Cursor::new(data), &mut *decoder)
+                    .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
+            bounded_read_into(&mut stream, dest)
+        })
     }
 }
 
