@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782555365872,
+  "lastUpdate": 1782558984585,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -20388,6 +20388,84 @@ window.BENCHMARK_DATA = {
             "value": 695038.709781294,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 4.7us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4567f29f119826f6af6f2af8a54364fd63613b56",
+          "message": "docs: README quick start, comparison table, and discoverability metadata (#565)\n\n## Summary\n\nPolishes the public-facing surface (README + crate metadata) now that\nthe roadmap is feature-complete. Improves first-touch conversion and\nsearch discoverability without marketing claims.\n\n## Changes\n\n- **README Quick Start** — `cargo add` (pinned to `5.7`, the release\nthis lands in) plus a minimal open / insert / get / flush example\nmirroring the crate-level `//!` docs.\n- **Comparison + When-to-use** — a factual capability matrix vs RocksDB\n/ sled / redb (implementation, structure, MVCC, `no_std`, encryption at\nrest, ECC, columnar, CDC, WAL) and an honest when-to-use / when-not\nsection.\n- **Corrected the zstd decode claim** — the old \"~2-3.5x slower than C\nreference\" predated the SIMD-kernel + decoder-context-reuse work. Fresh\nsame-run benchmark (i9): cold zstd-22 `point_read` ours 885µs vs RocksDB\n911µs at 1k, and 182.7ms vs 183.4ms at 70k — a tie/slight edge, so the\nline now states the decode is **competitive with the C reference\n(libzstd)** and links the benchmarks.\n- **crates.io category** `filesystem` -> `no-std` (this is a database,\nnot a filesystem tool; `no_std` is the unique differentiator in this\nfield).\n\nRepo metadata (description, homepage -> docs.rs, topics) was updated\nout-of-tree.\n\n## Testing\n\nDocs / metadata only; no code change. `cargo metadata` parses; README\nhas no em-dash and no internal-reference leaks; the version pin is\nforward-looking to the 5.7.0 release this merges into.\n\nCloses #564\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Documentation**\n* Added a **Quick start** guide with a minimal Rust example for\ncreating/opening a directory-backed tree, using `SeqNo::MAX`, and\nflushing for durability, with an explicit note that there is **no\nbuilt-in WAL** and durability is **caller-managed**.\n* Added a **Comparison** section vs RocksDB, sled, and redb, plus\n**when-to-use** guidance and limitations around tailing in-flight\nupdates.\n* Updated **`zstd`** feature documentation to highlight **compression\nratio vs decode speed** and **dictionary-mode** support.\n* **Chores**\n  * Updated crate metadata by removing the `filesystem` category.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-27T11:15:26Z",
+          "tree_id": "d7fb4186eb92a0fe3619f3bdf5b9691ad6c89386",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/4567f29f119826f6af6f2af8a54364fd63613b56"
+        },
+        "date": 1782558983379,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2063360.6896444715,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1200578.4651172198,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 882137.284555611,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.3us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3751867.8908786485,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 466080.83335439436,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.2us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 238249.2949110395,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 4.9us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.84s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1250360.2365989157,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1080622.3539712194,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.3us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 679326.892481085,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.7us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
