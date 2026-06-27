@@ -107,6 +107,11 @@ type TableEntry = InternalValue;
 /// resolved item)`. Aliased to keep `resolve_run_batched`'s return readable.
 type CoveredKey = (usize, u64, Option<InternalValue>);
 
+/// `(miss_keys, duplicates)` from [`Tree::dedup_sorted_miss_keys`]: `miss_keys`
+/// is `(key_index, bloom_hash)` for the strictly-sorted-unique batched resolver,
+/// `duplicates` is `(duplicate_index, representative_index)` for the fan-out.
+type DedupedMissKeys = (Vec<(usize, u64)>, Vec<(usize, usize)>);
+
 /// The outcome of resolving a key batch against one run (see `resolve_run_batched`).
 struct RunResolve {
     /// Covered, non-skipped keys with their resolved item, in input order.
@@ -1529,26 +1534,11 @@ impl AbstractTree for Tree {
         if !remaining.is_empty() {
             remaining.sort_by(|&a, &b| comparator.compare(keys[a].as_ref(), keys[b].as_ref()));
 
-            // Build (idx, hash) pairs for the miss keys, de-duplicating equal
-            // query keys. The batched on-disk path requires strictly-sorted-unique
-            // input (a duplicate would break its two-pointer walk), whereas the
-            // per-key path tolerated repeats. Keep one representative index per
-            // distinct key and remember each duplicate, so it can copy the
-            // representative's resolved entry once the batch returns. O(remaining).
-            let mut miss_keys: Vec<(usize, u64)> = Vec::with_capacity(remaining.len());
-            let mut duplicates: Vec<(usize, usize)> = Vec::new(); // (duplicate idx, representative idx)
-            for &idx in &remaining {
-                let key = keys[idx].as_ref();
-                match miss_keys.last() {
-                    Some(&(rep_idx, _))
-                        if comparator.compare(keys[rep_idx].as_ref(), key)
-                            == core::cmp::Ordering::Equal =>
-                    {
-                        duplicates.push((idx, rep_idx));
-                    }
-                    _ => miss_keys.push((idx, crate::hash::hash64(key))),
-                }
-            }
+            // De-duplicate equal query keys (the batched on-disk path requires
+            // strictly-sorted-unique input) and resolve the misses. Shared with
+            // the BlobTree path via these helpers so the two cannot drift.
+            let (miss_keys, duplicates) =
+                Self::dedup_sorted_miss_keys(&remaining, &keys, comparator);
 
             Self::batch_get_from_tables(
                 &super_version.version,
@@ -1560,13 +1550,7 @@ impl AbstractTree for Tree {
                 &mut internal_entries,
             )?;
 
-            // Fan each representative's resolved entry out to its duplicate
-            // positions, so every input position carries the same answer the
-            // per-key path would have produced.
-            for (dup_idx, rep_idx) in duplicates {
-                let resolved = internal_entries[rep_idx].clone();
-                internal_entries[dup_idx] = resolved;
-            }
+            Self::fan_out_duplicates(&duplicates, &mut internal_entries);
         }
 
         // Phase 3: Resolve entries (tombstones, RT suppression, merge operands)
@@ -2497,6 +2481,60 @@ impl Tree {
             crate::PinnableSlice::owned,
         )
         .map(|opt| opt.map(crate::PinnableSlice::into_value))
+    }
+
+    /// De-duplicates equal query keys in a comparator-sorted `remaining` index
+    /// list, returning the `(key_index, bloom_hash)` pairs for the batched
+    /// on-disk resolver (which requires strictly-sorted-unique input) and a
+    /// `(duplicate_index, representative_index)` map. Pair with
+    /// [`Self::fan_out_duplicates`] after the batch resolves.
+    ///
+    /// Shared by [`Self::multi_get`] and the `BlobTree` multi-get so the two
+    /// cannot silently diverge: forwarding duplicate miss keys into the
+    /// strictly-sorted-unique resolver was exactly the regression class this
+    /// guards against. `remaining` must already be sorted by `comparator`.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "remaining/miss_keys carry batch-local key indices < keys.len()"
+    )]
+    pub(crate) fn dedup_sorted_miss_keys<K: AsRef<[u8]>>(
+        remaining: &[usize],
+        keys: &[K],
+        comparator: &dyn crate::comparator::UserComparator,
+    ) -> DedupedMissKeys {
+        let mut miss_keys: Vec<(usize, u64)> = Vec::with_capacity(remaining.len());
+        let mut duplicates: Vec<(usize, usize)> = Vec::new();
+        for &idx in remaining {
+            let key = keys[idx].as_ref();
+            match miss_keys.last() {
+                Some(&(rep_idx, _))
+                    if comparator.compare(keys[rep_idx].as_ref(), key)
+                        == core::cmp::Ordering::Equal =>
+                {
+                    duplicates.push((idx, rep_idx));
+                }
+                _ => miss_keys.push((idx, crate::hash::hash64(key))),
+            }
+        }
+        (miss_keys, duplicates)
+    }
+
+    /// Fans each representative's resolved entry out to its duplicate positions,
+    /// so every input slot carries the same answer the per-key path would have
+    /// produced. Counterpart to [`Self::dedup_sorted_miss_keys`]; call after the
+    /// batched resolver fills `internal_entries`.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "duplicate/representative indices are batch-local key indices < entries.len()"
+    )]
+    pub(crate) fn fan_out_duplicates(
+        duplicates: &[(usize, usize)],
+        internal_entries: &mut [Option<InternalValue>],
+    ) {
+        for &(dup_idx, rep_idx) in duplicates {
+            let resolved = internal_entries[rep_idx].clone();
+            internal_entries[dup_idx] = resolved;
+        }
     }
 
     /// Queries tables for multiple keys using sorted access order.
