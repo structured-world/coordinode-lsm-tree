@@ -17,6 +17,12 @@ On-disk format version **V5**. V5 introduces a wire-format break for filter bloc
 
 ## Quick start
 
+```sh
+cargo add coordinode-lsm-tree@5.7
+```
+
+or add it to `Cargo.toml` directly:
+
 ```toml
 [dependencies]
 coordinode-lsm-tree = "5.7"
