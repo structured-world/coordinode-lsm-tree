@@ -762,18 +762,33 @@ impl RingThread {
         // op holds a raw pointer into the caller's buffer; `regions` is borrowed
         // for the whole call and we block on the receivers below, so every buffer
         // outlives the kernel's access (the UnsafeSend safety contract).
+        // Pre-pass: validate EVERY region length BEFORE submitting any op. A
+        // length over the i32 SQE cap must be rejected here, not mid-loop: once a
+        // read is sent the kernel may be writing its raw-ptr buffer, so an early
+        // `?` after earlier sends would strand those ops un-drained (Phase 2 only
+        // waits on receivers it already holds) and let the caller free the
+        // buffers mid-write. Validating up front keeps the send loop infallible
+        // on length. (SQE length is u32, CQE result i32 — block reads are KBs,
+        // never near the cap, so this only fires on misuse of the general API.)
+        let mut lens: Vec<u32> = Vec::with_capacity(regions.len());
+        for (_, buf) in regions.iter() {
+            let len = if buf.is_empty() {
+                0
+            } else {
+                i32::try_from(buf.len())
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "buffer exceeds i32::MAX")
+                    })?
+                    .unsigned_abs()
+            };
+            lens.push(len);
+        }
+
         let mut receivers: Vec<(mpsc::Receiver<i32>, usize)> = Vec::with_capacity(regions.len());
-        for (offset, buf) in regions.iter_mut() {
+        for ((offset, buf), &len) in regions.iter_mut().zip(&lens) {
             if buf.is_empty() {
                 continue;
             }
-            // SQE length is u32, CQE result is i32 (cap at i32::MAX so the byte
-            // count stays representable; block reads are KBs, never near the cap).
-            let len: u32 = i32::try_from(buf.len())
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "buffer exceeds i32::MAX")
-                })?
-                .unsigned_abs();
             let (tx, rx) = mpsc::sync_channel(1);
             let op = Op {
                 kind: OpKind::Read {
@@ -845,9 +860,15 @@ impl RingThread {
     /// devices) coalesce into one submission to the shared ring. Callers
     /// guarantee every request has an fd (`read_blocks_batched` checks first).
     fn submit_reads_multi(&self, reqs: &mut [BlockRead<'_>]) -> io::Result<()> {
-        let mut receivers: Vec<(mpsc::Receiver<i32>, usize)> = Vec::with_capacity(reqs.len());
-        for req in reqs.iter_mut() {
+        // Pre-pass: resolve every request's fd and validate its length BEFORE
+        // submitting any op (same un-drained-in-flight hazard as submit_reads: a
+        // missing fd or over-cap length returning via `?` mid-loop would strand
+        // earlier sends with the kernel still writing their buffers). `None`
+        // entries mark empty-buffer requests the send loop skips.
+        let mut metas: Vec<Option<(i32, u32)>> = Vec::with_capacity(reqs.len());
+        for req in reqs.iter() {
             if req.buf.is_empty() {
+                metas.push(None);
                 continue;
             }
             let fd = req.file.backing_fd().ok_or_else(|| {
@@ -861,6 +882,14 @@ impl RingThread {
                     io::Error::new(io::ErrorKind::InvalidInput, "buffer exceeds i32::MAX")
                 })?
                 .unsigned_abs();
+            metas.push(Some((fd, len)));
+        }
+
+        let mut receivers: Vec<(mpsc::Receiver<i32>, usize)> = Vec::with_capacity(reqs.len());
+        for (req, meta) in reqs.iter_mut().zip(&metas) {
+            let Some((fd, len)) = *meta else {
+                continue;
+            };
             let (tx, rx) = mpsc::sync_channel(1);
             let expected = req.buf.len();
             let op = Op {
