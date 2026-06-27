@@ -25,7 +25,7 @@ repository = "https://github.com/structured-world/coordinode-lsm-tree"
 homepage = "https://github.com/structured-world/coordinode-lsm-tree"
 documentation = "https://docs.rs/coordinode-lsm-tree"
 keywords = ["lsm-tree", "storage", "database", "embedded", "key-value"]
-categories = ["data-structures", "database-implementations", "filesystem", "compression"]
+categories = ["data-structures", "database-implementations", "no-std", "compression"]
 
 [package.metadata.docs.rs]
 # Build the docs.rs page with every feature enabled so the rendered
@@ -44,15 +44,16 @@ path = "src/lib.rs"
 [features]
 # `std` is the canonical platform feature. Default-on so every existing
 # downstream consumer keeps the current build profile (file I/O, threads,
-# `std::sync` primitives, system clock). Turning it OFF puts the crate
-# into no-std + alloc mode — currently in progress: only foundational
-# modules compile without `std`, the rest still imports `std::*` directly
-# and is gated to migrate incrementally. The `cargo check
-# --no-default-features --features alloc` CI job tracks migration progress
-# (expected to fail until each module is ported). New code added to this
-# crate MUST be no-std-friendly: prefer `core::*` / `alloc::*`, gate
-# std-only primitives behind `#[cfg(feature = "std")]`, and pick external
-# crates that support no-std.
+# `std::sync` primitives, system clock). Turning it OFF selects no-std +
+# alloc mode: the engine modules (read / write / compaction / recovery over
+# the injected `Fs`) compile without `std`; only the std default trait impls
+# (the system filesystem, the io_uring backend, the system clock) stay behind
+# `#[cfg(feature = "std")]`. The `cargo check --no-default-features --features
+# alloc` CI job builds this on the bare-metal `thumbv7em-none-eabihf` target
+# (no std at all), so any leaked `std::*` import fails the build. New code MUST
+# stay no-std-friendly: prefer `core::*` / `alloc::*`, gate std-only primitives
+# behind `#[cfg(feature = "std")]`, and pick external crates that support
+# no-std.
 default = ["std", "parallel"]
 std = [
     "dep:arc-swap",
