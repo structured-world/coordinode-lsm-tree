@@ -242,6 +242,48 @@ fn read_healing_single_bit_increments_secded_counter() -> crate::Result<()> {
     Ok(())
 }
 
+/// The prewarm path must never gather an ECC table's blocks: `from_reader`
+/// repairs an ECC-corrected payload silently (no `EccStatus`), so caching a
+/// corrected block as clean would let later `load_block` cache hits skip
+/// `from_file_with_recovery` / `maybe_record_persistent_heal`, leaving the
+/// latent on-disk fault unscheduled for healing. `decode_prewarmed_blocks`
+/// relies on this gate (and pins it with a `debug_assert!(ecc.is_none())`), so
+/// guard the invariant directly: `plan_prewarm` returns `None` for an ECC table.
+#[test]
+fn plan_prewarm_skips_ecc_tables() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let crate::AnyTree::Standard(tree) = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .page_ecc(true)
+    .ecc_scheme(EccScheme::Secded)
+    .open()?
+    else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+    for i in 0u64..2_000 {
+        tree.insert(format!("key-{i:06}"), format!("v{i:06}"), i);
+    }
+    tree.flush_active_memtable(2_000)?;
+
+    let binding = tree.version_history.read().latest_version();
+    #[expect(clippy::expect_used, reason = "flush produced exactly one table")]
+    let table = binding.version.iter_tables().next().expect("one table");
+
+    let sorted_keys: [(&[u8], u64); 2] = [
+        (b"key-000000", crate::hash::hash64(b"key-000000")),
+        (b"key-001000", crate::hash::hash64(b"key-001000")),
+    ];
+    assert!(
+        table.plan_prewarm(&sorted_keys, MAX_SEQNO).is_none(),
+        "plan_prewarm must skip an ECC table so a silently-corrected block is \
+         never prewarm-cached as clean",
+    );
+    Ok(())
+}
+
 /// The zstd partial-decode read path also schedules auto-heal: a bounded
 /// range scan that takes the partial path over a corrupted large block
 /// recovers via parity and flags the SST, just like the full load path.

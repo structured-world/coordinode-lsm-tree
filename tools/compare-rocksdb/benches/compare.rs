@@ -999,6 +999,140 @@ fn populate_ours(
     tree
 }
 
+/// Batched read head-to-head: one `multi_get` call resolves the whole key set,
+/// versus the per-key `point_read` loop in [`point_read_variant`]. This is where
+/// our batched read path (one bloom probe and one data-block decode shared by the
+/// co-located keys of each table) meets RocksDB's optimized batched MultiGet
+/// (`batched_multi_get_cf`, not the legacy per-key `multi_get`). At `n = 70k` the
+/// working set exceeds the 16 MiB block cache, so the batch's blocks are cold.
+///
+/// Apples-to-apples matches [`point_read_variant`]: identical [`WorkloadInputs`],
+/// the same matched compression / bloom / 16 MiB cache via [`populate_ours`] /
+/// [`populate_rocksdb`]. The only difference from `point_read` is one batched
+/// call instead of an N-iteration `get` loop. SurrealKV has no batch-get API, so
+/// it is omitted here (its sequential cost is already on the `point_read` chart);
+/// the series is `ours` vs `rocksdb` (plus `blob_tree` on the None variant).
+fn bench_multi_get(c: &mut Criterion) {
+    multi_get_variant(c, "multi_get", Compression::None);
+    multi_get_variant(c, "multi_get_zstd22", Compression::Zstd22);
+}
+
+fn multi_get_variant(c: &mut Criterion, group_name: &str, compression: Compression) {
+    // Only engines with a real batch-get API overlay here (SurrealKV has none).
+    let series: Vec<(&str, Engine)> = engines_for(compression)
+        .iter()
+        .copied()
+        .filter(|engine| !matches!(engine, Engine::SurrealKv))
+        .map(|engine| (engine.label(), engine))
+        .collect();
+
+    let mut group = c.benchmark_group(group_name);
+    for &n in &[1_000_u64, 10_000_u64, 70_000_u64] {
+        // The 70k working set exceeds the 16 MiB block cache (cold, scattered),
+        // so a single batched pass is far slower; drop to the criterion sample
+        // floor there to bound wall-clock while the median stays stable.
+        group.sample_size(if n >= 70_000 { 10 } else { 100 });
+        let inputs = WorkloadInputs::build(n);
+        group.throughput(Throughput::Elements(n));
+        for &(label, engine) in &series {
+            group.bench_with_input(BenchmarkId::new(label, n), &n, |b, _| {
+                // Build the on-disk database once (outside the timed window), so
+                // the measurement loop only ever pays for the batched read.
+                let dir = tempfile::tempdir().expect("tempdir");
+                // This measures WARM steady-state batched-MultiGet throughput, NOT
+                // cold first-touch latency: every engine populates + probes once
+                // outside the timed window, so all arms (ours, blob_tree, and the
+                // RocksDB arm below) enter the loop equally warmed. That symmetry
+                // is the point of the comparison. Cold fan-out latency is a
+                // separate, OS-cache-dropping measurement, not this bench.
+                match engine {
+                    Engine::Ours | Engine::BlobTree => {
+                        let tree =
+                            populate_ours(dir.path(), compression, &inputs, engine.kv_separated());
+                        // One-time "every key present" contract check OUTSIDE the
+                        // timed window (mirrors point_read), so a setup regression
+                        // can't quietly become a miss-read benchmark. It also warms
+                        // the cache identically to the RocksDB probe below.
+                        let probe = tree
+                            .multi_get(inputs.keys.iter(), MAX_SEQNO)
+                            .expect("ours: verify");
+                        // Cardinality before presence: a batched API that dropped
+                        // positions would otherwise pass the presence check while
+                        // the timed loop measures fewer than `n` lookups.
+                        assert_eq!(
+                            probe.len(),
+                            inputs.keys.len(),
+                            "ours: multi_get must return one result per input key"
+                        );
+                        assert!(
+                            probe.iter().all(Option::is_some),
+                            "ours: key unexpectedly missing"
+                        );
+                        b.iter_custom(|iters| {
+                            let start = std::time::Instant::now();
+                            for _ in 0..iters {
+                                let got = tree
+                                    .multi_get(inputs.keys.iter(), MAX_SEQNO)
+                                    .expect("ours: multi_get");
+                                std::hint::black_box(got);
+                            }
+                            start.elapsed()
+                        });
+                    }
+                    Engine::RocksDb => {
+                        // Open tracking the default CF: `batched_multi_get_cf`
+                        // (RocksDB's OPTIMIZED batched MultiGet: batched bloom
+                        // probes + coalesced block reads, NOT the legacy per-key
+                        // `multi_get`) needs a CF handle, and a plain `DB::open`
+                        // leaves the crate's CF map empty so `cf_handle` is None.
+                        // Same options / WAL-disabled populate as `populate_rocksdb`.
+                        let opts = rocksdb_options(compression, false);
+                        let db = rocksdb::DB::open_cf(
+                            &opts,
+                            dir.path(),
+                            [rocksdb::DEFAULT_COLUMN_FAMILY_NAME],
+                        )
+                        .expect("rocksdb: open_cf");
+                        let mut write_opts = rocksdb::WriteOptions::default();
+                        write_opts.disable_wal(true);
+                        for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
+                            db.put_opt(key, value, &write_opts).expect("rocksdb: put");
+                        }
+                        db.flush().expect("rocksdb: flush");
+                        // `sorted_input = false`: keys arrive in insertion order and
+                        // RocksDB sorts internally, exactly as our `multi_get` does.
+                        let cf = db
+                            .cf_handle(rocksdb::DEFAULT_COLUMN_FAMILY_NAME)
+                            .expect("rocksdb: default cf");
+                        let probe = db.batched_multi_get_cf(&cf, inputs.keys.iter(), false);
+                        assert_eq!(
+                            probe.len(),
+                            inputs.keys.len(),
+                            "rocksdb: batched_multi_get_cf must return one result per input key"
+                        );
+                        assert!(
+                            probe.iter().all(|r| matches!(r, Ok(Some(_)))),
+                            "rocksdb: key unexpectedly missing"
+                        );
+                        b.iter_custom(|iters| {
+                            let start = std::time::Instant::now();
+                            for _ in 0..iters {
+                                let got = db.batched_multi_get_cf(&cf, inputs.keys.iter(), false);
+                                std::hint::black_box(got);
+                            }
+                            start.elapsed()
+                        });
+                    }
+                    Engine::SurrealKv => {
+                        unreachable!("surrealkv is filtered out of the multi_get series")
+                    }
+                }
+            });
+        }
+    }
+    group.finish();
+}
+
 fn bench_range_scan(c: &mut Criterion) {
     range_scan_variant(c, "range_scan", Compression::None);
     range_scan_variant(c, "range_scan_zstd22", Compression::Zstd22);
@@ -1742,6 +1876,7 @@ criterion_group!(
     benches,
     bench_write_throughput,
     bench_point_read,
+    bench_multi_get,
     bench_range_scan,
     bench_seek_random,
     bench_overwrite,

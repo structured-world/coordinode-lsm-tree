@@ -81,6 +81,17 @@ use crate::metrics::Metrics;
 
 pub type TableInner = Inner;
 
+/// Plan produced by [`Table::plan_block_tasks`]: the SST's file handle, the
+/// table-local read seqno, whether the blocks need the special load path
+/// (Page-ECC / columnar), and per data block its handle plus the positions
+/// (into the input key batch) of the keys that fall in it.
+pub(crate) type BlockTaskPlan = (
+    Arc<dyn crate::fs::FsFile>,
+    SeqNo,
+    bool,
+    Vec<(BlockHandle, Vec<usize>)>,
+);
+
 /// A disk segment (a.k.a. `Table`, `SSTable`, `SST`, `sorted string table`) that is located on disk
 ///
 /// A table is an immutable list of key-value pairs, split into compressed blocks.
@@ -1442,6 +1453,306 @@ impl Table {
         }
 
         Ok(results)
+    }
+
+    /// Shared setup for the prewarm and chunked block planners: rejects a table
+    /// that cannot contribute (empty input, or entirely above the read snapshot),
+    /// bloom-filters `sorted_keys` to the passing positions, and opens a forward
+    /// block-index reader at the first passing key.
+    ///
+    /// `Ok(Some(..))` carries the passing positions, the reader, and the
+    /// table-local read seqno. `Ok(None)` means the table genuinely contributes no
+    /// block (nothing passes the snapshot/bloom/index). `Err` is a real
+    /// [`Table::check_bloom`] failure (a partitioned filter's block read) and is
+    /// propagated so the authoritative chunked planner surfaces it instead of
+    /// mistaking it for a miss; the best-effort prewarm planner maps it back to
+    /// `None`.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "passing[0] is valid after the emptiness check"
+    )]
+    fn plan_block_walk_setup(
+        &self,
+        sorted_keys: &[(&[u8], u64)],
+        seqno: SeqNo,
+    ) -> crate::Result<Option<(Vec<usize>, block_index::BlockIndexIterImpl, SeqNo)>> {
+        if sorted_keys.is_empty() {
+            return Ok(None);
+        }
+        let global_seqno = self.global_seqno();
+        let Some(table_seqno) = seqno.checked_sub(global_seqno) else {
+            return Ok(None);
+        };
+        if self.metadata.seqnos.0 >= table_seqno {
+            return Ok(None);
+        }
+        let mut passing: Vec<usize> = Vec::with_capacity(sorted_keys.len());
+        for (i, (key, hash)) in sorted_keys.iter().enumerate() {
+            if !self.check_bloom(key, *hash)?.should_skip() {
+                passing.push(i);
+            }
+        }
+        if passing.is_empty() {
+            return Ok(None);
+        }
+        let Some(block_iter) = self
+            .block_index
+            .forward_reader(sorted_keys[passing[0]].0, table_seqno)
+        else {
+            return Ok(None);
+        };
+        Ok(Some((passing, block_iter, table_seqno)))
+    }
+
+    /// Plans the COLD (uncached) data blocks [`Table::batch_get`] will read for
+    /// `sorted_keys`, returning this table's file handle alongside them so the
+    /// caller can read the blocks of MANY SSTs in one cross-file batch (see the
+    /// multi-get level prewarm). Returns `None` when there is nothing to prewarm:
+    /// no cold block, or a Page-ECC SST (the serial path observes auto-heal) or a
+    /// columnar SST (its blocks are reconstructed on the load path).
+    ///
+    /// Best-effort: an over- or under-estimate only affects warming, never a
+    /// query result, since `batch_get` re-reads every block authoritatively.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`passing` positions index into `sorted_keys` (< its len); `passing[p]` \
+                  is guarded by `p < passing.len()` each iteration."
+    )]
+    pub(crate) fn plan_prewarm(
+        &self,
+        sorted_keys: &[(&[u8], u64)],
+        seqno: SeqNo,
+    ) -> Option<(Arc<dyn crate::fs::FsFile>, Vec<BlockHandle>)> {
+        if self.metadata.ecc_params.is_some() {
+            return None;
+        }
+        #[cfg(feature = "columnar")]
+        if self.metadata.columnar {
+            return None;
+        }
+        // Best-effort warming: a bloom-probe error here just skips this table's
+        // prewarm (`.ok().flatten()` maps it to None; the authoritative resolve
+        // re-probes and surfaces it).
+        let (passing, mut block_iter, _table_seqno) = self
+            .plan_block_walk_setup(sorted_keys, seqno)
+            .ok()
+            .flatten()?;
+
+        // Conservative block-boundary walk (mirrors batch_get's span-retry),
+        // collecting only the COLD (uncached) blocks.
+        let mut handles: Vec<BlockHandle> = Vec::new();
+        let mut p = 0_usize;
+        while p < passing.len() {
+            let Some(Ok(block_handle)) = block_iter.next() else {
+                break;
+            };
+            let end_key = block_handle.end_key();
+            let first_in_block = sorted_keys[passing[p]].0;
+            if self.comparator.compare(first_in_block, end_key) == core::cmp::Ordering::Greater {
+                continue;
+            }
+            let handle = *block_handle.as_ref();
+            if self
+                .cache
+                .get_block(self.global_id(), handle.offset())
+                .is_none()
+            {
+                handles.push(handle);
+            }
+            while p < passing.len() {
+                let key = sorted_keys[passing[p]].0;
+                match self.comparator.compare(key, end_key) {
+                    core::cmp::Ordering::Greater | core::cmp::Ordering::Equal => break,
+                    core::cmp::Ordering::Less => p += 1,
+                }
+            }
+        }
+        if handles.is_empty() {
+            return None;
+        }
+
+        let (file, _) = self
+            .file_accessor
+            .get_or_open_table(&self.global_id(), &self.path)
+            .ok()?;
+        Some((file, handles))
+    }
+
+    /// Decodes blocks read by the level prewarm into the cache (`buffers[i]` is
+    /// the on-disk bytes of `handles[i]`, both from [`Table::plan_prewarm`]).
+    pub(crate) fn decode_prewarmed(&self, handles: &[BlockHandle], buffers: &[Vec<u8>]) {
+        crate::table::util::decode_prewarmed_blocks(
+            self.global_id(),
+            &self.cache,
+            handles,
+            buffers,
+            BlockType::Data,
+            self.metadata.data_block_compression,
+            self.encryption.as_deref(),
+            self.metadata.ecc_params,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+        );
+    }
+
+    /// Capacity in bytes of this table's (shared) block cache, for the level
+    /// prewarm's eviction-avoiding size bound.
+    pub(crate) fn cache_capacity(&self) -> u64 {
+        self.cache.capacity()
+    }
+
+    /// Whether this table's data blocks need the special load path rather than a
+    /// plain bytes decode: Page-ECC (re-read recovery) or columnar (PAX
+    /// reconstruction). The chunked `multi_get` resolver reads these via
+    /// [`Table::load_data_block`] instead of [`Table::decode_data_block_from_bytes`].
+    pub(crate) fn is_chunk_special(&self) -> bool {
+        if self.metadata.ecc_params.is_some() {
+            return true;
+        }
+        #[cfg(feature = "columnar")]
+        if self.metadata.columnar {
+            return true;
+        }
+        false
+    }
+
+    /// Plans the data blocks [`Table::batch_get`] would read for `sorted_keys`
+    /// (bloom + block-index walk, no decode), returning this table's file handle,
+    /// the table-local read seqno, whether it needs the special load path, and per
+    /// block the positions (into `sorted_keys`) of the keys that fall in it.
+    ///
+    /// Used by the chunked `multi_get` resolver to read MANY SSTs' blocks in one
+    /// batch and point-read directly, without the cache. Conservative at block
+    /// boundaries: a key equal to a block's end key is listed in that block AND
+    /// the next (an MVCC version of the same key can span the boundary), mirroring
+    /// `batch_get`'s span-retry; the higher-seqno hit wins at resolution.
+    ///
+    /// `Ok(None)` means this table covers none of `sorted_keys`. Unlike the
+    /// best-effort prewarm planner, a bloom-probe or table-open failure is
+    /// PROPAGATED (not swallowed to `None`): the chunked resolver is authoritative
+    /// for its level, so a swallowed error would let a stale lower level answer.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a bloom-probe ([`Table::check_bloom`]) or table-open failure.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`passing` positions index into `sorted_keys` (< its len); `passing[p]` \
+                  is guarded by `p < passing.len()` each iteration."
+    )]
+    pub(crate) fn plan_block_tasks(
+        &self,
+        sorted_keys: &[(&[u8], u64)],
+        seqno: SeqNo,
+    ) -> crate::Result<Option<BlockTaskPlan>> {
+        let Some((passing, mut block_iter, table_seqno)) =
+            self.plan_block_walk_setup(sorted_keys, seqno)?
+        else {
+            return Ok(None);
+        };
+
+        let mut blocks: Vec<(BlockHandle, Vec<usize>)> = Vec::new();
+        let mut p = 0_usize;
+        while p < passing.len() {
+            // None ends the index; an Err (index-read / decode failure) is
+            // PROPAGATED, not treated as end-of-index. Swallowing it would skip
+            // the rest of this table and let a lower level answer a key the
+            // failed table actually covers (same `?` contract as `batch_get`).
+            let Some(handle_result) = block_iter.next() else {
+                break;
+            };
+            let block_handle = handle_result?;
+            let end_key = block_handle.end_key();
+            let first_in_block = sorted_keys[passing[p]].0;
+            if self.comparator.compare(first_in_block, end_key) == core::cmp::Ordering::Greater {
+                continue;
+            }
+            let handle = *block_handle.as_ref();
+            let mut block_keys: Vec<usize> = Vec::new();
+            while p < passing.len() {
+                let pos = passing[p];
+                match self.comparator.compare(sorted_keys[pos].0, end_key) {
+                    core::cmp::Ordering::Greater => break,
+                    core::cmp::Ordering::Less => {
+                        block_keys.push(pos);
+                        p += 1;
+                    }
+                    // Equal: list in THIS block and (by not advancing p) the next,
+                    // since a version of this key may continue across the boundary.
+                    core::cmp::Ordering::Equal => {
+                        block_keys.push(pos);
+                        break;
+                    }
+                }
+            }
+            blocks.push((handle, block_keys));
+        }
+        if blocks.is_empty() {
+            return Ok(None);
+        }
+
+        let (file, _) = self
+            .file_accessor
+            .get_or_open_table(&self.global_id(), &self.path)?;
+        Ok(Some((file, table_seqno, self.is_chunk_special(), blocks)))
+    }
+
+    /// Decodes a data block from its on-disk bytes (read by the chunked resolver),
+    /// using the same path as [`Table::load_data_block`] for a non-special table
+    /// ([`Block::from_reader`] shares the header / decrypt helpers), so the block
+    /// is byte-identical. Not for Page-ECC / columnar tables ([`is_chunk_special`]).
+    ///
+    /// # Errors
+    ///
+    /// Propagates a corruption / decode error (the resolver surfaces it).
+    pub(crate) fn decode_data_block_from_bytes(
+        &self,
+        bytes: &[u8],
+    ) -> crate::Result<Option<DataBlock>> {
+        let transform = crate::table::util::build_block_transform(
+            self.metadata.data_block_compression,
+            self.encryption.as_deref(),
+            self.metadata.ecc_params,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+        )?;
+        let identity = crate::table::block::BlockIdentity {
+            table_id: self.global_id().table_id(),
+            block_type: BlockType::Data,
+            dict_id: self.metadata.data_block_compression.dict_id(),
+            window_log: 0,
+        };
+        let block = Block::from_reader(&mut crate::io::Cursor::new(bytes), identity, &transform)?;
+        if block.header.block_type != BlockType::Data {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                block.header.block_type.into(),
+            )));
+        }
+        let has_kv_footer = self.metadata.kv_checksum_algo.is_some();
+        DataBlock::from_loaded(block, has_kv_footer).map(Some)
+    }
+
+    /// Point-reads `key` in an already-decoded `block`, translating the
+    /// table-local seqno of any hit back to the global coordinate (matching
+    /// [`Table::batch_get`]'s contract).
+    ///
+    /// # Errors
+    ///
+    /// Propagates a decode / corruption error from the point read.
+    pub(crate) fn point_read_translated(
+        &self,
+        block: &DataBlock,
+        key: &[u8],
+        table_seqno: SeqNo,
+    ) -> crate::Result<Option<InternalValue>> {
+        let global_seqno = self.global_seqno();
+        Ok(block
+            .point_read(key, table_seqno, &self.comparator)?
+            .map(|mut item| {
+                item.key.seqno = apply_global_seqno(item.key.seqno, global_seqno);
+                item
+            }))
     }
 
     /// Creates a scanner over the `Table`.

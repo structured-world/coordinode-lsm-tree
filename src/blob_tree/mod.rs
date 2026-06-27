@@ -1123,13 +1123,12 @@ impl AbstractTree for BlobTree {
         if !remaining.is_empty() {
             remaining.sort_by(|&a, &b| comparator.compare(keys[a].as_ref(), keys[b].as_ref()));
 
-            let miss_keys: Vec<(usize, u64)> = remaining
-                .iter()
-                .map(|&idx| {
-                    let hash = crate::hash::hash64(keys[idx].as_ref());
-                    (idx, hash)
-                })
-                .collect();
+            // Shared dedup + fan-out with `Tree::multi_get` (see those helpers):
+            // the batched on-disk path needs strictly-sorted-unique input, and
+            // keeping one copy of this logic is what stops the two multi-get
+            // paths from drifting back apart.
+            let (miss_keys, duplicates) =
+                crate::Tree::dedup_sorted_miss_keys(&remaining, &keys, comparator);
 
             crate::Tree::batch_get_from_tables(
                 &super_version.version,
@@ -1137,8 +1136,11 @@ impl AbstractTree for BlobTree {
                 miss_keys,
                 seqno,
                 comparator,
+                &*self.index.config.fs,
                 &mut internal_entries,
             )?;
+
+            crate::Tree::fan_out_duplicates(&duplicates, &mut internal_entries);
         }
 
         // Phase 3: Resolve each entry (tombstones, RT suppression, merge, blob indirections)

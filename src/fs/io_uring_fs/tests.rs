@@ -523,6 +523,236 @@ fn available_space_reports_plausible_free_bytes() -> io::Result<()> {
 }
 
 #[test]
+fn read_many_fills_every_region() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("read_many.bin");
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+    let mut file = fs.open(&path, &opts)?;
+    let data: Vec<u8> = (0..=255u8).collect();
+    file.write_all(&data)?;
+    file.sync_all()?;
+
+    // Disjoint regions in non-file order plus an EMPTY region (the submit loop
+    // skips it) must each be filled by the one batched submission.
+    let mut b0 = [0u8; 4];
+    let mut b1 = [0u8; 8];
+    let mut empty: [u8; 0] = [];
+    let mut b2 = [0u8; 1];
+    let mut regions: Vec<(u64, &mut [u8])> = vec![
+        (10, &mut b0[..]),
+        (200, &mut b1[..]),
+        (50, &mut empty[..]),
+        (0, &mut b2[..]),
+    ];
+    file.read_many(&mut regions)?;
+    drop(regions);
+
+    assert_eq!(&b0[..], &data[10..14]);
+    assert_eq!(&b1[..], &data[200..208]);
+    assert_eq!(b2[0], data[0]);
+    Ok(())
+}
+
+#[test]
+fn read_blocks_batched_across_files_via_ring() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut f0 = fs.open(&dir.path().join("a.bin"), &opts)?;
+    f0.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    f0.sync_all()?;
+    let mut f1 = fs.open(&dir.path().join("b.bin"), &opts)?;
+    let rev: Vec<u8> = (0..=255u8).rev().collect();
+    f1.write_all(&rev)?;
+    f1.sync_all()?;
+
+    // Both handles back onto the SAME shared ring, so reads from two files
+    // submit in one batch (submit_reads_multi, per-request fd).
+    assert!(f0.backing_fd().is_some(), "io_uring file exposes its fd");
+    let mut b0 = [0u8; 4];
+    let mut b1 = [0u8; 4];
+    {
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: f0.as_ref(),
+                offset: 10,
+                buf: &mut b0,
+            },
+            crate::fs::BlockRead {
+                file: f1.as_ref(),
+                offset: 20,
+                buf: &mut b1,
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)?;
+    }
+    assert_eq!(b0, [10, 11, 12, 13]);
+    assert_eq!(b1, [rev[20], rev[21], rev[22], rev[23]]);
+    Ok(())
+}
+
+#[test]
+fn read_many_short_read_at_eof_errors() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("short_many.bin");
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+    let mut file = fs.open(&path, &opts)?;
+    file.write_all(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10])?;
+    file.sync_all()?;
+
+    // First region runs past EOF (a fixed-size short read = UnexpectedEof, not
+    // EOF); the second is in range. The first failing must NOT short-circuit the
+    // drain: every later op is still recv'd so its in-flight kernel write
+    // completes before the buffers are freed. The call surfaces the first error.
+    let mut short = [0u8; 32];
+    let mut ok = [0xAAu8; 4]; // sentinel: the drained read must overwrite it
+    let mut regions: Vec<(u64, &mut [u8])> = vec![(0, &mut short[..]), (4, &mut ok[..])];
+    match file.read_many(&mut regions) {
+        Ok(()) => panic!("read past EOF must fail, not report a short read as success"),
+        Err(err) => assert_eq!(err.kind(), crate::io::ErrorKind::UnexpectedEof),
+    }
+    // The in-range op was drained to completion despite the earlier short read:
+    // its buffer holds the on-disk bytes, not the sentinel.
+    assert_eq!(ok, [5, 6, 7, 8]);
+    Ok(())
+}
+
+#[test]
+fn read_blocks_batched_short_read_at_eof_errors() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+    let mut file = fs.open(&dir.path().join("short_block.bin"), &opts)?;
+    file.write_all(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10])?;
+    file.sync_all()?;
+
+    // First block runs past EOF; the second is in range. The failing block must
+    // not short-circuit the drain (every later op is recv'd before return).
+    let mut short = [0u8; 64];
+    let mut ok = [0xAAu8; 4]; // sentinel: the drained read must overwrite it
+    {
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: file.as_ref(),
+                offset: 0,
+                buf: &mut short,
+            },
+            crate::fs::BlockRead {
+                file: file.as_ref(),
+                offset: 4,
+                buf: &mut ok,
+            },
+        ];
+        match fs.read_blocks_batched(&mut reqs) {
+            Ok(()) => panic!("read past EOF must fail, not report a short read as success"),
+            Err(err) => assert_eq!(err.kind(), crate::io::ErrorKind::UnexpectedEof),
+        }
+    }
+    // The in-range op was drained to completion: its buffer holds on-disk bytes.
+    assert_eq!(ok, [5, 6, 7, 8]);
+    Ok(())
+}
+
+#[test]
+fn read_blocks_batched_fallback_short_read_errors() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&(1..=64u8).collect::<Vec<_>>())?;
+    uring_file.sync_all()?;
+
+    // A StdFs handle (no fd for the ring) forces the whole batch onto the serial
+    // read_at fallback; its block runs past EOF, so the fallback's fixed-size
+    // short read is reported as UnexpectedEof, not a silent partial fill.
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    std_file.write_all(&[0u8; 10])?;
+    std_file.sync_all()?;
+
+    let mut b0 = [0xAAu8; 8]; // sentinel: the in-range fallback read must fill it
+    let mut b1 = [0u8; 64]; // past EOF on the std file
+    {
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 0,
+                buf: &mut b0,
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: 0,
+                buf: &mut b1,
+            },
+        ];
+        match fs.read_blocks_batched(&mut reqs) {
+            Ok(()) => panic!("a short read in the serial fallback must fail"),
+            Err(err) => assert_eq!(err.kind(), crate::io::ErrorKind::UnexpectedEof),
+        }
+    }
+    // The in-range block was read by the fallback before the short one failed.
+    assert_eq!(b0, [1, 2, 3, 4, 5, 6, 7, 8]);
+    Ok(())
+}
+
+#[test]
+fn read_blocks_batched_falls_back_for_non_uring_file() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    uring_file.sync_all()?;
+
+    // A StdFs handle has no fd for the ring (backing_fd None), so mixing it into
+    // the batch forces the whole batch onto the serial read_at fallback.
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    let rev: Vec<u8> = (0..=255u8).rev().collect();
+    std_file.write_all(&rev)?;
+    std_file.sync_all()?;
+    assert_eq!(std_file.backing_fd(), None);
+
+    let mut b0 = [0u8; 4];
+    let mut b1 = [0u8; 4];
+    {
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 10,
+                buf: &mut b0,
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: 20,
+                buf: &mut b1,
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)?;
+    }
+    assert_eq!(b0, [10, 11, 12, 13]);
+    assert_eq!(b1, [rev[20], rev[21], rev[22], rev[23]]);
+    Ok(())
+}
+
+#[test]
 fn volume_id_matches_the_kernel_mount() -> io::Result<()> {
     // Free space is a property of the mount, not the I/O submission path, so
     // the uring backend reports the same volume id as `StdFs` for a path —

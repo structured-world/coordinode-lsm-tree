@@ -14,7 +14,7 @@
 //! Cold-path operations (mkdir, readdir, stat, rename, unlink) delegate
 //! to [`std::fs`] since they do not benefit from `io_uring`.
 
-use super::{Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions};
+use super::{BlockRead, Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions};
 use crate::HashMap;
 use core::sync::atomic::AtomicU64;
 use io_uring::{IoUring, opcode, types};
@@ -154,6 +154,28 @@ impl Fs for IoUringFs {
             is_append: opts.append,
             ring: Arc::clone(&self.inner),
         }))
+    }
+
+    fn read_blocks_batched(&self, reqs: &mut [BlockRead<'_>]) -> crate::io::Result<()> {
+        // Every request that has an fd goes to the one shared ring in a single
+        // batched submission (the kernel fans each read out to its file's
+        // device). If any request lacks an fd (a non-io_uring file mixed in),
+        // fall back to serial reads for the whole batch.
+        if reqs.iter().any(|r| r.file.backing_fd().is_none()) {
+            for req in reqs.iter_mut() {
+                let n = req.file.read_at(req.buf, req.offset)?;
+                if n != req.buf.len() {
+                    return Err(crate::io::Error::from(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "read_blocks_batched: short read on a fixed-size block",
+                    )));
+                }
+            }
+            return Ok(());
+        }
+        self.inner
+            .submit_reads_multi(reqs)
+            .map_err(crate::io::Error::from)
     }
 
     fn create_dir_all(&self, path: &Path) -> crate::io::Result<()> {
@@ -340,6 +362,21 @@ impl FsFile for IoUringFile {
         }
 
         Ok(total_read)
+    }
+
+    // Batched read: submit every region to the ring at once (one coalesced
+    // submission, reads overlap in flight) instead of the trait's serial
+    // read_at loop. This is the io_uring win for multi-block reads.
+    fn read_many(&self, regions: &mut [(u64, &mut [u8])]) -> crate::io::Result<()> {
+        self.ring
+            .submit_reads(self.file.as_raw_fd(), regions)
+            .map_err(crate::io::Error::from)
+    }
+
+    // Exposes the fd so `IoUringFs::read_blocks_batched` can submit reads across
+    // many files (SSTs) to this handle's shared ring in one batch.
+    fn backing_fd(&self) -> Option<i32> {
+        Some(self.file.as_raw_fd())
     }
 
     fn lock_exclusive(&self) -> crate::io::Result<()> {
@@ -709,6 +746,209 @@ impl RingThread {
             result_tx: tx,
         };
         self.send_and_wait(op, &rx)
+    }
+
+    /// Submits every read in `regions` to the ring BEFORE waiting on any of
+    /// them, then waits for all completions. Because the event loop drains all
+    /// queued ops into one `submit_and_wait`, the reads coalesce into far fewer
+    /// `io_uring_enter` calls and overlap in flight (one batched submission
+    /// instead of one blocking read per block).
+    ///
+    /// Fills each region completely; a short read on any region fails the whole
+    /// batch (block reads are fixed-size, so the caller treats a failure as
+    /// "could not batch-read" and falls back to per-block reads).
+    fn submit_reads(&self, fd: i32, regions: &mut [(u64, &mut [u8])]) -> io::Result<()> {
+        // Phase 1: send every op, collecting one result receiver per region. The
+        // op holds a raw pointer into the caller's buffer; `regions` is borrowed
+        // for the whole call and we block on the receivers below, so every buffer
+        // outlives the kernel's access (the UnsafeSend safety contract).
+        // Pre-pass: validate EVERY region length BEFORE submitting any op. A
+        // length over the i32 SQE cap must be rejected here, not mid-loop: once a
+        // read is sent the kernel may be writing its raw-ptr buffer, so an early
+        // `?` after earlier sends would strand those ops un-drained (Phase 2 only
+        // waits on receivers it already holds) and let the caller free the
+        // buffers mid-write. Validating up front keeps the send loop infallible
+        // on length. (SQE length is u32, CQE result i32 — block reads are KBs,
+        // never near the cap, so this only fires on misuse of the general API.)
+        let mut lens: Vec<u32> = Vec::with_capacity(regions.len());
+        for (_, buf) in regions.iter() {
+            let len = if buf.is_empty() {
+                0
+            } else {
+                i32::try_from(buf.len())
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "buffer exceeds i32::MAX")
+                    })?
+                    .unsigned_abs()
+            };
+            lens.push(len);
+        }
+
+        let mut receivers: Vec<(mpsc::Receiver<i32>, usize)> = Vec::with_capacity(regions.len());
+        for ((offset, buf), &len) in regions.iter_mut().zip(&lens) {
+            if buf.is_empty() {
+                continue;
+            }
+            let (tx, rx) = mpsc::sync_channel(1);
+            let op = Op {
+                kind: OpKind::Read {
+                    fd,
+                    buf: UnsafeSendMutPtr(buf.as_mut_ptr()),
+                    len,
+                    offset: *offset,
+                },
+                result_tx: tx,
+            };
+            // Send without waiting so the next op queues behind it; the event
+            // loop's try_recv drain coalesces them. The bounded channel applies
+            // backpressure past ring capacity, and the loop keeps draining +
+            // submitting, so a send beyond capacity makes progress (no deadlock).
+            self.tx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread shut down")
+                })?
+                .send(op)
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread exited"))?;
+            receivers.push((rx, buf.len()));
+        }
+
+        // Phase 2: drain EVERY receiver before returning, even on error. Each
+        // `recv()` blocks until that op's CQE arrives, so a short read or a
+        // negative result must NOT short-circuit the loop: any op left
+        // un-recv'd may still have the kernel writing into its Phase-1 raw-ptr
+        // buffer, and returning early lets the caller free those buffers
+        // mid-write (use-after-free). Drain all, surface the first error.
+        let mut first_err: Option<io::Error> = None;
+        for (rx, expected) in receivers {
+            let recv = rx.recv();
+            if first_err.is_some() {
+                continue; // already failing; just wait this op out, do not record
+            }
+            match recv {
+                Err(_) => {
+                    first_err = Some(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "io_uring thread exited",
+                    ));
+                }
+                Ok(result) if result < 0 => {
+                    first_err = Some(io::Error::from_raw_os_error(-result));
+                }
+                Ok(result) => {
+                    #[expect(clippy::cast_sign_loss, reason = "guarded by result < 0 above")]
+                    let n = result as usize;
+                    if n != expected {
+                        first_err = Some(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "io_uring read_many: short read on a fixed-size block region",
+                        ));
+                    }
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Like [`Self::submit_reads`], but each request carries its OWN fd, so
+    /// reads from DIFFERENT files (SSTs, and on a multi-device layout different
+    /// devices) coalesce into one submission to the shared ring. Callers
+    /// guarantee every request has an fd (`read_blocks_batched` checks first).
+    fn submit_reads_multi(&self, reqs: &mut [BlockRead<'_>]) -> io::Result<()> {
+        // Pre-pass: resolve every request's fd and validate its length BEFORE
+        // submitting any op (same un-drained-in-flight hazard as submit_reads: a
+        // missing fd or over-cap length returning via `?` mid-loop would strand
+        // earlier sends with the kernel still writing their buffers). `None`
+        // entries mark empty-buffer requests the send loop skips.
+        let mut metas: Vec<Option<(i32, u32)>> = Vec::with_capacity(reqs.len());
+        for req in reqs.iter() {
+            if req.buf.is_empty() {
+                metas.push(None);
+                continue;
+            }
+            let fd = req.file.backing_fd().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "submit_reads_multi: request without fd",
+                )
+            })?;
+            let len: u32 = i32::try_from(req.buf.len())
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "buffer exceeds i32::MAX")
+                })?
+                .unsigned_abs();
+            metas.push(Some((fd, len)));
+        }
+
+        let mut receivers: Vec<(mpsc::Receiver<i32>, usize)> = Vec::with_capacity(reqs.len());
+        for (req, meta) in reqs.iter_mut().zip(&metas) {
+            let Some((fd, len)) = *meta else {
+                continue;
+            };
+            let (tx, rx) = mpsc::sync_channel(1);
+            let expected = req.buf.len();
+            let op = Op {
+                kind: OpKind::Read {
+                    fd,
+                    buf: UnsafeSendMutPtr(req.buf.as_mut_ptr()),
+                    len,
+                    offset: req.offset,
+                },
+                result_tx: tx,
+            };
+            self.tx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread shut down")
+                })?
+                .send(op)
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread exited"))?;
+            receivers.push((rx, expected));
+        }
+
+        // Drain EVERY receiver before returning, even on error: an un-recv'd op
+        // may still have the kernel writing into its raw-ptr buffer, so a short
+        // read or negative result must not short-circuit the loop and let the
+        // caller free those buffers mid-write (use-after-free). See `submit_reads`.
+        let mut first_err: Option<io::Error> = None;
+        for (rx, expected) in receivers {
+            let recv = rx.recv();
+            if first_err.is_some() {
+                continue;
+            }
+            match recv {
+                Err(_) => {
+                    first_err = Some(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "io_uring thread exited",
+                    ));
+                }
+                Ok(result) if result < 0 => {
+                    first_err = Some(io::Error::from_raw_os_error(-result));
+                }
+                Ok(result) => {
+                    #[expect(clippy::cast_sign_loss, reason = "guarded by result < 0 above")]
+                    let n = result as usize;
+                    if n != expected {
+                        first_err = Some(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "io_uring read_blocks_batched: short read on a fixed-size block",
+                        ));
+                    }
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Submits a pwrite to the ring and blocks until completion.

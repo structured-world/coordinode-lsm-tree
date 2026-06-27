@@ -103,6 +103,36 @@ trait TablePointLookup: Sized {
 /// Lookup result for standard `get()` — entry only, no block retained.
 type TableEntry = InternalValue;
 
+/// One covered key in a batched run resolution: `(input index, key hash,
+/// resolved item)`. Aliased to keep `resolve_run_batched`'s return readable.
+type CoveredKey = (usize, u64, Option<InternalValue>);
+
+/// `(miss_keys, duplicates)` from [`Tree::dedup_sorted_miss_keys`]: `miss_keys`
+/// is `(key_index, bloom_hash)` for the strictly-sorted-unique batched resolver,
+/// `duplicates` is `(duplicate_index, representative_index)` for the fan-out.
+type DedupedMissKeys = (Vec<(usize, u64)>, Vec<(usize, usize)>);
+
+/// The outcome of resolving a key batch against one run (see `resolve_run_batched`).
+struct RunResolve {
+    /// Covered, non-skipped keys with their resolved item, in input order.
+    covered: Vec<CoveredKey>,
+    /// Keys this run does not cover, in input order, for the next run or level.
+    not_covered: Vec<(usize, u64)>,
+}
+
+/// One data block the chunked `multi_get` resolver will read (see
+/// `resolve_level_chunked`): the block, the SST it lives in (`table` + its `file`
+/// handle), the table-local read seqno, whether it needs the special load path
+/// (Page-ECC / columnar), and the ORIGINAL key indices that fall in this block.
+struct BlockTask<'a> {
+    table: &'a crate::Table,
+    file: Arc<dyn crate::fs::FsFile>,
+    handle: crate::table::BlockHandle,
+    table_seqno: SeqNo,
+    special: bool,
+    keys: Vec<usize>,
+}
+
 impl TablePointLookup for TableEntry {
     fn lookup(
         table: &Table,
@@ -1504,14 +1534,11 @@ impl AbstractTree for Tree {
         if !remaining.is_empty() {
             remaining.sort_by(|&a, &b| comparator.compare(keys[a].as_ref(), keys[b].as_ref()));
 
-            // Build (idx, hash) pairs only for miss keys — O(remaining) not O(n).
-            let miss_keys: Vec<(usize, u64)> = remaining
-                .iter()
-                .map(|&idx| {
-                    let hash = crate::hash::hash64(keys[idx].as_ref());
-                    (idx, hash)
-                })
-                .collect();
+            // De-duplicate equal query keys (the batched on-disk path requires
+            // strictly-sorted-unique input) and resolve the misses. Shared with
+            // the BlobTree path via these helpers so the two cannot drift.
+            let (miss_keys, duplicates) =
+                Self::dedup_sorted_miss_keys(&remaining, &keys, comparator);
 
             Self::batch_get_from_tables(
                 &super_version.version,
@@ -1519,8 +1546,11 @@ impl AbstractTree for Tree {
                 miss_keys,
                 seqno,
                 comparator,
+                &*self.config.fs,
                 &mut internal_entries,
             )?;
+
+            Self::fan_out_duplicates(&duplicates, &mut internal_entries);
         }
 
         // Phase 3: Resolve entries (tombstones, RT suppression, merge operands)
@@ -2453,6 +2483,60 @@ impl Tree {
         .map(|opt| opt.map(crate::PinnableSlice::into_value))
     }
 
+    /// De-duplicates equal query keys in a comparator-sorted `remaining` index
+    /// list, returning the `(key_index, bloom_hash)` pairs for the batched
+    /// on-disk resolver (which requires strictly-sorted-unique input) and a
+    /// `(duplicate_index, representative_index)` map. Pair with
+    /// [`Self::fan_out_duplicates`] after the batch resolves.
+    ///
+    /// Shared by [`Self::multi_get`] and the `BlobTree` multi-get so the two
+    /// cannot silently diverge: forwarding duplicate miss keys into the
+    /// strictly-sorted-unique resolver was exactly the regression class this
+    /// guards against. `remaining` must already be sorted by `comparator`.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "remaining/miss_keys carry batch-local key indices < keys.len()"
+    )]
+    pub(crate) fn dedup_sorted_miss_keys<K: AsRef<[u8]>>(
+        remaining: &[usize],
+        keys: &[K],
+        comparator: &dyn crate::comparator::UserComparator,
+    ) -> DedupedMissKeys {
+        let mut miss_keys: Vec<(usize, u64)> = Vec::with_capacity(remaining.len());
+        let mut duplicates: Vec<(usize, usize)> = Vec::new();
+        for &idx in remaining {
+            let key = keys[idx].as_ref();
+            match miss_keys.last() {
+                Some(&(rep_idx, _))
+                    if comparator.compare(keys[rep_idx].as_ref(), key)
+                        == core::cmp::Ordering::Equal =>
+                {
+                    duplicates.push((idx, rep_idx));
+                }
+                _ => miss_keys.push((idx, crate::hash::hash64(key))),
+            }
+        }
+        (miss_keys, duplicates)
+    }
+
+    /// Fans each representative's resolved entry out to its duplicate positions,
+    /// so every input slot carries the same answer the per-key path would have
+    /// produced. Counterpart to [`Self::dedup_sorted_miss_keys`]; call after the
+    /// batched resolver fills `internal_entries`.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "duplicate/representative indices are batch-local key indices < entries.len()"
+    )]
+    pub(crate) fn fan_out_duplicates(
+        duplicates: &[(usize, usize)],
+        internal_entries: &mut [Option<InternalValue>],
+    ) {
+        for &(dup_idx, rep_idx) in duplicates {
+            let resolved = internal_entries[rep_idx].clone();
+            internal_entries[dup_idx] = resolved;
+        }
+    }
+
     /// Queries tables for multiple keys using sorted access order.
     ///
     /// `miss_keys` contains `(key_index, bloom_hash)` pairs for keys not yet
@@ -2470,6 +2554,7 @@ impl Tree {
         miss_keys: Vec<(usize, u64)>,
         seqno: SeqNo,
         comparator: &dyn crate::comparator::UserComparator,
+        fs: &dyn crate::fs::Fs,
         results: &mut [Option<InternalValue>],
     ) -> crate::Result<()> {
         debug_assert_eq!(results.len(), keys.len());
@@ -2483,64 +2568,91 @@ impl Tree {
                 break;
             }
 
+            // Warm the cold data blocks this level will read across ALL its SSTs
+            // in one cross-file batched read, so the serial resolve below hits the
+            // cache. On io_uring the reads coalesce into one submission and the
+            // kernel fans them out across the underlying devices. When the cold
+            // working set is too large to warm without thrashing the cache, this
+            // signals oversize and warms nothing; the level is then resolved by
+            // reading its blocks in budget-sized chunks into a scratch and
+            // point-reading directly (no cache, no eviction).
+            if Self::prewarm_level_cross_sst(fs, level, &still_remaining, keys, seqno, comparator)
+                && Self::resolve_level_chunked(
+                    fs,
+                    level,
+                    &mut still_remaining,
+                    keys,
+                    seqno,
+                    comparator,
+                    results,
+                )?
+            {
+                continue;
+            }
+
             if level_idx == 0 {
-                // L0: must check ALL runs, keep highest seqno per key.
-                // Track keys at the seqno ceiling (seqno + 1 == read_seqno) —
-                // no other L0 run can beat them, so skip in subsequent runs.
-                // Bitmap: idx is always in 0..keys.len(), dense enough for Vec<bool>.
+                // L0: must check ALL runs, keep highest seqno per key. Track keys
+                // at the seqno ceiling (seqno + 1 == read_seqno): no other L0 run
+                // can beat them, so skip them in subsequent runs. The bitmap is
+                // dense over 0..keys.len().
                 let mut at_ceiling = vec![false; keys.len()];
 
                 for run in level.iter() {
-                    for &(idx, hash) in &still_remaining {
-                        if at_ceiling[idx] {
-                            continue;
-                        }
-                        let key = keys[idx].as_ref();
-                        if let Some(table) = run.get_for_key_cmp(key, comparator)
-                            && let Some(item) = table.get(key, seqno, hash)?
-                        {
-                            match &results[idx] {
-                                Some(current) if current.key.seqno >= item.key.seqno => {}
-                                _ => {
-                                    if item.key.seqno.checked_add(1) == Some(seqno) {
-                                        at_ceiling[idx] = true;
-                                    }
-                                    results[idx] = Some(item);
+                    // `at_ceiling` is read as this run's skip set (a key is visited
+                    // once per run, so the updates below only affect later runs)
+                    // and mutated from the returned outcomes: never both at once.
+                    let resolved = Self::resolve_run_batched(
+                        run,
+                        &still_remaining,
+                        keys,
+                        seqno,
+                        comparator,
+                        |idx| at_ceiling[idx],
+                    )?;
+                    for (idx, _hash, item) in resolved.covered {
+                        let Some(item) = item else { continue };
+                        match &results[idx] {
+                            Some(current) if current.key.seqno >= item.key.seqno => {}
+                            _ => {
+                                if item.key.seqno.checked_add(1) == Some(seqno) {
+                                    at_ceiling[idx] = true;
                                 }
+                                results[idx] = Some(item);
                             }
                         }
                     }
+                    // Uncovered keys stay in `still_remaining`; the retain below
+                    // prunes the ones any run resolved.
                 }
 
                 // Remove found keys (both values and tombstones)
                 still_remaining.retain(|&(idx, _)| results[idx].is_none());
             } else {
-                // L1+ runs have non-overlapping key ranges within a level.
-                // Once get_for_key_cmp identifies a covering run for a key,
-                // no other run in this level can contain it. We split into:
-                // - `not_covered`: key range didn't match any run yet → try next run
-                // - `covered_miss`: covering run found but table.get returned None
-                //   (bloom false negative or key absent) → skip remaining runs in
-                //   this level, but keep for lower levels
+                // L1+ runs have non-overlapping key ranges within a level. A
+                // covering run resolves a key definitively: a hit sets the result,
+                // a covering miss drops it to lower levels (`covered_miss`), and an
+                // uncovered key tries the next run in this level (`not_covered`).
                 let mut covered_miss: Vec<(usize, u64)> = Vec::new();
 
                 for run in level.iter() {
-                    let mut not_covered = Vec::with_capacity(still_remaining.len());
-                    for &(idx, hash) in &still_remaining {
-                        let key = keys[idx].as_ref();
-                        if let Some(table) = run.get_for_key_cmp(key, comparator) {
-                            if let Some(item) = table.get(key, seqno, hash)? {
-                                results[idx] = Some(item);
-                            } else {
-                                // Covering run found, but key not present — no other
-                                // run in this level can have it. Keep for lower levels.
-                                covered_miss.push((idx, hash));
-                            }
+                    let resolved = Self::resolve_run_batched(
+                        run,
+                        &still_remaining,
+                        keys,
+                        seqno,
+                        comparator,
+                        |_| false,
+                    )?;
+                    for (idx, hash, item) in resolved.covered {
+                        if let Some(item) = item {
+                            results[idx] = Some(item);
                         } else {
-                            not_covered.push((idx, hash));
+                            // Covering run found, key absent: no other run in this
+                            // level can have it. Keep for lower levels.
+                            covered_miss.push((idx, hash));
                         }
                     }
-                    still_remaining = not_covered;
+                    still_remaining = resolved.not_covered;
                 }
 
                 // Merge back: keys without a covering run + keys with a covering
@@ -2557,6 +2669,389 @@ impl Tree {
         }
 
         Ok(())
+    }
+
+    /// Resolves `remaining` (sorted ascending under `comparator`) against a
+    /// single run with per-table batched gets instead of a per-key `table.get`:
+    /// consecutive keys covered by the same table within the run share one
+    /// [`Table::batch_get`], so co-located keys decode their data block once.
+    /// Byte-identical to per-key resolution (the same point reads, the same
+    /// values). `skip(idx)` omits a key (e.g. one already pinned at the L0 seqno
+    /// ceiling, where no later run can beat it).
+    ///
+    /// Returns, per covered non-skipped key, `(idx, hash, resolved item)` in
+    /// input order, plus the keys this run does not cover (also in input order)
+    /// for the caller to pass to the next run or level.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "i < remaining.len() is loop-checked; idx values are valid key indices (caller's keys/results are aligned, same as batch_get_from_tables)"
+    )]
+    fn resolve_run_batched<K: AsRef<[u8]>>(
+        run: &crate::version::Run<crate::Table>,
+        remaining: &[(usize, u64)],
+        keys: &[K],
+        seqno: SeqNo,
+        comparator: &dyn crate::comparator::UserComparator,
+        skip: impl Fn(usize) -> bool,
+    ) -> crate::Result<RunResolve> {
+        let mut covered: Vec<CoveredKey> = Vec::new();
+        let mut not_covered: Vec<(usize, u64)> = Vec::new();
+
+        let mut i = 0;
+        while i < remaining.len() {
+            let (idx, hash) = remaining[i];
+            if skip(idx) {
+                i += 1;
+                continue;
+            }
+            let key = keys[idx].as_ref();
+            let Some(table) = run.get_for_key_cmp(key, comparator) else {
+                not_covered.push((idx, hash));
+                i += 1;
+                continue;
+            };
+
+            // Gather the contiguous, non-skipped keys covered by THIS table. The
+            // input is sorted and a run's tables partition the key space, so the
+            // keys for one table form a contiguous slice; one `batch_get` drains
+            // them with a single block decode for co-located keys.
+            let table_id = table.id();
+            let mut batch: Vec<(&[u8], u64)> = Vec::new();
+            let mut batch_keys: Vec<(usize, u64)> = Vec::new();
+            while i < remaining.len() {
+                let (jdx, jhash) = remaining[i];
+                if skip(jdx) {
+                    i += 1;
+                    continue;
+                }
+                let jkey = keys[jdx].as_ref();
+                match run.get_for_key_cmp(jkey, comparator) {
+                    Some(t) if t.id() == table_id => {
+                        batch.push((jkey, jhash));
+                        batch_keys.push((jdx, jhash));
+                        i += 1;
+                    }
+                    _ => break,
+                }
+            }
+
+            for ((kidx, khash), item) in batch_keys.into_iter().zip(table.batch_get(&batch, seqno)?)
+            {
+                covered.push((kidx, khash, item));
+            }
+        }
+
+        Ok(RunResolve {
+            covered,
+            not_covered,
+        })
+    }
+
+    /// Warms an entire level's COLD data blocks across ALL its SSTs in one
+    /// cross-file batched read ([`crate::fs::Fs::read_blocks_batched`]), so the
+    /// serial resolve walk that follows hits the cache. On `io_uring` the reads of
+    /// many SSTs (and, on a multi-device filesystem, many physical devices)
+    /// coalesce into one submission and overlap in flight.
+    ///
+    /// Purely best-effort: it never changes a query result (the resolve walk
+    /// re-reads authoritatively), and it is size-bounded to at most half the
+    /// shared cache so the warmed blocks survive until the walk reads them.
+    ///
+    /// Returns `true` when the level's cold working set EXCEEDS that half-cache
+    /// bound: warming would thrash the cache, so nothing is warmed and the caller
+    /// resolves the level with the chunked read-into-scratch path instead
+    /// ([`Tree::resolve_level_chunked`]). Returns `false` when it warmed the
+    /// blocks (or had nothing to warm), i.e. the serial resolve should run.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "planned[ti] and all_buffers[k..end] indices are built from `planned` itself, so they are in range by construction"
+    )]
+    fn prewarm_level_cross_sst<K: AsRef<[u8]>>(
+        fs: &dyn crate::fs::Fs,
+        level: &crate::version::Level,
+        remaining: &[(usize, u64)],
+        keys: &[K],
+        seqno: SeqNo,
+        comparator: &dyn crate::comparator::UserComparator,
+    ) -> bool {
+        // Gather per-table prewarm plans across the level's runs (group remaining
+        // keys by covering table, mirroring resolve_run_batched's walk).
+        let mut planned: Vec<(
+            &crate::Table,
+            Arc<dyn crate::fs::FsFile>,
+            Vec<crate::table::BlockHandle>,
+        )> = Vec::new();
+        for run in level.iter() {
+            let mut i = 0;
+            while i < remaining.len() {
+                let (idx, _) = remaining[i];
+                let key = keys[idx].as_ref();
+                let Some(table) = run.get_for_key_cmp(key, comparator) else {
+                    i += 1;
+                    continue;
+                };
+                let table_id = table.id();
+                let mut batch: Vec<(&[u8], u64)> = Vec::new();
+                while i < remaining.len() {
+                    let (jdx, jhash) = remaining[i];
+                    let jkey = keys[jdx].as_ref();
+                    match run.get_for_key_cmp(jkey, comparator) {
+                        Some(t) if t.id() == table_id => {
+                            batch.push((jkey, jhash));
+                            i += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                if let Some((file, handles)) = table.plan_prewarm(&batch, seqno) {
+                    planned.push((table, file, handles));
+                }
+            }
+        }
+
+        let total_cold: usize = planned.iter().map(|(_, _, h)| h.len()).sum();
+        if total_cold < 2 {
+            return false;
+        }
+        // Eviction-avoiding bound: warm at most half the (shared) cache.
+        let Some((first_table, _, _)) = planned.first() else {
+            return false;
+        };
+        let cap = first_table.cache_capacity();
+        let total_bytes: u64 = planned
+            .iter()
+            .flat_map(|(_, _, h)| h.iter().map(|x| u64::from(x.size())))
+            .sum();
+        if cap == 0 {
+            return false;
+        }
+        if total_bytes > cap / 2 {
+            // Cold working set too large to warm without thrash: signal the caller
+            // to resolve this level via the chunked read-into-scratch path.
+            return true;
+        }
+
+        // One buffer per cold block, in (table, block) order.
+        let mut all_buffers: Vec<Vec<u8>> = planned
+            .iter()
+            .flat_map(|(_, _, handles)| handles.iter().map(|h| vec![0u8; h.size() as usize]))
+            .collect();
+        // (table index, offset) per buffer, so each request borrows the right file.
+        let flat: Vec<(usize, u64)> = planned
+            .iter()
+            .enumerate()
+            .flat_map(|(ti, (_, _, handles))| handles.iter().map(move |h| (ti, *h.offset())))
+            .collect();
+
+        {
+            let mut reqs: Vec<crate::fs::BlockRead<'_>> = flat
+                .iter()
+                .zip(all_buffers.iter_mut())
+                .map(|(&(ti, offset), buf)| crate::fs::BlockRead {
+                    file: planned[ti].1.as_ref(),
+                    offset,
+                    buf: buf.as_mut_slice(),
+                })
+                .collect();
+            // Best-effort: a batched-read failure just leaves the blocks for the
+            // resolve walk to read normally.
+            if fs.read_blocks_batched(&mut reqs).is_err() {
+                return false;
+            }
+        }
+
+        // Decode each table's blocks (its contiguous slice of all_buffers).
+        let mut k = 0;
+        for (table, _, handles) in &planned {
+            let end = k + handles.len();
+            table.decode_prewarmed(handles, &all_buffers[k..end]);
+            k = end;
+        }
+        false
+    }
+
+    /// Plans every data block this level's SSTs will read for `remaining`,
+    /// grouping keys by covering table per run (mirrors `resolve_run_batched`'s
+    /// walk). Each task carries the ORIGINAL key indices (into `keys`).
+    ///
+    /// # Errors
+    ///
+    /// Propagates a table-side planning failure ([`Table::plan_block_tasks`]) so
+    /// the resolver surfaces it instead of letting a stale lower level answer.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "i < remaining.len() loop-checked; idx/jdx are valid key indices; batch_idx[pos] is in range (pos came from this table's own plan)"
+    )]
+    fn plan_level_block_tasks<'a, K: AsRef<[u8]>>(
+        level: &'a crate::version::Level,
+        remaining: &[(usize, u64)],
+        keys: &[K],
+        seqno: SeqNo,
+        comparator: &dyn crate::comparator::UserComparator,
+    ) -> crate::Result<Vec<BlockTask<'a>>> {
+        let mut tasks: Vec<BlockTask<'a>> = Vec::new();
+        for run in level.iter() {
+            let mut i = 0;
+            while i < remaining.len() {
+                let (idx, _) = remaining[i];
+                let key = keys[idx].as_ref();
+                let Some(table) = run.get_for_key_cmp(key, comparator) else {
+                    i += 1;
+                    continue;
+                };
+                let table_id = table.id();
+                let mut batch: Vec<(&[u8], u64)> = Vec::new();
+                let mut batch_idx: Vec<usize> = Vec::new();
+                while i < remaining.len() {
+                    let (jdx, jhash) = remaining[i];
+                    let jkey = keys[jdx].as_ref();
+                    match run.get_for_key_cmp(jkey, comparator) {
+                        Some(t) if t.id() == table_id => {
+                            batch.push((jkey, jhash));
+                            batch_idx.push(jdx);
+                            i += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                if let Some((file, table_seqno, special, blocks)) =
+                    table.plan_block_tasks(&batch, seqno)?
+                {
+                    for (handle, positions) in blocks {
+                        let task_keys: Vec<usize> =
+                            positions.iter().map(|&pos| batch_idx[pos]).collect();
+                        tasks.push(BlockTask {
+                            table,
+                            file: Arc::clone(&file),
+                            handle,
+                            table_seqno,
+                            special,
+                            keys: task_keys,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(tasks)
+    }
+
+    /// Resolves an ENTIRE level by reading its blocks in chunks into a scratch and
+    /// point-reading directly (no cache, no eviction). Called after
+    /// [`Tree::prewarm_level_cross_sst`] signals the cold working set is too large
+    /// to warm. Returns `Ok(true)` when it resolved the level (results updated,
+    /// found keys dropped from `still_remaining`); `Ok(false)` when the level has
+    /// no blocks to read for this batch (every key bloom-skips) or holds a
+    /// Page-ECC / columnar table, in which cases the caller falls through to the
+    /// serial resolve.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "start/end stay within tasks by construction"
+    )]
+    fn resolve_level_chunked<K: AsRef<[u8]>>(
+        fs: &dyn crate::fs::Fs,
+        level: &crate::version::Level,
+        still_remaining: &mut Vec<(usize, u64)>,
+        keys: &[K],
+        seqno: SeqNo,
+        comparator: &dyn crate::comparator::UserComparator,
+        results: &mut [Option<InternalValue>],
+    ) -> crate::Result<bool> {
+        let tasks = Self::plan_level_block_tasks(level, still_remaining, keys, seqno, comparator)?;
+        let Some(first) = tasks.first() else {
+            return Ok(false);
+        };
+        // A Page-ECC / columnar table covers some of these keys (only possible
+        // when the columnar/ECC policy differs between the SSTs in this level).
+        // The scratch decode path is row-format only, so hand the whole level to
+        // the serial resolve, which loads those blocks through their format-aware
+        // path. The scratch fast path stays homogeneous and row-only.
+        if tasks.iter().any(|t| t.special) {
+            return Ok(false);
+        }
+        // Read blocks in chunks of at most half the shared cache, so a chunk's
+        // scratch never dwarfs the cache it is meant to spare. `.max(1)` keeps the
+        // chunk loop's `end > start` guard the sole progress condition when the
+        // cache is disabled (capacity 0).
+        let budget = (first.table.cache_capacity() / 2).max(1);
+
+        let mut start = 0;
+        while start < tasks.len() {
+            let mut bytes = 0u64;
+            let mut end = start;
+            while end < tasks.len() {
+                let sz = u64::from(tasks[end].handle.size());
+                if end > start && bytes + sz > budget {
+                    break;
+                }
+                bytes += sz;
+                end += 1;
+            }
+            Self::resolve_block_task_chunk(fs, &tasks[start..end], keys, results)?;
+            start = end;
+        }
+        still_remaining.retain(|&(idx, _)| results[idx].is_none());
+        Ok(true)
+    }
+
+    /// Reads one chunk of block-tasks in ONE cross-file `read_blocks_batched`,
+    /// decodes each from its scratch buffer, and point-reads its keys, keeping the
+    /// highest-seqno hit per key in `results`. Every task is row-format (the caller
+    /// routes any level with a Page-ECC / columnar table to the serial resolve).
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "buffers is built from chunk so indices align; key indices are valid (caller's keys/results aligned)"
+    )]
+    fn resolve_block_task_chunk<K: AsRef<[u8]>>(
+        fs: &dyn crate::fs::Fs,
+        chunk: &[BlockTask<'_>],
+        keys: &[K],
+        results: &mut [Option<InternalValue>],
+    ) -> crate::Result<()> {
+        let mut buffers: Vec<Vec<u8>> = chunk
+            .iter()
+            .map(|t| vec![0u8; t.handle.size() as usize])
+            .collect();
+        {
+            let mut reqs: Vec<crate::fs::BlockRead<'_>> = chunk
+                .iter()
+                .zip(buffers.iter_mut())
+                .map(|(t, buf)| crate::fs::BlockRead {
+                    file: t.file.as_ref(),
+                    offset: *t.handle.offset(),
+                    buf: buf.as_mut_slice(),
+                })
+                .collect();
+            fs.read_blocks_batched(&mut reqs)?;
+        }
+
+        for (task, buf) in chunk.iter().zip(buffers.iter()) {
+            if let Some(block) = task.table.decode_data_block_from_bytes(buf)? {
+                for &kidx in &task.keys {
+                    if let Some(item) = task.table.point_read_translated(
+                        &block,
+                        keys[kidx].as_ref(),
+                        task.table_seqno,
+                    )? {
+                        Self::keep_highest(results, kidx, item);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Keeps the higher-seqno of an existing result and a new candidate (the L0
+    /// newest-version-wins merge; correct for L1+ too, where each key has one
+    /// candidate).
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "idx is a valid key index aligned with results"
+    )]
+    fn keep_highest(results: &mut [Option<InternalValue>], idx: usize, item: InternalValue) {
+        match &results[idx] {
+            Some(current) if current.key.seqno >= item.key.seqno => {}
+            _ => results[idx] = Some(item),
+        }
     }
 
     fn get_internal_entry_from_tables(

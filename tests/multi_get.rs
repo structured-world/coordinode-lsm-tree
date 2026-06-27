@@ -1,5 +1,5 @@
 use lsm_tree::{
-    AbstractTree, Config, KvSeparationOptions, MergeOperator, SeqNo, SequenceNumberCounter,
+    AbstractTree, Cache, Config, KvSeparationOptions, MergeOperator, SeqNo, SequenceNumberCounter,
     UserValue, get_tmp_folder,
 };
 use std::sync::Arc;
@@ -239,6 +239,107 @@ fn multi_get_unsorted_and_duplicate_keys() -> lsm_tree::Result<()> {
 }
 
 #[test]
+fn multi_get_duplicate_keys_missing_to_disk_match_per_key_get() -> lsm_tree::Result<()> {
+    // Regression: the prior test keeps its keys in the memtable, so its duplicate
+    // is resolved in Phase 1 and never reaches the batched on-disk path. A
+    // duplicate that MISSES the memtables and resolves on disk is the real edge
+    // case: the batch path requires strictly-sorted-unique keys, so a duplicate
+    // query key has to be de-duplicated before the batch and the shared answer
+    // fanned back to every position. Before the fix the duplicate reached the
+    // batch path and broke its sorted-unique contract.
+    let folder = get_tmp_folder();
+
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    tree.insert("k0000", "v0", 0);
+    tree.insert("k0008", "v8", 1);
+    // Flush so both keys live in an SST: Phase 1 misses them and the duplicate
+    // reaches the batched on-disk path. Pad with absent keys so the batch stays
+    // well above the small-batch per-key shortcut even if that cutoff changes.
+    tree.flush_active_memtable(0)?;
+
+    // "k0008" twice + "k0000" + absent padding: one duplicate, all disk misses.
+    let query = [
+        "k0008", "k0008", "k0000", "absent_0", "absent_1", "absent_2", "absent_3",
+    ];
+    let batched = tree.multi_get(query, SeqNo::MAX)?;
+    assert_eq!(batched.len(), query.len());
+
+    // Each position must equal the authoritative per-key get for the same key.
+    for (i, key) in query.iter().enumerate() {
+        let single = tree.get(key, SeqNo::MAX)?;
+        assert_eq!(
+            batched[i].as_deref(),
+            single.as_deref(),
+            "multi_get vs get mismatch at position {i} (key {key})"
+        );
+    }
+    // Concretely: both duplicates resolve to v8, the third to v0.
+    assert_eq!(batched[0].as_deref(), Some(b"v8".as_slice()));
+    assert_eq!(batched[1].as_deref(), Some(b"v8".as_slice()));
+    assert_eq!(batched[2].as_deref(), Some(b"v0".as_slice()));
+
+    Ok(())
+}
+
+#[test]
+fn multi_get_blob_tree_duplicate_keys_missing_to_disk_match_per_key_get() -> lsm_tree::Result<()> {
+    // Regression: BlobTree::multi_get forwards its disk-miss keys straight to the
+    // shared batched on-disk resolver, which requires strictly-sorted-unique
+    // input. A duplicate query key that misses the memtables reaches that path as
+    // a repeat and breaks the contract (the standard Tree de-dupes; the BlobTree
+    // must do the same and fan the shared answer back to every position).
+    let folder = get_tmp_folder();
+
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(KvSeparationOptions {
+        separation_threshold: 1, // separate all values into blobs
+        ..Default::default()
+    }))
+    .open()?;
+
+    let big0 = b"0".repeat(200);
+    let big8 = b"8".repeat(200);
+    tree.insert("k0000", big0.as_slice(), 0);
+    tree.insert("k0008", big8.as_slice(), 1);
+    // Flush so both live in an SST: Phase 1 misses them and the duplicate reaches
+    // the batched on-disk path. Pad the query with absent keys so it stays well
+    // above the small-batch per-key shortcut even if that cutoff changes, keeping
+    // the duplicate fan-out exercised through the shared resolver.
+    tree.flush_active_memtable(0)?;
+    assert!(tree.blob_file_count() > 0);
+
+    let query = [
+        "k0008", "k0008", "k0000", "absent_0", "absent_1", "absent_2", "absent_3",
+    ];
+    let batched = tree.multi_get(query, SeqNo::MAX)?;
+    assert_eq!(batched.len(), query.len());
+
+    for (i, key) in query.iter().enumerate() {
+        let single = tree.get(key, SeqNo::MAX)?;
+        assert_eq!(
+            batched[i].as_deref(),
+            single.as_deref(),
+            "blob multi_get vs get mismatch at position {i} (key {key})"
+        );
+    }
+    assert_eq!(batched[0].as_deref(), Some(big8.as_slice()));
+    assert_eq!(batched[1].as_deref(), Some(big8.as_slice()));
+    assert_eq!(batched[2].as_deref(), Some(big0.as_slice()));
+
+    Ok(())
+}
+
+#[test]
 fn multi_get_with_range_tombstones() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
 
@@ -381,6 +482,70 @@ fn multi_get_large_batch_all_from_disk() -> lsm_tree::Result<()> {
             results[result_idx].as_deref(),
             Some(expected.as_bytes()),
             "mismatch at result index {result_idx} (key_{i:05})",
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn multi_get_large_batch_oversize_working_set_matches_per_key_get() -> lsm_tree::Result<()> {
+    // Exercises the chunked resolve: a batch far larger than the per-level chunk
+    // threshold whose touched data blocks, across several SSTs, exceed the shared
+    // cache. With a deliberately tiny cache the level's blocks cannot all be
+    // warmed at once, so the resolver reads them in budget-sized chunks into a
+    // scratch and point-reads directly. The result must still equal the
+    // authoritative per-key `get` for every position.
+    let folder = get_tmp_folder();
+
+    // 16 KiB cache → ~8 KiB chunk budget, far below the total block bytes below,
+    // forcing multi-chunk reads.
+    let cache = Arc::new(Cache::with_capacity_bytes(16 * 1024));
+
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .use_cache(cache)
+    .open()?;
+
+    // Four flushes over disjoint key ranges → four L0 SSTs the batch spans, so
+    // the gathered block tasks cross SSTs (the property the chunked path keeps).
+    let per_sst = 600u64;
+    let total = 4 * per_sst;
+    let mut seqno = 0u64;
+    for sst in 0..4u64 {
+        let start = sst * per_sst;
+        for i in start..start + per_sst {
+            tree.insert(format!("key_{i:06}"), format!("value_{i:08}"), seqno);
+            seqno += 1;
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Reverse order exercises the sort; include misses interleaved.
+    let keys: Vec<String> = (0..total)
+        .rev()
+        .map(|i| {
+            if i % 50 == 0 {
+                format!("absent_{i:06}")
+            } else {
+                format!("key_{i:06}")
+            }
+        })
+        .collect();
+    assert!(keys.len() > 512, "batch must exceed the chunk threshold");
+
+    let batched = tree.multi_get(&keys, SeqNo::MAX)?;
+    assert_eq!(batched.len(), keys.len());
+
+    for (pos, key) in keys.iter().enumerate() {
+        let single = tree.get(key, SeqNo::MAX)?;
+        assert_eq!(
+            batched[pos].as_deref(),
+            single.as_deref(),
+            "multi_get vs get mismatch at position {pos} (key {key})"
         );
     }
 

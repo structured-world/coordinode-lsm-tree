@@ -230,6 +230,137 @@ fn fs_file_set_len() -> io::Result<()> {
 }
 
 #[test]
+fn fs_file_read_many_fills_every_region() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fs = StdFs;
+
+    let path = dir.path().join("read_many.bin");
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+    let mut file = fs.open(&path, &opts)?;
+    // 0..=255 so each region's bytes are self-identifying by offset.
+    let data: Vec<u8> = (0..=255u8).collect();
+    file.write_all(&data)?;
+
+    // Three disjoint regions in non-file order, covering the start and a
+    // single-byte read, must each be filled completely.
+    let mut b0 = [0u8; 4];
+    let mut b1 = [0u8; 8];
+    let mut b2 = [0u8; 1];
+    let mut regions: Vec<(u64, &mut [u8])> =
+        vec![(10, &mut b0[..]), (200, &mut b1[..]), (0, &mut b2[..])];
+    file.read_many(&mut regions)?;
+    drop(regions);
+
+    assert_eq!(&b0[..], &data[10..14]);
+    assert_eq!(&b1[..], &data[200..208]);
+    assert_eq!(b2[0], data[0]);
+
+    // The default read_many must agree byte-for-byte with per-region read_at.
+    let mut single = [0u8; 8];
+    assert_eq!(file.read_at(&mut single, 200)?, 8);
+    assert_eq!(single, b1);
+
+    Ok(())
+}
+
+#[test]
+fn fs_read_blocks_batched_across_files() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fs = StdFs;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut f0 = fs.open(&dir.path().join("a.bin"), &opts)?;
+    f0.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    let mut f1 = fs.open(&dir.path().join("b.bin"), &opts)?;
+    let rev: Vec<u8> = (0..=255u8).rev().collect();
+    f1.write_all(&rev)?;
+
+    // Reads spanning TWO files in one batched call, out of order, must each be
+    // filled from the right file at the right offset.
+    let mut b0 = [0u8; 4];
+    let mut b1 = [0u8; 4];
+    let mut b2 = [0u8; 2];
+    {
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: f0.as_ref(),
+                offset: 10,
+                buf: &mut b0,
+            },
+            crate::fs::BlockRead {
+                file: f1.as_ref(),
+                offset: 20,
+                buf: &mut b1,
+            },
+            crate::fs::BlockRead {
+                file: f0.as_ref(),
+                offset: 0,
+                buf: &mut b2,
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)?;
+    }
+
+    assert_eq!(b0, [10, 11, 12, 13]);
+    assert_eq!(b1, [rev[20], rev[21], rev[22], rev[23]]);
+    assert_eq!(b2, [0, 1]);
+    Ok(())
+}
+
+#[test]
+fn fs_file_read_many_short_read_at_eof_errors() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fs = StdFs;
+
+    let path = dir.path().join("short_many.bin");
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+    let mut file = fs.open(&path, &opts)?;
+    file.write_all(&[0u8; 10])?;
+
+    // A region that runs past EOF cannot be filled completely; the default
+    // read_many treats the fixed-size short read as UnexpectedEof, not EOF.
+    let mut buf = [0u8; 32];
+    let mut regions: Vec<(u64, &mut [u8])> = vec![(0, &mut buf[..])];
+    let err = file.read_many(&mut regions).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    Ok(())
+}
+
+#[test]
+fn fs_read_blocks_batched_short_read_at_eof_errors() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fs = StdFs;
+
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+    let mut file = fs.open(&dir.path().join("short_block.bin"), &opts)?;
+    file.write_all(&[0u8; 10])?;
+
+    let mut buf = [0u8; 64];
+    {
+        let mut reqs = vec![crate::fs::BlockRead {
+            file: file.as_ref(),
+            offset: 0,
+            buf: &mut buf,
+        }];
+        let err = fs.read_blocks_batched(&mut reqs).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+    Ok(())
+}
+
+#[test]
+fn fs_file_backing_fd_default_is_none() -> io::Result<()> {
+    // StdFs handles use the trait's default backing_fd (no shared io_uring ring),
+    // so read_blocks_batched reads them serially rather than via a ring.
+    let dir = tempfile::tempdir()?;
+    let fs = StdFs;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+    let file = fs.open(&dir.path().join("nofd.bin"), &opts)?;
+    assert_eq!(file.backing_fd(), None);
+    Ok(())
+}
+
+#[test]
 #[cfg(any(unix, windows))]
 fn fs_file_lock_exclusive() -> io::Result<()> {
     let dir = tempfile::tempdir()?;
