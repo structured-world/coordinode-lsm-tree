@@ -1228,6 +1228,43 @@ impl Writer {
         batch: &crate::table::columnar::ColumnBatch,
         comparator: &crate::SharedComparator,
     ) -> crate::Result<Option<crate::UserKey>> {
+        self.write_columnar_block_inner(batch, comparator, true)
+    }
+
+    /// Writes a pre-built [`ColumnBatch`](crate::table::columnar::ColumnBatch) as a
+    /// single columnar block, storing its value sub-columns AND its per-row seqnos
+    /// **verbatim** — unlike [`Self::write_columnar_batch`], which is the
+    /// bulk-ingest path and requires seqno `0` (assigned at finish). Salvage uses
+    /// this to re-emit a recovered columnar block under its original sequence
+    /// numbers, so the recovered copy keeps both its per-field sub-columns and its
+    /// MVCC versions. The table must be written with `global_seqno` `0` so the
+    /// stored seqnos are the effective ones.
+    ///
+    /// Returns the batch's last user key (or `None` for an empty batch).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write_columnar_batch`], except a non-zero per-row seqno is
+    /// accepted (it is stored as the row's sequence number).
+    #[cfg(feature = "columnar")]
+    pub(crate) fn write_columnar_block_verbatim(
+        &mut self,
+        batch: &crate::table::columnar::ColumnBatch,
+        comparator: &crate::SharedComparator,
+    ) -> crate::Result<Option<crate::UserKey>> {
+        self.write_columnar_block_inner(batch, comparator, false)
+    }
+
+    /// Shared body for the two columnar-block writers. `require_zero_seqno`
+    /// enforces the bulk-ingest contract (every row seqno `0`); the verbatim
+    /// salvage path passes `false` to store the batch's own seqnos.
+    #[cfg(feature = "columnar")]
+    fn write_columnar_block_inner(
+        &mut self,
+        batch: &crate::table::columnar::ColumnBatch,
+        comparator: &crate::SharedComparator,
+        require_zero_seqno: bool,
+    ) -> crate::Result<Option<crate::UserKey>> {
         // A columnar batch only makes sense (and only reads back correctly) when
         // the table is marked columnar; reject a row-mode writer rather than
         // writing a columnar block under a row descriptor.
@@ -1247,7 +1284,7 @@ impl Writer {
         // Ingest contract. Unsorted keys would corrupt the sorted block index /
         // zone map; a non-zero seqno would read back shifted by the table's
         // assigned sequence number. Reject both before writing anything.
-        if entries.iter().any(|e| e.key.seqno != 0) {
+        if require_zero_seqno && entries.iter().any(|e| e.key.seqno != 0) {
             return Err(crate::Error::FeatureUnsupported(
                 "columnar batch ingest requires every row seqno to be 0 (the ingestion assigns the sequence number)",
             ));

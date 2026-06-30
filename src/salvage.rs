@@ -404,6 +404,45 @@ fn salvage_blocks(
         };
         let end_key = keyed.end_key().clone();
         let offset = *keyed.as_ref().offset();
+
+        // Columnar source: re-emit each block as a delete-masked `ColumnBatch`
+        // verbatim, preserving its per-field value sub-columns and per-row seqnos.
+        // (The row reconstruction path below would collapse the sub-columns into a
+        // single value column.) Per-block corruption is isolated the same way.
+        #[cfg(feature = "columnar")]
+        if table.metadata.columnar {
+            match table.load_columnar_block_masked(keyed.as_ref()) {
+                Ok(Some(batch)) => {
+                    let rows = u64::from(batch.row_count);
+                    writer.write_columnar_block_verbatim(&batch, comparator)?;
+                    entries_salvaged += rows;
+                    blocks_salvaged += 1;
+                }
+                // Wholly-deleted block: nothing to recover, nothing lost.
+                Ok(None) => {}
+                Err(e) => {
+                    let reason = match &e {
+                        crate::Error::ChecksumMismatch { .. } => DropReason::ChecksumMismatch,
+                        crate::Error::InvalidHeader(_) | crate::Error::InvalidTag(_) => {
+                            DropReason::DecodeError(format!("{e:?}"))
+                        }
+                        _ => DropReason::ReadError(format!("{e:?}")),
+                    };
+                    dropped.push(DroppedBlock {
+                        offset,
+                        section: b"data".to_vec(),
+                        reason,
+                        key_range: Some((
+                            prev_end.clone().unwrap_or_else(UserKey::empty),
+                            end_key.clone(),
+                        )),
+                    });
+                }
+            }
+            prev_end = Some(end_key);
+            continue;
+        }
+
         match table.load_data_block(keyed.as_ref()) {
             // `try_iter`, not `iter`: a checksum-clean but structurally malformed
             // block (e.g. an invalid trailer) must be reported as a dropped

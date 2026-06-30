@@ -1,7 +1,8 @@
-use super::{
-    BlobDropReason, DropReason, SalvageOptions, salvage_blob_file, salvage_sst,
-    salvage_sst_with_options,
-};
+use super::{BlobDropReason, DropReason, salvage_blob_file, salvage_sst};
+// The options-bearing entry is exercised only by the encrypted / dictionary
+// salvage tests, which are themselves feature-gated.
+#[cfg(any(feature = "encryption", zstd_any))]
+use super::{SalvageOptions, salvage_sst_with_options};
 use crate::comparator::default_comparator;
 use crate::fs::{Fs, StdFs};
 use crate::table::{Table, Writer};
@@ -628,6 +629,7 @@ fn salvage_sst_reads_and_writes_through_the_injected_fs() -> crate::Result<()> {
 /// Reads the second data block's on-disk offset from a context-aware reopen of
 /// `source`, then flips a byte just past that block's header so its checksum /
 /// AEAD tag fails on load while every other block stays intact.
+#[cfg(any(feature = "encryption", zstd_any))]
 fn corrupt_second_data_block(
     source: &std::path::Path,
     fs: &Arc<dyn Fs>,
@@ -1092,6 +1094,76 @@ fn salvage_blob_file_rejects_a_compressed_source() -> crate::Result<()> {
             Err(crate::Error::FeatureUnsupported(_)),
         ),
         "a compressed blob file must be rejected rather than mis-salvaged",
+    );
+    Ok(())
+}
+
+/// A columnar source carrying a per-field value sub-column salvages into a copy
+/// that KEEPS the sub-column (verbatim `ColumnBatch` re-emit), instead of
+/// collapsing it into a single value column via a row round-trip.
+#[cfg(feature = "columnar")]
+#[test]
+fn salvage_preserves_columnar_value_subcolumns() -> crate::Result<()> {
+    use crate::table::columnar::{Column, TypeTag, entries_to_column_batch};
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let cmp = default_comparator();
+
+    // Two columnar blocks whose value is a single fixed-4 sub-column (id 3),
+    // written verbatim through the ingest batch path (per-row seqno 0).
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    for block in 0..2u32 {
+        let entries: Vec<InternalValue> = (0..4u32)
+            .map(|i| {
+                let k = format!("k{:04}", block * 4 + i);
+                InternalValue::from_components(k.into_bytes(), b"x".to_vec(), 0, ValueType::Value)
+            })
+            .collect();
+        let mut batch = entries_to_column_batch(&entries)?;
+        batch.columns.pop();
+        let mut data = Vec::new();
+        for i in 0..4u32 {
+            data.extend_from_slice(&(block * 4 + i).to_le_bytes());
+        }
+        batch.columns.push(Column {
+            column_id: 3,
+            type_tag: TypeTag::Fixed(4),
+            validity: None,
+            data,
+        });
+        writer.write_columnar_batch(&batch, &cmp)?;
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar SST is non-empty"
+    );
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert!(
+        report.is_complete(),
+        "a healthy columnar SST drops nothing: {report:?}"
+    );
+
+    // Reopen and project sub-column 3 via the per-SST scan: it survives as a
+    // sub-column. A row round-trip would have collapsed it into the value column.
+    let recovered = open(dest, &fs)?;
+    assert!(
+        recovered.metadata.columnar,
+        "the recovered copy stays columnar"
+    );
+    let batches = recovered.columnar_scan(&[3], None)?;
+    let rows: u32 = batches.iter().map(|b| b.row_count).sum();
+    assert_eq!(rows, 8, "every row's sub-column is recovered");
+    assert!(
+        batches
+            .iter()
+            .all(|b| b.columns.iter().all(|c| c.column_id == 3)),
+        "the value sub-column (id 3) is preserved verbatim, not collapsed",
     );
     Ok(())
 }

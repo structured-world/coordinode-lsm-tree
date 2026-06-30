@@ -475,6 +475,49 @@ impl Table {
         }
     }
 
+    /// Loads a columnar data block as a delete-masked
+    /// [`ColumnBatch`](crate::table::columnar::ColumnBatch), preserving its
+    /// per-field value sub-columns (and per-row seqnos) instead of reconstructing
+    /// rows. Salvage re-emits the result verbatim so a recovered columnar SST
+    /// keeps its sub-columns and MVCC versions; `Ok(None)` when the positional
+    /// delete-bitmap removes every row of the block.
+    ///
+    /// `pub(crate)` for the salvage walk ([`crate::salvage`]).
+    #[cfg(feature = "columnar")]
+    pub(crate) fn load_columnar_block_masked(
+        &self,
+        handle: &BlockHandle,
+    ) -> crate::Result<Option<crate::table::columnar::ColumnBatch>> {
+        let block = self.load_block(
+            handle,
+            BlockType::Columnar,
+            self.metadata.data_block_compression,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+        )?;
+        let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
+        let Some(start) = self
+            .delete_block_starts
+            .as_ref()
+            .and_then(|starts| starts.get(&handle.offset().0))
+            .copied()
+        else {
+            // No materialized deletes: the whole block is live.
+            return Ok(Some(batch));
+        };
+        // Drop positionally-deleted rows: this block's rows occupy global
+        // positions `[start, start + row_count)` in write order.
+        let keep: alloc::vec::Vec<bool> = (0..batch.row_count)
+            .map(|i| !self.delete_bitmap.contains(start.wrapping_add(i)))
+            .collect();
+        let masked = crate::table::columnar_predicate::filter_batch(&batch, &keep);
+        if masked.row_count == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(masked))
+        }
+    }
+
     /// Point-read counterpart to [`Self::load_columnar_data_block`]: decodes the
     /// columnar block once and rebuilds only `needle`'s rows (its MVCC versions,
     /// minus any masked by the positional delete-bitmap) into a tiny row block, or
