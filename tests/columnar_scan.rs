@@ -822,13 +822,16 @@ fn tree_columnar_scan_filters_rows_to_the_requested_range() {
     // just a segment selector).
     let folder = get_tmp_folder();
     let any = open_columnar_any(folder.path());
-    ingest_segment(&any, &[
-        (key(0), 0),
-        (key(1), 1),
-        (key(2), 2),
-        (key(3), 3),
-        (key(4), 4),
-    ]);
+    ingest_segment(
+        &any,
+        &[
+            (key(0), 0),
+            (key(1), 1),
+            (key(2), 2),
+            (key(3), 3),
+            (key(4), 4),
+        ],
+    );
     let tree = standard(&any);
 
     // [k1, k4): exclusive upper → k1, k2, k3.
@@ -840,7 +843,10 @@ fn tree_columnar_scan_filters_rows_to_the_requested_range() {
     );
 
     // Inclusive upper [k1, k3] → k1, k2, k3.
-    let got = scan_range_pairs(tree, UserKey::from(&key(1)[..])..=UserKey::from(&key(3)[..]));
+    let got = scan_range_pairs(
+        tree,
+        UserKey::from(&key(1)[..])..=UserKey::from(&key(3)[..]),
+    );
     assert_eq!(got, vec![(key(1), 1), (key(2), 2), (key(3), 3)]);
 }
 
@@ -855,7 +861,10 @@ fn tree_columnar_scan_overlap_merge_filters_rows_to_the_range() {
 
     let tree = standard(&any);
     // [k2, k4]: inclusive → k2, k3, k4.
-    let got = scan_range_pairs(tree, UserKey::from(&key(2)[..])..=UserKey::from(&key(4)[..]));
+    let got = scan_range_pairs(
+        tree,
+        UserKey::from(&key(2)[..])..=UserKey::from(&key(4)[..]),
+    );
     assert_eq!(
         got,
         vec![(key(2), 2), (key(3), 3), (key(4), 4)],

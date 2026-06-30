@@ -86,6 +86,12 @@ impl Tree {
     /// with newest-`seqno`-wins semantics so an overwritten key is returned once
     /// (its newest version); disjoint segments stream without merge overhead.
     ///
+    /// `range` bounds the result at row granularity: a segment that only
+    /// partially overlaps `range` contributes only the rows whose keys fall
+    /// inside it (the inclusive / exclusive sense of each bound is honored). A
+    /// fully unbounded range keeps the zero-copy fast path for an all-visible
+    /// segment.
+    ///
     /// `projection` lists the column ids to decode (value sub-column ids, plus
     /// optionally the intrinsic [`COL_USER_KEY`] / seqno / value-type columns);
     /// every other column is stepped over without decoding. Each yielded batch
@@ -153,6 +159,8 @@ impl Tree {
             predicate: predicate.cloned(),
             comparator,
             seqno,
+            lo,
+            hi,
         })
     }
 }
@@ -201,6 +209,11 @@ pub struct ColumnarScan {
     comparator: alloc::sync::Arc<dyn UserComparator>,
     /// The query snapshot, used for per-row seqno visibility masking.
     seqno: SeqNo,
+    /// The requested key range. Applied as a per-row filter (not just segment
+    /// selection): a segment that only partially overlaps the range must still
+    /// drop the rows that fall outside it.
+    lo: Bound<UserKey>,
+    hi: Bound<UserKey>,
 }
 
 impl ColumnarScan {
@@ -215,11 +228,20 @@ impl ColumnarScan {
         self.merge_group(group)
     }
 
-    /// Singleton group: no cross-segment merge. When every row is visible the
-    /// per-SST projected scan streams verbatim (zero-copy column-skip); when the
-    /// snapshot straddles the segment, a per-row seqno mask is applied.
+    /// Whether the requested key range is fully unbounded, so no per-row range
+    /// filtering is needed (the segment's every row is in range).
+    fn range_is_full(&self) -> bool {
+        matches!(self.lo, Bound::Unbounded) && matches!(self.hi, Bound::Unbounded)
+    }
+
+    /// Singleton group: no cross-segment merge. When every row is visible and the
+    /// range is unbounded, the per-SST projected scan streams verbatim (zero-copy
+    /// column-skip). Otherwise a per-row mask drops rows that are seqno-invisible
+    /// (when the snapshot straddles the segment) or outside the requested range
+    /// (when the segment only partially overlaps it).
     fn process_singleton(&self, seg: &Segment) -> crate::Result<Vec<ColumnBatch>> {
-        if seg.visibility == SeqnoVisibility::All {
+        let range_filter = !self.range_is_full();
+        if seg.visibility == SeqnoVisibility::All && !range_filter {
             let mut out = seg
                 .table
                 .columnar_scan(&self.projection, self.predicate.as_ref())?;
@@ -227,17 +249,23 @@ impl ColumnarScan {
             return Ok(out);
         }
 
-        // Partial visibility: decode the seqno column too, drop rows whose
-        // effective seqno is not visible, then strip the seqno column if the
-        // caller did not project it.
+        // Decode the columns the mask needs even when the caller did not project
+        // them (dropped again at the end): the seqno column for partial-visibility
+        // masking, the key column for range filtering.
+        let partial = seg.visibility == SeqnoVisibility::Partial;
         let seqno_projected = self.projection.contains(&COL_SEQNO);
+        let key_projected = self.projection.contains(&COL_USER_KEY);
         let mut augmented = self.projection.clone();
-        if !seqno_projected {
+        if partial && !seqno_projected {
             augmented.push(COL_SEQNO);
+        }
+        if range_filter && !key_projected {
+            augmented.push(COL_USER_KEY);
         }
         // Visible iff `local < threshold` (the snapshot in this segment's local
         // seqno space); `Partial` guarantees the subtraction is in range.
         let threshold = self.seqno.saturating_sub(seg.global);
+        let cmp = self.comparator.as_ref();
 
         let mut out = Vec::new();
         for batch in seg
@@ -247,10 +275,57 @@ impl ColumnarScan {
             if batch.row_count == 0 {
                 continue;
             }
-            let mask = seqno_visibility_mask(&batch, threshold)?;
+            let seqno_col = if partial {
+                Some(
+                    batch
+                        .columns
+                        .iter()
+                        .find(|c| c.column_id == COL_SEQNO)
+                        .ok_or(Error::InvalidHeader(
+                            "columnar_scan: partial-visibility batch missing the seqno column",
+                        ))?,
+                )
+            } else {
+                None
+            };
+            let key_col = if range_filter {
+                Some(
+                    batch
+                        .columns
+                        .iter()
+                        .find(|c| c.column_id == COL_USER_KEY)
+                        .ok_or(Error::InvalidHeader(
+                            "columnar_scan: range-filtered batch missing the key column",
+                        ))?,
+                )
+            } else {
+                None
+            };
+
+            let mut mask = Vec::with_capacity(batch.row_count as usize);
+            for row in 0..batch.row_count {
+                let seqno_ok = match seqno_col {
+                    Some(seqno_col) => fixed_u64_row(&seqno_col.data, row)? < threshold,
+                    None => true,
+                };
+                // Evaluate the range bound only when the row survived the seqno
+                // gate (short-circuit), so a row's key is decoded only if needed.
+                let keep = if !seqno_ok {
+                    false
+                } else if let Some(key_col) = key_col {
+                    let key = bytes_column_row(&key_col.data, batch.row_count, row)?;
+                    key_in_bounds(key, &self.lo, &self.hi, cmp)
+                } else {
+                    true
+                };
+                mask.push(keep);
+            }
             let mut visible = filter_batch(&batch, &mask);
-            if !seqno_projected {
+            if partial && !seqno_projected {
                 visible.columns.retain(|c| c.column_id != COL_SEQNO);
+            }
+            if range_filter && !key_projected {
+                visible.columns.retain(|c| c.column_id != COL_USER_KEY);
             }
             if visible.row_count > 0 {
                 out.push(visible);
@@ -360,7 +435,9 @@ impl ColumnarScan {
         });
 
         // Keep the first index of each distinct key (highest effective seqno);
-        // drop the shadowed older duplicates.
+        // drop the shadowed older duplicates and any key outside the requested
+        // range (a segment may only partially overlap it).
+        let range_filter = !self.range_is_full();
         let mut kept: Vec<u32> = Vec::with_capacity(order.len());
         let mut prev: Option<&[u8]> = None;
         for &i in &order {
@@ -371,6 +448,9 @@ impl ColumnarScan {
                 continue;
             }
             prev = Some(key);
+            if range_filter && !key_in_bounds(key, &self.lo, &self.hi, cmp) {
+                continue;
+            }
             kept.push(i);
         }
 
@@ -389,22 +469,27 @@ impl ColumnarScan {
     }
 }
 
-/// Builds a per-row keep mask for `batch` marking rows whose seqno is visible at
-/// `local_threshold` (a row is visible iff its local seqno is `< threshold`).
-/// The batch must carry the [`COL_SEQNO`] column.
-fn seqno_visibility_mask(batch: &ColumnBatch, local_threshold: SeqNo) -> crate::Result<Vec<bool>> {
-    let seqno_col = batch
-        .columns
-        .iter()
-        .find(|c| c.column_id == COL_SEQNO)
-        .ok_or(Error::InvalidHeader(
-            "columnar_scan: partial-visibility batch missing the seqno column",
-        ))?;
-    let mut mask = Vec::with_capacity(batch.row_count as usize);
-    for row in 0..batch.row_count {
-        mask.push(fixed_u64_row(&seqno_col.data, row)? < local_threshold);
-    }
-    Ok(mask)
+/// Whether `key` lies within the requested `[lo, hi]` key bounds, per the tree
+/// comparator. An unbounded side never excludes; the inclusive / exclusive sense
+/// of each bound matches the `RangeBounds` the caller passed.
+fn key_in_bounds(
+    key: &[u8],
+    lo: &Bound<UserKey>,
+    hi: &Bound<UserKey>,
+    cmp: &dyn UserComparator,
+) -> bool {
+    use core::cmp::Ordering;
+    let above_lo = match lo {
+        Bound::Unbounded => true,
+        Bound::Included(k) => cmp.compare(key, k.as_ref()) != Ordering::Less,
+        Bound::Excluded(k) => cmp.compare(key, k.as_ref()) == Ordering::Greater,
+    };
+    let below_hi = match hi {
+        Bound::Unbounded => true,
+        Bound::Included(k) => cmp.compare(key, k.as_ref()) != Ordering::Greater,
+        Bound::Excluded(k) => cmp.compare(key, k.as_ref()) == Ordering::Less,
+    };
+    above_lo && below_hi
 }
 
 impl Iterator for ColumnarScan {
