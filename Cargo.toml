@@ -165,7 +165,7 @@ lz4_flex = { version = "0.13.0", optional = true, default-features = false }
 # Default features carry the runtime-dispatched SIMD decode kernels (avx2/bmi2/
 # neon/sve/...); `default-features = false` would silently drop them and leave
 # the sequence decoder on the scalar path, measurably slower on cold point reads.
-structured-zstd = { version = "0.0.45", optional = true, features = ["lsm"] }
+structured-zstd = { version = "0.0.48", optional = true, features = ["lsm"] }
 # `once_cell::race::OnceBox` — the no-std + alloc one-shot primitive.
 # We pick it over `std::sync::OnceLock` (which has both `set` and the
 # stabilised `get_or_try_init` on our 1.92 MSRV) because OnceLock is
@@ -211,24 +211,17 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 # pulled in behind the `crc32c` feature — the default `Xxh3_64` algorithm
 # needs only `xxhash-rust`.
 crc32c = { version = "0.6", optional = true }
-# Exact pin on a prerelease — RC API can churn between releases, so locking
-# the exact version is intentional. The 0.11 surface we depend on:
+# The 0.11 surface we depend on:
 #   - aes_gcm::aead::{AeadInOut, Generate, Nonce, Tag}
 #   - AeadInOut::{encrypt_inout_detached, decrypt_inout_detached}
 #   - Nonce::generate_from_rng (via Generate)
 #   - Nonce::try_from / Tag::try_from
 # rand_core re-exported via aes-gcm's `rand_core` feature so `aead::rand_core`
 # exposes the rand_core 0.10 trait family (no version-skew).
-# TODO: bump to stable aes-gcm 0.11.0 once released — at that point this pin
-# becomes a normal "^0.11" caret requirement and the API list above can be
-# treated as the public 0.11 surface, not a prerelease snapshot.
-aes-gcm = { version = "=0.11.0-rc.4", optional = true, features = ["aes", "rand_core"] }
-# Exact pin on the matching prerelease — chacha20poly1305 0.11.0-rc.3 lines
-# up with aes-gcm 0.11.0-rc.3 on the shared `aead` 0.6 surface, so both
-# suites can share the same AeadInOut / Nonce / Tag types in the
-# AEAD-dispatch module. Bumps in lockstep with aes-gcm when the stable
-# 0.11.0 lands.
-chacha20poly1305 = { version = "=0.11.0-rc.3", optional = true, features = ["rand_core"] }
+aes-gcm = { version = "0.11.0", optional = true, features = ["aes", "rand_core"] }
+# Matches aes-gcm 0.11.0 on the shared `aead` 0.6 surface, so both suites
+# share the same AeadInOut / Nonce / Tag types in the AEAD-dispatch module.
+chacha20poly1305 = { version = "0.11.0", optional = true, features = ["rand_core"] }
 rand_chacha = { version = "0.10", optional = true }
 # Pure-Rust Reed-Solomon erasure coding, SIMD-accelerated on x86_64 / aarch64.
 # Used by the optional `page_ecc` feature for per-block parity. Apache-2.0 /
