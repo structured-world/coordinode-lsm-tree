@@ -1,4 +1,4 @@
-use super::{DropReason, salvage_sst};
+use super::{DropReason, SalvageOptions, salvage_sst, salvage_sst_with_options};
 use crate::comparator::default_comparator;
 use crate::fs::{Fs, StdFs};
 use crate::table::{Table, Writer};
@@ -610,6 +610,224 @@ fn salvage_sst_reads_and_writes_through_the_injected_fs() -> crate::Result<()> {
         reopen_item_count(dest, &fs)?,
         u64::from(n),
         "the salvaged SST reopens through the same in-memory backend",
+    );
+    Ok(())
+}
+
+// --- Forwarded recovery context: encrypted + dictionary-compressed sources ---
+
+/// Reads the second data block's on-disk offset from a context-aware reopen of
+/// `source`, then flips a byte just past that block's header so its checksum /
+/// AEAD tag fails on load while every other block stays intact.
+fn corrupt_second_data_block(
+    source: &std::path::Path,
+    fs: &Arc<dyn Fs>,
+    encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
+    #[cfg(zstd_any)] zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
+) -> crate::Result<()> {
+    let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&**fs, source)?);
+    let table = Table::recover(
+        source.to_path_buf(),
+        checksum,
+        0,
+        0,
+        0,
+        Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+        Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8))),
+        Arc::clone(fs),
+        false,
+        false,
+        encryption,
+        #[cfg(zstd_any)]
+        zstd_dictionary,
+        default_comparator(),
+        #[cfg(feature = "metrics")]
+        Arc::new(crate::Metrics::default()),
+    )?;
+    let offsets: alloc::vec::Vec<u64> = table
+        .data_block_handles()
+        .filter_map(Result::ok)
+        .map(|kh| *kh.as_ref().offset())
+        .collect();
+    let Some(&second) = offsets.get(1) else {
+        panic!("source SST must have at least two data blocks, got {offsets:?}");
+    };
+    let flip = usize::try_from(second).unwrap_or(0) + 16;
+    let mut bytes = std::fs::read(source)?;
+    if let Some(b) = bytes.get_mut(flip) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(source, &bytes)?;
+    Ok(())
+}
+
+/// An encrypted source: salvage cannot open it without the provider (the gap this
+/// closes), but with the provider in `SalvageOptions` it block-salvages like a
+/// plain SST and the recovered copy reopens under the same encryption.
+#[cfg(feature = "encryption")]
+#[test]
+fn salvage_recovers_an_encrypted_sst_with_the_provider() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let enc: Arc<dyn crate::encryption::EncryptionProvider> =
+        Arc::new(crate::encryption::Aes256GcmProvider::new(&[0x42; 32]));
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_data_block_size(256)
+        .use_encryption(Some(Arc::clone(&enc)));
+    let n = 200u32;
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source encrypted SST is non-empty"
+    );
+
+    corrupt_second_data_block(
+        &source,
+        &fs,
+        Some(Arc::clone(&enc)),
+        #[cfg(zstd_any)]
+        None,
+    )?;
+
+    // Without the provider, the encrypted source cannot even be opened.
+    assert!(
+        salvage_sst(&source, dest.clone(), &fs).is_err(),
+        "an encrypted SST must not salvage without the provider",
+    );
+
+    // With the provider, it block-salvages: the corrupt block is dropped, the
+    // rest recovered, and the copy is written encrypted.
+    let options = SalvageOptions {
+        encryption: Some(Arc::clone(&enc)),
+        #[cfg(zstd_any)]
+        zstd_dictionary: None,
+    };
+    let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
+    assert_eq!(
+        report.dropped.len(),
+        1,
+        "exactly the corrupt block drops: {report:?}"
+    );
+    assert!(
+        report.entries_salvaged > 0 && report.entries_salvaged < u64::from(n),
+        "a partial key range is recovered, got {} of {n}",
+        report.entries_salvaged,
+    );
+
+    // The salvaged copy reopens UNDER ENCRYPTION (a plaintext copy would fail the
+    // encrypted reopen) and holds exactly the recovered entries.
+    let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &dest)?);
+    let reopened = Table::recover(
+        dest,
+        checksum,
+        0,
+        0,
+        0,
+        Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+        Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8))),
+        Arc::clone(&fs),
+        false,
+        false,
+        Some(Arc::clone(&enc)),
+        #[cfg(zstd_any)]
+        None,
+        default_comparator(),
+        #[cfg(feature = "metrics")]
+        Arc::new(crate::Metrics::default()),
+    )?;
+    assert_eq!(
+        reopened.metadata.item_count, report.entries_salvaged,
+        "the encrypted salvaged copy reopens with exactly the recovered entries",
+    );
+    Ok(())
+}
+
+/// A zstd-dictionary-compressed source: salvage cannot decompress it without the
+/// dictionary, but with the dictionary in `SalvageOptions` it block-salvages and
+/// the recovered copy reopens under the same dictionary.
+#[cfg(zstd_any)]
+#[test]
+fn salvage_recovers_a_dictionary_sst_with_the_dictionary() -> crate::Result<()> {
+    use crate::CompressionType;
+    use crate::compression::ZstdDictionary;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // A small training corpus so the dictionary has content to match against.
+    let samples: alloc::vec::Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+    let dict = Arc::new(ZstdDictionary::new(&samples));
+    let compression = CompressionType::ZstdDict {
+        level: 3,
+        dict_id: dict.id(),
+    };
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_data_block_size(256)
+        .use_data_block_compression(compression)
+        .use_zstd_dictionary(Some(Arc::clone(&dict)));
+    let n = 200u32;
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source dictionary SST is non-empty"
+    );
+
+    corrupt_second_data_block(&source, &fs, None, Some(Arc::clone(&dict)))?;
+
+    // Without the dictionary, the source's blocks cannot be decompressed.
+    assert!(
+        salvage_sst(&source, dest.clone(), &fs).is_err(),
+        "a dictionary SST must not salvage without the dictionary",
+    );
+
+    let options = SalvageOptions {
+        encryption: None,
+        zstd_dictionary: Some(Arc::clone(&dict)),
+    };
+    let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
+    assert_eq!(
+        report.dropped.len(),
+        1,
+        "exactly the corrupt block drops: {report:?}"
+    );
+    assert!(
+        report.entries_salvaged > 0 && report.entries_salvaged < u64::from(n),
+        "a partial key range is recovered, got {} of {n}",
+        report.entries_salvaged,
+    );
+
+    // The salvaged copy reopens UNDER THE DICTIONARY with the recovered entries.
+    let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &dest)?);
+    let reopened = Table::recover(
+        dest,
+        checksum,
+        0,
+        0,
+        0,
+        Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+        Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8))),
+        Arc::clone(&fs),
+        false,
+        false,
+        None,
+        Some(Arc::clone(&dict)),
+        default_comparator(),
+        #[cfg(feature = "metrics")]
+        Arc::new(crate::Metrics::default()),
+    )?;
+    assert_eq!(
+        reopened.metadata.item_count, report.entries_salvaged,
+        "the dictionary salvaged copy reopens with exactly the recovered entries",
     );
     Ok(())
 }
