@@ -240,8 +240,14 @@ fn salvage_drops_a_corrupted_columnar_block_and_keeps_the_rest() -> crate::Resul
     );
     assert_eq!(report.salvaged_path.as_deref(), Some(dest.as_path()));
 
-    // The salvaged copy is a valid (row-format) SST holding the recovered rows.
-    assert_eq!(reopen_item_count(dest, &fs)?, report.entries_salvaged);
+    // The salvaged copy stays COLUMNAR (mirrored from the source) and holds the
+    // recovered rows — no longer degraded to a row-major copy.
+    let recovered = open(dest, &fs)?;
+    assert_eq!(recovered.metadata.item_count, report.entries_salvaged);
+    assert!(
+        recovered.metadata.columnar,
+        "a columnar source salvages into a columnar copy, not a row-major one",
+    );
     Ok(())
 }
 
@@ -860,7 +866,10 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
     for i in 0..n {
         writer.write(iv(i))?;
     }
-    assert!(writer.finish()?.is_some(), "source encrypted SST is non-empty");
+    assert!(
+        writer.finish()?.is_some(),
+        "source encrypted SST is non-empty"
+    );
 
     corrupt_second_data_block(
         &source,
@@ -895,7 +904,11 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
         table_id: TID,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
-    assert_eq!(report.dropped.len(), 1, "exactly the corrupt block drops: {report:?}");
+    assert_eq!(
+        report.dropped.len(),
+        1,
+        "exactly the corrupt block drops: {report:?}"
+    );
     assert!(
         report.entries_salvaged > 0 && report.entries_salvaged < u64::from(n),
         "a partial key range is recovered, got {} of {n}",

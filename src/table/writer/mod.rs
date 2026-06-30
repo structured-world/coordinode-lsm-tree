@@ -626,6 +626,41 @@ impl Writer {
         self
     }
 
+    /// Seeds this writer with the persisted block-layout settings of an existing
+    /// table's [`ParsedMeta`](crate::table::meta::ParsedMeta), so a rewrite (e.g.
+    /// salvage) reproduces the source's layout instead of falling back to writer
+    /// defaults: data + index block compression, ECC scheme, data-block restart
+    /// interval, columnar layout (with its zone map), and the per-KV checksum
+    /// footer algorithm.
+    ///
+    /// Only settings the descriptor actually records are mirrored. Layout choices
+    /// that are not persisted in metadata (partitioned filter / index, bloom
+    /// policy, hash ratio, locator, prefix extractor) fall back to writer
+    /// defaults and are not restored here. Must be called before the first key,
+    /// like the individual `use_*` setters it delegates to.
+    #[must_use]
+    pub(crate) fn mirror_from(self, meta: &crate::table::meta::ParsedMeta) -> Self {
+        let writer = self
+            .use_data_block_compression(meta.data_block_compression)
+            .use_index_block_compression(meta.index_block_compression)
+            .use_ecc(meta.ecc_params)
+            .use_data_block_restart_interval(meta.data_block_restart_interval)
+            // A columnar source re-emits as columnar (the writer transposes the
+            // recovered rows back into PAX blocks) and regenerates the zone map,
+            // rather than degrading to a row-major copy.
+            .use_columnar(meta.columnar)
+            .use_zone_map(meta.columnar);
+        // Re-emit per-KV checksum footers under the source's algorithm when it
+        // carried them (an SST is footer-homogeneous, so `AllLevels` reproduces
+        // the same per-block footer state).
+        match meta.kv_checksum_algo {
+            Some(algo) => {
+                writer.use_kv_checksums(crate::runtime_config::KvChecksumPolicy::AllLevels, algo)
+            }
+            None => writer,
+        }
+    }
+
     /// Convenience wiring: resolves the tree's `Config::page_ecc` flag +
     /// the configured `EccScheme` into the per-block [`EccParams`] and
     /// applies it via [`Self::use_ecc`]. `page_ecc == false` (or a

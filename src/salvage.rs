@@ -147,12 +147,16 @@ impl SalvageReport {
 /// filter: a single corrupt source block costs only its own key range, not the
 /// whole file.
 ///
-/// The salvaged copy preserves the source's data-block compression and
-/// error-correcting parameters. A columnar source is recovered as rows (the
-/// loader reconstructs row entries), holding the same keys and values; the
-/// columnar sidecars (zone map, delete bitmap) are not carried over yet. The
-/// source is opened in salvage mode, so a corrupt delete-bitmap degrades to
-/// "all rows live" rather than failing the open.
+/// The salvaged copy mirrors the source's persisted layout (data + index
+/// compression, ECC, restart interval, columnar layout with a regenerated zone
+/// map, per-KV checksum footers). A columnar source is recovered as columnar:
+/// the recovered rows are transposed back into PAX blocks, so the copy keeps the
+/// columnar layout and its zone map (a corrupt delete-bitmap is applied on read
+/// in salvage mode, so the surviving rows are already post-delete and the copy
+/// needs no delete-bitmap). Per-field value sub-columns collapse to a single
+/// value column in this row round-trip; preserving them verbatim is a separate
+/// step. The source is opened in salvage mode, so a corrupt delete-bitmap / zone
+/// map degrades gracefully rather than failing the open.
 ///
 /// The positional walk re-emits only point entries, so an SST that carries
 /// range tombstones cannot be salvaged without dropping them (which would let
@@ -289,13 +293,14 @@ pub(crate) fn salvage_with_context(
         ));
     }
 
-    // The recovered copy is written under the SAME context as the source: its
-    // compression + ECC layout, plus the caller's encryption provider and zstd
-    // dictionary, so an encrypted / dictionary source salvages into a copy that
-    // reopens under the live tree's `Config` instead of a plaintext mismatch.
+    // The recovered copy is written under the SAME layout as the source —
+    // compression, ECC, restart interval, columnar (+ zone map), per-KV
+    // checksums (`mirror_from`) — plus the caller's encryption provider and zstd
+    // dictionary, so a columnar / encrypted / dictionary source salvages into a
+    // faithful copy that reopens under the live tree's `Config` instead of a
+    // degraded row-major / plaintext mismatch.
     let writer = crate::table::Writer::new(dest.clone(), options.table_id, 0, Arc::clone(fs))?
-        .use_data_block_compression(table.metadata.data_block_compression)
-        .use_ecc(table.metadata.ecc_params)
+        .mirror_from(&table.metadata)
         .use_encryption(options.encryption.clone());
     #[cfg(zstd_any)]
     let writer = writer.use_zstd_dictionary(options.zstd_dictionary.clone());
