@@ -208,6 +208,98 @@ fn compact_validity(bits: &[u8], mask: &[bool], kept: usize) -> Vec<u8> {
     out
 }
 
+/// Builds a new batch from `batch`'s rows selected (and reordered) by `indices`.
+///
+/// Like [`filter_batch`] but driven by an explicit row-index list rather than a
+/// per-row bool mask, so it can both *drop* and *reorder* rows. The tree-level
+/// merge path (`Tree::columnar_scan` over an overlapping segment group) uses it
+/// to gather the surviving rows of a group in key order after a stable sort +
+/// newest-wins dedup. An out-of-range index contributes an empty (`Bytes`) or
+/// zero-filled (`Fixed`) cell rather than panicking, so a malformed index can
+/// never desync a column's framing from the output row count.
+#[must_use]
+pub(crate) fn take_rows(batch: &ColumnBatch, indices: &[u32]) -> ColumnBatch {
+    let rows = batch.row_count as usize;
+    let columns = batch
+        .columns
+        .iter()
+        .map(|c| take_column(c, rows, indices))
+        .collect();
+    // `indices.len()` is the output row count; it fits u32 because every index
+    // addresses a row of a single block, whose count is itself a u32.
+    let row_count = u32::try_from(indices.len()).unwrap_or(u32::MAX);
+    ColumnBatch { row_count, columns }
+}
+
+/// Gathers one column to the rows listed in `indices` (in that order),
+/// rebuilding its framing (fixed chunks copied, `Bytes` offset table + payload
+/// repacked) and its validity bitmap. Sibling of [`filter_column`] for the
+/// index-driven [`take_rows`] gather.
+fn take_column(col: &Column, rows: usize, indices: &[u32]) -> Column {
+    let data = match col.type_tag {
+        TypeTag::Fixed(width) => {
+            let width = width as usize;
+            let mut out = Vec::with_capacity(indices.len() * width);
+            for &i in indices {
+                let i = i as usize;
+                if let Some(start) = i.checked_mul(width)
+                    && let Some(end) = start.checked_add(width)
+                    && let Some(chunk) = col.data.get(start..end)
+                {
+                    out.extend_from_slice(chunk);
+                } else {
+                    // Out-of-range index: zero-fill one cell so the fixed framing
+                    // stays `row_count * width` bytes long.
+                    out.resize(out.len() + width, 0);
+                }
+            }
+            out
+        }
+        TypeTag::Bytes => {
+            let mut offsets = Vec::with_capacity((indices.len() + 1) * 4);
+            let mut payload = Vec::new();
+            let mut acc: u32 = 0;
+            offsets.extend_from_slice(&acc.to_le_bytes());
+            for &i in indices {
+                // A missing cell degrades to empty (one offset still written), so
+                // the offset table stays in lockstep with the output row count.
+                let value = bytes_row(&col.data, rows, i as usize).unwrap_or(&[]);
+                payload.extend_from_slice(value);
+                let len = u32::try_from(value.len()).unwrap_or(u32::MAX);
+                acc = acc.saturating_add(len);
+                offsets.extend_from_slice(&acc.to_le_bytes());
+            }
+            offsets.extend_from_slice(&payload);
+            offsets
+        }
+    };
+    let validity = col
+        .validity
+        .as_ref()
+        .map(|bits| take_validity(bits, indices));
+    Column {
+        column_id: col.column_id,
+        type_tag: col.type_tag,
+        validity,
+        data,
+    }
+}
+
+/// Rebuilds a validity bitmap for the rows listed in `indices`, preserving each
+/// gathered row's null bit in output order. Index-driven counterpart of
+/// [`compact_validity`].
+fn take_validity(bits: &[u8], indices: &[u32]) -> Vec<u8> {
+    let mut out = alloc::vec![0u8; indices.len().div_ceil(8)];
+    for (o, &i) in indices.iter().enumerate() {
+        let i = i as usize;
+        let valid = bits.get(i / 8).is_some_and(|b| b & (1u8 << (i % 8)) != 0);
+        if valid && let Some(byte) = out.get_mut(o / 8) {
+            *byte |= 1u8 << (o % 8);
+        }
+    }
+    out
+}
+
 /// Whether row `row` is valid (non-null) per the column's validity bitmap. A
 /// column with no bitmap has every row valid; otherwise a set bit means valid.
 fn row_valid(col: &Column, row: usize) -> bool {

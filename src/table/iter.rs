@@ -18,6 +18,10 @@ use crate::{
     },
 };
 use alloc::sync::Arc;
+// `Vec` is not in the `no_std` prelude; the columnar block iterator below needs
+// it explicitly (under `std` this just re-imports the prelude type).
+#[cfg(feature = "columnar")]
+use alloc::vec::Vec;
 
 use crate::path::PathBuf;
 use self_cell::self_cell;
