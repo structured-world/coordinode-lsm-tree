@@ -187,6 +187,9 @@ fn try_salvage_table(
             encryption: config.encryption.clone(),
             #[cfg(zstd_any)]
             zstd_dictionary: config.zstd_dictionary.clone(),
+            // The real table id, so encrypted block AAD (which binds it) decrypts
+            // and the recovered copy reopens under the same id below.
+            table_id,
         },
     )?;
     if report.salvaged_path.is_none() {

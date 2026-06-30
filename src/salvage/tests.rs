@@ -622,6 +622,7 @@ fn salvage_sst_reads_and_writes_through_the_injected_fs() -> crate::Result<()> {
 fn corrupt_second_data_block(
     source: &std::path::Path,
     fs: &Arc<dyn Fs>,
+    table_id: crate::table::TableId,
     encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
     #[cfg(zstd_any)] zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
 ) -> crate::Result<()> {
@@ -631,7 +632,9 @@ fn corrupt_second_data_block(
         checksum,
         0,
         0,
-        0,
+        // Open under the source's table id so an encrypted index (AAD binds the
+        // id) decrypts when reading the block offsets.
+        table_id,
         Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
         Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8))),
         Arc::clone(fs),
@@ -689,6 +692,7 @@ fn salvage_recovers_an_encrypted_sst_with_the_provider() -> crate::Result<()> {
     corrupt_second_data_block(
         &source,
         &fs,
+        0,
         Some(Arc::clone(&enc)),
         #[cfg(zstd_any)]
         None,
@@ -706,6 +710,7 @@ fn salvage_recovers_an_encrypted_sst_with_the_provider() -> crate::Result<()> {
         encryption: Some(Arc::clone(&enc)),
         #[cfg(zstd_any)]
         zstd_dictionary: None,
+        table_id: 0,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
     assert_eq!(
@@ -782,7 +787,7 @@ fn salvage_recovers_a_dictionary_sst_with_the_dictionary() -> crate::Result<()> 
         "source dictionary SST is non-empty"
     );
 
-    corrupt_second_data_block(&source, &fs, None, Some(Arc::clone(&dict)))?;
+    corrupt_second_data_block(&source, &fs, 0, None, Some(Arc::clone(&dict)))?;
 
     // Without the dictionary, the source's blocks cannot be decompressed.
     assert!(
@@ -793,6 +798,7 @@ fn salvage_recovers_a_dictionary_sst_with_the_dictionary() -> crate::Result<()> 
     let options = SalvageOptions {
         encryption: None,
         zstd_dictionary: Some(Arc::clone(&dict)),
+        table_id: 0,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
     assert_eq!(
@@ -828,6 +834,97 @@ fn salvage_recovers_a_dictionary_sst_with_the_dictionary() -> crate::Result<()> 
     assert_eq!(
         reopened.metadata.item_count, report.entries_salvaged,
         "the dictionary salvaged copy reopens with exactly the recovered entries",
+    );
+    Ok(())
+}
+
+/// An encrypted source sealed under a NON-ZERO table id: the encrypted-block AAD
+/// binds the table id, so salvage must be given that id. With the wrong id the
+/// AAD-bound blocks cannot be decrypted (the gap repair hit when it passed a
+/// hardcoded `0`); with the right id it block-salvages and the copy reopens.
+#[cfg(feature = "encryption")]
+#[test]
+fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let enc: Arc<dyn crate::encryption::EncryptionProvider> =
+        Arc::new(crate::encryption::Aes256GcmProvider::new(&[0x37; 32]));
+    const TID: crate::table::TableId = 7;
+
+    let mut writer = Writer::new(source.clone(), TID, 0, Arc::clone(&fs))?
+        .use_data_block_size(256)
+        .use_encryption(Some(Arc::clone(&enc)));
+    let n = 200u32;
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source encrypted SST is non-empty");
+
+    corrupt_second_data_block(
+        &source,
+        &fs,
+        TID,
+        Some(Arc::clone(&enc)),
+        #[cfg(zstd_any)]
+        None,
+    )?;
+
+    // Wrong table id (the legacy hardcoded 0): the AAD-bound blocks cannot be
+    // decrypted, so nothing is recovered (salvage either fails to open or drops
+    // every block).
+    let wrong = SalvageOptions {
+        encryption: Some(Arc::clone(&enc)),
+        #[cfg(zstd_any)]
+        zstd_dictionary: None,
+        table_id: 0,
+    };
+    let recovered_wrong = salvage_sst_with_options(&source, dest.clone(), &fs, &wrong)
+        .map_or(0, |r| r.entries_salvaged);
+    assert_eq!(
+        recovered_wrong, 0,
+        "the wrong table id cannot decrypt the AAD-bound encrypted source",
+    );
+
+    // Right table id: block-salvages, dropping only the corrupt block.
+    let options = SalvageOptions {
+        encryption: Some(Arc::clone(&enc)),
+        #[cfg(zstd_any)]
+        zstd_dictionary: None,
+        table_id: TID,
+    };
+    let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
+    assert_eq!(report.dropped.len(), 1, "exactly the corrupt block drops: {report:?}");
+    assert!(
+        report.entries_salvaged > 0 && report.entries_salvaged < u64::from(n),
+        "a partial key range is recovered, got {} of {n}",
+        report.entries_salvaged,
+    );
+
+    // The recovered copy reopens under the same table id + encryption.
+    let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &dest)?);
+    let reopened = Table::recover(
+        dest,
+        checksum,
+        0,
+        0,
+        TID,
+        Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+        Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8))),
+        Arc::clone(&fs),
+        false,
+        false,
+        Some(Arc::clone(&enc)),
+        #[cfg(zstd_any)]
+        None,
+        default_comparator(),
+        #[cfg(feature = "metrics")]
+        Arc::new(crate::Metrics::default()),
+    )?;
+    assert_eq!(
+        reopened.metadata.item_count, report.entries_salvaged,
+        "the recovered copy reopens under the same table id with the recovered entries",
     );
     Ok(())
 }

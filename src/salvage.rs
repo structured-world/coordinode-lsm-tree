@@ -42,6 +42,13 @@ pub struct SalvageOptions {
     /// when the source uses no dictionary.
     #[cfg(zstd_any)]
     pub zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
+    /// The source's table id. Encrypted block AAD binds the table identity, so
+    /// an encrypted source sealed under a non-zero `table_id` only decrypts when
+    /// the same id is supplied here, and the recovered copy is written under it
+    /// so it reopens consistently. [`crate::repair`] passes the table's real id;
+    /// defaults to `0` for the standalone API (matching an unencrypted or
+    /// id-`0` source).
+    pub table_id: crate::TableId,
 }
 
 /// Why a block could not be salvaged and had to be dropped.
@@ -250,7 +257,10 @@ pub(crate) fn salvage_with_context(
         checksum,
         0,
         0,
-        0,
+        // The source's table id: encrypted block AAD binds it, so an encrypted
+        // source only decrypts when opened under the same id (`0` for the legacy
+        // standalone / unencrypted path).
+        options.table_id,
         cache,
         Some(descriptor),
         Arc::clone(fs),
@@ -283,7 +293,7 @@ pub(crate) fn salvage_with_context(
     // compression + ECC layout, plus the caller's encryption provider and zstd
     // dictionary, so an encrypted / dictionary source salvages into a copy that
     // reopens under the live tree's `Config` instead of a plaintext mismatch.
-    let writer = crate::table::Writer::new(dest.clone(), table.id(), 0, Arc::clone(fs))?
+    let writer = crate::table::Writer::new(dest.clone(), options.table_id, 0, Arc::clone(fs))?
         .use_data_block_compression(table.metadata.data_block_compression)
         .use_ecc(table.metadata.ecc_params)
         .use_encryption(options.encryption.clone());
