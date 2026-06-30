@@ -91,11 +91,73 @@ fn salvage_of_a_healthy_sst_recovers_every_block() -> crate::Result<()> {
         "a salvaged file is written when at least one block is recovered",
     );
 
+    // Every block of a healthy SST reads back clean, so every salvaged block is
+    // copied through verbatim — none re-encoded.
+    assert_eq!(
+        report.blocks_copied_verbatim, report.blocks_salvaged,
+        "a healthy SST's blocks are all copied verbatim",
+    );
+
     // The salvaged copy is a valid SST that reopens and holds every key.
     assert_eq!(
         reopen_item_count(dest, &fs)?,
         u64::from(n),
         "the salvaged SST reopens with the full item count",
+    );
+    Ok(())
+}
+
+/// A clean block is byte-copied verbatim, not decoded and re-encoded: its raw
+/// on-disk bytes in the salvaged SST are identical to the source's, and the walk
+/// reports it under `blocks_copied_verbatim`.
+#[test]
+fn salvage_copies_a_clean_block_verbatim() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(256);
+    let n = 200u32;
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert!(
+        report.is_complete(),
+        "healthy SST salvages clean: {report:?}"
+    );
+    assert_eq!(
+        report.blocks_copied_verbatim, report.blocks_total,
+        "every clean block is copied verbatim, none re-encoded",
+    );
+
+    // The first data block's raw on-disk bytes must be byte-identical between the
+    // source and the salvaged copy (each resolved through its own intact index).
+    let first_block = |path: &std::path::Path| -> crate::Result<(usize, usize)> {
+        let table = open(path.to_path_buf(), &fs)?;
+        let Some(kh) = table.data_block_handles().find_map(Result::ok) else {
+            panic!("a non-empty SST has at least one data block");
+        };
+        let off = usize::try_from(*kh.as_ref().offset()).unwrap_or(usize::MAX);
+        Ok((off, kh.as_ref().size() as usize))
+    };
+    let (src_off, src_size) = first_block(&source)?;
+    let (dst_off, dst_size) = first_block(&dest)?;
+    assert_eq!(
+        src_size, dst_size,
+        "the verbatim copy preserves the block's on-disk size",
+    );
+
+    let src_bytes = std::fs::read(&source)?;
+    let dst_bytes = std::fs::read(&dest)?;
+    let src_block = src_bytes.get(src_off..src_off + src_size);
+    let dst_block = dst_bytes.get(dst_off..dst_off + dst_size);
+    assert!(
+        src_block.is_some() && src_block == dst_block,
+        "the clean block is copied byte-for-byte into the salvaged SST",
     );
     Ok(())
 }
@@ -175,6 +237,76 @@ fn salvage_drops_a_corrupted_block_and_keeps_the_rest() -> crate::Result<()> {
         report.entries_salvaged,
         "the salvaged SST holds exactly the entries the report counted",
     );
+    Ok(())
+}
+
+/// A data block that needs ECC recovery to read is NOT copied verbatim — its
+/// on-disk bytes are faulty, so propagating them would carry the corruption into
+/// the recovered copy. Salvage re-encodes the healed payload instead (clean bytes
+/// in the copy), while the surrounding clean blocks are still copied verbatim.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn salvage_reencodes_an_ecc_recovered_block_rather_than_copying_it() -> crate::Result<()> {
+    use crate::table::block::{EccParams, Header};
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // Data blocks carry RS(4,2) parity, so a small corruption is healed on read
+    // rather than failing the block.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_data_block_size(256)
+        .use_ecc(Some(EccParams::RS_4_2));
+    let n = 200u32;
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Flip one payload byte of the FIRST data block so reading it must repair via
+    // RS parity (an ECC-recovered read, not a clean one).
+    let first_off = {
+        let table = open(source.clone(), &fs)?;
+        let Some(kh) = table.data_block_handles().find_map(Result::ok) else {
+            panic!("a non-empty SST has at least one data block");
+        };
+        *kh.as_ref().offset()
+    };
+    let pos = usize::try_from(first_off).unwrap_or(usize::MAX) + Header::MIN_LEN + 3;
+    let mut bytes = std::fs::read(&source)?;
+    if let Some(b) = bytes.get_mut(pos) {
+        *b ^= 0x80;
+    }
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+
+    // The healed block is recovered, not dropped — nothing is lost.
+    assert!(
+        report.is_complete(),
+        "an ECC-recoverable block is healed, not dropped: {report:?}",
+    );
+    assert_eq!(
+        report.blocks_salvaged, report.blocks_total,
+        "every block is recovered",
+    );
+    assert_eq!(
+        report.entries_salvaged,
+        u64::from(n),
+        "every entry is recovered",
+    );
+    // Exactly the healed block was re-encoded; the rest were copied verbatim.
+    assert_eq!(
+        report.blocks_copied_verbatim,
+        report.blocks_salvaged - 1,
+        "the ECC-recovered block is re-encoded, not copied verbatim",
+    );
+
+    // The salvaged copy reopens with every key; its bytes are freshly encoded, so
+    // they no longer need ECC repair.
+    assert_eq!(reopen_item_count(dest, &fs)?, u64::from(n));
     Ok(())
 }
 
@@ -1147,6 +1279,12 @@ fn salvage_preserves_columnar_value_subcolumns() -> crate::Result<()> {
     assert!(
         report.is_complete(),
         "a healthy columnar SST drops nothing: {report:?}"
+    );
+    // No deletes + clean blocks: each columnar block is copied through verbatim,
+    // which is exactly why the per-field sub-columns survive byte-for-byte.
+    assert_eq!(
+        report.blocks_copied_verbatim, report.blocks_salvaged,
+        "clean columnar blocks are copied verbatim",
     );
 
     // Reopen and project sub-column 3 via the per-SST scan: it survives as a

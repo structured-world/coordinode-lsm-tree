@@ -100,6 +100,14 @@ pub struct SalvageReport {
     pub blocks_total: usize,
     /// Data blocks successfully re-emitted into the salvaged SST.
     pub blocks_salvaged: usize,
+    /// Of [`blocks_salvaged`](Self::blocks_salvaged), how many read back cleanly
+    /// (checksum passed without ECC recovery) and were copied through **verbatim**
+    /// — their raw on-disk bytes byte-copied, skipping the decode + re-encode +
+    /// recompression the rest pay. The remainder
+    /// (`blocks_salvaged - blocks_copied_verbatim`) were ECC-recovered and
+    /// re-emitted from their healed payload. A high ratio means a mostly-healthy
+    /// SST was recovered cheaply.
+    pub blocks_copied_verbatim: usize,
     /// Entries recovered into the salvaged SST.
     pub entries_salvaged: u64,
     /// Blocks the walk had to drop, with their key ranges where known.
@@ -125,6 +133,7 @@ impl SalvageReport {
     ///     salvaged_path: None,
     ///     blocks_total: 4,
     ///     blocks_salvaged: 4,
+    ///     blocks_copied_verbatim: 4,
     ///     entries_salvaged: 100,
     ///     dropped: Vec::new(),
     /// };
@@ -331,6 +340,7 @@ pub(crate) fn salvage_with_context(
         salvaged_path,
         blocks_total: walk.blocks_total,
         blocks_salvaged: walk.blocks_salvaged,
+        blocks_copied_verbatim: walk.blocks_copied_verbatim,
         entries_salvaged: walk.entries_salvaged,
         dropped: walk.dropped,
     })
@@ -342,6 +352,7 @@ pub(crate) fn salvage_with_context(
 struct SalvageWalk {
     blocks_total: usize,
     blocks_salvaged: usize,
+    blocks_copied_verbatim: usize,
     entries_salvaged: u64,
     dropped: Vec<DroppedBlock>,
     wrote: bool,
@@ -358,6 +369,35 @@ fn discard_partial(fs: &alloc::sync::Arc<dyn crate::fs::Fs>, dest: &std::path::P
             "salvage: could not remove the incomplete destination {}: {e}",
             dest.display(),
         );
+    }
+}
+
+/// Classifies a block load / read failure into a [`DroppedBlock`], distinguishing
+/// a bit-rot checksum mismatch from a structural decode error from a raw
+/// read / decompress failure, and attaching the block's `(prev_end, end_key]`
+/// range as the lower/upper bound of the lost keys.
+fn classify_drop(
+    e: &crate::Error,
+    offset: u64,
+    prev_end: Option<&UserKey>,
+    end_key: &UserKey,
+) -> DroppedBlock {
+    use alloc::format;
+    let reason = match e {
+        crate::Error::ChecksumMismatch { .. } => DropReason::ChecksumMismatch,
+        crate::Error::InvalidHeader(_) | crate::Error::InvalidTag(_) => {
+            DropReason::DecodeError(format!("{e:?}"))
+        }
+        _ => DropReason::ReadError(format!("{e:?}")),
+    };
+    DroppedBlock {
+        offset,
+        section: b"data".to_vec(),
+        reason,
+        key_range: Some((
+            prev_end.cloned().unwrap_or_else(UserKey::empty),
+            end_key.clone(),
+        )),
     }
 }
 
@@ -378,6 +418,7 @@ fn salvage_blocks(
 
     let mut blocks_total = 0usize;
     let mut blocks_salvaged = 0usize;
+    let mut blocks_copied_verbatim = 0usize;
     let mut entries_salvaged = 0u64;
     let mut dropped: Vec<DroppedBlock> = Vec::new();
     // Lower bound for a dropped block's range: the previous block's last key,
@@ -405,91 +446,121 @@ fn salvage_blocks(
         let end_key = keyed.end_key().clone();
         let offset = *keyed.as_ref().offset();
 
-        // Columnar source: re-emit each block as a delete-masked `ColumnBatch`
-        // verbatim, preserving its per-field value sub-columns and per-row seqnos.
-        // (The row reconstruction path below would collapse the sub-columns into a
-        // single value column.) Per-block corruption is isolated the same way.
+        // Columnar source: a clean block is byte-copied verbatim — preserving its
+        // PAX value sub-columns, zone map, and per-row seqnos without the transpose
+        // + recompression a re-encode pays — and an ECC-recovered block is
+        // re-emitted from its healed `ColumnBatch`. When the SST carries
+        // materialized positional deletes, a verbatim copy would resurrect deleted
+        // rows (the bitmap is not carried into the recovered SST), so every block
+        // is instead re-emitted as a delete-masked batch. Per-block corruption is
+        // isolated either way.
         #[cfg(feature = "columnar")]
         if table.metadata.columnar {
-            match table.load_columnar_block_masked(keyed.as_ref()) {
-                Ok(Some(batch)) => {
-                    let rows = u64::from(batch.row_count);
-                    writer.write_columnar_block_verbatim(&batch, comparator)?;
-                    entries_salvaged += rows;
-                    blocks_salvaged += 1;
-                }
-                // Wholly-deleted block: nothing to recover, nothing lost.
-                Ok(None) => {}
-                Err(e) => {
-                    let reason = match &e {
-                        crate::Error::ChecksumMismatch { .. } => DropReason::ChecksumMismatch,
-                        crate::Error::InvalidHeader(_) | crate::Error::InvalidTag(_) => {
-                            DropReason::DecodeError(format!("{e:?}"))
+            if table.delete_bitmap().is_empty() {
+                match table
+                    .salvage_load_block(keyed.as_ref(), crate::table::block::BlockType::Columnar)
+                {
+                    Ok(sb) => match crate::table::columnar::ColumnBatch::decode(&sb.block.data) {
+                        Ok(batch) => {
+                            let rows = u64::from(batch.row_count);
+                            match sb.verbatim {
+                                // Clean: copy the block's raw bytes as-is.
+                                Some((raw, header, layout)) => {
+                                    let entries =
+                                        crate::table::columnar::column_batch_to_entries(&batch)?;
+                                    writer.append_verbatim_data_block(
+                                        &raw, header, layout, &entries, comparator,
+                                    )?;
+                                    blocks_copied_verbatim += 1;
+                                }
+                                // ECC-recovered: re-encode the healed batch so the
+                                // recovered copy carries clean on-disk bytes.
+                                None => {
+                                    writer.write_columnar_block_verbatim(&batch, comparator)?;
+                                }
+                            }
+                            entries_salvaged += rows;
+                            blocks_salvaged += 1;
                         }
-                        _ => DropReason::ReadError(format!("{e:?}")),
-                    };
-                    dropped.push(DroppedBlock {
-                        offset,
-                        section: b"data".to_vec(),
-                        reason,
-                        key_range: Some((
-                            prev_end.clone().unwrap_or_else(UserKey::empty),
-                            end_key.clone(),
-                        )),
-                    });
+                        Err(e) => {
+                            dropped.push(classify_drop(&e, offset, prev_end.as_ref(), &end_key));
+                        }
+                    },
+                    Err(e) => dropped.push(classify_drop(&e, offset, prev_end.as_ref(), &end_key)),
+                }
+            } else {
+                // Materialized deletes present: re-emit each block as a
+                // delete-masked batch so the recovered copy keeps deletes applied.
+                match table.load_columnar_block_masked(keyed.as_ref()) {
+                    Ok(Some(batch)) => {
+                        let rows = u64::from(batch.row_count);
+                        writer.write_columnar_block_verbatim(&batch, comparator)?;
+                        entries_salvaged += rows;
+                        blocks_salvaged += 1;
+                    }
+                    // Wholly-deleted block: nothing to recover, nothing lost.
+                    Ok(None) => {}
+                    Err(e) => dropped.push(classify_drop(&e, offset, prev_end.as_ref(), &end_key)),
                 }
             }
             prev_end = Some(end_key);
             continue;
         }
 
-        match table.load_data_block(keyed.as_ref()) {
-            // `try_iter`, not `iter`: a checksum-clean but structurally malformed
-            // block (e.g. an invalid trailer) must be reported as a dropped
-            // `DecodeError`, never panic the salvage walk. `blocks_salvaged` is
-            // counted only once the whole block decoded and was written.
-            Ok(Some(block)) => match block.try_iter(comparator.clone()) {
-                Ok(iter) => {
-                    for parsed in iter {
-                        writer.write(parsed.materialize(block.as_slice()))?;
-                        entries_salvaged += 1;
-                    }
-                    blocks_salvaged += 1;
+        // Row source: a clean block is byte-copied verbatim; an ECC-recovered block
+        // is re-emitted entry by entry from its healed payload.
+        match table.salvage_load_block(keyed.as_ref(), crate::table::block::BlockType::Data) {
+            Ok(sb) => {
+                // Footer presence is a per-SST property (`kv_checksum_algo`), not a
+                // per-block header flag, so the descriptor supplies it here.
+                let has_kv_footer = table.metadata.kv_checksum_algo.is_some();
+                match crate::table::DataBlock::from_loaded(sb.block, has_kv_footer) {
+                    // `try_iter`, not `iter`: a checksum-clean but structurally
+                    // malformed block (e.g. an invalid trailer) must be reported as
+                    // a dropped `DecodeError`, never panic the salvage walk.
+                    Ok(data_block) => match data_block.try_iter(comparator.clone()) {
+                        Ok(iter) => {
+                            let entries: Vec<crate::InternalValue> =
+                                iter.map(|p| p.materialize(data_block.as_slice())).collect();
+                            let count = entries.len() as u64;
+                            match sb.verbatim {
+                                Some((raw, header, layout)) => {
+                                    writer.append_verbatim_data_block(
+                                        &raw, header, layout, &entries, comparator,
+                                    )?;
+                                    blocks_copied_verbatim += 1;
+                                }
+                                None => {
+                                    for e in entries {
+                                        writer.write(e)?;
+                                    }
+                                }
+                            }
+                            entries_salvaged += count;
+                            blocks_salvaged += 1;
+                        }
+                        Err(e) => dropped.push(DroppedBlock {
+                            offset,
+                            section: b"data".to_vec(),
+                            reason: DropReason::DecodeError(format!("{e:?}")),
+                            key_range: Some((
+                                prev_end.clone().unwrap_or_else(UserKey::empty),
+                                end_key.clone(),
+                            )),
+                        }),
+                    },
+                    Err(e) => dropped.push(DroppedBlock {
+                        offset,
+                        section: b"data".to_vec(),
+                        reason: DropReason::DecodeError(format!("{e:?}")),
+                        key_range: Some((
+                            prev_end.clone().unwrap_or_else(UserKey::empty),
+                            end_key.clone(),
+                        )),
+                    }),
                 }
-                Err(e) => dropped.push(DroppedBlock {
-                    offset,
-                    section: b"data".to_vec(),
-                    reason: DropReason::DecodeError(format!("{e:?}")),
-                    key_range: Some((
-                        prev_end.clone().unwrap_or_else(UserKey::empty),
-                        end_key.clone(),
-                    )),
-                }),
-            },
-            // A wholly-deleted columnar block carries no live keys: nothing to
-            // recover and nothing lost.
-            Ok(None) => {}
-            Err(e) => {
-                // Classify the failure so the report distinguishes a bit-rot
-                // checksum mismatch from a structural decode error from a raw
-                // read / decompress failure.
-                let reason = match &e {
-                    crate::Error::ChecksumMismatch { .. } => DropReason::ChecksumMismatch,
-                    crate::Error::InvalidHeader(_) | crate::Error::InvalidTag(_) => {
-                        DropReason::DecodeError(format!("{e:?}"))
-                    }
-                    _ => DropReason::ReadError(format!("{e:?}")),
-                };
-                dropped.push(DroppedBlock {
-                    offset,
-                    section: b"data".to_vec(),
-                    reason,
-                    key_range: Some((
-                        prev_end.clone().unwrap_or_else(UserKey::empty),
-                        end_key.clone(),
-                    )),
-                });
             }
+            Err(e) => dropped.push(classify_drop(&e, offset, prev_end.as_ref(), &end_key)),
         }
         prev_end = Some(end_key);
     }
@@ -504,6 +575,7 @@ fn salvage_blocks(
     Ok(SalvageWalk {
         blocks_total,
         blocks_salvaged,
+        blocks_copied_verbatim,
         entries_salvaged,
         dropped,
         wrote,

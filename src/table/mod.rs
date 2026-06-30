@@ -195,6 +195,24 @@ fn apply_global_seqno(local: SeqNo, global: SeqNo) -> SeqNo {
     })
 }
 
+/// Result of [`Table::salvage_load_block`]: the decoded block plus, when it read
+/// back cleanly, its raw on-disk bytes for a verbatim copy.
+pub(crate) struct SalvageBlock {
+    /// The decoded (decompressed / decrypted / ECC-healed) block: the source of
+    /// the per-row entries the salvage walk accounts and, on the re-encode path,
+    /// re-serializes.
+    pub block: Block,
+    /// `Some((raw_on_disk_bytes, header, inner_layout))` when the block read back
+    /// cleanly (no ECC recovery): the walk byte-copies these verbatim. `None` when
+    /// ECC recovery healed the block, so the faulty on-disk bytes must not be
+    /// propagated and the caller re-encodes the healed payload instead.
+    pub verbatim: Option<(
+        alloc::vec::Vec<u8>,
+        crate::table::block::Header,
+        alloc::vec::Vec<u32>,
+    )>,
+}
+
 impl Table {
     #[must_use]
     pub fn global_seqno(&self) -> SeqNo {
@@ -515,6 +533,90 @@ impl Table {
             Ok(None)
         } else {
             Ok(Some(masked))
+        }
+    }
+
+    /// Salvage helper: load one data block recovery-aware and, when it reads back
+    /// cleanly, also capture its raw on-disk bytes for a verbatim copy.
+    ///
+    /// Bypasses the block cache so the returned recovery status reflects THIS read
+    /// of the medium (a cached block hides whether the on-disk bytes needed ECC
+    /// repair). On a clean read ([`verbatim`](SalvageBlock::verbatim) is `Some`),
+    /// the salvage walk byte-copies the raw bytes into the recovered SST instead of
+    /// decoding + re-encoding the block; on an ECC-recovered read (`None`) the
+    /// faulty on-disk bytes must not be propagated, so the caller re-encodes the
+    /// healed payload in [`block`](SalvageBlock::block) instead.
+    ///
+    /// `pub(crate)` for the salvage walk ([`crate::salvage`]).
+    pub(crate) fn salvage_load_block(
+        &self,
+        handle: &BlockHandle,
+        block_type: BlockType,
+    ) -> crate::Result<SalvageBlock> {
+        let table_id = self.global_id();
+        let (fd, _) = self
+            .file_accessor
+            .get_or_open_table(&table_id, &self.path)?;
+        let transform = crate::table::util::build_block_transform(
+            self.metadata.data_block_compression,
+            self.encryption.as_deref(),
+            self.metadata.ecc_params,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+        )?;
+        let (block, _status, recovery) = crate::table::block::Block::from_file_with_recovery(
+            fd.as_ref(),
+            *handle,
+            crate::table::block::BlockIdentity {
+                table_id: table_id.table_id(),
+                block_type,
+                dict_id: self.metadata.data_block_compression.dict_id(),
+                window_log: 0,
+            },
+            &transform,
+        )?;
+        // A wrong block type means a swapped / corrupt index entry pointed us at
+        // the wrong bytes; surface it rather than salvage the wrong block.
+        if block.header.block_type != block_type {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                block.header.block_type.into(),
+            )));
+        }
+        let verbatim = if recovery.is_none() {
+            // Clean read: capture the raw on-disk bytes (and inner layout) for a
+            // verbatim copy. A second pread of a cold block costs far less than the
+            // re-compression the copy avoids.
+            use crate::coding::Decode;
+            let raw =
+                crate::file::read_exact(fd.as_ref(), *handle.offset(), handle.size() as usize)?;
+            let header = crate::table::block::Header::decode_from(&mut &raw[..])?;
+            let layout = self.inner_block_layout(handle.offset().0);
+            Some((raw.to_vec(), header, layout))
+        } else {
+            None
+        };
+        Ok(SalvageBlock { block, verbatim })
+    }
+
+    /// The inner-zstd block layout (cumulative decompressed end offsets) for the
+    /// data block at `offset`, or empty when the block has a single inner block
+    /// (the common case) — and always, on a build without zstd, where data blocks
+    /// never split. Salvage's verbatim copy passes this through so a multi-inner
+    /// block keeps its layout at its new file offset (the offsets are
+    /// decompressed-space and block-relative, so they stay valid after the move).
+    fn inner_block_layout(&self, offset: u64) -> alloc::vec::Vec<u32> {
+        #[cfg(feature = "zstd")]
+        {
+            self.block_layout
+                .ends_for(offset)
+                .map(<[u32]>::to_vec)
+                .unwrap_or_default()
+        }
+        #[cfg(not(feature = "zstd"))]
+        {
+            let _ = offset;
+            alloc::vec::Vec::new()
         }
     }
 
