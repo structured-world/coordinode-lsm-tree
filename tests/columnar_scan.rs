@@ -871,3 +871,56 @@ fn tree_columnar_scan_overlap_merge_filters_rows_to_the_range() {
         "the merge path drops rows outside the requested range",
     );
 }
+
+#[test]
+fn tree_columnar_scan_merge_preserves_a_nullable_sub_column() {
+    // The overlap-merge gather (`take_rows`) must carry a nullable value
+    // sub-column's validity bitmap through. Build two overlapping segments where
+    // one row's value is null, force the merge path, and assert the null survives
+    // in the recovered column.
+    let folder = get_tmp_folder();
+    let any = open_columnar_any(folder.path());
+
+    // Segment A: k0 (valid), k2 (NULL) — a nullable fixed-4 sub-column (id 3).
+    let mut batch_a = entries_to_column_batch(&[
+        InternalValue::from_components(key(0), b"x".to_vec(), 0, ValueType::Value),
+        InternalValue::from_components(key(2), b"x".to_vec(), 0, ValueType::Value),
+    ])
+    .expect("transpose");
+    batch_a.columns.pop();
+    batch_a.columns.push(Column {
+        column_id: 3,
+        type_tag: TypeTag::Fixed(4),
+        // LSB-first: row 0 valid (bit set), row 1 (k2) null (bit clear) → 0b01.
+        validity: Some(vec![0b0000_0001]),
+        data: vec![10, 0, 0, 0, 0, 0, 0, 0],
+    });
+    {
+        let mut ingest = any.ingestion().expect("ingestion");
+        ingest.write_columnar_batch(&batch_a).expect("write A");
+        ingest.finish().expect("finish A");
+    }
+    // Segment B: k1 — overlaps A's [k0, k2] range, forcing the merge path.
+    ingest_segment(&any, &[(key(1), 11)]);
+
+    let tree = standard(&any);
+    let mut col3: Option<Column> = None;
+    for batch in tree
+        .columnar_scan(&[COL_USER_KEY, 3], None, SeqNo::MAX, ..)
+        .expect("scan")
+    {
+        let batch = batch.expect("batch");
+        // Output is one merged batch in key order: k0, k1, k2.
+        if let Some(c) = batch.columns.into_iter().find(|c| c.column_id == 3) {
+            assert!(col3.is_none(), "merge yields a single batch here");
+            col3 = Some(c);
+        }
+    }
+    let col3 = col3.expect("value sub-column present");
+    let validity = col3.validity.expect("nullable column keeps its validity bitmap");
+    let is_valid = |row: usize| validity[row / 8] & (1 << (row % 8)) != 0;
+    // Key order: row0=k0 (valid), row1=k1 (valid), row2=k2 (NULL).
+    assert!(is_valid(0), "k0 is non-null");
+    assert!(is_valid(1), "k1 is non-null");
+    assert!(!is_valid(2), "k2's null survives the merge gather");
+}
