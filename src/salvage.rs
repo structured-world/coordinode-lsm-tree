@@ -471,5 +471,146 @@ fn salvage_blocks(
     })
 }
 
+/// Why a blob (vlog) record could not be salvaged.
+#[derive(Debug, Clone)]
+pub enum BlobDropReason {
+    /// The record's stored checksum did not match its key + value bytes
+    /// (bit-rot). The walk re-syncs at the next record, so only this record is
+    /// lost.
+    ChecksumMismatch,
+    /// A structural failure (bad frame magic, header CRC, or a frame that runs
+    /// past the data section) that desynchronizes the record stream: the walk
+    /// cannot locate later records and stops at this point.
+    Corrupt(String),
+}
+
+/// A blob record the salvage walk could not recover.
+#[derive(Debug, Clone)]
+pub struct DroppedBlob {
+    /// Why the record was dropped.
+    pub reason: BlobDropReason,
+}
+
+/// The outcome of salvaging a single blob (vlog) file.
+///
+/// Inspect [`is_complete`](BlobSalvageReport::is_complete) to tell a clean
+/// recovery (every record re-emitted) from a lossy one; [`dropped`] lists what
+/// was lost. Always check [`salvaged_path`] before using the recovered copy.
+///
+/// [`dropped`]: BlobSalvageReport::dropped
+/// [`salvaged_path`]: BlobSalvageReport::salvaged_path
+#[derive(Debug)]
+pub struct BlobSalvageReport {
+    /// Path of the freshly written salvaged blob file, or `None` when no record
+    /// was recoverable and nothing was written.
+    pub salvaged_path: Option<PathBuf>,
+    /// Total records the walk inspected (recovered plus dropped).
+    pub records_total: usize,
+    /// Records successfully re-emitted into the salvaged blob file.
+    pub records_salvaged: usize,
+    /// Records the walk had to drop.
+    pub dropped: Vec<DroppedBlob>,
+}
+
+impl BlobSalvageReport {
+    /// Returns `true` when no record had to be dropped.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.dropped.is_empty()
+    }
+}
+
+/// Salvages the readable records of the blob (vlog) file at `source` into a fresh
+/// blob file at `dest`.
+///
+/// Where [`crate::repair`] rebuilds the blob-file *manifest* around whole files,
+/// this walks one blob file record by record and re-emits every record whose
+/// checksum verifies, recording the rest. A single bit-rotted record costs only
+/// itself: the record stream re-synchronizes at the next frame after a checksum
+/// mismatch, so the walk keeps recovering. A structural break (corrupt frame
+/// magic / header CRC / a frame that runs past the data section) cannot be
+/// resynced, so the walk stops there and reports it.
+///
+/// `blob_file_id` is the source's id (its file name), recorded in the recovered
+/// file's metadata. The recovered file is written with no value compression, so
+/// a **compressed** source is rejected with [`Error::FeatureUnsupported`] rather
+/// than re-emitted under a mismatched descriptor (the scanner yields on-disk
+/// bytes; faithfully recompressing them is a separate step).
+///
+/// [`Error::FeatureUnsupported`]: crate::Error::FeatureUnsupported
+///
+/// # Errors
+///
+/// Returns an error when `source` cannot be opened at all (its metadata / SFA
+/// trailer is unreadable), when it is a compressed blob file, or when writing
+/// `dest` fails. Per-record corruption is not an error: such records are dropped
+/// and listed in the returned [`BlobSalvageReport`].
+pub fn salvage_blob_file(
+    source: &std::path::Path,
+    dest: std::path::PathBuf,
+    fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
+    blob_file_id: crate::vlog::BlobFileId,
+) -> crate::Result<BlobSalvageReport> {
+    use crate::vlog::blob_file::{scanner::Scanner, writer::Writer as BlobWriter};
+    use alloc::format;
+
+    // Read the source's metadata (this does not scan the data, so a data-corrupt
+    // file still opens) to reject a compressed source: the scanner yields on-disk
+    // (compressed) bytes, and re-emitting them verbatim under a no-compression
+    // descriptor would store undecodable values. Fail closed, the same way SST
+    // salvage fails closed on range tombstones.
+    let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&**fs, source)?);
+    let source_handle = crate::vlog::recover_blob_file(source, blob_file_id, checksum, 0, fs)?;
+    if source_handle.compression() != crate::CompressionType::None {
+        return Err(crate::Error::FeatureUnsupported(
+            "salvage of a compressed blob file",
+        ));
+    }
+
+    let scanner = Scanner::new(source, &**fs, blob_file_id)?;
+    let mut writer = BlobWriter::new(&dest, blob_file_id, 0, &**fs)?;
+
+    let mut records_total = 0usize;
+    let mut records_salvaged = 0usize;
+    let mut dropped: Vec<DroppedBlob> = Vec::new();
+    for item in scanner {
+        records_total += 1;
+        match item {
+            Ok(entry) => {
+                writer.write(&entry.key, entry.seqno, &entry.value)?;
+                records_salvaged += 1;
+            }
+            // The scanner repositions at the next frame after a checksum miss, so
+            // a bit-rotted record costs only itself and the walk continues.
+            Err(crate::Error::ChecksumMismatch { .. }) => dropped.push(DroppedBlob {
+                reason: BlobDropReason::ChecksumMismatch,
+            }),
+            // A structural break: the scanner terminates (it cannot find the next
+            // frame), so this is the last record the walk inspects.
+            Err(e) => dropped.push(DroppedBlob {
+                reason: BlobDropReason::Corrupt(format!("{e:?}")),
+            }),
+        }
+    }
+
+    let salvaged_path = if records_salvaged > 0 {
+        writer.finish()?;
+        Some(dest)
+    } else {
+        // Nothing recoverable: `BlobWriter::new` created `dest`, so remove the
+        // empty placeholder a repair caller would otherwise re-quarantine.
+        drop(writer);
+        discard_partial(fs, &dest);
+        None
+    };
+
+    Ok(BlobSalvageReport {
+        salvaged_path,
+        records_total,
+        records_salvaged,
+        dropped,
+    })
+}
+
 #[cfg(test)]
 mod tests;

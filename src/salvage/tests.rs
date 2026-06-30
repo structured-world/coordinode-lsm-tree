@@ -1,4 +1,7 @@
-use super::{DropReason, SalvageOptions, salvage_sst, salvage_sst_with_options};
+use super::{
+    BlobDropReason, DropReason, SalvageOptions, salvage_blob_file, salvage_sst,
+    salvage_sst_with_options,
+};
 use crate::comparator::default_comparator;
 use crate::fs::{Fs, StdFs};
 use crate::table::{Table, Writer};
@@ -938,6 +941,157 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
     assert_eq!(
         reopened.metadata.item_count, report.entries_salvaged,
         "the recovered copy reopens under the same table id with the recovered entries",
+    );
+    Ok(())
+}
+
+// --- Blob (vlog) file record-granular salvage ---
+
+use crate::vlog::blob_file::scanner::Scanner as BlobScanner;
+use crate::vlog::blob_file::writer::Writer as BlobWriter;
+
+/// Builds a blob file at `path` from `(key, value)` records (seqno 0, no
+/// compression).
+fn build_blob(
+    path: &std::path::Path,
+    fs: &Arc<dyn Fs>,
+    records: &[(&[u8], &[u8])],
+) -> crate::Result<()> {
+    let mut writer = BlobWriter::new(path, 0, 0, &**fs)?;
+    for (k, v) in records {
+        writer.write(k, 0, v)?;
+    }
+    writer.finish()?;
+    Ok(())
+}
+
+/// Scans a blob file into its `(key, value)` records (Ok records only).
+fn scan_blob(path: &std::path::Path, fs: &Arc<dyn Fs>) -> crate::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    Ok(BlobScanner::new(path, &**fs, 0)?
+        .filter_map(Result::ok)
+        .map(|e| (e.key.to_vec(), e.value.to_vec()))
+        .collect())
+}
+
+#[test]
+fn salvage_blob_file_recovers_every_record_of_a_healthy_file() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("blob_source");
+    let dest = dir.path().join("blob_salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let records: Vec<(&[u8], &[u8])> = vec![
+        (b"k0", b"v0"),
+        (b"k1", b"v1"),
+        (b"k2", b"v2"),
+        (b"k3", b"v3"),
+    ];
+    build_blob(&source, &fs, &records)?;
+
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0)?;
+    assert!(
+        report.is_complete(),
+        "a healthy blob file drops nothing: {report:?}"
+    );
+    assert_eq!(report.records_salvaged, 4);
+    assert_eq!(report.salvaged_path.as_deref(), Some(dest.as_path()));
+
+    let recovered = scan_blob(&dest, &fs)?;
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = records
+        .iter()
+        .map(|(k, v)| (k.to_vec(), v.to_vec()))
+        .collect();
+    assert_eq!(
+        recovered, expected,
+        "every record round-trips through salvage"
+    );
+    Ok(())
+}
+
+#[test]
+fn salvage_blob_file_drops_a_corrupt_record_and_keeps_the_rest() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("blob_source");
+    let dest = dir.path().join("blob_salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let records: Vec<(&[u8], &[u8])> = vec![
+        (b"k0", b"value-zero"),
+        (b"k1", b"value-one"),
+        (b"k2", b"value-two"),
+        (b"k3", b"value-three"),
+    ];
+    build_blob(&source, &fs, &records)?;
+
+    // Flip the last byte of the second record's value: the checksum (over
+    // key + value) fails, but the frame header (lengths, magic) stays intact, so
+    // the scanner reports a checksum mismatch and re-syncs at the next record.
+    let Some(second_frame_end) = BlobScanner::new(&source, &*fs, 0)?
+        .filter_map(Result::ok)
+        .nth(1)
+        .map(|e| e.frame_end)
+    else {
+        panic!("source blob must have at least two records");
+    };
+    let flip = usize::try_from(second_frame_end - 1).unwrap_or(0);
+    let mut bytes = std::fs::read(&source)?;
+    if let Some(b) = bytes.get_mut(flip) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0)?;
+    assert_eq!(
+        report.dropped.len(),
+        1,
+        "exactly the corrupt record drops: {report:?}"
+    );
+    assert!(
+        matches!(
+            report.dropped.first().map(|d| &d.reason),
+            Some(BlobDropReason::ChecksumMismatch)
+        ),
+        "the dropped record reports a checksum mismatch: {report:?}",
+    );
+    assert_eq!(
+        report.records_salvaged, 3,
+        "the other three records are recovered"
+    );
+
+    // The salvaged file holds every record except the corrupted k1.
+    let recovered = scan_blob(&dest, &fs)?;
+    let keys: Vec<Vec<u8>> = recovered.iter().map(|(k, _)| k.clone()).collect();
+    assert_eq!(
+        keys,
+        vec![b"k0".to_vec(), b"k2".to_vec(), b"k3".to_vec()],
+        "the corrupt record's key is the only one missing",
+    );
+    Ok(())
+}
+
+/// A compressed blob source is rejected (fail-closed): the scanner yields on-disk
+/// compressed bytes that this path cannot faithfully re-emit yet.
+#[cfg(feature = "lz4")]
+#[test]
+fn salvage_blob_file_rejects_a_compressed_source() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("blob_source");
+    let dest = dir.path().join("blob_salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    {
+        let mut writer =
+            BlobWriter::new(&source, 0, 0, &*fs)?.use_compression(crate::CompressionType::Lz4);
+        writer.write(b"k0", 0, b"some compressible value aaaaaaaaaaaaaaaa")?;
+        writer.finish()?;
+    }
+
+    assert!(
+        matches!(
+            salvage_blob_file(&source, dest, &fs, 0),
+            Err(crate::Error::FeatureUnsupported(_)),
+        ),
+        "a compressed blob file must be rejected rather than mis-salvaged",
     );
     Ok(())
 }
