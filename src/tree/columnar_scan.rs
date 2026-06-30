@@ -350,6 +350,15 @@ impl ColumnarScan {
         if !seqno_projected {
             augmented.push(COL_SEQNO);
         }
+        // The predicate is applied AFTER newest-version dedup (below), so its
+        // column must be decoded here even when the caller did not project it.
+        let predicate_col = self.predicate.as_ref().map(|p| p.column_id);
+        let predicate_col_projected = predicate_col.is_some_and(|c| self.projection.contains(&c));
+        if let Some(pc) = predicate_col
+            && !augmented.contains(&pc)
+        {
+            augmented.push(pc);
+        }
 
         // Concatenate every segment's visible rows into one batch, tracking each
         // surviving row's effective seqno (`local + global`) in lockstep so the
@@ -358,10 +367,12 @@ impl ColumnarScan {
         let mut effective: Vec<SeqNo> = Vec::new();
         for seg in &group.segments {
             let threshold = self.seqno.saturating_sub(seg.global);
-            for batch in seg
-                .table
-                .columnar_scan(&augmented, self.predicate.as_ref())?
-            {
+            // No predicate here: in an overlap group the predicate must run after
+            // newest-version dedup, so every version (including a newest one that
+            // fails the predicate but shadows an older matching version) has to be
+            // collected first. Predicate-driven zone-map block-skip is likewise
+            // unsafe here for the same reason, so it is also dropped.
+            for batch in seg.table.columnar_scan(&augmented, None)? {
                 if batch.row_count == 0 {
                     continue;
                 }
@@ -455,12 +466,27 @@ impl ColumnarScan {
         }
 
         let mut merged = take_rows(&combined, &kept);
+
+        // Apply the row predicate AFTER newest-version dedup: each surviving row is
+        // now the newest visible version of its key, so a key whose newest version
+        // fails the predicate is correctly dropped instead of falling back to an
+        // older matching version.
+        if let Some(pred) = self.predicate.as_ref() {
+            let mask = pred.matching_rows(&merged);
+            merged = filter_batch(&merged, &mask);
+        }
+
         // Match the singleton contract: yield exactly the projected columns.
         if !key_projected {
             merged.columns.retain(|c| c.column_id != COL_USER_KEY);
         }
         if !seqno_projected {
             merged.columns.retain(|c| c.column_id != COL_SEQNO);
+        }
+        if let Some(pc) = predicate_col
+            && !predicate_col_projected
+        {
+            merged.columns.retain(|c| c.column_id != pc);
         }
         if merged.row_count == 0 {
             return Ok(Vec::new());

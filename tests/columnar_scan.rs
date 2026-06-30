@@ -917,7 +917,9 @@ fn tree_columnar_scan_merge_preserves_a_nullable_sub_column() {
         }
     }
     let col3 = col3.expect("value sub-column present");
-    let validity = col3.validity.expect("nullable column keeps its validity bitmap");
+    let validity = col3
+        .validity
+        .expect("nullable column keeps its validity bitmap");
     let is_valid = |row: usize| validity[row / 8] & (1 << (row % 8)) != 0;
     // Key order: row0=k0 (valid), row1=k1 (valid), row2=k2 (NULL).
     assert!(is_valid(0), "k0 is non-null");
