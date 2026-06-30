@@ -605,6 +605,13 @@ impl Table {
     /// never split. Salvage's verbatim copy passes this through so a multi-inner
     /// block keeps its layout at its new file offset (the offsets are
     /// decompressed-space and block-relative, so they stay valid after the move).
+    #[cfg_attr(
+        not(feature = "zstd"),
+        expect(
+            clippy::unused_self,
+            reason = "the layout lookup is zstd-only; without zstd no data block splits, so the layout is always empty and `self` is unused"
+        )
+    )]
     fn inner_block_layout(&self, offset: u64) -> alloc::vec::Vec<u32> {
         #[cfg(feature = "zstd")]
         {
@@ -770,6 +777,145 @@ impl Table {
                     log::error!(
                         "patrol scrub: uncorrectable block at offset {block_offset} in table {} \
                          at {}: {e:?}",
+                        self.id(),
+                        self.path.display(),
+                    );
+                    report.errors.push(ScrubError::UncorrectableBlock {
+                        table_id: self.id(),
+                        path: self.path.to_path_buf(),
+                        block_offset,
+                        reason: alloc::format!("{e:?}"),
+                    });
+                }
+            }
+        }
+
+        report
+    }
+
+    /// In-place ECC autoheal: like [`Self::scrub_data_blocks`], but PERSISTS each
+    /// correction by writing the corrected block back at its existing offset
+    /// (size-preserving) instead of scheduling a full-file healing rewrite.
+    /// Healthy blocks are never rewritten, so the cost is O(damage), not O(file).
+    ///
+    /// Opens the SST read+write through the tree's `Fs` (bypassing the block
+    /// cache, like scrub), and for each data block that fails its checksum but
+    /// Page-ECC recovers it, writes back `header ++ recovered_data ++ recomputed
+    /// parity` and `sync_data`s it before moving on, so a crash mid-heal leaves
+    /// the block in its prior, still-RS-correctable state. Uncorrectable /
+    /// unreadable blocks are recorded as findings and left for block salvage.
+    ///
+    /// `pub(crate)` for [`crate::scrub::patrol_scrub`] (heal-in-place enabled).
+    #[cfg(feature = "page_ecc")]
+    pub(crate) fn heal_data_blocks_in_place(&self) -> crate::scrub::PatrolScrubReport {
+        use crate::scrub::{PatrolScrubReport, ScrubError};
+        use std::io::{Seek, SeekFrom, Write};
+
+        let mut report = PatrolScrubReport {
+            sst_files_scanned: 1,
+            ..PatrolScrubReport::default()
+        };
+
+        // A single read+write handle for both the recovery read and the
+        // write-back, opened directly (not via the read-only descriptor cache) so
+        // the heal sees the medium and can mutate it.
+        let mut file = match self
+            .fs
+            .open(&self.path, &FsOpenOptions::new().read(true).write(true))
+        {
+            Ok(f) => f,
+            Err(e) => {
+                report.errors.push(ScrubError::BlockIndexUnreadable {
+                    table_id: self.id(),
+                    path: self.path.to_path_buf(),
+                    reason: alloc::format!("open read+write for heal: {e}"),
+                });
+                return report;
+            }
+        };
+
+        let transform = match crate::table::util::build_block_transform(
+            self.metadata.data_block_compression,
+            self.encryption.as_deref(),
+            self.metadata.ecc_params,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                report.errors.push(ScrubError::BlockIndexUnreadable {
+                    table_id: self.id(),
+                    path: self.path.to_path_buf(),
+                    reason: alloc::format!("build transform for heal: {e:?}"),
+                });
+                return report;
+            }
+        };
+
+        for entry in self.block_index.iter() {
+            let keyed = match entry {
+                Ok(h) => h,
+                Err(e) => {
+                    // A structural index error means later offsets can't be
+                    // trusted — stop this table, record it.
+                    report.errors.push(ScrubError::BlockIndexUnreadable {
+                        table_id: self.id(),
+                        path: self.path.to_path_buf(),
+                        reason: alloc::format!("{e:?}"),
+                    });
+                    break;
+                }
+            };
+            let block_offset = keyed.offset().0;
+            let handle = BlockHandle::new(keyed.offset(), keyed.size());
+            report.blocks_scanned += 1;
+
+            match crate::table::block::Block::heal_frame(file.as_ref(), handle, &transform) {
+                // Clean (or no recognized parity): nothing to persist.
+                Ok(None) => {}
+                // Corrected: write the canonical frame back in place + sync.
+                Ok(Some((frame, kind))) => {
+                    #[cfg(feature = "metrics")]
+                    self.metrics.record_ecc_recovery(kind);
+                    #[cfg(not(feature = "metrics"))]
+                    let _ = kind;
+                    // Seek + write (std::io) and sync (crate::io) carry different
+                    // error types, so each is handled separately; both render to
+                    // text for the finding. `sync_data` (not `sync_all`): the file
+                    // size is unchanged, so only the data needs flushing, and it
+                    // must land before the next block so a crash leaves the block
+                    // in its prior, still-RS-correctable state.
+                    let write_back = file
+                        .seek(SeekFrom::Start(block_offset))
+                        .and_then(|_| file.write_all(&frame));
+                    let durable = match write_back {
+                        Ok(()) => file.sync_data().map_err(|e| alloc::format!("sync: {e}")),
+                        Err(e) => Err(alloc::format!("write: {e}")),
+                    };
+                    if let Err(reason) = durable {
+                        report.uncorrectable_blocks += 1;
+                        log::error!(
+                            "in-place heal: write-back failed for block at offset \
+                             {block_offset} in table {} at {}: {reason}",
+                            self.id(),
+                            self.path.display(),
+                        );
+                        report.errors.push(ScrubError::UncorrectableBlock {
+                            table_id: self.id(),
+                            path: self.path.to_path_buf(),
+                            block_offset,
+                            reason: alloc::format!("in-place heal {reason}"),
+                        });
+                        continue;
+                    }
+                    report.corrections_applied += 1;
+                    report.blocks_healed_in_place += 1;
+                }
+                Err(e) => {
+                    report.uncorrectable_blocks += 1;
+                    log::error!(
+                        "in-place heal: uncorrectable block at offset {block_offset} in table \
+                         {} at {}: {e:?}",
                         self.id(),
                         self.path.display(),
                     );

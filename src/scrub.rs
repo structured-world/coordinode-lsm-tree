@@ -98,8 +98,15 @@ pub struct PatrolScrubReport {
     /// Distinct SSTs newly queued for a healing recompaction by this scrub
     /// (confirmed-persistent correction with `auto_heal` enabled). Zero when
     /// `auto_heal` is off (correction-on-read still happens, only the rewrite
-    /// scheduling is suppressed).
+    /// scheduling is suppressed), and zero in heal-in-place mode (the correction
+    /// is persisted directly, so no full-file rewrite is scheduled).
     pub ssts_scheduled_for_rewrite: usize,
+    /// Blocks whose Page-ECC correction was persisted **in place** — the
+    /// corrected bytes written back at the block's existing offset
+    /// (size-preserving), no full-file rewrite. Non-zero only when
+    /// [`PatrolScrubOptions::heal_in_place`] is set; it is the O(damage)
+    /// counterpart to [`ssts_scheduled_for_rewrite`](Self::ssts_scheduled_for_rewrite).
+    pub blocks_healed_in_place: usize,
     /// Blocks that failed their checksum and could NOT be recovered from parity
     /// (or were otherwise unreadable). These are real, unhealed corruption.
     pub uncorrectable_blocks: usize,
@@ -123,6 +130,7 @@ impl PatrolScrubReport {
         self.blocks_scanned += other.blocks_scanned;
         self.corrections_applied += other.corrections_applied;
         self.ssts_scheduled_for_rewrite += other.ssts_scheduled_for_rewrite;
+        self.blocks_healed_in_place += other.blocks_healed_in_place;
         self.uncorrectable_blocks += other.uncorrectable_blocks;
         self.errors.extend(other.errors);
     }
@@ -141,6 +149,15 @@ pub struct PatrolScrubOptions {
     /// the next, capping I/O pressure on a production box during a scrub.
     /// `None` (the default) runs at full speed.
     pub throttle: Option<std::time::Duration>,
+
+    /// Persist each Page-ECC correction **in place** rather than scheduling a
+    /// full-file healing rewrite: a corrected block's bytes are written back at
+    /// its existing offset (size-preserving), leaving every healthy block
+    /// untouched (O(damage), not O(file)). `false` (the default) keeps the
+    /// classic behaviour — correct on read and queue the SST for a clean rewrite
+    /// via [`HealHints`](crate::heal_hints::HealHints). Requires the `page_ecc`
+    /// feature; without it the flag is inert (there is no parity to heal from).
+    pub heal_in_place: bool,
 }
 
 impl Default for PatrolScrubOptions {
@@ -148,6 +165,7 @@ impl Default for PatrolScrubOptions {
         Self {
             parallelism: 1,
             throttle: None,
+            heal_in_place: false,
         }
     }
 }
@@ -164,6 +182,14 @@ impl PatrolScrubOptions {
     #[must_use]
     pub const fn throttle(mut self, delay: std::time::Duration) -> Self {
         self.throttle = Some(delay);
+        self
+    }
+
+    /// Enables persisting corrections in place (see
+    /// [`heal_in_place`](Self::heal_in_place)).
+    #[must_use]
+    pub const fn heal_in_place(mut self, enable: bool) -> Self {
+        self.heal_in_place = enable;
         self
     }
 }
@@ -230,7 +256,7 @@ pub fn patrol_scrub(tree: &impl AbstractTree, options: &PatrolScrubOptions) -> P
     if workers <= 1 {
         let mut report = PatrolScrubReport::default();
         for (idx, table) in tables.iter().enumerate() {
-            report.merge(table.scrub_data_blocks());
+            report.merge(scan_one(table, options));
             // Inter-SST pause only; skip the sleep after the final table so a
             // finished scrub returns promptly instead of idling one extra
             // throttle interval.
@@ -251,7 +277,7 @@ pub fn patrol_scrub(tree: &impl AbstractTree, options: &PatrolScrubOptions) -> P
                     let mut local = PatrolScrubReport::default();
                     let mut idx = cursor.fetch_add(1, Ordering::Relaxed);
                     while let Some(table) = tables.get(idx) {
-                        local.merge(table.scrub_data_blocks());
+                        local.merge(scan_one(table, options));
                         // Claim the next SST first; only pause if this worker
                         // still has another table, so no worker sleeps after its
                         // final SST.
@@ -282,6 +308,18 @@ pub fn patrol_scrub(tree: &impl AbstractTree, options: &PatrolScrubOptions) -> P
         report.merge(partial);
     }
     report
+}
+
+/// Scans one SST: heals corrections in place when
+/// [`heal_in_place`](PatrolScrubOptions::heal_in_place) is set (and `page_ecc` is
+/// built), otherwise runs the classic correct-on-read + schedule-rewrite scrub.
+fn scan_one(table: &crate::table::Table, options: &PatrolScrubOptions) -> PatrolScrubReport {
+    #[cfg(feature = "page_ecc")]
+    if options.heal_in_place {
+        return table.heal_data_blocks_in_place();
+    }
+    let _ = options;
+    table.scrub_data_blocks()
 }
 
 #[cfg(test)]

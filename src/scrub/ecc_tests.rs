@@ -204,3 +204,109 @@ fn patrol_scrub_clean_ecc_tree_reports_no_corrections() -> crate::Result<()> {
     assert_eq!(&*got, b"v000000");
     Ok(())
 }
+
+#[test]
+fn patrol_scrub_heals_in_place_restoring_the_block_byte_for_byte() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst(dir.path());
+
+    // Snapshot the healthy file, then flip one RS-correctable payload byte.
+    let original = std::fs::read(&sst_path)?;
+    let corrupt_pos = block.offset().0 as usize + Header::MIN_LEN + 3;
+    let mut bytes = original.clone();
+    let slot = bytes
+        .get_mut(corrupt_pos)
+        .expect("corrupt_pos in range for the SST bytes");
+    *slot ^= 0x80;
+    std::fs::write(&sst_path, &bytes)?;
+    assert_ne!(bytes, original, "the seeded fault changed the file");
+
+    // Heal in place: persist the correction at the block's offset, no full rewrite.
+    let tree = open_ecc_tree(dir.path());
+    let opts = PatrolScrubOptions::default().heal_in_place(true);
+    let report = patrol_scrub(&tree, &opts);
+
+    assert_eq!(
+        report.blocks_healed_in_place, 1,
+        "exactly the corrupted block is healed in place: {report:?}",
+    );
+    assert_eq!(report.corrections_applied, 1, "{report:?}");
+    assert_eq!(
+        report.ssts_scheduled_for_rewrite, 0,
+        "in-place heal schedules no full-file rewrite: {report:?}",
+    );
+    assert_eq!(report.uncorrectable_blocks, 0, "{report:?}");
+    assert!(report.is_ok(), "{report:?}");
+
+    // The heal reconstructs the ORIGINAL frame (RS-recovered data + recomputed
+    // parity == as-written bytes), so the file is byte-identical to before the
+    // fault: the correction was persisted, and no healthy block was touched.
+    let healed = std::fs::read(&sst_path)?;
+    assert_eq!(
+        healed, original,
+        "in-place heal restores the SST byte-for-byte (O(damage), nothing else moved)",
+    );
+
+    // A second pass finds nothing to heal — the on-disk bytes now read clean.
+    // Drop the first tree first: the directory lock is exclusive, so a second
+    // open of the same dir while it is alive would fail with `Locked`.
+    drop(tree);
+    let tree2 = open_ecc_tree(dir.path());
+    let report2 = patrol_scrub(&tree2, &PatrolScrubOptions::default().heal_in_place(true));
+    assert_eq!(
+        report2.blocks_healed_in_place, 0,
+        "nothing left to heal after a clean heal: {report2:?}",
+    );
+    assert_eq!(report2.corrections_applied, 0, "{report2:?}");
+    Ok(())
+}
+
+#[test]
+fn patrol_scrub_heal_in_place_leaves_an_uncorrectable_block_for_salvage() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst(dir.path());
+
+    // Wreck the whole payload+parity (header intact): beyond the RS(8,2) budget.
+    let payload_start = block.offset().0 as usize + Header::MIN_LEN;
+    let payload_end = block.offset().0 as usize + block.size() as usize;
+    let mut bytes = std::fs::read(&sst_path)?;
+    for slot in bytes
+        .get_mut(payload_start..payload_end)
+        .expect("block payload range in bounds")
+    {
+        *slot ^= 0xFF;
+    }
+    std::fs::write(&sst_path, &bytes)?;
+    let corrupted = std::fs::read(&sst_path)?;
+
+    let tree = open_ecc_tree(dir.path());
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+
+    assert_eq!(
+        report.blocks_healed_in_place, 0,
+        "an uncorrectable block is not healed in place: {report:?}",
+    );
+    assert!(
+        report.uncorrectable_blocks >= 1,
+        "the uncorrectable block is reported, not silently skipped: {report:?}",
+    );
+    assert!(
+        !report.is_ok(),
+        "uncorrectable corruption fails the heal pass"
+    );
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, ScrubError::UncorrectableBlock { .. })),
+        "the finding is an UncorrectableBlock: {report:?}",
+    );
+    // The heal must not have written anything for that block: it is left intact
+    // for block salvage (the new-file copy-through path).
+    let after = std::fs::read(&sst_path)?;
+    assert_eq!(
+        after, corrupted,
+        "an uncorrectable block is left untouched in place for salvage",
+    );
+    Ok(())
+}
