@@ -777,3 +777,88 @@ fn tree_columnar_scan_blob_tree_unsupported() {
         "columnar scan over a blob tree must be rejected"
     );
 }
+
+/// Collects `(key, sub-column-3)` pairs from a bounded-range tree scan, asserting
+/// each batch carries exactly the key + value-3 columns.
+fn scan_range_pairs<R: std::ops::RangeBounds<UserKey>>(
+    tree: &lsm_tree::Tree,
+    range: R,
+) -> Vec<(Vec<u8>, u32)> {
+    let mut out = Vec::new();
+    for batch in tree
+        .columnar_scan(&[COL_USER_KEY, 3], None, SeqNo::MAX, range)
+        .expect("scan")
+    {
+        let batch = batch.expect("batch");
+        let key_col = batch
+            .columns
+            .iter()
+            .find(|c| c.column_id == COL_USER_KEY)
+            .expect("key column");
+        let val_col = batch
+            .columns
+            .iter()
+            .find(|c| c.column_id == 3)
+            .expect("value column");
+        let rows = batch.row_count as usize;
+        let off = |i: usize| {
+            let b: [u8; 4] = key_col.data[i * 4..i * 4 + 4].try_into().unwrap();
+            u32::from_le_bytes(b) as usize
+        };
+        let payload = &key_col.data[(rows + 1) * 4..];
+        for i in 0..rows {
+            let k = payload[off(i)..off(i + 1)].to_vec();
+            let a = u32::from_le_bytes(val_col.data[i * 4..i * 4 + 4].try_into().unwrap());
+            out.push((k, a));
+        }
+    }
+    out
+}
+
+#[test]
+fn tree_columnar_scan_filters_rows_to_the_requested_range() {
+    // A bounded range that PARTIALLY overlaps a single segment must return only
+    // the in-range rows — not the whole segment (the range is a row filter, not
+    // just a segment selector).
+    let folder = get_tmp_folder();
+    let any = open_columnar_any(folder.path());
+    ingest_segment(&any, &[
+        (key(0), 0),
+        (key(1), 1),
+        (key(2), 2),
+        (key(3), 3),
+        (key(4), 4),
+    ]);
+    let tree = standard(&any);
+
+    // [k1, k4): exclusive upper → k1, k2, k3.
+    let got = scan_range_pairs(tree, UserKey::from(&key(1)[..])..UserKey::from(&key(4)[..]));
+    assert_eq!(
+        got,
+        vec![(key(1), 1), (key(2), 2), (key(3), 3)],
+        "only rows inside the requested range are returned",
+    );
+
+    // Inclusive upper [k1, k3] → k1, k2, k3.
+    let got = scan_range_pairs(tree, UserKey::from(&key(1)[..])..=UserKey::from(&key(3)[..]));
+    assert_eq!(got, vec![(key(1), 1), (key(2), 2), (key(3), 3)]);
+}
+
+#[test]
+fn tree_columnar_scan_overlap_merge_filters_rows_to_the_range() {
+    // The overlap-merge path must also enforce the row-level range: a bounded scan
+    // over two overlapping segments returns only in-range keys.
+    let folder = get_tmp_folder();
+    let any = open_columnar_any(folder.path());
+    ingest_segment(&any, &[(key(0), 0), (key(2), 2), (key(4), 4)]);
+    ingest_segment(&any, &[(key(1), 1), (key(3), 3), (key(5), 5)]); // overlaps → merge
+
+    let tree = standard(&any);
+    // [k2, k4]: inclusive → k2, k3, k4.
+    let got = scan_range_pairs(tree, UserKey::from(&key(2)[..])..=UserKey::from(&key(4)[..]));
+    assert_eq!(
+        got,
+        vec![(key(2), 2), (key(3), 3), (key(4), 4)],
+        "the merge path drops rows outside the requested range",
+    );
+}
