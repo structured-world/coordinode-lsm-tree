@@ -165,6 +165,8 @@ lz4_flex = { version = "0.13.0", optional = true, default-features = false }
 # Default features carry the runtime-dispatched SIMD decode kernels (avx2/bmi2/
 # neon/sve/...); `default-features = false` would silently drop them and leave
 # the sequence decoder on the scalar path, measurably slower on cold point reads.
+# 0.0.48 is the published crates.io release; it fixes a dictionary match
+# binary-tree encoder panic present in 0.0.46/0.0.47 on high (BT-strategy) levels.
 structured-zstd = { version = "0.0.48", optional = true, features = ["lsm"] }
 # `once_cell::race::OnceBox` — the no-std + alloc one-shot primitive.
 # We pick it over `std::sync::OnceLock` (which has both `set` and the
