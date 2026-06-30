@@ -516,6 +516,9 @@ pub use {
     vlog::BlobFile,
 };
 
+#[cfg(feature = "columnar")]
+pub use tree::columnar_scan::ColumnarScan;
+
 #[cfg(zstd_any)]
 pub use compression::ZstdDictionary;
 

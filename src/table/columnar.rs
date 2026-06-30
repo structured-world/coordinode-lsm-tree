@@ -761,7 +761,7 @@ fn build_bytes_column<'a>(rows: impl Iterator<Item = &'a [u8]>) -> Result<Vec<u8
 
 /// Reads row `i` of a [`TypeTag::Bytes`] column body (offset table + payload),
 /// bounds-checked.
-fn bytes_column_row(data: &[u8], row_count: u32, i: u32) -> Result<&[u8]> {
+pub(crate) fn bytes_column_row(data: &[u8], row_count: u32, i: u32) -> Result<&[u8]> {
     let off_bytes = (row_count as usize + 1) * 4;
     let read_off = |idx: u32| -> Result<usize> {
         let base = idx as usize * 4;
@@ -845,7 +845,7 @@ fn combine_validity(
 }
 
 /// Reads row `i` of a `Fixed(8)` column body as a little-endian `u64`.
-fn fixed_u64_row(data: &[u8], i: u32) -> Result<u64> {
+pub(crate) fn fixed_u64_row(data: &[u8], i: u32) -> Result<u64> {
     let base = i as usize * 8;
     let b = data
         .get(base..base + 8)

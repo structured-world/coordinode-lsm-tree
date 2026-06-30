@@ -129,6 +129,21 @@ impl core::fmt::Debug for Table {
     }
 }
 
+/// How an SST's rows are visible at a query snapshot, returned by
+/// [`Table::seqno_visibility`]. Drives whether the tree-level columnar scan can
+/// stream a segment verbatim ([`All`](Self::All)) or must apply a per-row seqno
+/// mask ([`Partial`](Self::Partial)); [`None`](Self::None) segments are dropped.
+#[cfg(feature = "columnar")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SeqnoVisibility {
+    /// No row is visible at the snapshot (the SST postdates it).
+    None,
+    /// Every row is visible (the SST entirely predates the snapshot).
+    All,
+    /// The snapshot straddles the SST's seqno range; visibility is per-row.
+    Partial,
+}
+
 /// Result of a bloom filter check.
 enum BloomResult {
     /// Bloom says key is definitely absent — skip point read.
@@ -184,6 +199,34 @@ impl Table {
     #[must_use]
     pub fn global_seqno(&self) -> SeqNo {
         self.0.global_seqno
+    }
+
+    /// Classifies how this SST's rows are visible at query snapshot `seqno`,
+    /// using the same exclusive MVCC rule as [`Self::point_read`]: a row is
+    /// visible iff its effective seqno (`local + global_seqno`) is `< seqno`.
+    ///
+    /// Bulk-ingested columnar SSTs carry a uniform per-row seqno (every local
+    /// seqno is `0`, sharing one `global_seqno`), so they classify as wholly
+    /// [`All`](SeqnoVisibility::All) or wholly [`None`](SeqnoVisibility::None);
+    /// only a flush-produced multi-seqno SST whose seqno range straddles the
+    /// snapshot is [`Partial`](SeqnoVisibility::Partial), which the tree-level
+    /// columnar scan resolves with a per-row seqno mask.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn seqno_visibility(&self, seqno: SeqNo) -> SeqnoVisibility {
+        // Translate the query snapshot into this table's local seqno space; a
+        // snapshot below the base predates every row.
+        let Some(local_threshold) = seqno.checked_sub(self.global_seqno()) else {
+            return SeqnoVisibility::None;
+        };
+        // seqnos are (min, max) local; visible rows satisfy `local < threshold`.
+        if self.metadata.seqnos.0 >= local_threshold {
+            return SeqnoVisibility::None;
+        }
+        if self.metadata.seqnos.1 < local_threshold {
+            SeqnoVisibility::All
+        } else {
+            SeqnoVisibility::Partial
+        }
     }
 
     pub fn referenced_blob_bytes(&self) -> crate::Result<u64> {

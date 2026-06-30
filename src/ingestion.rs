@@ -163,4 +163,74 @@ impl AnyTree {
             Self::Blob(b) => Ok(AnyIngestion::Blob(BlobIngestion::new(b)?)),
         }
     }
+
+    /// Runs a projected columnar scan across the tree.
+    ///
+    /// Delegates to [`Tree::columnar_scan`](crate::Tree::columnar_scan) on a
+    /// standard tree: iterates the columnar segments intersecting `range` and
+    /// visible at `seqno`, applies each segment's positional delete-bitmap and the
+    /// optional `predicate`, and yields projected
+    /// [`ColumnBatch`](crate::table::columnar::ColumnBatch)es in key order,
+    /// merging overlapping segments newest-seqno-wins. See
+    /// [`Tree::columnar_scan`](crate::Tree::columnar_scan) for the full contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tree is a blob tree (columnar scan does not support
+    /// KV separation), if a visible non-columnar segment overlaps `range`, or —
+    /// lazily, while iterating — on a block read / decode failure.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::table::columnar::{Column, TypeTag, entries_to_column_batch};
+    /// use lsm_tree::{AnyTree, Config, InternalValue, SeqNo, ValueType};
+    ///
+    /// let folder = tempfile::tempdir()?;
+    /// let any = Config::new(folder, Default::default(), Default::default()).open()?;
+    /// if let AnyTree::Standard(tree) = &any {
+    ///     tree.update_runtime_config(|cfg| cfg.columnar = true)?;
+    /// }
+    ///
+    /// // Ingest one row whose value is a single fixed-4 sub-column (id 3).
+    /// let mut batch = entries_to_column_batch(&[InternalValue::from_components(
+    ///     b"k0".to_vec(),
+    ///     b"x".to_vec(),
+    ///     0,
+    ///     ValueType::Value,
+    /// )])?;
+    /// batch.columns.pop();
+    /// batch.columns.push(Column {
+    ///     column_id: 3,
+    ///     type_tag: TypeTag::Fixed(4),
+    ///     validity: None,
+    ///     data: vec![1, 0, 0, 0],
+    /// });
+    /// let mut ingestion = any.ingestion()?;
+    /// ingestion.write_columnar_batch(&batch)?;
+    /// ingestion.finish()?;
+    ///
+    /// // Scan projecting only sub-column 3 across the whole tree.
+    /// let mut rows = 0;
+    /// for batch in any.columnar_scan(&[3], None, SeqNo::MAX, ..)? {
+    ///     rows += batch?.row_count;
+    /// }
+    /// assert_eq!(rows, 1);
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    #[cfg(feature = "columnar")]
+    pub fn columnar_scan<R: core::ops::RangeBounds<crate::UserKey>>(
+        &self,
+        projection: &[u16],
+        predicate: Option<&crate::table::columnar_predicate::ColumnRangePredicate>,
+        seqno: crate::SeqNo,
+        range: R,
+    ) -> crate::Result<crate::tree::columnar_scan::ColumnarScan> {
+        match self {
+            Self::Standard(t) => t.columnar_scan(projection, predicate, seqno, range),
+            Self::Blob(_) => Err(crate::Error::FeatureUnsupported(
+                "columnar scan is not supported for blob trees",
+            )),
+        }
+    }
 }

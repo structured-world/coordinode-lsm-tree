@@ -2,6 +2,8 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+#[cfg(feature = "columnar")]
+pub mod columnar_scan;
 pub mod ingest;
 pub mod inner;
 pub mod sealed;
