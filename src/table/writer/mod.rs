@@ -1297,7 +1297,23 @@ impl Writer {
                 "columnar batch ingest requires every row seqno to be 0 (the ingestion assigns the sequence number)",
             ));
         }
-        let Some(inputs) = self.account_direct_block(&entries, comparator)? else {
+        // Columnar ingest is a bulk load of strictly-unique, ascending keys (the
+        // verbatim salvage path, which can carry repeated user keys across MVCC
+        // versions, does NOT go through here). Check within the batch and against
+        // the writer's prior key before any state mutation.
+        let mut prev = self.current_key.as_ref();
+        for e in &entries {
+            if let Some(p) = prev
+                && comparator.compare(p.as_ref(), e.key.user_key.as_ref())
+                    != core::cmp::Ordering::Less
+            {
+                return Err(crate::Error::InvalidHeader(
+                    "columnar batch ingest requires strictly increasing keys",
+                ));
+            }
+            prev = Some(&e.key.user_key);
+        }
+        let Some(inputs) = self.account_direct_block(&entries)? else {
             return Ok(None); // empty batch: no block
         };
 
@@ -1435,33 +1451,22 @@ impl Writer {
     /// block: the caller emits it (encode, or a verbatim byte-copy). Returns `None`
     /// for an empty entry set (no block).
     ///
+    /// `entries` must already be in valid block order. Equal user keys are
+    /// permitted (a recovered data block can carry several MVCC versions of one
+    /// key); the columnar-ingest contract of strictly-unique keys is enforced by
+    /// the caller ([`Self::write_columnar_block_inner`]), not here.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the keys are not strictly increasing (within `entries`
-    /// or against the writer's prior key), or if flushing the pending chunk fails.
+    /// Returns an error if flushing the pending row chunk or registering a filter
+    /// key fails.
     fn account_direct_block(
         &mut self,
         entries: &[InternalValue],
-        comparator: &crate::SharedComparator,
     ) -> crate::Result<Option<DirectBlockInputs>> {
         let Some(last) = entries.last() else {
             return Ok(None);
         };
-        // Unsorted keys would corrupt the sorted block index / zone map. Check
-        // against the writer's last key and within the block before any state
-        // mutation, so a bad block leaves the writer untouched.
-        let mut prev = self.current_key.as_ref();
-        for e in entries {
-            if let Some(p) = prev
-                && comparator.compare(p.as_ref(), e.key.user_key.as_ref())
-                    != core::cmp::Ordering::Less
-            {
-                return Err(crate::Error::InvalidHeader(
-                    "direct block write requires strictly increasing keys",
-                ));
-            }
-            prev = Some(&e.key.user_key);
-        }
         let last_key = last.key.user_key.clone();
         let last_seqno = last.key.seqno;
         let item_count = entries.len();
@@ -1564,19 +1569,20 @@ impl Writer {
     /// diverges from the copied bytes.
     ///
     /// Returns the block's last user key (or `None` for an empty entry set).
+    /// `entries` may contain repeated user keys (MVCC versions of one key); they
+    /// are accounted, not re-ordered, and the raw block already holds them in
+    /// valid order.
     ///
     /// # Errors
     ///
-    /// Returns an error if the keys are not strictly increasing, `raw`'s length
-    /// disagrees with the header's on-disk size under this writer's ECC scheme, or
-    /// the write fails.
+    /// Returns an error if `raw`'s length disagrees with the header's on-disk size
+    /// under this writer's ECC scheme, or the write fails.
     pub(crate) fn append_verbatim_data_block(
         &mut self,
         raw: &[u8],
         header: crate::table::block::Header,
         layout: alloc::vec::Vec<u32>,
         entries: &[InternalValue],
-        comparator: &crate::SharedComparator,
     ) -> crate::Result<Option<crate::UserKey>> {
         // The copied bytes ARE the block; their length must equal what the index
         // entry will record (`register_written_block` sizes the handle and advances
@@ -1589,7 +1595,7 @@ impl Writer {
                 "verbatim block copy: raw length disagrees with the header on-disk size",
             ));
         }
-        let Some(inputs) = self.account_direct_block(entries, comparator)? else {
+        let Some(inputs) = self.account_direct_block(entries)? else {
             return Ok(None);
         };
         {

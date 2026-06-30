@@ -469,7 +469,7 @@ fn salvage_blocks(
                                     let entries =
                                         crate::table::columnar::column_batch_to_entries(&batch)?;
                                     writer.append_verbatim_data_block(
-                                        &raw, header, layout, &entries, comparator,
+                                        &raw, header, layout, &entries,
                                     )?;
                                     blocks_copied_verbatim += 1;
                                 }
@@ -526,7 +526,7 @@ fn salvage_blocks(
                             match sb.verbatim {
                                 Some((raw, header, layout)) => {
                                     writer.append_verbatim_data_block(
-                                        &raw, header, layout, &entries, comparator,
+                                        &raw, header, layout, &entries,
                                     )?;
                                     blocks_copied_verbatim += 1;
                                 }

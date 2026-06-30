@@ -11,6 +11,60 @@ use alloc::sync::Arc;
 use tempfile::tempdir;
 use test_log::test;
 
+/// Regression: a data block can hold several MVCC versions of one user key
+/// (same key, descending seqno). The verbatim copy-through path must accept
+/// equal user keys — only columnar *ingest* requires strictly-unique keys — so
+/// salvaging such a block recovers every version instead of erroring.
+#[test]
+fn salvage_recovers_a_block_with_multiple_versions_of_one_key() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // One block holding the same user key at several seqnos, surrounded by unique
+    // keys. Valid SST order: user key ascending, seqno descending within a key.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    writer.write(InternalValue::from_components(
+        b"a".to_vec(),
+        b"a".to_vec(),
+        1,
+        ValueType::Value,
+    ))?;
+    for seqno in [3u64, 2, 1] {
+        writer.write(InternalValue::from_components(
+            b"dup".to_vec(),
+            format!("v{seqno}").into_bytes(),
+            seqno,
+            ValueType::Value,
+        ))?;
+    }
+    writer.write(InternalValue::from_components(
+        b"z".to_vec(),
+        b"z".to_vec(),
+        1,
+        ValueType::Value,
+    ))?;
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert!(
+        report.is_complete(),
+        "a healthy SST with MVCC duplicates salvages cleanly: {report:?}",
+    );
+    assert_eq!(
+        report.entries_salvaged, 5,
+        "every version is recovered, including all 3 of `dup`: {report:?}",
+    );
+
+    let recovered = open(dest, &fs)?;
+    assert_eq!(
+        recovered.metadata.item_count, 5,
+        "all 5 entries (3 versions of `dup`) are recovered",
+    );
+    Ok(())
+}
+
 fn iv(i: u32) -> InternalValue {
     InternalValue::from_components(
         format!("key{i:05}").into_bytes(),
@@ -1303,5 +1357,84 @@ fn salvage_preserves_columnar_value_subcolumns() -> crate::Result<()> {
             .all(|b| b.columns.iter().all(|c| c.column_id == 3)),
         "the value sub-column (id 3) is preserved verbatim, not collapsed",
     );
+    Ok(())
+}
+
+/// A columnar Page-ECC SST with a single-byte RS-recoverable fault in a data
+/// block (no deletes): salvage recovers the block from parity and **re-encodes**
+/// the healed batch rather than copying the faulty on-disk bytes verbatim, so the
+/// recovered copy carries clean bytes. The clean block around it is still copied
+/// verbatim.
+#[cfg(all(feature = "columnar", feature = "page_ecc"))]
+#[test]
+fn salvage_reencodes_an_ecc_recovered_columnar_block() -> crate::Result<()> {
+    use crate::table::block::{EccParams, Header};
+    use crate::table::columnar::entries_to_column_batch;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let cmp = default_comparator();
+
+    // Two columnar blocks under RS(4,2) parity, no deletes (so the no-deletes
+    // copy-through / recover path is taken, not the delete-masked one).
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_ecc(Some(EccParams::RS_4_2));
+    for block in 0..2u32 {
+        let entries: Vec<InternalValue> = (0..4u32)
+            .map(|i| {
+                let k = format!("k{:04}", block * 4 + i);
+                InternalValue::from_components(k.into_bytes(), b"x".to_vec(), 0, ValueType::Value)
+            })
+            .collect();
+        let batch = entries_to_column_batch(&entries)?;
+        writer.write_columnar_batch(&batch, &cmp)?;
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar SST is non-empty"
+    );
+
+    // Flip one byte of the first columnar data block (RS(4,2) recovers a single
+    // byte error).
+    let first_off = {
+        let table = open(source.clone(), &fs)?;
+        let Some(kh) = table.data_block_handles().find_map(Result::ok) else {
+            panic!("a non-empty SST has at least one data block");
+        };
+        usize::try_from(*kh.as_ref().offset()).unwrap_or(usize::MAX)
+    };
+    let pos = first_off + Header::MIN_LEN + 3;
+    let mut bytes = std::fs::read(&source)?;
+    if let Some(b) = bytes.get_mut(pos) {
+        *b ^= 0x80;
+    }
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert!(
+        report.is_complete(),
+        "an RS-recoverable columnar block is healed, not dropped: {report:?}",
+    );
+    assert_eq!(
+        report.blocks_salvaged, report.blocks_total,
+        "every block is recovered",
+    );
+    // The recovered block was re-encoded (verbatim:None), so fewer verbatim copies
+    // than salvaged blocks; the other (clean) block is copied verbatim.
+    assert!(
+        report.blocks_copied_verbatim < report.blocks_salvaged,
+        "the ECC-recovered columnar block is re-encoded, not copied verbatim: {report:?}",
+    );
+
+    let recovered = open(dest, &fs)?;
+    assert!(
+        recovered.metadata.columnar,
+        "the recovered copy stays columnar"
+    );
+    assert_eq!(recovered.metadata.item_count, 8, "every row is recovered");
     Ok(())
 }
