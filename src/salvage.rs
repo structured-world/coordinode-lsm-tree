@@ -456,7 +456,29 @@ fn salvage_blocks(
         // isolated either way.
         #[cfg(feature = "columnar")]
         if table.metadata.columnar {
-            if table.delete_bitmap().is_empty() {
+            // A delete-bearing SST (it carries a delete-bitmap section) always
+            // takes the re-emit path: byte-copying its blocks verbatim would
+            // resurrect positionally-deleted rows (the recovered copy carries no
+            // bitmap), and a salvage-mode open degrades a corrupt bitmap to empty,
+            // so `delete_bitmap().is_empty()` cannot tell "no deletes" from "deletes
+            // whose bitmap was lost". A degraded bitmap still recovers all rows
+            // live (the documented salvage degradation) — but never via a verbatim
+            // copy. Only a genuinely delete-free SST is eligible for copy-through.
+            if table.has_delete_bitmap_section() {
+                // Re-emit each block as a delete-masked batch so the recovered copy
+                // keeps any (readable) deletes applied.
+                match table.load_columnar_block_masked(keyed.as_ref()) {
+                    Ok(Some(batch)) => {
+                        let rows = u64::from(batch.row_count);
+                        writer.write_columnar_block_verbatim(&batch, comparator)?;
+                        entries_salvaged += rows;
+                        blocks_salvaged += 1;
+                    }
+                    // Wholly-deleted block: nothing to recover, nothing lost.
+                    Ok(None) => {}
+                    Err(e) => dropped.push(classify_drop(&e, offset, prev_end.as_ref(), &end_key)),
+                }
+            } else {
                 match table
                     .salvage_load_block(keyed.as_ref(), crate::table::block::BlockType::Columnar)
                 {
@@ -486,20 +508,6 @@ fn salvage_blocks(
                             dropped.push(classify_drop(&e, offset, prev_end.as_ref(), &end_key));
                         }
                     },
-                    Err(e) => dropped.push(classify_drop(&e, offset, prev_end.as_ref(), &end_key)),
-                }
-            } else {
-                // Materialized deletes present: re-emit each block as a
-                // delete-masked batch so the recovered copy keeps deletes applied.
-                match table.load_columnar_block_masked(keyed.as_ref()) {
-                    Ok(Some(batch)) => {
-                        let rows = u64::from(batch.row_count);
-                        writer.write_columnar_block_verbatim(&batch, comparator)?;
-                        entries_salvaged += rows;
-                        blocks_salvaged += 1;
-                    }
-                    // Wholly-deleted block: nothing to recover, nothing lost.
-                    Ok(None) => {}
                     Err(e) => dropped.push(classify_drop(&e, offset, prev_end.as_ref(), &end_key)),
                 }
             }
@@ -684,35 +692,58 @@ pub fn salvage_blob_file(
     let mut records_total = 0usize;
     let mut records_salvaged = 0usize;
     let mut dropped: Vec<DroppedBlob> = Vec::new();
-    for item in scanner {
-        records_total += 1;
-        match item {
-            Ok(entry) => {
-                writer.write(&entry.key, entry.seqno, &entry.value)?;
-                records_salvaged += 1;
+    // Emit every recoverable record. A `write` failure here (not a per-record
+    // checksum/corruption drop, which the match arms absorb) is a hard error: it
+    // leaves a partial `dest`, removed on the error path below the same way the
+    // SST salvage path removes its partial output.
+    let walk = (|| -> crate::Result<()> {
+        for item in scanner {
+            records_total += 1;
+            match item {
+                Ok(entry) => {
+                    writer.write(&entry.key, entry.seqno, &entry.value)?;
+                    records_salvaged += 1;
+                }
+                // The scanner repositions at the next frame after a checksum miss,
+                // so a bit-rotted record costs only itself and the walk continues.
+                Err(crate::Error::ChecksumMismatch { .. }) => dropped.push(DroppedBlob {
+                    reason: BlobDropReason::ChecksumMismatch,
+                }),
+                // A structural break: the scanner terminates (it cannot find the
+                // next frame), so this is the last record the walk inspects.
+                Err(e) => dropped.push(DroppedBlob {
+                    reason: BlobDropReason::Corrupt(format!("{e:?}")),
+                }),
             }
-            // The scanner repositions at the next frame after a checksum miss, so
-            // a bit-rotted record costs only itself and the walk continues.
-            Err(crate::Error::ChecksumMismatch { .. }) => dropped.push(DroppedBlob {
-                reason: BlobDropReason::ChecksumMismatch,
-            }),
-            // A structural break: the scanner terminates (it cannot find the next
-            // frame), so this is the last record the walk inspects.
-            Err(e) => dropped.push(DroppedBlob {
-                reason: BlobDropReason::Corrupt(format!("{e:?}")),
-            }),
         }
-    }
+        Ok(())
+    })();
 
-    let salvaged_path = if records_salvaged > 0 {
-        writer.finish()?;
-        Some(dest)
-    } else {
+    let salvaged_path = match walk {
+        // A write failed mid-walk: drop the writer and remove the partial dest
+        // before propagating, so a retry / repair caller never sees a half-written
+        // blob file.
+        Err(e) => {
+            drop(writer);
+            discard_partial(fs, &dest);
+            return Err(e);
+        }
+        Ok(()) if records_salvaged > 0 => {
+            // A `finish` failure likewise leaves a partial dest — remove it before
+            // propagating.
+            if let Err(e) = writer.finish() {
+                discard_partial(fs, &dest);
+                return Err(e);
+            }
+            Some(dest)
+        }
         // Nothing recoverable: `BlobWriter::new` created `dest`, so remove the
         // empty placeholder a repair caller would otherwise re-quarantine.
-        drop(writer);
-        discard_partial(fs, &dest);
-        None
+        Ok(()) => {
+            drop(writer);
+            discard_partial(fs, &dest);
+            None
+        }
     };
 
     Ok(BlobSalvageReport {

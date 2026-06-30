@@ -510,6 +510,15 @@ fn salvage_tolerates_a_corrupt_delete_bitmap_as_all_live() -> crate::Result<()> 
         u64::from(n),
         "every row is recovered live, the corrupt bitmap is ignored",
     );
+    // The SST was written WITH deletes (it carries a delete-bitmap section), so
+    // even though the degraded bitmap reads as empty, salvage must NOT take the
+    // verbatim copy-through fast path: that would byte-copy the physical blocks
+    // (including positionally-deleted rows) without the bitmap. It re-emits
+    // instead, so nothing is copied verbatim here.
+    assert_eq!(
+        report.blocks_copied_verbatim, 0,
+        "a delete-bearing SST is never copied verbatim, even with a degraded bitmap: {report:?}",
+    );
     assert_eq!(reopen_item_count(dest, &fs)?, u64::from(n));
     Ok(())
 }
@@ -1192,6 +1201,42 @@ fn salvage_blob_file_recovers_every_record_of_a_healthy_file() -> crate::Result<
     assert_eq!(
         recovered, expected,
         "every record round-trips through salvage"
+    );
+    Ok(())
+}
+
+/// When a record write to the destination fails mid-salvage, `salvage_blob_file`
+/// must error AND remove the partial destination it created, so a retry / repair
+/// caller never finds a half-written blob file.
+#[test]
+fn salvage_blob_file_removes_the_partial_dest_when_a_write_fails() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("blob_source");
+    let dest = dir.path().join("blob_salvaged");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    let records: Vec<(&[u8], &[u8])> = vec![(b"k0", b"v0"), (b"k1", b"v1")];
+    build_blob(&source, &fs, &records)?;
+
+    // Fail every write to the destination file: the first recovered record's
+    // write-back errors.
+    injector.arm(
+        FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::Other)).on_path("blob_salvaged"),
+    );
+
+    let result = salvage_blob_file(&source, dest.clone(), &fs, 0);
+    assert!(
+        result.is_err(),
+        "a failed destination write must error the salvage",
+    );
+    assert!(
+        !std::path::Path::new(&dest).exists(),
+        "the partial destination is removed on a write failure",
     );
     Ok(())
 }

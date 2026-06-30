@@ -357,6 +357,19 @@ impl Table {
         self.delete_bitmap.as_ref()
     }
 
+    /// Whether this segment was written WITH a positional delete bitmap (it
+    /// carries a `delete_bitmap` section), independent of whether that bitmap is
+    /// currently loaded. This stays `true` even when a salvage-mode open degraded
+    /// a corrupt bitmap to empty, so the salvage walk can tell "no deletes ever"
+    /// apart from "deletes whose bitmap was lost" — and must NOT byte-copy a block
+    /// of the latter verbatim (which would resurrect positionally-deleted rows
+    /// the recovered copy no longer masks).
+    ///
+    /// `pub(crate)` for the salvage walk ([`crate::salvage`]).
+    pub(crate) fn has_delete_bitmap_section(&self) -> bool {
+        self.regions.delete_bitmap.is_some()
+    }
+
     /// Whether this segment carries a parallel `zone_map` section, i.e. it was
     /// written with the zone-map policy on and held at least one data block.
     /// The section powers predicate-based block-skip; absence means scans read
