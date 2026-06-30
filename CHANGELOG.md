@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.8.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.7.0...v5.8.0) - 2026-06-30
+
+### Added
+
+- *(columnar)* tree-level projected columnar scan ([#567](https://github.com/structured-world/coordinode-lsm-tree/pull/567))
+
 ## [5.7.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.6.0...v5.7.0) - 2026-06-27
 
 ### Added
