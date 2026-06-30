@@ -924,3 +924,75 @@ fn tree_columnar_scan_merge_preserves_a_nullable_sub_column() {
     assert!(is_valid(1), "k1 is non-null");
     assert!(!is_valid(2), "k2's null survives the merge gather");
 }
+
+/// Ingests a single-key segment whose value is one variable-width (Bytes) sub-
+/// column (id 3), so a value-column predicate can actually row-filter it.
+fn ingest_bytes_value(any: &AnyTree, k: &[u8], value: &[u8]) {
+    let mut batch = entries_to_column_batch(&[InternalValue::from_components(
+        k.to_vec(),
+        b"x".to_vec(),
+        0,
+        ValueType::Value,
+    )])
+    .expect("transpose");
+    batch.columns.pop();
+    // One-row Bytes column: (row + 1) u32 offset table [0, len] then the payload.
+    let mut data = Vec::new();
+    data.extend_from_slice(&0u32.to_le_bytes());
+    data.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    data.extend_from_slice(value);
+    batch.columns.push(Column {
+        column_id: 3,
+        type_tag: TypeTag::Bytes,
+        validity: None,
+        data,
+    });
+    let mut ingest = any.ingestion().expect("ingestion");
+    ingest.write_columnar_batch(&batch).expect("write");
+    ingest.finish().expect("finish");
+}
+
+#[test]
+fn tree_columnar_scan_applies_predicate_after_newest_version_wins() {
+    // MVCC + predicate ordering in the overlap-merge path: when a key's NEWEST
+    // visible version does NOT match the predicate but an older version does, the
+    // key must be OMITTED (the newest version shadows the older) — not returned as
+    // the stale matching older row.
+    let folder = get_tmp_folder();
+    let any = open_columnar_any(folder.path());
+    ingest_bytes_value(&any, &key(1), b"aaa"); // older: matches predicate
+    ingest_bytes_value(&any, &key(1), b"zzz"); // newer, same key: does NOT match
+
+    let pred = ColumnRangePredicate {
+        column_id: 3,
+        lower: Some(b"aaa".to_vec()),
+        upper: Some(b"aaa".to_vec()),
+    };
+    let tree = standard(&any);
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    for batch in tree
+        .columnar_scan(&[COL_USER_KEY, 3], Some(&pred), SeqNo::MAX, ..)
+        .expect("scan")
+    {
+        let batch = batch.expect("batch");
+        let key_col = batch
+            .columns
+            .iter()
+            .find(|c| c.column_id == COL_USER_KEY)
+            .expect("key column");
+        let rows = batch.row_count as usize;
+        let off = |i: usize| {
+            let b: [u8; 4] = key_col.data[i * 4..i * 4 + 4].try_into().unwrap();
+            u32::from_le_bytes(b) as usize
+        };
+        let payload = &key_col.data[(rows + 1) * 4..];
+        for i in 0..rows {
+            keys.push(payload[off(i)..off(i + 1)].to_vec());
+        }
+    }
+    assert!(
+        keys.is_empty(),
+        "k1's newest version (zzz) fails the predicate, so k1 is omitted, not \
+         returned as the stale older matching version; got {keys:?}",
+    );
+}
