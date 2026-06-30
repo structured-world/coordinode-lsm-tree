@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782562624487,
+  "lastUpdate": 1782845048170,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -20544,6 +20544,84 @@ window.BENCHMARK_DATA = {
             "value": 696821.1853708803,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 4.4us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "db61920e31df14c27c49fecf025b5bc84f9500a3",
+          "message": "feat(columnar): tree-level projected columnar scan (#567)\n\n## Summary\n\nLifts the per-SST `Table::columnar_scan` to the whole tree via\n`Tree::columnar_scan` (surfaced through `AnyTree::columnar_scan`). A\nconsumer holding a tree can now run a **projected, predicate-pushed\ncolumnar scan across every columnar segment** intersecting a key range\nand visible at an MVCC snapshot, yielding `ColumnBatch`es in key order —\nwithout reimplementing segment selection, snapshot visibility,\ndelete-masking, or cross-segment ordering.\n\n```rust\nlet scan = tree.columnar_scan(&[col_a, col_b], Some(&predicate), seqno, lo..hi)?;\nfor batch in scan { /* projected ColumnBatch in key order */ }\n```\n\n## Design — overlap-aware merge (InfluxDB IOx model)\n\nVisible columnar segments are grouped by key-range overlap:\n\n- **Singleton + all-visible** → streams its per-SST scan **verbatim**\n(zero-copy column-skip, no key/seqno decode, no row gather).\n- **Overlapping group** → row-merged: keep the newest version of each\nkey by **effective seqno**, gathered in key order.\n\nThe expensive key/seqno decode + gather is paid **only where segments\nactually overlap** — the disjoint append-only (TIMESERIES) case stays\nzero-cost. As multi-segment columnar compaction reduces overlap, more of\nthe scan takes the fast path, mirroring how IOx inserts its dedup\noperator only over overlapping files.\n\nMVCC visibility via `Table::seqno_visibility`: segment-granular for\nuniform-seqno ingested segments, per-row masked when a snapshot\nstraddles a flush-produced multi-seqno segment.\n\n**EXPLAIN ANALYZE** needs no new API: the columnar scan feeds the\nstandard `metrics` block-load counters, and zone-map-skipped blocks are\nnever loaded, so a consumer reads per-scan decode counts by diffing\n`data_block_load_count` around the scan.\n\n## Also in this PR\n\n- **Dependency updates** (`build(deps)`): `structured-zstd` 0.0.45 →\n0.0.48 (0.0.46/0.0.47 had a dict match-BT encoder panic on BT-strategy\nlevels; 0.0.48 fixes it), `aes-gcm` / `chacha20poly1305` RC → stable\n`0.11.0`.\n- Fix a latent no_std break: the columnar block iterator in `table/iter`\nused `Vec` without importing it, so `--no-default-features --features\ncolumnar` failed to build.\n\n## Testing\n\n- 14 tree-level integration tests: disjoint streaming, overlapping\nnewest-wins, snapshot visibility, per-row seqno mask, projection\ncolumn-skip, predicate across segments + on an unprojected column,\ndelete-bitmap masking, mixed-mode rejection, empty range,\ninternal-column drop, block-decode-count drops with a pruning predicate\n(via `metrics`), blob-tree rejection.\n- Full suite `cargo nextest run --all-features`: **2506 passed, 0\nfailed**.\n- `cargo clippy --all-features --all-targets`: clean. `cargo doc` (+\nall-features): 0 warnings. Doc tests: pass. `no_std` `--features alloc`\nand `--features columnar`: both build clean.\n\nCloses #566\n\nhttps://claude.ai/code/session_01VuBftVDYEigwgvYEe1G6fK\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added feature-gated, projected columnar scans with snapshot-aware\nvisibility, key-range filtering, and overlap-aware newest-wins merging\nacross visible segments.\n* Publicly exposed the `ColumnarScan` iterator (when the columnar\nfeature is enabled).\n* **Bug Fixes**\n* Improved row gathering/merge behavior, preserving ordering,\nnullability, delete-bitmap masking, and correct intrinsic filtering;\nrejects unsupported scan layouts (mixed-mode/blob trees).\n* **Tests**\n* Expanded coverage for projected scans, predicates, MVCC visibility,\ndeduplication, key-range handling, and zone-map pruning.\n* **Chores**\n* Updated optional and encryption dependency version pins to stable\nreleases.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-30T21:43:08+03:00",
+          "tree_id": "ba5cc7e67a2dd154735987179ea46dc65fb0d29c",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/db61920e31df14c27c49fecf025b5bc84f9500a3"
+        },
+        "date": 1782845046669,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2068670.7459267795,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1229903.0460049417,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 893416.960317559,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.1us | P99.9: 6.5us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3800527.4181924597,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.1us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 455107.8530405133,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.3us | P99.9: 9.2us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 240072.96143797328,
+            "unit": "ops/sec",
+            "extra": "P50: 3.9us | P99: 4.9us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.83s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1249984.9767430609,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1083868.063255234,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 2.5us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 686392.0810286675,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.5us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
