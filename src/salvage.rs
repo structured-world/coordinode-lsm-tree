@@ -16,9 +16,33 @@
 //! the corruption is not propagated into the recovered copy.
 
 use crate::UserKey;
+use crate::encryption::EncryptionProvider;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use std::path::PathBuf;
+
+/// The recovery + write context salvage needs to recover an SST that is
+/// encrypted and/or zstd-dictionary compressed.
+///
+/// Block salvage opens the source and rewrites the recovered copy through the
+/// normal table path, so both ends need the same crypto / dictionary context as
+/// the live tree: without the [`EncryptionProvider`] an encrypted source cannot
+/// be decrypted to read its blocks (and the rewritten copy would be plaintext,
+/// inconsistent with an encrypted reopen); without the dictionary a
+/// dictionary-compressed source cannot be decompressed (and the copy could not
+/// be re-compressed to match). [`crate::repair`] fills this from the tree's
+/// `Config`; [`salvage_sst`] defaults it to empty (a plain, unencrypted source).
+#[derive(Clone, Default)]
+pub struct SalvageOptions {
+    /// Encryption provider matching the source's at-rest encryption, or `None`
+    /// for an unencrypted source.
+    pub encryption: Option<Arc<dyn EncryptionProvider>>,
+    /// zstd dictionary matching the source's dictionary compression, or `None`
+    /// when the source uses no dictionary.
+    #[cfg(zstd_any)]
+    pub zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
+}
 
 /// Why a block could not be salvaged and had to be dropped.
 #[derive(Debug, Clone)]
@@ -167,22 +191,51 @@ pub fn salvage_sst(
     dest: std::path::PathBuf,
     fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
 ) -> crate::Result<SalvageReport> {
-    salvage_sst_with_comparator(source, dest, fs, &crate::comparator::default_comparator())
+    salvage_sst_with_options(source, dest, fs, &SalvageOptions::default())
 }
 
-/// Salvages `source` into `dest` under a caller-supplied `comparator`.
+/// Salvages `source` into `dest` with an explicit recovery + write context.
 ///
-/// [`crate::repair`] calls this with the tree's configured comparator so the
-/// rewritten SST opens and orders consistently with the rest of the tree; the
-/// public [`salvage_sst`] wraps it with the default lexicographic comparator.
-pub(crate) fn salvage_sst_with_comparator(
+/// Use this over [`salvage_sst`] to salvage an SST that is encrypted and/or
+/// zstd-dictionary compressed: supply the matching [`EncryptionProvider`] and
+/// dictionary in `options` so the source can be decrypted / decompressed to read
+/// its blocks and the recovered copy is written under the same context. Opens and
+/// rewrites under the default lexicographic comparator; [`crate::repair`] uses the
+/// tree's configured comparator instead via the crate-internal path.
+///
+/// # Errors
+///
+/// As [`salvage_sst`]; additionally fails to open the source when `options` does
+/// not carry the encryption / dictionary context the source was written with.
+pub fn salvage_sst_with_options(
+    source: &std::path::Path,
+    dest: std::path::PathBuf,
+    fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
+    options: &SalvageOptions,
+) -> crate::Result<SalvageReport> {
+    salvage_with_context(
+        source,
+        dest,
+        fs,
+        &crate::comparator::default_comparator(),
+        options,
+    )
+}
+
+/// Salvages `source` into `dest` under a caller-supplied `comparator` and
+/// recovery context.
+///
+/// [`crate::repair`] calls this with the tree's configured comparator and the
+/// `Config`'s encryption provider + zstd dictionary, so the rewritten SST opens,
+/// orders, and decrypts / decompresses consistently with the rest of the tree;
+/// the public entry points wrap it with the default lexicographic comparator.
+pub(crate) fn salvage_with_context(
     source: &std::path::Path,
     dest: std::path::PathBuf,
     fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
     comparator: &crate::comparator::SharedComparator,
+    options: &SalvageOptions,
 ) -> crate::Result<SalvageReport> {
-    use alloc::sync::Arc;
-
     // Digest the source through the injected `Fs`, not `std::fs`: salvage runs
     // over MemFs / fault-injected / routed backends (repair passes its own `fs`),
     // where a direct `std::fs` read would miss the file or hash the wrong bytes.
@@ -203,9 +256,11 @@ pub(crate) fn salvage_sst_with_comparator(
         Arc::clone(fs),
         false,
         false,
-        None,
+        // Decrypt / decompress the source with the caller's context: without it an
+        // encrypted or dictionary-compressed source cannot be read at all.
+        options.encryption.clone(),
         #[cfg(zstd_any)]
-        None,
+        options.zstd_dictionary.clone(),
         comparator.clone(),
         #[cfg(feature = "metrics")]
         metrics,
@@ -217,17 +272,23 @@ pub(crate) fn salvage_sst_with_comparator(
     // Fail closed on range tombstones: the positional walk re-emits only point
     // entries, so salvaging an SST that carries range tombstones would drop them
     // and let lower-level keys they cover reappear after repair (a merge-semantics
-    // violation). Reject until the writer path can re-emit them, the same way
-    // encrypted / dictionary SSTs fall back to quarantine.
+    // violation). Reject until the writer path can re-emit them.
     if !table.range_tombstones().is_empty() {
         return Err(crate::Error::FeatureUnsupported(
             "salvage of an SST with range tombstones",
         ));
     }
 
+    // The recovered copy is written under the SAME context as the source: its
+    // compression + ECC layout, plus the caller's encryption provider and zstd
+    // dictionary, so an encrypted / dictionary source salvages into a copy that
+    // reopens under the live tree's `Config` instead of a plaintext mismatch.
     let writer = crate::table::Writer::new(dest.clone(), table.id(), 0, Arc::clone(fs))?
         .use_data_block_compression(table.metadata.data_block_compression)
-        .use_ecc(table.metadata.ecc_params);
+        .use_ecc(table.metadata.ecc_params)
+        .use_encryption(options.encryption.clone());
+    #[cfg(zstd_any)]
+    let writer = writer.use_zstd_dictionary(options.zstd_dictionary.clone());
 
     let walk = match salvage_blocks(&table, writer, comparator) {
         Ok(walk) => walk,

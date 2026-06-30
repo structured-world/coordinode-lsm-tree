@@ -174,13 +174,20 @@ fn try_salvage_table(
     // preserves the corrupt bytes for the operator to inspect.
     let quarantined = quarantine_file(&**fs, table_base_folder, table_path, file_name)?;
 
-    // Salvage under the tree's configured comparator so the rewritten SST opens
-    // and orders consistently with the rest of the tree on reopen.
-    let report = crate::salvage::salvage_sst_with_comparator(
+    // Salvage under the tree's configured comparator + crypto/dictionary context
+    // so the rewritten SST opens, orders, and decrypts / decompresses consistently
+    // with the rest of the tree on reopen (the reopen below uses the same
+    // `config.encryption` / `config.zstd_dictionary`).
+    let report = crate::salvage::salvage_with_context(
         &quarantined,
         table_path.to_path_buf(),
         fs,
         &config.comparator,
+        &crate::salvage::SalvageOptions {
+            encryption: config.encryption.clone(),
+            #[cfg(zstd_any)]
+            zstd_dictionary: config.zstd_dictionary.clone(),
+        },
     )?;
     if report.salvaged_path.is_none() {
         return Ok(None);
