@@ -65,6 +65,55 @@ fn salvage_recovers_a_block_with_multiple_versions_of_one_key() -> crate::Result
     Ok(())
 }
 
+/// A block where a weak tombstone is immediately followed by a value for the
+/// same key (a reclaimable pair) salvages verbatim and recovers both entries —
+/// exercising the reclaimable-weak-tombstone accounting on the copy-through path.
+#[test]
+fn salvage_recovers_a_reclaimable_weak_tombstone_pair() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // SST order is user key ascending, seqno descending: the weak tombstone
+    // (higher seqno) precedes the value it reclaims (lower seqno) for `dup`.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    writer.write(InternalValue::from_components(
+        b"a".to_vec(),
+        b"a".to_vec(),
+        1,
+        ValueType::Value,
+    ))?;
+    writer.write(InternalValue::from_components(
+        b"dup".to_vec(),
+        b"".to_vec(),
+        3,
+        ValueType::WeakTombstone,
+    ))?;
+    writer.write(InternalValue::from_components(
+        b"dup".to_vec(),
+        b"v1".to_vec(),
+        1,
+        ValueType::Value,
+    ))?;
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    let report = salvage_sst(&source, dest, &fs)?;
+    assert!(
+        report.is_complete(),
+        "healthy SST salvages cleanly: {report:?}"
+    );
+    assert_eq!(
+        report.entries_salvaged, 3,
+        "the weak tombstone and both values are recovered: {report:?}",
+    );
+    assert!(
+        report.blocks_copied_verbatim >= 1,
+        "the clean block is copied verbatim: {report:?}",
+    );
+    Ok(())
+}
+
 fn iv(i: u32) -> InternalValue {
     InternalValue::from_components(
         format!("key{i:05}").into_bytes(),

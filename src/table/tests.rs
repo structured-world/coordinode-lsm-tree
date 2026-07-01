@@ -2986,6 +2986,84 @@ fn heal_data_blocks_in_place_reports_a_block_whose_write_back_fails() -> crate::
     Ok(())
 }
 
+/// A non-ECC SST carries no parity, so an in-place heal finds nothing to
+/// reconstruct: every block reads back as "no recognized parity", nothing is
+/// written, and no block is reported as healed or uncorrectable.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn heal_data_blocks_in_place_is_a_noop_on_a_non_ecc_sst() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(crate::fs::StdFs);
+    // No ECC (no `use_ecc`): blocks carry no parity trailer.
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(256);
+    for i in 0..200u32 {
+        writer.write(InternalValue::from_components(
+            format!("key{i:05}").into_bytes(),
+            b"value-payload-bytes".to_vec(),
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let Some((_, checksum)) = writer.finish()? else {
+        panic!("non-empty SST");
+    };
+
+    let table = recover_table_on(&file, checksum, fs);
+    let report = table.heal_data_blocks_in_place();
+    assert!(
+        report.blocks_scanned > 0,
+        "the walk inspected blocks: {report:?}"
+    );
+    assert_eq!(
+        report.blocks_healed_in_place, 0,
+        "no parity means nothing to heal: {report:?}",
+    );
+    assert_eq!(report.uncorrectable_blocks, 0, "{report:?}");
+    assert!(report.errors.is_empty(), "{report:?}");
+    Ok(())
+}
+
+/// If the read+write handle for the heal cannot even be opened (a failing `Fs`),
+/// the heal records an error finding and scans nothing rather than panicking.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn heal_data_blocks_in_place_reports_when_the_file_cannot_be_opened() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+    use crate::io::ErrorKind;
+    use crate::table::block::EccParams;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(fault);
+
+    let checksum = build_ecc_sst_for_heal(&file, Arc::clone(&fs), EccParams::RS_4_2, 200);
+    let table = recover_table_on(&file, checksum, Arc::clone(&fs));
+
+    // Fail opens from here on: the heal's read+write open cannot be created.
+    injector.arm(FaultRule::new(
+        FaultOp::Open,
+        Fault::Error(ErrorKind::Other),
+    ));
+
+    let report = table.heal_data_blocks_in_place();
+    assert_eq!(
+        report.blocks_scanned, 0,
+        "the walk never started: {report:?}",
+    );
+    assert_eq!(report.blocks_healed_in_place, 0, "{report:?}");
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, crate::scrub::ScrubError::BlockIndexUnreadable { .. })),
+        "a failed open is reported: {report:?}",
+    );
+    Ok(())
+}
+
 /// End-to-end corruption test: tamper on-disk `seqno#kv_max` so it exceeds
 /// `seqno#max`, then verify that `ParsedMeta::load_with_handle` rejects the
 /// file with an `InvalidData` error.
