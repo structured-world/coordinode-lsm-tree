@@ -3,8 +3,11 @@
     reason = "tests assert on known-present values; a panic is the failure signal"
 )]
 // Target-conditional: `u64 as usize` on a block offset only narrows on
-// 32-bit pointer widths, so clippy does NOT fire on the 64-bit CI host;
-// `allow` (not `expect`, which would be unfulfilled there).
+// 32-bit pointer widths, so clippy does NOT fire on the 64-bit CI host.
+// This must stay `allow`, NOT `expect`: an `#[expect]` that never fires (as on
+// the 64-bit host) is itself a warning (`unfulfilled_lint_expectations`), so the
+// usual `#[expect]`-over-`#[allow]` preference does not apply to a lint that only
+// triggers on some targets.
 #![allow(
     clippy::cast_possible_truncation,
     reason = "in-file block offsets fit usize; only narrow on 32-bit targets"

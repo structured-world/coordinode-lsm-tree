@@ -1044,7 +1044,9 @@ fn salvage_recovers_a_dictionary_sst_with_the_dictionary() -> crate::Result<()> 
 
     corrupt_second_data_block(&source, &fs, 0, None, Some(Arc::clone(&dict)))?;
 
-    // Without the dictionary, the source's blocks cannot be decompressed.
+    // Without the dictionary, the source cannot even be opened: `recover_inner`
+    // fail-fasts on the ZstdDict-id mismatch at open time (before any block
+    // walk), so salvage returns `Err`, not a zero-recovered report.
     assert!(
         salvage_sst(&source, dest.clone(), &fs).is_err(),
         "a dictionary SST must not salvage without the dictionary",
