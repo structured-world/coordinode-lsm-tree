@@ -1678,6 +1678,32 @@ impl Block {
         if block_size < Header::MIN_LEN {
             return Err(crate::Error::InvalidHeader("Block"));
         }
+        // Pre-allocation sanity cap on `handle.size()` (mirrors
+        // `from_file_with_recovery`): reject an absurd on-disk size from a corrupt
+        // handle before allocating the read buffer. Bound = max payload
+        // (+ encryption overhead) + its parity + the largest header.
+        let enc_overhead = transform
+            .encryption()
+            .map_or(0u64, |e| u64::from(e.max_overhead()));
+        let max_payload = u64::from(MAX_DECOMPRESSION_SIZE) + enc_overhead;
+        let max_ecc_overhead = match transform.ecc_params() {
+            Some(params) => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "max_payload is MAX_DECOMPRESSION_SIZE (+ enc overhead), well below u32::MAX"
+                )]
+                let max_payload_u32 = max_payload.min(u64::from(u32::MAX)) as u32;
+                u64::from(expected_parity_len(max_payload_u32, params))
+            }
+            None => 0,
+        };
+        let max_on_disk_size = max_payload + max_ecc_overhead + Header::MAX_LEN as u64;
+        if u64::from(handle.size()) > max_on_disk_size {
+            return Err(crate::Error::DecompressedSizeTooLarge {
+                declared: u64::from(handle.size()),
+                limit: max_on_disk_size,
+            });
+        }
         let mut buf = alloc::vec![0u8; block_size];
         let n = file.read_at(&mut buf, *handle.offset())?;
         if n != block_size {
@@ -1729,11 +1755,17 @@ impl Block {
         frame.extend_from_slice(header_bytes);
         frame.extend_from_slice(&data);
         frame.extend_from_slice(&parity);
-        debug_assert_eq!(
-            frame.len(),
-            block_size,
-            "an in-place heal must be byte-length-identical to the original block",
-        );
+        // An in-place heal overwrites the block at its existing offset, so the
+        // rebuilt frame MUST be byte-length-identical to the original — a shorter
+        // or longer frame would corrupt the following block. Enforce at runtime
+        // (not just `debug_assert`): the recovered payload / recomputed parity are
+        // deterministic, so a mismatch means the header disagrees with the on-disk
+        // layout; refuse rather than write a wrong-length block in release builds.
+        if frame.len() != block_size {
+            return Err(crate::Error::InvalidHeader(
+                "in-place heal: rebuilt frame length differs from the on-disk block",
+            ));
+        }
         Ok(Some((frame, kind)))
     }
 

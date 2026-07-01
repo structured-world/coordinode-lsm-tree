@@ -104,9 +104,12 @@ pub struct SalvageReport {
     /// (checksum passed without ECC recovery) and were copied through **verbatim**
     /// — their raw on-disk bytes byte-copied, skipping the decode + re-encode +
     /// recompression the rest pay. The remainder
-    /// (`blocks_salvaged - blocks_copied_verbatim`) were ECC-recovered and
-    /// re-emitted from their healed payload. A high ratio means a mostly-healthy
-    /// SST was recovered cheaply.
+    /// (`blocks_salvaged - blocks_copied_verbatim`) were re-emitted rather than
+    /// byte-copied: ECC-recovered blocks (re-encoded from their healed payload)
+    /// and, for a columnar SST that carries deletes, its clean blocks too
+    /// (re-emitted with the delete mask applied so deleted rows are not
+    /// resurrected). A high ratio means a mostly-healthy, delete-free SST was
+    /// recovered cheaply.
     pub blocks_copied_verbatim: usize,
     /// Entries recovered into the salvaged SST.
     pub entries_salvaged: u64,
