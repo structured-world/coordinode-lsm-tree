@@ -332,6 +332,13 @@ impl BlobFile {
         self.0.checksum
     }
 
+    /// The compression applied to this blob file's values (the descriptor a
+    /// reader uses to decode each record's on-disk bytes).
+    #[must_use]
+    pub(crate) fn compression(&self) -> crate::CompressionType {
+        self.0.meta.compression
+    }
+
     /// Returns the blob file path.
     #[must_use]
     pub fn path(&self) -> &Path {

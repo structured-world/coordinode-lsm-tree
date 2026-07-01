@@ -16,9 +16,40 @@
 //! the corruption is not propagated into the recovered copy.
 
 use crate::UserKey;
+use crate::encryption::EncryptionProvider;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use std::path::PathBuf;
+
+/// The recovery + write context salvage needs to recover an SST that is
+/// encrypted and/or zstd-dictionary compressed.
+///
+/// Block salvage opens the source and rewrites the recovered copy through the
+/// normal table path, so both ends need the same crypto / dictionary context as
+/// the live tree: without the [`EncryptionProvider`] an encrypted source cannot
+/// be decrypted to read its blocks (and the rewritten copy would be plaintext,
+/// inconsistent with an encrypted reopen); without the dictionary a
+/// dictionary-compressed source cannot be decompressed (and the copy could not
+/// be re-compressed to match). [`crate::repair`] fills this from the tree's
+/// `Config`; [`salvage_sst`] defaults it to empty (a plain, unencrypted source).
+#[derive(Clone, Default)]
+pub struct SalvageOptions {
+    /// Encryption provider matching the source's at-rest encryption, or `None`
+    /// for an unencrypted source.
+    pub encryption: Option<Arc<dyn EncryptionProvider>>,
+    /// zstd dictionary matching the source's dictionary compression, or `None`
+    /// when the source uses no dictionary.
+    #[cfg(zstd_any)]
+    pub zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
+    /// The source's table id. Encrypted block AAD binds the table identity, so
+    /// an encrypted source sealed under a non-zero `table_id` only decrypts when
+    /// the same id is supplied here, and the recovered copy is written under it
+    /// so it reopens consistently. [`crate::repair`] passes the table's real id;
+    /// defaults to `0` for the standalone API (matching an unencrypted or
+    /// id-`0` source).
+    pub table_id: crate::TableId,
+}
 
 /// Why a block could not be salvaged and had to be dropped.
 #[derive(Debug, Clone)]
@@ -69,6 +100,17 @@ pub struct SalvageReport {
     pub blocks_total: usize,
     /// Data blocks successfully re-emitted into the salvaged SST.
     pub blocks_salvaged: usize,
+    /// Of [`blocks_salvaged`](Self::blocks_salvaged), how many read back cleanly
+    /// (checksum passed without ECC recovery) and were copied through **verbatim**
+    /// — their raw on-disk bytes byte-copied, skipping the decode + re-encode +
+    /// recompression the rest pay. The remainder
+    /// (`blocks_salvaged - blocks_copied_verbatim`) were re-emitted rather than
+    /// byte-copied: ECC-recovered blocks (re-encoded from their healed payload)
+    /// and, for a columnar SST that carries deletes, its clean blocks too
+    /// (re-emitted with the delete mask applied so deleted rows are not
+    /// resurrected). A high ratio means a mostly-healthy, delete-free SST was
+    /// recovered cheaply.
+    pub blocks_copied_verbatim: usize,
     /// Entries recovered into the salvaged SST.
     pub entries_salvaged: u64,
     /// Blocks the walk had to drop, with their key ranges where known.
@@ -94,6 +136,7 @@ impl SalvageReport {
     ///     salvaged_path: None,
     ///     blocks_total: 4,
     ///     blocks_salvaged: 4,
+    ///     blocks_copied_verbatim: 4,
     ///     entries_salvaged: 100,
     ///     dropped: Vec::new(),
     /// };
@@ -116,12 +159,16 @@ impl SalvageReport {
 /// filter: a single corrupt source block costs only its own key range, not the
 /// whole file.
 ///
-/// The salvaged copy preserves the source's data-block compression and
-/// error-correcting parameters. A columnar source is recovered as rows (the
-/// loader reconstructs row entries), holding the same keys and values; the
-/// columnar sidecars (zone map, delete bitmap) are not carried over yet. The
-/// source is opened in salvage mode, so a corrupt delete-bitmap degrades to
-/// "all rows live" rather than failing the open.
+/// The salvaged copy mirrors the source's persisted layout (data + index
+/// compression, ECC, restart interval, columnar layout with a regenerated zone
+/// map, per-KV checksum footers). A columnar source is recovered as columnar:
+/// the recovered rows are transposed back into PAX blocks, so the copy keeps the
+/// columnar layout and its zone map (a corrupt delete-bitmap is applied on read
+/// in salvage mode, so the surviving rows are already post-delete and the copy
+/// needs no delete-bitmap). Per-field value sub-columns collapse to a single
+/// value column in this row round-trip; preserving them verbatim is a separate
+/// step. The source is opened in salvage mode, so a corrupt delete-bitmap / zone
+/// map degrades gracefully rather than failing the open.
 ///
 /// The positional walk re-emits only point entries, so an SST that carries
 /// range tombstones cannot be salvaged without dropping them (which would let
@@ -167,22 +214,51 @@ pub fn salvage_sst(
     dest: std::path::PathBuf,
     fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
 ) -> crate::Result<SalvageReport> {
-    salvage_sst_with_comparator(source, dest, fs, &crate::comparator::default_comparator())
+    salvage_sst_with_options(source, dest, fs, &SalvageOptions::default())
 }
 
-/// Salvages `source` into `dest` under a caller-supplied `comparator`.
+/// Salvages `source` into `dest` with an explicit recovery + write context.
 ///
-/// [`crate::repair`] calls this with the tree's configured comparator so the
-/// rewritten SST opens and orders consistently with the rest of the tree; the
-/// public [`salvage_sst`] wraps it with the default lexicographic comparator.
-pub(crate) fn salvage_sst_with_comparator(
+/// Use this over [`salvage_sst`] to salvage an SST that is encrypted and/or
+/// zstd-dictionary compressed: supply the matching [`EncryptionProvider`] and
+/// dictionary in `options` so the source can be decrypted / decompressed to read
+/// its blocks and the recovered copy is written under the same context. Opens and
+/// rewrites under the default lexicographic comparator; [`crate::repair`] uses the
+/// tree's configured comparator instead via the crate-internal path.
+///
+/// # Errors
+///
+/// As [`salvage_sst`]; additionally fails to open the source when `options` does
+/// not carry the encryption / dictionary context the source was written with.
+pub fn salvage_sst_with_options(
+    source: &std::path::Path,
+    dest: std::path::PathBuf,
+    fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
+    options: &SalvageOptions,
+) -> crate::Result<SalvageReport> {
+    salvage_with_context(
+        source,
+        dest,
+        fs,
+        &crate::comparator::default_comparator(),
+        options,
+    )
+}
+
+/// Salvages `source` into `dest` under a caller-supplied `comparator` and
+/// recovery context.
+///
+/// [`crate::repair`] calls this with the tree's configured comparator and the
+/// `Config`'s encryption provider + zstd dictionary, so the rewritten SST opens,
+/// orders, and decrypts / decompresses consistently with the rest of the tree;
+/// the public entry points wrap it with the default lexicographic comparator.
+pub(crate) fn salvage_with_context(
     source: &std::path::Path,
     dest: std::path::PathBuf,
     fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
     comparator: &crate::comparator::SharedComparator,
+    options: &SalvageOptions,
 ) -> crate::Result<SalvageReport> {
-    use alloc::sync::Arc;
-
     // Digest the source through the injected `Fs`, not `std::fs`: salvage runs
     // over MemFs / fault-injected / routed backends (repair passes its own `fs`),
     // where a direct `std::fs` read would miss the file or hash the wrong bytes.
@@ -197,15 +273,20 @@ pub(crate) fn salvage_sst_with_comparator(
         checksum,
         0,
         0,
-        0,
+        // The source's table id: encrypted block AAD binds it, so an encrypted
+        // source only decrypts when opened under the same id (`0` for the legacy
+        // standalone / unencrypted path).
+        options.table_id,
         cache,
         Some(descriptor),
         Arc::clone(fs),
         false,
         false,
-        None,
+        // Decrypt / decompress the source with the caller's context: without it an
+        // encrypted or dictionary-compressed source cannot be read at all.
+        options.encryption.clone(),
         #[cfg(zstd_any)]
-        None,
+        options.zstd_dictionary.clone(),
         comparator.clone(),
         #[cfg(feature = "metrics")]
         metrics,
@@ -217,17 +298,24 @@ pub(crate) fn salvage_sst_with_comparator(
     // Fail closed on range tombstones: the positional walk re-emits only point
     // entries, so salvaging an SST that carries range tombstones would drop them
     // and let lower-level keys they cover reappear after repair (a merge-semantics
-    // violation). Reject until the writer path can re-emit them, the same way
-    // encrypted / dictionary SSTs fall back to quarantine.
+    // violation). Reject until the writer path can re-emit them.
     if !table.range_tombstones().is_empty() {
         return Err(crate::Error::FeatureUnsupported(
             "salvage of an SST with range tombstones",
         ));
     }
 
-    let writer = crate::table::Writer::new(dest.clone(), table.id(), 0, Arc::clone(fs))?
-        .use_data_block_compression(table.metadata.data_block_compression)
-        .use_ecc(table.metadata.ecc_params);
+    // The recovered copy is written under the SAME layout as the source —
+    // compression, ECC, restart interval, columnar (+ zone map), per-KV
+    // checksums (`mirror_from`) — plus the caller's encryption provider and zstd
+    // dictionary, so a columnar / encrypted / dictionary source salvages into a
+    // faithful copy that reopens under the live tree's `Config` instead of a
+    // degraded row-major / plaintext mismatch.
+    let writer = crate::table::Writer::new(dest.clone(), options.table_id, 0, Arc::clone(fs))?
+        .mirror_from(&table.metadata)
+        .use_encryption(options.encryption.clone());
+    #[cfg(zstd_any)]
+    let writer = writer.use_zstd_dictionary(options.zstd_dictionary.clone());
 
     let walk = match salvage_blocks(&table, writer, comparator) {
         Ok(walk) => walk,
@@ -255,6 +343,7 @@ pub(crate) fn salvage_sst_with_comparator(
         salvaged_path,
         blocks_total: walk.blocks_total,
         blocks_salvaged: walk.blocks_salvaged,
+        blocks_copied_verbatim: walk.blocks_copied_verbatim,
         entries_salvaged: walk.entries_salvaged,
         dropped: walk.dropped,
     })
@@ -266,6 +355,7 @@ pub(crate) fn salvage_sst_with_comparator(
 struct SalvageWalk {
     blocks_total: usize,
     blocks_salvaged: usize,
+    blocks_copied_verbatim: usize,
     entries_salvaged: u64,
     dropped: Vec<DroppedBlock>,
     wrote: bool,
@@ -282,6 +372,35 @@ fn discard_partial(fs: &alloc::sync::Arc<dyn crate::fs::Fs>, dest: &std::path::P
             "salvage: could not remove the incomplete destination {}: {e}",
             dest.display(),
         );
+    }
+}
+
+/// Classifies a block load / read failure into a [`DroppedBlock`], distinguishing
+/// a bit-rot checksum mismatch from a structural decode error from a raw
+/// read / decompress failure, and attaching the block's `(prev_end, end_key]`
+/// range as the lower/upper bound of the lost keys.
+fn classify_drop(
+    e: &crate::Error,
+    offset: u64,
+    prev_end: Option<&UserKey>,
+    end_key: &UserKey,
+) -> DroppedBlock {
+    use alloc::format;
+    let reason = match e {
+        crate::Error::ChecksumMismatch { .. } => DropReason::ChecksumMismatch,
+        crate::Error::InvalidHeader(_) | crate::Error::InvalidTag(_) => {
+            DropReason::DecodeError(format!("{e:?}"))
+        }
+        _ => DropReason::ReadError(format!("{e:?}")),
+    };
+    DroppedBlock {
+        offset,
+        section: b"data".to_vec(),
+        reason,
+        key_range: Some((
+            prev_end.cloned().unwrap_or_else(UserKey::empty),
+            end_key.clone(),
+        )),
     }
 }
 
@@ -302,6 +421,7 @@ fn salvage_blocks(
 
     let mut blocks_total = 0usize;
     let mut blocks_salvaged = 0usize;
+    let mut blocks_copied_verbatim = 0usize;
     let mut entries_salvaged = 0u64;
     let mut dropped: Vec<DroppedBlock> = Vec::new();
     // Lower bound for a dropped block's range: the previous block's last key,
@@ -328,53 +448,130 @@ fn salvage_blocks(
         };
         let end_key = keyed.end_key().clone();
         let offset = *keyed.as_ref().offset();
-        match table.load_data_block(keyed.as_ref()) {
-            // `try_iter`, not `iter`: a checksum-clean but structurally malformed
-            // block (e.g. an invalid trailer) must be reported as a dropped
-            // `DecodeError`, never panic the salvage walk. `blocks_salvaged` is
-            // counted only once the whole block decoded and was written.
-            Ok(Some(block)) => match block.try_iter(comparator.clone()) {
-                Ok(iter) => {
-                    for parsed in iter {
-                        writer.write(parsed.materialize(block.as_slice()))?;
-                        entries_salvaged += 1;
+
+        // Columnar source: a clean block is byte-copied verbatim — preserving its
+        // PAX value sub-columns, zone map, and per-row seqnos without the transpose
+        // + recompression a re-encode pays — and an ECC-recovered block is
+        // re-emitted from its healed `ColumnBatch`. When the SST carries
+        // materialized positional deletes, a verbatim copy would resurrect deleted
+        // rows (the bitmap is not carried into the recovered SST), so every block
+        // is instead re-emitted as a delete-masked batch. Per-block corruption is
+        // isolated either way.
+        #[cfg(feature = "columnar")]
+        if table.metadata.columnar {
+            // A delete-bearing SST (it carries a delete-bitmap section) always
+            // takes the re-emit path: byte-copying its blocks verbatim would
+            // resurrect positionally-deleted rows (the recovered copy carries no
+            // bitmap), and a salvage-mode open degrades a corrupt bitmap to empty,
+            // so `delete_bitmap().is_empty()` cannot tell "no deletes" from "deletes
+            // whose bitmap was lost". A degraded bitmap still recovers all rows
+            // live (the documented salvage degradation) — but never via a verbatim
+            // copy. Only a genuinely delete-free SST is eligible for copy-through.
+            if table.has_delete_bitmap_section() {
+                // Re-emit each block as a delete-masked batch so the recovered copy
+                // keeps any (readable) deletes applied.
+                match table.load_columnar_block_masked(keyed.as_ref()) {
+                    Ok(Some(batch)) => {
+                        let rows = u64::from(batch.row_count);
+                        writer.write_columnar_block_verbatim(&batch, comparator)?;
+                        entries_salvaged += rows;
+                        blocks_salvaged += 1;
                     }
-                    blocks_salvaged += 1;
+                    // Wholly-deleted block: nothing to recover, nothing lost.
+                    Ok(None) => {}
+                    Err(e) => dropped.push(classify_drop(&e, offset, prev_end.as_ref(), &end_key)),
                 }
-                Err(e) => dropped.push(DroppedBlock {
-                    offset,
-                    section: b"data".to_vec(),
-                    reason: DropReason::DecodeError(format!("{e:?}")),
-                    key_range: Some((
-                        prev_end.clone().unwrap_or_else(UserKey::empty),
-                        end_key.clone(),
-                    )),
-                }),
-            },
-            // A wholly-deleted columnar block carries no live keys: nothing to
-            // recover and nothing lost.
-            Ok(None) => {}
-            Err(e) => {
-                // Classify the failure so the report distinguishes a bit-rot
-                // checksum mismatch from a structural decode error from a raw
-                // read / decompress failure.
-                let reason = match &e {
-                    crate::Error::ChecksumMismatch { .. } => DropReason::ChecksumMismatch,
-                    crate::Error::InvalidHeader(_) | crate::Error::InvalidTag(_) => {
-                        DropReason::DecodeError(format!("{e:?}"))
-                    }
-                    _ => DropReason::ReadError(format!("{e:?}")),
-                };
-                dropped.push(DroppedBlock {
-                    offset,
-                    section: b"data".to_vec(),
-                    reason,
-                    key_range: Some((
-                        prev_end.clone().unwrap_or_else(UserKey::empty),
-                        end_key.clone(),
-                    )),
-                });
+            } else {
+                match table
+                    .salvage_load_block(keyed.as_ref(), crate::table::block::BlockType::Columnar)
+                {
+                    Ok(sb) => match crate::table::columnar::ColumnBatch::decode(&sb.block.data) {
+                        Ok(batch) => {
+                            let rows = u64::from(batch.row_count);
+                            match sb.verbatim {
+                                // Clean: copy the block's raw bytes as-is.
+                                Some((raw, header, layout)) => {
+                                    let entries =
+                                        crate::table::columnar::column_batch_to_entries(&batch)?;
+                                    writer.append_verbatim_data_block(
+                                        &raw, header, layout, &entries,
+                                    )?;
+                                    blocks_copied_verbatim += 1;
+                                }
+                                // ECC-recovered: re-encode the healed batch so the
+                                // recovered copy carries clean on-disk bytes.
+                                None => {
+                                    writer.write_columnar_block_verbatim(&batch, comparator)?;
+                                }
+                            }
+                            entries_salvaged += rows;
+                            blocks_salvaged += 1;
+                        }
+                        Err(e) => {
+                            dropped.push(classify_drop(&e, offset, prev_end.as_ref(), &end_key));
+                        }
+                    },
+                    Err(e) => dropped.push(classify_drop(&e, offset, prev_end.as_ref(), &end_key)),
+                }
             }
+            prev_end = Some(end_key);
+            continue;
+        }
+
+        // Row source: a clean block is byte-copied verbatim; an ECC-recovered block
+        // is re-emitted entry by entry from its healed payload.
+        match table.salvage_load_block(keyed.as_ref(), crate::table::block::BlockType::Data) {
+            Ok(sb) => {
+                // Footer presence is a per-SST property (`kv_checksum_algo`), not a
+                // per-block header flag, so the descriptor supplies it here.
+                let has_kv_footer = table.metadata.kv_checksum_algo.is_some();
+                match crate::table::DataBlock::from_loaded(sb.block, has_kv_footer) {
+                    // `try_iter`, not `iter`: a checksum-clean but structurally
+                    // malformed block (e.g. an invalid trailer) must be reported as
+                    // a dropped `DecodeError`, never panic the salvage walk.
+                    Ok(data_block) => match data_block.try_iter(comparator.clone()) {
+                        Ok(iter) => {
+                            let entries: Vec<crate::InternalValue> =
+                                iter.map(|p| p.materialize(data_block.as_slice())).collect();
+                            let count = entries.len() as u64;
+                            match sb.verbatim {
+                                Some((raw, header, layout)) => {
+                                    writer.append_verbatim_data_block(
+                                        &raw, header, layout, &entries,
+                                    )?;
+                                    blocks_copied_verbatim += 1;
+                                }
+                                None => {
+                                    for e in entries {
+                                        writer.write(e)?;
+                                    }
+                                }
+                            }
+                            entries_salvaged += count;
+                            blocks_salvaged += 1;
+                        }
+                        Err(e) => dropped.push(DroppedBlock {
+                            offset,
+                            section: b"data".to_vec(),
+                            reason: DropReason::DecodeError(format!("{e:?}")),
+                            key_range: Some((
+                                prev_end.clone().unwrap_or_else(UserKey::empty),
+                                end_key.clone(),
+                            )),
+                        }),
+                    },
+                    Err(e) => dropped.push(DroppedBlock {
+                        offset,
+                        section: b"data".to_vec(),
+                        reason: DropReason::DecodeError(format!("{e:?}")),
+                        key_range: Some((
+                            prev_end.clone().unwrap_or_else(UserKey::empty),
+                            end_key.clone(),
+                        )),
+                    }),
+                }
+            }
+            Err(e) => dropped.push(classify_drop(&e, offset, prev_end.as_ref(), &end_key)),
         }
         prev_end = Some(end_key);
     }
@@ -389,9 +586,174 @@ fn salvage_blocks(
     Ok(SalvageWalk {
         blocks_total,
         blocks_salvaged,
+        blocks_copied_verbatim,
         entries_salvaged,
         dropped,
         wrote,
+    })
+}
+
+/// Why a blob (vlog) record could not be salvaged.
+#[derive(Debug, Clone)]
+pub enum BlobDropReason {
+    /// The record's stored checksum did not match its key + value bytes
+    /// (bit-rot). The walk re-syncs at the next record, so only this record is
+    /// lost.
+    ChecksumMismatch,
+    /// A structural failure (bad frame magic, header CRC, or a frame that runs
+    /// past the data section) that desynchronizes the record stream: the walk
+    /// cannot locate later records and stops at this point.
+    Corrupt(String),
+}
+
+/// A blob record the salvage walk could not recover.
+#[derive(Debug, Clone)]
+pub struct DroppedBlob {
+    /// Why the record was dropped.
+    pub reason: BlobDropReason,
+}
+
+/// The outcome of salvaging a single blob (vlog) file.
+///
+/// Inspect [`is_complete`](BlobSalvageReport::is_complete) to tell a clean
+/// recovery (every record re-emitted) from a lossy one; [`dropped`] lists what
+/// was lost. Always check [`salvaged_path`] before using the recovered copy.
+///
+/// [`dropped`]: BlobSalvageReport::dropped
+/// [`salvaged_path`]: BlobSalvageReport::salvaged_path
+#[derive(Debug)]
+pub struct BlobSalvageReport {
+    /// Path of the freshly written salvaged blob file, or `None` when no record
+    /// was recoverable and nothing was written.
+    pub salvaged_path: Option<PathBuf>,
+    /// Total records the walk inspected (recovered plus dropped).
+    pub records_total: usize,
+    /// Records successfully re-emitted into the salvaged blob file.
+    pub records_salvaged: usize,
+    /// Records the walk had to drop.
+    pub dropped: Vec<DroppedBlob>,
+}
+
+impl BlobSalvageReport {
+    /// Returns `true` when no record had to be dropped.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.dropped.is_empty()
+    }
+}
+
+/// Salvages the readable records of the blob (vlog) file at `source` into a fresh
+/// blob file at `dest`.
+///
+/// Where [`crate::repair`] rebuilds the blob-file *manifest* around whole files,
+/// this walks one blob file record by record and re-emits every record whose
+/// checksum verifies, recording the rest. A single bit-rotted record costs only
+/// itself: the record stream re-synchronizes at the next frame after a checksum
+/// mismatch, so the walk keeps recovering. A structural break (corrupt frame
+/// magic / header CRC / a frame that runs past the data section) cannot be
+/// resynced, so the walk stops there and reports it.
+///
+/// `blob_file_id` is the source's id (its file name), recorded in the recovered
+/// file's metadata. The recovered file is written with no value compression, so
+/// a **compressed** source is rejected with [`Error::FeatureUnsupported`] rather
+/// than re-emitted under a mismatched descriptor (the scanner yields on-disk
+/// bytes; faithfully recompressing them is a separate step).
+///
+/// [`Error::FeatureUnsupported`]: crate::Error::FeatureUnsupported
+///
+/// # Errors
+///
+/// Returns an error when `source` cannot be opened at all (its metadata / SFA
+/// trailer is unreadable), when it is a compressed blob file, or when writing
+/// `dest` fails. Per-record corruption is not an error: such records are dropped
+/// and listed in the returned [`BlobSalvageReport`].
+pub fn salvage_blob_file(
+    source: &std::path::Path,
+    dest: std::path::PathBuf,
+    fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
+    blob_file_id: crate::vlog::BlobFileId,
+) -> crate::Result<BlobSalvageReport> {
+    use crate::vlog::blob_file::{scanner::Scanner, writer::Writer as BlobWriter};
+    use alloc::format;
+
+    // Read the source's metadata (this does not scan the data, so a data-corrupt
+    // file still opens) to reject a compressed source: the scanner yields on-disk
+    // (compressed) bytes, and re-emitting them verbatim under a no-compression
+    // descriptor would store undecodable values. Fail closed, the same way SST
+    // salvage fails closed on range tombstones.
+    let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&**fs, source)?);
+    let source_handle = crate::vlog::recover_blob_file(source, blob_file_id, checksum, 0, fs)?;
+    if source_handle.compression() != crate::CompressionType::None {
+        return Err(crate::Error::FeatureUnsupported(
+            "salvage of a compressed blob file",
+        ));
+    }
+
+    let scanner = Scanner::new(source, &**fs, blob_file_id)?;
+    let mut writer = BlobWriter::new(&dest, blob_file_id, 0, &**fs)?;
+
+    let mut records_total = 0usize;
+    let mut records_salvaged = 0usize;
+    let mut dropped: Vec<DroppedBlob> = Vec::new();
+    // Emit every recoverable record. A `write` failure here (not a per-record
+    // checksum/corruption drop, which the match arms absorb) is a hard error: it
+    // leaves a partial `dest`, removed on the error path below the same way the
+    // SST salvage path removes its partial output.
+    let walk = (|| -> crate::Result<()> {
+        for item in scanner {
+            records_total += 1;
+            match item {
+                Ok(entry) => {
+                    writer.write(&entry.key, entry.seqno, &entry.value)?;
+                    records_salvaged += 1;
+                }
+                // The scanner repositions at the next frame after a checksum miss,
+                // so a bit-rotted record costs only itself and the walk continues.
+                Err(crate::Error::ChecksumMismatch { .. }) => dropped.push(DroppedBlob {
+                    reason: BlobDropReason::ChecksumMismatch,
+                }),
+                // A structural break: the scanner terminates (it cannot find the
+                // next frame), so this is the last record the walk inspects.
+                Err(e) => dropped.push(DroppedBlob {
+                    reason: BlobDropReason::Corrupt(format!("{e:?}")),
+                }),
+            }
+        }
+        Ok(())
+    })();
+
+    let salvaged_path = match walk {
+        // A write failed mid-walk: drop the writer and remove the partial dest
+        // before propagating, so a retry / repair caller never sees a half-written
+        // blob file.
+        Err(e) => {
+            drop(writer);
+            discard_partial(fs, &dest);
+            return Err(e);
+        }
+        Ok(()) if records_salvaged > 0 => {
+            // A `finish` failure likewise leaves a partial dest — remove it before
+            // propagating.
+            if let Err(e) = writer.finish() {
+                discard_partial(fs, &dest);
+                return Err(e);
+            }
+            Some(dest)
+        }
+        // Nothing recoverable: `BlobWriter::new` created `dest`, so remove the
+        // empty placeholder a repair caller would otherwise re-quarantine.
+        Ok(()) => {
+            drop(writer);
+            discard_partial(fs, &dest);
+            None
+        }
+    };
+
+    Ok(BlobSalvageReport {
+        salvaged_path,
+        records_total,
+        records_salvaged,
+        dropped,
     })
 }
 

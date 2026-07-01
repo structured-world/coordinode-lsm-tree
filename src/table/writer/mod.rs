@@ -58,6 +58,17 @@ struct HandleMeta {
     zone_block_min: Option<UserKey>,
 }
 
+/// The [`Writer::register_written_block`] inputs computed once by
+/// [`Writer::account_direct_block`] and shared by the columnar-ingest block path
+/// and the verbatim copy-through salvage path.
+struct DirectBlockInputs {
+    last_key: UserKey,
+    last_seqno: crate::SeqNo,
+    seqno_bounds: Option<(u64, u64)>,
+    item_count: usize,
+    zone_block_min: Option<UserKey>,
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Debug, core::hash::Hash)]
 pub struct LinkedFile {
     pub blob_file_id: BlobFileId,
@@ -624,6 +635,41 @@ impl Writer {
         self.index_writer = self.index_writer.use_ecc(ecc);
         self.filter_writer = self.filter_writer.use_ecc(ecc);
         self
+    }
+
+    /// Seeds this writer with the persisted block-layout settings of an existing
+    /// table's [`ParsedMeta`](crate::table::meta::ParsedMeta), so a rewrite (e.g.
+    /// salvage) reproduces the source's layout instead of falling back to writer
+    /// defaults: data + index block compression, ECC scheme, data-block restart
+    /// interval, columnar layout (with its zone map), and the per-KV checksum
+    /// footer algorithm.
+    ///
+    /// Only settings the descriptor actually records are mirrored. Layout choices
+    /// that are not persisted in metadata (partitioned filter / index, bloom
+    /// policy, hash ratio, locator, prefix extractor) fall back to writer
+    /// defaults and are not restored here. Must be called before the first key,
+    /// like the individual `use_*` setters it delegates to.
+    #[must_use]
+    pub(crate) fn mirror_from(self, meta: &crate::table::meta::ParsedMeta) -> Self {
+        let writer = self
+            .use_data_block_compression(meta.data_block_compression)
+            .use_index_block_compression(meta.index_block_compression)
+            .use_ecc(meta.ecc_params)
+            .use_data_block_restart_interval(meta.data_block_restart_interval)
+            // A columnar source re-emits as columnar (the writer transposes the
+            // recovered rows back into PAX blocks) and regenerates the zone map,
+            // rather than degrading to a row-major copy.
+            .use_columnar(meta.columnar)
+            .use_zone_map(meta.columnar);
+        // Re-emit per-KV checksum footers under the source's algorithm when it
+        // carried them (an SST is footer-homogeneous, so `AllLevels` reproduces
+        // the same per-block footer state).
+        match meta.kv_checksum_algo {
+            Some(algo) => {
+                writer.use_kv_checksums(crate::runtime_config::KvChecksumPolicy::AllLevels, algo)
+            }
+            None => writer,
+        }
     }
 
     /// Convenience wiring: resolves the tree's `Config::page_ecc` flag +
@@ -1193,6 +1239,43 @@ impl Writer {
         batch: &crate::table::columnar::ColumnBatch,
         comparator: &crate::SharedComparator,
     ) -> crate::Result<Option<crate::UserKey>> {
+        self.write_columnar_block_inner(batch, comparator, true)
+    }
+
+    /// Writes a pre-built [`ColumnBatch`](crate::table::columnar::ColumnBatch) as a
+    /// single columnar block, storing its value sub-columns AND its per-row seqnos
+    /// **verbatim** — unlike [`Self::write_columnar_batch`], which is the
+    /// bulk-ingest path and requires seqno `0` (assigned at finish). Salvage uses
+    /// this to re-emit a recovered columnar block under its original sequence
+    /// numbers, so the recovered copy keeps both its per-field sub-columns and its
+    /// MVCC versions. The table must be written with `global_seqno` `0` so the
+    /// stored seqnos are the effective ones.
+    ///
+    /// Returns the batch's last user key (or `None` for an empty batch).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write_columnar_batch`], except a non-zero per-row seqno is
+    /// accepted (it is stored as the row's sequence number).
+    #[cfg(feature = "columnar")]
+    pub(crate) fn write_columnar_block_verbatim(
+        &mut self,
+        batch: &crate::table::columnar::ColumnBatch,
+        comparator: &crate::SharedComparator,
+    ) -> crate::Result<Option<crate::UserKey>> {
+        self.write_columnar_block_inner(batch, comparator, false)
+    }
+
+    /// Shared body for the two columnar-block writers. `require_zero_seqno`
+    /// enforces the bulk-ingest contract (every row seqno `0`); the verbatim
+    /// salvage path passes `false` to store the batch's own seqnos.
+    #[cfg(feature = "columnar")]
+    fn write_columnar_block_inner(
+        &mut self,
+        batch: &crate::table::columnar::ColumnBatch,
+        comparator: &crate::SharedComparator,
+        require_zero_seqno: bool,
+    ) -> crate::Result<Option<crate::UserKey>> {
         // A columnar batch only makes sense (and only reads back correctly) when
         // the table is marked columnar; reject a row-mode writer rather than
         // writing a columnar block under a row descriptor.
@@ -1205,111 +1288,46 @@ impl Writer {
         // The framed values feed the shape accounting; the block stores the
         // consumer's sub-columns (not a re-transpose).
         let entries = crate::table::columnar::column_batch_to_entries(batch)?;
-        let Some(last) = entries.last() else {
-            return Ok(None); // empty batch: no block
-        };
 
         // Ingest contract. Unsorted keys would corrupt the sorted block index /
         // zone map; a non-zero seqno would read back shifted by the table's
         // assigned sequence number. Reject both before writing anything.
-        if entries.iter().any(|e| e.key.seqno != 0) {
+        if require_zero_seqno && entries.iter().any(|e| e.key.seqno != 0) {
             return Err(crate::Error::FeatureUnsupported(
                 "columnar batch ingest requires every row seqno to be 0 (the ingestion assigns the sequence number)",
             ));
         }
-        let mut prev = self.current_key.as_ref();
-        for e in &entries {
-            if let Some(p) = prev
-                && comparator.compare(p.as_ref(), e.key.user_key.as_ref())
-                    != core::cmp::Ordering::Less
-            {
-                return Err(crate::Error::InvalidHeader(
-                    "columnar batch ingest requires strictly increasing keys",
-                ));
-            }
-            prev = Some(&e.key.user_key);
-        }
-        let last_key = last.key.user_key.clone();
-        let last_seqno = last.key.seqno;
-        let item_count = entries.len();
-        let seqno_bounds = self.use_seqno_in_index.then(|| {
-            entries.iter().fold((u64::MAX, u64::MIN), |(mn, mx), e| {
-                (mn.min(e.key.seqno), mx.max(e.key.seqno))
-            })
-        });
-        let zone_block_min = self
-            .use_zone_map
-            .then(|| entries.first().map(|e| e.key.user_key.clone()))
-            .flatten();
-
-        // Flush any row chunk buffered by prior `write()` calls before this
-        // direct block, so its block (and locator ordinal) is registered first
-        // and the sorted block / index order is preserved. The validation above
-        // ran first, so an invalid batch never forces a spill. A no-op when the
-        // chunk is empty (the columnar-only ingest path).
-        self.spill_block()?;
-
-        // Per-row shape / seqno / key accounting, mirroring `write()` minus the
-        // chunk push (the direct columnar block holds all rows already). The
-        // locator records each new key's position within this single block, the
-        // same as the flush path does for a transposed columnar block.
-        for (row, e) in entries.iter().enumerate() {
-            let user_key = &e.key.user_key;
-            self.meta.sum_user_key_bytes += user_key.len() as u64;
-            self.meta.sum_value_bytes += e.value.len() as u64;
-            if e.is_tombstone() {
-                self.meta.tombstone_count += 1;
-            }
-            if e.key.value_type == ValueType::WeakTombstone {
-                self.meta.weak_tombstone_count += 1;
-            }
-            if e.key.value_type == ValueType::Value
-                && let Some((prev_key, prev_type)) = &self.previous_item
-                && prev_type == &ValueType::WeakTombstone
-                && prev_key.as_ref() == user_key.as_ref()
-            {
-                self.meta.weak_tombstone_reclaimable_count += 1;
-            }
-            if Some(user_key) != self.current_key.as_ref() {
-                self.meta.key_count += 1;
-                self.current_key = Some(user_key.clone());
-                if self.bloom_policy.is_active() {
-                    self.filter_writer.register_key(user_key)?;
-                }
-                if let Some(spec) = self.locator {
-                    // `row` is this key's item index within the forming columnar
-                    // block; `locator_block_id` is the block's ordinal.
-                    let pos = row as u64;
-                    let slot = match spec.precision {
-                        crate::config::LocatorPrecision::Block => 0,
-                        crate::config::LocatorPrecision::Restart => {
-                            pos / u64::from(self.data_block_restart_interval)
-                        }
-                        crate::config::LocatorPrecision::Entry => pos,
-                    };
-                    self.locators.push((
-                        crate::hash::hash64(user_key),
-                        self.locator_block_id,
-                        slot,
+        // Bulk columnar ingest (`require_zero_seqno`) is a load of strictly-unique,
+        // ascending keys. The verbatim salvage re-emit path (`require_zero_seqno ==
+        // false`) can carry repeated user keys across MVCC versions of one key, so
+        // it must NOT enforce strict uniqueness — only that the block is validly
+        // ordered, which `account_direct_block` already trusts. Check within the
+        // batch and against the writer's prior key before any state mutation.
+        if require_zero_seqno {
+            let mut prev = self.current_key.as_ref();
+            for e in &entries {
+                if let Some(p) = prev
+                    && comparator.compare(p.as_ref(), e.key.user_key.as_ref())
+                        != core::cmp::Ordering::Less
+                {
+                    return Err(crate::Error::InvalidHeader(
+                        "columnar batch ingest requires strictly increasing keys",
                     ));
                 }
+                prev = Some(&e.key.user_key);
             }
-            if self.meta.first_key.is_none() {
-                self.meta.first_key = Some(user_key.clone());
-            }
-            self.previous_item = Some((user_key.clone(), e.key.value_type));
-            self.meta.lowest_seqno = self.meta.lowest_seqno.min(e.key.seqno);
-            self.meta.highest_seqno = self.meta.highest_seqno.max(e.key.seqno);
-            self.meta.highest_kv_seqno = self.meta.highest_kv_seqno.max(e.key.seqno);
         }
+        let Some(inputs) = self.account_direct_block(&entries)? else {
+            return Ok(None); // empty batch: no block
+        };
 
         self.encode_columnar_batch_block(
             batch,
-            last_key.clone(),
-            last_seqno,
-            seqno_bounds,
-            item_count,
-            zone_block_min,
+            inputs.last_key.clone(),
+            inputs.last_seqno,
+            inputs.seqno_bounds,
+            inputs.item_count,
+            inputs.zone_block_min,
         )?;
         // This block's keys were recorded with the current locator ordinal;
         // advance it so a following batch's keys belong to the next block (the
@@ -1317,7 +1335,7 @@ impl Writer {
         if self.locator.is_some() {
             self.locator_block_id += 1;
         }
-        Ok(Some(last_key))
+        Ok(Some(inputs.last_key))
     }
 
     /// Encodes `chunk` into `buf`, returning the `block_flags` bits the transform
@@ -1426,6 +1444,186 @@ impl Writer {
 
         self.meta.last_key = Some(last_key);
         Ok(())
+    }
+
+    /// Validates key order against prior writes, flushes any pending row chunk to
+    /// keep block order, and folds the per-row shape / seqno / filter / locator
+    /// accounting for a block written *directly* (not via the row chunk) —
+    /// returning the inputs [`Self::register_written_block`] needs. Shared by the
+    /// columnar-ingest block path and the verbatim copy-through salvage path so the
+    /// bookkeeping has a single source of truth. Does NOT write or register the
+    /// block: the caller emits it (encode, or a verbatim byte-copy). Returns `None`
+    /// for an empty entry set (no block).
+    ///
+    /// `entries` must already be in valid block order. Equal user keys are
+    /// permitted (a recovered data block can carry several MVCC versions of one
+    /// key); the columnar-ingest contract of strictly-unique keys is enforced by
+    /// the caller ([`Self::write_columnar_block_inner`]), not here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if flushing the pending row chunk or registering a filter
+    /// key fails.
+    fn account_direct_block(
+        &mut self,
+        entries: &[InternalValue],
+    ) -> crate::Result<Option<DirectBlockInputs>> {
+        let Some(last) = entries.last() else {
+            return Ok(None);
+        };
+        let last_key = last.key.user_key.clone();
+        let last_seqno = last.key.seqno;
+        let item_count = entries.len();
+        let seqno_bounds = self.use_seqno_in_index.then(|| {
+            entries.iter().fold((u64::MAX, u64::MIN), |(mn, mx), e| {
+                (mn.min(e.key.seqno), mx.max(e.key.seqno))
+            })
+        });
+        let zone_block_min = self
+            .use_zone_map
+            .then(|| entries.first().map(|e| e.key.user_key.clone()))
+            .flatten();
+
+        // Flush any row chunk buffered by prior `write()` calls before this
+        // direct block, so its block (and locator ordinal) is registered first
+        // and the sorted block / index order is preserved. The validation above
+        // ran first, so an invalid batch never forces a spill. A no-op when the
+        // chunk is empty (the columnar-only ingest / salvage path).
+        self.spill_block()?;
+
+        // Per-row shape / seqno / key accounting, mirroring `write()` minus the
+        // chunk push (the direct block holds all rows already). The locator
+        // records each new key's position within this single block, the same as
+        // the flush path does for a transposed columnar block.
+        for (row, e) in entries.iter().enumerate() {
+            let user_key = &e.key.user_key;
+            self.meta.sum_user_key_bytes += user_key.len() as u64;
+            self.meta.sum_value_bytes += e.value.len() as u64;
+            if e.is_tombstone() {
+                self.meta.tombstone_count += 1;
+            }
+            if e.key.value_type == ValueType::WeakTombstone {
+                self.meta.weak_tombstone_count += 1;
+            }
+            if e.key.value_type == ValueType::Value
+                && let Some((prev_key, prev_type)) = &self.previous_item
+                && prev_type == &ValueType::WeakTombstone
+                && prev_key.as_ref() == user_key.as_ref()
+            {
+                self.meta.weak_tombstone_reclaimable_count += 1;
+            }
+            if Some(user_key) != self.current_key.as_ref() {
+                self.meta.key_count += 1;
+                self.current_key = Some(user_key.clone());
+                if self.bloom_policy.is_active() {
+                    self.filter_writer.register_key(user_key)?;
+                }
+                if let Some(spec) = self.locator {
+                    // `row` is this key's item index within the forming block;
+                    // `locator_block_id` is the block's ordinal.
+                    let pos = row as u64;
+                    let slot = match spec.precision {
+                        crate::config::LocatorPrecision::Block => 0,
+                        crate::config::LocatorPrecision::Restart => {
+                            pos / u64::from(self.data_block_restart_interval)
+                        }
+                        crate::config::LocatorPrecision::Entry => pos,
+                    };
+                    self.locators.push((
+                        crate::hash::hash64(user_key),
+                        self.locator_block_id,
+                        slot,
+                    ));
+                }
+            }
+            if self.meta.first_key.is_none() {
+                self.meta.first_key = Some(user_key.clone());
+            }
+            self.previous_item = Some((user_key.clone(), e.key.value_type));
+            self.meta.lowest_seqno = self.meta.lowest_seqno.min(e.key.seqno);
+            self.meta.highest_seqno = self.meta.highest_seqno.max(e.key.seqno);
+            self.meta.highest_kv_seqno = self.meta.highest_kv_seqno.max(e.key.seqno);
+        }
+
+        Ok(Some(DirectBlockInputs {
+            last_key,
+            last_seqno,
+            seqno_bounds,
+            item_count,
+            zone_block_min,
+        }))
+    }
+
+    /// Appends a data block to the output by copying its raw on-disk bytes
+    /// **verbatim** — no decode + re-encode + re-compress + re-ECC — while folding
+    /// the same per-row accounting a freshly-encoded block gets. Salvage uses this
+    /// to fast-path blocks that read back cleanly (checksum passed without ECC
+    /// recovery): the original framing, compression, encryption, ECC parity, and
+    /// (for a columnar block) the PAX sub-columns / zone map are preserved
+    /// bit-for-bit at the block's new file offset.
+    ///
+    /// `raw` MUST be the exact `header.on_disk_size_with(self.ecc)` bytes the
+    /// source wrote for this block (header + payload + ECC trailer); `layout` is
+    /// its inner-zstd block layout (empty for a single-inner block). The inner
+    /// layout offsets are decompressed-space and block-relative, so they stay
+    /// valid at the new file offset. `entries` are the block's decoded rows, used
+    /// only for filter / key-count / seqno / zone accounting — never
+    /// re-serialized. The writer's ECC scheme must match the one the source block
+    /// was written under (the salvage path mirrors it), or the recorded block size
+    /// diverges from the copied bytes.
+    ///
+    /// Returns the block's last user key (or `None` for an empty entry set).
+    /// `entries` may contain repeated user keys (MVCC versions of one key); they
+    /// are accounted, not re-ordered, and the raw block already holds them in
+    /// valid order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `raw`'s length disagrees with the header's on-disk size
+    /// under this writer's ECC scheme, or the write fails.
+    pub(crate) fn append_verbatim_data_block(
+        &mut self,
+        raw: &[u8],
+        header: crate::table::block::Header,
+        layout: alloc::vec::Vec<u32>,
+        entries: &[InternalValue],
+    ) -> crate::Result<Option<crate::UserKey>> {
+        // The copied bytes ARE the block; their length must equal what the index
+        // entry will record (`register_written_block` sizes the handle and advances
+        // `file_pos` by `header.on_disk_size_with(self.ecc)`). A mismatch means the
+        // writer's ECC scheme was not mirrored from the source — refuse rather than
+        // record a handle that over- or under-reads on reopen.
+        let expected = header.on_disk_size_with(self.ecc) as usize;
+        if raw.len() != expected {
+            return Err(crate::Error::InvalidHeader(
+                "verbatim block copy: raw length disagrees with the header on-disk size",
+            ));
+        }
+        let Some(inputs) = self.account_direct_block(entries)? else {
+            return Ok(None);
+        };
+        {
+            #[cfg(not(feature = "std"))]
+            use crate::io::Write;
+            #[cfg(feature = "std")]
+            use std::io::Write;
+            // Append straight into the active data region, exactly where
+            // `Block::write_to` would have written a freshly-encoded block's bytes.
+            self.file_writer.write_all(raw)?;
+        }
+        self.register_written_block(
+            header,
+            layout,
+            inputs.last_key.clone(),
+            inputs.last_seqno,
+            inputs.seqno_bounds,
+            inputs.item_count,
+            inputs.zone_block_min,
+        )?;
+        if self.locator.is_some() {
+            self.locator_block_id += 1;
+        }
+        Ok(Some(inputs.last_key))
     }
 
     /// Builds the parallel compressor on first use, capturing the now-finalized

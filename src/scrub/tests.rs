@@ -23,6 +23,7 @@ fn report_merge_sums_every_counter_and_concatenates_errors() {
         blocks_scanned: 10,
         corrections_applied: 2,
         ssts_scheduled_for_rewrite: 1,
+        blocks_healed_in_place: 4,
         uncorrectable_blocks: 0,
         errors: vec![],
     };
@@ -31,6 +32,7 @@ fn report_merge_sums_every_counter_and_concatenates_errors() {
         blocks_scanned: 5,
         corrections_applied: 1,
         ssts_scheduled_for_rewrite: 1,
+        blocks_healed_in_place: 3,
         uncorrectable_blocks: 3,
         errors: vec![ScrubError::UncorrectableBlock {
             table_id: 7,
@@ -43,6 +45,7 @@ fn report_merge_sums_every_counter_and_concatenates_errors() {
     assert_eq!(acc.blocks_scanned, 15);
     assert_eq!(acc.corrections_applied, 3);
     assert_eq!(acc.ssts_scheduled_for_rewrite, 2);
+    assert_eq!(acc.blocks_healed_in_place, 7);
     assert_eq!(acc.uncorrectable_blocks, 3);
     assert_eq!(acc.errors.len(), 1);
 }

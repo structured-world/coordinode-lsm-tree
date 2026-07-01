@@ -2805,6 +2805,265 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
     Ok(())
 }
 
+/// Writes a small-block ECC SST of `n` entries under `scheme` through `fs`,
+/// returning its checksum. Shared by the in-place heal tests.
+#[cfg(feature = "page_ecc")]
+fn build_ecc_sst_for_heal(
+    file: &std::path::Path,
+    fs: Arc<dyn crate::fs::Fs>,
+    scheme: crate::table::block::EccParams,
+    n: u32,
+) -> crate::Checksum {
+    #[expect(
+        clippy::expect_used,
+        reason = "test setup; a panic is the failure signal"
+    )]
+    let mut writer = Writer::new(file.to_path_buf(), 0, 0, fs)
+        .expect("open writer")
+        .use_data_block_size(256)
+        .use_ecc(Some(scheme));
+    for i in 0..n {
+        #[expect(clippy::expect_used, reason = "test setup")]
+        writer
+            .write(InternalValue::from_components(
+                format!("key{i:05}").into_bytes(),
+                b"value-payload-bytes".to_vec(),
+                u64::from(i) + 1,
+                crate::ValueType::Value,
+            ))
+            .expect("write");
+    }
+    #[expect(clippy::expect_used, reason = "finish() returns Some after writes")]
+    let (_, checksum) = writer.finish().expect("finish").expect("non-empty");
+    checksum
+}
+
+/// Recovers a `Table` for `file` through `fs` with fresh caches.
+#[cfg(feature = "page_ecc")]
+#[expect(
+    clippy::expect_used,
+    reason = "test setup; a panic is the failure signal"
+)]
+fn recover_table_on(
+    file: &std::path::Path,
+    checksum: crate::Checksum,
+    fs: Arc<dyn crate::fs::Fs>,
+) -> Table {
+    Table::recover(
+        file.to_path_buf(),
+        checksum,
+        0,
+        0,
+        0,
+        Arc::new(crate::Cache::with_capacity_bytes(10_000_000)),
+        Some(Arc::new(crate::descriptor_table::DescriptorTable::new(10))),
+        fs,
+        false,
+        false,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        crate::comparator::default_comparator(),
+        #[cfg(feature = "metrics")]
+        Arc::new(crate::metrics::Metrics::default()),
+    )
+    .expect("recover table")
+}
+
+/// The first data block's file offset in `table`.
+#[cfg(feature = "page_ecc")]
+fn first_data_block_offset(table: &Table) -> u64 {
+    use crate::table::block_index::BlockIndex as _;
+    let Some(keyed) = table.block_index.iter().find_map(Result::ok) else {
+        panic!("a non-empty SST has at least one data block");
+    };
+    keyed.offset().0
+}
+
+/// A single-bit fault in a Page-ECC data block is healed in place AND the file
+/// is restored byte-for-byte (RS / SEC-DED reconstruct the original payload, the
+/// parity is recomputed deterministically). Exercises the SEC-DED branch of the
+/// heal primitive.
+#[cfg(feature = "page_ecc")]
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "in-file block offset fits usize; only narrows on 32-bit targets"
+)]
+fn heal_data_blocks_in_place_restores_a_secded_block_byte_for_byte() -> crate::Result<()> {
+    use crate::table::block::{EccParams, Header};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(crate::fs::StdFs);
+    let checksum = build_ecc_sst_for_heal(&file, Arc::clone(&fs), EccParams::Secded, 200);
+
+    let original = std::fs::read(&file)?;
+    let first_off =
+        first_data_block_offset(&recover_table_on(&file, checksum, Arc::clone(&fs))) as usize;
+
+    // Flip a single bit in the first data block's payload — SEC-DED corrects one
+    // bit flip per word.
+    let pos = first_off + Header::MIN_LEN + 3;
+    let mut bytes = original.clone();
+    if let Some(b) = bytes.get_mut(pos) {
+        *b ^= 0x01;
+    }
+    std::fs::write(&file, &bytes)?;
+    assert_ne!(bytes, original, "the seeded fault changed the file");
+
+    let table = recover_table_on(&file, checksum, Arc::clone(&fs));
+    let report = table.heal_data_blocks_in_place();
+    assert_eq!(report.blocks_healed_in_place, 1, "{report:?}");
+    assert_eq!(report.uncorrectable_blocks, 0, "{report:?}");
+
+    let healed = std::fs::read(&file)?;
+    assert_eq!(
+        healed, original,
+        "SEC-DED in-place heal restores the block byte-for-byte",
+    );
+    Ok(())
+}
+
+/// When the corrected block's write-back fails (a failing `Fs`), the heal does
+/// not count it as healed and records it as an uncorrectable finding so it is
+/// left for block salvage rather than silently lost.
+#[cfg(feature = "page_ecc")]
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "in-file block offset fits usize; only narrows on 32-bit targets"
+)]
+fn heal_data_blocks_in_place_reports_a_block_whose_write_back_fails() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+    use crate::io::ErrorKind;
+    use crate::table::block::{EccParams, Header};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(fault);
+
+    let checksum = build_ecc_sst_for_heal(&file, Arc::clone(&fs), EccParams::RS_4_2, 200);
+
+    let first_off =
+        first_data_block_offset(&recover_table_on(&file, checksum, Arc::clone(&fs))) as usize;
+
+    // RS-recoverable single-byte fault: the read recovers it (so heal returns a
+    // corrected frame), then the write-back is what fails.
+    let pos = first_off + Header::MIN_LEN + 3;
+    let mut bytes = std::fs::read(&file)?;
+    if let Some(b) = bytes.get_mut(pos) {
+        *b ^= 0x80;
+    }
+    std::fs::write(&file, &bytes)?;
+
+    // Fail every write through the fs: the heal reads + recovers the block, then
+    // its write-back errors.
+    injector.arm(FaultRule::new(
+        FaultOp::Write,
+        Fault::Error(ErrorKind::Other),
+    ));
+
+    let table = recover_table_on(&file, checksum, fs);
+    let report = table.heal_data_blocks_in_place();
+    assert_eq!(
+        report.blocks_healed_in_place, 0,
+        "a failed write-back heals nothing: {report:?}",
+    );
+    assert!(
+        report.uncorrectable_blocks >= 1,
+        "the failed write-back is reported, not silently dropped: {report:?}",
+    );
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, crate::scrub::ScrubError::UncorrectableBlock { .. })),
+        "the finding is an UncorrectableBlock: {report:?}",
+    );
+    Ok(())
+}
+
+/// A non-ECC SST carries no parity, so an in-place heal finds nothing to
+/// reconstruct: every block reads back as "no recognized parity", nothing is
+/// written, and no block is reported as healed or uncorrectable.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn heal_data_blocks_in_place_is_a_noop_on_a_non_ecc_sst() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(crate::fs::StdFs);
+    // No ECC (no `use_ecc`): blocks carry no parity trailer.
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(256);
+    for i in 0..200u32 {
+        writer.write(InternalValue::from_components(
+            format!("key{i:05}").into_bytes(),
+            b"value-payload-bytes".to_vec(),
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let Some((_, checksum)) = writer.finish()? else {
+        panic!("non-empty SST");
+    };
+
+    let table = recover_table_on(&file, checksum, fs);
+    let report = table.heal_data_blocks_in_place();
+    assert!(
+        report.blocks_scanned > 0,
+        "the walk inspected blocks: {report:?}"
+    );
+    assert_eq!(
+        report.blocks_healed_in_place, 0,
+        "no parity means nothing to heal: {report:?}",
+    );
+    assert_eq!(report.uncorrectable_blocks, 0, "{report:?}");
+    assert!(report.errors.is_empty(), "{report:?}");
+    Ok(())
+}
+
+/// If the read+write handle for the heal cannot even be opened (a failing `Fs`),
+/// the heal records an error finding and scans nothing rather than panicking.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn heal_data_blocks_in_place_reports_when_the_file_cannot_be_opened() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+    use crate::io::ErrorKind;
+    use crate::table::block::EccParams;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(fault);
+
+    let checksum = build_ecc_sst_for_heal(&file, Arc::clone(&fs), EccParams::RS_4_2, 200);
+    let table = recover_table_on(&file, checksum, Arc::clone(&fs));
+
+    // Fail opens from here on: the heal's read+write open cannot be created.
+    injector.arm(FaultRule::new(
+        FaultOp::Open,
+        Fault::Error(ErrorKind::Other),
+    ));
+
+    let report = table.heal_data_blocks_in_place();
+    assert_eq!(
+        report.blocks_scanned, 0,
+        "the walk never started: {report:?}",
+    );
+    assert_eq!(report.blocks_healed_in_place, 0, "{report:?}");
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, crate::scrub::ScrubError::BlockIndexUnreadable { .. })),
+        "a failed open is reported: {report:?}",
+    );
+    Ok(())
+}
+
 /// End-to-end corruption test: tamper on-disk `seqno#kv_max` so it exceeds
 /// `seqno#max`, then verify that `ParsedMeta::load_with_handle` rejects the
 /// file with an `InvalidData` error.

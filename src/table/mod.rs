@@ -195,6 +195,24 @@ fn apply_global_seqno(local: SeqNo, global: SeqNo) -> SeqNo {
     })
 }
 
+/// Result of [`Table::salvage_load_block`]: the decoded block plus, when it read
+/// back cleanly, its raw on-disk bytes for a verbatim copy.
+pub(crate) struct SalvageBlock {
+    /// The decoded (decompressed / decrypted / ECC-healed) block: the source of
+    /// the per-row entries the salvage walk accounts and, on the re-encode path,
+    /// re-serializes.
+    pub block: Block,
+    /// `Some((raw_on_disk_bytes, header, inner_layout))` when the block read back
+    /// cleanly (no ECC recovery): the walk byte-copies these verbatim. `None` when
+    /// ECC recovery healed the block, so the faulty on-disk bytes must not be
+    /// propagated and the caller re-encodes the healed payload instead.
+    pub verbatim: Option<(
+        alloc::vec::Vec<u8>,
+        crate::table::block::Header,
+        alloc::vec::Vec<u32>,
+    )>,
+}
+
 impl Table {
     #[must_use]
     pub fn global_seqno(&self) -> SeqNo {
@@ -339,6 +357,19 @@ impl Table {
         self.delete_bitmap.as_ref()
     }
 
+    /// Whether this segment was written WITH a positional delete bitmap (it
+    /// carries a `delete_bitmap` section), independent of whether that bitmap is
+    /// currently loaded. This stays `true` even when a salvage-mode open degraded
+    /// a corrupt bitmap to empty, so the salvage walk can tell "no deletes ever"
+    /// apart from "deletes whose bitmap was lost" — and must NOT byte-copy a block
+    /// of the latter verbatim (which would resurrect positionally-deleted rows
+    /// the recovered copy no longer masks).
+    ///
+    /// `pub(crate)` for the salvage walk ([`crate::salvage`]).
+    pub(crate) fn has_delete_bitmap_section(&self) -> bool {
+        self.regions.delete_bitmap.is_some()
+    }
+
     /// Whether this segment carries a parallel `zone_map` section, i.e. it was
     /// written with the zone-map policy on and held at least one data block.
     /// The section powers predicate-based block-skip; absence means scans read
@@ -472,6 +503,140 @@ impl Table {
             // No materialized deletes (or, unreachably, an unmapped block):
             // reconstruct the whole block.
             None => DataBlock::from_columnar_block(&block.data, restart).map(Some),
+        }
+    }
+
+    /// Loads a columnar data block as a delete-masked
+    /// [`ColumnBatch`](crate::table::columnar::ColumnBatch), preserving its
+    /// per-field value sub-columns (and per-row seqnos) instead of reconstructing
+    /// rows. Salvage re-emits the result verbatim so a recovered columnar SST
+    /// keeps its sub-columns and MVCC versions; `Ok(None)` when the positional
+    /// delete-bitmap removes every row of the block.
+    ///
+    /// `pub(crate)` for the salvage walk ([`crate::salvage`]).
+    #[cfg(feature = "columnar")]
+    pub(crate) fn load_columnar_block_masked(
+        &self,
+        handle: &BlockHandle,
+    ) -> crate::Result<Option<crate::table::columnar::ColumnBatch>> {
+        let block = self.load_block(
+            handle,
+            BlockType::Columnar,
+            self.metadata.data_block_compression,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+        )?;
+        let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
+        let Some(start) = self
+            .delete_block_starts
+            .as_ref()
+            .and_then(|starts| starts.get(&handle.offset().0))
+            .copied()
+        else {
+            // No materialized deletes: the whole block is live.
+            return Ok(Some(batch));
+        };
+        // Drop positionally-deleted rows: this block's rows occupy global
+        // positions `[start, start + row_count)` in write order.
+        let keep: alloc::vec::Vec<bool> = (0..batch.row_count)
+            .map(|i| !self.delete_bitmap.contains(start.wrapping_add(i)))
+            .collect();
+        let masked = crate::table::columnar_predicate::filter_batch(&batch, &keep);
+        if masked.row_count == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(masked))
+        }
+    }
+
+    /// Salvage helper: load one data block recovery-aware and, when it reads back
+    /// cleanly, also capture its raw on-disk bytes for a verbatim copy.
+    ///
+    /// Bypasses the block cache so the returned recovery status reflects THIS read
+    /// of the medium (a cached block hides whether the on-disk bytes needed ECC
+    /// repair). On a clean read ([`verbatim`](SalvageBlock::verbatim) is `Some`),
+    /// the salvage walk byte-copies the raw bytes into the recovered SST instead of
+    /// decoding + re-encoding the block; on an ECC-recovered read (`None`) the
+    /// faulty on-disk bytes must not be propagated, so the caller re-encodes the
+    /// healed payload in [`block`](SalvageBlock::block) instead.
+    ///
+    /// `pub(crate)` for the salvage walk ([`crate::salvage`]).
+    pub(crate) fn salvage_load_block(
+        &self,
+        handle: &BlockHandle,
+        block_type: BlockType,
+    ) -> crate::Result<SalvageBlock> {
+        let table_id = self.global_id();
+        let (fd, _) = self
+            .file_accessor
+            .get_or_open_table(&table_id, &self.path)?;
+        let transform = crate::table::util::build_block_transform(
+            self.metadata.data_block_compression,
+            self.encryption.as_deref(),
+            self.metadata.ecc_params,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+        )?;
+        let (block, _status, recovery) = crate::table::block::Block::from_file_with_recovery(
+            fd.as_ref(),
+            *handle,
+            crate::table::block::BlockIdentity {
+                table_id: table_id.table_id(),
+                block_type,
+                dict_id: self.metadata.data_block_compression.dict_id(),
+                window_log: 0,
+            },
+            &transform,
+        )?;
+        // A wrong block type means a swapped / corrupt index entry pointed us at
+        // the wrong bytes; surface it rather than salvage the wrong block.
+        if block.header.block_type != block_type {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                block.header.block_type.into(),
+            )));
+        }
+        let verbatim = if recovery.is_none() {
+            // Clean read: capture the raw on-disk bytes (and inner layout) for a
+            // verbatim copy. A second pread of a cold block costs far less than the
+            // re-compression the copy avoids.
+            use crate::coding::Decode;
+            let raw =
+                crate::file::read_exact(fd.as_ref(), *handle.offset(), handle.size() as usize)?;
+            let header = crate::table::block::Header::decode_from(&mut &raw[..])?;
+            let layout = self.inner_block_layout(handle.offset().0);
+            Some((raw.to_vec(), header, layout))
+        } else {
+            None
+        };
+        Ok(SalvageBlock { block, verbatim })
+    }
+
+    /// The inner-zstd block layout (cumulative decompressed end offsets) for the
+    /// data block at `offset`, or empty when the block has a single inner block
+    /// (the common case) — and always, on a build without zstd, where data blocks
+    /// never split. Salvage's verbatim copy passes this through so a multi-inner
+    /// block keeps its layout at its new file offset (the offsets are
+    /// decompressed-space and block-relative, so they stay valid after the move).
+    #[cfg_attr(
+        not(feature = "zstd"),
+        expect(
+            clippy::unused_self,
+            reason = "the layout lookup is zstd-only; without zstd no data block splits, so the layout is always empty and `self` is unused"
+        )
+    )]
+    fn inner_block_layout(&self, offset: u64) -> alloc::vec::Vec<u32> {
+        #[cfg(feature = "zstd")]
+        {
+            self.block_layout
+                .ends_for(offset)
+                .map(<[u32]>::to_vec)
+                .unwrap_or_default()
+        }
+        #[cfg(not(feature = "zstd"))]
+        {
+            let _ = offset;
+            alloc::vec::Vec::new()
         }
     }
 
@@ -625,6 +790,145 @@ impl Table {
                     log::error!(
                         "patrol scrub: uncorrectable block at offset {block_offset} in table {} \
                          at {}: {e:?}",
+                        self.id(),
+                        self.path.display(),
+                    );
+                    report.errors.push(ScrubError::UncorrectableBlock {
+                        table_id: self.id(),
+                        path: self.path.to_path_buf(),
+                        block_offset,
+                        reason: alloc::format!("{e:?}"),
+                    });
+                }
+            }
+        }
+
+        report
+    }
+
+    /// In-place ECC autoheal: like [`Self::scrub_data_blocks`], but PERSISTS each
+    /// correction by writing the corrected block back at its existing offset
+    /// (size-preserving) instead of scheduling a full-file healing rewrite.
+    /// Healthy blocks are never rewritten, so the cost is O(damage), not O(file).
+    ///
+    /// Opens the SST read+write through the tree's `Fs` (bypassing the block
+    /// cache, like scrub), and for each data block that fails its checksum but
+    /// Page-ECC recovers it, writes back `header ++ recovered_data ++ recomputed
+    /// parity` and `sync_data`s it before moving on, so a crash mid-heal leaves
+    /// the block in its prior, still-RS-correctable state. Uncorrectable /
+    /// unreadable blocks are recorded as findings and left for block salvage.
+    ///
+    /// `pub(crate)` for [`crate::scrub::patrol_scrub`] (heal-in-place enabled).
+    #[cfg(feature = "page_ecc")]
+    pub(crate) fn heal_data_blocks_in_place(&self) -> crate::scrub::PatrolScrubReport {
+        use crate::scrub::{PatrolScrubReport, ScrubError};
+        use std::io::{Seek, SeekFrom, Write};
+
+        let mut report = PatrolScrubReport {
+            sst_files_scanned: 1,
+            ..PatrolScrubReport::default()
+        };
+
+        // A single read+write handle for both the recovery read and the
+        // write-back, opened directly (not via the read-only descriptor cache) so
+        // the heal sees the medium and can mutate it.
+        let mut file = match self
+            .fs
+            .open(&self.path, &FsOpenOptions::new().read(true).write(true))
+        {
+            Ok(f) => f,
+            Err(e) => {
+                report.errors.push(ScrubError::BlockIndexUnreadable {
+                    table_id: self.id(),
+                    path: self.path.to_path_buf(),
+                    reason: alloc::format!("open read+write for heal: {e}"),
+                });
+                return report;
+            }
+        };
+
+        let transform = match crate::table::util::build_block_transform(
+            self.metadata.data_block_compression,
+            self.encryption.as_deref(),
+            self.metadata.ecc_params,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                report.errors.push(ScrubError::BlockIndexUnreadable {
+                    table_id: self.id(),
+                    path: self.path.to_path_buf(),
+                    reason: alloc::format!("build transform for heal: {e:?}"),
+                });
+                return report;
+            }
+        };
+
+        for entry in self.block_index.iter() {
+            let keyed = match entry {
+                Ok(h) => h,
+                Err(e) => {
+                    // A structural index error means later offsets can't be
+                    // trusted — stop this table, record it.
+                    report.errors.push(ScrubError::BlockIndexUnreadable {
+                        table_id: self.id(),
+                        path: self.path.to_path_buf(),
+                        reason: alloc::format!("{e:?}"),
+                    });
+                    break;
+                }
+            };
+            let block_offset = keyed.offset().0;
+            let handle = BlockHandle::new(keyed.offset(), keyed.size());
+            report.blocks_scanned += 1;
+
+            match crate::table::block::Block::heal_frame(file.as_ref(), handle, &transform) {
+                // Clean (or no recognized parity): nothing to persist.
+                Ok(None) => {}
+                // Corrected: write the canonical frame back in place + sync.
+                Ok(Some((frame, kind))) => {
+                    #[cfg(feature = "metrics")]
+                    self.metrics.record_ecc_recovery(kind);
+                    #[cfg(not(feature = "metrics"))]
+                    let _ = kind;
+                    // Seek + write (std::io) and sync (crate::io) carry different
+                    // error types, so each is handled separately; both render to
+                    // text for the finding. `sync_data` (not `sync_all`): the file
+                    // size is unchanged, so only the data needs flushing, and it
+                    // must land before the next block so a crash leaves the block
+                    // in its prior, still-RS-correctable state.
+                    let write_back = file
+                        .seek(SeekFrom::Start(block_offset))
+                        .and_then(|_| file.write_all(&frame));
+                    let durable = match write_back {
+                        Ok(()) => file.sync_data().map_err(|e| alloc::format!("sync: {e}")),
+                        Err(e) => Err(alloc::format!("write: {e}")),
+                    };
+                    if let Err(reason) = durable {
+                        report.uncorrectable_blocks += 1;
+                        log::error!(
+                            "in-place heal: write-back failed for block at offset \
+                             {block_offset} in table {} at {}: {reason}",
+                            self.id(),
+                            self.path.display(),
+                        );
+                        report.errors.push(ScrubError::UncorrectableBlock {
+                            table_id: self.id(),
+                            path: self.path.to_path_buf(),
+                            block_offset,
+                            reason: alloc::format!("in-place heal {reason}"),
+                        });
+                        continue;
+                    }
+                    report.corrections_applied += 1;
+                    report.blocks_healed_in_place += 1;
+                }
+                Err(e) => {
+                    report.uncorrectable_blocks += 1;
+                    log::error!(
+                        "in-place heal: uncorrectable block at offset {block_offset} in table \
+                         {} at {}: {e:?}",
                         self.id(),
                         self.path.display(),
                     );
