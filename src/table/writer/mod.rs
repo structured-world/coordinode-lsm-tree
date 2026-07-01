@@ -1297,21 +1297,25 @@ impl Writer {
                 "columnar batch ingest requires every row seqno to be 0 (the ingestion assigns the sequence number)",
             ));
         }
-        // Columnar ingest is a bulk load of strictly-unique, ascending keys (the
-        // verbatim salvage path, which can carry repeated user keys across MVCC
-        // versions, does NOT go through here). Check within the batch and against
-        // the writer's prior key before any state mutation.
-        let mut prev = self.current_key.as_ref();
-        for e in &entries {
-            if let Some(p) = prev
-                && comparator.compare(p.as_ref(), e.key.user_key.as_ref())
-                    != core::cmp::Ordering::Less
-            {
-                return Err(crate::Error::InvalidHeader(
-                    "columnar batch ingest requires strictly increasing keys",
-                ));
+        // Bulk columnar ingest (`require_zero_seqno`) is a load of strictly-unique,
+        // ascending keys. The verbatim salvage re-emit path (`require_zero_seqno ==
+        // false`) can carry repeated user keys across MVCC versions of one key, so
+        // it must NOT enforce strict uniqueness — only that the block is validly
+        // ordered, which `account_direct_block` already trusts. Check within the
+        // batch and against the writer's prior key before any state mutation.
+        if require_zero_seqno {
+            let mut prev = self.current_key.as_ref();
+            for e in &entries {
+                if let Some(p) = prev
+                    && comparator.compare(p.as_ref(), e.key.user_key.as_ref())
+                        != core::cmp::Ordering::Less
+                {
+                    return Err(crate::Error::InvalidHeader(
+                        "columnar batch ingest requires strictly increasing keys",
+                    ));
+                }
+                prev = Some(&e.key.user_key);
             }
-            prev = Some(&e.key.user_key);
         }
         let Some(inputs) = self.account_direct_block(&entries)? else {
             return Ok(None); // empty batch: no block
