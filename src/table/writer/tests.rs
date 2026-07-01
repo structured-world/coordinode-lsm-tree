@@ -209,3 +209,33 @@ fn writer_rejects_partitioned_filter_switch_after_write() {
     }
     let _writer = writer.use_partitioned_filter();
 }
+
+/// A block re-emitted through the verbatim columnar path can hold several MVCC
+/// versions of one user key (same key, descending seqno). Unlike bulk ingest,
+/// that path must NOT reject equal user keys — only strictly-unique keys are an
+/// ingest contract. Regression for the verbatim salvage re-emit path.
+#[cfg(feature = "columnar")]
+#[test]
+fn write_columnar_block_verbatim_accepts_mvcc_duplicate_keys() -> crate::Result<()> {
+    use crate::comparator::default_comparator;
+    use crate::table::columnar::entries_to_column_batch;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("1");
+    let cmp = default_comparator();
+    let mut writer = Writer::new(path, 1, 0, Arc::new(StdFs))?.use_columnar(true);
+
+    // Two MVCC versions of "dup" (valid block order: user key ascending, seqno
+    // descending within a key) — NOT strictly unique.
+    let entries = alloc::vec![
+        InternalValue::from_components(b"dup".to_vec(), b"v3".to_vec(), 3, ValueType::Value),
+        InternalValue::from_components(b"dup".to_vec(), b"v1".to_vec(), 1, ValueType::Value),
+    ];
+    let batch = entries_to_column_batch(&entries)?;
+    writer.write_columnar_block_verbatim(&batch, &cmp)?;
+    assert!(
+        writer.finish()?.is_some(),
+        "the verbatim block writes and finishes"
+    );
+    Ok(())
+}
