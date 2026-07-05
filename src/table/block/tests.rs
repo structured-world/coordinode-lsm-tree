@@ -1852,6 +1852,37 @@ mod page_ecc {
         Ok(())
     }
 
+    /// `heal_frame` validates the on-disk trailer before treating a block as
+    /// clean: a handle whose size claims more bytes than `header + data + parity`
+    /// (extra trailing bytes) is rejected — matching the normal read path — rather
+    /// than silently reported clean and left un-healed.
+    #[test]
+    fn heal_frame_rejects_a_block_with_extra_trailing_bytes() -> crate::Result<()> {
+        let transform = BlockTransform::PlainEcc(EccParams::RS_4_2);
+        let tmp = super::write_block_to_tempfile(
+            PAYLOAD,
+            BlockIdentity::for_test(0, BlockType::Data),
+            &transform,
+        )?;
+        let path = tmp.dir.path().join("block");
+
+        // Append trailing bytes and claim them in the handle: the block still
+        // reads back clean, but its declared size now exceeds header + data +
+        // parity.
+        let mut bytes = std::fs::read(&path)?;
+        let real_size = bytes.len();
+        bytes.extend_from_slice(&[0u8; 16]);
+        std::fs::write(&path, &bytes)?;
+
+        let oversized = BlockHandle::new(tmp.handle.offset(), (real_size + 16) as u32);
+        let file = std::fs::File::open(&path)?;
+        assert!(
+            Block::heal_frame(&file, oversized, &transform).is_err(),
+            "an over-sized block (extra trailing bytes) is rejected, not reported clean",
+        );
+        Ok(())
+    }
+
     /// `from_file_with_status` reports `EccStatus::Corrected` when a read
     /// repaired the block via ECC, and `EccStatus::Ok` for a clean read.
     /// This is the auto-heal (#411) signal: a healed read returns the
