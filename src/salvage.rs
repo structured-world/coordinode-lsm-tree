@@ -690,7 +690,17 @@ pub fn salvage_blob_file(
     }
 
     let scanner = Scanner::new(source, &**fs, blob_file_id)?;
-    let mut writer = BlobWriter::new(&dest, blob_file_id, 0, &**fs)?;
+    // `BlobWriter::new` creates `dest` (open with `create_new`) before it finishes
+    // initializing the blob's SFA section; a failure in that init returns after the
+    // file exists, so remove the partial `dest` here rather than leaving it for a
+    // retry / repair caller to trip over.
+    let mut writer = match BlobWriter::new(&dest, blob_file_id, 0, &**fs) {
+        Ok(w) => w,
+        Err(e) => {
+            discard_partial(fs, &dest);
+            return Err(e);
+        }
+    };
 
     let mut records_total = 0usize;
     let mut records_salvaged = 0usize;
