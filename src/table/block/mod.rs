@@ -1717,11 +1717,26 @@ impl Block {
         // Heal targets blocks under a recognized parity scheme; without one there
         // is nothing to reconstruct from (a checksum-only block that fails is
         // salvage's job, not in-place heal's).
-        if !block_has_parity(&header, transform) {
+        let has_ecc = block_has_parity(&header, transform);
+        if !has_ecc {
             return Ok(None);
         }
         let ecc_params = block_ecc_params(&header, transform);
         let ecc_length = expected_parity_len(header.data_length, ecc_params);
+        // Validate the on-disk trailer the same way the read path does before ever
+        // treating the block as clean: the post-header bytes must be exactly
+        // `data_length + ecc_length`. Extra trailing bytes (an over-sized / malformed
+        // block) are rejected rather than silently reported clean, matching
+        // `from_file_with_recovery`.
+        let actual_data_len = usize::try_from(header.data_length)
+            .map_err(|_| crate::Error::InvalidHeader("Block"))?;
+        classify_block_trailer(
+            has_ecc,
+            block_size.saturating_sub(header_len),
+            actual_data_len,
+            ecc_length,
+            &handle,
+        )?;
         // `read_payload_and_verify` consumes exactly `data_length + ecc_length`
         // bytes from a cursor over the post-header bytes, returning the (recovered)
         // data and whether a correction was applied.
