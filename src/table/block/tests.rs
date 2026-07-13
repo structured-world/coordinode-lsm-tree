@@ -1883,6 +1883,63 @@ mod page_ecc {
         Ok(())
     }
 
+    /// `heal_frame` on a block with no recognized parity has nothing to
+    /// reconstruct, so it returns `Ok(None)` (heal is a no-op; a checksum-only
+    /// block that fails is salvage's job).
+    #[test]
+    fn heal_frame_returns_none_for_a_block_without_parity() -> crate::Result<()> {
+        let tmp = super::write_block_to_tempfile(
+            PAYLOAD,
+            BlockIdentity::for_test(0, BlockType::Data),
+            &BlockTransform::PLAIN,
+        )?;
+        assert!(
+            Block::heal_frame(&tmp.file, tmp.handle, &BlockTransform::PLAIN)?.is_none(),
+            "a block without parity is a heal no-op",
+        );
+        Ok(())
+    }
+
+    /// `heal_frame` rejects an absurd on-disk size (a corrupt handle) before
+    /// allocating the read buffer, the same cap the read path applies.
+    #[test]
+    fn heal_frame_rejects_an_oversized_handle() -> crate::Result<()> {
+        let transform = BlockTransform::PlainEcc(EccParams::RS_4_2);
+        let tmp = super::write_block_to_tempfile(
+            PAYLOAD,
+            BlockIdentity::for_test(0, BlockType::Data),
+            &transform,
+        )?;
+        let oversized = BlockHandle::new(tmp.handle.offset(), u32::MAX);
+        let err = Block::heal_frame(&tmp.file, oversized, &transform)
+            .expect_err("oversized handle must be rejected");
+        assert!(
+            matches!(err, crate::Error::DecompressedSizeTooLarge { .. }),
+            "expected DecompressedSizeTooLarge, got {err:?}",
+        );
+        Ok(())
+    }
+
+    /// `heal_frame` errors when the handle claims more bytes than the file holds
+    /// (a truncated block), rather than acting on a short read.
+    #[test]
+    fn heal_frame_errors_on_a_short_read() -> crate::Result<()> {
+        let transform = BlockTransform::PlainEcc(EccParams::RS_4_2);
+        let tmp = super::write_block_to_tempfile(
+            PAYLOAD,
+            BlockIdentity::for_test(0, BlockType::Data),
+            &transform,
+        )?;
+        // Claim 4 KiB more than the file actually contains: within the size cap,
+        // but the read cannot fill the buffer.
+        let short = BlockHandle::new(tmp.handle.offset(), tmp.handle.size() + 4096);
+        assert!(
+            Block::heal_frame(&tmp.file, short, &transform).is_err(),
+            "a handle past EOF must error, not act on a short read",
+        );
+        Ok(())
+    }
+
     /// `from_file_with_status` reports `EccStatus::Corrected` when a read
     /// repaired the block via ECC, and `EccStatus::Ok` for a clean read.
     /// This is the auto-heal (#411) signal: a healed read returns the
