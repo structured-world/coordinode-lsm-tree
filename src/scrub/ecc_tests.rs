@@ -313,3 +313,75 @@ fn patrol_scrub_heal_in_place_leaves_an_uncorrectable_block_for_salvage() -> cra
     );
     Ok(())
 }
+
+/// A table WITHOUT Page-ECC still has its integrity checked under
+/// `heal_in_place`: there is nothing to heal without parity, so it takes the
+/// checksum-verifying scrub path, and a corrupt block is reported uncorrectable
+/// rather than silently reported clean.
+#[test]
+fn patrol_scrub_heal_in_place_still_checks_a_non_ecc_table() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Build a plain (no Page-ECC) SST, then drop the tree so the file can be
+    // corrupted and reopened with fresh caches.
+    let sst_path;
+    let block_off;
+    {
+        let crate::AnyTree::Standard(tree) = crate::Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()
+        .expect("open plain tree") else {
+            unreachable!("standard tree configured (no kv separation)");
+        };
+        for i in 0u64..2_000 {
+            tree.insert(format!("key-{i:06}"), format!("v{i:06}"), i);
+        }
+        tree.flush_active_memtable(2_000).expect("flush");
+        let binding = tree.version_history.read().latest_version();
+        let table = binding
+            .version
+            .iter_tables()
+            .next()
+            .expect("flush produced one table");
+        let keyed = table
+            .block_index
+            .iter()
+            .next()
+            .expect("table has a data block")
+            .expect("index entry decodes");
+        sst_path = (*table.path).clone();
+        block_off = keyed.offset().0 as usize;
+    }
+
+    // Flip a payload byte of the first data block (no parity → uncorrectable).
+    let mut bytes = std::fs::read(&sst_path)?;
+    let slot = bytes
+        .get_mut(block_off + Header::MIN_LEN + 3)
+        .expect("corrupt position in range");
+    *slot ^= 0x80;
+    std::fs::write(&sst_path, &bytes)?;
+
+    let crate::AnyTree::Standard(tree) = crate::Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()
+    .expect("reopen plain tree") else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+
+    assert_eq!(
+        report.blocks_healed_in_place, 0,
+        "a non-ECC table has nothing to heal in place: {report:?}",
+    );
+    assert!(
+        report.uncorrectable_blocks >= 1,
+        "a corrupt block in a non-ECC table is reported, not silently clean: {report:?}",
+    );
+    assert!(!report.is_ok(), "uncorrectable corruption fails the pass");
+    Ok(())
+}
