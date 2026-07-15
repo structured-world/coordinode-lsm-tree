@@ -365,7 +365,9 @@ impl Table {
     /// of the latter verbatim (which would resurrect positionally-deleted rows
     /// the recovered copy no longer masks).
     ///
-    /// `pub(crate)` for the salvage walk ([`crate::salvage`]).
+    /// `pub(crate)` for the salvage walk ([`crate::salvage`]); only the columnar
+    /// copy-through path consults it, so it is gated to that feature.
+    #[cfg(feature = "columnar")]
     pub(crate) fn has_delete_bitmap_section(&self) -> bool {
         self.regions.delete_bitmap.is_some()
     }
@@ -883,15 +885,57 @@ impl Table {
             let handle = BlockHandle::new(keyed.offset(), keyed.size());
             report.blocks_scanned += 1;
 
-            match crate::table::block::Block::heal_frame(file.as_ref(), handle, &transform) {
-                // Clean (or no recognized parity): nothing to persist.
-                Ok(None) => {}
-                // Corrected: write the canonical frame back in place + sync.
-                Ok(Some((frame, kind))) => {
-                    #[cfg(feature = "metrics")]
-                    self.metrics.record_ecc_recovery(kind);
-                    #[cfg(not(feature = "metrics"))]
-                    let _ = kind;
+            // Verify the block through the SAME full read the scrub path uses
+            // (checksum + decode + ECC recovery), not just a bare frame check.
+            // This detects a checksum-clean-but-undecodable block (e.g. a corrupt
+            // `uncompressed_length`) and a corrupt block in a non-ECC segment,
+            // reporting it as uncorrectable instead of silently clean. `heal_hints
+            // = None`: this path persists the correction IN PLACE, so it must not
+            // also queue a full-file healing rewrite. The metric is recorded inside
+            // `scrub_block`.
+            let outcome = crate::table::util::scrub_block(
+                self.global_id(),
+                &self.path,
+                &self.file_accessor,
+                &handle,
+                BlockType::Data,
+                self.metadata.data_block_compression,
+                self.encryption.as_deref(),
+                self.metadata.ecc_params,
+                #[cfg(zstd_any)]
+                self.zstd_dictionary.as_deref(),
+                None,
+                #[cfg(feature = "metrics")]
+                &self.metrics,
+            );
+            match outcome {
+                // Verified clean: nothing to persist.
+                Ok(crate::table::util::BlockScrubOutcome::Clean) => {}
+                // Recovered from parity: persist the corrected frame in place.
+                Ok(crate::table::util::BlockScrubOutcome::Corrected { .. }) => {
+                    let frame = match crate::table::block::Block::heal_frame(
+                        file.as_ref(),
+                        handle,
+                        &transform,
+                    ) {
+                        Ok(Some((frame, _kind))) => frame,
+                        // The scrub read reported a correction, so heal_frame must
+                        // see the same fault; a None/Err here is an inconsistency —
+                        // surface it rather than silently skip the write-back.
+                        other => {
+                            report.uncorrectable_blocks += 1;
+                            report.errors.push(ScrubError::UncorrectableBlock {
+                                table_id: self.id(),
+                                path: self.path.to_path_buf(),
+                                block_offset,
+                                reason: alloc::format!(
+                                    "in-place heal: block scrubbed as corrected but heal_frame did \
+                                     not yield a frame: {other:?}"
+                                ),
+                            });
+                            continue;
+                        }
+                    };
                     // Seek + write (std::io) and sync (crate::io) carry different
                     // error types, so each is handled separately; both render to
                     // text for the finding. `sync_data` (not `sync_all`): the file

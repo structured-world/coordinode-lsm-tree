@@ -314,8 +314,13 @@ pub fn patrol_scrub(tree: &impl AbstractTree, options: &PatrolScrubOptions) -> P
 /// [`heal_in_place`](PatrolScrubOptions::heal_in_place) is set (and `page_ecc` is
 /// built), otherwise runs the classic correct-on-read + schedule-rewrite scrub.
 fn scan_one(table: &crate::table::Table, options: &PatrolScrubOptions) -> PatrolScrubReport {
+    // In-place heal only applies to SSTs written with Page-ECC parity — there is
+    // nothing to reconstruct without it. A table with no ECC still needs its
+    // integrity checked, so it takes the normal scrub path (which verifies each
+    // block's checksum and reports uncorrectable ones) rather than the heal path,
+    // whose per-block reconstruction is a no-op there.
     #[cfg(feature = "page_ecc")]
-    if options.heal_in_place {
+    if options.heal_in_place && table.metadata.ecc_params.is_some() {
         return table.heal_data_blocks_in_place();
     }
     let _ = options;
