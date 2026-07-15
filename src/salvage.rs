@@ -722,11 +722,17 @@ pub fn salvage_blob_file(
                 Err(crate::Error::ChecksumMismatch { .. }) => dropped.push(DroppedBlob {
                     reason: BlobDropReason::ChecksumMismatch,
                 }),
-                // A structural break: the scanner terminates (it cannot find the
-                // next frame), so this is the last record the walk inspects.
-                Err(e) => dropped.push(DroppedBlob {
-                    reason: BlobDropReason::Corrupt(format!("{e:?}")),
-                }),
+                // A structural / IO error: the scanner does not re-sync from it
+                // (only a checksum miss repositions), and an error that leaves the
+                // read position before `data_end` without terminating would make
+                // the iterator keep yielding it. Record the corruption and stop the
+                // walk — this is the last record it can inspect.
+                Err(e) => {
+                    dropped.push(DroppedBlob {
+                        reason: BlobDropReason::Corrupt(format!("{e:?}")),
+                    });
+                    break;
+                }
             }
         }
         Ok(())
