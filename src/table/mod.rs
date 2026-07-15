@@ -539,10 +539,20 @@ impl Table {
             return Ok(Some(batch));
         };
         // Drop positionally-deleted rows: this block's rows occupy global
-        // positions `[start, start + row_count)` in write order.
+        // positions `[start, start + row_count)` in write order. A corrupt zone
+        // map can make `start` large enough that `start + i` overflows the u32
+        // row-position space and wraps back to the start of the bitmap, masking
+        // unrelated rows. Fail closed on overflow: the salvage walk drops and
+        // re-emits this block as corrupt rather than applying deletes at wrong
+        // positions.
         let keep: alloc::vec::Vec<bool> = (0..batch.row_count)
-            .map(|i| !self.delete_bitmap.contains(start.wrapping_add(i)))
-            .collect();
+            .map(|i| {
+                let pos = start.checked_add(i).ok_or(crate::Error::InvalidHeader(
+                    "columnar delete position overflow",
+                ))?;
+                Ok(!self.delete_bitmap.contains(pos))
+            })
+            .collect::<crate::Result<_>>()?;
         let masked = crate::table::columnar_predicate::filter_batch(&batch, &keep);
         if masked.row_count == 0 {
             Ok(None)
@@ -598,7 +608,14 @@ impl Table {
                 block.header.block_type.into(),
             )));
         }
-        let verbatim = if recovery.is_none() {
+        // A table whose ECC descriptor this build cannot interpret still reads
+        // cleanly (`EccStatus::Unrecognized`, `recovery.is_none()`), but its raw
+        // bytes carry an opaque parity trailer the salvage writer's mirrored ECC
+        // (`ecc_params = None`) does not account for. A verbatim copy of those
+        // bytes would fail the writer's on-disk-size check and abort the whole
+        // salvage, so force the re-encode path (which emits a trailer-free block
+        // from the decoded payload) for such tables.
+        let verbatim = if recovery.is_none() && !self.metadata.ecc_unrecognized {
             // Clean read: capture the raw on-disk bytes (and inner layout) for a
             // verbatim copy. A second pread of a cold block costs far less than the
             // re-compression the copy avoids.
