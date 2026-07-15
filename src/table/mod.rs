@@ -915,6 +915,11 @@ impl Table {
                 &self.path,
                 &self.file_accessor,
                 &handle,
+                // `BlockType::Data` here is not load-bearing for a columnar SST:
+                // the AAD block-type byte is reconstructed from the on-disk frame
+                // (see `reconstruct_block_aad`), not this argument, and ECC /
+                // checksum verification is header- and params-driven — so the
+                // decrypt + decode succeed regardless of the type passed here.
                 BlockType::Data,
                 self.metadata.data_block_compression,
                 self.encryption.as_deref(),
@@ -936,18 +941,33 @@ impl Table {
                         &transform,
                     ) {
                         Ok(Some((frame, _kind))) => frame,
-                        // The scrub read reported a correction, so heal_frame must
-                        // see the same fault; a None/Err here is an inconsistency —
-                        // surface it rather than silently skip the write-back.
-                        other => {
+                        // The scrub read corrected a fault but the confirming
+                        // re-read is already clean: a TRANSIENT fault the first
+                        // read hit and the re-read did not. This mirrors the
+                        // schedule path (`maybe_record_persistent_heal`), which
+                        // treats a clean confirmation re-read as transient and
+                        // does not act — there is nothing on disk to persist.
+                        Ok(None) => {
+                            log::debug!(
+                                "in-place heal: transient correction on block at offset \
+                                 {block_offset} in table {} at {}; re-read clean, nothing to \
+                                 persist",
+                                self.id(),
+                                self.path.display(),
+                            );
+                            continue;
+                        }
+                        // A real read/decode error on the re-read: surface it
+                        // rather than silently skip the write-back.
+                        Err(e) => {
                             report.uncorrectable_blocks += 1;
                             report.errors.push(ScrubError::UncorrectableBlock {
                                 table_id: self.id(),
                                 path: self.path.to_path_buf(),
                                 block_offset,
                                 reason: alloc::format!(
-                                    "in-place heal: block scrubbed as corrected but heal_frame did \
-                                     not yield a frame: {other:?}"
+                                    "in-place heal: block scrubbed as corrected but the heal \
+                                     re-read failed: {e:?}"
                                 ),
                             });
                             continue;
