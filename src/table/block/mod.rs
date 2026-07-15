@@ -1752,7 +1752,14 @@ impl Block {
             ecc_params,
         )?;
         let Some(kind) = recovery else {
-            // Clean read: nothing to persist.
+            // Clean read: nothing to persist. NOTE this is a FRAME-level clean
+            // (header + payload checksum + trailer verified), not a full decode —
+            // a header-only fault such as a bad `uncompressed_length` is not caught
+            // here. A caller that needs full-integrity detection must pair this
+            // with a decoding read; the in-place heal
+            // (`Table::heal_data_blocks_in_place`) verifies each block via the scrub
+            // read path first and only uses `heal_frame` to fetch the corrected
+            // bytes for a block that read path already flagged as recovered.
             return Ok(None);
         };
         // Recompute the parity over the corrected data so the rewritten frame is
