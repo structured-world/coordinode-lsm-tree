@@ -385,3 +385,75 @@ fn patrol_scrub_heal_in_place_still_checks_a_non_ecc_table() -> crate::Result<()
     assert!(!report.is_ok(), "uncorrectable corruption fails the pass");
     Ok(())
 }
+
+/// A clean encrypted, columnar, Page-ECC SST heals in place with no findings.
+/// Its data blocks are sealed as
+/// [`BlockType::Columnar`](crate::table::block::BlockType::Columnar) and
+/// encrypted through the AAD block path; the heal read must decrypt, decompress,
+/// and verify them without reporting a healthy block as uncorrectable. (The AAD
+/// block-type byte is reconstructed from the on-disk frame, not the caller's
+/// block-type argument, so the heal read decrypts correctly regardless of the
+/// argument — this guards that the whole encrypted-columnar heal path stays
+/// clean.)
+#[cfg(all(feature = "columnar", feature = "encryption", zstd_any))]
+#[test]
+fn heal_in_place_leaves_a_clean_encrypted_columnar_sst_with_no_findings() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let enc: std::sync::Arc<dyn crate::encryption::EncryptionProvider> =
+        std::sync::Arc::new(crate::Aes256GcmProvider::new(&[0x51; 32]));
+    let crate::AnyTree::Standard(tree) = crate::Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .page_ecc(true)
+    .ecc_scheme(EccScheme::ReedSolomon {
+        data_shards: 8,
+        parity_shards: 2,
+    })
+    .with_encryption(Some(enc))
+    .open()
+    .expect("open encrypted ecc tree") else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+    // Columnar layout: the flush transposes the memtable into
+    // `BlockType::Columnar` data blocks (encrypted through the tree's provider).
+    tree.update_runtime_config(|cfg| cfg.columnar = true)?;
+
+    for i in 0u64..2_000 {
+        tree.insert(format!("key-{i:06}"), format!("v{i:06}"), i);
+    }
+    tree.flush_active_memtable(2_000).expect("flush");
+
+    // Precondition: the flush produced an encrypted columnar SST (columnar
+    // layout + ECC parity + an encryption provider), so the heal read exercises
+    // the AAD block path over `BlockType::Columnar` blocks.
+    {
+        let binding = tree.version_history.read().latest_version();
+        let table = binding
+            .version
+            .iter_tables()
+            .next()
+            .expect("flush produced one table");
+        assert!(table.metadata.columnar, "the SST is columnar");
+        assert!(table.metadata.ecc_params.is_some(), "the SST carries ECC");
+        assert!(table.encryption.is_some(), "the SST is encrypted");
+    }
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+
+    assert!(
+        report.blocks_scanned >= 1,
+        "the columnar SST has at least one data block to scrub: {report:?}",
+    );
+    assert_eq!(
+        report.uncorrectable_blocks, 0,
+        "a clean encrypted columnar block must decrypt and verify cleanly, \
+         not be reported uncorrectable: {report:?}",
+    );
+    assert!(
+        report.is_ok(),
+        "a clean encrypted columnar SST heals with no findings: {report:?}",
+    );
+    Ok(())
+}
