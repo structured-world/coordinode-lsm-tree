@@ -413,6 +413,86 @@ fn salvage_reencodes_an_ecc_recovered_block_rather_than_copying_it() -> crate::R
     Ok(())
 }
 
+/// Bit rot confined to a block's PARITY trailer reads as clean (the payload
+/// checksum passes and parity is only consulted on a mismatch), so a verbatim
+/// copy would carry the rotted parity into the salvaged SST as latent ECC
+/// corruption. Salvage must verify the trailer before copying and re-encode
+/// (regenerating fresh parity) when it disagrees: every data block of the
+/// recovered copy must carry parity that matches its payload.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn salvage_regenerates_a_rotted_parity_trailer_rather_than_copying_it() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::table::block::{EccParams, Header, expected_parity_len};
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_data_block_size(256)
+        .use_ecc(Some(EccParams::RS_4_2));
+    let n = 200u32;
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Flip one byte INSIDE the first data block's parity trailer (right after
+    // its `data_length` payload). The payload checksum still verifies, so the
+    // block reads back clean with no ECC recovery.
+    let first_off = {
+        let table = open(source.clone(), &fs)?;
+        let Some(kh) = table.data_block_handles().find_map(Result::ok) else {
+            panic!("a non-empty SST has at least one data block");
+        };
+        usize::try_from(*kh.as_ref().offset()).expect("offset fits usize")
+    };
+    let mut bytes = std::fs::read(&source)?;
+    let header = Header::decode_from(&mut bytes.get(first_off..).expect("block within the file"))?;
+    let trailer_pos =
+        first_off + Header::header_len(header.block_type) + header.data_length as usize;
+    *bytes
+        .get_mut(trailer_pos)
+        .expect("parity trailer within the file") ^= 0xFF;
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert!(
+        report.is_complete(),
+        "the payload is intact, every block is recovered: {report:?}",
+    );
+    assert_eq!(reopen_item_count(dest.clone(), &fs)?, u64::from(n));
+
+    // Every data block of the salvaged copy carries parity that matches its
+    // payload — the rotted trailer was regenerated, not byte-copied.
+    let dest_bytes = std::fs::read(&dest)?;
+    let dest_table = open(dest, &fs)?;
+    let (ds, ps) = EccParams::RS_4_2.as_shards();
+    for kh in dest_table.data_block_handles() {
+        let kh = kh?;
+        let off = usize::try_from(*kh.as_ref().offset()).expect("offset fits usize");
+        let hdr = Header::decode_from(&mut dest_bytes.get(off..).expect("block within the file"))?;
+        let hlen = Header::header_len(hdr.block_type);
+        let dl = hdr.data_length as usize;
+        let payload = dest_bytes
+            .get(off + hlen..off + hlen + dl)
+            .expect("payload within the file");
+        let plen = expected_parity_len(hdr.data_length, EccParams::RS_4_2) as usize;
+        let trailer = dest_bytes
+            .get(off + hlen + dl..off + hlen + dl + plen)
+            .expect("trailer within the file");
+        let fresh = crate::ecc::encode_parity(payload, ds, ps)?;
+        assert_eq!(
+            trailer,
+            fresh.as_slice(),
+            "block at offset {off}: the salvaged copy's parity matches its payload",
+        );
+    }
+    Ok(())
+}
+
 /// A columnar source with one corrupted PAX data block: the columnar loader
 /// fails to reconstruct that block (a torn sub-column frame), so salvage drops
 /// it and recovers every other block, writing the survivors as a plain row SST.
