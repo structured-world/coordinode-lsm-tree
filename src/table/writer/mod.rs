@@ -309,10 +309,20 @@ impl Writer {
         let path = std::path::absolute(path)?;
 
         let file = fs.open(&path, &FsOpenOptions::new().write(true).create_new(true))?;
+        // From here the file exists and is OURS (`create_new` proved it), so
+        // this constructor owns cleanup: an init failure below must not leak a
+        // partial file, and a CALLER must never remove `path` on a constructor
+        // error — an open failure above created nothing, so caller-side
+        // cleanup would race a concurrent creator and delete a file it does
+        // not own.
         let writer = BufWriter::with_capacity(u16::MAX.into(), file);
         let writer = ChecksummedWriter::new(writer);
         let mut writer = crate::sfa::Writer::from_writer(writer);
-        writer.start("data")?;
+        if let Err(e) = writer.start("data") {
+            drop(writer);
+            let _ = fs.remove_file(&path);
+            return Err(e.into());
+        }
 
         Ok(Self {
             fs,

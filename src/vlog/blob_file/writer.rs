@@ -164,10 +164,19 @@ impl Writer {
         let path = path.as_ref();
 
         let file = fs.open(path, &FsOpenOptions::new().write(true).create_new(true))?;
-        let writer = BufWriter::new(file);
-        let writer = ChecksummedWriter::new(writer);
-        let mut writer = crate::sfa::Writer::from_writer(writer);
-        writer.start("data")?;
+        // From here the file exists and is OURS (`create_new` proved it), so
+        // this constructor owns cleanup: an init failure below must not leak a
+        // partial file, and a CALLER must never remove `path` on a constructor
+        // error — an open failure above created nothing, so caller-side
+        // cleanup would race a concurrent creator and delete a file it does
+        // not own.
+        let mut writer =
+            crate::sfa::Writer::from_writer(ChecksummedWriter::new(BufWriter::new(file)));
+        if let Err(e) = writer.start("data") {
+            drop(writer);
+            let _ = fs.remove_file(path);
+            return Err(e.into());
+        }
 
         Ok(Self {
             tree_id,

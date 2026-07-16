@@ -723,23 +723,14 @@ pub fn salvage_blob_file(
     }
 
     let scanner = Scanner::new(source, &**fs, blob_file_id)?;
-    // `BlobWriter::new` creates `dest` (open with `create_new`) before it finishes
-    // initializing the blob's SFA section; a failure in that init returns after the
-    // file exists, so remove the partial `dest` here rather than leaving it for a
-    // retry / repair caller to trip over. But `create_new` itself fails WITHOUT
-    // creating anything when `dest` already exists — cleaning up then would
-    // delete a pre-existing file (turning a stale path collision, or
-    // `source == dest`, into data loss), so only remove what this call created.
-    let dest_existed_before = fs.metadata(&dest).is_ok();
-    let mut writer = match BlobWriter::new(&dest, blob_file_id, 0, &**fs) {
-        Ok(w) => w,
-        Err(e) => {
-            if !dest_existed_before {
-                discard_partial(fs, &dest);
-            }
-            return Err(e);
-        }
-    };
+    // Destination ownership is decided by the writer's `create_new` open, and
+    // the CONSTRUCTOR owns cleanup of any partial file it created: on a
+    // constructor error this call created nothing (or the constructor already
+    // removed it), so no caller-side cleanup — an existence pre-check here
+    // would race a concurrent creator (TOCTOU) and delete a file this salvage
+    // does not own. Later `write` / `finish` failures still clean up below:
+    // by then `create_new` has proven `dest` is ours.
+    let mut writer = BlobWriter::new(&dest, blob_file_id, 0, &**fs)?;
 
     let mut records_total = 0usize;
     let mut records_salvaged = 0usize;
