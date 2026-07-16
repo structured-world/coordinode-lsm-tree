@@ -693,11 +693,17 @@ pub fn salvage_blob_file(
     // `BlobWriter::new` creates `dest` (open with `create_new`) before it finishes
     // initializing the blob's SFA section; a failure in that init returns after the
     // file exists, so remove the partial `dest` here rather than leaving it for a
-    // retry / repair caller to trip over.
+    // retry / repair caller to trip over. But `create_new` itself fails WITHOUT
+    // creating anything when `dest` already exists — cleaning up then would
+    // delete a pre-existing file (turning a stale path collision, or
+    // `source == dest`, into data loss), so only remove what this call created.
+    let dest_existed_before = fs.metadata(&dest).is_ok();
     let mut writer = match BlobWriter::new(&dest, blob_file_id, 0, &**fs) {
         Ok(w) => w,
         Err(e) => {
-            discard_partial(fs, &dest);
+            if !dest_existed_before {
+                discard_partial(fs, &dest);
+            }
             return Err(e);
         }
     };
