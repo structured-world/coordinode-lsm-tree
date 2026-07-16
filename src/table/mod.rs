@@ -614,8 +614,12 @@ impl Table {
         // (`ecc_params = None`) does not account for. A verbatim copy of those
         // bytes would fail the writer's on-disk-size check and abort the whole
         // salvage, so force the re-encode path (which emits a trailer-free block
-        // from the decoded payload) for such tables.
-        let verbatim = if recovery.is_none() && !self.metadata.ecc_unrecognized {
+        // from the decoded payload) for such tables. The same applies to a
+        // RECOGNIZED scheme on a build without `page_ecc`: the salvage writer
+        // mirrors ECC as `None` there (it cannot emit parity), so raw bytes
+        // with a trailer must be re-encoded trailer-free, not byte-copied.
+        let ecc_verbatim_ok = cfg!(feature = "page_ecc") || self.metadata.ecc_params.is_none();
+        let verbatim = if recovery.is_none() && !self.metadata.ecc_unrecognized && ecc_verbatim_ok {
             // Clean read: capture the raw on-disk bytes (and inner layout) for a
             // verbatim copy. A second pread of a cold block costs far less than the
             // re-compression the copy avoids.

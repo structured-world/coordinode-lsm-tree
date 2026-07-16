@@ -651,10 +651,22 @@ impl Writer {
     /// like the individual `use_*` setters it delegates to.
     #[must_use]
     pub(crate) fn mirror_from(self, meta: &crate::table::meta::ParsedMeta) -> Self {
+        // Mirror ECC only when this build can actually emit parity. Without the
+        // `page_ecc` feature `with_ecc()` is the identity (no trailer is ever
+        // written), but a `Some` here would still size every registered block
+        // handle with phantom parity bytes (`on_disk_size_with`), so the
+        // re-emitted table would reopen with handles that over-read into the
+        // following blocks. Matches the metadata writer's effective-ECC logic,
+        // which likewise resolves to "off" on such builds.
+        let effective_ecc = if cfg!(feature = "page_ecc") {
+            meta.ecc_params
+        } else {
+            None
+        };
         let writer = self
             .use_data_block_compression(meta.data_block_compression)
             .use_index_block_compression(meta.index_block_compression)
-            .use_ecc(meta.ecc_params)
+            .use_ecc(effective_ecc)
             .use_data_block_restart_interval(meta.data_block_restart_interval)
             // A columnar source re-emits as columnar (the writer transposes the
             // recovered rows back into PAX blocks) and regenerates the zone map,
