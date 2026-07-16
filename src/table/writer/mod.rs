@@ -1332,9 +1332,12 @@ impl Writer {
         // Bulk columnar ingest (`require_zero_seqno`) is a load of strictly-unique,
         // ascending keys. The verbatim salvage re-emit path (`require_zero_seqno ==
         // false`) can carry repeated user keys across MVCC versions of one key, so
-        // it must NOT enforce strict uniqueness — only that the block is validly
-        // ordered, which `account_direct_block` already trusts. Check within the
-        // batch and against the writer's prior key before any state mutation.
+        // it must NOT enforce strict uniqueness — but the block must still be in
+        // valid INTERNAL-key order (`account_direct_block` trusts it): salvage
+        // feeds this path with entries decoded from an untrusted block, and an
+        // unvalidated out-of-order block would register a wrong last-key in the
+        // index. Check within the batch and against the writer's prior key before
+        // any state mutation.
         if require_zero_seqno {
             let mut prev = self.current_key.as_ref();
             for e in &entries {
@@ -1348,6 +1351,8 @@ impl Writer {
                 }
                 prev = Some(&e.key.user_key);
             }
+        } else {
+            self.validate_direct_block_order(&entries, comparator)?;
         }
         let Some(inputs) = self.account_direct_block(&entries)? else {
             return Ok(None); // empty batch: no block
@@ -1612,13 +1617,15 @@ impl Writer {
     /// # Errors
     ///
     /// Returns an error if `raw`'s length disagrees with the header's on-disk size
-    /// under this writer's ECC scheme, or the write fails.
+    /// under this writer's ECC scheme, if the entries are out of internal-key
+    /// order ([`Self::validate_direct_block_order`]), or the write fails.
     pub(crate) fn append_verbatim_data_block(
         &mut self,
         raw: &[u8],
         header: crate::table::block::Header,
         layout: alloc::vec::Vec<u32>,
         entries: &[InternalValue],
+        comparator: &crate::SharedComparator,
     ) -> crate::Result<Option<crate::UserKey>> {
         // The copied bytes ARE the block; their length must equal what the index
         // entry will record (`register_written_block` sizes the handle and advances
@@ -1631,6 +1638,10 @@ impl Writer {
                 "verbatim block copy: raw length disagrees with the header on-disk size",
             ));
         }
+        // The entries come from an UNTRUSTED (possibly tampered,
+        // checksum-repatched) block; `account_direct_block` trusts their order,
+        // so validate it before any state mutation.
+        self.validate_direct_block_order(entries, comparator)?;
         let Some(inputs) = self.account_direct_block(entries)? else {
             return Ok(None);
         };
@@ -1656,6 +1667,41 @@ impl Writer {
             self.locator_block_id += 1;
         }
         Ok(Some(inputs.last_key))
+    }
+
+    /// Validates a direct (verbatim / re-emitted) block's entries against the
+    /// internal-key ordering invariant BEFORE any writer state mutates: user
+    /// keys non-decreasing (duplicate user keys are MVCC versions and are
+    /// allowed, unlike bulk ingest), equal user keys carry strictly decreasing
+    /// seqnos, and the block must not sort before the previously written key.
+    /// The salvage walk feeds these paths with entries decoded from untrusted
+    /// (possibly tampered, checksum-repatched) blocks; emitting an out-of-order
+    /// block would register a wrong last-key in the index and corrupt binary
+    /// search / scan order in the recovered SST. `pub(crate)` so the salvage
+    /// walk can also pre-validate its row-by-row re-emit path.
+    pub(crate) fn validate_direct_block_order(
+        &self,
+        entries: &[InternalValue],
+        comparator: &crate::SharedComparator,
+    ) -> crate::Result<()> {
+        let err = || crate::Error::InvalidHeader("direct block entries out of internal-key order");
+        if let (Some(prev), Some(first)) = (self.current_key.as_ref(), entries.first())
+            && comparator.compare(prev.as_ref(), first.key.user_key.as_ref())
+                == core::cmp::Ordering::Greater
+        {
+            return Err(err());
+        }
+        for pair in entries.windows(2) {
+            let (Some(a), Some(b)) = (pair.first(), pair.get(1)) else {
+                continue;
+            };
+            match comparator.compare(a.key.user_key.as_ref(), b.key.user_key.as_ref()) {
+                core::cmp::Ordering::Less => {}
+                core::cmp::Ordering::Equal if a.key.seqno > b.key.seqno => {}
+                _ => return Err(err()),
+            }
+        }
+        Ok(())
     }
 
     /// Builds the parallel compressor on first use, capturing the now-finalized

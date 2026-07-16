@@ -497,9 +497,27 @@ fn salvage_blocks(
                 match table.load_columnar_block_masked(keyed.as_ref()) {
                     Ok(Some(batch)) => {
                         let rows = u64::from(batch.row_count);
-                        writer.write_columnar_block_verbatim(&batch, comparator)?;
-                        entries_salvaged += rows;
-                        blocks_salvaged += 1;
+                        // A writer REJECTION (ordering / framing validation,
+                        // `InvalidHeader` / `InvalidTag`) is block-local
+                        // malformed content — drop the block and keep walking;
+                        // destination I/O errors stay hard.
+                        match writer.write_columnar_block_verbatim(&batch, comparator) {
+                            Ok(_) => {
+                                entries_salvaged += rows;
+                                blocks_salvaged += 1;
+                            }
+                            Err(
+                                e @ (crate::Error::InvalidHeader(_) | crate::Error::InvalidTag(_)),
+                            ) => {
+                                dropped.push(classify_drop(
+                                    &e,
+                                    offset,
+                                    prev_end.as_ref(),
+                                    &end_key,
+                                ));
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
                     // Wholly-deleted block: nothing to recover, nothing lost.
                     Ok(None) => {}
@@ -523,22 +541,43 @@ fn salvage_blocks(
                         }) {
                         Ok((batch, entries)) => {
                             let rows = u64::from(batch.row_count);
-                            match sb.verbatim {
+                            // A writer REJECTION (ordering / framing validation)
+                            // is block-local malformed content — drop the block
+                            // and keep walking; destination I/O errors stay hard.
+                            let emitted = match sb.verbatim {
                                 // Clean: copy the block's raw bytes as-is.
-                                Some((raw, header, layout)) => {
-                                    writer.append_verbatim_data_block(
-                                        &raw, header, layout, &entries,
-                                    )?;
-                                    blocks_copied_verbatim += 1;
-                                }
+                                Some((raw, header, layout)) => writer
+                                    .append_verbatim_data_block(
+                                        &raw, header, layout, &entries, comparator,
+                                    )
+                                    .map(|_| true),
                                 // ECC-recovered: re-encode the healed batch so the
                                 // recovered copy carries clean on-disk bytes.
-                                None => {
-                                    writer.write_columnar_block_verbatim(&batch, comparator)?;
+                                None => writer
+                                    .write_columnar_block_verbatim(&batch, comparator)
+                                    .map(|_| false),
+                            };
+                            match emitted {
+                                Ok(verbatim) => {
+                                    if verbatim {
+                                        blocks_copied_verbatim += 1;
+                                    }
+                                    entries_salvaged += rows;
+                                    blocks_salvaged += 1;
                                 }
+                                Err(
+                                    e @ (crate::Error::InvalidHeader(_)
+                                    | crate::Error::InvalidTag(_)),
+                                ) => {
+                                    dropped.push(classify_drop(
+                                        &e,
+                                        offset,
+                                        prev_end.as_ref(),
+                                        &end_key,
+                                    ));
+                                }
+                                Err(e) => return Err(e),
                             }
-                            entries_salvaged += rows;
-                            blocks_salvaged += 1;
                         }
                         Err(e) => {
                             dropped.push(classify_drop(&e, offset, prev_end.as_ref(), &end_key));
@@ -567,21 +606,49 @@ fn salvage_blocks(
                             let entries: Vec<crate::InternalValue> =
                                 iter.map(|p| p.materialize(data_block.as_slice())).collect();
                             let count = entries.len() as u64;
-                            match sb.verbatim {
-                                Some((raw, header, layout)) => {
-                                    writer.append_verbatim_data_block(
-                                        &raw, header, layout, &entries,
-                                    )?;
-                                    blocks_copied_verbatim += 1;
-                                }
-                                None => {
-                                    for e in entries {
-                                        writer.write(e)?;
+                            // Ordering guard for BOTH emit paths: the verbatim
+                            // append validates internally, but the row-by-row
+                            // re-emit (`writer.write`) trusts its input, so a
+                            // tampered checksum-repatched block must be caught
+                            // here. A validation rejection is block-local
+                            // malformed content — drop the block and keep
+                            // walking; destination I/O errors stay hard.
+                            let emitted = writer
+                                .validate_direct_block_order(&entries, comparator)
+                                .and_then(|()| match sb.verbatim {
+                                    Some((raw, header, layout)) => writer
+                                        .append_verbatim_data_block(
+                                            &raw, header, layout, &entries, comparator,
+                                        )
+                                        .map(|_| true),
+                                    None => {
+                                        for e in entries {
+                                            writer.write(e)?;
+                                        }
+                                        Ok(false)
                                     }
+                                });
+                            match emitted {
+                                Ok(verbatim) => {
+                                    if verbatim {
+                                        blocks_copied_verbatim += 1;
+                                    }
+                                    entries_salvaged += count;
+                                    blocks_salvaged += 1;
                                 }
+                                Err(
+                                    e @ (crate::Error::InvalidHeader(_)
+                                    | crate::Error::InvalidTag(_)),
+                                ) => {
+                                    dropped.push(classify_drop(
+                                        &e,
+                                        offset,
+                                        prev_end.as_ref(),
+                                        &end_key,
+                                    ));
+                                }
+                                Err(e) => return Err(e),
                             }
-                            entries_salvaged += count;
-                            blocks_salvaged += 1;
                         }
                         Err(e) => dropped.push(DroppedBlock {
                             offset,
