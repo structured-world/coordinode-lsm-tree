@@ -615,13 +615,14 @@ fn salvage_blocks(
                             // walking; destination I/O errors stay hard.
                             let emitted = writer
                                 .validate_direct_block_order(&entries, comparator)
-                                .and_then(|()| match sb.verbatim {
-                                    Some((raw, header, layout)) => writer
-                                        .append_verbatim_data_block(
-                                            &raw, header, layout, &entries, comparator,
-                                        )
-                                        .map(|_| true),
-                                    None => {
+                                .and_then(|()| {
+                                    if let Some((raw, header, layout)) = sb.verbatim {
+                                        writer
+                                            .append_verbatim_data_block(
+                                                &raw, header, layout, &entries, comparator,
+                                            )
+                                            .map(|_| true)
+                                    } else {
                                         for e in entries {
                                             writer.write(e)?;
                                         }
