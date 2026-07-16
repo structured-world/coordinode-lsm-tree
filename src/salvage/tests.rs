@@ -490,6 +490,115 @@ fn salvage_drops_a_corrupted_columnar_block_and_keeps_the_rest() -> crate::Resul
     Ok(())
 }
 
+/// A columnar block whose outer `ColumnBatch` frame decodes but whose row
+/// materialization fails (an invalid value-type byte in an otherwise
+/// checksum-consistent block) is dropped like any other block-local decode
+/// failure — one malformed block must not abort the whole salvage and discard
+/// the destination while later blocks are still recoverable.
+#[cfg(feature = "columnar")]
+#[test]
+fn salvage_drops_a_columnar_block_with_an_invalid_value_type() -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::table::block::Header;
+    use crate::table::columnar::{CodecId, ColumnBatch};
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let n = 200u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_data_block_size(256);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar SST is non-empty"
+    );
+
+    // Poison the SECOND data block: decode its ColumnBatch, stamp an invalid
+    // value-type tag into the first row, re-encode under the writer's Plain
+    // codec (byte-identical framing => same length), and re-stamp the header
+    // checksum. The block stays checksum-consistent, so the failure surfaces
+    // in row materialization — not as an ordinary checksum drop.
+    let (block_off, block_size) = {
+        let table = open(source.clone(), &fs)?;
+        let Some(kh) = table.data_block_handles().filter_map(Result::ok).nth(1) else {
+            panic!("source must have at least two data blocks");
+        };
+        (
+            usize::try_from(*kh.as_ref().offset()).expect("offset fits usize"),
+            kh.as_ref().size() as usize,
+        )
+    };
+    let mut bytes = std::fs::read(&source)?;
+    let block = bytes
+        .get(block_off..block_off + block_size)
+        .expect("block range within the file");
+    let header = Header::decode_from(&mut &block[..])?;
+    let header_len = Header::header_len(header.block_type);
+    let payload = block
+        .get(header_len..header_len + header.data_length as usize)
+        .expect("payload range within the block");
+    let mut batch = ColumnBatch::decode(payload)?;
+    let poisoned_rows = u64::from(batch.row_count);
+    // Columns are ordered (key, seqno, value-type, values...); 0xFF is not a
+    // defined ValueType tag.
+    *batch
+        .columns
+        .get_mut(2)
+        .expect("value-type column present")
+        .data
+        .get_mut(0)
+        .expect("value-type column non-empty") = 0xFF;
+    let new_payload = batch.encode(CodecId::Plain)?;
+    assert_eq!(
+        new_payload.len(),
+        payload.len(),
+        "a one-byte in-place mutation re-encodes to the same length",
+    );
+    let new_header = Header {
+        checksum: crate::Checksum::from_raw(crate::hash::hash128(&new_payload)),
+        ..header
+    };
+    let mut new_block = Vec::with_capacity(header_len + new_payload.len());
+    new_header.encode_into(&mut new_block)?;
+    assert_eq!(
+        new_block.len(),
+        header_len,
+        "header re-encodes to its length"
+    );
+    new_block.extend_from_slice(&new_payload);
+    bytes
+        .get_mut(block_off..block_off + new_block.len())
+        .expect("block range within the file")
+        .copy_from_slice(&new_block);
+    std::fs::write(&source, &bytes)?;
+
+    // Salvage drops exactly the poisoned block and recovers every other one.
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert_eq!(
+        report.dropped.len(),
+        1,
+        "exactly the poisoned block is dropped: {report:?}",
+    );
+    assert!(
+        matches!(report.dropped[0].reason, DropReason::DecodeError(_)),
+        "the invalid value-type tag classifies as a decode error: {report:?}",
+    );
+    assert_eq!(
+        report.entries_salvaged,
+        u64::from(n) - poisoned_rows,
+        "every row outside the poisoned block is recovered",
+    );
+    assert_eq!(reopen_item_count(dest, &fs)?, u64::from(n) - poisoned_rows);
+    Ok(())
+}
+
 /// A columnar source carrying deletes whose `delete_bitmap` section is
 /// corrupted (data blocks intact): normal recovery refuses to open it (opening
 /// would resurrect deleted rows), but salvage degrades to "all rows live" and
