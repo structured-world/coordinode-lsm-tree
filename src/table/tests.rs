@@ -3024,14 +3024,17 @@ fn heal_data_blocks_in_place_is_a_noop_on_a_non_ecc_sst() -> crate::Result<()> {
     Ok(())
 }
 
-/// If the read+write handle for the heal cannot even be opened (a failing `Fs`),
-/// the heal records an error finding and scans nothing rather than panicking.
+/// If the read+write handle for the heal cannot even be opened (a read-only
+/// replica, restrictive permissions, a failing `Fs`), the pass must NOT return
+/// a silent healthy report with zero blocks scanned: it records the failed
+/// open AND falls back to the read-only scrub, so the table's integrity is
+/// still checked and real corruption still surfaces.
 #[cfg(feature = "page_ecc")]
 #[test]
 fn heal_data_blocks_in_place_reports_when_the_file_cannot_be_opened() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
     use crate::io::ErrorKind;
-    use crate::table::block::EccParams;
+    use crate::table::block::{EccParams, Header};
 
     let dir = tempdir()?;
     let file = dir.path().join("table");
@@ -3042,24 +3045,50 @@ fn heal_data_blocks_in_place_reports_when_the_file_cannot_be_opened() -> crate::
     let checksum = build_ecc_sst_for_heal(&file, Arc::clone(&fs), EccParams::RS_4_2, 200);
     let table = recover_table_on(&file, checksum, Arc::clone(&fs));
 
-    // Fail opens from here on: the heal's read+write open cannot be created.
-    injector.arm(FaultRule::new(
-        FaultOp::Open,
-        Fault::Error(ErrorKind::Other),
-    ));
+    // Wreck the first data block's whole payload (header intact, far beyond
+    // the RS(4,2) budget) so the read-only fallback has real corruption to
+    // find and report.
+    {
+        use crate::table::block_index::BlockIndex as _;
+        let Some(keyed) = table.block_index.iter().find_map(Result::ok) else {
+            panic!("the SST has at least one data block");
+        };
+        let base = usize::try_from(keyed.offset().0).unwrap_or(usize::MAX);
+        let mut bytes = std::fs::read(&file)?;
+        let Some(payload) = bytes.get_mut(base + Header::MIN_LEN..base + keyed.size() as usize)
+        else {
+            panic!("block payload range within the file");
+        };
+        for b in payload {
+            *b ^= 0xFF;
+        }
+        std::fs::write(&file, &bytes)?;
+    }
+
+    // Fail exactly the heal's read+write open (the first open after arming);
+    // the read-only fallback may reopen freely afterwards.
+    injector.arm(FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other)).once());
 
     let report = table.heal_data_blocks_in_place();
-    assert_eq!(
-        report.blocks_scanned, 0,
-        "the walk never started: {report:?}",
+    assert!(
+        report.blocks_scanned >= 1,
+        "the read-only fallback still scans the table: {report:?}",
     );
-    assert_eq!(report.blocks_healed_in_place, 0, "{report:?}");
+    assert_eq!(
+        report.blocks_healed_in_place, 0,
+        "nothing is healed without a writable file: {report:?}",
+    );
+    assert!(
+        report.uncorrectable_blocks >= 1,
+        "the fallback scrub reports the seeded corruption: {report:?}",
+    );
+    assert!(!report.is_ok(), "corruption fails the pass: {report:?}");
     assert!(
         report
             .errors
             .iter()
             .any(|e| matches!(e, crate::scrub::ScrubError::BlockIndexUnreadable { .. })),
-        "a failed open is reported: {report:?}",
+        "the failed read+write open is still reported: {report:?}",
     );
     Ok(())
 }
