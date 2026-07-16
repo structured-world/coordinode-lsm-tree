@@ -485,14 +485,23 @@ fn salvage_blocks(
                 match table
                     .salvage_load_block(keyed.as_ref(), crate::table::block::BlockType::Columnar)
                 {
-                    Ok(sb) => match crate::table::columnar::ColumnBatch::decode(&sb.block.data) {
-                        Ok(batch) => {
+                    // Row materialization validates the batch content (framing,
+                    // value-type tags, key invariants) beyond the outer frame
+                    // decode. A checksum-consistent block that fails EITHER step
+                    // is malformed content — drop this one block and keep
+                    // walking, exactly like a row-major block whose entries fail
+                    // to decode. Only writer errors (I/O to the destination)
+                    // stay hard errors.
+                    Ok(sb) => match crate::table::columnar::ColumnBatch::decode(&sb.block.data)
+                        .and_then(|batch| {
+                            crate::table::columnar::column_batch_to_entries(&batch)
+                                .map(|entries| (batch, entries))
+                        }) {
+                        Ok((batch, entries)) => {
                             let rows = u64::from(batch.row_count);
                             match sb.verbatim {
                                 // Clean: copy the block's raw bytes as-is.
                                 Some((raw, header, layout)) => {
-                                    let entries =
-                                        crate::table::columnar::column_batch_to_entries(&batch)?;
                                     writer.append_verbatim_data_block(
                                         &raw, header, layout, &entries,
                                     )?;
