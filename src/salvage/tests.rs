@@ -687,6 +687,131 @@ fn salvage_drops_a_columnar_block_with_an_invalid_value_type() -> crate::Result<
     Ok(())
 }
 
+/// By default salvage FAILS CLOSED on a delete-bearing SST whose delete
+/// bitmap is unreadable: recovering "all rows live" would resurrect
+/// positionally-deleted rows, so that degradation requires the caller's
+/// explicit [`SalvageOptions::allow_delete_resurrection`] opt-in. No
+/// destination file is left behind.
+#[cfg(feature = "columnar")]
+#[test]
+fn salvage_fails_closed_on_a_corrupt_delete_bitmap_by_default() -> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let n = 200u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_data_block_size(256)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    for pos in [5u32, 50, 150] {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    // Corrupt the `delete_bitmap` SFA section (data blocks stay intact).
+    let (db_pos, db_len) = {
+        let mut f = std::fs::File::open(&source)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"delete_bitmap") else {
+            panic!("source must carry a delete_bitmap section");
+        };
+        (entry.pos(), entry.len())
+    };
+    let flip = usize::try_from(db_pos + db_len / 2).unwrap_or(0);
+    let mut bytes = std::fs::read(&source)?;
+    if let Some(b) = bytes.get_mut(flip) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&source, &bytes)?;
+
+    let result = salvage_sst(&source, dest.clone(), &fs);
+    assert!(
+        result.is_err(),
+        "default salvage refuses to resurrect deleted rows: {result:?}",
+    );
+    assert!(
+        fs.metadata(&dest).is_err(),
+        "no destination file is left behind by the refused salvage",
+    );
+    Ok(())
+}
+
+/// Same fail-closed default for the other degradation: a READABLE delete
+/// bitmap whose positioning zone map is corrupt cannot be applied, so the
+/// default salvage refuses rather than recovering all rows live.
+#[cfg(feature = "columnar")]
+#[test]
+fn salvage_fails_closed_on_an_unpositionable_delete_bitmap_by_default() -> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let n = 200u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_data_block_size(256)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    for pos in [5u32, 50, 150] {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    // Corrupt the `zone_map` section (the bitmap stays readable but can no
+    // longer be positioned).
+    let (zm_pos, zm_len) = {
+        let mut f = std::fs::File::open(&source)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"zone_map") else {
+            panic!("source must carry a zone_map section");
+        };
+        (entry.pos(), entry.len())
+    };
+    let flip = usize::try_from(zm_pos + zm_len / 2).unwrap_or(0);
+    let mut bytes = std::fs::read(&source)?;
+    if let Some(b) = bytes.get_mut(flip) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&source, &bytes)?;
+
+    let result = salvage_sst(&source, dest.clone(), &fs);
+    assert!(
+        result.is_err(),
+        "default salvage refuses to resurrect deleted rows: {result:?}",
+    );
+    assert!(
+        fs.metadata(&dest).is_err(),
+        "no destination file is left behind by the refused salvage",
+    );
+    Ok(())
+}
+
 /// A columnar source carrying deletes whose `delete_bitmap` section is
 /// corrupted (data blocks intact): normal recovery refuses to open it (opening
 /// would resurrect deleted rows), but salvage degrades to "all rows live" and
