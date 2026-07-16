@@ -1594,6 +1594,47 @@ fn salvage_blob_file_recovers_every_record_of_a_healthy_file() -> crate::Result<
     Ok(())
 }
 
+/// The TOCTOU variant of the pre-existing-destination guarantee: a file that
+/// appears at `dest` AFTER any existence probe but BEFORE the writer's
+/// `create_new` open (a concurrent worker winning the destination) must also
+/// survive the failed salvage. Ownership is decided by `create_new` alone —
+/// when it fails, this call created nothing and must remove nothing. The
+/// injected `Metadata` fault materializes the race window deterministically:
+/// the probe cannot see the file, yet `create_new` finds it.
+#[test]
+fn salvage_blob_file_keeps_a_racing_dest_created_after_the_existence_probe() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("blob_source");
+    let dest = dir.path().join("blob_dest");
+    let plain: Arc<dyn Fs> = Arc::new(StdFs);
+    build_blob(&source, &plain, &[(b"k0", b"v0")])?;
+
+    // The "racing" worker's file is already at dest, but any metadata probe of
+    // dest fails — exactly the window where the file lands between a stat and
+    // the `create_new` open.
+    std::fs::write(&dest, b"racing worker's blob")?;
+    let fault = FaultFs::new(StdFs);
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Metadata, Fault::Error(ErrorKind::NotFound)).on_path("blob_dest"),
+    );
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    let result = salvage_blob_file(&source, dest.clone(), &fs, 0);
+    assert!(
+        result.is_err(),
+        "the destination is taken, the salvage fails: {result:?}",
+    );
+    assert_eq!(
+        std::fs::read(&dest)?,
+        b"racing worker's blob",
+        "the racing worker's file survives the failed salvage",
+    );
+    Ok(())
+}
+
 /// `salvage_blob_file` must not delete a pre-existing file at `dest` when the
 /// destination cannot be created (the writer's `create_new` open fails because
 /// the path already exists): the error-path cleanup is only for a partial file

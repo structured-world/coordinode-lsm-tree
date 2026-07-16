@@ -84,6 +84,10 @@ pub enum FaultOp {
     SyncData,
     /// [`FsFile::set_len`] — truncate / extend.
     SetLen,
+    /// [`Fs::metadata`] — path metadata probe (existence / size). Failing it
+    /// models a stat that races file creation or an inaccessible path, e.g. to
+    /// exercise TOCTOU windows between an existence check and an open.
+    Metadata,
 }
 
 /// What a matched [`FaultRule`] does to the operation.
@@ -338,6 +342,9 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
+        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::Metadata, Some(path)) {
+            return Err(fault_error(kind, FaultOp::Metadata));
+        }
         self.inner.metadata(path)
     }
 
