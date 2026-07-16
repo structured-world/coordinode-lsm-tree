@@ -1256,6 +1256,35 @@ fn salvage_blob_file_recovers_every_record_of_a_healthy_file() -> crate::Result<
     Ok(())
 }
 
+/// `salvage_blob_file` must not delete a pre-existing file at `dest` when the
+/// destination cannot be created (the writer's `create_new` open fails because
+/// the path already exists): the error-path cleanup is only for a partial file
+/// THIS call created. Deleting a pre-existing destination would turn an
+/// argument mistake (a stale path collision, or `source == dest`) into data
+/// loss.
+#[test]
+fn salvage_blob_file_keeps_a_preexisting_dest_on_open_failure() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("blob_source");
+    let dest = dir.path().join("blob_dest");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    build_blob(&source, &fs, &[(b"k0", b"v0")])?;
+    std::fs::write(&dest, b"pre-existing destination bytes")?;
+
+    let result = salvage_blob_file(&source, dest.clone(), &fs, 0);
+    assert!(
+        result.is_err(),
+        "an already-existing destination fails the salvage: {result:?}",
+    );
+    assert_eq!(
+        std::fs::read(&dest)?,
+        b"pre-existing destination bytes",
+        "a pre-existing destination file survives the failed salvage",
+    );
+    Ok(())
+}
+
 /// When a record write to the destination fails mid-salvage, `salvage_blob_file`
 /// must error AND remove the partial destination it created, so a retry / repair
 /// caller never finds a half-written blob file.
