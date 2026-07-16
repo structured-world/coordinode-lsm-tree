@@ -124,8 +124,10 @@ impl PatrolScrubReport {
         self.uncorrectable_blocks == 0
     }
 
-    /// Folds a per-SST partial report into this accumulator.
-    fn merge(&mut self, other: Self) {
+    /// Folds a per-SST partial report into this accumulator. `pub(crate)` for
+    /// the heal path's read-only fallback (it folds a scrub report into the
+    /// heal report when the file cannot be opened read+write).
+    pub(crate) fn merge(&mut self, other: Self) {
         self.sst_files_scanned += other.sst_files_scanned;
         self.blocks_scanned += other.blocks_scanned;
         self.corrections_applied += other.corrections_applied;

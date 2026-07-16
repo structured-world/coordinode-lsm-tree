@@ -922,11 +922,19 @@ impl Table {
         {
             Ok(f) => f,
             Err(e) => {
+                // Cannot persist corrections (a read-only replica, restrictive
+                // permissions) — but the table must still get its integrity
+                // CHECKED. Record the failed open, then fall back to the
+                // read-only scrub so corruption still surfaces instead of
+                // returning a healthy-looking report with zero blocks scanned.
                 report.errors.push(ScrubError::BlockIndexUnreadable {
                     table_id: self.id(),
                     path: self.path.to_path_buf(),
                     reason: alloc::format!("open read+write for heal: {e}"),
                 });
+                report.merge(self.scrub_data_blocks());
+                // Both passes stamped this SST as scanned; it is one file.
+                report.sst_files_scanned = 1;
                 return report;
             }
         };
