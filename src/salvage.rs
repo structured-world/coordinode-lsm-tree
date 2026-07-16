@@ -49,6 +49,14 @@ pub struct SalvageOptions {
     /// defaults to `0` for the standalone API (matching an unencrypted or
     /// id-`0` source).
     pub table_id: crate::TableId,
+    /// Opt-in to salvaging a delete-bearing columnar SST whose positional
+    /// delete bitmap cannot be applied (the bitmap section is unreadable, or a
+    /// readable bitmap's positioning zone map is unreadable). The degraded
+    /// recovery emits EVERY row live — positionally-deleted rows are
+    /// resurrected in the salvaged copy. `false` (the default) fails such a
+    /// salvage closed instead, preserving delete semantics at the cost of
+    /// recovering nothing from that SST.
+    pub allow_delete_resurrection: bool,
 }
 
 /// Why a block could not be salvaged and had to be dropped.
@@ -163,12 +171,15 @@ impl SalvageReport {
 /// compression, ECC, restart interval, columnar layout with a regenerated zone
 /// map, per-KV checksum footers). A columnar source is recovered as columnar:
 /// the recovered rows are transposed back into PAX blocks, so the copy keeps the
-/// columnar layout and its zone map (a corrupt delete-bitmap is applied on read
-/// in salvage mode, so the surviving rows are already post-delete and the copy
-/// needs no delete-bitmap). Per-field value sub-columns collapse to a single
-/// value column in this row round-trip; preserving them verbatim is a separate
-/// step. The source is opened in salvage mode, so a corrupt delete-bitmap / zone
-/// map degrades gracefully rather than failing the open.
+/// columnar layout and its zone map (a readable delete-bitmap is applied on
+/// read, so the surviving rows are already post-delete and the copy needs no
+/// delete-bitmap). Per-field value sub-columns collapse to a single value
+/// column in this row round-trip; preserving them verbatim is a separate step.
+/// When the delete bitmap CANNOT be applied (an unreadable bitmap section, or a
+/// readable bitmap whose positioning zone map is unreadable), the salvage fails
+/// closed by default — recovering "all rows live" would resurrect
+/// positionally-deleted rows — unless the caller opts in via
+/// [`SalvageOptions::allow_delete_resurrection`].
 ///
 /// The positional walk re-emits only point entries, so an SST that carries
 /// range tombstones cannot be salvaged without dropping them (which would let
@@ -185,9 +196,11 @@ impl SalvageReport {
 ///
 /// Returns an error when `source` cannot be opened at all (its metadata, index,
 /// or SFA trailer is unreadable), when it carries range tombstones (salvage
-/// fails closed rather than dropping them), or when writing `dest` fails.
-/// Per-block corruption is not an error: such blocks are dropped and listed in
-/// the returned [`SalvageReport`].
+/// fails closed rather than dropping them), when its positional delete bitmap
+/// cannot be applied (fails closed rather than resurrecting deleted rows; see
+/// [`SalvageOptions::allow_delete_resurrection`]), or when writing `dest`
+/// fails. Per-block corruption is not an error: such blocks are dropped and
+/// listed in the returned [`SalvageReport`].
 ///
 /// # Examples
 ///
@@ -302,6 +315,17 @@ pub(crate) fn salvage_with_context(
     if !table.range_tombstones().is_empty() {
         return Err(crate::Error::FeatureUnsupported(
             "salvage of an SST with range tombstones",
+        ));
+    }
+
+    // Fail closed when the salvage-mode open degraded delete masking (the
+    // delete bitmap was unreadable, or readable but unpositionable): emitting
+    // "all rows live" resurrects positionally-deleted rows, which the caller
+    // must explicitly opt into via `allow_delete_resurrection`.
+    if table.delete_bitmap_degraded && !options.allow_delete_resurrection {
+        return Err(crate::Error::InvalidHeader(
+            "salvage: the delete bitmap cannot be applied; recovering would resurrect deleted \
+             rows (opt in with allow_delete_resurrection)",
         ));
     }
 

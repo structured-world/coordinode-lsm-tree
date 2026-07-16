@@ -190,6 +190,11 @@ fn try_salvage_table(
             // The real table id, so encrypted block AAD (which binds it) decrypts
             // and the recovered copy reopens under the same id below.
             table_id,
+            // Automated repair never silently resurrects deleted rows: a
+            // delete-bearing SST whose bitmap cannot be applied fails salvage
+            // (the corrupt original stays in quarantine). An operator who
+            // accepts the degradation salvages it explicitly via the opt-in.
+            allow_delete_resurrection: false,
         },
     )?;
     if report.salvaged_path.is_none() {

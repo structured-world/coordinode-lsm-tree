@@ -255,8 +255,12 @@ inspection, or rollback to a known-good point.
   fully-valid file, quarantine the corrupt ones, and report the key range each
   dropped, so one bad block costs only its own keys instead of the whole file. A
   columnar segment with a damaged sidecar degrades conservatively: a torn
-  sub-column drops just its block, and a corrupt delete-bitmap reads as "all rows
-  live, pending recompaction" rather than failing the open.
+  sub-column drops just its block. A delete-bearing segment whose positional
+  delete bitmap cannot be applied (unreadable bitmap, or a bitmap whose
+  positioning zone map is unreadable) fails the salvage closed by default —
+  recovering "all rows live" would resurrect deleted rows — unless explicitly
+  opted in (`SalvageOptions::allow_delete_resurrection`, `sst-dump salvage
+  --allow-delete-resurrection`).
 - **`Config::repair_with_salvage(true)`** (also `tools/sst-dump repair
   --salvage`): the manifest rebuild above, but an SST that fails verification is
   block-salvaged in place instead of being left out, and

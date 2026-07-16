@@ -1,7 +1,7 @@
 use super::{BlobDropReason, DropReason, salvage_blob_file, salvage_sst};
-// The options-bearing entry is exercised only by the encrypted / dictionary
-// salvage tests, which are themselves feature-gated.
-#[cfg(any(feature = "encryption", zstd_any))]
+// The options-bearing entry is exercised only by the encrypted / dictionary /
+// delete-resurrection salvage tests, which are themselves feature-gated.
+#[cfg(any(feature = "encryption", feature = "columnar", zstd_any))]
 use super::{SalvageOptions, salvage_sst_with_options};
 use crate::comparator::default_comparator;
 use crate::fs::{Fs, StdFs};
@@ -814,8 +814,9 @@ fn salvage_fails_closed_on_an_unpositionable_delete_bitmap_by_default() -> crate
 
 /// A columnar source carrying deletes whose `delete_bitmap` section is
 /// corrupted (data blocks intact): normal recovery refuses to open it (opening
-/// would resurrect deleted rows), but salvage degrades to "all rows live" and
-/// recovers every block.
+/// would resurrect deleted rows) and default salvage fails closed, but a
+/// caller who explicitly opts into [`SalvageOptions::allow_delete_resurrection`]
+/// degrades to "all rows live" and recovers every block.
 #[cfg(feature = "columnar")]
 #[test]
 fn salvage_tolerates_a_corrupt_delete_bitmap_as_all_live() -> crate::Result<()> {
@@ -870,8 +871,13 @@ fn salvage_tolerates_a_corrupt_delete_bitmap_as_all_live() -> crate::Result<()> 
         "normal recovery must fail closed on a corrupt delete-bitmap",
     );
 
-    // Salvage degrades to "all rows live": every block recovers, nothing masked.
-    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    // With the explicit opt-in, salvage degrades to "all rows live": every
+    // block recovers, nothing masked.
+    let options = SalvageOptions {
+        allow_delete_resurrection: true,
+        ..SalvageOptions::default()
+    };
+    let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
     assert!(
         report.is_complete(),
         "the data blocks are intact; only the sidecar was corrupt: {report:?}",
@@ -896,8 +902,9 @@ fn salvage_tolerates_a_corrupt_delete_bitmap_as_all_live() -> crate::Result<()> 
 
 /// A columnar SST with deletes whose ZONE MAP is corrupt (the bitmap stays
 /// readable): the bitmap cannot be positioned without the zone map, so normal
-/// recovery fails closed, but salvage ignores the bitmap ("all rows live") and
-/// recovers every row.
+/// recovery and default salvage fail closed, but a caller who explicitly opts
+/// into [`SalvageOptions::allow_delete_resurrection`] ignores the bitmap
+/// ("all rows live") and recovers every row.
 #[cfg(feature = "columnar")]
 #[test]
 fn salvage_ignores_a_delete_bitmap_without_a_readable_zone_map() -> crate::Result<()> {
@@ -951,8 +958,13 @@ fn salvage_ignores_a_delete_bitmap_without_a_readable_zone_map() -> crate::Resul
         "normal recovery must reject a bitmap with no readable zone map",
     );
 
-    // Salvage ignores the unpositionable bitmap and recovers every row live.
-    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    // With the explicit opt-in, salvage ignores the unpositionable bitmap and
+    // recovers every row live.
+    let options = SalvageOptions {
+        allow_delete_resurrection: true,
+        ..SalvageOptions::default()
+    };
+    let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
     assert!(
         report.is_complete(),
         "the data blocks are intact; only the zone map was corrupt: {report:?}",
@@ -1288,6 +1300,7 @@ fn salvage_recovers_an_encrypted_sst_with_the_provider() -> crate::Result<()> {
         #[cfg(zstd_any)]
         zstd_dictionary: None,
         table_id: 0,
+        allow_delete_resurrection: false,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
     assert_eq!(
@@ -1378,6 +1391,7 @@ fn salvage_recovers_a_dictionary_sst_with_the_dictionary() -> crate::Result<()> 
         encryption: None,
         zstd_dictionary: Some(Arc::clone(&dict)),
         table_id: 0,
+        allow_delete_resurrection: false,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
     assert_eq!(
@@ -1461,6 +1475,7 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
         #[cfg(zstd_any)]
         zstd_dictionary: None,
         table_id: 0,
+        allow_delete_resurrection: false,
     };
     let recovered_wrong = salvage_sst_with_options(&source, dest.clone(), &fs, &wrong)
         .map_or(0, |r| r.entries_salvaged);
@@ -1475,6 +1490,7 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
         #[cfg(zstd_any)]
         zstd_dictionary: None,
         table_id: TID,
+        allow_delete_resurrection: false,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
     assert_eq!(

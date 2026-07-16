@@ -160,6 +160,16 @@ pub struct Inner {
     /// masking, instead of recomputing the cumulative row counts per read.
     pub(crate) delete_block_starts: Option<alloc::sync::Arc<crate::HashMap<u64, u32>>>,
 
+    /// Whether a SALVAGE-MODE open degraded this segment's delete masking: its
+    /// `delete_bitmap` section exists but was unreadable (so the bitmap was
+    /// reset to empty) or readable-but-unpositionable (its zone map was
+    /// unreadable, so it was ignored). Reads then show every row live,
+    /// resurrecting positionally-deleted rows — the salvage walk consults this
+    /// to fail closed unless the caller explicitly opted into that
+    /// degradation. Always `false` on a normal (non-salvage) open, which fails
+    /// instead of degrading.
+    pub(crate) delete_bitmap_degraded: bool,
+
     /// Retrieval-ribbon locator, loaded on open from the optional `locator`
     /// section. `Some` only when the table was written with a locator policy
     /// enabled; lets a point read resolve a key to its data block in O(1),

@@ -238,9 +238,9 @@ fn repair_with_salvage_reports_a_range_tombstone_sst_as_unsalvageable() -> crate
 
 /// `repair_with_salvage` on a columnar SST whose delete-bitmap AND sole data
 /// block are both corrupt: whole-file recovery refuses it (the corrupt bitmap
-/// would resurrect deleted rows) and block-salvage, though it opens in salvage
-/// mode, finds the one block unreadable, so the table is reported unreadable
-/// rather than half-recovered.
+/// would resurrect deleted rows) and automated block-salvage fails closed on
+/// the unreadable bitmap before even walking the blocks, so the table is
+/// reported unreadable rather than half-recovered.
 #[cfg(feature = "columnar")]
 #[test]
 fn repair_with_salvage_reports_a_corrupt_bitmap_and_block_sst_as_unsalvageable() -> crate::Result<()>
@@ -339,7 +339,7 @@ fn repair_with_salvage_reports_a_corrupt_bitmap_and_block_sst_as_unsalvageable()
     .repair_with_salvage(true)?;
     assert_eq!(
         report.salvaged, 0,
-        "the sole block is corrupt: nothing to salvage"
+        "the bitmap is unreadable: automated salvage fails closed"
     );
     assert_eq!(report.recovered, 0, "no table joins the rebuilt manifest");
     let [(_, reason)] = report.unreadable_files.as_slice() else {
@@ -349,19 +349,21 @@ fn repair_with_salvage_reports_a_corrupt_bitmap_and_block_sst_as_unsalvageable()
         );
     };
     assert!(
-        reason.contains("nothing salvageable"),
-        "the reason names the empty salvage, got: {reason}",
+        reason.contains("salvage failed"),
+        "the reason names the failed salvage, got: {reason}",
     );
     Ok(())
 }
 
-/// `repair_with_salvage` recovers an SST that normal recovery refuses: a
-/// columnar segment whose delete-bitmap section is corrupt fails whole-file
-/// recovery (it would resurrect deleted rows), but salvage degrades it to "all
-/// rows live" and the rebuilt manifest references the recovered table.
+/// `repair_with_salvage` QUARANTINES an SST whose delete-bitmap section is
+/// corrupt rather than recovering it: whole-file recovery refuses it (a corrupt
+/// bitmap would resurrect deleted rows) and automated salvage fails closed for
+/// the same reason — the "all rows live" degradation is an explicit
+/// `SalvageOptions::allow_delete_resurrection` opt-in that automated repair
+/// never takes. The original stays in quarantine for a manual opt-in salvage.
 #[cfg(feature = "columnar")]
 #[test]
-fn repair_with_salvage_recovers_a_corrupt_delete_bitmap_sst() -> crate::Result<()> {
+fn repair_with_salvage_quarantines_a_corrupt_delete_bitmap_sst() -> crate::Result<()> {
     use crate::config::DeleteStrategy;
     use crate::table::Writer;
     use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
@@ -421,10 +423,20 @@ fn repair_with_salvage_recovers_a_corrupt_delete_bitmap_sst() -> crate::Result<(
     )
     .repair_with_salvage(true)?;
     assert_eq!(
-        report.salvaged, 1,
-        "the corrupt-bitmap SST is salvaged: {:?}",
+        report.salvaged, 0,
+        "automated repair refuses to resurrect deleted rows: {:?}",
         report.unreadable_files,
     );
-    assert_eq!(report.recovered, 1, "the salvaged table joins the manifest");
+    assert_eq!(report.recovered, 0, "no table joins the rebuilt manifest");
+    let [(_, reason)] = report.unreadable_files.as_slice() else {
+        panic!(
+            "expected exactly one unreadable file, got {:?}",
+            report.unreadable_files,
+        );
+    };
+    assert!(
+        reason.contains("salvage failed") && reason.contains("resurrect"),
+        "the reason names the refused delete resurrection, got: {reason}",
+    );
     Ok(())
 }

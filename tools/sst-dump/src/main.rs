@@ -246,14 +246,19 @@ enum Command {
     /// Salvage the readable data blocks of a (possibly corrupt) SST into a
     /// fresh SST at `<dest>`. Walks every data block, re-emits the ones that
     /// pass their checksum into a new file with fresh checksums / index /
-    /// filter, and reports the key range of every block it had to drop. A
-    /// columnar segment with a damaged sidecar (delete-bitmap / zone map)
-    /// degrades to a conservative "all rows live" state rather than failing.
-    /// The `<path>` positional is the source SST. Exits non-zero only when the
+    /// filter, and reports the key range of every block it had to drop. The
+    /// `<path>` positional is the source SST. Exits non-zero only when the
     /// source cannot be opened or nothing was recoverable.
     Salvage {
         /// Destination path for the recovered SST (must not already exist).
         dest: PathBuf,
+        /// Salvage a delete-bearing columnar SST whose positional delete
+        /// bitmap cannot be applied (unreadable bitmap, or a bitmap whose
+        /// positioning zone map is unreadable) by emitting EVERY row live.
+        /// Positionally-deleted rows come back in the recovered SST, so this
+        /// degradation is off by default and the salvage fails closed.
+        #[arg(long)]
+        allow_delete_resurrection: bool,
     },
 }
 
@@ -283,7 +288,10 @@ fn main() -> ExitCode {
             table_id,
             reconstruct_aad,
         } => run_dump_block(&cli.path, offset, tree_id, table_id, reconstruct_aad),
-        Command::Salvage { dest } => run_salvage(&cli.path, &dest),
+        Command::Salvage {
+            dest,
+            allow_delete_resurrection,
+        } => run_salvage(&cli.path, &dest, allow_delete_resurrection),
     }
 }
 
@@ -329,11 +337,24 @@ fn run_repair(db_dir: &std::path::Path, salvage: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_salvage(source: &std::path::Path, dest: &std::path::Path) -> ExitCode {
+fn run_salvage(
+    source: &std::path::Path,
+    dest: &std::path::Path,
+    allow_delete_resurrection: bool,
+) -> ExitCode {
     use std::sync::Arc;
 
     let fs: Arc<dyn lsm_tree::fs::Fs> = Arc::new(lsm_tree::fs::StdFs);
-    let report = match lsm_tree::salvage::salvage_sst(source, dest.to_path_buf(), &fs) {
+    let options = lsm_tree::salvage::SalvageOptions {
+        allow_delete_resurrection,
+        ..lsm_tree::salvage::SalvageOptions::default()
+    };
+    let report = match lsm_tree::salvage::salvage_sst_with_options(
+        source,
+        dest.to_path_buf(),
+        &fs,
+        &options,
+    ) {
         Ok(report) => report,
         Err(err) => {
             eprintln!("salvage failed: {err}");

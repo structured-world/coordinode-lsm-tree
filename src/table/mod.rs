@@ -3289,6 +3289,7 @@ impl Table {
         // resurrect deleted rows, so normal recovery propagates the error and
         // fails. In salvage mode it degrades to empty ("all rows live, pending
         // recompaction") so the segment's data is still recoverable.
+        let mut delete_bitmap_degraded = false;
         let mut delete_bitmap = if let Some(db_handle) = regions.delete_bitmap {
             let load = || -> crate::Result<crate::table::delete_bitmap::DeleteBitmap> {
                 let block = Block::from_file(
@@ -3327,6 +3328,7 @@ impl Table {
                         "delete-bitmap for table {:?} is unreadable ({e}); salvaging all rows as live",
                         metadata.id
                     );
+                    delete_bitmap_degraded = true;
                     crate::table::delete_bitmap::DeleteBitmap::default()
                 }
                 Err(e) => return Err(e),
@@ -3348,6 +3350,7 @@ impl Table {
                     "salvage: delete-bitmap for table {:?} has no readable zone map; ignoring it (all rows live)",
                     metadata.id
                 );
+                delete_bitmap_degraded = true;
                 delete_bitmap = crate::table::delete_bitmap::DeleteBitmap::default();
             } else {
                 return Err(crate::Error::InvalidHeader(
@@ -3485,6 +3488,7 @@ impl Table {
                 zone_map,
                 delete_bitmap,
                 delete_block_starts,
+                delete_bitmap_degraded,
                 locator_index,
                 encryption,
 
