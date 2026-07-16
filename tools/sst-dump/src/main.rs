@@ -247,8 +247,9 @@ enum Command {
     /// fresh SST at `<dest>`. Walks every data block, re-emits the ones that
     /// pass their checksum into a new file with fresh checksums / index /
     /// filter, and reports the key range of every block it had to drop. The
-    /// `<path>` positional is the source SST. Exits non-zero only when the
-    /// source cannot be opened or nothing was recoverable.
+    /// `<path>` positional is the source SST. Exits non-zero when the salvage
+    /// is refused (e.g. delete semantics cannot be preserved) or fails, or
+    /// when nothing was recoverable.
     Salvage {
         /// Destination path for the recovered SST (must not already exist).
         dest: PathBuf,

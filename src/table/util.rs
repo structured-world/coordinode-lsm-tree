@@ -433,6 +433,14 @@ pub(crate) enum BlockScrubOutcome {
 /// Returns the [`BlockScrubOutcome`], or `Err` when the block is uncorrectable
 /// (checksum failed and parity could not recover it) or unreadable; the caller
 /// records that as an uncorrectable finding rather than silently skipping it.
+///
+/// Scope: FRAME integrity only — checksum, decompress, decrypt, ECC. The
+/// block body (restart trailer, entry framing, value-type tags) is
+/// deliberately NOT decoded here: a scrub is a lightweight bit-rot patrol,
+/// and any body-level fault in a checksum-clean block is (a) not producible
+/// by media corruption (the checksum covers the payload) and (b) the domain
+/// of the full semantic pass, [`crate::verify::verify_sst_file`]. Both the
+/// plain patrol scrub and the in-place heal share exactly this depth.
 #[cfg(feature = "std")]
 #[expect(
     clippy::too_many_arguments,
