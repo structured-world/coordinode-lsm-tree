@@ -336,7 +336,7 @@ pub(crate) fn salvage_with_context(
     // faithful copy that reopens under the live tree's `Config` instead of a
     // degraded row-major / plaintext mismatch.
     let writer = crate::table::Writer::new(dest.clone(), options.table_id, 0, Arc::clone(fs))?
-        .mirror_from(&table.metadata)
+        .mirror_from(&table.metadata, table.has_zone_map())
         .use_encryption(options.encryption.clone());
     #[cfg(zstd_any)]
     let writer = writer.use_zstd_dictionary(options.zstd_dictionary.clone());

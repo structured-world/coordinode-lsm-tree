@@ -114,6 +114,12 @@ pub struct ParsedMeta {
     /// path (the restart heads sit every `data_block_restart_interval` entries).
     pub data_block_restart_interval: u8,
 
+    /// Restart interval the index blocks were encoded with. Not consumed on
+    /// the read path (index blocks decode without it), but persisted so a
+    /// layout-mirroring rewrite (salvage) reproduces the source's index
+    /// encoding instead of the writer default.
+    pub index_block_restart_interval: u8,
+
     /// Whether this SST's data blocks are column-organized (PAX) rather than
     /// row-major. Read from the optional `descriptor#columnar` property;
     /// defaults to `false` for SSTs written without it (row-major). The reader
@@ -270,7 +276,7 @@ impl ParsedMeta {
             }
         }
 
-        let _index_block_restart_interval =
+        let index_block_restart_interval =
             validated_restart_interval_index(read_u8!(block, b"restart_interval#index", &cmp))?;
         // Data-block restart interval: needed to rebuild a positional restart
         // index when partial-decoding a block (lazy read path).
@@ -467,6 +473,7 @@ impl ParsedMeta {
             ecc_params,
             ecc_unrecognized,
             data_block_restart_interval,
+            index_block_restart_interval,
             columnar,
         })
     }

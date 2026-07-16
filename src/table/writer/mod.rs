@@ -654,13 +654,22 @@ impl Writer {
     /// interval, columnar layout (with its zone map), and the per-KV checksum
     /// footer algorithm.
     ///
-    /// Only settings the descriptor actually records are mirrored. Layout choices
+    /// Only settings the source actually carries are mirrored. Layout choices
     /// that are not persisted in metadata (partitioned filter / index, bloom
     /// policy, hash ratio, locator, prefix extractor) fall back to writer
     /// defaults and are not restored here. Must be called before the first key,
     /// like the individual `use_*` setters it delegates to.
+    ///
+    /// `has_zone_map` is the source's ACTUAL zone-map presence (a section, not
+    /// a metadata property — the caller reads it off the open table): a row SST
+    /// written with the zone-map policy keeps its zone map, and a columnar SST
+    /// without one does not gain one.
     #[must_use]
-    pub(crate) fn mirror_from(self, meta: &crate::table::meta::ParsedMeta) -> Self {
+    pub(crate) fn mirror_from(
+        self,
+        meta: &crate::table::meta::ParsedMeta,
+        has_zone_map: bool,
+    ) -> Self {
         // Mirror ECC only when this build can actually emit parity. Without the
         // `page_ecc` feature `with_ecc()` is the identity (no trailer is ever
         // written), but a `Some` here would still size every registered block
@@ -678,11 +687,12 @@ impl Writer {
             .use_index_block_compression(meta.index_block_compression)
             .use_ecc(effective_ecc)
             .use_data_block_restart_interval(meta.data_block_restart_interval)
+            .use_index_block_restart_interval(meta.index_block_restart_interval)
             // A columnar source re-emits as columnar (the writer transposes the
-            // recovered rows back into PAX blocks) and regenerates the zone map,
-            // rather than degrading to a row-major copy.
+            // recovered rows back into PAX blocks), rather than degrading to a
+            // row-major copy.
             .use_columnar(meta.columnar)
-            .use_zone_map(meta.columnar);
+            .use_zone_map(has_zone_map);
         // Re-emit per-KV checksum footers under the source's algorithm when it
         // carried them (an SST is footer-homogeneous, so `AllLevels` reproduces
         // the same per-block footer state).
