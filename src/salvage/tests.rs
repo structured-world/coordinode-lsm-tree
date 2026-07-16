@@ -447,15 +447,19 @@ fn salvage_regenerates_a_rotted_parity_trailer_rather_than_copying_it() -> crate
         let Some(kh) = table.data_block_handles().find_map(Result::ok) else {
             panic!("a non-empty SST has at least one data block");
         };
-        usize::try_from(*kh.as_ref().offset()).expect("offset fits usize")
+        usize::try_from(*kh.as_ref().offset()).unwrap_or(usize::MAX)
     };
     let mut bytes = std::fs::read(&source)?;
-    let header = Header::decode_from(&mut bytes.get(first_off..).expect("block within the file"))?;
+    let Some(mut cursor) = bytes.get(first_off..) else {
+        panic!("first data block within the file");
+    };
+    let header = Header::decode_from(&mut cursor)?;
     let trailer_pos =
         first_off + Header::header_len(header.block_type) + header.data_length as usize;
-    *bytes
-        .get_mut(trailer_pos)
-        .expect("parity trailer within the file") ^= 0xFF;
+    let Some(slot) = bytes.get_mut(trailer_pos) else {
+        panic!("parity trailer within the file");
+    };
+    *slot ^= 0xFF;
     std::fs::write(&source, &bytes)?;
 
     let report = salvage_sst(&source, dest.clone(), &fs)?;
@@ -472,17 +476,20 @@ fn salvage_regenerates_a_rotted_parity_trailer_rather_than_copying_it() -> crate
     let (ds, ps) = EccParams::RS_4_2.as_shards();
     for kh in dest_table.data_block_handles() {
         let kh = kh?;
-        let off = usize::try_from(*kh.as_ref().offset()).expect("offset fits usize");
-        let hdr = Header::decode_from(&mut dest_bytes.get(off..).expect("block within the file"))?;
+        let off = usize::try_from(*kh.as_ref().offset()).unwrap_or(usize::MAX);
+        let Some(mut cursor) = dest_bytes.get(off..) else {
+            panic!("block at offset {off} within the file");
+        };
+        let hdr = Header::decode_from(&mut cursor)?;
         let hlen = Header::header_len(hdr.block_type);
         let dl = hdr.data_length as usize;
-        let payload = dest_bytes
-            .get(off + hlen..off + hlen + dl)
-            .expect("payload within the file");
+        let Some(payload) = dest_bytes.get(off + hlen..off + hlen + dl) else {
+            panic!("payload of block at offset {off} within the file");
+        };
         let plen = expected_parity_len(hdr.data_length, EccParams::RS_4_2) as usize;
-        let trailer = dest_bytes
-            .get(off + hlen + dl..off + hlen + dl + plen)
-            .expect("trailer within the file");
+        let Some(trailer) = dest_bytes.get(off + hlen + dl..off + hlen + dl + plen) else {
+            panic!("parity trailer of block at offset {off} within the file");
+        };
         let fresh = crate::ecc::encode_parity(payload, ds, ps)?;
         assert_eq!(
             trailer,
@@ -611,30 +618,28 @@ fn salvage_drops_a_columnar_block_with_an_invalid_value_type() -> crate::Result<
             panic!("source must have at least two data blocks");
         };
         (
-            usize::try_from(*kh.as_ref().offset()).expect("offset fits usize"),
+            usize::try_from(*kh.as_ref().offset()).unwrap_or(usize::MAX),
             kh.as_ref().size() as usize,
         )
     };
     let mut bytes = std::fs::read(&source)?;
-    let block = bytes
-        .get(block_off..block_off + block_size)
-        .expect("block range within the file");
-    let header = Header::decode_from(&mut &block[..])?;
+    let Some(block) = bytes.get(block_off..block_off + block_size) else {
+        panic!("block range within the file");
+    };
+    let mut cursor = block;
+    let header = Header::decode_from(&mut cursor)?;
     let header_len = Header::header_len(header.block_type);
-    let payload = block
-        .get(header_len..header_len + header.data_length as usize)
-        .expect("payload range within the block");
+    let Some(payload) = block.get(header_len..header_len + header.data_length as usize) else {
+        panic!("payload range within the block");
+    };
     let mut batch = ColumnBatch::decode(payload)?;
     let poisoned_rows = u64::from(batch.row_count);
     // Columns are ordered (key, seqno, value-type, values...); 0xFF is not a
     // defined ValueType tag.
-    *batch
-        .columns
-        .get_mut(2)
-        .expect("value-type column present")
-        .data
-        .get_mut(0)
-        .expect("value-type column non-empty") = 0xFF;
+    let Some(vt_byte) = batch.columns.get_mut(2).and_then(|col| col.data.get_mut(0)) else {
+        panic!("value-type column present and non-empty");
+    };
+    *vt_byte = 0xFF;
     let new_payload = batch.encode(CodecId::Plain)?;
     assert_eq!(
         new_payload.len(),
@@ -653,10 +658,10 @@ fn salvage_drops_a_columnar_block_with_an_invalid_value_type() -> crate::Result<
         "header re-encodes to its length"
     );
     new_block.extend_from_slice(&new_payload);
-    bytes
-        .get_mut(block_off..block_off + new_block.len())
-        .expect("block range within the file")
-        .copy_from_slice(&new_block);
+    let Some(target) = bytes.get_mut(block_off..block_off + new_block.len()) else {
+        panic!("block range within the file");
+    };
+    target.copy_from_slice(&new_block);
     std::fs::write(&source, &bytes)?;
 
     // Salvage drops exactly the poisoned block and recovers every other one.
@@ -667,7 +672,10 @@ fn salvage_drops_a_columnar_block_with_an_invalid_value_type() -> crate::Result<
         "exactly the poisoned block is dropped: {report:?}",
     );
     assert!(
-        matches!(report.dropped[0].reason, DropReason::DecodeError(_)),
+        matches!(
+            report.dropped.first().map(|d| &d.reason),
+            Some(DropReason::DecodeError(_))
+        ),
         "the invalid value-type tag classifies as a decode error: {report:?}",
     );
     assert_eq!(
