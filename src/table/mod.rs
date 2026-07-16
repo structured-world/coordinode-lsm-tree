@@ -628,11 +628,72 @@ impl Table {
                 crate::file::read_exact(fd.as_ref(), *handle.offset(), handle.size() as usize)?;
             let header = crate::table::block::Header::decode_from(&mut &raw[..])?;
             let layout = self.inner_block_layout(handle.offset().0);
-            Some((raw.to_vec(), header, layout))
+            // A clean payload checksum does NOT validate the parity trailer
+            // (parity is only consulted on a mismatch), so bit rot confined to
+            // the trailer still reads as a clean block. Verify the trailer
+            // against freshly computed parity before byte-copying; on a
+            // mismatch fall back to the re-encode path, which regenerates the
+            // parity from the decoded payload instead of propagating the rot.
+            if self.raw_block_parity_verifies(&raw, &header) {
+                Some((raw.to_vec(), header, layout))
+            } else {
+                None
+            }
         } else {
             None
         };
         Ok(SalvageBlock { block, verbatim })
+    }
+
+    /// Whether `raw`'s parity trailer matches freshly computed parity over its
+    /// payload — the verbatim-copy eligibility check for a block of an
+    /// ECC-carrying table (see [`Self::salvage_load_block`]). Trivially `true`
+    /// for a table without a recognized ECC scheme; a build without `page_ecc`
+    /// never reaches this for an ECC table (the caller's gate already routes
+    /// those to the re-encode path).
+    #[cfg_attr(
+        not(feature = "page_ecc"),
+        expect(
+            clippy::unused_self,
+            reason = "without page_ecc the caller's gate excludes ECC tables, so there is no parity to check"
+        )
+    )]
+    fn raw_block_parity_verifies(&self, raw: &[u8], header: &crate::table::block::Header) -> bool {
+        #[cfg(feature = "page_ecc")]
+        {
+            let Some(params) = self.metadata.ecc_params else {
+                return true;
+            };
+            let header_len = crate::table::block::Header::header_len(header.block_type);
+            let data_len = header.data_length as usize;
+            // The frame was just read through the verified path, so these
+            // slices are consistent by construction; treat any inconsistency
+            // as "did not verify" (re-encode) rather than panicking.
+            let (Some(payload), Some(trailer)) = (
+                raw.get(header_len..header_len + data_len),
+                raw.get(header_len + data_len..),
+            ) else {
+                return false;
+            };
+            let fresh = match params {
+                crate::table::block::EccParams::Secded => {
+                    crate::secded::encode_block_parity(payload)
+                }
+                crate::table::block::EccParams::Shard { .. } => {
+                    let (ds, ps) = params.as_shards();
+                    match crate::ecc::encode_parity(payload, ds, ps) {
+                        Ok(p) => p,
+                        Err(_) => return false,
+                    }
+                }
+            };
+            trailer == fresh
+        }
+        #[cfg(not(feature = "page_ecc"))]
+        {
+            let _ = (raw, header);
+            true
+        }
     }
 
     /// The inner-zstd block layout (cumulative decompressed end offsets) for the
