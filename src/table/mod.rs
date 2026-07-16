@@ -628,13 +628,30 @@ impl Table {
                 crate::file::read_exact(fd.as_ref(), *handle.offset(), handle.size() as usize)?;
             let header = crate::table::block::Header::decode_from(&mut &raw[..])?;
             let layout = self.inner_block_layout(handle.offset().0);
-            // A clean payload checksum does NOT validate the parity trailer
-            // (parity is only consulted on a mismatch), so bit rot confined to
-            // the trailer still reads as a clean block. Verify the trailer
-            // against freshly computed parity before byte-copying; on a
-            // mismatch fall back to the re-encode path, which regenerates the
-            // parity from the decoded payload instead of propagating the rot.
-            if self.raw_block_parity_verifies(&raw, &header) {
+            // The bytes COPIED are this second read, not the verified first
+            // one, so validate this exact frame before marking it
+            // verbatim-safe (a transient fault or concurrent mutation between
+            // the reads must not persist unchecked bytes):
+            // - the re-read header must equal the verified read's header;
+            // - the re-read payload must hash to the header's stored checksum
+            //   (the checksum covers the on-disk payload bytes uniformly —
+            //   pre-decrypt, pre-decompress);
+            // - for an ECC table, the parity trailer must match freshly
+            //   computed parity (a clean payload checksum never validates the
+            //   trailer — parity is only consulted on a mismatch — so bit rot
+            //   confined to the trailer otherwise reads as a clean block).
+            // Any mismatch falls back to the re-encode path, which emits the
+            // VERIFIED first read's decoded payload with fresh framing.
+            let header_len = crate::table::block::Header::header_len(header.block_type);
+            let payload_checksum_ok = raw
+                .get(header_len..header_len + header.data_length as usize)
+                .is_some_and(|payload| {
+                    crate::hash::hash128(payload) == header.checksum.into_u128()
+                });
+            if header == block.header
+                && payload_checksum_ok
+                && self.raw_block_parity_verifies(&raw, &header)
+            {
                 Some((raw.to_vec(), header, layout))
             } else {
                 None
