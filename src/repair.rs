@@ -181,7 +181,12 @@ fn block_verify_passes(
 ) -> bool {
     if config.encryption.is_some() {
         let report = table.scrub_data_blocks();
-        report.is_ok() && report.errors.is_empty() && report.corrections_applied == 0
+        report.is_ok()
+            && report.errors.is_empty()
+            && report.corrections_applied == 0
+            // Filters load lazily on point reads, so the data-block scrub
+            // never touches them — verify the filter section explicitly.
+            && table.filter_blocks_verified()
     } else {
         crate::verify::verify_sst_file_with_fs(&**folder_fs, table_path).is_ok()
     }
