@@ -604,11 +604,18 @@ impl Table {
                 // trust the (potentially tampered) zone-map claim for it.
                 return false;
             };
-            // A ColumnBatch encodes its row count as the leading LE u32.
-            let advance = match block.data.get(0..4) {
-                Some(rc) => u32::from_le_bytes(rc.try_into().unwrap_or([0; 4])),
-                None => return false,
+            // FULLY decode the batch rather than trusting the leading LE u32
+            // row count: a checksum-repatched tamper can keep those four bytes
+            // intact while breaking the column framing. The salvage walk would
+            // drop such a block as undecodable — but its ACTUAL row count is
+            // then just as unknowable as an unreadable block's, so accepting
+            // the claimed count here would let the mask land on unproven
+            // positions for every later block. Fail closed on any decode
+            // failure.
+            let Ok(batch) = crate::table::columnar::ColumnBatch::decode(&block.data) else {
+                return false;
             };
+            let advance = batch.row_count;
             // `wrapping_add` matches how the open path builds the starts map,
             // so the comparison chain stays consistent (the salvage read mask
             // separately rejects positions that would overflow).
