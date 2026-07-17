@@ -1086,6 +1086,97 @@ fn salvage_tolerates_a_corrupt_delete_bitmap_as_all_live() -> crate::Result<()> 
     Ok(())
 }
 
+/// An UNREADABLE data block inside a delete-bearing columnar SST makes every
+/// later delete position unverifiable: the block's actual row count is
+/// unknowable, and trusting the zone map's claim for it would let a
+/// checksum-repatched count on exactly that block shift the masks of all
+/// later readable blocks undetected. Default salvage must fail closed; the
+/// explicit [`SalvageOptions::allow_delete_resurrection`] opt-in recovers the
+/// readable rows live (never masking against unverified positions).
+#[cfg(feature = "columnar")]
+#[test]
+fn salvage_fails_closed_on_an_unreadable_block_in_a_delete_bearing_sst() -> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let n = 200u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_data_block_size(256)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    for pos in [5u32, 50, 150] {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    // Corrupt the SECOND data block's bytes (a plain checksum break): the
+    // block becomes unreadable, so its actual row count is unknowable.
+    let target = {
+        let table = open(source.clone(), &fs)?;
+        let offsets: alloc::vec::Vec<u64> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|kh| *kh.as_ref().offset())
+            .collect();
+        let Some(&second) = offsets.get(1) else {
+            panic!("source must have at least two data blocks, got {offsets:?}");
+        };
+        second
+    };
+    let flip = usize::try_from(target).unwrap_or(0) + 16;
+    let mut bytes = std::fs::read(&source)?;
+    if let Some(b) = bytes.get_mut(flip) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&source, &bytes)?;
+
+    // Default: fail closed — the delete positions past the unreadable block
+    // cannot be proven faithful.
+    let result = salvage_sst(&source, dest.clone(), &fs);
+    assert!(
+        result.is_err(),
+        "unverifiable delete positions fail the default salvage: {result:?}",
+    );
+    assert!(
+        fs.metadata(&dest).is_err(),
+        "no destination file is left behind by the refused salvage",
+    );
+
+    // Explicit opt-in: the readable rows are recovered LIVE; only the corrupt
+    // block's rows are lost.
+    let options = SalvageOptions {
+        allow_delete_resurrection: true,
+        ..SalvageOptions::default()
+    };
+    let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
+    assert_eq!(
+        report.dropped.len(),
+        1,
+        "exactly the corrupt block is dropped: {report:?}",
+    );
+    assert!(
+        report.entries_salvaged < u64::from(n),
+        "the dropped block's rows are lost: {report:?}",
+    );
+    assert_eq!(
+        reopen_item_count(dest, &fs)?,
+        report.entries_salvaged,
+        "the recovered copy reopens with every salvaged row live",
+    );
+    Ok(())
+}
+
 /// A zone map that DECODES but carries wrong per-block row counts (a
 /// checksum-repatched tamper) would misposition the delete bitmap: the masked
 /// re-emit derives each block's start row from the zone map, so deletes land
