@@ -386,6 +386,57 @@ fn patrol_scrub_heal_in_place_still_checks_a_non_ecc_table() -> crate::Result<()
     Ok(())
 }
 
+/// Bit rot confined to a block's PARITY trailer reads as Clean (the payload
+/// checksum passes and parity is only consulted on a payload mismatch), so
+/// without an explicit trailer check the heal pass would leave dead ECC on
+/// disk — a later payload fault could no longer be recovered. `heal_in_place`
+/// must verify each clean block's trailer against freshly computed parity and
+/// PERSIST a rebuilt trailer on a mismatch (the pass holds the read+write
+/// handle; the payload is untouched, so the rewrite is size-preserving).
+#[test]
+fn heal_in_place_restores_a_rotted_parity_trailer() -> crate::Result<()> {
+    use crate::coding::Decode;
+
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst(dir.path());
+
+    // Flip one byte INSIDE the first data block's parity trailer (right after
+    // its `data_length` payload): the payload checksum still verifies, so the
+    // block reads back Clean.
+    let mut bytes = std::fs::read(&sst_path)?;
+    let base = block.offset().0 as usize;
+    let Some(mut cursor) = bytes.get(base..) else {
+        panic!("first data block within the file");
+    };
+    let header = Header::decode_from(&mut cursor)?;
+    let trailer_pos = base + Header::header_len(header.block_type) + header.data_length as usize;
+    let Some(slot) = bytes.get_mut(trailer_pos) else {
+        panic!("parity trailer within the file");
+    };
+    let rotted = *slot ^ 0xFF;
+    *slot = rotted;
+    std::fs::write(&sst_path, &bytes)?;
+
+    // Reopen (fresh caches + fds) and heal in place.
+    let tree = open_ecc_tree(dir.path());
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+
+    assert!(
+        report.blocks_healed_in_place >= 1,
+        "the rotted parity trailer is rebuilt and persisted: {report:?}",
+    );
+    assert_eq!(report.uncorrectable_blocks, 0, "{report:?}");
+    assert!(report.is_ok(), "a parity rebuild is a heal, not a finding");
+
+    // The on-disk trailer byte is restored (no longer the rotted value).
+    let healed = std::fs::read(&sst_path)?;
+    let Some(&now) = healed.get(trailer_pos) else {
+        panic!("parity trailer within the healed file");
+    };
+    assert_ne!(now, rotted, "the rotted trailer byte was rewritten on disk");
+    Ok(())
+}
+
 /// A clean encrypted, columnar, Page-ECC SST heals in place with no findings.
 /// Its data blocks are sealed as
 /// [`BlockType::Columnar`](crate::table::block::BlockType::Columnar) and
