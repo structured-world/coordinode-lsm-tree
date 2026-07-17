@@ -168,7 +168,11 @@ fn quarantine_file(
 /// does not decode without the provider, so that walk would misreport every
 /// healthy encrypted table as corrupt — and are verified through the recovered
 /// table itself instead: its cache-bypassing, provider-wired data-block scrub
-/// (checksum + ECC per block; a block-index failure is reported too).
+/// (checksum + ECC per block; a block-index failure is reported too). A scrub
+/// CORRECTION also fails the verify: the scrub heals an RS-recoverable fault
+/// in memory, but the corrupt bytes stay on disk — the unencrypted verifier
+/// flags the same checksum mismatch, so a persistent correctable fault must
+/// likewise drive the table through salvage into a clean rewrite.
 fn block_verify_passes(
     config: &Config,
     folder_fs: &Arc<dyn crate::fs::Fs>,
@@ -177,7 +181,7 @@ fn block_verify_passes(
 ) -> bool {
     if config.encryption.is_some() {
         let report = table.scrub_data_blocks();
-        report.is_ok() && report.errors.is_empty()
+        report.is_ok() && report.errors.is_empty() && report.corrections_applied == 0
     } else {
         crate::verify::verify_sst_file_with_fs(&**folder_fs, table_path).is_ok()
     }
