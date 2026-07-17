@@ -561,6 +561,68 @@ impl Table {
         }
     }
 
+    /// Cross-checks the positional delete mask against the ACTUAL per-block
+    /// row counts. `delete_block_starts` is derived from the zone map, and a
+    /// zone map that decodes but carries wrong counts (a checksum-repatched
+    /// tamper) shifts every later block's claimed start — the mask would then
+    /// delete the WRONG rows, silently. Walks the data blocks in index order
+    /// and requires each block's claimed start to equal the running sum of
+    /// actual decoded row counts. An unreadable block advances the running sum
+    /// by the zone map's claimed count (its own count is unverifiable; later
+    /// readable blocks still re-anchor the chain). Trivially `true` when the
+    /// segment has no materialized deletes.
+    ///
+    /// `pub(crate)` for the salvage walk ([`crate::salvage`]), which must not
+    /// mask against unverified positions.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn delete_positions_verified(&self) -> bool {
+        let Some(starts) = self.delete_block_starts.as_deref() else {
+            // No materialized deletes: there is nothing to position.
+            return true;
+        };
+        let mut cumulative: u32 = 0;
+        for keyed in self.block_index.iter() {
+            let Ok(keyed) = keyed else {
+                // An unreadable index makes every later position unverifiable.
+                return false;
+            };
+            let offset = keyed.offset().0;
+            if starts.get(&offset) != Some(&cumulative) {
+                return false;
+            }
+            let handle = BlockHandle::new(keyed.offset(), keyed.size());
+            let advance = match self.load_block(
+                &handle,
+                BlockType::Columnar,
+                self.metadata.data_block_compression,
+                #[cfg(zstd_any)]
+                self.zstd_dictionary.as_deref(),
+            ) {
+                // A ColumnBatch encodes its row count as the leading LE u32.
+                Ok(block) => match block.data.get(0..4) {
+                    Some(rc) => u32::from_le_bytes(rc.try_into().unwrap_or([0; 4])),
+                    None => return false,
+                },
+                // Unreadable block: its actual count is unknowable — advance
+                // by the zone map's claim so later READABLE blocks still
+                // verify against the same chain the mask uses.
+                Err(_) => match self
+                    .zone_map
+                    .columns_for(offset)
+                    .and_then(|stats| stats.first())
+                {
+                    Some(col) => col.row_count,
+                    None => return false,
+                },
+            };
+            // `wrapping_add` matches how the open path builds the starts map,
+            // so the comparison chain stays consistent (the salvage read mask
+            // separately rejects positions that would overflow).
+            cumulative = cumulative.wrapping_add(advance);
+        }
+        true
+    }
+
     /// Salvage helper: load one data block recovery-aware and, when it reads back
     /// cleanly, also capture its raw on-disk bytes for a verbatim copy.
     ///

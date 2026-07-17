@@ -320,11 +320,21 @@ pub(crate) fn salvage_with_context(
         ));
     }
 
-    // Fail closed when the salvage-mode open degraded delete masking (the
-    // delete bitmap was unreadable, or readable but unpositionable): emitting
-    // "all rows live" resurrects positionally-deleted rows, which the caller
-    // must explicitly opt into via `allow_delete_resurrection`.
-    if table.delete_bitmap_degraded && !options.allow_delete_resurrection {
+    // Fail closed when the delete mask cannot be applied FAITHFULLY: the
+    // salvage-mode open degraded it (an unreadable bitmap, or a readable
+    // bitmap whose zone map was unreadable), or the zone map decodes but its
+    // claimed positions do not match the actual per-block row counts (a
+    // checksum-repatched tamper that would silently mask the WRONG rows).
+    // Emitting "all rows live" instead resurrects positionally-deleted rows,
+    // which the caller must explicitly opt into via
+    // `allow_delete_resurrection`; under that opt-in the walk re-emits
+    // UNMASKED — it never masks against unverified positions.
+    #[cfg(feature = "columnar")]
+    let delete_mask_unpositionable = table.delete_bitmap_degraded
+        || (!table.delete_bitmap().is_empty() && !table.delete_positions_verified());
+    #[cfg(not(feature = "columnar"))]
+    let delete_mask_unpositionable = table.delete_bitmap_degraded;
+    if delete_mask_unpositionable && !options.allow_delete_resurrection {
         return Err(crate::Error::InvalidHeader(
             "salvage: the delete bitmap cannot be applied; recovering would resurrect deleted \
              rows (opt in with allow_delete_resurrection)",
@@ -349,7 +359,7 @@ pub(crate) fn salvage_with_context(
     #[cfg(zstd_any)]
     let writer = writer.use_zstd_dictionary(options.zstd_dictionary.clone());
 
-    let walk = match salvage_blocks(&table, writer, comparator) {
+    let walk = match salvage_blocks(&table, writer, comparator, !delete_mask_unpositionable) {
         Ok(walk) => walk,
         Err(e) => {
             // A `write` / `finish` failure after `Writer::new` created `dest`
@@ -439,14 +449,29 @@ fn classify_drop(
 /// Walks `table`'s data blocks in index order, re-emitting every block that
 /// loads and decodes cleanly into `writer` and recording the rest.
 ///
+/// `apply_delete_mask` gates the delete-masked re-emit of a delete-bearing
+/// columnar source: `false` means the mask is unpositionable (degraded bitmap
+/// or unverified zone-map positions) and the caller explicitly opted into
+/// resurrection — the walk then re-emits every row LIVE rather than masking
+/// against unverified positions. Ignored for sources without a delete-bitmap
+/// section.
+///
 /// Consumes `writer`: on success it is finished (when at least one block was
 /// emitted) or dropped (when none were). On a `write` / `finish` error the
 /// writer is dropped as the error unwinds, so the caller must remove the partial
 /// destination it left behind.
+#[cfg_attr(
+    not(feature = "columnar"),
+    expect(
+        unused_variables,
+        reason = "the delete mask exists only for columnar sources; without the feature the flag has no consumer"
+    )
+)]
 fn salvage_blocks(
     table: &crate::table::Table,
     mut writer: crate::table::Writer,
     comparator: &crate::comparator::SharedComparator,
+    apply_delete_mask: bool,
 ) -> crate::Result<SalvageWalk> {
     use crate::table::block::ParsedItem;
     use alloc::format;
@@ -499,7 +524,10 @@ fn salvage_blocks(
             // whose bitmap was lost". A degraded bitmap still recovers all rows
             // live (the documented salvage degradation) — but never via a verbatim
             // copy. Only a genuinely delete-free SST is eligible for copy-through.
-            if table.has_delete_bitmap_section() {
+            // The MASKED re-emit additionally requires verified positions
+            // (`apply_delete_mask`); an unpositionable mask under the explicit
+            // resurrection opt-in re-emits every row live via the unmasked arm.
+            if table.has_delete_bitmap_section() && apply_delete_mask {
                 // Re-emit each block as a delete-masked batch so the recovered copy
                 // keeps any (readable) deletes applied.
                 match table.load_columnar_block_masked(keyed.as_ref()) {
@@ -549,18 +577,27 @@ fn salvage_blocks(
                         }) {
                         Ok((batch, entries)) => {
                             let rows = u64::from(batch.row_count);
+                            // A delete-bearing SST is never byte-copied, even
+                            // on this unmasked (resurrection opt-in) arm: the
+                            // re-encode keeps the recovered copy's layout
+                            // consistent with the degraded-bitmap path.
+                            let verbatim_source = if table.has_delete_bitmap_section() {
+                                None
+                            } else {
+                                sb.verbatim
+                            };
                             // A writer REJECTION (ordering / framing validation)
                             // is block-local malformed content — drop the block
                             // and keep walking; destination I/O errors stay hard.
-                            let emitted = match sb.verbatim {
+                            let emitted = match verbatim_source {
                                 // Clean: copy the block's raw bytes as-is.
                                 Some((raw, header, layout)) => writer
                                     .append_verbatim_data_block(
                                         &raw, header, layout, &entries, comparator,
                                     )
                                     .map(|_| true),
-                                // ECC-recovered: re-encode the healed batch so the
-                                // recovered copy carries clean on-disk bytes.
+                                // ECC-recovered (or delete-bearing): re-encode the
+                                // batch so the recovered copy carries clean bytes.
                                 None => writer
                                     .write_columnar_block_verbatim(&batch, comparator)
                                     .map(|_| false),
