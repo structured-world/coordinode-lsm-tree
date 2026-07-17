@@ -206,12 +206,16 @@ pub(crate) struct SalvageBlock {
     /// cleanly (no ECC recovery): the walk byte-copies these verbatim. `None` when
     /// ECC recovery healed the block, so the faulty on-disk bytes must not be
     /// propagated and the caller re-encodes the healed payload instead.
-    pub verbatim: Option<(
-        alloc::vec::Vec<u8>,
-        crate::table::block::Header,
-        alloc::vec::Vec<u32>,
-    )>,
+    pub verbatim: Option<VerbatimCopy>,
 }
+
+/// Raw on-disk frame captured for a verbatim block copy:
+/// `(raw_on_disk_bytes, header, inner_layout)`. See [`SalvageBlock::verbatim`].
+pub(crate) type VerbatimCopy = (
+    alloc::vec::Vec<u8>,
+    crate::table::block::Header,
+    alloc::vec::Vec<u32>,
+);
 
 impl Table {
     #[must_use]
@@ -682,14 +686,22 @@ impl Table {
         // mirrors ECC as `None` there (it cannot emit parity), so raw bytes
         // with a trailer must be re-encoded trailer-free, not byte-copied.
         let ecc_verbatim_ok = cfg!(feature = "page_ecc") || self.metadata.ecc_params.is_none();
-        let verbatim = if recovery.is_none() && !self.metadata.ecc_unrecognized && ecc_verbatim_ok {
-            // Clean read: capture the raw on-disk bytes (and inner layout) for a
-            // verbatim copy. A second pread of a cold block costs far less than the
-            // re-compression the copy avoids.
+        // Clean read: capture the raw on-disk bytes (and inner layout) for a
+        // verbatim copy. A second pread of a cold block costs far less than the
+        // re-compression the copy avoids.
+        //
+        // `Err` from this function is reserved for the initial VERIFIED read:
+        // by this point that read has already produced a recoverable decoded
+        // block, so ANY failure of the re-read — a transient I/O error or a
+        // corrupt header, same as a checksum / parity mismatch below — must
+        // not drop the block; it just disqualifies the byte-copy and falls
+        // back to re-encoding the verified payload (`verbatim = None`).
+        let capture_verbatim = || -> Option<VerbatimCopy> {
             use crate::coding::Decode;
             let raw =
-                crate::file::read_exact(fd.as_ref(), *handle.offset(), handle.size() as usize)?;
-            let header = crate::table::block::Header::decode_from(&mut &raw[..])?;
+                crate::file::read_exact(fd.as_ref(), *handle.offset(), handle.size() as usize)
+                    .ok()?;
+            let header = crate::table::block::Header::decode_from(&mut &raw[..]).ok()?;
             let layout = self.inner_block_layout(handle.offset().0);
             // The bytes COPIED are this second read, not the verified first
             // one, so validate this exact frame before marking it
@@ -711,14 +723,13 @@ impl Table {
                 .is_some_and(|payload| {
                     crate::hash::hash128(payload) == header.checksum.into_u128()
                 });
-            if header == block.header
+            (header == block.header
                 && payload_checksum_ok
-                && self.raw_block_parity_verifies(&raw, &header)
-            {
-                Some((raw.to_vec(), header, layout))
-            } else {
-                None
-            }
+                && self.raw_block_parity_verifies(&raw, &header))
+            .then(|| (raw.to_vec(), header, layout))
+        };
+        let verbatim = if recovery.is_none() && !self.metadata.ecc_unrecognized && ecc_verbatim_ok {
+            capture_verbatim()
         } else {
             None
         };
