@@ -882,7 +882,12 @@ pub(crate) fn verify_sst_file_with_context(
         }
     };
 
-    match scan_sst_blocks(fs, path, 0, 0, ecc, ecc_unrecognized) {
+    // Encrypted blocks legitimately exceed the plaintext data_length cap by
+    // up to the provider's AEAD overhead (mirroring `Block::from_file`); a
+    // zero here would false-flag a healthy encrypted block just over the cap
+    // as HeaderCorrupted and send the whole table to quarantine/salvage.
+    let max_enc_overhead = encryption.map_or(0u32, |e| e.max_overhead());
+    match scan_sst_blocks(fs, path, 0, max_enc_overhead, ecc, ecc_unrecognized) {
         Ok(per_file) => {
             report.blocks_scanned = per_file.blocks_scanned;
             report.errors = per_file.errors;
