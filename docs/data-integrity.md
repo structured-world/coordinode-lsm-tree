@@ -261,6 +261,13 @@ inspection, or rollback to a known-good point.
   recovering "all rows live" would resurrect deleted rows — unless explicitly
   opted in (`SalvageOptions::allow_delete_resurrection`, `sst-dump salvage
   --allow-delete-resurrection`).
+- **`salvage::salvage_blob_file(src, dest, &fs, id) -> BlobSalvageReport`**:
+  record-granular salvage of one blob (vlog) file — re-sync at the next frame
+  after a bit-rotted record, so one bad record costs only itself. The salvaged
+  file is written COMPACTED, so it is **not a drop-in replacement** while SST
+  entries hold `ValueHandle::offset` values into the source: re-target them
+  through `BlobSalvageReport::offset_remap` first (a source offset absent from
+  the map is a lost record).
 - **`Config::repair_with_salvage(true)`** (also `tools/sst-dump repair
   --salvage`): the manifest rebuild above, but an SST that fails verification is
   block-salvaged in place instead of being left out, and

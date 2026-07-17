@@ -2060,6 +2060,88 @@ fn salvage_blob_file_keeps_a_preexisting_dest_on_open_failure() -> crate::Result
     Ok(())
 }
 
+/// The salvaged blob file is COMPACTED: after a dropped record every later
+/// record shifts to a new offset, and existing SST `ValueHandle::offset`
+/// values point into the SOURCE. The report's `offset_remap` must map every
+/// salvaged record's source frame offset to its offset in the recovered file
+/// (and omit the dropped one), so a caller can re-target handles before
+/// swapping the file in.
+#[test]
+fn salvage_blob_file_reports_an_offset_remap_for_every_salvaged_record() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("blob_source");
+    let dest = dir.path().join("blob_salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let records: Vec<(&[u8], &[u8])> = vec![
+        (b"k0", b"v0-payload"),
+        (b"k1", b"v1-payload"),
+        (b"k2", b"v2-payload"),
+        (b"k3", b"v3-payload"),
+    ];
+    build_blob(&source, &fs, &records)?;
+
+    // Source frame offsets, in order, from a clean pre-corruption scan.
+    let source_offsets: Vec<u64> = BlobScanner::new(&source, &*fs, 0)?
+        .filter_map(Result::ok)
+        .map(|e| e.offset)
+        .collect();
+    assert_eq!(source_offsets.len(), 4, "four source records");
+
+    // Corrupt the SECOND record's value bytes (a checksum break): the scanner
+    // re-syncs at the next frame, so records 0, 2, 3 survive.
+    {
+        let Some(&second) = source_offsets.get(1) else {
+            panic!("second record offset");
+        };
+        // Past the frame header, inside key/value bytes.
+        let flip = usize::try_from(second).unwrap_or(0) + 45;
+        let mut bytes = std::fs::read(&source)?;
+        if let Some(b) = bytes.get_mut(flip) {
+            *b ^= 0xFF;
+        }
+        std::fs::write(&source, &bytes)?;
+    }
+
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0)?;
+    assert_eq!(report.records_salvaged, 3, "{report:?}");
+    assert_eq!(report.dropped.len(), 1, "{report:?}");
+
+    // The remap covers exactly the salvaged records, keyed by their SOURCE
+    // offsets, and its targets are the actual frame offsets in the recovered
+    // file (verified against a scan of the destination).
+    let dest_offsets: Vec<u64> = BlobScanner::new(&dest, &*fs, 0)?
+        .filter_map(Result::ok)
+        .map(|e| e.offset)
+        .collect();
+    let expected: Vec<(u64, u64)> = [0usize, 2, 3]
+        .iter()
+        .zip(&dest_offsets)
+        .map(|(&src_idx, &new)| {
+            (
+                source_offsets.get(src_idx).copied().unwrap_or(u64::MAX),
+                new,
+            )
+        })
+        .collect();
+    assert_eq!(
+        report.offset_remap, expected,
+        "the remap maps each surviving source frame to its compacted target",
+    );
+    // The dropped record's source offset is NOT in the map: its handle is lost.
+    let Some(&dropped_src) = source_offsets.get(1) else {
+        panic!("second record offset");
+    };
+    assert!(
+        report
+            .offset_remap
+            .iter()
+            .all(|(src, _)| *src != dropped_src),
+        "a dropped record has no remap target: {report:?}",
+    );
+    Ok(())
+}
+
 /// When a record write to the destination fails mid-salvage, `salvage_blob_file`
 /// must error AND remove the partial destination it created, so a retry / repair
 /// caller never finds a half-written blob file.

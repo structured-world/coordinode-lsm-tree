@@ -776,6 +776,14 @@ pub struct BlobSalvageReport {
     pub records_total: usize,
     /// Records successfully re-emitted into the salvaged blob file.
     pub records_salvaged: usize,
+    /// `(source_offset, salvaged_offset)` for every re-emitted record, in walk
+    /// order. The salvaged file is written COMPACTED — after the first dropped
+    /// record every later record lands at a NEW offset — so existing SST
+    /// entries whose `ValueHandle::offset` points into the source file must be
+    /// remapped through this table before the salvaged file can replace the
+    /// original under the same id. A source offset absent from this map (and
+    /// implied by [`Self::dropped`]) is lost: its handle has no target.
+    pub offset_remap: Vec<(u64, u64)>,
     /// Records the walk had to drop.
     pub dropped: Vec<DroppedBlob>,
 }
@@ -804,6 +812,13 @@ impl BlobSalvageReport {
 /// a **compressed** source is rejected with [`Error::FeatureUnsupported`] rather
 /// than re-emitted under a mismatched descriptor (the scanner yields on-disk
 /// bytes; faithfully recompressing them is a separate step).
+///
+/// The salvaged file is written COMPACTED: after the first dropped record,
+/// every later record lands at a new offset, so it is **not a drop-in
+/// replacement** for the source while SST entries still hold
+/// `ValueHandle::offset` values into it. Re-target those handles through
+/// [`BlobSalvageReport::offset_remap`] first; a source offset absent from the
+/// map is a lost record.
 ///
 /// [`Error::FeatureUnsupported`]: crate::Error::FeatureUnsupported
 ///
@@ -847,6 +862,7 @@ pub fn salvage_blob_file(
 
     let mut records_total = 0usize;
     let mut records_salvaged = 0usize;
+    let mut offset_remap: Vec<(u64, u64)> = Vec::new();
     let mut dropped: Vec<DroppedBlob> = Vec::new();
     // Emit every recoverable record. A `write` failure here (not a per-record
     // checksum/corruption drop, which the match arms absorb) is a hard error: it
@@ -857,7 +873,15 @@ pub fn salvage_blob_file(
             records_total += 1;
             match item {
                 Ok(entry) => {
+                    // Record the frame relocation BEFORE the write advances the
+                    // writer: existing SST ValueHandles point at SOURCE frame
+                    // offsets, and the compacted rewrite shifts every record
+                    // after the first drop, so the caller needs this map to
+                    // re-target handles before the salvaged file can replace
+                    // the original.
+                    let salvaged_offset = writer.offset();
                     writer.write(&entry.key, entry.seqno, &entry.value)?;
+                    offset_remap.push((entry.offset, salvaged_offset));
                     records_salvaged += 1;
                 }
                 // The scanner repositions at the next frame after a checksum miss,
@@ -912,6 +936,7 @@ pub fn salvage_blob_file(
         salvaged_path,
         records_total,
         records_salvaged,
+        offset_remap,
         dropped,
     })
 }
