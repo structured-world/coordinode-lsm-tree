@@ -2239,7 +2239,7 @@ fn salvage_load_block_reencodes_when_the_verbatim_reread_fails() -> crate::Resul
     // Collect the first data block's handle BEFORE arming the fault (the
     // open + index walk issue their own reads).
     let table = open(source, &fs)?;
-    let Some(kh) = table.data_block_handles().filter_map(Result::ok).next() else {
+    let Some(kh) = table.data_block_handles().find_map(Result::ok) else {
         panic!("source has at least one data block");
     };
     let handle = *kh.as_ref();
