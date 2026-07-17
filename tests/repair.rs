@@ -47,7 +47,7 @@ fn count_sst_files(dir: &std::path::Path) -> std::io::Result<usize> {
 
 #[test]
 fn repair_rebuilds_manifest_and_preserves_all_keys() -> lsm_tree::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
 
     // Three flushes → three L0 tables, with an overwrite in the last batch so
     // repair has to preserve the latest value across overlapping L0 runs.
@@ -124,7 +124,7 @@ fn repair_rebuilds_manifest_and_preserves_all_keys() -> lsm_tree::Result<()> {
 
 #[test]
 fn repair_skips_unreadable_file_but_recovers_the_rest() -> lsm_tree::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
 
     {
         let tree = Config::new(
@@ -187,7 +187,7 @@ fn repair_skips_unreadable_file_but_recovers_the_rest() -> lsm_tree::Result<()> 
 
 #[test]
 fn repair_with_no_ssts_produces_empty_readable_tree() -> lsm_tree::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
 
     // Open and close without ever flushing: the manifest exists but no SST does
     // (manifest lost before the first flush is the scenario).
@@ -226,7 +226,7 @@ fn repair_with_no_ssts_produces_empty_readable_tree() -> lsm_tree::Result<()> {
 
 #[test]
 fn repair_reports_non_table_id_filename_as_unreadable() -> lsm_tree::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
 
     {
         let tree = Config::new(
@@ -296,7 +296,7 @@ fn repair_reports_non_table_id_filename_as_unreadable() -> lsm_tree::Result<()> 
 // and skipped — while intact SSTs still recover and the tree reopens.
 #[test]
 fn repair_rejects_corrupted_sst_and_recovers_the_rest() -> lsm_tree::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
 
     {
         let tree = Config::new(
@@ -390,7 +390,7 @@ fn repair_rejects_corrupted_sst_and_recovers_the_rest() -> lsm_tree::Result<()> 
 #[cfg(unix)]
 #[test]
 fn repair_reports_unopenable_file_as_unreadable() -> lsm_tree::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
 
     {
         let tree = Config::new(
@@ -432,7 +432,7 @@ fn repair_reports_unopenable_file_as_unreadable() -> lsm_tree::Result<()> {
 
 #[test]
 fn repair_fails_when_a_bad_filename_cannot_be_quarantined() -> lsm_tree::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
     let big = |i: u64| format!("{i:08}").repeat(512);
 
     {
@@ -482,7 +482,7 @@ fn repair_fails_when_a_bad_table_filename_cannot_be_quarantined() -> lsm_tree::R
     // Sibling of the blob-side test above, covering the standard `tables/`
     // quarantine path so the false-success regression cannot slip back for
     // standard trees.
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
 
     {
         let tree = Config::new(
@@ -537,7 +537,7 @@ fn count_blob_files(dir: &std::path::Path) -> std::io::Result<usize> {
 
 #[test]
 fn repair_rebuilds_blob_tree_manifest_and_preserves_values() -> lsm_tree::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
 
     // ~4 KiB values, above the 1 KiB KV-separation threshold, so they spill into
     // the value log as blob files: the artifact a blob-tree repair must
@@ -642,7 +642,7 @@ fn corrupt_data_region(path: &std::path::Path) -> std::io::Result<()> {
 /// instead of leaving a table that errors on read.
 #[test]
 fn repair_with_salvage_recovers_a_block_corrupt_sst() -> lsm_tree::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
     {
         let tree = Config::new(
             dir.path(),
@@ -711,7 +711,7 @@ fn repair_with_salvage_recovers_a_block_corrupt_sst() -> lsm_tree::Result<()> {
 /// salvage mode, so repair reports it unreadable rather than salvaging it.
 #[test]
 fn repair_with_salvage_reports_an_unopenable_sst_as_unreadable() -> lsm_tree::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
     {
         let tree = Config::new(
             dir.path(),
@@ -760,11 +760,11 @@ fn repair_with_salvage_reports_an_unopenable_sst_as_unreadable() -> lsm_tree::Re
 /// every encrypted table as corrupt and salvage it on every repair).
 #[cfg(feature = "encryption")]
 #[test]
-fn repair_with_salvage_keeps_a_healthy_encrypted_sst_untouched() -> lsm_tree::Result<()> {
+fn repair_with_salvage_healthy_encrypted_sst_remains_untouched() -> lsm_tree::Result<()> {
     use lsm_tree::Aes256GcmProvider;
     use std::sync::Arc;
 
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
     let provider = || Arc::new(Aes256GcmProvider::new(&[0x5A; 32]));
     {
         let tree = Config::new(
