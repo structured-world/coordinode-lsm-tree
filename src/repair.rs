@@ -163,33 +163,26 @@ fn quarantine_file(
 /// open the source (its metadata / index / SFA trailer is itself unreadable).
 /// Whether a freshly-recovered SST passes the salvage-mode block verify.
 ///
-/// Unencrypted tables use the out-of-band file walk (it also covers non-data
-/// sections). Encrypted tables CANNOT be verified out-of-band — the meta block
-/// does not decode without the provider, so that walk would misreport every
-/// healthy encrypted table as corrupt — and are verified through the recovered
-/// table itself instead: its cache-bypassing, provider-wired data-block scrub
-/// (checksum + ECC per block; a block-index failure is reported too). A scrub
-/// CORRECTION also fails the verify: the scrub heals an RS-recoverable fault
-/// in memory, but the corrupt bytes stay on disk — the unencrypted verifier
-/// flags the same checksum mismatch, so a persistent correctable fault must
-/// likewise drive the table through salvage into a clean rewrite.
+/// One uniform path for encrypted and unencrypted tables: the out-of-band
+/// section walk. Block headers and payload checksums are PLAINTEXT, so the
+/// walk needs the provider only to decode the meta block (the per-SST ECC
+/// descriptor); every section — data, index/TLI, filter, zone map, delete
+/// bitmap, locator, meta — is then verified against its raw on-disk checksum,
+/// which flags even a persistent ECC-CORRECTABLE fault (a live read would
+/// silently heal it in memory while the corrupt bytes stay on disk).
 fn block_verify_passes(
     config: &Config,
     folder_fs: &Arc<dyn crate::fs::Fs>,
     table_path: &std::path::Path,
     table: &Table,
 ) -> bool {
-    if config.encryption.is_some() {
-        let report = table.scrub_data_blocks();
-        report.is_ok()
-            && report.errors.is_empty()
-            && report.corrections_applied == 0
-            // Filters load lazily on point reads, so the data-block scrub
-            // never touches them — verify the filter section explicitly.
-            && table.filter_blocks_verified()
-    } else {
-        crate::verify::verify_sst_file_with_fs(&**folder_fs, table_path).is_ok()
-    }
+    crate::verify::verify_sst_file_with_context(
+        &**folder_fs,
+        table_path,
+        config.encryption.as_deref(),
+        table.metadata.id,
+    )
+    .is_ok()
 }
 
 fn try_salvage_table(

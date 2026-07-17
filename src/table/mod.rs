@@ -1407,55 +1407,6 @@ impl Table {
         Ok(BloomResult::Proceed { has_filter })
     }
 
-    /// Verifies the bloom-filter section blocks load cleanly (checksum +
-    /// decrypt + ECC through the table's own transform). Filters load LAZILY
-    /// on point reads, so a corrupt filter block is invisible to a data-block
-    /// scrub and to an unpinned open; the encrypted repair verify calls this
-    /// so such a table is salvaged (rebuilt with a fresh filter) instead of
-    /// failing later reads. Partitioned filters verify every partition (the
-    /// TLI itself was validated at open); a pinned whole filter was already
-    /// loaded-and-verified at open, and its `regions.filter` handle re-loads
-    /// cheaply here. `true` when the table carries no filter.
-    ///
-    /// `pub(crate)` for [`crate::repair`]'s encrypted block-verify gate.
-    #[cfg(feature = "std")]
-    pub(crate) fn filter_blocks_verified(&self) -> bool {
-        if let Some(filter_idx) = &self.pinned_filter_index {
-            // Partitioned: walk EVERY partition handle out of the TLI.
-            let mut iter = filter_idx.iter(self.comparator.clone());
-            loop {
-                let Some(handle) = iter.next() else {
-                    return true;
-                };
-                let handle = handle.materialize(filter_idx.as_slice());
-                if self
-                    .load_block(
-                        &handle.into_inner(),
-                        BlockType::Filter,
-                        CompressionType::None,
-                        #[cfg(zstd_any)]
-                        None,
-                    )
-                    .is_err()
-                {
-                    return false;
-                }
-            }
-        }
-        if let Some(handle) = &self.regions.filter {
-            return self
-                .load_block(
-                    handle,
-                    BlockType::Filter,
-                    CompressionType::None,
-                    #[cfg(zstd_any)]
-                    None,
-                )
-                .is_ok();
-        }
-        true
-    }
-
     /// Records a data-consulting point read for per-segment tiering / placement
     /// stats: a single `Relaxed` counter bump plus, on `std`, the access time.
     /// Called only after the seqno-range + bloom gates pass, so bloom misses do

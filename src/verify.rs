@@ -772,6 +772,24 @@ pub(crate) fn verify_sst_file_with_fs(
     fs: &dyn crate::fs::Fs,
     path: &std::path::Path,
 ) -> BlockVerifyReport {
+    verify_sst_file_with_context(fs, path, None, 0)
+}
+
+/// As [`verify_sst_file_with_fs`], but with an encryption context for
+/// ENCRYPTED SSTs. Block headers and payload checksums are plaintext, so the
+/// section walk itself needs no decryption — the provider (and the AAD-bound
+/// `table_id`) are used only to decode the meta block for the per-SST ECC
+/// descriptor. This makes the full out-of-band walk (every section, raw
+/// checksums — which flag even ECC-correctable persistent faults) available
+/// for encrypted tables, applying the same verification standard as the
+/// unencrypted path.
+#[cfg(feature = "std")]
+pub(crate) fn verify_sst_file_with_context(
+    fs: &dyn crate::fs::Fs,
+    path: &std::path::Path,
+    encryption: Option<&dyn crate::encryption::EncryptionProvider>,
+    table_id: crate::TableId,
+) -> BlockVerifyReport {
     let mut report = BlockVerifyReport {
         sst_files_scanned: 1,
         ..BlockVerifyReport::default()
@@ -785,7 +803,7 @@ pub(crate) fn verify_sst_file_with_fs(
     // the scan and reports spurious corruption. Surface the indeterminacy and
     // skip the walk.
     let mut ecc_unrecognized = false;
-    let ecc = match read_ecc_params_out_of_band(fs, path) {
+    let ecc = match read_ecc_params_out_of_band(fs, path, encryption, table_id) {
         Ok(Some(ScrubEcc::Off)) => None,
         Ok(Some(ScrubEcc::Scheme(params))) => Some(params),
         // The descriptor decodes to a scheme this build can't apply: the
@@ -885,6 +903,8 @@ enum ScrubEcc {
 fn read_ecc_params_out_of_band(
     fs: &dyn crate::fs::Fs,
     path: &std::path::Path,
+    encryption: Option<&dyn crate::encryption::EncryptionProvider>,
+    table_id: crate::TableId,
 ) -> std::io::Result<Option<ScrubEcc>> {
     let mut probe = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
     let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)
@@ -900,11 +920,18 @@ fn read_ecc_params_out_of_band(
             continue;
         };
         let handle = crate::table::BlockHandle::new(crate::table::BlockOffset(pos), size);
-        // table_id is moot here: this scrub path reads unencrypted meta
-        // (encryption = None), so the AAD identity is unused.
-        if let Ok(meta) =
-            crate::table::meta::ParsedMeta::load_with_handle(probe.as_ref(), &handle, None, None)
-        {
+        // The meta block is the ONLY read here that needs the provider: block
+        // HEADERS and payload checksums are plaintext, so the section walk
+        // below works on encrypted files without decrypting anything — only
+        // the ECC descriptor (inside the meta payload) requires decryption.
+        // The expected-id cross-check is enforced only for encrypted reads
+        // (the AAD binds it anyway); unencrypted diagnostic reads skip it.
+        if let Ok(meta) = crate::table::meta::ParsedMeta::load_with_handle(
+            probe.as_ref(),
+            &handle,
+            encryption.is_some().then_some(table_id),
+            encryption,
+        ) {
             let state = if meta.ecc_unrecognized {
                 ScrubEcc::Unrecognized
             } else if let Some(params) = meta.ecc_params {
