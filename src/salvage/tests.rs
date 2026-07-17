@@ -220,6 +220,80 @@ fn salvage_preserves_the_source_linked_blob_files() -> crate::Result<()> {
     Ok(())
 }
 
+/// A KV-separated source whose `linked_blob_files` section is unreadable (a
+/// count header claiming more records than the section holds) fails the
+/// salvage — but must NOT leave a partial destination behind: the links are
+/// read before anything is created at `dest`, so a failed salvage leaves no
+/// stale output for a later repair or retry to trip over.
+#[test]
+fn salvage_leaves_no_destination_when_the_blob_links_are_unreadable() -> crate::Result<()> {
+    use crate::AbstractTree;
+
+    let dir = tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let crate::AnyTree::Blob(tree) = crate::Config::new(
+        dir.path(),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+    .open()?
+    else {
+        unreachable!("kv separation configured");
+    };
+    let big = |i: u32| format!("{i:08}").repeat(512);
+    for i in 0u32..10 {
+        tree.insert(format!("key{i:05}"), big(i), u64::from(i) + 1);
+    }
+    tree.flush_active_memtable(10)?;
+    let source = {
+        let binding = tree.index.version_history.read().latest_version();
+        let Some(table) = binding.version.iter_tables().next() else {
+            panic!("flush produced one table");
+        };
+        (*table.path).clone()
+    };
+    drop(tree);
+
+    // Overwrite the linked_blob_files count header (leading LE u32) with a
+    // value far larger than the section can hold, so parsing the records
+    // hits EOF and list_blob_file_references errors.
+    let pos = {
+        let mut f = std::fs::File::open(&source)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader
+            .toc()
+            .iter()
+            .find(|e| e.name() == b"linked_blob_files")
+        else {
+            panic!("the source must carry a linked_blob_files section");
+        };
+        usize::try_from(entry.pos()).unwrap_or(usize::MAX)
+    };
+    let mut bytes = std::fs::read(&source)?;
+    let Some(count) = bytes.get_mut(pos..pos + 4) else {
+        panic!("linked_blob_files count header within the file");
+    };
+    count.copy_from_slice(&u32::MAX.to_le_bytes());
+    std::fs::write(&source, &bytes)?;
+
+    let dest = dir.path().join("salvaged");
+    let result = salvage_sst(&source, dest.clone(), &fs);
+    assert!(
+        result.is_err(),
+        "unreadable blob links fail the salvage: {result:?}",
+    );
+    assert!(
+        fs.metadata(&dest).is_err(),
+        "no destination file is left behind by the failed salvage",
+    );
+    Ok(())
+}
+
 /// Standalone salvage preserves the SOURCE's persisted table id: an
 /// unencrypted SST written under a non-zero id salvages WITHOUT the caller
 /// supplying that id (the salvage-mode open reads it from the metadata
