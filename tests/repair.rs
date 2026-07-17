@@ -851,6 +851,146 @@ fn repair_with_salvage_correctable_ecc_fault_in_encrypted_sst_is_rewritten() -> 
     Ok(())
 }
 
+/// A PERSISTENT but ECC-correctable fault in an encrypted table's FILTER
+/// block must drive `repair_with_salvage` into salvaging: loading the filter
+/// through the table silently corrects the fault in memory
+/// (`EccStatus::Corrected` is hidden behind an `Ok`), while the corrupt bytes
+/// stay on disk — the same standard already applied to data blocks.
+#[cfg(all(feature = "encryption", feature = "page_ecc"))]
+#[test]
+fn repair_with_salvage_correctable_ecc_fault_in_encrypted_filter_is_rewritten()
+-> lsm_tree::Result<()> {
+    use lsm_tree::Aes256GcmProvider;
+    use lsm_tree::runtime_config::EccScheme;
+    use std::sync::Arc;
+
+    let dir = lsm_tree::get_tmp_folder();
+    let provider = || Arc::new(Aes256GcmProvider::new(&[0x8D; 32]));
+    let config = |dir: &std::path::Path| {
+        Config::new(
+            dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_encryption(Some(provider()))
+        .page_ecc(true)
+        .ecc_scheme(EccScheme::ReedSolomon {
+            data_shards: 4,
+            parity_shards: 2,
+        })
+    };
+    {
+        let tree = config(dir.path()).open()?;
+        for i in 0..500 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Flip ONE byte inside the filter block's payload (past the ~33-byte
+    // header): within the RS(4,2) budget, so a filter load CORRECTS it in
+    // memory — but the fault persists on disk.
+    let ssts = sorted_sst_paths(dir.path());
+    let victim = ssts.first().expect("an SST to corrupt");
+    flip_byte_in_section(victim, b"filter", 40)?;
+
+    nuke_manifest(dir.path())?;
+
+    let report = config(dir.path()).repair_with_salvage(true)?;
+    assert_eq!(
+        report.salvaged, 1,
+        "a persistent correctable filter fault drives the table through salvage: {:?}",
+        report.unreadable_files,
+    );
+    assert_eq!(
+        report.recovered, 1,
+        "the rewritten table joins the manifest"
+    );
+    Ok(())
+}
+
+/// The same standard for SIDE sections loaded during recover (index TLI,
+/// meta, zone map, ...): those loads silently correct an ECC-recoverable
+/// fault in memory, so a persistent correctable flip there must also drive
+/// `repair_with_salvage` into a clean rewrite — the unencrypted out-of-band
+/// verifier flags the same raw checksum mismatch.
+#[cfg(all(feature = "encryption", feature = "page_ecc"))]
+#[test]
+fn repair_with_salvage_correctable_ecc_fault_in_encrypted_tli_is_rewritten() -> lsm_tree::Result<()>
+{
+    use lsm_tree::Aes256GcmProvider;
+    use lsm_tree::runtime_config::EccScheme;
+    use std::sync::Arc;
+
+    let dir = lsm_tree::get_tmp_folder();
+    let provider = || Arc::new(Aes256GcmProvider::new(&[0x9E; 32]));
+    let config = |dir: &std::path::Path| {
+        Config::new(
+            dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_encryption(Some(provider()))
+        .page_ecc(true)
+        .ecc_scheme(EccScheme::ReedSolomon {
+            data_shards: 4,
+            parity_shards: 2,
+        })
+    };
+    {
+        let tree = config(dir.path()).open()?;
+        for i in 0..500 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let ssts = sorted_sst_paths(dir.path());
+    let victim = ssts.first().expect("an SST to corrupt");
+    flip_byte_in_section(victim, b"tli", 40)?;
+
+    nuke_manifest(dir.path())?;
+
+    let report = config(dir.path()).repair_with_salvage(true)?;
+    assert_eq!(
+        report.salvaged, 1,
+        "a persistent correctable TLI fault drives the table through salvage: {:?}",
+        report.unreadable_files,
+    );
+    assert_eq!(
+        report.recovered, 1,
+        "the rewritten table joins the manifest"
+    );
+    Ok(())
+}
+
+/// Flips one byte at `offset_in_section` inside the named SFA section of an
+/// SST (locating it via the trailer TOC).
+#[cfg(all(feature = "encryption", feature = "page_ecc"))]
+fn flip_byte_in_section(
+    path: &std::path::Path,
+    section: &[u8],
+    offset_in_section: u64,
+) -> lsm_tree::Result<()> {
+    let pos = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = lsm_tree::sfa::Reader::from_reader(&mut f)?;
+        let entry = reader
+            .toc()
+            .iter()
+            .find(|e| e.name() == section)
+            .unwrap_or_else(|| panic!("the SST carries a {section:?} section"));
+        entry.pos() + offset_in_section
+    };
+    let mut bytes = std::fs::read(path)?;
+    let slot = bytes
+        .get_mut(usize::try_from(pos).expect("position fits usize"))
+        .expect("flip position within the SST");
+    *slot ^= 0x40;
+    std::fs::write(path, &bytes)?;
+    Ok(())
+}
+
 /// A corrupt BLOOM FILTER block in an encrypted SST must drive
 /// `repair_with_salvage` into salvaging the table: the encrypted verify path
 /// scrubs data blocks through the table, but the filter section loads lazily
