@@ -126,13 +126,23 @@ fn iv(i: u32) -> InternalValue {
 /// Opens an SST as a `Table`, stamping the open with the file's current digest
 /// (the source may be corrupt; per-block checksums catch the actual damage).
 fn open(path: std::path::PathBuf, fs: &Arc<dyn Fs>) -> crate::Result<Table> {
+    open_with_id(path, fs, 0)
+}
+
+/// As [`open`] but under an explicit expected table id (the recover
+/// cross-checks it against the SST's stored `table_id`).
+fn open_with_id(
+    path: std::path::PathBuf,
+    fs: &Arc<dyn Fs>,
+    table_id: crate::TableId,
+) -> crate::Result<Table> {
     let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&**fs, &path)?);
     Table::recover(
         path,
         checksum,
         0,
         0,
-        0,
+        table_id,
         Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
         Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8))),
         Arc::clone(fs),
@@ -150,6 +160,46 @@ fn open(path: std::path::PathBuf, fs: &Arc<dyn Fs>) -> crate::Result<Table> {
 /// A reopen of a salvaged SST: recover it and return its live item count.
 fn reopen_item_count(path: std::path::PathBuf, fs: &Arc<dyn Fs>) -> crate::Result<u64> {
     Ok(open(path, fs)?.metadata.item_count)
+}
+
+/// Standalone salvage preserves the SOURCE's persisted table id: an
+/// unencrypted SST written under a non-zero id salvages WITHOUT the caller
+/// supplying that id (the salvage-mode open reads it from the metadata
+/// instead of failing the id cross-check against the options default of 0),
+/// and the recovered copy is stamped with the source's id — so it keeps its
+/// identity when an operator swaps it in for the original.
+#[test]
+fn salvage_preserves_a_nonzero_source_table_id() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    const TID: crate::TableId = 7;
+    let mut writer = Writer::new(source.clone(), TID, 0, Arc::clone(&fs))?.use_data_block_size(256);
+    let n = 200u32;
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Default options (table_id = 0): the salvage must still open the source
+    // and carry its real id through.
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert!(
+        report.is_complete(),
+        "a healthy non-zero-id SST salvages completely: {report:?}",
+    );
+
+    // The recovered copy reopens under the SOURCE's id (the recover
+    // cross-checks the stored table_id against the expected one).
+    let recovered = open_with_id(dest, &fs, TID)?;
+    assert_eq!(
+        recovered.metadata.id, TID,
+        "the salvaged copy is stamped with the source's table id",
+    );
+    assert_eq!(recovered.metadata.item_count, u64::from(n));
+    Ok(())
 }
 
 #[test]
