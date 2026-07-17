@@ -790,11 +790,19 @@ fn repair_with_salvage_correctable_ecc_fault_in_encrypted_sst_is_rewritten() -> 
         tree.flush_active_memtable(0)?;
     }
 
-    // Flip one byte in the data region: within the RS(4,2) budget, so every
-    // read CORRECTS it in memory — but the fault persists on disk.
+    // Flip one byte INSIDE the first data block's payload (the data region
+    // starts at file offset 0; the block header is ~33 bytes, so offset 40 is
+    // payload — NOT the parity trailer, which a clean-checksum read never
+    // validates). Within the RS(4,2) budget, so every read CORRECTS it in
+    // memory — but the fault persists on disk.
     let ssts = sorted_sst_paths(dir.path());
     let victim = ssts.first().expect("an SST to corrupt");
-    corrupt_data_region(victim)?;
+    {
+        let mut bytes = std::fs::read(victim)?;
+        let slot = bytes.get_mut(40).expect("offset 40 within the SST");
+        *slot ^= 0x80;
+        std::fs::write(victim, &bytes)?;
+    }
 
     nuke_manifest(dir.path())?;
 
