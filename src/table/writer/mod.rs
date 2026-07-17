@@ -132,6 +132,14 @@ pub struct Writer {
 
     current_key: Option<UserKey>,
 
+    /// Seqno of the LAST entry written (any path — row `write()` or a direct
+    /// block), tracked alongside `current_key` so a direct block that begins
+    /// with the SAME user key can be validated against the internal order
+    /// `(user_key asc, seqno desc)` across the block boundary
+    /// ([`Self::validate_direct_block_order`]). `None` only before the first
+    /// entry.
+    current_key_seqno: Option<crate::SeqNo>,
+
     bloom_policy: BloomConstructionPolicy,
 
     /// Stored so `use_partitioned_filter()` can re-apply it to the new writer
@@ -374,6 +382,7 @@ impl Writer {
             chunk_size: 0,
 
             current_key: None,
+            current_key_seqno: None,
 
             bloom_policy: BloomConstructionPolicy::default(),
 
@@ -956,6 +965,7 @@ impl Writer {
         self.chunk_size += user_key.len() + value_len;
         self.chunk.push(item);
         self.previous_item = Some((user_key, value_type));
+        self.current_key_seqno = Some(seqno);
 
         if self.chunk_size >= self.data_block_size as usize {
             self.spill_block()?;
@@ -1577,6 +1587,7 @@ impl Writer {
                 self.meta.first_key = Some(user_key.clone());
             }
             self.previous_item = Some((user_key.clone(), e.key.value_type));
+            self.current_key_seqno = Some(e.key.seqno);
             self.meta.lowest_seqno = self.meta.lowest_seqno.min(e.key.seqno);
             self.meta.highest_seqno = self.meta.highest_seqno.max(e.key.seqno);
             self.meta.highest_kv_seqno = self.meta.highest_kv_seqno.max(e.key.seqno);
@@ -1685,11 +1696,23 @@ impl Writer {
         comparator: &crate::SharedComparator,
     ) -> crate::Result<()> {
         let err = || crate::Error::InvalidHeader("direct block entries out of internal-key order");
-        if let (Some(prev), Some(first)) = (self.current_key.as_ref(), entries.first())
-            && comparator.compare(prev.as_ref(), first.key.user_key.as_ref())
-                == core::cmp::Ordering::Greater
-        {
-            return Err(err());
+        if let (Some(prev), Some(first)) = (self.current_key.as_ref(), entries.first()) {
+            match comparator.compare(prev.as_ref(), first.key.user_key.as_ref()) {
+                core::cmp::Ordering::Greater => return Err(err()),
+                // The same user key spans the block boundary: its versions
+                // must keep strictly decreasing seqnos across the edge, just
+                // like the in-block window check below. An untracked prior
+                // seqno cannot happen once a key was written (both write
+                // paths record it), so treat it as a violation, not a pass.
+                core::cmp::Ordering::Equal
+                    if self
+                        .current_key_seqno
+                        .is_none_or(|prev_seqno| first.key.seqno >= prev_seqno) =>
+                {
+                    return Err(err());
+                }
+                _ => {}
+            }
         }
         for pair in entries.windows(2) {
             let (Some(a), Some(b)) = (pair.first(), pair.get(1)) else {
