@@ -279,6 +279,17 @@ fn verify_sst_file_detects_a_rotted_parity_trailer() {
         "a rotted parity trailer under a clean payload checksum must be \
          flagged (dead ECC), got {report:?}",
     );
+    let mismatch = report
+        .errors
+        .iter()
+        .find(|e| matches!(e, BlockVerifyError::EccParityMismatch { .. }))
+        .unwrap_or_else(|| panic!("expected an EccParityMismatch error, got {report:?}"));
+    // The rendered finding names the block and the dead-ECC condition.
+    let rendered = mismatch.to_string();
+    assert!(
+        rendered.contains("parity trailer") && rendered.contains("offset 0"),
+        "display names the block and the condition: {rendered}",
+    );
 }
 
 /// Returns the on-disk path of the first SST registered with the

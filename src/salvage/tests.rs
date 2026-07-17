@@ -1005,6 +1005,286 @@ fn salvage_drops_a_columnar_block_with_out_of_order_keys() -> crate::Result<()> 
     Ok(())
 }
 
+/// The ROW-source twin of the columnar out-of-order drop: a checksum-clean
+/// row block with two adjacent keys swapped passes frame decode and row
+/// materialization, so the ordering guard before the emit is the only thing
+/// standing between it and a recovered SST with a corrupt index order. The
+/// rejection is block-local: the block drops, the rest still salvages.
+#[test]
+fn salvage_drops_a_row_block_with_out_of_order_keys() -> crate::Result<()> {
+    use crate::coding::Encode;
+    use crate::comparator::default_comparator;
+    use crate::table::block::Header;
+    use crate::table::block::decoder::ParsedItem as _;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let n = 200u32;
+    // Restart interval 1 + no hash index: every entry stores its full key, so
+    // swapping two equal-length keys re-encodes to a byte-identical length.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_data_block_size(256)
+        .use_data_block_restart_interval(1)
+        .use_data_block_hash_ratio(0.0);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Poison the SECOND data block: decode its entries, swap the first two
+    // (equal-length keys), re-encode under the same block parameters, and
+    // re-stamp the header checksum.
+    let (block_off, poisoned_rows, new_block) = {
+        let table = open(source.clone(), &fs)?;
+        let Some(kh) = table.data_block_handles().filter_map(Result::ok).nth(1) else {
+            panic!("source must have at least two data blocks");
+        };
+        let block_off = usize::try_from(*kh.as_ref().offset()).unwrap_or(usize::MAX);
+        let sb = table.salvage_load_block(kh.as_ref(), crate::table::block::BlockType::Data)?;
+        let header = sb.block.header;
+        let db = crate::table::DataBlock::from_loaded(sb.block, false)?;
+        let iter = db.try_iter(default_comparator())?;
+        let mut entries: alloc::vec::Vec<crate::InternalValue> =
+            iter.map(|p| p.materialize(db.as_slice())).collect();
+        assert!(entries.len() >= 2, "block holds at least two rows");
+        entries.swap(0, 1);
+        let mut new_payload: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        crate::table::DataBlock::encode_into(&mut new_payload, &entries, 1, 0.0)?;
+        assert_eq!(
+            new_payload.len(),
+            header.data_length as usize,
+            "an adjacent equal-length key swap re-encodes to the same length",
+        );
+        let header_len = Header::header_len(header.block_type);
+        let new_header = Header {
+            checksum: crate::Checksum::from_raw(crate::hash::hash128(&new_payload)),
+            ..header
+        };
+        let mut new_block: alloc::vec::Vec<u8> =
+            alloc::vec::Vec::with_capacity(header_len + new_payload.len());
+        new_header.encode_into(&mut new_block)?;
+        new_block.extend_from_slice(&new_payload);
+        (block_off, entries.len() as u64, new_block)
+    };
+    let mut bytes = std::fs::read(&source)?;
+    let Some(target) = bytes.get_mut(block_off..block_off + new_block.len()) else {
+        panic!("block range within the file");
+    };
+    target.copy_from_slice(&new_block);
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert_eq!(
+        report.dropped.len(),
+        1,
+        "exactly the out-of-order block is dropped: {report:?}",
+    );
+    assert!(
+        matches!(
+            report.dropped.first().map(|d| &d.reason),
+            Some(DropReason::DecodeError(_))
+        ),
+        "the ordering violation classifies as a decode error: {report:?}",
+    );
+    assert_eq!(
+        report.entries_salvaged,
+        u64::from(n) - poisoned_rows,
+        "every row outside the poisoned block is recovered",
+    );
+    assert_eq!(reopen_item_count(dest, &fs)?, u64::from(n) - poisoned_rows);
+    Ok(())
+}
+
+/// The DELETE-BEARING twin of the columnar out-of-order drop: the swapped
+/// keys keep every block's row count intact, so the delete positions still
+/// verify and the walk takes the masked re-emit — whose writer then rejects
+/// the broken ordering. The rejection stays block-local: only the poisoned
+/// block drops, deletes still apply to every other block.
+#[cfg(feature = "columnar")]
+#[test]
+fn salvage_drops_an_out_of_order_columnar_block_in_a_delete_bearing_sst() -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::config::DeleteStrategy;
+    use crate::table::block::Header;
+    use crate::table::columnar::{CodecId, ColumnBatch};
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let n = 200u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_data_block_size(256)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    let deletes = [5u32, 50, 150];
+    for pos in deletes {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    // Poison the SECOND data block exactly like the delete-free variant: swap
+    // the first two rows' user keys inside the key column and re-stamp the
+    // checksum. Row counts stay intact, so the delete positions still verify.
+    let (block_off, block_size) = {
+        let table = open(source.clone(), &fs)?;
+        let Some(kh) = table.data_block_handles().filter_map(Result::ok).nth(1) else {
+            panic!("source must have at least two data blocks");
+        };
+        (
+            usize::try_from(*kh.as_ref().offset()).unwrap_or(usize::MAX),
+            kh.as_ref().size() as usize,
+        )
+    };
+    let mut bytes = std::fs::read(&source)?;
+    let Some(block) = bytes.get(block_off..block_off + block_size) else {
+        panic!("block range within the file");
+    };
+    let mut cursor = block;
+    let header = Header::decode_from(&mut cursor)?;
+    let header_len = Header::header_len(header.block_type);
+    let Some(payload) = block.get(header_len..header_len + header.data_length as usize) else {
+        panic!("payload range within the block");
+    };
+    let mut batch = ColumnBatch::decode(payload)?;
+    let poisoned_rows = u64::from(batch.row_count);
+    assert!(batch.row_count >= 2, "block holds at least two rows");
+    {
+        let Some(key_col) = batch.columns.first_mut() else {
+            panic!("key column present");
+        };
+        let table_len = (batch.row_count as usize + 1) * 4;
+        let off = |data: &[u8], idx: usize| -> usize {
+            let Some(b) = data.get(idx * 4..idx * 4 + 4) else {
+                panic!("offset {idx} within the frame table");
+            };
+            u32::from_le_bytes(b.try_into().unwrap_or([0; 4])) as usize
+        };
+        let (o0, o1, o2) = (
+            off(&key_col.data, 0),
+            off(&key_col.data, 1),
+            off(&key_col.data, 2),
+        );
+        assert_eq!(o1 - o0, o2 - o1, "adjacent keys are equal-length");
+        let len = o1 - o0;
+        let Some(first) = key_col.data.get(table_len + o0..table_len + o0 + len) else {
+            panic!("first key within the column");
+        };
+        let first = first.to_vec();
+        let Some(second) = key_col.data.get(table_len + o1..table_len + o1 + len) else {
+            panic!("second key within the column");
+        };
+        let second = second.to_vec();
+        let Some(dst0) = key_col.data.get_mut(table_len + o0..table_len + o0 + len) else {
+            panic!("first key range within the column");
+        };
+        dst0.copy_from_slice(&second);
+        let Some(dst1) = key_col.data.get_mut(table_len + o1..table_len + o1 + len) else {
+            panic!("second key range within the column");
+        };
+        dst1.copy_from_slice(&first);
+    }
+    let new_payload = batch.encode(CodecId::Plain)?;
+    assert_eq!(
+        new_payload.len(),
+        payload.len(),
+        "an in-place key swap re-encodes to the same length",
+    );
+    let new_header = Header {
+        checksum: crate::Checksum::from_raw(crate::hash::hash128(&new_payload)),
+        ..header
+    };
+    let mut new_block = Vec::with_capacity(header_len + new_payload.len());
+    new_header.encode_into(&mut new_block)?;
+    new_block.extend_from_slice(&new_payload);
+    let Some(target) = bytes.get_mut(block_off..block_off + new_block.len()) else {
+        panic!("block range within the file");
+    };
+    target.copy_from_slice(&new_block);
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_sst(&source, dest, &fs)?;
+    assert_eq!(
+        report.dropped.len(),
+        1,
+        "exactly the out-of-order block is dropped: {report:?}",
+    );
+    assert!(
+        matches!(
+            report.dropped.first().map(|d| &d.reason),
+            Some(DropReason::DecodeError(_))
+        ),
+        "the ordering violation classifies as a decode error: {report:?}",
+    );
+    // Every row outside the poisoned block is recovered, minus the deletes
+    // that fall outside it (none of 5 / 50 / 150 land in the second block,
+    // which spans rows ~17..34 at 256-byte blocks).
+    assert_eq!(
+        report.entries_salvaged,
+        u64::from(n) - poisoned_rows - deletes.len() as u64,
+        "rows outside the poisoned block are recovered with deletes applied",
+    );
+    Ok(())
+}
+
+/// A DESTINATION write failure mid-walk is a hard error, not a dropped block:
+/// the salvage propagates it and removes the partial destination so a retry
+/// or repair caller never sees half-written output.
+#[test]
+fn salvage_sst_errors_and_discards_the_dest_on_a_write_failure() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    // Values big enough that the destination's buffered writer flushes
+    // mid-walk (so the failure surfaces through a block emit, not finish).
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0..200u32 {
+        writer.write(InternalValue::from_components(
+            format!("key{i:05}").into_bytes(),
+            vec![0xAB; 1_024],
+            1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    injector.arm(
+        FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::Other))
+            .on_path("salvaged")
+            .once(),
+    );
+    let result = salvage_sst(&source, dest.clone(), &fs);
+    injector.clear();
+
+    assert!(
+        result.is_err(),
+        "a destination write failure errors the whole salvage: {result:?}",
+    );
+    assert!(
+        fs.metadata(&dest).is_err(),
+        "the partial destination is removed on a write failure",
+    );
+    Ok(())
+}
+
 /// By default salvage FAILS CLOSED on a delete-bearing SST whose delete
 /// bitmap is unreadable: recovering "all rows live" would resurrect
 /// positionally-deleted rows, so that degradation requires the caller's
@@ -2550,6 +2830,104 @@ fn salvage_blob_file_drops_a_corrupt_record_and_keeps_the_rest() -> crate::Resul
         vec![b"k0".to_vec(), b"k2".to_vec(), b"k3".to_vec()],
         "the corrupt record's key is the only one missing",
     );
+    Ok(())
+}
+
+/// A blob file where EVERY record is corrupt salvages nothing: the report
+/// carries only drops, `salvaged_path` is `None`, and the empty destination
+/// placeholder the writer created is removed (a repair caller would otherwise
+/// re-quarantine a stray zero-record blob file in its place).
+#[test]
+fn salvage_blob_file_removes_the_empty_dest_when_nothing_is_recoverable() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("blob_source");
+    let dest = dir.path().join("blob_salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let records: Vec<(&[u8], &[u8])> = vec![(b"k0", b"value-zero"), (b"k1", b"value-one")];
+    build_blob(&source, &fs, &records)?;
+
+    // Flip the last value byte of BOTH records: each frame header stays
+    // intact, so the scanner reports one checksum mismatch per record and
+    // re-syncs — leaving zero salvageable records.
+    let frame_ends: Vec<u64> = BlobScanner::new(&source, &*fs, 0)?
+        .filter_map(Result::ok)
+        .map(|e| e.frame_end)
+        .collect();
+    assert_eq!(frame_ends.len(), 2, "source blob holds two records");
+    let mut bytes = std::fs::read(&source)?;
+    for end in frame_ends {
+        let flip = usize::try_from(end - 1).unwrap_or(0);
+        if let Some(b) = bytes.get_mut(flip) {
+            *b ^= 0xFF;
+        }
+    }
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0)?;
+    assert_eq!(report.records_salvaged, 0, "{report:?}");
+    assert_eq!(report.dropped.len(), 2, "both records drop: {report:?}");
+    assert_eq!(
+        report.salvaged_path, None,
+        "nothing recoverable yields no salvaged path",
+    );
+    assert!(
+        fs.metadata(&dest).is_err(),
+        "the empty destination placeholder is removed",
+    );
+    Ok(())
+}
+
+/// A STRUCTURAL failure mid-walk (a record frame whose magic bytes are gone,
+/// not a checksum miss) terminates the blob walk: the scanner cannot re-sync
+/// past it, so the salvage records one `Corrupt` drop for the unreadable tail
+/// and keeps everything scanned before it.
+#[test]
+fn salvage_blob_file_stops_at_a_smashed_frame_and_keeps_the_prefix() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("blob_source");
+    let dest = dir.path().join("blob_salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let records: Vec<(&[u8], &[u8])> = vec![
+        (b"k0", b"value-zero"),
+        (b"k1", b"value-one"),
+        (b"k2", b"value-two"),
+    ];
+    build_blob(&source, &fs, &records)?;
+
+    // Smash the LAST record's frame magic (the file structure and trailer
+    // stay intact): the scanner reports it as a structural InvalidHeader it
+    // cannot re-sync from, unlike a checksum miss.
+    let Some(last_start) = BlobScanner::new(&source, &*fs, 0)?
+        .filter_map(Result::ok)
+        .nth(1)
+        .map(|e| e.frame_end)
+    else {
+        panic!("source blob must have at least two records");
+    };
+    let mut bytes = std::fs::read(&source)?;
+    let at = usize::try_from(last_start).unwrap_or(0);
+    let Some(magic) = bytes.get_mut(at..at + 4) else {
+        panic!("last record's frame magic within the file");
+    };
+    magic.copy_from_slice(b"????");
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0)?;
+    assert_eq!(
+        report.records_salvaged, 2,
+        "the records before the smashed frame are recovered: {report:?}",
+    );
+    assert!(
+        matches!(
+            report.dropped.first().map(|d| &d.reason),
+            Some(BlobDropReason::Corrupt(_))
+        ),
+        "the truncated tail is recorded as a structural drop: {report:?}",
+    );
+    let recovered = scan_blob(&dest, &fs)?;
+    assert_eq!(recovered.len(), 2, "the salvaged copy holds the prefix");
     Ok(())
 }
 

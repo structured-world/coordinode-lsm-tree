@@ -437,6 +437,179 @@ fn heal_in_place_restores_a_rotted_parity_trailer() -> crate::Result<()> {
     Ok(())
 }
 
+/// Opens an RS(8,2) Page-ECC tree at `dir` through the given filesystem
+/// (fault-injection variant of [`open_ecc_tree`]).
+fn open_ecc_tree_on(dir: &std::path::Path, fs: std::sync::Arc<dyn crate::fs::Fs>) -> crate::Tree {
+    let crate::AnyTree::Standard(tree) = crate::Config::new(
+        dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .page_ecc(true)
+    .ecc_scheme(EccScheme::ReedSolomon {
+        data_shards: 8,
+        parity_shards: 2,
+    })
+    .with_shared_fs(fs)
+    .open()
+    .expect("open ecc tree on injected fs") else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+    tree
+}
+
+/// A failed raw re-read during the clean-block parity-trailer check is a
+/// finding, not a silent skip: the block's trailer could not be verified, so
+/// the heal pass reports it as uncorrectable and moves on (the remaining
+/// blocks still get their trailers checked).
+#[test]
+fn heal_in_place_reports_a_failed_parity_reread_as_uncorrectable() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let (_sst_path, _block) = write_ecc_sst(dir.path());
+
+    let fault = FaultFs::new(crate::fs::StdFs);
+    let injector = fault.injector();
+    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));
+
+    // Within the heal pass, per block: read #1 is the verifying scrub read,
+    // read #2 is the raw frame re-read for the parity-trailer comparison.
+    // Fail exactly the FIRST block's re-read.
+    injector.arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .skip(1)
+            .once(),
+    );
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    injector.clear();
+
+    assert_eq!(
+        report.uncorrectable_blocks, 1,
+        "the unverifiable trailer is a finding: {report:?}",
+    );
+    assert!(
+        format!("{report:?}").contains("parity re-read failed"),
+        "the finding names the failed re-read: {report:?}",
+    );
+    assert_eq!(
+        report.blocks_healed_in_place, 0,
+        "nothing was persisted for the failed block: {report:?}",
+    );
+    Ok(())
+}
+
+/// A parity-trailer rebuild whose WRITE fails is a finding: the rot stays on
+/// disk, so the heal must report the block as uncorrectable instead of
+/// counting a heal that never landed.
+#[test]
+fn heal_in_place_reports_a_failed_trailer_writeback_as_uncorrectable() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst(dir.path());
+
+    // Rot one parity-trailer byte of the first data block (payload checksum
+    // still verifies, so the block scrubs Clean and the trailer check fires).
+    let mut bytes = std::fs::read(&sst_path)?;
+    let base = block.offset().0 as usize;
+    let Some(mut cursor) = bytes.get(base..) else {
+        panic!("first data block within the file");
+    };
+    let header = Header::decode_from(&mut cursor)?;
+    let trailer_pos = base + Header::header_len(header.block_type) + header.data_length as usize;
+    let Some(slot) = bytes.get_mut(trailer_pos) else {
+        panic!("parity trailer within the file");
+    };
+    let rotted = *slot ^ 0xFF;
+    *slot = rotted;
+    std::fs::write(&sst_path, &bytes)?;
+
+    let fault = FaultFs::new(crate::fs::StdFs);
+    let injector = fault.injector();
+    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));
+
+    // The heal pass performs no other writes to the SST, so the first write
+    // is the trailer rebuild.
+    injector.arm(
+        FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .once(),
+    );
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    injector.clear();
+
+    assert_eq!(
+        report.blocks_healed_in_place, 0,
+        "a write-back that failed is not counted as a heal: {report:?}",
+    );
+    assert_eq!(report.uncorrectable_blocks, 1, "{report:?}");
+    assert!(
+        format!("{report:?}").contains("in-place parity rebuild"),
+        "the finding names the failed rebuild: {report:?}",
+    );
+
+    // The rot is still on disk (nothing was silently half-written).
+    let after = std::fs::read(&sst_path)?;
+    assert_eq!(
+        after.get(trailer_pos).copied(),
+        Some(rotted),
+        "the rotted trailer byte is untouched after the failed write-back",
+    );
+    Ok(())
+}
+
+/// A corrected block whose heal RE-READ fails (transient I/O on the second,
+/// persist-side read) is a finding: the correction cannot be written back, so
+/// the block is reported uncorrectable rather than silently skipped.
+#[test]
+fn heal_in_place_reports_a_failed_heal_reread_as_uncorrectable() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst(dir.path());
+
+    // Flip one payload byte of the first data block (RS-correctable).
+    let corrupt_pos = block.offset().0 as usize + Header::MIN_LEN + 3;
+    let mut bytes = std::fs::read(&sst_path)?;
+    let Some(slot) = bytes.get_mut(corrupt_pos) else {
+        panic!("corrupt_pos in range for the SST bytes");
+    };
+    *slot ^= 0x80;
+    std::fs::write(&sst_path, &bytes)?;
+
+    let fault = FaultFs::new(crate::fs::StdFs);
+    let injector = fault.injector();
+    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));
+
+    // For the corrupted first block: read #1 is the scrub read (corrects in
+    // memory), read #2 is `heal_frame`'s persist-side re-read — fail that one.
+    injector.arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .skip(1)
+            .once(),
+    );
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    injector.clear();
+
+    assert_eq!(
+        report.blocks_healed_in_place, 0,
+        "nothing was persisted for the failed block: {report:?}",
+    );
+    assert_eq!(report.uncorrectable_blocks, 1, "{report:?}");
+    assert!(
+        format!("{report:?}").contains("heal re-read failed"),
+        "the finding names the failed heal re-read: {report:?}",
+    );
+    Ok(())
+}
+
 /// A clean encrypted, columnar, Page-ECC SST heals in place with no findings.
 /// Its data blocks are sealed as
 /// [`BlockType::Columnar`](crate::table::block::BlockType::Columnar) and
