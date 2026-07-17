@@ -2212,6 +2212,65 @@ fn salvage_blob_file_keeps_a_racing_dest_created_after_the_existence_probe() -> 
     Ok(())
 }
 
+/// A transient I/O failure on the verbatim REREAD must not drop the block:
+/// the first, recovery-aware read has already produced a verified decoded
+/// block, so the loader falls back to the re-encode path (`verbatim = None`)
+/// exactly like a checksum / parity mismatch on the re-read frame. Reserving
+/// `Err` for the initial verified read keeps one flaky pread from discarding
+/// a block that is provably recoverable.
+#[test]
+fn salvage_load_block_reencodes_when_the_verbatim_reread_fails() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+    use crate::table::block::BlockType;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0..50u32 {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Collect the first data block's handle BEFORE arming the fault (the
+    // open + index walk issue their own reads).
+    let table = open(source, &fs)?;
+    let Some(kh) = table.data_block_handles().filter_map(Result::ok).next() else {
+        panic!("source has at least one data block");
+    };
+    let handle = *kh.as_ref();
+
+    // Within `salvage_load_block` the FIRST positional read is the verified
+    // recovery-aware load; the SECOND is the raw verbatim re-read. Fail
+    // exactly that second read, once.
+    injector.arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other))
+            .on_path("source")
+            .skip(1)
+            .once(),
+    );
+    let result = table.salvage_load_block(&handle, BlockType::Data);
+    injector.clear();
+
+    let sb = match result {
+        Ok(sb) => sb,
+        Err(e) => panic!("a failed verbatim re-read falls back to re-encode, got Err({e:?})"),
+    };
+    assert!(
+        sb.verbatim.is_none(),
+        "the re-read was never verified, so the block must not be byte-copied",
+    );
+    assert!(
+        !sb.block.data.is_empty(),
+        "the verified first read's decoded payload is preserved for re-encoding",
+    );
+    Ok(())
+}
+
 /// `salvage_blob_file` must not delete a pre-existing file at `dest` when the
 /// destination cannot be created (the writer's `create_new` open fails because
 /// the path already exists): the error-path cleanup is only for a partial file
