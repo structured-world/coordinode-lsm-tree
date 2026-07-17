@@ -753,3 +753,67 @@ fn repair_with_salvage_reports_an_unopenable_sst_as_unreadable() -> lsm_tree::Re
     );
     Ok(())
 }
+
+/// `repair_with_salvage` must NOT quarantine and rewrite a HEALTHY encrypted
+/// SST: the block-verify gate has to be encryption-aware (the out-of-band
+/// file walk cannot decode an encrypted meta block, so it would misreport
+/// every encrypted table as corrupt and salvage it on every repair).
+#[cfg(feature = "encryption")]
+#[test]
+fn repair_with_salvage_keeps_a_healthy_encrypted_sst_untouched() -> lsm_tree::Result<()> {
+    use lsm_tree::Aes256GcmProvider;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let provider = || Arc::new(Aes256GcmProvider::new(&[0x5A; 32]));
+    {
+        let tree = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_encryption(Some(provider()))
+        .open()?;
+        for i in 0..500 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    nuke_manifest(dir.path())?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_encryption(Some(provider()))
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.salvaged, 0,
+        "a healthy encrypted SST is not quarantined + rewritten: {:?}",
+        report.unreadable_files,
+    );
+    assert_eq!(
+        report.recovered, 1,
+        "the healthy encrypted table joins the rebuilt manifest: {:?}",
+        report.unreadable_files,
+    );
+
+    // The tree reopens and every key reads back.
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_encryption(Some(provider()))
+    .open()?;
+    for i in 0..500 {
+        assert!(
+            tree.get(key(i), MAX_SEQNO)?.is_some(),
+            "key {} survives the repair untouched",
+            key(i),
+        );
+    }
+    Ok(())
+}
