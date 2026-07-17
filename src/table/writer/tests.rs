@@ -240,6 +240,70 @@ fn write_columnar_block_verbatim_accepts_mvcc_duplicate_keys() -> crate::Result<
     Ok(())
 }
 
+/// When the same user key spans two consecutive direct blocks, the boundary
+/// must keep the internal order `(user_key asc, seqno desc)`: a second block
+/// whose FIRST version of the shared key carries a seqno >= the previous
+/// block's LAST version is a tampered / malformed block and must be rejected,
+/// exactly like an in-block inversion. A correctly descending boundary still
+/// passes.
+#[cfg(feature = "columnar")]
+#[test]
+fn write_columnar_block_verbatim_rejects_an_equal_key_boundary_seqno_inversion() -> crate::Result<()>
+{
+    use crate::comparator::default_comparator;
+    use crate::table::columnar::entries_to_column_batch;
+
+    let dir = tempfile::tempdir()?;
+    let cmp = default_comparator();
+
+    // Inverted boundary: block 1 ends with ("dup", 5); block 2 begins with
+    // ("dup", 6) — a NEWER version sorting after an older one.
+    let mut writer = Writer::new(dir.path().join("inv"), 1, 0, Arc::new(StdFs))?.use_columnar(true);
+    let first = entries_to_column_batch(&alloc::vec![InternalValue::from_components(
+        b"dup".to_vec(),
+        b"v5".to_vec(),
+        5,
+        ValueType::Value,
+    )])?;
+    writer.write_columnar_block_verbatim(&first, &cmp)?;
+    let inverted = entries_to_column_batch(&alloc::vec![InternalValue::from_components(
+        b"dup".to_vec(),
+        b"v6".to_vec(),
+        6,
+        ValueType::Value,
+    )])?;
+    assert!(
+        writer
+            .write_columnar_block_verbatim(&inverted, &cmp)
+            .is_err(),
+        "an equal-key boundary whose seqno does not decrease is rejected",
+    );
+
+    // Valid boundary: the shared key's versions keep strictly decreasing
+    // across the block edge.
+    let mut ok_writer =
+        Writer::new(dir.path().join("ok"), 1, 0, Arc::new(StdFs))?.use_columnar(true);
+    let first = entries_to_column_batch(&alloc::vec![InternalValue::from_components(
+        b"dup".to_vec(),
+        b"v5".to_vec(),
+        5,
+        ValueType::Value,
+    )])?;
+    ok_writer.write_columnar_block_verbatim(&first, &cmp)?;
+    let descending = entries_to_column_batch(&alloc::vec![InternalValue::from_components(
+        b"dup".to_vec(),
+        b"v3".to_vec(),
+        3,
+        ValueType::Value,
+    )])?;
+    ok_writer.write_columnar_block_verbatim(&descending, &cmp)?;
+    assert!(
+        ok_writer.finish()?.is_some(),
+        "a correctly descending equal-key boundary still writes and finishes",
+    );
+    Ok(())
+}
+
 /// The columnar bulk-ingest contract is enforced by `write_columnar_batch`:
 /// a row-mode writer, a non-zero per-row seqno, or non-increasing keys are each
 /// rejected before any block is written.
