@@ -1086,6 +1086,125 @@ fn salvage_tolerates_a_corrupt_delete_bitmap_as_all_live() -> crate::Result<()> 
     Ok(())
 }
 
+/// A zone map that DECODES but carries wrong per-block row counts (a
+/// checksum-repatched tamper) would misposition the delete bitmap: the masked
+/// re-emit derives each block's start row from the zone map, so deletes land
+/// on the wrong rows — deleted rows resurrect AND live rows vanish, silently.
+/// Salvage must cross-check the claimed positions against the actual decoded
+/// row counts and fail closed on a mismatch; with the explicit
+/// [`SalvageOptions::allow_delete_resurrection`] opt-in it recovers all rows
+/// live instead of masking against the wrong positions.
+#[cfg(feature = "columnar")]
+#[test]
+fn salvage_fails_closed_on_a_zone_map_with_wrong_row_counts() -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::config::DeleteStrategy;
+    use crate::table::block::Header;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let n = 200u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_data_block_size(256)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    for pos in [5u32, 50, 150] {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    // Tamper the FIRST block's row count inside the zone map (wire layout:
+    // count u32, then block_offset u64 + n_columns u16, then per column
+    // id u32 + type_tag u8 + codec_id u8 + null_count u32 + row_count u32 —
+    // so the first row_count sits at payload bytes 24..28) and re-stamp the
+    // section block's checksum. The zone map still DECODES — only its claimed
+    // positions are shifted for every block after the first.
+    let zm_pos = {
+        let mut f = std::fs::File::open(&source)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"zone_map") else {
+            panic!("source must carry a zone_map section");
+        };
+        usize::try_from(entry.pos()).unwrap_or(usize::MAX)
+    };
+    let mut bytes = std::fs::read(&source)?;
+    let Some(mut cursor) = bytes.get(zm_pos..) else {
+        panic!("zone_map section within the file");
+    };
+    let header = Header::decode_from(&mut cursor)?;
+    let header_len = Header::header_len(header.block_type);
+    let payload_range = zm_pos + header_len..zm_pos + header_len + header.data_length as usize;
+    {
+        let Some(payload) = bytes.get_mut(payload_range.clone()) else {
+            panic!("zone_map payload within the file");
+        };
+        let Some(rc) = payload.get_mut(24..28) else {
+            panic!("first row_count within the zone map payload");
+        };
+        let claimed = u32::from_le_bytes(rc.try_into().unwrap_or([0; 4]));
+        assert!(claimed >= 2, "the first block holds at least two rows");
+        rc.copy_from_slice(&(claimed - 1).to_le_bytes());
+    }
+    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(
+        bytes.get(payload_range).unwrap_or(&[]),
+    ));
+    let new_header = Header {
+        checksum: new_checksum,
+        ..header
+    };
+    let mut hdr_bytes = Vec::with_capacity(header_len);
+    new_header.encode_into(&mut hdr_bytes)?;
+    let Some(hdr_dst) = bytes.get_mut(zm_pos..zm_pos + header_len) else {
+        panic!("zone_map header within the file");
+    };
+    hdr_dst.copy_from_slice(&hdr_bytes);
+    std::fs::write(&source, &bytes)?;
+
+    // Default: fail closed — masking against the shifted positions would
+    // silently corrupt visibility in the recovered SST.
+    let result = salvage_sst(&source, dest.clone(), &fs);
+    assert!(
+        result.is_err(),
+        "a mispositioning zone map fails the default salvage: {result:?}",
+    );
+    assert!(
+        fs.metadata(&dest).is_err(),
+        "no destination file is left behind by the refused salvage",
+    );
+
+    // Explicit opt-in: recover all rows LIVE (never mask against the wrong
+    // positions).
+    let options = SalvageOptions {
+        allow_delete_resurrection: true,
+        ..SalvageOptions::default()
+    };
+    let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
+    assert!(
+        report.is_complete(),
+        "the data blocks are intact; only the zone map lies: {report:?}",
+    );
+    assert_eq!(
+        report.entries_salvaged,
+        u64::from(n),
+        "every row is recovered live under the opt-in",
+    );
+    assert_eq!(reopen_item_count(dest, &fs)?, u64::from(n));
+    Ok(())
+}
+
 /// A columnar SST with deletes whose ZONE MAP is corrupt (the bitmap stays
 /// readable): the bitmap cannot be positioned without the zone map, so normal
 /// recovery and default salvage fail closed, but a caller who explicitly opts
