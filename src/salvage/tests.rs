@@ -162,6 +162,64 @@ fn reopen_item_count(path: std::path::PathBuf, fs: &Arc<dyn Fs>) -> crate::Resul
     Ok(open(path, fs)?.metadata.item_count)
 }
 
+/// An SST from a KV-separated tree carries a `linked_blob_files` section
+/// naming every blob file its `ValueHandle`s point into; blob GC / relocation
+/// consults it (via `list_blob_file_references`) to decide whether a blob is
+/// still referenced. The salvaged copy must carry the SOURCE's links —
+/// omitting the section would let GC rewrite or delete a blob that only this
+/// table still references, silently breaking its indirections.
+#[test]
+fn salvage_preserves_the_source_linked_blob_files() -> crate::Result<()> {
+    use crate::AbstractTree;
+
+    let dir = tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // A KV-separated tree: large values go to a blob file, the SST holds
+    // indirections plus a linked_blob_files section.
+    let crate::AnyTree::Blob(tree) = crate::Config::new(
+        dir.path(),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+    .open()?
+    else {
+        unreachable!("kv separation configured");
+    };
+    let big = |i: u32| format!("{i:08}").repeat(512);
+    for i in 0u32..10 {
+        tree.insert(format!("key{i:05}"), big(i), u64::from(i) + 1);
+    }
+    tree.flush_active_memtable(10)?;
+    let source = {
+        let binding = tree.index.version_history.read().latest_version();
+        let Some(table) = binding.version.iter_tables().next() else {
+            panic!("flush produced one table");
+        };
+        (*table.path).clone()
+    };
+    drop(tree);
+
+    let dest = dir.path().join("salvaged");
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert!(report.is_complete(), "healthy SST: {report:?}");
+
+    // The source's blob links survive into the recovered copy.
+    let Some(source_links) = open(source, &fs)?.list_blob_file_references()? else {
+        panic!("the source carries a linked_blob_files section");
+    };
+    assert!(!source_links.is_empty(), "the source references blob files");
+    let Some(recovered_links) = open(dest, &fs)?.list_blob_file_references()? else {
+        panic!("the salvaged copy carries a linked_blob_files section");
+    };
+    assert_eq!(
+        recovered_links, source_links,
+        "the salvaged copy references the same blob files as the source",
+    );
+    Ok(())
+}
+
 /// Standalone salvage preserves the SOURCE's persisted table id: an
 /// unencrypted SST written under a non-zero id salvages WITHOUT the caller
 /// supplying that id (the salvage-mode open reads it from the metadata
