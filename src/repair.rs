@@ -161,6 +161,28 @@ fn quarantine_file(
 /// Returns `Ok(None)` when nothing was recoverable (the original stays in
 /// quarantine and the path is left empty), or `Err` when even salvage cannot
 /// open the source (its metadata / index / SFA trailer is itself unreadable).
+/// Whether a freshly-recovered SST passes the salvage-mode block verify.
+///
+/// Unencrypted tables use the out-of-band file walk (it also covers non-data
+/// sections). Encrypted tables CANNOT be verified out-of-band — the meta block
+/// does not decode without the provider, so that walk would misreport every
+/// healthy encrypted table as corrupt — and are verified through the recovered
+/// table itself instead: its cache-bypassing, provider-wired data-block scrub
+/// (checksum + ECC per block; a block-index failure is reported too).
+fn block_verify_passes(
+    config: &Config,
+    folder_fs: &Arc<dyn crate::fs::Fs>,
+    table_path: &std::path::Path,
+    table: &Table,
+) -> bool {
+    if config.encryption.is_some() {
+        let report = table.scrub_data_blocks();
+        report.is_ok() && report.errors.is_empty()
+    } else {
+        crate::verify::verify_sst_file_with_fs(&**folder_fs, table_path).is_ok()
+    }
+}
+
 fn try_salvage_table(
     config: &Config,
     table_base_folder: &std::path::Path,
@@ -505,11 +527,14 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                 // In salvage mode a table whose whole-file recovery succeeded can
                 // still hold corrupt data blocks (recovery is lazy on the data
                 // section). Block-verify it; if any block is corrupt, salvage it
-                // rather than keep a table that errors on read.
+                // rather than keep a table that errors on read. The verify must
+                // be ENCRYPTION-AWARE: the out-of-band file walk cannot decode
+                // an encrypted meta block, so it would misreport every healthy
+                // encrypted table as corrupt and rewrite it on every repair —
+                // encrypted tables verify through the recovered table itself
+                // (its cache-bypassing, provider-wired data-block scrub).
                 Ok(table)
-                    if salvage
-                        && !crate::verify::verify_sst_file_with_fs(&*folder_fs, &table_path)
-                            .is_ok() =>
+                    if salvage && !block_verify_passes(config, &folder_fs, &table_path, &table) =>
                 {
                     drop(table);
                     match try_salvage_table(
