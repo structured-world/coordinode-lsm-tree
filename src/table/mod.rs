@@ -2875,6 +2875,18 @@ impl Table {
         let regions = ParsedRegions::parse_from_toc(trailer.toc())?;
 
         log::trace!("Reading meta block, with meta_ptr={:?}", regions.metadata);
+        // The expected-id cross-check rejects a swapped / wrong-id file in a
+        // LIVE tree, where the manifest / file name is the durable identity. A
+        // salvage-mode open is a standalone recovery reader: the SOURCE's own
+        // stored id IS the identity to recover under, so an unencrypted
+        // salvage open skips the check (None) and derives the id from the
+        // metadata. An ENCRYPTED open still passes the caller's id — the meta
+        // block's AAD binds it, so decryption itself requires the right id.
+        let expected_id = if salvage && encryption.is_none() {
+            None
+        } else {
+            Some(table_id)
+        };
         // TAIL first (authoritative copy by convention; physically
         // identical content to MID — same `file_size`, same
         // `created_at`, same KV map — the only difference is which
@@ -2883,7 +2895,7 @@ impl Table {
         let metadata = match ParsedMeta::load_with_handle(
             &*file,
             &regions.metadata,
-            Some(table_id),
+            expected_id,
             encryption.as_deref(),
         ) {
             Ok(m) => m,
@@ -2909,7 +2921,7 @@ impl Table {
                     match ParsedMeta::load_with_handle(
                         &*file,
                         &mid_handle,
-                        Some(table_id),
+                        expected_id,
                         encryption.as_deref(),
                     ) {
                         Ok(mid) => mid,

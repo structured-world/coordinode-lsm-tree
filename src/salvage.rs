@@ -42,12 +42,14 @@ pub struct SalvageOptions {
     /// when the source uses no dictionary.
     #[cfg(zstd_any)]
     pub zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
-    /// The source's table id. Encrypted block AAD binds the table identity, so
-    /// an encrypted source sealed under a non-zero `table_id` only decrypts when
-    /// the same id is supplied here, and the recovered copy is written under it
-    /// so it reopens consistently. [`crate::repair`] passes the table's real id;
-    /// defaults to `0` for the standalone API (matching an unencrypted or
-    /// id-`0` source).
+    /// The open / decrypt context id for an ENCRYPTED source: block AAD binds
+    /// the table identity, so an encrypted source sealed under a non-zero id
+    /// only decrypts when the same id is supplied here.
+    /// [`crate::repair`] passes the table's real id; the standalone default of
+    /// `0` matches an unencrypted or id-`0` encrypted source. An UNENCRYPTED
+    /// source needs no id at all — the salvage-mode open reads the stored one
+    /// from the metadata — and the recovered copy is always stamped with the
+    /// SOURCE's stored id (its identity), never with this field.
     pub table_id: crate::TableId,
     /// Opt-in to salvaging a delete-bearing columnar SST whose positional
     /// delete bitmap cannot be applied (the bitmap section is unreadable, or a
@@ -335,7 +337,13 @@ pub(crate) fn salvage_with_context(
     // dictionary, so a columnar / encrypted / dictionary source salvages into a
     // faithful copy that reopens under the live tree's `Config` instead of a
     // degraded row-major / plaintext mismatch.
-    let writer = crate::table::Writer::new(dest.clone(), options.table_id, 0, Arc::clone(fs))?
+    // The recovered copy is stamped with the SOURCE's stored table id (its
+    // identity), not the caller's open/AAD context id: an unencrypted
+    // salvage-mode open accepts any stored id (`options.table_id` stays the
+    // default 0), and the copy must keep the source's identity so it reopens
+    // consistently when swapped in for the original. For an encrypted source
+    // the two are necessarily equal (the open's AAD binds the caller's id).
+    let writer = crate::table::Writer::new(dest.clone(), table.metadata.id, 0, Arc::clone(fs))?
         .mirror_from(&table.metadata, table.has_zone_map())
         .use_encryption(options.encryption.clone());
     #[cfg(zstd_any)]
