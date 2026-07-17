@@ -734,38 +734,55 @@ impl Table {
     fn raw_block_parity_verifies(&self, raw: &[u8], header: &crate::table::block::Header) -> bool {
         #[cfg(feature = "page_ecc")]
         {
-            let Some(params) = self.metadata.ecc_params else {
-                return true;
-            };
-            let header_len = crate::table::block::Header::header_len(header.block_type);
-            let data_len = header.data_length as usize;
-            // The frame was just read through the verified path, so these
-            // slices are consistent by construction; treat any inconsistency
-            // as "did not verify" (re-encode) rather than panicking.
-            let (Some(payload), Some(trailer)) = (
-                raw.get(header_len..header_len + data_len),
-                raw.get(header_len + data_len..),
-            ) else {
-                return false;
-            };
-            let fresh = match params {
-                crate::table::block::EccParams::Secded => {
-                    crate::secded::encode_block_parity(payload)
-                }
-                crate::table::block::EccParams::Shard { .. } => {
-                    let (ds, ps) = params.as_shards();
-                    match crate::ecc::encode_parity(payload, ds, ps) {
-                        Ok(p) => p,
-                        Err(_) => return false,
-                    }
-                }
-            };
-            trailer == fresh
+            matches!(self.raw_block_parity_delta(raw, header), Ok(None))
         }
         #[cfg(not(feature = "page_ecc"))]
         {
             let _ = (raw, header);
             true
+        }
+    }
+
+    /// Compares `raw`'s parity trailer against freshly computed parity over
+    /// its payload. `Ok(None)` — the trailer matches (or the table carries no
+    /// recognized ECC scheme); `Ok(Some(fresh))` — MISMATCH, `fresh` is the
+    /// parity the trailer should hold (the in-place heal persists it);
+    /// `Err(())` — the frame is inconsistent or the encoder rejected the
+    /// shape, so the trailer is unverifiable.
+    #[cfg(feature = "page_ecc")]
+    fn raw_block_parity_delta(
+        &self,
+        raw: &[u8],
+        header: &crate::table::block::Header,
+    ) -> Result<Option<alloc::vec::Vec<u8>>, ()> {
+        let Some(params) = self.metadata.ecc_params else {
+            return Ok(None);
+        };
+        let header_len = crate::table::block::Header::header_len(header.block_type);
+        let data_len = header.data_length as usize;
+        // The frame was just read through the verified path, so these slices
+        // are consistent by construction; treat any inconsistency as
+        // "unverifiable" rather than panicking.
+        let (Some(payload), Some(trailer)) = (
+            raw.get(header_len..header_len + data_len),
+            raw.get(header_len + data_len..),
+        ) else {
+            return Err(());
+        };
+        let fresh = match params {
+            crate::table::block::EccParams::Secded => crate::secded::encode_block_parity(payload),
+            crate::table::block::EccParams::Shard { .. } => {
+                let (ds, ps) = params.as_shards();
+                match crate::ecc::encode_parity(payload, ds, ps) {
+                    Ok(p) => p,
+                    Err(_) => return Err(()),
+                }
+            }
+        };
+        if trailer == fresh {
+            Ok(None)
+        } else {
+            Ok(Some(fresh))
         }
     }
 
@@ -1078,7 +1095,93 @@ impl Table {
             );
             match outcome {
                 // Verified clean: nothing to persist.
-                Ok(crate::table::util::BlockScrubOutcome::Clean) => {}
+                // Verified clean — but a clean PAYLOAD checksum never
+                // validates the parity trailer (parity is only consulted on a
+                // mismatch), so rot confined to the trailer would silently
+                // leave dead ECC on disk: a later payload fault in this block
+                // could no longer be recovered. This pass holds the read+write
+                // handle and the payload is untouched, so a size-preserving
+                // trailer rebuild is exactly the heal it exists to perform.
+                Ok(crate::table::util::BlockScrubOutcome::Clean) => {
+                    let raw = match crate::file::read_exact(
+                        file.as_ref(),
+                        block_offset,
+                        keyed.size() as usize,
+                    ) {
+                        Ok(raw) => raw,
+                        Err(e) => {
+                            report.uncorrectable_blocks += 1;
+                            report.errors.push(ScrubError::UncorrectableBlock {
+                                table_id: self.id(),
+                                path: self.path.to_path_buf(),
+                                block_offset,
+                                reason: alloc::format!(
+                                    "in-place heal: parity re-read failed: {e:?}"
+                                ),
+                            });
+                            continue;
+                        }
+                    };
+                    use crate::coding::Decode;
+                    let Ok(raw_header) = crate::table::block::Header::decode_from(&mut &raw[..])
+                    else {
+                        // The scrub just read this frame cleanly; a header that
+                        // no longer decodes is an inconsistency worth surfacing.
+                        report.uncorrectable_blocks += 1;
+                        report.errors.push(ScrubError::UncorrectableBlock {
+                            table_id: self.id(),
+                            path: self.path.to_path_buf(),
+                            block_offset,
+                            reason: alloc::string::String::from(
+                                "in-place heal: block scrubbed clean but its header no \
+                                 longer decodes",
+                            ),
+                        });
+                        continue;
+                    };
+                    match self.raw_block_parity_delta(&raw, &raw_header) {
+                        // Trailer matches (or no ECC): nothing to persist.
+                        Ok(None) => {}
+                        // Trailer rot: persist the freshly computed parity at
+                        // its on-disk position (header + payload unchanged).
+                        Ok(Some(fresh)) => {
+                            let trailer_offset = block_offset
+                                + crate::table::block::Header::header_len(raw_header.block_type)
+                                    as u64
+                                + u64::from(raw_header.data_length);
+                            let write_back = file
+                                .seek(SeekFrom::Start(trailer_offset))
+                                .and_then(|_| file.write_all(&fresh));
+                            let durable = match write_back {
+                                Ok(()) => file.sync_data().map_err(|e| alloc::format!("sync: {e}")),
+                                Err(e) => Err(alloc::format!("write: {e}")),
+                            };
+                            if let Err(reason) = durable {
+                                report.uncorrectable_blocks += 1;
+                                report.errors.push(ScrubError::UncorrectableBlock {
+                                    table_id: self.id(),
+                                    path: self.path.to_path_buf(),
+                                    block_offset,
+                                    reason: alloc::format!("in-place parity rebuild {reason}"),
+                                });
+                                continue;
+                            }
+                            report.blocks_healed_in_place += 1;
+                        }
+                        Err(()) => {
+                            report.uncorrectable_blocks += 1;
+                            report.errors.push(ScrubError::UncorrectableBlock {
+                                table_id: self.id(),
+                                path: self.path.to_path_buf(),
+                                block_offset,
+                                reason: alloc::string::String::from(
+                                    "in-place heal: parity trailer unverifiable on a \
+                                     checksum-clean block",
+                                ),
+                            });
+                        }
+                    }
+                }
                 // Recovered from parity: persist the corrected frame in place.
                 Ok(crate::table::util::BlockScrubOutcome::Corrected { .. }) => {
                     let frame = match crate::table::block::Block::heal_frame(

@@ -353,13 +353,12 @@ pub(crate) fn salvage_with_context(
     // default 0), and the copy must keep the source's identity so it reopens
     // consistently when swapped in for the original. For an encrypted source
     // the two are necessarily equal (the open's AAD binds the caller's id).
-    let mut writer = crate::table::Writer::new(dest.clone(), table.metadata.id, 0, Arc::clone(fs))?
+    let writer = crate::table::Writer::new(dest.clone(), table.metadata.id, 0, Arc::clone(fs))?
         .mirror_from(&table.metadata, table.has_zone_map())
         .use_encryption(options.encryption.clone());
     #[cfg(zstd_any)]
-    let writer_with_dict = writer.use_zstd_dictionary(options.zstd_dictionary.clone());
-    #[cfg(zstd_any)]
-    let mut writer = writer_with_dict;
+    let writer = writer.use_zstd_dictionary(options.zstd_dictionary.clone());
+    let mut writer = writer;
     // A KV-separated source's entries hold ValueHandles into blob files, and
     // blob GC / relocation consults the table's linked_blob_files section to
     // decide whether a blob is still referenced. Carry the SOURCE's links into
