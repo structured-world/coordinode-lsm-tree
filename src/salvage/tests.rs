@@ -1235,6 +1235,129 @@ fn salvage_fails_closed_on_an_unreadable_block_in_a_delete_bearing_sst() -> crat
     Ok(())
 }
 
+/// A delete-bearing columnar SST with a checksum-clean block whose
+/// `ColumnBatch` does NOT decode (a repatched tamper that keeps the leading
+/// row-count u32 intact but breaks the column framing): the block's ACTUAL row
+/// count is unknowable, so every later block's delete positions are
+/// unverifiable — the position verifier must fully decode each block rather
+/// than trust the leading four bytes, and the default salvage must fail
+/// closed instead of dropping the block and masking later rows at positions
+/// it could not prove.
+#[cfg(feature = "columnar")]
+#[test]
+fn salvage_fails_closed_on_an_undecodable_checksum_clean_block_with_deletes() -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::config::DeleteStrategy;
+    use crate::table::block::Header;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let n = 200u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_data_block_size(256)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    for pos in [5u32, 50, 150] {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    // Poison the SECOND data block: stamp an invalid type tag into the first
+    // column's header (payload layout: row_count u32, column_count u32, then
+    // per column id u16 + type u8 + ... — so the first type byte sits at
+    // payload offset 10) and re-stamp the block checksum. The leading
+    // row-count u32 stays intact, the frame stays checksum-consistent, but
+    // `ColumnBatch::decode` fails on the unknown tag.
+    let (block_off, block_size) = {
+        let table = open(source.clone(), &fs)?;
+        let Some(kh) = table.data_block_handles().filter_map(Result::ok).nth(1) else {
+            panic!("source must have at least two data blocks");
+        };
+        (
+            usize::try_from(*kh.as_ref().offset()).unwrap_or(usize::MAX),
+            kh.as_ref().size() as usize,
+        )
+    };
+    let mut bytes = std::fs::read(&source)?;
+    let Some(block) = bytes.get(block_off..block_off + block_size) else {
+        panic!("block range within the file");
+    };
+    let mut cursor = block;
+    let header = Header::decode_from(&mut cursor)?;
+    let header_len = Header::header_len(header.block_type);
+    let payload_range =
+        block_off + header_len..block_off + header_len + header.data_length as usize;
+    {
+        let Some(payload) = bytes.get_mut(payload_range.clone()) else {
+            panic!("payload range within the block");
+        };
+        let Some(tag) = payload.get_mut(10) else {
+            panic!("first column's type byte within the payload");
+        };
+        *tag = 0xEE;
+    }
+    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(
+        bytes.get(payload_range).unwrap_or(&[]),
+    ));
+    let new_header = Header {
+        checksum: new_checksum,
+        ..header
+    };
+    let mut hdr_bytes = Vec::with_capacity(header_len);
+    new_header.encode_into(&mut hdr_bytes)?;
+    let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
+        panic!("block header within the file");
+    };
+    hdr_dst.copy_from_slice(&hdr_bytes);
+    std::fs::write(&source, &bytes)?;
+
+    // Default: fail closed — the block reads back checksum-clean but cannot
+    // be decoded, so its actual row count (and every later block's delete
+    // positions) cannot be proven faithful.
+    let result = salvage_sst(&source, dest.clone(), &fs);
+    assert!(
+        result.is_err(),
+        "unverifiable delete positions fail the default salvage: {result:?}",
+    );
+    assert!(
+        fs.metadata(&dest).is_err(),
+        "no destination file is left behind by the refused salvage",
+    );
+
+    // Explicit opt-in: the poisoned block is dropped, every other row is
+    // recovered LIVE (never masked against unproven positions).
+    let options = SalvageOptions {
+        allow_delete_resurrection: true,
+        ..SalvageOptions::default()
+    };
+    let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
+    assert_eq!(
+        report.dropped.len(),
+        1,
+        "exactly the poisoned block is dropped: {report:?}",
+    );
+    assert!(
+        report.entries_salvaged < u64::from(n),
+        "the poisoned block's rows are lost: {report:?}",
+    );
+    assert_eq!(
+        reopen_item_count(dest, &fs)?,
+        report.entries_salvaged,
+        "the recovered copy reopens with every salvaged row live",
+    );
+    Ok(())
+}
+
 /// A zone map that DECODES but carries wrong per-block row counts (a
 /// checksum-repatched tamper) would misposition the delete bitmap: the masked
 /// re-emit derives each block's start row from the zone map, so deletes land
