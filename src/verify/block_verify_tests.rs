@@ -222,6 +222,65 @@ fn verify_block_checksums_clean_nondefault_ecc_tree_has_no_errors() {
     );
 }
 
+/// Rot confined to a Page-ECC parity trailer is invisible to the payload
+/// checksum (the checksum covers the payload only; parity is consulted just
+/// for recovery on a mismatch), so a walk that merely SKIPS the trailer
+/// reports the SST as healthy while its ECC is dead — a later payload fault
+/// on that block would no longer be recoverable. The out-of-band walk must
+/// compare each clean block's trailer against freshly computed parity and
+/// flag a mismatch.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn verify_sst_file_detects_a_rotted_parity_trailer() {
+    use crate::coding::Decode;
+    use crate::table::block::Header;
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let any = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+        .page_ecc(true)
+        .ecc_scheme(crate::runtime_config::EccScheme::ReedSolomon {
+            data_shards: 4,
+            parity_shards: 2,
+        })
+        .open()
+        .unwrap();
+        for i in 0u64..2_000 {
+            let key = format!("k{i:08}");
+            let val = format!("v{i:08}");
+            any.insert(key.as_bytes(), val.as_bytes(), 1 + i);
+        }
+        any.flush_active_memtable(2_001).unwrap();
+        drop(any);
+    }
+    let sst_path = pick_first_sst_path(dir.path());
+
+    // The first data block sits at file offset 0 (the writer opens the file
+    // with the `data` section). Its parity trailer follows the payload:
+    // header_len + data_length.
+    let mut bytes = std::fs::read(&sst_path).unwrap();
+    let mut cursor = bytes.as_slice();
+    let header = Header::decode_from(&mut cursor).unwrap();
+    let trailer_pos = Header::header_len(header.block_type) + header.data_length as usize;
+    let slot = bytes
+        .get_mut(trailer_pos)
+        .expect("parity trailer within the file");
+    *slot ^= 0xFF;
+    std::fs::write(&sst_path, &bytes).unwrap();
+
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        !report.is_ok(),
+        "a rotted parity trailer under a clean payload checksum must be \
+         flagged (dead ECC), got {report:?}",
+    );
+}
+
 /// Returns the on-disk path of the first SST registered with the
 /// tree's current version. Drops the tree before returning so the
 /// caller can mutate the file safely (no descriptor cache, no

@@ -355,6 +355,194 @@ fn repair_with_salvage_reports_a_corrupt_bitmap_and_block_sst_as_unsalvageable()
     Ok(())
 }
 
+/// `repair_with_salvage` must not accept a table whose ECC descriptor this
+/// build cannot interpret: the out-of-band verify skips the SST-block
+/// sections for such a table (their parity-trailer length is underivable), so
+/// its report carries a WARNING and the on-disk bytes are effectively
+/// unchecked. A gate that only checks `is_ok()` stamps those unchecked bytes
+/// into the rebuilt manifest; the repair must instead salvage the table
+/// (re-encode under a recognized descriptor) so the result is verifiable.
+#[test]
+fn repair_with_salvage_rewrites_an_unrecognized_ecc_sst() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    let n = 200u32;
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?;
+        for i in 0..n {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Forge an UNRECOGNIZED ECC descriptor into both meta blocks (`meta` and
+    // its `meta_mid` mirror) and re-stamp their checksums. Meta blocks are
+    // written with restart interval 1 (no prefix truncation), so the key
+    // appears verbatim in the payload, followed by a one-byte value length
+    // (4) and the 4-byte descriptor. `[0, 8, 2, 1]` is a non-canonical "off"
+    // (junk reserved bytes) that decodes to `ecc_unrecognized = true`: reads
+    // still work (payload framed by data_length), but the out-of-band verify
+    // cannot size the parity trailers, so the SST-block sections are skipped
+    // with a warning — the table's on-disk bytes are effectively UNCHECKED.
+    forge_unrecognized_ecc_descriptor(&sst)?;
+    // Precondition: the forged table opens and is flagged unrecognized.
+    assert!(
+        recover_table(sst.clone(), &fs)?.metadata.ecc_unrecognized,
+        "the forged descriptor must flag the table as unrecognized-ECC",
+    );
+
+    // Salvage-mode repair must NOT stamp a table whose block sections could
+    // not be verified into the rebuilt manifest as-is: the warning-bearing
+    // verify report means the bytes are unchecked, so the table is salvaged
+    // (re-encoded under a recognized descriptor) instead.
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.salvaged, 1,
+        "an unverifiable unrecognized-ECC table is rewritten, not accepted \
+         as-is: {report:?}",
+    );
+    assert!(
+        report.unreadable_files.is_empty(),
+        "every row is recoverable: {:?}",
+        report.unreadable_files,
+    );
+
+    // The rewritten table carries a recognized descriptor and every row.
+    let table = recover_table(sst, &fs)?;
+    assert!(
+        !table.metadata.ecc_unrecognized,
+        "the salvaged copy is re-stamped with a recognized descriptor",
+    );
+    assert_eq!(table.metadata.item_count, u64::from(n));
+    Ok(())
+}
+
+/// Recovers the SST at `path` as a `Table`, stamping the open with the file's
+/// current digest.
+fn recover_table(
+    path: std::path::PathBuf,
+    fs: &std::sync::Arc<dyn crate::fs::Fs>,
+) -> crate::Result<crate::table::Table> {
+    use std::sync::Arc;
+    let checksum = crate::Checksum::from_raw(super::compute_table_checksum(&**fs, &path)?);
+    crate::table::Table::recover(
+        path,
+        checksum,
+        0,
+        0,
+        0,
+        Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+        Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8))),
+        Arc::clone(fs),
+        false,
+        false,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        crate::comparator::default_comparator(),
+        #[cfg(feature = "metrics")]
+        Arc::new(crate::Metrics::default()),
+    )
+}
+
+/// Patches `descriptor#page_ecc` to a non-canonical (unrecognized) value in
+/// both meta blocks of the SST at `path`, re-stamping each block's checksum
+/// so the frames stay checksum-clean.
+fn forge_unrecognized_ecc_descriptor(path: &std::path::Path) -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::table::block::Header;
+
+    let mut bytes = std::fs::read(path)?;
+    let sections: Vec<(u64, u64)> = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        [b"meta".as_slice(), b"meta_mid".as_slice()]
+            .iter()
+            .map(|name| {
+                let Some(entry) = reader.toc().iter().find(|e| e.name() == *name) else {
+                    panic!(
+                        "the SST must carry a {} section",
+                        String::from_utf8_lossy(name)
+                    );
+                };
+                (entry.pos(), entry.len())
+            })
+            .collect()
+    };
+    for (pos, _len) in sections {
+        let block_off = usize::try_from(pos).unwrap_or(usize::MAX);
+        let Some(block) = bytes.get(block_off..) else {
+            panic!("meta block within the file");
+        };
+        let mut cursor = block;
+        let header = Header::decode_from(&mut cursor)?;
+        let header_len = Header::header_len(header.block_type);
+        let payload_range =
+            block_off + header_len..block_off + header_len + header.data_length as usize;
+        {
+            let Some(payload) = bytes.get_mut(payload_range.clone()) else {
+                panic!("meta payload within the file");
+            };
+            let needle = b"descriptor#page_ecc";
+            let Some(key_pos) = payload
+                .windows(needle.len())
+                .position(|w| w == needle.as_slice())
+            else {
+                panic!("descriptor key present verbatim (restart interval 1)");
+            };
+            // Entry layout after the key bytes: value length (LEB128, one
+            // byte for 4), then the 4-byte descriptor value.
+            let val_at = key_pos + needle.len();
+            assert_eq!(
+                payload.get(val_at).copied(),
+                Some(4),
+                "descriptor value length prefix",
+            );
+            let Some(value) = payload.get_mut(val_at + 1..val_at + 5) else {
+                panic!("descriptor value within the payload");
+            };
+            assert_eq!(value, [0u8, 0, 0, 0], "table was written without ECC");
+            value.copy_from_slice(&[0u8, 8, 2, 1]);
+        }
+        let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(
+            bytes.get(payload_range).unwrap_or(&[]),
+        ));
+        let new_header = Header {
+            checksum: new_checksum,
+            ..header
+        };
+        let mut hdr_bytes = Vec::with_capacity(header_len);
+        new_header.encode_into(&mut hdr_bytes)?;
+        let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
+            panic!("meta header within the file");
+        };
+        hdr_dst.copy_from_slice(&hdr_bytes);
+    }
+    std::fs::write(path, &bytes)?;
+    Ok(())
+}
+
 /// `repair_with_salvage` QUARANTINES an SST whose delete-bitmap section is
 /// corrupt rather than recovering it: whole-file recovery refuses it (a corrupt
 /// bitmap would resurrect deleted rows) and automated salvage fails closed for
