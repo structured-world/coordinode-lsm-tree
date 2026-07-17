@@ -851,6 +851,92 @@ fn repair_with_salvage_correctable_ecc_fault_in_encrypted_sst_is_rewritten() -> 
     Ok(())
 }
 
+/// A corrupt BLOOM FILTER block in an encrypted SST must drive
+/// `repair_with_salvage` into salvaging the table: the encrypted verify path
+/// scrubs data blocks through the table, but the filter section loads lazily
+/// on point reads — without verifying it, repair accepts an SST whose later
+/// reads fail on the corrupt filter (the unencrypted out-of-band verifier
+/// covers the filter section).
+#[cfg(feature = "encryption")]
+#[test]
+fn repair_with_salvage_corrupt_filter_in_encrypted_sst_is_rewritten() -> lsm_tree::Result<()> {
+    use lsm_tree::Aes256GcmProvider;
+    use std::sync::Arc;
+
+    let dir = lsm_tree::get_tmp_folder();
+    let provider = || Arc::new(Aes256GcmProvider::new(&[0x7C; 32]));
+    {
+        let tree = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_encryption(Some(provider()))
+        .open()?;
+        for i in 0..500 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Corrupt the middle of the `filter` SFA section (data blocks stay intact).
+    let ssts = sorted_sst_paths(dir.path());
+    let victim = ssts.first().expect("an SST to corrupt");
+    {
+        let (pos, len) = {
+            let mut f = std::fs::File::open(victim)?;
+            let reader = lsm_tree::sfa::Reader::from_reader(&mut f)?;
+            let entry = reader
+                .toc()
+                .iter()
+                .find(|e| e.name() == b"filter")
+                .expect("the SST carries a filter section");
+            (entry.pos(), entry.len())
+        };
+        let flip = usize::try_from(pos + len / 2).unwrap_or(0);
+        let mut bytes = std::fs::read(victim)?;
+        let slot = bytes.get_mut(flip).expect("flip position within the SST");
+        *slot ^= 0xFF;
+        std::fs::write(victim, &bytes)?;
+    }
+
+    nuke_manifest(dir.path())?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_encryption(Some(provider()))
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.salvaged, 1,
+        "a corrupt filter drives the encrypted table through salvage: {:?}",
+        report.unreadable_files,
+    );
+    assert_eq!(
+        report.recovered, 1,
+        "the rewritten table joins the manifest"
+    );
+
+    // The tree reopens with a FRESH filter and every point read succeeds.
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_encryption(Some(provider()))
+    .open()?;
+    for i in 0..500 {
+        assert!(
+            tree.get(key(i), MAX_SEQNO)?.is_some(),
+            "key {} reads back through the rebuilt filter",
+            key(i),
+        );
+    }
+    Ok(())
+}
+
 /// `repair_with_salvage` must NOT quarantine and rewrite a HEALTHY encrypted
 /// SST: the block-verify gate has to be encryption-aware (the out-of-band
 /// file walk cannot decode an encrypted meta block, so it would misreport
