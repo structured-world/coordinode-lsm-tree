@@ -754,6 +754,95 @@ fn repair_with_salvage_reports_an_unopenable_sst_as_unreadable() -> lsm_tree::Re
     Ok(())
 }
 
+/// A PERSISTENT but ECC-correctable fault in an encrypted Page-ECC SST must
+/// drive `repair_with_salvage` into salvaging the table (rewriting it with
+/// clean bytes), not accept it as verified: the encrypted verify path scrubs
+/// through the table, and a scrub silently corrects the fault on read
+/// (`corrections_applied > 0` with no errors) while the corrupt bytes stay on
+/// disk — the unencrypted out-of-band verifier flags the same checksum
+/// mismatch and salvages.
+#[cfg(all(feature = "encryption", feature = "page_ecc"))]
+#[test]
+fn repair_with_salvage_correctable_ecc_fault_in_encrypted_sst_is_rewritten() -> lsm_tree::Result<()>
+{
+    use lsm_tree::Aes256GcmProvider;
+    use lsm_tree::runtime_config::EccScheme;
+    use std::sync::Arc;
+
+    let dir = lsm_tree::get_tmp_folder();
+    let provider = || Arc::new(Aes256GcmProvider::new(&[0x6B; 32]));
+    {
+        let tree = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_encryption(Some(provider()))
+        .page_ecc(true)
+        .ecc_scheme(EccScheme::ReedSolomon {
+            data_shards: 4,
+            parity_shards: 2,
+        })
+        .open()?;
+        for i in 0..500 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Flip one byte in the data region: within the RS(4,2) budget, so every
+    // read CORRECTS it in memory — but the fault persists on disk.
+    let ssts = sorted_sst_paths(dir.path());
+    let victim = ssts.first().expect("an SST to corrupt");
+    corrupt_data_region(victim)?;
+
+    nuke_manifest(dir.path())?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_encryption(Some(provider()))
+    .page_ecc(true)
+    .ecc_scheme(EccScheme::ReedSolomon {
+        data_shards: 4,
+        parity_shards: 2,
+    })
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.salvaged, 1,
+        "a persistent correctable fault drives the table through salvage: {:?}",
+        report.unreadable_files,
+    );
+    assert_eq!(
+        report.recovered, 1,
+        "the rewritten table joins the manifest"
+    );
+
+    // The tree reopens and every key reads back from the clean rewrite.
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_encryption(Some(provider()))
+    .page_ecc(true)
+    .ecc_scheme(EccScheme::ReedSolomon {
+        data_shards: 4,
+        parity_shards: 2,
+    })
+    .open()?;
+    for i in 0..500 {
+        assert!(
+            tree.get(key(i), MAX_SEQNO)?.is_some(),
+            "key {} survives the salvage rewrite",
+            key(i),
+        );
+    }
+    Ok(())
+}
+
 /// `repair_with_salvage` must NOT quarantine and rewrite a HEALTHY encrypted
 /// SST: the block-verify gate has to be encryption-aware (the out-of-band
 /// file walk cannot decode an encrypted meta block, so it would misreport
