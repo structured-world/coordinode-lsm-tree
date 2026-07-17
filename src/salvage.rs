@@ -353,19 +353,23 @@ pub(crate) fn salvage_with_context(
     // default 0), and the copy must keep the source's identity so it reopens
     // consistently when swapped in for the original. For an encrypted source
     // the two are necessarily equal (the open's AAD binds the caller's id).
+    // A KV-separated source's entries hold ValueHandles into blob files, and
+    // blob GC / relocation consults the table's linked_blob_files section to
+    // decide whether a blob is still referenced. Carry the SOURCE's links into
+    // the recovered copy — conservatively (a dropped block may remove the last
+    // reference to some blob, so the copy can over-reference; that only makes
+    // GC retain a blob longer, never break a live indirection). Read them
+    // BEFORE `Writer::new` creates `dest`: a fallible step between creation
+    // and the cleanup-wrapped walk below would leak a partial destination on
+    // failure.
+    let blob_links = table.list_blob_file_references()?;
     let writer = crate::table::Writer::new(dest.clone(), table.metadata.id, 0, Arc::clone(fs))?
         .mirror_from(&table.metadata, table.has_zone_map())
         .use_encryption(options.encryption.clone());
     #[cfg(zstd_any)]
     let writer = writer.use_zstd_dictionary(options.zstd_dictionary.clone());
     let mut writer = writer;
-    // A KV-separated source's entries hold ValueHandles into blob files, and
-    // blob GC / relocation consults the table's linked_blob_files section to
-    // decide whether a blob is still referenced. Carry the SOURCE's links into
-    // the recovered copy — conservatively (a dropped block may remove the last
-    // reference to some blob, so the copy can over-reference; that only makes
-    // GC retain a blob longer, never break a live indirection).
-    if let Some(links) = table.list_blob_file_references()? {
+    if let Some(links) = blob_links {
         for link in links {
             writer.link_blob_file(link.blob_file_id, link.len, link.bytes, link.on_disk_bytes);
         }
