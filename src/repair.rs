@@ -176,13 +176,18 @@ fn block_verify_passes(
     table_path: &std::path::Path,
     table: &Table,
 ) -> bool {
-    crate::verify::verify_sst_file_with_context(
+    let report = crate::verify::verify_sst_file_with_context(
         &**folder_fs,
         table_path,
         config.encryption.as_deref(),
         table.metadata.id,
-    )
-    .is_ok()
+    );
+    // A warning-bearing report means part of the table was NOT verified
+    // (e.g. an unrecognized ECC descriptor skips every SST-block section):
+    // repair must not stamp effectively-unchecked bytes into the rebuilt
+    // manifest, so warnings fail this gate and route the table to salvage
+    // (which re-encodes it under a recognized descriptor).
+    report.is_ok() && !report.has_warnings()
 }
 
 fn try_salvage_table(

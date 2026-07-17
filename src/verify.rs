@@ -310,6 +310,23 @@ pub enum BlockVerifyError {
         error: io::Error,
     },
 
+    /// A block's Page-ECC parity trailer did not match parity freshly
+    /// computed over its (checksum-clean) payload. The payload itself is
+    /// intact — but the block's ECC is dead: a later payload fault could no
+    /// longer be recovered from this trailer. Reported only when the payload
+    /// checksum matched (a corrupt payload legitimately mismatches the
+    /// original trailer and is already reported as `DataCorrupted`).
+    EccParityMismatch {
+        /// Table ID.
+        table_id: TableId,
+        /// Path to the SST file.
+        path: PathBuf,
+        /// File offset where the block header sits.
+        offset: u64,
+        /// Length of the on-disk data segment, in bytes.
+        data_length: u32,
+    },
+
     /// SFA TOC-level corruption: a named section's length / position
     /// fields are inconsistent (overflow on addition), or seeking to
     /// its declared start offset fails before any block is read.
@@ -382,6 +399,18 @@ impl core::fmt::Display for BlockVerifyError {
                 f,
                 "SST table {table_id} at {}: failed to read {data_length}-byte data segment for \
                  block at offset {offset}: {error}",
+                path.display(),
+            ),
+            Self::EccParityMismatch {
+                table_id,
+                path,
+                offset,
+                data_length,
+            } => write!(
+                f,
+                "SST table {table_id} at {}: block at offset {offset} ({data_length} bytes) has a \
+                 clean payload but its ECC parity trailer does not match freshly computed parity \
+                 (dead ECC — recompact or heal in place)",
                 path.display(),
             ),
             Self::TocCorrupted {
@@ -1028,6 +1057,9 @@ fn scan_sst_blocks(
     // calls into a single growing allocation that settles at the
     // largest block size seen.
     let mut data_buf: Vec<u8> = Vec::new();
+    // Same story for the Page-ECC parity trailer (read for alignment and,
+    // when the codecs are compiled in, verified against fresh parity).
+    let mut parity_buf: Vec<u8> = Vec::new();
 
     for entry in toc.iter() {
         if RAW_FORMAT_SECTIONS.contains(&entry.name()) {
@@ -1078,6 +1110,7 @@ fn scan_sst_blocks(
             table_id,
             path,
             data_buf: &mut data_buf,
+            parity_buf: &mut parity_buf,
             blocks_scanned: &mut blocks_scanned,
             errors: &mut errors,
             max_data_length: block_data_length_cap(max_enc_overhead),
@@ -1143,6 +1176,10 @@ struct WalkCtx<'a> {
     table_id: TableId,
     path: &'a Path,
     data_buf: &'a mut Vec<u8>,
+    /// Reused buffer for each block's Page-ECC parity trailer: consumed for
+    /// walk alignment and, on a build with the ECC codecs, verified against
+    /// parity freshly recomputed over the payload.
+    parity_buf: &'a mut Vec<u8>,
     blocks_scanned: &'a mut usize,
     errors: &'a mut Vec<BlockVerifyError>,
     /// Effective `data_length` cap (plaintext limit + AEAD overhead).
@@ -1362,7 +1399,8 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         }
 
         let computed = Checksum::from_raw(crate::hash::hash128(ctx.data_buf));
-        if computed != header.checksum {
+        let payload_clean = computed == header.checksum;
+        if !payload_clean {
             ctx.errors.push(BlockVerifyError::DataCorrupted {
                 table_id: ctx.table_id,
                 path: ctx.path.to_path_buf(),
@@ -1374,58 +1412,57 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         }
 
         // Consume the parity trailer (if any) so the reader cursor lands on
-        // the next block's header. The payload checksum above already covers
-        // correctness; parity is only consulted for ECC recovery on the live
-        // read path, so the scrub discards it — but it MUST still skip exactly
-        // `parity_len` bytes or the next iteration mis-reads parity as a header.
+        // the next block's header — it MUST advance exactly `parity_len` bytes
+        // or the next iteration mis-reads parity as a header. The trailer is
+        // read into a buffer (not drained) so a build with the ECC codecs can
+        // also VERIFY it: the payload checksum never covers the trailer, so
+        // rot confined to parity reads as a clean block while its ECC is dead.
         if parity_len > 0 {
-            // Discard the parity trailer so the cursor lands on the next block's
-            // header. `crate::io` has no `copy`/`sink`, so drain exactly
-            // `parity_len` bytes through a small scratch buffer.
-            let mut scratch = [0u8; 512];
-            let mut remaining = parity_len;
-            // A short read (EOF before `parity_len`) and an underlying read error
-            // are the same outcome for the scrub: the trailer cannot be skipped,
-            // so collapse both into one `Err` and report a single DataReadError.
-            let drain: io::Result<()> = loop {
-                if remaining == 0 {
-                    break Ok(());
-                }
-                let want =
-                    usize::try_from(remaining.min(scratch.len() as u64)).unwrap_or(scratch.len());
-                let (head, _) = scratch.split_at_mut(want);
-                match ctx.reader.read(head) {
-                    Ok(0) => {
-                        break Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            alloc::format!(
-                                "parity trailer truncated: read {} of {parity_len} bytes",
-                                parity_len - remaining
-                            ),
-                        ));
-                    }
-                    Ok(n) => remaining -= n as u64,
-                    Err(e) => {
-                        // EINTR is transient: retry the read rather than aborting
-                        // the parity skip with a spurious DataReadError (matches
-                        // the Interrupted handling in read_exact above). Convert
-                        // first so the kind check is uniform across std/no_std.
-                        let e: io::Error = e.into();
-                        if e.kind() != io::ErrorKind::Interrupted {
-                            break Err(e);
-                        }
-                    }
-                }
-            };
-            if let Err(error) = drain {
+            let parity_usize = usize::try_from(parity_len).unwrap_or(usize::MAX);
+            ctx.parity_buf.resize(parity_usize, 0);
+            // A short read (EOF before `parity_len`) and an underlying read
+            // error are the same outcome for the scrub: the trailer cannot be
+            // consumed, so report a single DataReadError. (`read_exact`
+            // retries `Interrupted` internally.)
+            if let Err(e) = ctx.reader.read_exact(ctx.parity_buf.as_mut_slice()) {
                 ctx.errors.push(BlockVerifyError::DataReadError {
                     table_id: ctx.table_id,
                     path: ctx.path.to_path_buf(),
                     offset,
                     data_length: header.data_length,
-                    error,
+                    error: e.into(),
                 });
                 return;
+            }
+            // Compare the stored trailer against parity freshly computed over
+            // the payload — only when the payload itself is checksum-clean (a
+            // corrupt payload legitimately mismatches its original trailer and
+            // is already reported as DataCorrupted above). Only a build with
+            // the ECC codecs can recompute parity; without `page_ecc` the
+            // trailer is consumed for alignment but stays unverified (that
+            // build cannot consume it on the read path either).
+            #[cfg(feature = "page_ecc")]
+            if payload_clean && let Some(scheme) = block_ecc {
+                let fresh = match scheme {
+                    crate::table::block::EccParams::Secded => {
+                        Some(crate::secded::encode_block_parity(ctx.data_buf))
+                    }
+                    crate::table::block::EccParams::Shard { .. } => {
+                        let (ds, ps) = scheme.as_shards();
+                        crate::ecc::encode_parity(ctx.data_buf, ds, ps).ok()
+                    }
+                };
+                // An encoder that rejects a shape the writer accepted, or a
+                // trailer that differs from the recomputed parity, both mean
+                // the block's ECC cannot be trusted — fail loud either way.
+                if fresh.as_deref() != Some(ctx.parity_buf.as_slice()) {
+                    ctx.errors.push(BlockVerifyError::EccParityMismatch {
+                        table_id: ctx.table_id,
+                        path: ctx.path.to_path_buf(),
+                        offset,
+                        data_length: header.data_length,
+                    });
+                }
             }
         }
 
