@@ -288,6 +288,17 @@ impl Table {
             // Parse the buffer
             let mut reader = &buf[..];
             let len = reader.read_u32::<LE>()?;
+            // Bound the declared record count by the bytes that remain BEFORE
+            // reserving: each record is 4 u64s (32 bytes), so a corrupt or
+            // forged count header (e.g. u32::MAX) must fail as invalid data
+            // here rather than trigger a multi-GB Vec pre-allocation (which
+            // aborts the process on allocators that don't overcommit).
+            const RECORD_SIZE: usize = 4 * core::mem::size_of::<u64>();
+            if len as usize > reader.len() / RECORD_SIZE {
+                return Err(crate::Error::InvalidHeader(
+                    "linked_blob_files: declared record count exceeds section size",
+                ));
+            }
             let mut blob_files = Vec::with_capacity(len as usize);
 
             for _ in 0..len {
