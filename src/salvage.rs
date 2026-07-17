@@ -353,11 +353,24 @@ pub(crate) fn salvage_with_context(
     // default 0), and the copy must keep the source's identity so it reopens
     // consistently when swapped in for the original. For an encrypted source
     // the two are necessarily equal (the open's AAD binds the caller's id).
-    let writer = crate::table::Writer::new(dest.clone(), table.metadata.id, 0, Arc::clone(fs))?
+    let mut writer = crate::table::Writer::new(dest.clone(), table.metadata.id, 0, Arc::clone(fs))?
         .mirror_from(&table.metadata, table.has_zone_map())
         .use_encryption(options.encryption.clone());
     #[cfg(zstd_any)]
-    let writer = writer.use_zstd_dictionary(options.zstd_dictionary.clone());
+    let writer_with_dict = writer.use_zstd_dictionary(options.zstd_dictionary.clone());
+    #[cfg(zstd_any)]
+    let mut writer = writer_with_dict;
+    // A KV-separated source's entries hold ValueHandles into blob files, and
+    // blob GC / relocation consults the table's linked_blob_files section to
+    // decide whether a blob is still referenced. Carry the SOURCE's links into
+    // the recovered copy — conservatively (a dropped block may remove the last
+    // reference to some blob, so the copy can over-reference; that only makes
+    // GC retain a blob longer, never break a live indirection).
+    if let Some(links) = table.list_blob_file_references()? {
+        for link in links {
+            writer.link_blob_file(link.blob_file_id, link.len, link.bytes, link.on_disk_bytes);
+        }
+    }
 
     let walk = match salvage_blocks(&table, writer, comparator, !delete_mask_unpositionable) {
         Ok(walk) => walk,
