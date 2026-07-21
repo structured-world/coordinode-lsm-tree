@@ -920,6 +920,86 @@ fn repair_with_salvage_rejects_a_corrupt_unrecognized_ecc_tombstone_sst_with_par
     Ok(())
 }
 
+/// The fallback verification behind the unscanned escape hatch must also
+/// cover the LAZY side blocks a data scrub never touches: the full bloom
+/// filter only loads on the first point read, so a table with clean data
+/// blocks but a corrupt filter would otherwise be kept and fail point reads
+/// once the rebuilt manifest goes live.
+#[test]
+fn repair_with_salvage_rejects_an_unrecognized_ecc_tombstone_sst_with_a_corrupt_filter()
+-> crate::Result<()> {
+    use crate::range_tombstone::RangeTombstone;
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, UserKey, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?;
+        for i in 0..200u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        w.write_range_tombstone(RangeTombstone::new(
+            UserKey::from(b"k00002".as_slice()),
+            UserKey::from(b"k00005".as_slice()),
+            2,
+        ));
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Forge the unrecognized descriptor and corrupt the FILTER section: the
+    // out-of-band walk skips it (unrecognized descriptor), the data scrub
+    // never loads it (the full bloom filter is lazy), so only a point read
+    // can surface the damage.
+    forge_unrecognized_ecc_descriptor(&sst)?;
+    let (filter_pos, filter_len) = {
+        let mut f = std::fs::File::open(&sst)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"filter") else {
+            panic!("the SST must carry a filter section");
+        };
+        (entry.pos(), entry.len())
+    };
+    let flip = usize::try_from(filter_pos + filter_len / 2).unwrap_or(0);
+    let mut bytes = std::fs::read(&sst)?;
+    if let Some(b) = bytes.get_mut(flip) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&sst, &bytes)?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.recovered, 0,
+        "a table whose lazy filter is corrupt must not be kept over the \
+         range-tombstone escape hatch: {report:?}",
+    );
+    assert_eq!(
+        report.unreadable_files.len(),
+        1,
+        "the unverifiable table is reported unreadable: {:?}",
+        report.unreadable_files,
+    );
+    Ok(())
+}
+
 /// Patches `descriptor#page_ecc` to a non-canonical (unrecognized) value in
 /// both meta blocks of the SST at `path`, re-stamping each block's checksum
 /// so the frames stay checksum-clean.
