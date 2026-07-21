@@ -182,21 +182,13 @@ fn block_verify_verdict(
         config.encryption.as_deref(),
         table.metadata.id,
     );
-    if !report.is_ok() {
-        // Parity-ONLY rot: every payload checksum verified clean, only the
-        // recovery margin is dead. The data is fully readable, so it grades
-        // like a warning-bearing report — salvage preferred (the rewrite
-        // regenerates fresh parity), but never at the cost of dropping data
-        // salvage cannot re-emit.
-        if report
-            .errors
-            .iter()
-            .all(|e| matches!(e, crate::verify::BlockVerifyError::EccParityMismatch { .. }))
-        {
-            BlockVerifyVerdict::DegradedButReadable
-        } else {
-            BlockVerifyVerdict::Corrupt
-        }
+    // A non-parity error is corruption regardless of any warnings.
+    if !report
+        .errors
+        .iter()
+        .all(|e| matches!(e, crate::verify::BlockVerifyError::EccParityMismatch { .. }))
+    {
+        BlockVerifyVerdict::Corrupt
     } else if report
         .warnings
         .iter()
@@ -205,8 +197,18 @@ fn block_verify_verdict(
         // Unrecognized ECC descriptor: the walk SKIPPED the SST-block
         // sections entirely (their trailer length is underivable), so
         // NOTHING about the data was verified — a stronger degradation
-        // than a checked-but-unverifiable-parity report.
+        // than a checked-but-unverifiable-parity report. Graded BEFORE the
+        // parity-only arm below: parity mismatches in the still-walked
+        // self-describing meta blocks must not mask the skipped data /
+        // index sections.
         BlockVerifyVerdict::DegradedUnscanned
+    } else if !report.is_ok() {
+        // Parity-ONLY rot: every payload checksum verified clean, only the
+        // recovery margin is dead. The data is fully readable, so it grades
+        // like a warning-bearing report — salvage preferred (the rewrite
+        // regenerates fresh parity), but never at the cost of dropping data
+        // salvage cannot re-emit.
+        BlockVerifyVerdict::DegradedButReadable
     } else if report.has_warnings() {
         // Everything scanned verified clean, but the parity trailers could
         // not be recomputed (a parity-less build). The caller decides
@@ -281,8 +283,14 @@ fn verify_wants_salvage(
                 // regardless of the descriptor. Clean → keep; anything else
                 // → salvage (whose range-tombstone refusal then correctly
                 // reports the corrupt table as unreadable).
+                //
+                // `is_ok()` alone is NOT enough: it only counts uncorrectable
+                // blocks, while a block-index walk failure (a corrupt
+                // partitioned-index leaf) lands in `errors` without touching
+                // that counter — and means the data blocks were never even
+                // ENUMERATED. The keep requires an error-free scrub.
                 let scrub = table.scrub_data_blocks();
-                if scrub.is_ok() {
+                if scrub.is_ok() && scrub.errors.is_empty() {
                     log::warn!(
                         "table {} at {}: data verified clean through handle-based \
                          reads (its ECC descriptor is unrecognized, so the \
