@@ -544,6 +544,14 @@ impl Table {
             self.zstd_dictionary.as_deref(),
         )?;
         let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
+        // A real writer never emits an empty data block (the ingest path skips
+        // the write entirely), so a checksum-clean ZERO-ROW batch is malformed
+        // input. Reject it here rather than return it as "live": the writer
+        // primitives emit nothing for an empty batch, and a caller counting it
+        // as recovered would misreport an unrecovered block as salvaged.
+        if batch.row_count == 0 {
+            return Err(crate::Error::InvalidHeader("columnar: zero-row data block"));
+        }
         let Some(start) = self
             .delete_block_starts
             .as_ref()

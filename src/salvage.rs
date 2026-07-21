@@ -591,6 +591,21 @@ fn salvage_blocks(
                             crate::table::columnar::column_batch_to_entries(&batch)
                                 .map(|entries| (batch, entries))
                         }) {
+                        // A real writer never emits an empty data block, so a
+                        // checksum-clean ZERO-ROW batch is malformed input:
+                        // the writer primitives below would emit NOTHING for
+                        // it, and counting it as salvaged would misreport an
+                        // unrecovered block (an SST whose only block is empty
+                        // would even report a salvaged path that the
+                        // empty-table finish just removed).
+                        Ok((batch, _)) if batch.row_count == 0 => {
+                            dropped.push(classify_drop(
+                                &crate::Error::InvalidHeader("columnar: zero-row data block"),
+                                offset,
+                                prev_end.as_ref(),
+                                &end_key,
+                            ));
+                        }
                         Ok((batch, entries)) => {
                             let rows = u64::from(batch.row_count);
                             // A delete-bearing SST is never byte-copied, even
@@ -666,6 +681,23 @@ fn salvage_blocks(
                         Ok(iter) => {
                             let entries: Vec<crate::InternalValue> =
                                 iter.map(|p| p.materialize(data_block.as_slice())).collect();
+                            // A real writer never emits an empty data block, so
+                            // checksum-clean ZERO entries are malformed input:
+                            // the emit below would write nothing, and counting
+                            // the block as salvaged would misreport it (see the
+                            // columnar zero-row arm above).
+                            if entries.is_empty() {
+                                dropped.push(classify_drop(
+                                    &crate::Error::InvalidHeader(
+                                        "row block decodes to zero entries",
+                                    ),
+                                    offset,
+                                    prev_end.as_ref(),
+                                    &end_key,
+                                ));
+                                prev_end = Some(end_key);
+                                continue;
+                            }
                             let count = entries.len() as u64;
                             // Ordering guard for BOTH emit paths: the verbatim
                             // append validates internally, but the row-by-row
