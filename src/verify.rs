@@ -459,6 +459,20 @@ pub enum BlockVerifyWarning {
         /// On-disk path of the SST.
         path: PathBuf,
     },
+
+    /// The table carries a RECOGNIZED Page-ECC scheme, but this build was
+    /// compiled without the ECC codecs (the `page_ecc` feature), so its parity
+    /// trailers were consumed for walk alignment but could NOT be verified.
+    /// Block payloads still verify by their own checksums — parity-only rot is
+    /// what stays invisible on this build. Verify on a `page_ecc`-enabled
+    /// build, or recompact (on this build the rewrite is parity-less) to leave
+    /// only verifiable bytes.
+    ParityUnverifiable {
+        /// Table the warning applies to.
+        table_id: TableId,
+        /// On-disk path of the SST.
+        path: PathBuf,
+    },
 }
 
 /// Aggregated result of a per-block scrub run.
@@ -578,6 +592,19 @@ fn scan_one_table(table: &crate::table::Table) -> BlockVerifyReport {
             table_id,
             path: path.to_path_buf(),
         });
+    }
+
+    // A recognized scheme on a build WITHOUT the ECC codecs: trailers are
+    // consumed for alignment but cannot be verified (parity-only rot stays
+    // invisible) — surface the gap, mirroring the out-of-band walk.
+    #[cfg(not(feature = "page_ecc"))]
+    if table.metadata.ecc_params.is_some() {
+        report
+            .warnings
+            .push(BlockVerifyWarning::ParityUnverifiable {
+                table_id,
+                path: path.to_path_buf(),
+            });
     }
 
     // Use each Table's own `Fs` handle (StdFs, MemFs, IoUring, …).
@@ -847,7 +874,7 @@ pub(crate) fn verify_sst_file_with_context(
                 path.display(),
             );
             report.warnings.push(BlockVerifyWarning::UnrecognizedEcc {
-                table_id: 0,
+                table_id,
                 path: path.to_path_buf(),
             });
             ecc_unrecognized = true;
@@ -858,7 +885,7 @@ pub(crate) fn verify_sst_file_with_context(
         // undeterminable; skip the walk rather than mis-walk an ECC-bearing SST.
         Ok(None) => {
             report.errors.push(BlockVerifyError::SstFileUnreadable {
-                table_id: 0,
+                table_id,
                 path: path.to_path_buf(),
                 error: io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -874,7 +901,7 @@ pub(crate) fn verify_sst_file_with_context(
         // rather than collapsing it into the undeterminable message above.
         Err(error) => {
             report.errors.push(BlockVerifyError::SstFileUnreadable {
-                table_id: 0,
+                table_id,
                 path: path.to_path_buf(),
                 error: error.into(),
             });
@@ -882,20 +909,36 @@ pub(crate) fn verify_sst_file_with_context(
         }
     };
 
+    // A recognized scheme on a build WITHOUT the ECC codecs: the trailers are
+    // consumed for walk alignment but cannot be verified, so parity-only rot
+    // stays invisible. Surface that as a warning — the repair gate requires a
+    // warning-free report, so such a table routes to salvage (whose rewrite is
+    // parity-less on this build, leaving only verifiable bytes) instead of
+    // being stamped into a rebuilt manifest with unchecked trailer bytes.
+    #[cfg(not(feature = "page_ecc"))]
+    if ecc.is_some() {
+        report
+            .warnings
+            .push(BlockVerifyWarning::ParityUnverifiable {
+                table_id,
+                path: path.to_path_buf(),
+            });
+    }
+
     // Encrypted blocks legitimately exceed the plaintext data_length cap by
     // up to the provider's AEAD overhead (mirroring `Block::from_file`); a
     // zero here would false-flag a healthy encrypted block just over the cap
     // as HeaderCorrupted and send the whole table to quarantine/salvage.
     let max_enc_overhead =
         encryption.map_or(0u32, crate::encryption::EncryptionProvider::max_overhead);
-    match scan_sst_blocks(fs, path, 0, max_enc_overhead, ecc, ecc_unrecognized) {
+    match scan_sst_blocks(fs, path, table_id, max_enc_overhead, ecc, ecc_unrecognized) {
         Ok(per_file) => {
             report.blocks_scanned = per_file.blocks_scanned;
             report.errors = per_file.errors;
         }
         Err(error) => {
             report.errors.push(BlockVerifyError::SstFileUnreadable {
-                table_id: 0,
+                table_id,
                 path: path.to_path_buf(),
                 error,
             });
