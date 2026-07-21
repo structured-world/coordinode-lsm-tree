@@ -183,14 +183,27 @@ fn block_verify_verdict(
         table.metadata.id,
     );
     if !report.is_ok() {
-        BlockVerifyVerdict::Corrupt
+        // Parity-ONLY rot: every payload checksum verified clean, only the
+        // recovery margin is dead. The data is fully readable, so it grades
+        // like a warning-bearing report — salvage preferred (the rewrite
+        // regenerates fresh parity), but never at the cost of dropping data
+        // salvage cannot re-emit.
+        if report
+            .errors
+            .iter()
+            .all(|e| matches!(e, crate::verify::BlockVerifyError::EccParityMismatch { .. }))
+        {
+            BlockVerifyVerdict::DegradedButReadable
+        } else {
+            BlockVerifyVerdict::Corrupt
+        }
     } else if report.has_warnings() {
         // Everything scanned verified clean, but part of the table could NOT
         // be checked (an unrecognized ECC descriptor skips the SST-block
         // sections; a parity-less build cannot recompute trailers). The
         // caller decides between salvage (a rewrite under fully-verifiable
         // framing) and keeping the table when salvage cannot re-emit it.
-        BlockVerifyVerdict::WarningsOnly
+        BlockVerifyVerdict::DegradedButReadable
     } else {
         BlockVerifyVerdict::Clean
     }
@@ -201,22 +214,25 @@ fn block_verify_verdict(
 enum BlockVerifyVerdict {
     /// Every section verified against its raw on-disk checksum.
     Clean,
-    /// No errors, but part of the table went UNCHECKED (warning-bearing
-    /// report): prefer a salvage rewrite, but never at the cost of dropping
-    /// data salvage cannot re-emit.
-    WarningsOnly,
-    /// At least one section failed verification.
+    /// Every payload the walk could check verified clean, but the table is
+    /// DEGRADED: part of it went unchecked (warning-bearing report), or its
+    /// parity trailers rotted while the payloads stayed intact. Prefer a
+    /// salvage rewrite, but never at the cost of dropping data salvage
+    /// cannot re-emit.
+    DegradedButReadable,
+    /// At least one payload / section failed verification.
     Corrupt,
 }
 
 /// Whether a freshly-recovered table should be routed through block salvage.
 ///
-/// `Corrupt` always salvages. `WarningsOnly` (payloads verified clean, but
-/// part of the table is uncheckable — an unrecognized ECC descriptor, or a
-/// build without the parity codecs) salvages ONLY when salvage can faithfully
-/// re-emit the table: a range-tombstone SST is rejected by the block walk, so
-/// routing it through salvage would drop healthy, verified data over a
-/// warning — it is kept as-is (with an operator-facing warning) instead.
+/// `Corrupt` always salvages. `DegradedButReadable` (payloads verified clean,
+/// but part of the table is uncheckable — an unrecognized ECC descriptor, a
+/// build without the parity codecs — or its parity trailers rotted) salvages
+/// ONLY when salvage can faithfully re-emit the table: a range-tombstone SST
+/// is rejected by the block walk, so routing it through salvage would drop
+/// healthy, verified data over dead parity — it is kept as-is (with an
+/// operator-facing warning) instead.
 fn verify_wants_salvage(
     config: &Config,
     folder_fs: &Arc<dyn crate::fs::Fs>,
@@ -226,14 +242,15 @@ fn verify_wants_salvage(
     match block_verify_verdict(config, folder_fs, table_path, table) {
         BlockVerifyVerdict::Clean => false,
         BlockVerifyVerdict::Corrupt => true,
-        BlockVerifyVerdict::WarningsOnly => {
+        BlockVerifyVerdict::DegradedButReadable => {
             if table.range_tombstones().is_empty() {
                 true
             } else {
                 log::warn!(
-                    "table {} at {}: verified clean with warnings (partially uncheckable \
-                     ECC), but salvage cannot re-emit its range tombstones — keeping the \
-                     table as-is; recompact to re-stamp it under a verifiable scheme",
+                    "table {} at {}: every payload verified clean but its ECC is \
+                     partially uncheckable or rotted, and salvage cannot re-emit its \
+                     range tombstones — keeping the table as-is; recompact to re-stamp \
+                     it under fresh, verifiable parity",
                     table.metadata.id,
                     table_path.display(),
                 );

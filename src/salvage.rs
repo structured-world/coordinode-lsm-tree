@@ -920,6 +920,16 @@ pub fn salvage_blob_file(
         for item in scanner {
             records_total += 1;
             match item {
+                // A frame whose CRCs are internally consistent but whose
+                // key_len is ZERO is malformed input (the writer's ingest
+                // never emits an empty key and asserts against one): route it
+                // through the corrupt-record path — the scanner is already
+                // positioned past the frame, so the walk continues.
+                Ok(entry) if entry.key.is_empty() => {
+                    dropped.push(DroppedBlob {
+                        reason: BlobDropReason::Corrupt("frame carries an empty key".to_string()),
+                    });
+                }
                 Ok(entry) => {
                     // Record the frame relocation BEFORE the write advances the
                     // writer: existing SST ValueHandles point at SOURCE frame

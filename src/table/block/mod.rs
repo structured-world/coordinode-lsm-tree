@@ -811,6 +811,20 @@ impl Block {
         // compiler folds it out.
         #[cfg(feature = "page_ecc")]
         let parity_buf: Option<Vec<u8>> = if let Some(ecc_params) = transform.ecc_params() {
+            // Reject a trailer above the payload hard cap BEFORE encoding it:
+            // the out-of-band verifier bounds trailers at this cap (its DoS
+            // guard against forged descriptors), so emitting a larger one
+            // would create an SST the verifier falsely flags as corrupt. No
+            // sane scheme/block combination reaches this — it takes a
+            // high-amplification shard layout (e.g. RS(1,255)) on a huge
+            // block — so the write fails loudly instead of producing an
+            // unverifiable file.
+            if expected_parity_len(payload_len, ecc_params) > MAX_DECOMPRESSION_SIZE {
+                return Err(crate::Error::FeatureUnsupported(
+                    "ecc parity trailer above the verifier's hard cap: the configured shard \
+                     scheme amplifies this block's payload past 256 MiB of parity",
+                ));
+            }
             // SEC-DED emits one check byte per 8-byte word; shard schemes emit a
             // Reed-Solomon / XOR trailer. Both produce a parity buffer the
             // reader re-sizes from `data_length` via `expected_parity_len`.
