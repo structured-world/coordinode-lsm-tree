@@ -753,6 +753,173 @@ fn repair_with_salvage_keeps_a_healthy_unrecognized_ecc_tombstone_sst() -> crate
     Ok(())
 }
 
+/// The escape-hatch fallback scrub must be trusted only when it saw EVERY
+/// block: `scrub_data_blocks` records a block-index walk failure in `errors`
+/// WITHOUT counting an uncorrectable block, so a gate that only checks
+/// `is_ok()` treats a table whose data blocks were never enumerated (a
+/// corrupt partitioned-index leaf) as verified clean and keeps it.
+#[test]
+fn repair_with_salvage_rejects_an_unrecognized_ecc_tombstone_sst_with_a_corrupt_index()
+-> crate::Result<()> {
+    use crate::range_tombstone::RangeTombstone;
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, UserKey, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    {
+        // Partitioned index: its leaf blocks load lazily, so a corrupt leaf
+        // survives recovery and only surfaces when the fallback scrub walks
+        // the block index.
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_partitioned_index();
+        for i in 0..200u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        w.write_range_tombstone(RangeTombstone::new(
+            UserKey::from(b"k00002".as_slice()),
+            UserKey::from(b"k00005".as_slice()),
+            2,
+        ));
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Forge the unrecognized descriptor (out-of-band walk skips the data AND
+    // index sections) and corrupt an index leaf so the handle-based fallback
+    // cannot enumerate the data blocks.
+    forge_unrecognized_ecc_descriptor(&sst)?;
+    let (index_pos, index_len) = {
+        let mut f = std::fs::File::open(&sst)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"index") else {
+            panic!("a partitioned-index SST must carry an index section");
+        };
+        (entry.pos(), entry.len())
+    };
+    let flip = usize::try_from(index_pos + index_len / 2).unwrap_or(0);
+    let mut bytes = std::fs::read(&sst)?;
+    if let Some(b) = bytes.get_mut(flip) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&sst, &bytes)?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.recovered, 0,
+        "a table whose data blocks the fallback scrub could not enumerate \
+         must not be kept: {report:?}",
+    );
+    assert_eq!(
+        report.unreadable_files.len(),
+        1,
+        "the unverifiable table is reported unreadable: {:?}",
+        report.unreadable_files,
+    );
+    Ok(())
+}
+
+/// An unrecognized ECC descriptor combined with parity-only errors in the
+/// still-walked self-describing meta blocks must grade as UNSCANNED, not
+/// merely degraded: the SST data/index sections were skipped entirely, so
+/// the range-tombstone escape hatch must run the handle-based scrub — which
+/// here finds the corrupt data block and refuses the keep.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn repair_with_salvage_rejects_a_corrupt_unrecognized_ecc_tombstone_sst_with_parity_errors()
+-> crate::Result<()> {
+    use crate::range_tombstone::RangeTombstone;
+    use crate::table::Writer;
+    use crate::table::block::EccParams;
+    use crate::{Config, InternalValue, SequenceNumberCounter, UserKey, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    {
+        // An ECC table: its meta blocks carry SELF-DESCRIBING parity, which
+        // the forge below leaves stale (it re-stamps the payload checksum
+        // without recomputing the trailer) — producing exactly the
+        // EccParityMismatch-only error set on a walk that skipped the data.
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?
+            .use_ecc(Some(EccParams::try_new(4, 2)?));
+        for i in 0..8u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        w.write_range_tombstone(RangeTombstone::new(
+            UserKey::from(b"k00002".as_slice()),
+            UserKey::from(b"k00005".as_slice()),
+            2,
+        ));
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    forge_unrecognized_ecc_descriptor(&sst)?;
+    // Corrupt the sole data block: the out-of-band walk cannot see it (the
+    // data section is skipped under the unrecognized descriptor), so only
+    // the handle-based fallback can catch it.
+    let block_off = {
+        let table = recover_table(sst.clone(), &fs)?;
+        let offsets: alloc::vec::Vec<u64> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|kh| *kh.as_ref().offset())
+            .collect();
+        let [only] = offsets.as_slice() else {
+            panic!("expected a single data block, got {offsets:?}");
+        };
+        usize::try_from(*only).unwrap_or(usize::MAX)
+    };
+    let mut bytes = std::fs::read(&sst)?;
+    if let Some(b) = bytes.get_mut(block_off + 40) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&sst, &bytes)?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.recovered, 0,
+        "parity-only meta errors must not mask the unscanned data sections: {report:?}",
+    );
+    assert_eq!(
+        report.unreadable_files.len(),
+        1,
+        "the corrupt table is reported unreadable: {:?}",
+        report.unreadable_files,
+    );
+    Ok(())
+}
+
 /// Patches `descriptor#page_ecc` to a non-canonical (unrecognized) value in
 /// both meta blocks of the SST at `path`, re-stamping each block's checksum
 /// so the frames stay checksum-clean.
@@ -812,7 +979,7 @@ fn forge_unrecognized_ecc_descriptor(path: &std::path::Path) -> crate::Result<()
             let Some(value) = payload.get_mut(val_at + 1..val_at + 5) else {
                 panic!("descriptor value within the payload");
             };
-            assert_eq!(value, [0u8, 0, 0, 0], "table was written without ECC");
+            assert_ne!(value, [0u8, 8, 2, 1], "descriptor not already forged");
             value.copy_from_slice(&[0u8, 8, 2, 1]);
         }
         let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(
