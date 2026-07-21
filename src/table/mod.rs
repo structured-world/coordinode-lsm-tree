@@ -1021,6 +1021,16 @@ impl Table {
     /// the block in its prior, still-RS-correctable state. Uncorrectable /
     /// unreadable blocks are recorded as findings and left for block salvage.
     ///
+    /// HARD-LINK SAFE by construction (checkpoints hard-link SSTs, sharing the
+    /// inode, so an in-place write reaches the checkpoint's copy too): every
+    /// write this pass performs restores the block's ORIGINAL bytes — the
+    /// recovered payload is the pre-rot payload and the recomputed parity
+    /// therefore equals the originally-written parity — so a linked checkpoint
+    /// heals along with the live file rather than diverging from its intended
+    /// content, and every torn intermediate state differs from the original by
+    /// at most the already-correctable rotted bits (still within the ECC
+    /// budget any reader can recover).
+    ///
     /// `pub(crate)` for [`crate::scrub::patrol_scrub`] (heal-in-place enabled).
     #[cfg(feature = "page_ecc")]
     pub(crate) fn heal_data_blocks_in_place(&self) -> crate::scrub::PatrolScrubReport {
@@ -1168,6 +1178,34 @@ impl Table {
                         });
                         continue;
                     };
+                    // The bytes examined below are this SECOND read, not the
+                    // frame the scrub just verified: a transient fault or
+                    // fresh rot between the reads would otherwise feed the
+                    // parity comparison an unverified payload, and the
+                    // rebuild arm would PERSIST parity computed over those
+                    // corrupt bytes — turning a recoverable block into one
+                    // whose ECC agrees with the corruption. Verify the
+                    // re-read payload against the header checksum first; a
+                    // mismatch is surfaced, never acted on.
+                    let header_len = crate::table::block::Header::header_len(raw_header.block_type);
+                    let payload_ok = raw
+                        .get(header_len..header_len + raw_header.data_length as usize)
+                        .is_some_and(|payload| {
+                            crate::hash::hash128(payload) == raw_header.checksum.into_u128()
+                        });
+                    if !payload_ok {
+                        report.uncorrectable_blocks += 1;
+                        report.errors.push(ScrubError::UncorrectableBlock {
+                            table_id: self.id(),
+                            path: self.path.to_path_buf(),
+                            block_offset,
+                            reason: alloc::string::String::from(
+                                "in-place heal: block scrubbed clean but its re-read \
+                                 payload does not match its checksum",
+                            ),
+                        });
+                        continue;
+                    }
                     match self.raw_block_parity_delta(&raw, &raw_header) {
                         // Trailer matches (or no ECC): nothing to persist.
                         Ok(None) => {}
