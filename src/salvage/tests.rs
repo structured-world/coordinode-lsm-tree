@@ -162,6 +162,17 @@ fn reopen_item_count(path: std::path::PathBuf, fs: &Arc<dyn Fs>) -> crate::Resul
     Ok(open(path, fs)?.metadata.item_count)
 }
 
+/// Point-reads `key` from the SST at `path` at the latest snapshot — the
+/// LOGICAL visibility check behind the physical row counts (a delete either
+/// masks the key or, under the resurrection opt-in, leaves it readable).
+fn reopen_get(
+    path: std::path::PathBuf,
+    fs: &Arc<dyn Fs>,
+    key: &[u8],
+) -> crate::Result<Option<crate::InternalValue>> {
+    open(path, fs)?.get(key, crate::MAX_SEQNO, crate::hash::hash64(key))
+}
+
 /// An SST from a KV-separated tree carries a `linked_blob_files` section
 /// naming every blob file its `ValueHandle`s point into; blob GC / relocation
 /// consults it (via `list_blob_file_references`) to decide whether a blob is
@@ -1214,7 +1225,7 @@ fn salvage_drops_an_out_of_order_columnar_block_in_a_delete_bearing_sst() -> cra
     target.copy_from_slice(&new_block);
     std::fs::write(&source, &bytes)?;
 
-    let report = salvage_sst(&source, dest, &fs)?;
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
     assert_eq!(
         report.dropped.len(),
         1,
@@ -1234,6 +1245,18 @@ fn salvage_drops_an_out_of_order_columnar_block_in_a_delete_bearing_sst() -> cra
         report.entries_salvaged,
         u64::from(n) - poisoned_rows - deletes.len() as u64,
         "rows outside the poisoned block are recovered with deletes applied",
+    );
+    // LOGICAL visibility: the deletes were applied faithfully, so the deleted
+    // keys stay masked while a neighbouring live key reads back.
+    for pos in deletes {
+        assert!(
+            reopen_get(dest.clone(), &fs, format!("key{pos:05}").as_bytes())?.is_none(),
+            "the deleted key at position {pos} stays masked in the recovered copy",
+        );
+    }
+    assert!(
+        reopen_get(dest, &fs, b"key00051")?.is_some(),
+        "a neighbouring live key reads back from the recovered copy",
     );
     Ok(())
 }
@@ -1582,10 +1605,18 @@ fn salvage_fails_closed_on_an_unreadable_block_in_a_delete_bearing_sst() -> crat
         "the dropped block's rows are lost: {report:?}",
     );
     assert_eq!(
-        reopen_item_count(dest, &fs)?,
+        reopen_item_count(dest.clone(), &fs)?,
         report.entries_salvaged,
         "the recovered copy reopens with every salvaged row live",
     );
+    // LOGICAL visibility of the resurrection: the deleted positions live
+    // outside the corrupt block, so under the opt-in their keys read back.
+    for pos in [5u32, 50, 150] {
+        assert!(
+            reopen_get(dest.clone(), &fs, format!("key{pos:05}").as_bytes())?.is_some(),
+            "the opt-in resurrects the deleted key at position {pos}",
+        );
+    }
     Ok(())
 }
 
@@ -1705,10 +1736,18 @@ fn salvage_fails_closed_on_an_undecodable_checksum_clean_block_with_deletes() ->
         "the poisoned block's rows are lost: {report:?}",
     );
     assert_eq!(
-        reopen_item_count(dest, &fs)?,
+        reopen_item_count(dest.clone(), &fs)?,
         report.entries_salvaged,
         "the recovered copy reopens with every salvaged row live",
     );
+    // LOGICAL visibility of the resurrection: the deleted positions live
+    // outside the poisoned block, so under the opt-in their keys read back.
+    for pos in [5u32, 50, 150] {
+        assert!(
+            reopen_get(dest.clone(), &fs, format!("key{pos:05}").as_bytes())?.is_some(),
+            "the opt-in resurrects the deleted key at position {pos}",
+        );
+    }
     Ok(())
 }
 
@@ -1827,7 +1866,15 @@ fn salvage_fails_closed_on_a_zone_map_with_wrong_row_counts() -> crate::Result<(
         u64::from(n),
         "every row is recovered live under the opt-in",
     );
-    assert_eq!(reopen_item_count(dest, &fs)?, u64::from(n));
+    assert_eq!(reopen_item_count(dest.clone(), &fs)?, u64::from(n));
+    // LOGICAL visibility of the resurrection: "all rows live" means the keys
+    // at the deleted positions read back.
+    for pos in [5u32, 50, 150] {
+        assert!(
+            reopen_get(dest.clone(), &fs, format!("key{pos:05}").as_bytes())?.is_some(),
+            "the opt-in resurrects the deleted key at position {pos}",
+        );
+    }
     Ok(())
 }
 

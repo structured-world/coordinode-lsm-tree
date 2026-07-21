@@ -906,6 +906,18 @@ fn repair_with_salvage_correctable_ecc_fault_in_encrypted_filter_is_rewritten()
         report.recovered, 1,
         "the rewritten table joins the manifest"
     );
+
+    // Exercise the REBUILT filter: reopen under the same configuration and
+    // point-read every key (point reads consult the filter, which loads
+    // lazily — `recovered == 1` alone only proves the table was admitted).
+    let tree = config(dir.path()).open()?;
+    for i in 0..500 {
+        assert!(
+            tree.get(key(i), MAX_SEQNO)?.is_some(),
+            "key {} survives the salvage rewrite",
+            key(i),
+        );
+    }
     Ok(())
 }
 
@@ -961,6 +973,18 @@ fn repair_with_salvage_correctable_ecc_fault_in_encrypted_tli_is_rewritten() -> 
         report.recovered, 1,
         "the rewritten table joins the manifest"
     );
+
+    // Exercise the REBUILT index: reopen under the same configuration and
+    // point-read every key (each read binary-searches the rewritten TLI —
+    // `recovered == 1` alone only proves the table was admitted).
+    let tree = config(dir.path()).open()?;
+    for i in 0..500 {
+        assert!(
+            tree.get(key(i), MAX_SEQNO)?.is_some(),
+            "key {} survives the salvage rewrite",
+            key(i),
+        );
+    }
     Ok(())
 }
 

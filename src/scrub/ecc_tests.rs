@@ -413,8 +413,8 @@ fn heal_in_place_restores_a_rotted_parity_trailer() -> crate::Result<()> {
     let Some(slot) = bytes.get_mut(trailer_pos) else {
         panic!("parity trailer within the file");
     };
-    let rotted = *slot ^ 0xFF;
-    *slot = rotted;
+    let original = *slot;
+    *slot = original ^ 0xFF;
     std::fs::write(&sst_path, &bytes)?;
 
     // Reopen (fresh caches + fds) and heal in place.
@@ -428,12 +428,14 @@ fn heal_in_place_restores_a_rotted_parity_trailer() -> crate::Result<()> {
     assert_eq!(report.uncorrectable_blocks, 0, "{report:?}");
     assert!(report.is_ok(), "a parity rebuild is a heal, not a finding");
 
-    // The on-disk trailer byte is restored (no longer the rotted value).
+    // The on-disk byte is restored to its EXACT original value (not merely
+    // changed): the rebuilt parity is recomputed over the untouched payload,
+    // so anything but the original would be wrong parity persisted.
     let healed = std::fs::read(&sst_path)?;
     let Some(&now) = healed.get(trailer_pos) else {
         panic!("parity trailer within the healed file");
     };
-    assert_ne!(now, rotted, "the rotted trailer byte was rewritten on disk");
+    assert_eq!(now, original, "the original parity byte was restored");
     Ok(())
 }
 
