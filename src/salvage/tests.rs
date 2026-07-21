@@ -1773,6 +1773,94 @@ fn salvage_fails_closed_on_an_unreadable_block_in_a_delete_bearing_sst() -> crat
     Ok(())
 }
 
+/// A footer-bearing row SST (per-KV checksums) whose block checksum was
+/// re-stamped over a tampered entry: the BLOCK checksum verifies, but the
+/// entry no longer matches its per-KV digest. Salvage must verify the footer
+/// before emitting (verbatim or re-encoded) — otherwise it recovers a block
+/// the live per-KV scrub would reject, laundering the corruption into a
+/// "fully valid" copy.
+#[test]
+fn salvage_drops_a_row_block_with_a_stale_kv_digest() -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::runtime_config::{ChecksumAlgorithm, KvChecksumPolicy};
+    use crate::table::block::Header;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let n = 200u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_data_block_size(256)
+        .use_kv_checksums(KvChecksumPolicy::AllLevels, ChecksumAlgorithm::Xxh3_64);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Tamper one entry byte inside the SECOND block's inner payload and
+    // re-stamp the BLOCK checksum: the frame verifies clean, but the entry's
+    // stored per-KV digest no longer matches its bytes.
+    let (block_off, block_size) = {
+        let table = open(source.clone(), &fs)?;
+        let Some(kh) = table.data_block_handles().filter_map(Result::ok).nth(1) else {
+            panic!("source must have at least two data blocks");
+        };
+        (
+            usize::try_from(*kh.as_ref().offset()).unwrap_or(usize::MAX),
+            kh.as_ref().size() as usize,
+        )
+    };
+    let mut bytes = std::fs::read(&source)?;
+    let Some(block) = bytes.get(block_off..block_off + block_size) else {
+        panic!("block range within the file");
+    };
+    let mut cursor = block;
+    let header = Header::decode_from(&mut cursor)?;
+    let header_len = Header::header_len(header.block_type);
+    let payload_range =
+        block_off + header_len..block_off + header_len + header.data_length as usize;
+    {
+        let Some(payload) = bytes.get_mut(payload_range.clone()) else {
+            panic!("payload range within the block");
+        };
+        // A byte inside the first entry's value bytes (past the entry header),
+        // well before the per-KV footer at the payload tail.
+        let Some(b) = payload.get_mut(12) else {
+            panic!("entry byte within the payload");
+        };
+        *b ^= 0xFF;
+    }
+    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(
+        bytes.get(payload_range).unwrap_or(&[]),
+    ));
+    let new_header = Header {
+        checksum: new_checksum,
+        ..header
+    };
+    let mut hdr_bytes: Vec<u8> = Vec::with_capacity(header_len);
+    new_header.encode_into(&mut hdr_bytes)?;
+    let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
+        panic!("block header within the file");
+    };
+    hdr_dst.copy_from_slice(&hdr_bytes);
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert_eq!(
+        report.dropped.len(),
+        1,
+        "the block with a stale per-KV digest is dropped: {report:?}",
+    );
+    assert!(
+        report.entries_salvaged < u64::from(n),
+        "the tampered block's rows are not laundered into the copy: {report:?}",
+    );
+    assert_eq!(reopen_item_count(dest, &fs)?, report.entries_salvaged);
+    Ok(())
+}
+
 /// A delete-bearing columnar SST with a checksum-clean block whose
 /// `ColumnBatch` does NOT decode (a repatched tamper that keeps the leading
 /// row-count u32 intact but breaks the column framing): the block's ACTUAL row
