@@ -170,24 +170,77 @@ fn quarantine_file(
 /// bitmap, locator, meta — is then verified against its raw on-disk checksum,
 /// which flags even a persistent ECC-CORRECTABLE fault (a live read would
 /// silently heal it in memory while the corrupt bytes stay on disk).
-fn block_verify_passes(
+fn block_verify_verdict(
     config: &Config,
     folder_fs: &Arc<dyn crate::fs::Fs>,
     table_path: &std::path::Path,
     table: &Table,
-) -> bool {
+) -> BlockVerifyVerdict {
     let report = crate::verify::verify_sst_file_with_context(
         &**folder_fs,
         table_path,
         config.encryption.as_deref(),
         table.metadata.id,
     );
-    // A warning-bearing report means part of the table was NOT verified
-    // (e.g. an unrecognized ECC descriptor skips every SST-block section):
-    // repair must not stamp effectively-unchecked bytes into the rebuilt
-    // manifest, so warnings fail this gate and route the table to salvage
-    // (which re-encodes it under a recognized descriptor).
-    report.is_ok() && !report.has_warnings()
+    if !report.is_ok() {
+        BlockVerifyVerdict::Corrupt
+    } else if report.has_warnings() {
+        // Everything scanned verified clean, but part of the table could NOT
+        // be checked (an unrecognized ECC descriptor skips the SST-block
+        // sections; a parity-less build cannot recompute trailers). The
+        // caller decides between salvage (a rewrite under fully-verifiable
+        // framing) and keeping the table when salvage cannot re-emit it.
+        BlockVerifyVerdict::WarningsOnly
+    } else {
+        BlockVerifyVerdict::Clean
+    }
+}
+
+/// Outcome of the salvage-mode block verify, from the repair gate's point of
+/// view (see [`block_verify_verdict`]).
+enum BlockVerifyVerdict {
+    /// Every section verified against its raw on-disk checksum.
+    Clean,
+    /// No errors, but part of the table went UNCHECKED (warning-bearing
+    /// report): prefer a salvage rewrite, but never at the cost of dropping
+    /// data salvage cannot re-emit.
+    WarningsOnly,
+    /// At least one section failed verification.
+    Corrupt,
+}
+
+/// Whether a freshly-recovered table should be routed through block salvage.
+///
+/// `Corrupt` always salvages. `WarningsOnly` (payloads verified clean, but
+/// part of the table is uncheckable — an unrecognized ECC descriptor, or a
+/// build without the parity codecs) salvages ONLY when salvage can faithfully
+/// re-emit the table: a range-tombstone SST is rejected by the block walk, so
+/// routing it through salvage would drop healthy, verified data over a
+/// warning — it is kept as-is (with an operator-facing warning) instead.
+fn verify_wants_salvage(
+    config: &Config,
+    folder_fs: &Arc<dyn crate::fs::Fs>,
+    table_path: &std::path::Path,
+    table: &Table,
+) -> bool {
+    match block_verify_verdict(config, folder_fs, table_path, table) {
+        BlockVerifyVerdict::Clean => false,
+        BlockVerifyVerdict::Corrupt => true,
+        BlockVerifyVerdict::WarningsOnly => {
+            if table.range_tombstones().is_empty() {
+                true
+            } else {
+                log::warn!(
+                    "table {} at {}: verified clean with warnings (partially uncheckable \
+                     ECC), but salvage cannot re-emit its range tombstones — keeping the \
+                     table as-is; recompact to re-stamp it under a verifiable scheme",
+                    table.metadata.id,
+                    table_path.display(),
+                );
+                false
+            }
+        }
+    }
 }
 
 fn try_salvage_table(
@@ -543,7 +596,7 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                 // and would misreport every healthy encrypted table as corrupt,
                 // rewriting it on every repair.
                 Ok(table)
-                    if salvage && !block_verify_passes(config, &folder_fs, &table_path, &table) =>
+                    if salvage && verify_wants_salvage(config, &folder_fs, &table_path, &table) =>
                 {
                     drop(table);
                     match try_salvage_table(

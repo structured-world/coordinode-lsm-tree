@@ -423,14 +423,15 @@ fn run_verify(path: &std::path::Path, verbose: bool) -> ExitCode {
     for (idx, err) in report.errors.iter().take(to_show).enumerate() {
         // Show each error with its variant tag so consumers grep'ing
         // for a specific failure mode (HeaderCorrupted, DataCorrupted,
-        // DataReadError, TocCorrupted, SstFileUnreadable) get a stable
-        // anchor. The Display impl includes file path + offset + a
-        // human reason.
+        // DataReadError, EccParityMismatch, TocCorrupted,
+        // SstFileUnreadable) get a stable anchor. The Display impl
+        // includes file path + offset + a human reason.
         let kind = match err {
             BlockVerifyError::SstFileUnreadable { .. } => "SstFileUnreadable",
             BlockVerifyError::HeaderCorrupted { .. } => "HeaderCorrupted",
             BlockVerifyError::DataCorrupted { .. } => "DataCorrupted",
             BlockVerifyError::DataReadError { .. } => "DataReadError",
+            BlockVerifyError::EccParityMismatch { .. } => "EccParityMismatch",
             BlockVerifyError::TocCorrupted { .. } => "TocCorrupted",
             // `BlockVerifyError` is `#[non_exhaustive]` upstream — a
             // future lib release can add new variants without bumping

@@ -1354,6 +1354,25 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
                 scheme,
             ))
         });
+        // Hard cap on the parity trailer, mirroring the data_length cap
+        // below: a syntactically valid but absurd shard layout (e.g.
+        // RS(1,255), every payload byte amplified 255x into parity) drives
+        // `expected_parity_len` toward its u32::MAX saturation point, and a
+        // lying TOC length (forged, or a sparse file) would let the buffered
+        // verify reserve that whole multi-GB trailer before any corruption
+        // is reported. No real configuration produces a trailer above the
+        // payload cap itself.
+        if parity_len > MAX_BLOCK_DATA_LENGTH {
+            ctx.errors.push(BlockVerifyError::HeaderCorrupted {
+                table_id: ctx.table_id,
+                path: ctx.path.to_path_buf(),
+                offset,
+                reason: format!(
+                    "parity trailer length {parity_len} exceeds hard cap {MAX_BLOCK_DATA_LENGTH}",
+                ),
+            });
+            return;
+        }
 
         // Validate data_length against TWO bounds before allocating
         // / reading:
