@@ -197,12 +197,21 @@ fn block_verify_verdict(
         } else {
             BlockVerifyVerdict::Corrupt
         }
+    } else if report
+        .warnings
+        .iter()
+        .any(|w| matches!(w, crate::verify::BlockVerifyWarning::UnrecognizedEcc { .. }))
+    {
+        // Unrecognized ECC descriptor: the walk SKIPPED the SST-block
+        // sections entirely (their trailer length is underivable), so
+        // NOTHING about the data was verified — a stronger degradation
+        // than a checked-but-unverifiable-parity report.
+        BlockVerifyVerdict::DegradedUnscanned
     } else if report.has_warnings() {
-        // Everything scanned verified clean, but part of the table could NOT
-        // be checked (an unrecognized ECC descriptor skips the SST-block
-        // sections; a parity-less build cannot recompute trailers). The
-        // caller decides between salvage (a rewrite under fully-verifiable
-        // framing) and keeping the table when salvage cannot re-emit it.
+        // Everything scanned verified clean, but the parity trailers could
+        // not be recomputed (a parity-less build). The caller decides
+        // between salvage (a rewrite under fully-verifiable framing) and
+        // keeping the table when salvage cannot re-emit it.
         BlockVerifyVerdict::DegradedButReadable
     } else {
         BlockVerifyVerdict::Clean
@@ -214,12 +223,15 @@ fn block_verify_verdict(
 enum BlockVerifyVerdict {
     /// Every section verified against its raw on-disk checksum.
     Clean,
-    /// Every payload the walk could check verified clean, but the table is
-    /// DEGRADED: part of it went unchecked (warning-bearing report), or its
-    /// parity trailers rotted while the payloads stayed intact. Prefer a
-    /// salvage rewrite, but never at the cost of dropping data salvage
-    /// cannot re-emit.
+    /// Every payload the walk checked verified clean, but the table is
+    /// DEGRADED: its parity trailers rotted or could not be recomputed while
+    /// the payloads stayed intact. Prefer a salvage rewrite, but never at
+    /// the cost of dropping data salvage cannot re-emit.
     DegradedButReadable,
+    /// The walk could not scan the SST-block sections at all (an
+    /// unrecognized ECC descriptor): the data is UNVERIFIED, not merely
+    /// degraded — any keep decision must first verify it another way.
+    DegradedUnscanned,
     /// At least one payload / section failed verification.
     Corrupt,
 }
@@ -255,6 +267,35 @@ fn verify_wants_salvage(
                     table_path.display(),
                 );
                 false
+            }
+        }
+        BlockVerifyVerdict::DegradedUnscanned => {
+            if table.range_tombstones().is_empty() {
+                true
+            } else {
+                // The out-of-band walk verified NOTHING about the data here,
+                // so the range-tombstone escape hatch must not keep the
+                // table blindly. Verify it through handle-based reads
+                // instead: the cache-bypassing per-block scrub frames each
+                // payload by `data_length` and checksum-verifies it
+                // regardless of the descriptor. Clean → keep; anything else
+                // → salvage (whose range-tombstone refusal then correctly
+                // reports the corrupt table as unreadable).
+                let scrub = table.scrub_data_blocks();
+                if scrub.is_ok() {
+                    log::warn!(
+                        "table {} at {}: data verified clean through handle-based \
+                         reads (its ECC descriptor is unrecognized, so the \
+                         out-of-band walk skipped it), and salvage cannot re-emit \
+                         its range tombstones — keeping the table as-is; recompact \
+                         to re-stamp it under a supported scheme",
+                        table.metadata.id,
+                        table_path.display(),
+                    );
+                    false
+                } else {
+                    true
+                }
             }
         }
     }

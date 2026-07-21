@@ -673,6 +673,24 @@ fn salvage_blocks(
                 // Footer presence is a per-SST property (`kv_checksum_algo`), not a
                 // per-block header flag, so the descriptor supplies it here.
                 let has_kv_footer = table.metadata.kv_checksum_algo.is_some();
+                // Verify the per-KV digests BEFORE stripping the footer: a
+                // block-checksum-re-stamped entry whose stored digest no
+                // longer matches its bytes would otherwise be recovered (even
+                // byte-copied verbatim) into a copy the live per-KV scrub
+                // rejects — laundering the corruption. A mismatch is
+                // block-local malformed content: drop the block, keep walking.
+                if has_kv_footer
+                    && let Err(e) = crate::table::DataBlock::verify_kv_checked(
+                        &sb.block.data,
+                        sb.block.header,
+                        comparator.clone(),
+                        table.metadata.kv_checksum_algo,
+                    )
+                {
+                    dropped.push(classify_drop(&e, offset, prev_end.as_ref(), &end_key));
+                    prev_end = Some(end_key);
+                    continue;
+                }
                 match crate::table::DataBlock::from_loaded(sb.block, has_kv_footer) {
                     // `try_iter`, not `iter`: a checksum-clean but structurally
                     // malformed block (e.g. an invalid trailer) must be reported as
