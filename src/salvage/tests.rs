@@ -1016,6 +1016,158 @@ fn salvage_drops_a_columnar_block_with_out_of_order_keys() -> crate::Result<()> 
     Ok(())
 }
 
+/// A checksum-clean columnar block that decodes as a ZERO-ROW `ColumnBatch`
+/// is malformed input (a real writer never emits an empty block): the writer
+/// primitive emits nothing for it, so counting it as salvaged would let an
+/// SST whose only block is empty report `salvaged_path = Some(dest)` while
+/// the empty-table `finish` REMOVES `dest` — and a mixed SST would
+/// under-report its dropped key ranges. Such a block must be dropped as a
+/// decode error.
+#[cfg(feature = "columnar")]
+#[test]
+fn salvage_drops_a_zero_row_columnar_block() -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::table::block::Header;
+    use crate::table::columnar::{
+        COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, CodecId, Column, ColumnBatch, TypeTag,
+    };
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // A single-block columnar SST (few rows, default block size). An ODD row
+    // count lets the retry below flip the payload-length parity by growing
+    // every value one byte.
+    let n = 9u32;
+    let build = |value_pad: usize| -> crate::Result<()> {
+        let _ = std::fs::remove_file(&source);
+        let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_columnar(true);
+        for i in 0..n {
+            writer.write(InternalValue::from_components(
+                format!("key{i:05}").into_bytes(),
+                format!("val{i:05}{}", "x".repeat(value_pad)).into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(writer.finish()?.is_some(), "source SST is non-empty");
+        Ok(())
+    };
+    build(0)?;
+
+    // The zero-row replacement encodes to 8 (row/column counts) + 44 bytes of
+    // intrinsic + value column headers, padded to the ORIGINAL payload length
+    // with extra empty value sub-columns (Fixed = 10 bytes, Bytes = 14 — every
+    // reachable length is even, so an odd source payload is rebuilt one byte
+    // per value larger to flip its parity).
+    let payload_len = |src: &std::path::Path| -> crate::Result<usize> {
+        let bytes = std::fs::read(src)?;
+        let mut cursor = bytes.as_slice();
+        let header = Header::decode_from(&mut cursor)?;
+        Ok(header.data_length as usize)
+    };
+    let mut target_len = payload_len(&source)?;
+    if target_len % 2 != 0 {
+        build(1)?;
+        target_len = payload_len(&source)?;
+    }
+    assert_eq!(target_len % 2, 0, "an even payload length is reachable");
+
+    let empty_fixed = |id: u16, width: u8| Column {
+        column_id: id,
+        type_tag: TypeTag::Fixed(width),
+        validity: None,
+        data: Vec::new(),
+    };
+    let mut columns = vec![
+        Column {
+            column_id: COL_USER_KEY,
+            type_tag: TypeTag::Bytes,
+            validity: None,
+            // A zero-row Bytes column is exactly its (row_count + 1) * 4 = 4
+            // byte offset table.
+            data: vec![0u8; 4],
+        },
+        empty_fixed(COL_SEQNO, 8),
+        empty_fixed(COL_VALUE_TYPE, 1),
+        empty_fixed(COL_VALUE, 1),
+    ];
+    let mut rem = target_len
+        .checked_sub(8 + 14 + 10 + 10 + 10)
+        .expect("source payload larger than the zero-row skeleton");
+    let mut next_id = COL_VALUE + 1;
+    // Greedy fill: Bytes columns (+14) until the remainder is divisible by
+    // 10, then Fixed columns (+10).
+    while rem % 10 != 0 {
+        columns.push(Column {
+            column_id: next_id,
+            type_tag: TypeTag::Bytes,
+            validity: None,
+            data: vec![0u8; 4],
+        });
+        next_id += 1;
+        rem = rem
+            .checked_sub(14)
+            .expect("remainder covers a Bytes column");
+    }
+    while rem > 0 {
+        columns.push(empty_fixed(next_id, 1));
+        next_id += 1;
+        rem -= 10;
+    }
+    let batch = ColumnBatch {
+        row_count: 0,
+        columns,
+    };
+    let new_payload = batch.encode(CodecId::Plain)?;
+    assert_eq!(
+        new_payload.len(),
+        target_len,
+        "the zero-row batch pads to the original payload length",
+    );
+
+    // Splice it under a re-stamped checksum (frame length unchanged).
+    let mut bytes = std::fs::read(&source)?;
+    let mut cursor = bytes.as_slice();
+    let header = Header::decode_from(&mut cursor)?;
+    let header_len = Header::header_len(header.block_type);
+    let new_header = Header {
+        checksum: crate::Checksum::from_raw(crate::hash::hash128(&new_payload)),
+        ..header
+    };
+    let mut new_block: Vec<u8> = Vec::with_capacity(header_len + new_payload.len());
+    new_header.encode_into(&mut new_block)?;
+    new_block.extend_from_slice(&new_payload);
+    let Some(target) = bytes.get_mut(..new_block.len()) else {
+        panic!("block range within the file");
+    };
+    target.copy_from_slice(&new_block);
+    std::fs::write(&source, &bytes)?;
+
+    // The zero-row block is DROPPED, so nothing is recoverable: no destination
+    // is left behind and no salvaged path is reported (the pre-fix behavior
+    // counted it as salvaged, reporting Some(dest) for a file the empty-table
+    // finish had just removed).
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert_eq!(
+        report.dropped.len(),
+        1,
+        "the zero-row block is dropped as malformed: {report:?}",
+    );
+    assert_eq!(report.blocks_salvaged, 0, "{report:?}");
+    assert_eq!(
+        report.salvaged_path, None,
+        "an SST whose only block is empty reports nothing salvaged",
+    );
+    assert!(
+        fs.metadata(&dest).is_err(),
+        "no destination file is left behind",
+    );
+    Ok(())
+}
+
 /// The ROW-source twin of the columnar out-of-order drop: a checksum-clean
 /// row block with two adjacent keys swapped passes frame decode and row
 /// materialization, so the ordering guard before the emit is the only thing
