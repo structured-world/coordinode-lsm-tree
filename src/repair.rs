@@ -289,8 +289,22 @@ fn verify_wants_salvage(
                 // partitioned-index leaf) lands in `errors` without touching
                 // that counter — and means the data blocks were never even
                 // ENUMERATED. The keep requires an error-free scrub.
+                //
+                // The data scrub also never touches the LAZY side blocks
+                // (the full bloom filter only loads on the first point
+                // read), so probe one point read through the table's real
+                // read stack: it forces the filter (and, for partitioned
+                // filters, its TLI) to load and verify. The probed key is
+                // the table's own smallest key, so the filter cannot
+                // short-circuit the load with a definite miss.
                 let scrub = table.scrub_data_blocks();
-                if scrub.is_ok() && scrub.errors.is_empty() {
+                let probe = || {
+                    let key = table.metadata.key_range.min().clone();
+                    table
+                        .get(&key, crate::SeqNo::MAX, crate::hash::hash64(&key))
+                        .is_ok()
+                };
+                if scrub.is_ok() && scrub.errors.is_empty() && probe() {
                     log::warn!(
                         "table {} at {}: data verified clean through handle-based \
                          reads (its ECC descriptor is unrecognized, so the \
