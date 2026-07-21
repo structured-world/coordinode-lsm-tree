@@ -463,6 +463,69 @@ fn recover_table(
     )
 }
 
+/// A WARNING-ONLY verify report (here: an unrecognized ECC descriptor) on a
+/// table salvage cannot faithfully re-emit (it carries range tombstones) must
+/// KEEP the table: its payload checksums verified clean, so quarantining it
+/// through a salvage that is guaranteed to refuse would throw away healthy
+/// data over a warning. Salvage stays reserved for reports with ERRORS and
+/// for warning-only tables salvage can actually rewrite.
+#[test]
+fn repair_with_salvage_keeps_a_warning_only_range_tombstone_sst() -> crate::Result<()> {
+    use crate::range_tombstone::RangeTombstone;
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, UserKey, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?;
+        for i in 0..8u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        w.write_range_tombstone(RangeTombstone::new(
+            UserKey::from(b"k00002".as_slice()),
+            UserKey::from(b"k00005".as_slice()),
+            2,
+        ));
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // The forged descriptor makes the verify report WARNING-only (sections
+    // skipped, no errors) while the data itself is untouched and healthy.
+    forge_unrecognized_ecc_descriptor(&sst)?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair_with_salvage(true)?;
+    assert!(
+        report.unreadable_files.is_empty(),
+        "a healthy table must not be dropped over a warning-only report: {:?}",
+        report.unreadable_files,
+    );
+    assert_eq!(
+        report.recovered, 1,
+        "the range-tombstone table joins the rebuilt manifest as-is: {report:?}",
+    );
+    assert_eq!(
+        report.salvaged, 0,
+        "salvage is never attempted when it cannot re-emit the range tombstones",
+    );
+    Ok(())
+}
+
 /// Patches `descriptor#page_ecc` to a non-canonical (unrecognized) value in
 /// both meta blocks of the SST at `path`, re-stamping each block's checksum
 /// so the frames stay checksum-clean.

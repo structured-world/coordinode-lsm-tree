@@ -798,6 +798,106 @@ fn walk_block_region_reports_data_read_error_on_truncated_parity_trailer() {
     );
 }
 
+/// A syntactically valid but absurd shard layout (RS(1,255): every payload
+/// byte amplified 255x into parity) drives `expected_parity_len` toward
+/// `u32::MAX`. Combined with a lying TOC length (a forged or sparse SST), the
+/// walk would reserve the whole multi-GB trailer buffer BEFORE reporting any
+/// corruption. The trailer length must be capped like `data_length` is: over
+/// the cap it is `HeaderCorrupted`, reported without reserving anything.
+#[test]
+#[expect(
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation,
+    reason = "synthetic SFA forgery — offsets are in-bounds by construction (we wrote the \
+              bytes ourselves) and the archive is small, so the casts cannot overflow"
+)]
+fn walk_block_region_caps_an_absurd_parity_trailer_length() {
+    use crate::coding::Encode;
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::table::block::{BlockType, EccParams, Header, expected_parity_len};
+
+    // Trailer layout (38 bytes at the tail of an SFA archive):
+    //   MAGIC(4) | version(1) | csum_type(1) | toc_checksum(16) | toc_pos(8) | toc_len(8)
+    const TRAILER_LEN: usize = 4 + 1 + 1 + 16 + 8 + 8;
+    // 2 MiB of real payload: RS(1,255) turns that into a ~510 MiB claimed
+    // parity trailer — well over the 256 MiB hard cap.
+    const DATA_LENGTH: u32 = 2 * 1024 * 1024;
+    const HEADER_LEN: u64 = Header::MIN_LEN as u64;
+
+    let params = EccParams::try_new(1, 255).expect("a 1/255 shard layout parses");
+    let parity_len = u64::from(expected_parity_len(DATA_LENGTH, params));
+    assert!(
+        parity_len > u64::from(DATA_LENGTH) * 200,
+        "the forged scheme must amplify parity far past the payload",
+    );
+
+    let data = vec![0xABu8; DATA_LENGTH as usize];
+    let header = Header {
+        checksum: Checksum::from_raw(crate::hash::hash128(&data)),
+        data_length: DATA_LENGTH,
+        uncompressed_length: DATA_LENGTH,
+        ..Header::test_dummy(BlockType::Data)
+    };
+
+    // One `data` section: header + full payload, no parity bytes on disk.
+    let mut archive_bytes: Vec<u8> = Vec::new();
+    {
+        let mut writer = crate::sfa::Writer::from_writer(std::io::Cursor::new(&mut archive_bytes));
+        writer.start("data").unwrap();
+        writer.write_all(&header.encode_into_vec()).unwrap();
+        writer.write_all(&data).unwrap();
+        writer.finish().unwrap();
+    }
+
+    // Inflate the TOC section length to cover the claimed parity so the
+    // bounds check passes (the sparse-file / forged-TOC shape), recomputing
+    // the TOC checksum so crate::sfa::Reader still accepts the file.
+    let trailer_start = archive_bytes.len() - TRAILER_LEN;
+    let toc_pos = u64::from_le_bytes(
+        archive_bytes[trailer_start + 22..trailer_start + 30]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let toc_len = u64::from_le_bytes(
+        archive_bytes[trailer_start + 30..trailer_start + 38]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let len_field_offset = toc_pos + 4 + 4 + 8;
+    let lied_len: u64 = HEADER_LEN + u64::from(DATA_LENGTH) + parity_len;
+    archive_bytes[len_field_offset..len_field_offset + 8].copy_from_slice(&lied_len.to_le_bytes());
+    let new_toc_checksum = crate::hash::hash128(&archive_bytes[toc_pos..toc_pos + toc_len]);
+    let csum_field_offset = trailer_start + 4 + 1 + 1;
+    archive_bytes[csum_field_offset..csum_field_offset + 16]
+        .copy_from_slice(&new_toc_checksum.to_le_bytes());
+
+    let fs = MemFs::new();
+    let path = std::path::Path::new("/forged-parity-cap.sst");
+    {
+        let mut f = fs
+            .open(
+                path,
+                &FsOpenOptions::new().write(true).create(true).truncate(true),
+            )
+            .unwrap();
+        f.write_all(&archive_bytes).unwrap();
+    }
+
+    let table_id: TableId = 7;
+    let scan = scan_sst_blocks(&fs, path, table_id, 0, Some(params), false)
+        .expect("forged SFA must parse cleanly");
+    assert!(
+        scan.errors.iter().any(|e| matches!(
+            e,
+            BlockVerifyError::HeaderCorrupted { table_id: t, offset: 0, reason, .. }
+                if *t == table_id && reason.contains("parity trailer length")
+        )),
+        "an over-cap parity trailer must be HeaderCorrupted without reserving \
+         the buffer, got {:?}",
+        scan.errors,
+    );
+}
+
 /// A block header whose own bytes extend past the section boundary must be
 /// reported as `HeaderCorrupted`, not slip through with a clamped-to-zero
 /// remaining payload.
