@@ -526,6 +526,96 @@ fn repair_with_salvage_keeps_a_warning_only_range_tombstone_sst() -> crate::Resu
     Ok(())
 }
 
+/// PARITY-ONLY rot (every payload checksum still clean) on a table salvage
+/// cannot faithfully re-emit (range tombstones) must also KEEP the table:
+/// the data is fully readable, only its recovery margin is degraded, and
+/// quarantining it through a salvage that is guaranteed to refuse would
+/// throw the table away over dead parity.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn repair_with_salvage_keeps_a_parity_rotted_range_tombstone_sst() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::range_tombstone::RangeTombstone;
+    use crate::table::Writer;
+    use crate::table::block::{EccParams, Header};
+    use crate::{Config, InternalValue, SequenceNumberCounter, UserKey, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?
+            .use_ecc(Some(EccParams::try_new(4, 2)?));
+        for i in 0..8u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        w.write_range_tombstone(RangeTombstone::new(
+            UserKey::from(b"k00002".as_slice()),
+            UserKey::from(b"k00005".as_slice()),
+            2,
+        ));
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Rot one byte of the sole data block's PARITY trailer: the payload
+    // checksum still verifies, so the out-of-band walk reports only an
+    // EccParityMismatch — the data itself is untouched.
+    let block_off = {
+        let table = recover_table(sst.clone(), &fs)?;
+        let offsets: alloc::vec::Vec<u64> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|kh| *kh.as_ref().offset())
+            .collect();
+        let [only] = offsets.as_slice() else {
+            panic!("expected a single data block, got {offsets:?}");
+        };
+        usize::try_from(*only).unwrap_or(usize::MAX)
+    };
+    let mut bytes = std::fs::read(&sst)?;
+    let Some(mut cursor) = bytes.get(block_off..) else {
+        panic!("data block within the file");
+    };
+    let header = Header::decode_from(&mut cursor)?;
+    let trailer_pos =
+        block_off + Header::header_len(header.block_type) + header.data_length as usize;
+    let Some(slot) = bytes.get_mut(trailer_pos) else {
+        panic!("parity trailer within the file");
+    };
+    *slot ^= 0xFF;
+    std::fs::write(&sst, &bytes)?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair_with_salvage(true)?;
+    assert!(
+        report.unreadable_files.is_empty(),
+        "a readable table must not be dropped over parity-only rot: {:?}",
+        report.unreadable_files,
+    );
+    assert_eq!(
+        report.recovered, 1,
+        "the range-tombstone table joins the rebuilt manifest as-is: {report:?}",
+    );
+    assert_eq!(
+        report.salvaged, 0,
+        "salvage is never attempted when it cannot re-emit the range tombstones",
+    );
+    Ok(())
+}
+
 /// Patches `descriptor#page_ecc` to a non-canonical (unrecognized) value in
 /// both meta blocks of the SST at `path`, re-stamping each block's checksum
 /// so the frames stay checksum-clean.

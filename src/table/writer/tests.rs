@@ -71,6 +71,38 @@ fn table_writer_count() -> crate::Result<()> {
     Ok(())
 }
 
+/// A shard scheme whose parity trailer for a block would exceed the payload
+/// hard cap (256 MiB) must be rejected at WRITE time: the out-of-band
+/// verifier bounds the trailer at that cap before reserving its buffer, so a
+/// writer that could emit a larger one would produce an SST the verifier
+/// falsely flags as corrupt. Rejecting the write keeps the cap an invariant —
+/// every SST in existence stays within the verifier's supported envelope.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn writer_rejects_a_block_whose_parity_exceeds_the_hard_cap() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("1");
+    // RS(1,255): every payload byte amplified 255x into parity — a 2 MiB
+    // value produces a ~510 MiB trailer, over the 256 MiB cap.
+    let mut writer = Writer::new(path, 1, 0, Arc::new(StdFs))?
+        .use_ecc(Some(crate::table::block::EccParams::try_new(1, 255)?));
+    let write_result = writer.write(InternalValue::from_components(
+        b"k".as_slice(),
+        vec![0xABu8; 2 * 1024 * 1024],
+        0,
+        ValueType::Value,
+    ));
+    let result = match write_result {
+        Ok(()) => writer.finish().map(|_| ()),
+        Err(e) => Err(e),
+    };
+    assert!(
+        matches!(result, Err(crate::Error::FeatureUnsupported(_))),
+        "an over-cap parity trailer must fail the write loudly, got {result:?}",
+    );
+    Ok(())
+}
+
 #[test]
 #[should_panic(expected = "index block restart interval must be greater than zero")]
 fn writer_rejects_zero_index_block_restart_interval() {

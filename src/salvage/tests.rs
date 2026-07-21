@@ -3131,6 +3131,96 @@ fn salvage_blob_file_stops_at_a_smashed_frame_and_keeps_the_prefix() -> crate::R
     Ok(())
 }
 
+/// A blob frame whose header CRC and data checksum are internally consistent
+/// but whose `key_len` is ZERO yields an Ok scanner entry with an empty key —
+/// which the blob writer's ingest asserts against. Salvage must route such a
+/// frame through the corrupt-record path (dropped, walk continues) instead of
+/// panicking in the writer and leaving a partial destination behind.
+#[test]
+fn salvage_blob_file_drops_an_empty_key_frame() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("blob_source");
+    let dest = dir.path().join("blob_salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    build_blob(&source, &fs, &[(b"k", b"vvvv"), (b"k2", b"second")])?;
+
+    // Re-frame the FIRST record as `key_len = 0`: its key byte becomes the
+    // first value byte (the hashed key||value byte span is unchanged), with
+    // the header CRC and data checksum recomputed so the frame stays
+    // internally consistent. V4 frame layout from offset 0:
+    //   magic 4 | checksum 16 | seqno 8 | key_len 2 | real_val_len 4 |
+    //   on_disk_val_len 4 | header_crc 4 | key | value.
+    let mut bytes = std::fs::read(&source)?;
+    let seqno = {
+        let Some(b) = bytes.get(20..28) else {
+            panic!("seqno within the first frame");
+        };
+        u64::from_le_bytes(b.try_into().unwrap_or([0; 8]))
+    };
+    // header_crc = truncated xxh3 over (seqno, key_len, real_val_len,
+    // on_disk_val_len), matching the writer's framing.
+    let new_hcrc = {
+        let mut hasher = xxhash_rust::xxh3::Xxh3::default();
+        hasher.update(&seqno.to_le_bytes());
+        hasher.update(&0u16.to_le_bytes());
+        hasher.update(&5u32.to_le_bytes());
+        hasher.update(&5u32.to_le_bytes());
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "intentionally truncated to the 4-byte header CRC"
+        )]
+        {
+            hasher.digest() as u32
+        }
+    };
+    // data checksum = xxh3_128(key || value || header_crc_le); with the empty
+    // key the hashed span is the same "kvvvv" bytes plus the NEW header CRC.
+    let new_checksum = {
+        let mut hasher = xxhash_rust::xxh3::Xxh3::default();
+        hasher.update(b"kvvvv");
+        hasher.update(&new_hcrc.to_le_bytes());
+        hasher.digest128()
+    };
+    let patch = |bytes: &mut Vec<u8>, range: core::ops::Range<usize>, val: &[u8]| {
+        let Some(slot) = bytes.get_mut(range) else {
+            panic!("patch range within the first frame");
+        };
+        slot.copy_from_slice(val);
+    };
+    patch(&mut bytes, 4..20, &new_checksum.to_le_bytes());
+    patch(&mut bytes, 28..30, &0u16.to_le_bytes());
+    patch(&mut bytes, 30..34, &5u32.to_le_bytes());
+    patch(&mut bytes, 34..38, &5u32.to_le_bytes());
+    patch(&mut bytes, 38..42, &new_hcrc.to_le_bytes());
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0)?;
+    assert_eq!(
+        report.dropped.len(),
+        1,
+        "the empty-key frame drops as corrupt: {report:?}",
+    );
+    assert!(
+        matches!(
+            report.dropped.first().map(|d| &d.reason),
+            Some(BlobDropReason::Corrupt(_))
+        ),
+        "the drop reason names the malformed frame: {report:?}",
+    );
+    assert_eq!(
+        report.records_salvaged, 1,
+        "the record after the malformed frame is still recovered",
+    );
+    let recovered = scan_blob(&dest, &fs)?;
+    assert_eq!(
+        recovered,
+        vec![(b"k2".to_vec(), b"second".to_vec())],
+        "the salvaged copy holds exactly the healthy record",
+    );
+    Ok(())
+}
+
 /// A compressed blob source is rejected (fail-closed): the scanner yields on-disk
 /// compressed bytes that this path cannot faithfully re-emit yet.
 #[cfg(feature = "lz4")]
