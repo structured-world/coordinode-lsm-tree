@@ -1094,9 +1094,9 @@ fn salvage_drops_a_zero_row_columnar_block() -> crate::Result<()> {
         empty_fixed(COL_VALUE_TYPE, 1),
         empty_fixed(COL_VALUE, 1),
     ];
-    let mut rem = target_len
-        .checked_sub(8 + 14 + 10 + 10 + 10)
-        .expect("source payload larger than the zero-row skeleton");
+    let Some(mut rem) = target_len.checked_sub(8 + 14 + 10 + 10 + 10) else {
+        panic!("source payload larger than the zero-row skeleton");
+    };
     let mut next_id = COL_VALUE + 1;
     // Greedy fill: Bytes columns (+14) until the remainder is divisible by
     // 10, then Fixed columns (+10).
@@ -1108,9 +1108,10 @@ fn salvage_drops_a_zero_row_columnar_block() -> crate::Result<()> {
             data: vec![0u8; 4],
         });
         next_id += 1;
-        rem = rem
-            .checked_sub(14)
-            .expect("remainder covers a Bytes column");
+        let Some(next_rem) = rem.checked_sub(14) else {
+            panic!("remainder covers a Bytes column");
+        };
+        rem = next_rem;
     }
     while rem > 0 {
         columns.push(empty_fixed(next_id, 1));
