@@ -439,8 +439,10 @@ pub(crate) enum BlockScrubOutcome {
 /// deliberately NOT decoded here: a scrub is a lightweight bit-rot patrol,
 /// and any body-level fault in a checksum-clean block is (a) not producible
 /// by media corruption (the checksum covers the payload) and (b) the domain
-/// of the full semantic pass, [`crate::verify::verify_sst_file`]. Both the
-/// plain patrol scrub and the in-place heal share exactly this depth.
+/// of callers that fully decode and validate block bodies (e.g. the salvage
+/// walk's row materialization). [`crate::verify::verify_sst_file`] is likewise
+/// a frame-level verifier. Both the plain patrol scrub and the in-place heal
+/// share exactly this depth.
 #[cfg(feature = "std")]
 #[expect(
     clippy::too_many_arguments,

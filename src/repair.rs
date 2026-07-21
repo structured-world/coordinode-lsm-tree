@@ -534,12 +534,14 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                 // In salvage mode a table whose whole-file recovery succeeded can
                 // still hold corrupt data blocks (recovery is lazy on the data
                 // section). Block-verify it; if any block is corrupt, salvage it
-                // rather than keep a table that errors on read. The verify must
-                // be ENCRYPTION-AWARE: the out-of-band file walk cannot decode
-                // an encrypted meta block, so it would misreport every healthy
-                // encrypted table as corrupt and rewrite it on every repair —
-                // encrypted tables verify through the recovered table itself
-                // (its cache-bypassing, provider-wired data-block scrub).
+                // rather than keep a table that errors on read. Encrypted and
+                // unencrypted tables take the SAME encryption-aware out-of-band
+                // walk (block headers and payload checksums are plaintext; the
+                // provider only decodes the meta block) — the recovered `table`
+                // merely supplies the id the encrypted meta's AAD binds. Without
+                // the provider the walk could not decode an encrypted meta block
+                // and would misreport every healthy encrypted table as corrupt,
+                // rewriting it on every repair.
                 Ok(table)
                     if salvage && !block_verify_passes(config, &folder_fs, &table_path, &table) =>
                 {
