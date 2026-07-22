@@ -154,9 +154,9 @@ fn quarantine_file(
     Ok(dest)
 }
 
-/// Block-salvages a corrupt SST during repair: quarantines the original (which
-/// frees its path), writes a fresh SST holding its recoverable blocks into that
-/// path, and reopens it.
+/// Block-salvages a corrupt SST during repair: reads the ALREADY-QUARANTINED
+/// original (the caller performs the move, which frees `table_path`), writes a
+/// fresh SST holding its recoverable blocks into that path, and reopens it.
 ///
 /// Returns `Ok(None)` when nothing was recoverable (the original stays in
 /// quarantine and the path is left empty), or `Err` when even salvage cannot
@@ -305,23 +305,23 @@ fn verify_keep_decision(
 
 fn try_salvage_table(
     config: &Config,
-    table_base_folder: &std::path::Path,
     fs: &Arc<dyn crate::fs::Fs>,
+    // The already-quarantined corrupt original (the salvage source). The
+    // CALLER performs the quarantine move and aborts the whole repair when it
+    // fails — a manifest omitting a still-in-place file would let the next
+    // open's orphan cleanup delete the only copy. An error returned from HERE
+    // is therefore always post-quarantine: the original is safely preserved,
+    // and the caller records the failure instead of aborting.
+    quarantined: &std::path::Path,
     table_path: &std::path::Path,
-    file_name: &str,
     table_id: TableId,
 ) -> crate::Result<Option<Table>> {
-    // Move the corrupt original aside first: this frees `table_path` so salvage
-    // can write the recovered copy straight into it (no temp-file rename), and
-    // preserves the corrupt bytes for the operator to inspect.
-    let quarantined = quarantine_file(&**fs, table_base_folder, table_path, file_name)?;
-
     // Salvage under the tree's configured comparator + crypto/dictionary context
     // so the rewritten SST opens, orders, and decrypts / decompresses consistently
     // with the rest of the tree on reopen (the reopen below uses the same
     // `config.encryption` / `config.zstd_dictionary`).
     let report = crate::salvage::salvage_with_context(
-        &quarantined,
+        quarantined,
         table_path.to_path_buf(),
         fs,
         &config.comparator,
@@ -680,20 +680,33 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                                     table_path,
                                     format!("{reason}; quarantined to {}", dest.display()),
                                 )),
-                                Err(e) => unreadable_files.push((
-                                    table_path,
-                                    format!("{reason}; quarantine failed ({e})"),
-                                )),
+                                // A FAILED quarantine aborts the whole repair:
+                                // installing a manifest that omits the
+                                // still-in-place file would let the next
+                                // open's orphan cleanup DELETE the only copy
+                                // meant to be preserved for manual recovery.
+                                Err(e) => return Err(e),
                             }
                         }
                         RepairKeepDecision::Salvage => {
                             drop(table);
-                            match try_salvage_table(
-                                config,
+                            // Quarantine BEFORE salvage, aborting the repair
+                            // on failure: a manifest omitting a still-in-place
+                            // file would let the next open's orphan cleanup
+                            // delete the only copy. A salvage error AFTER a
+                            // successful move is recorded instead — the
+                            // original is safely preserved in quarantine.
+                            let quarantined = quarantine_file(
+                                &*folder_fs,
                                 &table_base_folder,
-                                &folder_fs,
                                 &table_path,
                                 &file_name,
+                            )?;
+                            match try_salvage_table(
+                                config,
+                                &folder_fs,
+                                &quarantined,
+                                &table_path,
                                 table_id,
                             ) {
                                 Ok(Some(table)) => {
@@ -726,15 +739,14 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                 Err(e) if salvage => {
                     // Whole-file recovery failed; try block-level salvage: the
                     // corrupt original is quarantined and a fresh SST holding
-                    // its recoverable blocks is written in its place.
-                    match try_salvage_table(
-                        config,
-                        &table_base_folder,
-                        &folder_fs,
-                        &table_path,
-                        &file_name,
-                        table_id,
-                    ) {
+                    // its recoverable blocks is written in its place. A FAILED
+                    // quarantine aborts the repair (the `?`): a manifest
+                    // omitting a still-in-place file would let the next open's
+                    // orphan cleanup delete the only copy.
+                    let quarantined =
+                        quarantine_file(&*folder_fs, &table_base_folder, &table_path, &file_name)?;
+                    match try_salvage_table(config, &folder_fs, &quarantined, &table_path, table_id)
+                    {
                         Ok(Some(table)) => {
                             salvaged += 1;
                             recovered_tables.push(table);
