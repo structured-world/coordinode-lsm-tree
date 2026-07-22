@@ -355,27 +355,30 @@ pub(crate) fn salvage_with_context(
     // the two are necessarily equal (the open's AAD binds the caller's id).
     // A KV-separated source's entries hold ValueHandles into blob files, and
     // blob GC / relocation consults the table's linked_blob_files section to
-    // decide whether a blob is still referenced. Carry the SOURCE's links into
-    // the recovered copy — conservatively (a dropped block may remove the last
-    // reference to some blob, so the copy can over-reference; that only makes
-    // GC retain a blob longer, never break a live indirection). Read them
-    // BEFORE `Writer::new` creates `dest`: a fallible step between creation
-    // and the cleanup-wrapped walk below would leak a partial destination on
-    // failure.
+    // decide whether a blob is still referenced. The SOURCE's list is NOT
+    // authoritative: a section that parses but under-reports (a forged count
+    // word) would let GC delete a blob the copy still references, so the walk
+    // derives the links from the recovered indirections and unions the source
+    // list in (a source-only id stays — a dropped block may hold its last
+    // reference, and over-referencing only makes GC retain a blob longer,
+    // never breaks a live indirection). Read the source list BEFORE
+    // `Writer::new` creates `dest`: a fallible step between creation and the
+    // cleanup-wrapped walk below would leak a partial destination on failure.
     let blob_links = table.list_blob_file_references()?;
     let writer = crate::table::Writer::new(dest.clone(), table.metadata.id, 0, Arc::clone(fs))?
         .mirror_from(&table.metadata, table.has_zone_map())
         .use_encryption(options.encryption.clone());
     #[cfg(zstd_any)]
     let writer = writer.use_zstd_dictionary(options.zstd_dictionary.clone());
-    let mut writer = writer;
-    if let Some(links) = blob_links {
-        for link in links {
-            writer.link_blob_file(link.blob_file_id, link.len, link.bytes, link.on_disk_bytes);
-        }
-    }
+    let writer = writer;
 
-    let walk = match salvage_blocks(&table, writer, comparator, !delete_mask_unpositionable) {
+    let walk = match salvage_blocks(
+        &table,
+        writer,
+        comparator,
+        !delete_mask_unpositionable,
+        blob_links,
+    ) {
         Ok(walk) => walk,
         Err(e) => {
             // A `write` / `finish` failure after `Writer::new` created `dest`
@@ -462,6 +465,72 @@ fn classify_drop(
     }
 }
 
+/// Decodes the [`crate::blob_tree::handle::BlobIndirection`] of every
+/// indirection entry in `entries`. An entry TAGGED as an indirection whose
+/// value fails to decode is corrupt content the live read path could not
+/// follow either — the caller drops the block rather than laundering it into
+/// the recovered copy.
+fn collect_indirections(
+    entries: &[crate::InternalValue],
+) -> crate::Result<Vec<crate::blob_tree::handle::BlobIndirection>> {
+    use crate::coding::Decode;
+
+    let mut out = Vec::new();
+    for entry in entries {
+        if entry.key.value_type == crate::ValueType::Indirection {
+            let mut cursor = &entry.value[..];
+            out.push(crate::blob_tree::handle::BlobIndirection::decode_from(
+                &mut cursor,
+            )?);
+        }
+    }
+    Ok(out)
+}
+
+/// [`collect_indirections`] for a columnar batch: a cheap value-type-column
+/// scan first, so the per-row materialization is only paid when the batch
+/// actually holds indirections (KV-separated columnar sources are rare).
+#[cfg(feature = "columnar")]
+fn collect_columnar_indirections(
+    batch: &crate::table::columnar::ColumnBatch,
+) -> crate::Result<Vec<crate::blob_tree::handle::BlobIndirection>> {
+    let tag = u8::from(crate::ValueType::Indirection);
+    // Columns are key / seqno / value-type / values...; the value-type column
+    // holds one tag byte per row.
+    let has_indirections = batch
+        .columns
+        .get(2)
+        .is_some_and(|c| c.data.iter().any(|&b| b == tag));
+    if !has_indirections {
+        return Ok(Vec::new());
+    }
+    let entries = crate::table::columnar::column_batch_to_entries(batch)?;
+    collect_indirections(&entries)
+}
+
+/// Folds one block's recovered indirections into the walk's derived blob-link
+/// map, mirroring the accumulation the live write path does per entry.
+fn fold_blob_links(
+    derived: &mut crate::HashMap<crate::vlog::BlobFileId, crate::table::writer::LinkedFile>,
+    indirections: &[crate::blob_tree::handle::BlobIndirection],
+) {
+    for ind in indirections {
+        derived
+            .entry(ind.vhandle.blob_file_id)
+            .and_modify(|link| {
+                link.bytes += u64::from(ind.size);
+                link.on_disk_bytes += u64::from(ind.vhandle.on_disk_size);
+                link.len += 1;
+            })
+            .or_insert_with(|| crate::table::writer::LinkedFile {
+                blob_file_id: ind.vhandle.blob_file_id,
+                bytes: u64::from(ind.size),
+                on_disk_bytes: u64::from(ind.vhandle.on_disk_size),
+                len: 1,
+            });
+    }
+}
+
 /// Walks `table`'s data blocks in index order, re-emitting every block that
 /// loads and decodes cleanly into `writer` and recording the rest.
 ///
@@ -488,6 +557,7 @@ fn salvage_blocks(
     mut writer: crate::table::Writer,
     comparator: &crate::comparator::SharedComparator,
     apply_delete_mask: bool,
+    source_blob_links: Option<Vec<crate::table::writer::LinkedFile>>,
 ) -> crate::Result<SalvageWalk> {
     use crate::table::block::ParsedItem;
     use alloc::format;
@@ -497,6 +567,13 @@ fn salvage_blocks(
     let mut blocks_copied_verbatim = 0usize;
     let mut entries_salvaged = 0u64;
     let mut dropped: Vec<DroppedBlock> = Vec::new();
+    // Blob links DERIVED from the recovered entries' indirections, keyed by
+    // blob file id. Exact for the recovered copy (only emitted rows count);
+    // unioned with the source's own list before finish.
+    let mut derived_blob_links: crate::HashMap<
+        crate::vlog::BlobFileId,
+        crate::table::writer::LinkedFile,
+    > = crate::HashMap::default();
     // Lower bound for a dropped block's range: the previous block's last key,
     // since the index stores each block's last key (so block N covers
     // `(end_key[N-1], end_key[N]]`).
@@ -549,6 +626,22 @@ fn salvage_blocks(
                 match table.load_columnar_block_masked(keyed.as_ref()) {
                     Ok(Some(batch)) => {
                         let rows = u64::from(batch.row_count);
+                        // Indirections of the SURVIVING (unmasked) rows,
+                        // BEFORE emit: an undecodable indirection is corrupt
+                        // content — drop the block, don't launder it.
+                        let block_links = match collect_columnar_indirections(&batch) {
+                            Ok(links) => links,
+                            Err(e) => {
+                                dropped.push(classify_drop(
+                                    &e,
+                                    offset,
+                                    prev_end.as_ref(),
+                                    &end_key,
+                                ));
+                                prev_end = Some(end_key);
+                                continue;
+                            }
+                        };
                         // A writer REJECTION (ordering / framing validation,
                         // `InvalidHeader` / `InvalidTag`) is block-local
                         // malformed content — drop the block and keep walking;
@@ -557,6 +650,7 @@ fn salvage_blocks(
                             Ok(_) => {
                                 entries_salvaged += rows;
                                 blocks_salvaged += 1;
+                                fold_blob_links(&mut derived_blob_links, &block_links);
                             }
                             Err(
                                 e @ (crate::Error::InvalidHeader(_) | crate::Error::InvalidTag(_)),
@@ -608,6 +702,23 @@ fn salvage_blocks(
                         }
                         Ok((batch, entries)) => {
                             let rows = u64::from(batch.row_count);
+                            // Indirections BEFORE emit: an entry tagged as an
+                            // indirection whose value fails to decode is
+                            // corrupt content — drop the block rather than
+                            // laundering it into the copy.
+                            let block_links = match collect_indirections(&entries) {
+                                Ok(links) => links,
+                                Err(e) => {
+                                    dropped.push(classify_drop(
+                                        &e,
+                                        offset,
+                                        prev_end.as_ref(),
+                                        &end_key,
+                                    ));
+                                    prev_end = Some(end_key);
+                                    continue;
+                                }
+                            };
                             // A delete-bearing SST is never byte-copied, even
                             // on this unmasked (resurrection opt-in) arm: the
                             // re-encode keeps the recovered copy's layout
@@ -640,6 +751,7 @@ fn salvage_blocks(
                                     }
                                     entries_salvaged += rows;
                                     blocks_salvaged += 1;
+                                    fold_blob_links(&mut derived_blob_links, &block_links);
                                 }
                                 Err(
                                     e @ (crate::Error::InvalidHeader(_)
@@ -717,6 +829,23 @@ fn salvage_blocks(
                                 continue;
                             }
                             let count = entries.len() as u64;
+                            // Indirections BEFORE emit: an entry tagged as an
+                            // indirection whose value fails to decode is
+                            // corrupt content — drop the block rather than
+                            // laundering it into the copy.
+                            let block_links = match collect_indirections(&entries) {
+                                Ok(links) => links,
+                                Err(e) => {
+                                    dropped.push(classify_drop(
+                                        &e,
+                                        offset,
+                                        prev_end.as_ref(),
+                                        &end_key,
+                                    ));
+                                    prev_end = Some(end_key);
+                                    continue;
+                                }
+                            };
                             // Ordering guard for BOTH emit paths: the verbatim
                             // append validates internally, but the row-by-row
                             // re-emit (`writer.write`) trusts its input, so a
@@ -747,6 +876,7 @@ fn salvage_blocks(
                                     }
                                     entries_salvaged += count;
                                     blocks_salvaged += 1;
+                                    fold_blob_links(&mut derived_blob_links, &block_links);
                                 }
                                 Err(
                                     e @ (crate::Error::InvalidHeader(_)
@@ -790,6 +920,26 @@ fn salvage_blocks(
 
     let wrote = blocks_salvaged > 0;
     if wrote {
+        // Blob links: the DERIVED map (exact for the recovered rows) unioned
+        // with any source-only ids (a dropped block may hold the last
+        // reference to a blob; over-referencing only makes GC retain it
+        // longer, never breaks a live indirection). The source list alone is
+        // not trusted — a parseable section with a forged count word would
+        // under-report and let GC delete a blob the copy still references.
+        let mut links: Vec<crate::table::writer::LinkedFile> =
+            derived_blob_links.into_values().collect();
+        if let Some(source_links) = source_blob_links {
+            for link in source_links {
+                if !links.iter().any(|l| l.blob_file_id == link.blob_file_id) {
+                    links.push(link);
+                }
+            }
+        }
+        // Deterministic section order regardless of hash-map iteration.
+        links.sort_unstable_by_key(|l| l.blob_file_id);
+        for link in links {
+            writer.link_blob_file(link.blob_file_id, link.len, link.bytes, link.on_disk_bytes);
+        }
         writer.finish()?;
     } else {
         drop(writer);
