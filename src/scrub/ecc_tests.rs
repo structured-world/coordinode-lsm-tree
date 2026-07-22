@@ -687,6 +687,94 @@ fn heal_in_place_refreshes_the_manifest_checksum() -> crate::Result<()> {
     Ok(())
 }
 
+/// A heal pass that fixes one block while ANOTHER block in the same SST stays
+/// uncorrectable must NOT refresh the manifest's full-file checksum: the
+/// refreshed digest would be computed over the current bytes — including the
+/// still-corrupt block — so a later `verify_integrity` would pass on an SST
+/// with known, unrepaired corruption. The digest may only be restamped once
+/// the file is fully healed.
+#[test]
+fn heal_in_place_skips_the_checksum_refresh_while_corruption_remains() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::{Config, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+    let (sst_path, first) = write_ecc_sst(dir.path());
+
+    // The SECOND data block, to wreck beyond the RS budget.
+    let second = {
+        let tree = open_ecc_tree(dir.path());
+        let binding = tree.version_history.read().latest_version();
+        let table = binding
+            .version
+            .iter_tables()
+            .next()
+            .expect("one table recovered");
+        let mut it = table.block_index.iter();
+        let _ = it.next().expect("first block").expect("decodes");
+        let keyed = it.next().expect("second block").expect("decodes");
+        crate::table::BlockHandle::new(keyed.offset(), keyed.size())
+    };
+
+    let mut bytes = std::fs::read(&sst_path)?;
+
+    // Block 1: rot one parity-trailer byte (heal-in-place rebuilds it).
+    let base = first.offset().0 as usize;
+    let Some(mut cursor) = bytes.get(base..) else {
+        panic!("first data block within the file");
+    };
+    let header = Header::decode_from(&mut cursor)?;
+    let trailer_pos = base + Header::header_len(header.block_type) + header.data_length as usize;
+    let Some(slot) = bytes.get_mut(trailer_pos) else {
+        panic!("parity trailer within the file");
+    };
+    *slot ^= 0xFF;
+
+    // Block 2: wreck the whole payload+parity (uncorrectable, left for salvage).
+    let payload_start = second.offset().0 as usize + Header::MIN_LEN;
+    let payload_end = second.offset().0 as usize + second.size() as usize;
+    for slot in bytes
+        .get_mut(payload_start..payload_end)
+        .expect("second block payload range in bounds")
+    {
+        *slot ^= 0xFF;
+    }
+    std::fs::write(&sst_path, &bytes)?;
+
+    // Manifest rebuild records the digest of the CORRUPT bytes.
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+    assert_eq!(report.recovered, 1, "{report:?}");
+
+    // Heal pass: block 1's trailer is rebuilt, block 2 stays uncorrectable.
+    let tree = open_ecc_tree(dir.path());
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report.blocks_healed_in_place >= 1,
+        "the rotted trailer is rebuilt in place: {report:?}",
+    );
+    assert!(
+        report.uncorrectable_blocks >= 1,
+        "the wrecked block is reported uncorrectable: {report:?}",
+    );
+
+    // The digest must NOT have been restamped over the still-corrupt bytes:
+    // the file no longer matches ANY trustworthy digest, and the integrity
+    // scan must keep flagging it until the corruption is actually repaired.
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "an SST with a known uncorrectable block must keep failing \
+         verify_integrity — restamping its manifest checksum would mask the \
+         corruption",
+    );
+    Ok(())
+}
+
 /// A clean encrypted, columnar, Page-ECC SST heals in place with no findings.
 /// Its data blocks are sealed as
 /// [`BlockType::Columnar`](crate::table::block::BlockType::Columnar) and
