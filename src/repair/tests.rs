@@ -463,69 +463,6 @@ fn recover_table(
     )
 }
 
-/// A WARNING-ONLY verify report (here: an unrecognized ECC descriptor) on a
-/// table salvage cannot faithfully re-emit (it carries range tombstones) must
-/// KEEP the table: its payload checksums verified clean, so quarantining it
-/// through a salvage that is guaranteed to refuse would throw away healthy
-/// data over a warning. Salvage stays reserved for reports with ERRORS and
-/// for warning-only tables salvage can actually rewrite.
-#[test]
-fn repair_with_salvage_keeps_a_warning_only_range_tombstone_sst() -> crate::Result<()> {
-    use crate::range_tombstone::RangeTombstone;
-    use crate::table::Writer;
-    use crate::{Config, InternalValue, SequenceNumberCounter, UserKey, ValueType};
-    use std::sync::Arc;
-
-    let dir = tempfile::tempdir()?;
-    let tables = dir.path().join("tables");
-    std::fs::create_dir_all(&tables)?;
-    let sst = tables.join("0");
-    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
-
-    {
-        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?;
-        for i in 0..8u32 {
-            w.write(InternalValue::from_components(
-                format!("k{i:05}").into_bytes(),
-                format!("v{i}").into_bytes(),
-                1,
-                ValueType::Value,
-            ))?;
-        }
-        w.write_range_tombstone(RangeTombstone::new(
-            UserKey::from(b"k00002".as_slice()),
-            UserKey::from(b"k00005".as_slice()),
-            2,
-        ));
-        assert!(w.finish()?.is_some(), "the SST is non-empty");
-    }
-
-    // The forged descriptor makes the verify report WARNING-only (sections
-    // skipped, no errors) while the data itself is untouched and healthy.
-    forge_unrecognized_ecc_descriptor(&sst)?;
-
-    let report = Config::new(
-        dir.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .repair_with_salvage(true)?;
-    assert!(
-        report.unreadable_files.is_empty(),
-        "a healthy table must not be dropped over a warning-only report: {:?}",
-        report.unreadable_files,
-    );
-    assert_eq!(
-        report.recovered, 1,
-        "the range-tombstone table joins the rebuilt manifest as-is: {report:?}",
-    );
-    assert_eq!(
-        report.salvaged, 0,
-        "salvage is never attempted when it cannot re-emit the range tombstones",
-    );
-    Ok(())
-}
-
 /// PARITY-ONLY rot (every payload checksum still clean) on a table salvage
 /// cannot faithfully re-emit (range tombstones) must also KEEP the table:
 /// the data is fully readable, only its recovery margin is degraded, and
@@ -701,12 +638,14 @@ fn repair_with_salvage_rejects_a_corrupt_unrecognized_ecc_tombstone_sst() -> cra
     Ok(())
 }
 
-/// The HEALTHY counterpart: an unrecognized-ECC range-tombstone table whose
-/// handle-based verification comes back clean IS kept (contract guard for the
-/// escape hatch — its data was actually verified, just through the table
-/// reads rather than the out-of-band walk).
+/// An unrecognized-ECC range-tombstone table can be neither verified in full
+/// (the block walk skips its sections; every lazy side structure would need
+/// its own handle-based check) nor faithfully salvaged (range tombstones are
+/// not re-emittable) — even a HEALTHY one is therefore QUARANTINED for
+/// manual recovery rather than riding unverified into the rebuilt manifest,
+/// and the quarantine protects it from the orphan cleanup a later open runs.
 #[test]
-fn repair_with_salvage_keeps_a_healthy_unrecognized_ecc_tombstone_sst() -> crate::Result<()> {
+fn repair_with_salvage_quarantines_an_unrecognized_ecc_tombstone_sst() -> crate::Result<()> {
     use crate::range_tombstone::RangeTombstone;
     use crate::table::Writer;
     use crate::{Config, InternalValue, SequenceNumberCounter, UserKey, ValueType};
@@ -743,13 +682,31 @@ fn repair_with_salvage_keeps_a_healthy_unrecognized_ecc_tombstone_sst() -> crate
         SequenceNumberCounter::default(),
     )
     .repair_with_salvage(true)?;
-    assert!(
-        report.unreadable_files.is_empty(),
-        "a handle-verified healthy table is kept: {:?}",
-        report.unreadable_files,
+    assert_eq!(
+        report.recovered, 0,
+        "an unverifiable table never joins the rebuilt manifest: {report:?}",
     );
-    assert_eq!(report.recovered, 1, "{report:?}");
-    assert_eq!(report.salvaged, 0, "{report:?}");
+    assert_eq!(
+        report.salvaged, 0,
+        "salvage cannot re-emit range tombstones"
+    );
+    let [(_, reason)] = report.unreadable_files.as_slice() else {
+        panic!(
+            "expected exactly one unreadable file, got {:?}",
+            report.unreadable_files,
+        );
+    };
+    assert!(
+        reason.contains("quarantined") && reason.contains("recompact"),
+        "the reason names the quarantine and the recovery path, got: {reason}",
+    );
+    // The original bytes survive in the quarantine (a later open's orphan
+    // cleanup would delete an unquarantined file the manifest ignores).
+    let quarantined = dir.path().join("repair-quarantine").join("0");
+    assert!(
+        fs.metadata(&quarantined).is_ok(),
+        "the original file is preserved in the quarantine",
+    );
     Ok(())
 }
 

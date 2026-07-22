@@ -238,27 +238,44 @@ enum BlockVerifyVerdict {
     Corrupt,
 }
 
-/// Whether a freshly-recovered table should be routed through block salvage.
+/// What the repair should do with a freshly-recovered table, based on the
+/// salvage-mode block verify.
+enum RepairKeepDecision {
+    /// The table joins the rebuilt manifest as-is.
+    Keep,
+    /// The table is routed through block salvage (quarantine + rewrite).
+    Salvage,
+    /// The table can be neither trusted nor faithfully salvaged: it is
+    /// QUARANTINED (protecting it from the orphan cleanup a later open runs)
+    /// and reported unreadable with this reason.
+    Quarantine(&'static str),
+}
+
+/// Grades a freshly-recovered table into a [`RepairKeepDecision`].
 ///
 /// `Corrupt` always salvages. `DegradedButReadable` (payloads verified clean,
-/// but part of the table is uncheckable — an unrecognized ECC descriptor, a
-/// build without the parity codecs — or its parity trailers rotted) salvages
-/// ONLY when salvage can faithfully re-emit the table: a range-tombstone SST
-/// is rejected by the block walk, so routing it through salvage would drop
+/// only the parity trailers rotted or could not be recomputed) salvages ONLY
+/// when salvage can faithfully re-emit the table: a range-tombstone SST is
+/// rejected by the block walk, so routing it through salvage would drop
 /// healthy, verified data over dead parity — it is kept as-is (with an
-/// operator-facing warning) instead.
-fn verify_wants_salvage(
+/// operator-facing warning) instead. `DegradedUnscanned` (unrecognized ECC
+/// descriptor: the walk verified NOTHING about the data) never keeps: a
+/// rewritable table salvages, and a range-tombstone table — which cannot be
+/// verified in full (every lazy side structure would need its own
+/// handle-based check) and cannot be re-emitted — is quarantined for the
+/// operator instead of riding unverified into the rebuilt manifest.
+fn verify_keep_decision(
     config: &Config,
     folder_fs: &Arc<dyn crate::fs::Fs>,
     table_path: &std::path::Path,
     table: &Table,
-) -> bool {
+) -> RepairKeepDecision {
     match block_verify_verdict(config, folder_fs, table_path, table) {
-        BlockVerifyVerdict::Clean => false,
-        BlockVerifyVerdict::Corrupt => true,
+        BlockVerifyVerdict::Clean => RepairKeepDecision::Keep,
+        BlockVerifyVerdict::Corrupt => RepairKeepDecision::Salvage,
         BlockVerifyVerdict::DegradedButReadable => {
             if table.range_tombstones().is_empty() {
-                true
+                RepairKeepDecision::Salvage
             } else {
                 log::warn!(
                     "table {} at {}: every payload verified clean but its ECC is \
@@ -268,56 +285,19 @@ fn verify_wants_salvage(
                     table.metadata.id,
                     table_path.display(),
                 );
-                false
+                RepairKeepDecision::Keep
             }
         }
         BlockVerifyVerdict::DegradedUnscanned => {
             if table.range_tombstones().is_empty() {
-                true
+                RepairKeepDecision::Salvage
             } else {
-                // The out-of-band walk verified NOTHING about the data here,
-                // so the range-tombstone escape hatch must not keep the
-                // table blindly. Verify it through handle-based reads
-                // instead: the cache-bypassing per-block scrub frames each
-                // payload by `data_length` and checksum-verifies it
-                // regardless of the descriptor. Clean → keep; anything else
-                // → salvage (whose range-tombstone refusal then correctly
-                // reports the corrupt table as unreadable).
-                //
-                // `is_ok()` alone is NOT enough: it only counts uncorrectable
-                // blocks, while a block-index walk failure (a corrupt
-                // partitioned-index leaf) lands in `errors` without touching
-                // that counter — and means the data blocks were never even
-                // ENUMERATED. The keep requires an error-free scrub.
-                //
-                // The data scrub also never touches the LAZY side blocks
-                // (the full bloom filter only loads on the first point
-                // read), so probe one point read through the table's real
-                // read stack: it forces the filter (and, for partitioned
-                // filters, its TLI) to load and verify. The probed key is
-                // the table's own smallest key, so the filter cannot
-                // short-circuit the load with a definite miss.
-                let scrub = table.scrub_data_blocks();
-                let probe = || {
-                    let key = table.metadata.key_range.min().clone();
-                    table
-                        .get(&key, crate::SeqNo::MAX, crate::hash::hash64(&key))
-                        .is_ok()
-                };
-                if scrub.is_ok() && scrub.errors.is_empty() && probe() {
-                    log::warn!(
-                        "table {} at {}: data verified clean through handle-based \
-                         reads (its ECC descriptor is unrecognized, so the \
-                         out-of-band walk skipped it), and salvage cannot re-emit \
-                         its range tombstones — keeping the table as-is; recompact \
-                         to re-stamp it under a supported scheme",
-                        table.metadata.id,
-                        table_path.display(),
-                    );
-                    false
-                } else {
-                    true
-                }
+                RepairKeepDecision::Quarantine(
+                    "ECC descriptor unrecognized (the block walk cannot verify the \
+                     table) and salvage cannot re-emit its range tombstones; \
+                     quarantined for manual recovery — recompact it under a \
+                     supported scheme",
+                )
             }
         }
     }
@@ -675,37 +655,65 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                 // the provider the walk could not decode an encrypted meta block
                 // and would misreport every healthy encrypted table as corrupt,
                 // rewriting it on every repair.
-                Ok(table)
-                    if salvage && verify_wants_salvage(config, &folder_fs, &table_path, &table) =>
-                {
-                    drop(table);
-                    match try_salvage_table(
-                        config,
-                        &table_base_folder,
-                        &folder_fs,
-                        &table_path,
-                        &file_name,
-                        table_id,
-                    ) {
-                        Ok(Some(table)) => {
-                            salvaged += 1;
-                            recovered_tables.push(table);
-                        }
-                        Ok(None) => {
+                Ok(table) if salvage => {
+                    match verify_keep_decision(config, &folder_fs, &table_path, &table) {
+                        RepairKeepDecision::Keep => recovered_tables.push(table),
+                        RepairKeepDecision::Quarantine(reason) => {
+                            drop(table);
                             seen_ids.remove(&table_id);
-                            unreadable_files.push((
-                                table_path,
-                                "verify found corrupt blocks; nothing salvageable".to_string(),
-                            ));
+                            // Quarantine (not leave-in-place): a later
+                            // `Tree::open` orphan-cleans table files the
+                            // rebuilt manifest does not reference, so an
+                            // unquarantined original would be DELETED.
+                            match quarantine_file(
+                                &*folder_fs,
+                                &table_base_folder,
+                                &table_path,
+                                &file_name,
+                            ) {
+                                Ok(dest) => unreadable_files.push((
+                                    table_path,
+                                    format!("{reason}; quarantined to {}", dest.display()),
+                                )),
+                                Err(e) => unreadable_files.push((
+                                    table_path,
+                                    format!("{reason}; quarantine failed ({e})"),
+                                )),
+                            }
                         }
-                        Err(salvage_err) => {
-                            seen_ids.remove(&table_id);
-                            unreadable_files.push((
-                                table_path,
-                                format!(
-                                    "verify found corrupt blocks; salvage failed ({salvage_err})"
-                                ),
-                            ));
+                        RepairKeepDecision::Salvage => {
+                            drop(table);
+                            match try_salvage_table(
+                                config,
+                                &table_base_folder,
+                                &folder_fs,
+                                &table_path,
+                                &file_name,
+                                table_id,
+                            ) {
+                                Ok(Some(table)) => {
+                                    salvaged += 1;
+                                    recovered_tables.push(table);
+                                }
+                                Ok(None) => {
+                                    seen_ids.remove(&table_id);
+                                    unreadable_files.push((
+                                        table_path,
+                                        "verify found corrupt blocks; nothing salvageable"
+                                            .to_string(),
+                                    ));
+                                }
+                                Err(salvage_err) => {
+                                    seen_ids.remove(&table_id);
+                                    unreadable_files.push((
+                                        table_path,
+                                        format!(
+                                            "verify found corrupt blocks; salvage failed \
+                                             ({salvage_err})"
+                                        ),
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
