@@ -80,6 +80,22 @@ pub enum ScrubError {
         /// The underlying error, rendered as text.
         reason: String,
     },
+
+    /// An in-place heal rewrote this table's bytes, but its refreshed
+    /// full-file digest could not be persisted to the manifest (recomputing
+    /// the digest or installing the new version failed). The healed BYTES are
+    /// durable; the manifest may still carry a stale pre-heal digest, so a
+    /// later [`crate::verify::verify_integrity`] can flag the healed file as
+    /// corrupt until a re-run of the scrub (or a manifest rebuild) refreshes
+    /// it.
+    ChecksumRefreshFailed {
+        /// Table whose digest could not be refreshed.
+        table_id: crate::table::TableId,
+        /// On-disk path of the SST.
+        path: PathBuf,
+        /// The underlying error, rendered as text.
+        reason: String,
+    },
 }
 
 /// Aggregated result of a [`patrol_scrub`] run.
@@ -261,8 +277,8 @@ pub fn patrol_scrub(tree: &impl AbstractTree, options: &PatrolScrubOptions) -> P
             let partial = scan_one(table, options);
             let refresh = wants_checksum_refresh(&partial);
             report.merge(partial);
-            if refresh {
-                refresh_healed_checksum(tree, table);
+            if refresh && let Some(finding) = refresh_healed_checksum(tree, table) {
+                report.errors.push(finding);
             }
             // Inter-SST pause only; skip the sleep after the final table so a
             // finished scrub returns promptly instead of idling one extra
@@ -323,8 +339,10 @@ pub fn patrol_scrub(tree: &impl AbstractTree, options: &PatrolScrubOptions) -> P
     for (partial, healed) in partials {
         report.merge(partial);
         for idx in healed {
-            if let Some(table) = tables.get(idx) {
-                refresh_healed_checksum(tree, table);
+            if let Some(table) = tables.get(idx)
+                && let Some(finding) = refresh_healed_checksum(tree, table)
+            {
+                report.errors.push(finding);
             }
         }
     }
@@ -345,25 +363,29 @@ fn wants_checksum_refresh(partial: &PatrolScrubReport) -> bool {
 
 /// Persists a healed table's refreshed full-file digest to the manifest: an
 /// in-place heal rewrote bytes, so the digest captured at recovery is stale and
-/// a later verify (or repair) would flag the healed file against it. Failure is
-/// logged, not fatal — the bytes themselves are already healed; the digest can
-/// be re-derived by a manifest rebuild.
-fn refresh_healed_checksum(tree: &impl AbstractTree, table: &crate::table::Table) {
-    match crate::repair::compute_table_checksum(&*table.fs, &table.path) {
-        Ok(raw) => {
-            let checksum = crate::Checksum::from_raw(raw);
-            if let Err(e) = tree.refresh_table_checksum(table.id(), checksum) {
-                log::warn!(
-                    "failed to persist refreshed checksum for healed table #{}: {e}",
-                    table.id(),
-                );
-            }
-        }
+/// a later verify (or repair) would flag the healed file against it. A failure
+/// is returned as a [`ScrubError::ChecksumRefreshFailed`] finding (the caller
+/// folds it into the report) — the healed bytes are durable either way, but a
+/// silently-stale manifest digest would make every later `verify_integrity`
+/// flag the freshly healed file while the patrol report claimed a clean heal.
+fn refresh_healed_checksum(
+    tree: &impl AbstractTree,
+    table: &crate::table::Table,
+) -> Option<ScrubError> {
+    let result = crate::repair::compute_table_checksum(&*table.fs, &table.path)
+        .and_then(|raw| tree.refresh_table_checksum(table.id(), crate::Checksum::from_raw(raw)));
+    match result {
+        Ok(()) => None,
         Err(e) => {
             log::warn!(
-                "failed to recompute checksum for healed table #{}: {e}",
+                "failed to persist refreshed checksum for healed table #{}: {e}",
                 table.id(),
             );
+            Some(ScrubError::ChecksumRefreshFailed {
+                table_id: table.id(),
+                path: (*table.path).clone(),
+                reason: e.to_string(),
+            })
         }
     }
 }
