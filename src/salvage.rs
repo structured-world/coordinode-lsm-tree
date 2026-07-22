@@ -497,10 +497,7 @@ fn collect_columnar_indirections(
     let tag = u8::from(crate::ValueType::Indirection);
     // Columns are key / seqno / value-type / values...; the value-type column
     // holds one tag byte per row.
-    let has_indirections = batch
-        .columns
-        .get(2)
-        .is_some_and(|c| c.data.iter().any(|&b| b == tag));
+    let has_indirections = batch.columns.get(2).is_some_and(|c| c.data.contains(&tag));
     if !has_indirections {
         return Ok(Vec::new());
     }
