@@ -638,6 +638,15 @@ impl Table {
             let Ok(batch) = crate::table::columnar::ColumnBatch::decode(&block.data) else {
                 return false;
             };
+            // A ZERO-ROW batch is malformed input (a real writer never emits
+            // an empty block) and the salvage walk DROPS it — so accepting it
+            // here (a tampered zone map can claim 0 for exactly that block,
+            // keeping the chain self-consistent) would verify positions the
+            // bitmap was never built against for every later block. Reject
+            // it like the rest of the salvage pipeline does.
+            if batch.row_count == 0 {
+                return false;
+            }
             let advance = batch.row_count;
             // `wrapping_add` matches how the open path builds the starts map,
             // so the comparison chain stays consistent (the salvage read mask
