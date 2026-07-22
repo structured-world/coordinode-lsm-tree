@@ -710,6 +710,79 @@ fn repair_with_salvage_quarantines_an_unrecognized_ecc_tombstone_sst() -> crate:
     Ok(())
 }
 
+/// A FAILED quarantine must abort the repair: the rebuilt manifest omits the
+/// unverifiable table, so a later `Tree::open` orphan-cleans the still-in-place
+/// original — installing that manifest after the move failed would let the
+/// next open DELETE the only copy instead of preserving it for manual
+/// recovery. The repair must propagate the quarantine error and leave no
+/// rebuilt manifest behind.
+#[test]
+fn repair_aborts_when_the_quarantine_move_fails() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+    use crate::range_tombstone::RangeTombstone;
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, UserKey, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    // An unverifiable range-tombstone SST: the repair routes it to quarantine.
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?;
+        for i in 0..8u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        w.write_range_tombstone(RangeTombstone::new(
+            UserKey::from(b"k00002".as_slice()),
+            UserKey::from(b"k00005".as_slice()),
+            2,
+        ));
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+    forge_unrecognized_ecc_descriptor(&sst)?;
+
+    // Fail the quarantine move (rename matched against its destination).
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    injector.arm(
+        FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::Other))
+            .on_path("repair-quarantine")
+            .once(),
+    );
+
+    let result = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(fault))
+    .repair_with_salvage(true);
+    injector.clear();
+
+    assert!(
+        result.is_err(),
+        "a failed quarantine must abort the repair (a rebuilt manifest \
+         omitting the still-in-place file would let the next open delete the \
+         only copy), got {result:?}",
+    );
+    // The original is still where it was — nothing moved, nothing lost.
+    assert!(
+        fs.metadata(&sst).is_ok(),
+        "the original file stays in place after the aborted repair",
+    );
+    Ok(())
+}
+
 /// The escape-hatch fallback scrub must be trusted only when it saw EVERY
 /// block: `scrub_data_blocks` records a block-index walk failure in `errors`
 /// WITHOUT counting an uncorrectable block, so a gate that only checks
