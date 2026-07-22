@@ -102,6 +102,24 @@ pub trait AbstractTree: sealed::Sealed {
     #[doc(hidden)]
     fn current_version(&self) -> Version;
 
+    /// Records that the table with `table_id` now has the full-file digest
+    /// `checksum`, persisting it to the manifest through a version upgrade.
+    ///
+    /// Called after an in-place heal rewrites a table's bytes: the healed
+    /// file's digest no longer matches the one captured at recovery, and
+    /// without the refresh a later [`verify`](crate::verify) pass (or a
+    /// repair) would flag the healed file as corrupted against the stale
+    /// manifest digest. A no-op when the table is no longer part of the
+    /// current version (compacted away while the heal ran — the old file is
+    /// on its way out).
+    #[cfg(feature = "std")]
+    #[doc(hidden)]
+    fn refresh_table_checksum(
+        &self,
+        table_id: TableId,
+        checksum: crate::checksum::Checksum,
+    ) -> crate::Result<()>;
+
     /// Returns a read-only snapshot of the tree's on-disk storage footprint:
     /// total used bytes, entry count, the average shape of a stored entry
     /// (average key / value bytes), and an estimate of how many more

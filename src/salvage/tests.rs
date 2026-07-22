@@ -1926,14 +1926,16 @@ fn salvage_fails_closed_on_a_zero_row_block_in_a_delete_bearing_sst() -> crate::
         // + max) to the SECOND block's FIRST column row_count — the field
         // the derived delete starts are built from.
         let read_u32 = |data: &[u8], at: usize| -> u32 {
-            data.get(at..at + 4)
-                .map(|b| u32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
-                .unwrap_or_else(|| panic!("u32 at {at} within the zone map payload"))
+            let Some(b) = data.get(at..at + 4) else {
+                panic!("u32 at {at} within the zone map payload");
+            };
+            u32::from_le_bytes(b.try_into().unwrap_or([0; 4]))
         };
         let read_u16 = |data: &[u8], at: usize| -> u16 {
-            data.get(at..at + 2)
-                .map(|b| u16::from_le_bytes(b.try_into().unwrap_or([0; 2])))
-                .unwrap_or_else(|| panic!("u16 at {at} within the zone map payload"))
+            let Some(b) = data.get(at..at + 2) else {
+                panic!("u16 at {at} within the zone map payload");
+            };
+            u16::from_le_bytes(b.try_into().unwrap_or([0; 2]))
         };
         let mut at = 4; // past the block count
         // Skip block 1 entirely: offset u64 + n_columns u16, then each

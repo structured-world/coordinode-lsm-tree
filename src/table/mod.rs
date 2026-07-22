@@ -112,6 +112,13 @@ pub struct Table(
     /// (not the shared `Arc<Inner>`) so an older snapshot keeps its own
     /// unrestricted view of the same physical SST. `None` on the common path.
     Option<UserKey>,
+    /// Refreshed full-file checksum: when `Some`, an in-place heal changed the
+    /// file's bytes AFTER it was recovered, and this digest supersedes the one
+    /// captured at recovery. Carried on the wrapper (like the restriction) so
+    /// the version diff sees the change and persists it to the manifest, while
+    /// older snapshots keep the digest they were recovered under. `None` on
+    /// the common path.
+    Option<Checksum>,
 );
 
 impl core::ops::Deref for Table {
@@ -3783,6 +3790,7 @@ impl Table {
                 heal_hints: once_cell::race::OnceBox::new(),
             }),
             None,
+            None,
         ))
     }
 
@@ -3816,7 +3824,7 @@ impl Table {
     /// durably installed.
     #[must_use]
     pub(crate) fn with_restriction(&self, lower: UserKey) -> Self {
-        Self(self.0.clone(), Some(lower))
+        Self(self.0.clone(), Some(lower), self.2)
     }
 
     /// Re-opens this table as a DISTINCT [`Inner`](inner::Inner) (its own file
@@ -3938,7 +3946,18 @@ impl Table {
 
     #[must_use]
     pub fn checksum(&self) -> Checksum {
-        self.0.checksum
+        // The refreshed digest (an in-place heal changed the bytes after
+        // recovery) supersedes the one captured at recovery.
+        self.2.unwrap_or(self.0.checksum)
+    }
+
+    /// A view of this table whose full-file checksum is `checksum`: an
+    /// in-place heal changed the file's bytes, and installing this view into
+    /// a new version makes the diff persist the refreshed digest to the
+    /// manifest (see [`crate::Version::with_refreshed_table_checksum`]).
+    #[must_use]
+    pub(crate) fn with_refreshed_checksum(&self, checksum: Checksum) -> Self {
+        Self(self.0.clone(), self.1.clone(), Some(checksum))
     }
 
     /// Read `len` bytes from the cursor position with checked arithmetic.

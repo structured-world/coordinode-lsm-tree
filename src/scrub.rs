@@ -258,7 +258,12 @@ pub fn patrol_scrub(tree: &impl AbstractTree, options: &PatrolScrubOptions) -> P
     if workers <= 1 {
         let mut report = PatrolScrubReport::default();
         for (idx, table) in tables.iter().enumerate() {
-            report.merge(scan_one(table, options));
+            let partial = scan_one(table, options);
+            let healed = partial.blocks_healed_in_place > 0;
+            report.merge(partial);
+            if healed {
+                refresh_healed_checksum(tree, table);
+            }
             // Inter-SST pause only; skip the sleep after the final table so a
             // finished scrub returns promptly instead of idling one extra
             // throttle interval.
@@ -277,9 +282,18 @@ pub fn patrol_scrub(tree: &impl AbstractTree, options: &PatrolScrubOptions) -> P
             .map(|_| {
                 scope.spawn(|| {
                     let mut local = PatrolScrubReport::default();
+                    // Table indexes whose scan healed blocks in place; the
+                    // manifest-digest refresh happens on the calling thread
+                    // after the workers join (it takes the tree's version
+                    // locks, which stay off the scan workers).
+                    let mut healed = Vec::new();
                     let mut idx = cursor.fetch_add(1, Ordering::Relaxed);
                     while let Some(table) = tables.get(idx) {
-                        local.merge(scan_one(table, options));
+                        let partial = scan_one(table, options);
+                        if partial.blocks_healed_in_place > 0 {
+                            healed.push(idx);
+                        }
+                        local.merge(partial);
                         // Claim the next SST first; only pause if this worker
                         // still has another table, so no worker sleeps after its
                         // final SST.
@@ -290,7 +304,7 @@ pub fn patrol_scrub(tree: &impl AbstractTree, options: &PatrolScrubOptions) -> P
                             std::thread::sleep(delay);
                         }
                     }
-                    local
+                    (local, healed)
                 })
             })
             .collect();
@@ -306,10 +320,40 @@ pub fn patrol_scrub(tree: &impl AbstractTree, options: &PatrolScrubOptions) -> P
     });
 
     let mut report = PatrolScrubReport::default();
-    for partial in partials {
+    for (partial, healed) in partials {
         report.merge(partial);
+        for idx in healed {
+            if let Some(table) = tables.get(idx) {
+                refresh_healed_checksum(tree, table);
+            }
+        }
     }
     report
+}
+
+/// Persists a healed table's refreshed full-file digest to the manifest: an
+/// in-place heal rewrote bytes, so the digest captured at recovery is stale and
+/// a later verify (or repair) would flag the healed file against it. Failure is
+/// logged, not fatal — the bytes themselves are already healed; the digest can
+/// be re-derived by a manifest rebuild.
+fn refresh_healed_checksum(tree: &impl AbstractTree, table: &crate::table::Table) {
+    match crate::repair::compute_table_checksum(&*table.fs, &table.path) {
+        Ok(raw) => {
+            let checksum = crate::Checksum::from_raw(raw);
+            if let Err(e) = tree.refresh_table_checksum(table.id(), checksum) {
+                log::warn!(
+                    "failed to persist refreshed checksum for healed table #{}: {e}",
+                    table.id(),
+                );
+            }
+        }
+        Err(e) => {
+            log::warn!(
+                "failed to recompute checksum for healed table #{}: {e}",
+                table.id(),
+            );
+        }
+    }
 }
 
 /// Scans one SST: heals corrections in place when

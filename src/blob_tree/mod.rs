@@ -387,6 +387,17 @@ impl AbstractTree for BlobTree {
         self.index.current_version()
     }
 
+    #[cfg(feature = "std")]
+    fn refresh_table_checksum(
+        &self,
+        table_id: crate::TableId,
+        checksum: crate::checksum::Checksum,
+    ) -> crate::Result<()> {
+        // Tables live in the index tree's version; blob files carry no
+        // manifest digest.
+        self.index.refresh_table_checksum(table_id, checksum)
+    }
+
     fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
         // Forward the index tree's compaction state (the default impl would
         // always report idle), and mark value bytes as NOT user values: large

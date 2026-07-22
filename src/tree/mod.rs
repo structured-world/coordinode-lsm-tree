@@ -413,6 +413,48 @@ impl AbstractTree for Tree {
         self.version_history.read().latest_version().version
     }
 
+    #[cfg(feature = "std")]
+    fn refresh_table_checksum(
+        &self,
+        table_id: TableId,
+        checksum: crate::checksum::Checksum,
+    ) -> crate::Result<()> {
+        // Same lock order as flush / compaction version installs: compaction
+        // state first, then the version history write lock.
+        let mut _compaction_state = self.compaction_state.lock();
+        let mut version_lock = self.version_history.write();
+
+        // Table already compacted away while the heal ran: the old file is on
+        // its way out, there is no manifest entry left to refresh.
+        if !version_lock
+            .latest_version()
+            .version
+            .iter_tables()
+            .any(|t| t.id() == table_id)
+        {
+            return Ok(());
+        }
+
+        version_lock.upgrade_version(
+            &self.config.path,
+            |current| {
+                let mut copy = current.clone();
+                if let Some(next) = copy
+                    .version
+                    .with_refreshed_table_checksum(table_id, checksum)
+                {
+                    copy.version = next;
+                }
+                Ok(copy)
+            },
+            &self.config.seqno,
+            &self.config.visible_seqno,
+            &*self.config.fs,
+            self.0.runtime_config.load_full(),
+            self.0.config.encryption.clone(),
+        )
+    }
+
     fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
         // One version snapshot reused for the footprint and the full-compaction
         // estimate below: a second `current_version()` could race a concurrent
