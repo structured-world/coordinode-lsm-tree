@@ -361,10 +361,20 @@ pub(crate) fn salvage_with_context(
     // derives the links from the recovered indirections and unions the source
     // list in (a source-only id stays — a dropped block may hold its last
     // reference, and over-referencing only makes GC retain a blob longer,
-    // never breaks a live indirection). Read the source list BEFORE
-    // `Writer::new` creates `dest`: a fallible step between creation and the
-    // cleanup-wrapped walk below would leak a partial destination on failure.
-    let blob_links = table.list_blob_file_references()?;
+    // never breaks a live indirection). The read is BEST-EFFORT: an
+    // unreadable section must not abort the salvage — the derived links
+    // already cover every recovered row, and failing here would leave the
+    // whole table unrecovered over a non-authoritative side section (a
+    // source-only id is then simply unknowable — its blocks did not make it
+    // into the copy anyway). Read it BEFORE `Writer::new` creates `dest` so
+    // no fallible step sits between creation and the cleanup-wrapped walk.
+    let blob_links = table.list_blob_file_references().unwrap_or_else(|e| {
+        log::warn!(
+            "salvage: the source linked_blob_files section is unreadable ({e}); \
+             deriving the copy's links from its recovered indirections only",
+        );
+        None
+    });
     let writer = crate::table::Writer::new(dest.clone(), table.metadata.id, 0, Arc::clone(fs))?
         .mirror_from(&table.metadata, table.has_zone_map())
         .use_encryption(options.encryption.clone());
