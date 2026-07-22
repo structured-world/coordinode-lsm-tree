@@ -687,6 +687,64 @@ fn heal_in_place_refreshes_the_manifest_checksum() -> crate::Result<()> {
     Ok(())
 }
 
+/// A manifest-digest refresh that FAILS after an in-place heal must surface in
+/// the scrub report, not vanish into a log line: the heal already rewrote the
+/// SST's bytes, so with the refresh lost a manifest that carried a stale
+/// (pre-heal) digest keeps flagging the healed file as corrupt on every later
+/// `verify_integrity` — while the patrol report claims a clean heal.
+#[test]
+fn heal_in_place_reports_a_failed_checksum_refresh() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst(dir.path());
+
+    // Rot one parity-trailer byte (payload checksums stay clean) so the heal
+    // pass rebuilds it in place.
+    let mut bytes = std::fs::read(&sst_path)?;
+    let base = block.offset().0 as usize;
+    let Some(mut cursor) = bytes.get(base..) else {
+        panic!("first data block within the file");
+    };
+    let header = Header::decode_from(&mut cursor)?;
+    let trailer_pos = base + Header::header_len(header.block_type) + header.data_length as usize;
+    let Some(slot) = bytes.get_mut(trailer_pos) else {
+        panic!("parity trailer within the file");
+    };
+    *slot ^= 0xFF;
+    std::fs::write(&sst_path, &bytes)?;
+
+    let fault = FaultFs::new(crate::fs::StdFs);
+    let injector = fault.injector();
+    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));
+
+    // Fail the manifest edit-log open the refresh performs; the heal itself
+    // touches only the SST under tables/.
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
+            .on_path("edits")
+            .once(),
+    );
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    injector.clear();
+
+    assert!(
+        report.blocks_healed_in_place >= 1,
+        "the rotted trailer is rebuilt in place: {report:?}",
+    );
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| format!("{e:?}").contains("ChecksumRefreshFailed")),
+        "a failed manifest-digest refresh must be a scrub finding, not a \
+         swallowed log line: {report:?}",
+    );
+    Ok(())
+}
+
 /// A heal pass that fixes one block while ANOTHER block in the same SST stays
 /// uncorrectable must NOT refresh the manifest's full-file checksum: the
 /// refreshed digest would be computed over the current bytes — including the
