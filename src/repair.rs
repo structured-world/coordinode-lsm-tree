@@ -332,6 +332,11 @@ fn try_salvage_table(
             // The real table id, so encrypted block AAD (which binds it) decrypts
             // and the recovered copy reopens under the same id below.
             table_id,
+            // Repair KNOWS the durable id (the file name), so the salvage
+            // open cross-checks the meta payload against it: a forged tail
+            // id falls back to the intact MID mirror instead of stamping the
+            // recovered copy with an identity the reopen below would reject.
+            expected_stored_id: Some(table_id),
             // Automated repair never silently resurrects deleted rows: a
             // delete-bearing SST whose bitmap cannot be applied fails salvage
             // (the corrupt original stays in quarantine). An operator who

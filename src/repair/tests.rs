@@ -1092,7 +1092,10 @@ fn repair_with_salvage_preserves_the_file_name_id_over_a_forged_tail_meta_id() -
             .map(|kh| *kh.as_ref().offset())
             .collect();
         assert!(offsets.len() >= 2, "need several blocks, got {offsets:?}");
-        offsets[0]
+        let Some(&first) = offsets.first() else {
+            panic!("a first data block exists");
+        };
+        first
     };
     let flip = usize::try_from(offset).unwrap_or(0) + 16;
     let mut bytes = std::fs::read(&sst)?;

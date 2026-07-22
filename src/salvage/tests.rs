@@ -2841,6 +2841,7 @@ fn salvage_recovers_an_encrypted_sst_with_the_provider() -> crate::Result<()> {
         #[cfg(zstd_any)]
         zstd_dictionary: None,
         table_id: 0,
+        expected_stored_id: None,
         allow_delete_resurrection: false,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
@@ -2932,6 +2933,7 @@ fn salvage_recovers_a_dictionary_sst_with_the_dictionary() -> crate::Result<()> 
         encryption: None,
         zstd_dictionary: Some(Arc::clone(&dict)),
         table_id: 0,
+        expected_stored_id: None,
         allow_delete_resurrection: false,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
@@ -3016,6 +3018,7 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
         #[cfg(zstd_any)]
         zstd_dictionary: None,
         table_id: 0,
+        expected_stored_id: None,
         allow_delete_resurrection: false,
     };
     let recovered_wrong = salvage_sst_with_options(&source, dest.clone(), &fs, &wrong)
@@ -3031,6 +3034,7 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
         #[cfg(zstd_any)]
         zstd_dictionary: None,
         table_id: TID,
+        expected_stored_id: None,
         allow_delete_resurrection: false,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;

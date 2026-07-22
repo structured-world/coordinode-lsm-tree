@@ -92,6 +92,31 @@ pub(crate) type BlockTaskPlan = (
     Vec<(BlockHandle, Vec<usize>)>,
 );
 
+/// How [`Table::recover_inner`] treats degraded sidecars and the metadata id
+/// cross-check.
+#[derive(Clone, Copy)]
+pub(crate) enum RecoveryMode {
+    /// Live-tree open: a corrupt delete-bitmap / unreadable zone map fails
+    /// closed, and the caller's durable id (manifest entry / file name) is
+    /// cross-checked against the meta payload (with MID-mirror fallback on a
+    /// bad TAIL copy).
+    Live,
+    /// Salvage open: a corrupt delete-bitmap / missing zone map degrades
+    /// instead of failing, so a damaged sidecar still opens. For an
+    /// UNENCRYPTED source the id cross-check uses `expected_id`: `Some` when
+    /// the caller knows the durable id out-of-band (repair — from the SST
+    /// file name), so a forged TAIL id falls back to the intact MID mirror
+    /// instead of poisoning the recovered copy's identity; `None` for a
+    /// standalone recovery reader, where the source's own stored id IS the
+    /// identity to recover under. An ENCRYPTED open always cross-checks the
+    /// caller's id — the meta block's AAD binds it regardless.
+    Salvage {
+        /// The durable table id known out-of-band, or `None` when the
+        /// source's stored id is authoritative.
+        expected_id: Option<TableId>,
+    },
+}
+
 /// A disk segment (a.k.a. `Table`, `SSTable`, `SST`, `sorted string table`) that is located on disk
 ///
 /// A table is an immutable list of key-value pairs, split into compressed blocks.
@@ -3074,18 +3099,18 @@ impl Table {
             comparator,
             #[cfg(feature = "metrics")]
             metrics,
-            false,
+            RecoveryMode::Live,
         )
     }
 
-    /// Recovers a table, optionally in **salvage mode** (`salvage = true`).
+    /// Recovers a table, optionally in **salvage mode** (see [`RecoveryMode`]).
     ///
     /// In salvage mode a corrupt or truncated delete-bitmap degrades to empty
     /// ("all rows live, pending recompaction") and a delete-bitmap with an
     /// unreadable zone map is ignored rather than erroring, so a columnar
     /// segment with a damaged sidecar still opens and its data blocks can be
-    /// recovered. Normal recovery (`salvage = false`) fails closed on both, to
-    /// avoid resurrecting deleted rows. Used by [`crate::salvage`].
+    /// recovered. Normal recovery ([`RecoveryMode::Live`]) fails closed on
+    /// both, to avoid resurrecting deleted rows. Used by [`crate::salvage`].
     #[expect(
         clippy::too_many_arguments,
         clippy::too_many_lines,
@@ -3106,11 +3131,13 @@ impl Table {
         #[cfg(zstd_any)] zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
         comparator: SharedComparator,
         #[cfg(feature = "metrics")] metrics: Arc<Metrics>,
-        salvage: bool,
+        mode: RecoveryMode,
     ) -> crate::Result<Self> {
         use core::sync::atomic::AtomicBool;
         use meta::ParsedMeta;
         use regions::ParsedRegions;
+
+        let salvage = matches!(mode, RecoveryMode::Salvage { .. });
 
         log::debug!("Recovering table from file {}", file_path.display());
         let mut file = fs.open(&file_path, &FsOpenOptions::new().read(true))?;
@@ -3126,16 +3153,22 @@ impl Table {
 
         log::trace!("Reading meta block, with meta_ptr={:?}", regions.metadata);
         // The expected-id cross-check rejects a swapped / wrong-id file in a
-        // LIVE tree, where the manifest / file name is the durable identity. A
-        // salvage-mode open is a standalone recovery reader: the SOURCE's own
-        // stored id IS the identity to recover under, so an unencrypted
-        // salvage open skips the check (None) and derives the id from the
-        // metadata. An ENCRYPTED open still passes the caller's id — the meta
-        // block's AAD binds it, so decryption itself requires the right id.
-        let expected_id = if salvage && encryption.is_none() {
-            None
-        } else {
-            Some(table_id)
+        // LIVE tree, where the manifest / file name is the durable identity.
+        // A salvage open with a caller-known id (repair — from the file name)
+        // keeps the check so a forged TAIL id falls back to the MID mirror; a
+        // STANDALONE salvage reader has no out-of-band id, so the SOURCE's
+        // own stored id is the identity and the check is skipped (None). An
+        // ENCRYPTED open always passes the caller's id — the meta block's AAD
+        // binds it, so decryption itself requires the right id.
+        let expected_id = match mode {
+            RecoveryMode::Live => Some(table_id),
+            RecoveryMode::Salvage { expected_id } => {
+                if encryption.is_some() {
+                    Some(table_id)
+                } else {
+                    expected_id
+                }
+            }
         };
         // TAIL first (authoritative copy by convention; physically
         // identical content to MID — same `file_size`, same

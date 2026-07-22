@@ -51,6 +51,14 @@ pub struct SalvageOptions {
     /// from the metadata — and the recovered copy is always stamped with the
     /// SOURCE's stored id (its identity), never with this field.
     pub table_id: crate::TableId,
+    /// The durable table id the caller knows OUT-OF-BAND (the SST file name /
+    /// manifest entry), or `None` (the standalone default) when the source's
+    /// stored id is the identity. When `Some`, the salvage open cross-checks
+    /// the meta payload against it — with fallback to the mirrored MID meta
+    /// copy — so a checksum-clean tail meta whose stored id was forged cannot
+    /// poison the recovered copy's identity. [`crate::repair`] passes the id
+    /// derived from the file name.
+    pub expected_stored_id: Option<crate::TableId>,
     /// Opt-in to salvaging a delete-bearing columnar SST whose positional
     /// delete bitmap cannot be applied (the bitmap section is unreadable, or a
     /// readable bitmap's positioning zone map is unreadable). The degraded
@@ -306,8 +314,12 @@ pub(crate) fn salvage_with_context(
         #[cfg(feature = "metrics")]
         metrics,
         // Salvage mode: a corrupt delete-bitmap / missing zone map degrades to
-        // "all rows live" instead of failing, so a damaged sidecar still opens.
-        true,
+        // "all rows live" instead of failing, so a damaged sidecar still
+        // opens. A caller-known durable id (repair) keeps the meta id
+        // cross-check live, so a forged tail id falls back to the MID mirror.
+        crate::table::RecoveryMode::Salvage {
+            expected_id: options.expected_stored_id,
+        },
     )?;
 
     // Fail closed on range tombstones: the positional walk re-emits only point
