@@ -82,13 +82,15 @@ fn table_writer_count() -> crate::Result<()> {
 fn writer_rejects_a_block_whose_parity_exceeds_the_hard_cap() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("1");
-    // RS(1,255): every payload byte amplified 255x into parity — a 2 MiB
-    // value produces a ~510 MiB trailer, over the 256 MiB cap.
+    // RS(1,255): every payload byte amplified 255x into parity. Keep the
+    // payload JUST above the 256 MiB cap (1_100_000 × 255 ≈ 268 MiB) so a
+    // regression of the pre-encoding guard allocates barely past the cap
+    // instead of half a gigabyte destabilizing CI.
     let mut writer = Writer::new(path, 1, 0, Arc::new(StdFs))?
         .use_ecc(Some(crate::table::block::EccParams::try_new(1, 255)?));
     let write_result = writer.write(InternalValue::from_components(
         b"k".as_slice(),
-        vec![0xABu8; 2 * 1024 * 1024],
+        vec![0xABu8; 1_100_000],
         0,
         ValueType::Value,
     ));
