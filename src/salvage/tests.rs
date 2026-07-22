@@ -1773,6 +1773,223 @@ fn salvage_fails_closed_on_an_unreadable_block_in_a_delete_bearing_sst() -> crat
     Ok(())
 }
 
+/// A delete-bearing columnar SST where one block was REPLACED by a zero-row
+/// batch and the zone map's claim for it patched to 0: the position verifier
+/// would accept the block (decoded count 0 matches the claim) while the walk
+/// drops it as malformed — leaving later blocks masked at starts that no
+/// longer reflect the ORIGINAL row layout the bitmap was built against.
+/// A zero-row batch is malformed input everywhere else in the salvage
+/// pipeline, so the verifier must reject it too and fail the salvage closed.
+#[cfg(feature = "columnar")]
+#[test]
+fn salvage_fails_closed_on_a_zero_row_block_in_a_delete_bearing_sst() -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::config::DeleteStrategy;
+    use crate::table::block::Header;
+    use crate::table::columnar::{
+        COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, CodecId, Column, ColumnBatch, TypeTag,
+    };
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let n = 200u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_data_block_size(256)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    for pos in [5u32, 50, 150] {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    // Replace the SECOND data block with a length-preserving ZERO-ROW batch
+    // (skeleton + padding columns, checksum re-stamped) — the same forgery
+    // the plain zero-row test uses.
+    let (block_off, block_size) = {
+        let table = open(source.clone(), &fs)?;
+        let Some(kh) = table.data_block_handles().filter_map(Result::ok).nth(1) else {
+            panic!("source must have at least two data blocks");
+        };
+        (
+            usize::try_from(*kh.as_ref().offset()).unwrap_or(usize::MAX),
+            kh.as_ref().size() as usize,
+        )
+    };
+    let mut bytes = std::fs::read(&source)?;
+    let Some(block) = bytes.get(block_off..block_off + block_size) else {
+        panic!("block range within the file");
+    };
+    let mut cursor = block;
+    let header = Header::decode_from(&mut cursor)?;
+    let header_len = Header::header_len(header.block_type);
+    let target_len = header.data_length as usize;
+    assert_eq!(
+        target_len % 2,
+        0,
+        "the padded skeleton needs an even length"
+    );
+    let empty_fixed = |id: u16, width: u8| Column {
+        column_id: id,
+        type_tag: TypeTag::Fixed(width),
+        validity: None,
+        data: Vec::new(),
+    };
+    let mut columns = vec![
+        Column {
+            column_id: COL_USER_KEY,
+            type_tag: TypeTag::Bytes,
+            validity: None,
+            data: vec![0u8; 4],
+        },
+        empty_fixed(COL_SEQNO, 8),
+        empty_fixed(COL_VALUE_TYPE, 1),
+        empty_fixed(COL_VALUE, 1),
+    ];
+    let Some(mut rem) = target_len.checked_sub(8 + 14 + 10 + 10 + 10) else {
+        panic!("source payload larger than the zero-row skeleton");
+    };
+    let mut next_id = COL_VALUE + 1;
+    while rem % 10 != 0 {
+        columns.push(Column {
+            column_id: next_id,
+            type_tag: TypeTag::Bytes,
+            validity: None,
+            data: vec![0u8; 4],
+        });
+        next_id += 1;
+        let Some(next_rem) = rem.checked_sub(14) else {
+            panic!("remainder covers a Bytes column");
+        };
+        rem = next_rem;
+    }
+    while rem > 0 {
+        columns.push(empty_fixed(next_id, 1));
+        next_id += 1;
+        rem -= 10;
+    }
+    let new_payload = ColumnBatch {
+        row_count: 0,
+        columns,
+    }
+    .encode(CodecId::Plain)?;
+    assert_eq!(new_payload.len(), target_len, "length-preserving forgery");
+    let new_header = Header {
+        checksum: crate::Checksum::from_raw(crate::hash::hash128(&new_payload)),
+        ..header
+    };
+    let mut new_block: Vec<u8> = Vec::with_capacity(header_len + new_payload.len());
+    new_header.encode_into(&mut new_block)?;
+    new_block.extend_from_slice(&new_payload);
+    let Some(target) = bytes.get_mut(block_off..block_off + new_block.len()) else {
+        panic!("block range within the file");
+    };
+    target.copy_from_slice(&new_block);
+
+    // Patch the zone map's row_count claim for the second block to 0 (the
+    // first column's count drives the derived delete starts) and re-stamp
+    // the zone-map block checksum, so the tampered chain is self-consistent.
+    let zm_pos = {
+        let mut f = std::io::Cursor::new(&bytes);
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"zone_map") else {
+            panic!("source must carry a zone_map section");
+        };
+        usize::try_from(entry.pos()).unwrap_or(usize::MAX)
+    };
+    let Some(mut zm_cursor) = bytes.get(zm_pos..) else {
+        panic!("zone_map section within the file");
+    };
+    let zm_header = Header::decode_from(&mut zm_cursor)?;
+    let zm_header_len = Header::header_len(zm_header.block_type);
+    let zm_payload_range =
+        zm_pos + zm_header_len..zm_pos + zm_header_len + zm_header.data_length as usize;
+    {
+        let Some(payload) = bytes.get_mut(zm_payload_range.clone()) else {
+            panic!("zone_map payload within the file");
+        };
+        // Walk the wire layout (count u32; per block: block_offset u64 +
+        // n_columns u16; per column: id u32 + type u8 + codec u8 +
+        // null_count u32 + row_count u32 + min_len u32 + min + max_len u32
+        // + max) to the SECOND block's FIRST column row_count — the field
+        // the derived delete starts are built from.
+        let read_u32 = |data: &[u8], at: usize| -> u32 {
+            data.get(at..at + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
+                .unwrap_or_else(|| panic!("u32 at {at} within the zone map payload"))
+        };
+        let read_u16 = |data: &[u8], at: usize| -> u16 {
+            data.get(at..at + 2)
+                .map(|b| u16::from_le_bytes(b.try_into().unwrap_or([0; 2])))
+                .unwrap_or_else(|| panic!("u16 at {at} within the zone map payload"))
+        };
+        let mut at = 4; // past the block count
+        // Skip block 1 entirely: offset u64 + n_columns u16, then each
+        // column's fixed 14 bytes + variable min/max.
+        at += 8;
+        let block1_cols = read_u16(payload, at);
+        at += 2;
+        for _ in 0..block1_cols {
+            at += 10; // id + type + codec + null_count
+            at += 4; // row_count
+            let min_len = read_u32(payload, at) as usize;
+            at += 4 + min_len;
+            let max_len = read_u32(payload, at) as usize;
+            at += 4 + max_len;
+        }
+        // Block 2: seek to its first column's row_count and zero it.
+        at += 8; // block_offset
+        at += 2; // n_columns
+        at += 10; // first column's id + type + codec + null_count
+        let claimed = read_u32(payload, at);
+        assert!(claimed > 0, "the second block originally holds rows");
+        let Some(rc) = payload.get_mut(at..at + 4) else {
+            panic!("second block's first row_count within the zone map payload");
+        };
+        rc.copy_from_slice(&0u32.to_le_bytes());
+    }
+    let new_zm_checksum = crate::Checksum::from_raw(crate::hash::hash128(
+        bytes.get(zm_payload_range).unwrap_or(&[]),
+    ));
+    let new_zm_header = Header {
+        checksum: new_zm_checksum,
+        ..zm_header
+    };
+    let mut zm_hdr_bytes: Vec<u8> = Vec::with_capacity(zm_header_len);
+    new_zm_header.encode_into(&mut zm_hdr_bytes)?;
+    let Some(zm_dst) = bytes.get_mut(zm_pos..zm_pos + zm_header_len) else {
+        panic!("zone_map header within the file");
+    };
+    zm_dst.copy_from_slice(&zm_hdr_bytes);
+    std::fs::write(&source, &bytes)?;
+
+    // Default: fail closed — the zero-row block is unpositionable input (the
+    // walk drops it while later blocks would be masked at starts the bitmap
+    // was never built against).
+    let result = salvage_sst(&source, dest.clone(), &fs);
+    assert!(
+        result.is_err(),
+        "a zero-row block in a delete-bearing SST fails the default salvage: {result:?}",
+    );
+    assert!(
+        fs.metadata(&dest).is_err(),
+        "no destination file is left behind by the refused salvage",
+    );
+    Ok(())
+}
+
 /// A footer-bearing row SST (per-KV checksums) whose block checksum was
 /// re-stamped over a tampered entry: the BLOCK checksum verifies, but the
 /// entry no longer matches its per-KV digest. Salvage must verify the footer
