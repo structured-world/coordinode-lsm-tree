@@ -612,6 +612,81 @@ fn heal_in_place_reports_a_failed_heal_reread_as_uncorrectable() -> crate::Resul
     Ok(())
 }
 
+/// An in-place heal that changes the SST's bytes must REFRESH the manifest's
+/// full-file checksum. The heal itself restores the block's original bytes
+/// (whose digest usually matches the manifest), but a table admitted by a
+/// MANIFEST REBUILD while its parity was already rotted carries the digest of
+/// the ROTTED bytes — a later heal then restores the original parity and
+/// `verify_integrity` flags the freshly healed table as corrupt against the
+/// stale digest, durably, on every scan.
+#[test]
+fn heal_in_place_refreshes_the_manifest_checksum() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::{Config, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst(dir.path());
+
+    // Rot one parity-trailer byte (payload checksums stay clean).
+    let mut bytes = std::fs::read(&sst_path)?;
+    let base = block.offset().0 as usize;
+    let Some(mut cursor) = bytes.get(base..) else {
+        panic!("first data block within the file");
+    };
+    let header = Header::decode_from(&mut cursor)?;
+    let trailer_pos = base + Header::header_len(header.block_type) + header.data_length as usize;
+    let Some(slot) = bytes.get_mut(trailer_pos) else {
+        panic!("parity trailer within the file");
+    };
+    *slot ^= 0xFF;
+    std::fs::write(&sst_path, &bytes)?;
+
+    // A manifest rebuild admits the table with the digest of the ROTTED
+    // bytes (parity-only rot grades degraded-but-readable; the sole data
+    // block here carries no range tombstones, but a rebuild recomputes the
+    // digest from whatever is on disk either way — force the keep by
+    // rebuilding without salvage).
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+    assert_eq!(report.recovered, 1, "{report:?}");
+
+    // Heal the trailer in place: the file's bytes return to their ORIGINAL
+    // state, which no longer matches the rotted digest the rebuilt manifest
+    // recorded.
+    let tree = open_ecc_tree(dir.path());
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report.blocks_healed_in_place >= 1,
+        "the rotted trailer is rebuilt in place: {report:?}",
+    );
+
+    // Without a manifest-checksum refresh, every later integrity scan flags
+    // the freshly healed (fully verifiable) table as corrupt.
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        integrity.is_ok(),
+        "a healed table must verify clean against a refreshed manifest \
+         checksum, got {:?}",
+        integrity.errors,
+    );
+
+    // The refreshed checksum survives a reopen (persisted, not just patched
+    // in memory).
+    drop(tree);
+    let tree = open_ecc_tree(dir.path());
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        integrity.is_ok(),
+        "the refreshed checksum is durable across reopen, got {:?}",
+        integrity.errors,
+    );
+    Ok(())
+}
+
 /// A clean encrypted, columnar, Page-ECC SST heals in place with no findings.
 /// Its data blocks are sealed as
 /// [`BlockType::Columnar`](crate::table::block::BlockType::Columnar) and
