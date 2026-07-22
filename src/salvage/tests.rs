@@ -231,6 +231,103 @@ fn salvage_preserves_the_source_linked_blob_files() -> crate::Result<()> {
     Ok(())
 }
 
+/// A `linked_blob_files` section that PARSES but under-reports its contents
+/// (count word forged to 0, record bytes left in place) must not be trusted
+/// as the sole source of the recovered copy's links: the recovered entries
+/// still hold `ValueHandle` indirections into the blob file, and blob GC /
+/// relocation consults the links to decide liveness — an under-reported list
+/// would let GC delete or rewrite a blob the copy still references. Salvage
+/// derives the links from the recovered indirections and unions them with
+/// the source list.
+#[test]
+fn salvage_rebuilds_blob_links_from_recovered_indirections() -> crate::Result<()> {
+    use crate::AbstractTree;
+
+    let dir = tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let crate::AnyTree::Blob(tree) = crate::Config::new(
+        dir.path(),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+    .open()?
+    else {
+        unreachable!("kv separation configured");
+    };
+    let big = |i: u32| format!("{i:08}").repeat(512);
+    for i in 0u32..10 {
+        tree.insert(format!("key{i:05}"), big(i), u64::from(i) + 1);
+    }
+    tree.flush_active_memtable(10)?;
+    let source = {
+        let binding = tree.index.version_history.read().latest_version();
+        let Some(table) = binding.version.iter_tables().next() else {
+            panic!("flush produced one table");
+        };
+        (*table.path).clone()
+    };
+    drop(tree);
+
+    // The TRUE links, before the forgery.
+    let Some(true_links) = open(source.clone(), &fs)?.list_blob_file_references()? else {
+        panic!("the source carries a linked_blob_files section");
+    };
+    assert!(!true_links.is_empty(), "the source references blob files");
+
+    // Forge the count word to 0: the section still parses (the bound check
+    // passes trivially) but reports NO links.
+    let pos = {
+        let mut f = std::fs::File::open(&source)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader
+            .toc()
+            .iter()
+            .find(|e| e.name() == b"linked_blob_files")
+        else {
+            panic!("the source must carry a linked_blob_files section");
+        };
+        usize::try_from(entry.pos()).unwrap_or(usize::MAX)
+    };
+    let mut bytes = std::fs::read(&source)?;
+    let Some(count) = bytes.get_mut(pos..pos + 4) else {
+        panic!("linked_blob_files count header within the file");
+    };
+    count.copy_from_slice(&0u32.to_le_bytes());
+    std::fs::write(&source, &bytes)?;
+
+    // Sanity: the forgery took — the source now under-reports.
+    let Some(forged) = open(source.clone(), &fs)?.list_blob_file_references()? else {
+        panic!("the forged section still parses");
+    };
+    assert!(forged.is_empty(), "the forged count hides every link");
+
+    let dest = dir.path().join("salvaged");
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert!(report.is_complete(), "data blocks are healthy: {report:?}");
+
+    // The copy's links are derived from its recovered indirections, not
+    // parroted from the forged source list.
+    let Some(recovered_links) = open(dest, &fs)?.list_blob_file_references()? else {
+        panic!("the salvaged copy must carry links derived from its indirections");
+    };
+    for link in &true_links {
+        assert!(
+            recovered_links
+                .iter()
+                .any(|l| l.blob_file_id == link.blob_file_id),
+            "blob file {} is referenced by recovered indirections but missing \
+             from the copy's links: {recovered_links:?}",
+            link.blob_file_id,
+        );
+    }
+    Ok(())
+}
+
 /// A KV-separated source whose `linked_blob_files` section is unreadable (a
 /// count header claiming more records than the section holds) fails the
 /// salvage — but must NOT leave a partial destination behind: the links are
