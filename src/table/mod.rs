@@ -3851,7 +3851,11 @@ impl Table {
     pub(crate) fn reopen_restricted(&self, lower: UserKey) -> crate::Result<Self> {
         let reopened = Self::recover(
             (*self.path).clone(),
-            self.checksum,
+            // The override-aware accessor, NOT the inner recovery-time field:
+            // an in-place heal may have refreshed this table's digest, and the
+            // reopened view must carry that forward or a tight-space swap
+            // would reinstall the stale pre-heal digest into the manifest.
+            self.checksum(),
             self.global_seqno,
             self.tree_id,
             self.metadata.id,
