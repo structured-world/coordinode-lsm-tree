@@ -960,6 +960,186 @@ fn repair_with_salvage_rejects_an_unrecognized_ecc_tombstone_sst_with_a_corrupt_
 /// Patches `descriptor#page_ecc` to a non-canonical (unrecognized) value in
 /// both meta blocks of the SST at `path`, re-stamping each block's checksum
 /// so the frames stay checksum-clean.
+/// Overwrites the TAIL meta copy's `table_id` value with `forged_id` and
+/// restamps that block's checksum, leaving the mirrored `meta_mid` copy
+/// intact — the "only the tail id rotted" scenario a normal recovery survives
+/// via its expected-id cross-check + MID fallback.
+fn forge_tail_meta_table_id(path: &std::path::Path, forged_id: u64) -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::table::block::Header;
+
+    let mut bytes = std::fs::read(path)?;
+    let pos = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"meta") else {
+            panic!("the SST must carry a meta section");
+        };
+        entry.pos()
+    };
+    let block_off = usize::try_from(pos).unwrap_or(usize::MAX);
+    let Some(block) = bytes.get(block_off..) else {
+        panic!("meta block within the file");
+    };
+    let mut cursor = block;
+    let header = Header::decode_from(&mut cursor)?;
+    let header_len = Header::header_len(header.block_type);
+    let payload_range =
+        block_off + header_len..block_off + header_len + header.data_length as usize;
+    {
+        let Some(payload) = bytes.get_mut(payload_range.clone()) else {
+            panic!("meta payload within the file");
+        };
+        let needle = b"table_id";
+        let Some(key_pos) = payload
+            .windows(needle.len())
+            .position(|w| w == needle.as_slice())
+        else {
+            panic!("table_id key present verbatim (restart interval 1)");
+        };
+        // Entry layout after the key bytes: value length (LEB128, one byte
+        // for 8), then the 8-byte little-endian id.
+        let val_at = key_pos + needle.len();
+        assert_eq!(
+            payload.get(val_at).copied(),
+            Some(8),
+            "table_id value length prefix",
+        );
+        let Some(value) = payload.get_mut(val_at + 1..val_at + 9) else {
+            panic!("table_id value within the payload");
+        };
+        value.copy_from_slice(&forged_id.to_le_bytes());
+    }
+    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(
+        bytes.get(payload_range).unwrap_or(&[]),
+    ));
+    let new_header = Header {
+        checksum: new_checksum,
+        ..header
+    };
+    let mut hdr_bytes = Vec::with_capacity(header_len);
+    new_header.encode_into(&mut hdr_bytes)?;
+    let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
+        panic!("meta header within the file");
+    };
+    hdr_dst.copy_from_slice(&hdr_bytes);
+    std::fs::write(path, &bytes)?;
+    Ok(())
+}
+
+/// A repair salvage knows the durable table id from the SST's file name; the
+/// salvage-mode open must cross-check it so a checksum-clean TAIL meta whose
+/// `table_id` field was forged falls back to the intact MID mirror (exactly
+/// like normal recovery) instead of stamping the recovered copy with the
+/// forged id — which would fail the post-salvage reopen under the file-name
+/// id and quarantine a recoverable table.
+#[test]
+fn repair_with_salvage_preserves_the_file_name_id_over_a_forged_tail_meta_id() -> crate::Result<()>
+{
+    use crate::table::Writer;
+    use crate::{AbstractTree, Config, InternalValue, MAX_SEQNO, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("7");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    // Enough data for SEVERAL blocks: one gets corrupted (triggering salvage),
+    // the rest stay recoverable.
+    {
+        let mut w = Writer::new(sst.clone(), 7, 0, Arc::clone(&fs))?;
+        for i in 0..600u32 {
+            w.write(InternalValue::from_components(
+                format!("key{i:05}").into_bytes(),
+                format!("{i:08}").repeat(8).into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Corrupt the FIRST data block so verification routes the table through
+    // salvage.
+    let offset = {
+        let checksum = crate::Checksum::from_raw(compute_table_checksum(&*fs, &sst)?);
+        let table = crate::table::Table::recover(
+            sst.clone(),
+            checksum,
+            0,
+            0,
+            7,
+            Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+            None,
+            Arc::clone(&fs),
+            false,
+            false,
+            None,
+            #[cfg(zstd_any)]
+            None,
+            crate::comparator::default_comparator(),
+            #[cfg(feature = "metrics")]
+            Arc::new(crate::Metrics::default()),
+        )?;
+        let offsets: alloc::vec::Vec<u64> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|kh| *kh.as_ref().offset())
+            .collect();
+        assert!(offsets.len() >= 2, "need several blocks, got {offsets:?}");
+        offsets[0]
+    };
+    let flip = usize::try_from(offset).unwrap_or(0) + 16;
+    let mut bytes = std::fs::read(&sst)?;
+    if let Some(b) = bytes.get_mut(flip) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&sst, &bytes)?;
+
+    // Forge ONLY the tail meta's table_id (7 → 99); the MID mirror keeps 7.
+    forge_tail_meta_table_id(&sst, 99)?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.salvaged, 1,
+        "the readable blocks are salvaged under the file-name id: {:?}",
+        report.unreadable_files,
+    );
+    assert_eq!(
+        report.unreadable, 0,
+        "no quarantine for a recoverable table: {:?}",
+        report.unreadable_files,
+    );
+
+    // The recovered copy reopens under the durable file-name id and serves
+    // the surviving keys.
+    let crate::AnyTree::Standard(tree) = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?
+    else {
+        unreachable!("standard tree");
+    };
+    let got = tree.get(b"key00599", MAX_SEQNO)?;
+    assert!(
+        got.is_some(),
+        "a key outside the corrupt block survives the salvage",
+    );
+    Ok(())
+}
+
 fn forge_unrecognized_ecc_descriptor(path: &std::path::Path) -> crate::Result<()> {
     use crate::coding::{Decode, Encode};
     use crate::table::block::Header;
