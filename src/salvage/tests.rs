@@ -328,13 +328,16 @@ fn salvage_rebuilds_blob_links_from_recovered_indirections() -> crate::Result<()
     Ok(())
 }
 
-/// A KV-separated source whose `linked_blob_files` section is unreadable (a
-/// count header claiming more records than the section holds) fails the
-/// salvage — but must NOT leave a partial destination behind: the links are
-/// read before anything is created at `dest`, so a failed salvage leaves no
-/// stale output for a later repair or retry to trip over.
+/// A KV-separated source whose `linked_blob_files` section is UNREADABLE (a
+/// count header claiming more records than the section holds) must not abort
+/// the salvage: the section is not authoritative — the walk derives the
+/// copy's links from the recovered `ValueHandle` indirections — so the
+/// readable data blocks are still recovered and the copy carries the derived
+/// links. Failing here would leave the whole table unrecovered over a
+/// non-authoritative side section.
 #[test]
-fn salvage_leaves_no_destination_when_the_blob_links_are_unreadable() -> crate::Result<()> {
+fn salvage_recovers_with_derived_links_when_the_blob_link_section_is_unreadable()
+-> crate::Result<()> {
     use crate::AbstractTree;
 
     let dir = tempdir()?;
@@ -390,14 +393,17 @@ fn salvage_leaves_no_destination_when_the_blob_links_are_unreadable() -> crate::
     std::fs::write(&source, &bytes)?;
 
     let dest = dir.path().join("salvaged");
-    let result = salvage_sst(&source, dest.clone(), &fs);
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert!(report.is_complete(), "data blocks are healthy: {report:?}");
+
+    // The copy's links are derived from its recovered indirections; the
+    // unreadable source section contributes nothing.
+    let Some(recovered_links) = open(dest, &fs)?.list_blob_file_references()? else {
+        panic!("the salvaged copy must carry links derived from its indirections");
+    };
     assert!(
-        result.is_err(),
-        "unreadable blob links fail the salvage: {result:?}",
-    );
-    assert!(
-        fs.metadata(&dest).is_err(),
-        "no destination file is left behind by the failed salvage",
+        !recovered_links.is_empty(),
+        "the recovered indirections reference at least one blob file",
     );
     Ok(())
 }
