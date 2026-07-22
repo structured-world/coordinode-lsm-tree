@@ -259,9 +259,9 @@ pub fn patrol_scrub(tree: &impl AbstractTree, options: &PatrolScrubOptions) -> P
         let mut report = PatrolScrubReport::default();
         for (idx, table) in tables.iter().enumerate() {
             let partial = scan_one(table, options);
-            let healed = partial.blocks_healed_in_place > 0;
+            let refresh = wants_checksum_refresh(&partial);
             report.merge(partial);
-            if healed {
+            if refresh {
                 refresh_healed_checksum(tree, table);
             }
             // Inter-SST pause only; skip the sleep after the final table so a
@@ -290,7 +290,7 @@ pub fn patrol_scrub(tree: &impl AbstractTree, options: &PatrolScrubOptions) -> P
                     let mut idx = cursor.fetch_add(1, Ordering::Relaxed);
                     while let Some(table) = tables.get(idx) {
                         let partial = scan_one(table, options);
-                        if partial.blocks_healed_in_place > 0 {
+                        if wants_checksum_refresh(&partial) {
                             healed.push(idx);
                         }
                         local.merge(partial);
@@ -329,6 +329,18 @@ pub fn patrol_scrub(tree: &impl AbstractTree, options: &PatrolScrubOptions) -> P
         }
     }
     report
+}
+
+/// Whether a per-SST scan warrants restamping the table's manifest digest:
+/// the scan must have healed at least one block (the bytes changed) AND left
+/// the file free of known corruption (no uncorrectable blocks, no findings).
+/// Restamping a partially-healed file would compute the fresh digest over the
+/// still-corrupt bytes, making a later `verify_integrity` pass on an SST with
+/// known, unrepaired corruption.
+fn wants_checksum_refresh(partial: &PatrolScrubReport) -> bool {
+    partial.blocks_healed_in_place > 0
+        && partial.uncorrectable_blocks == 0
+        && partial.errors.is_empty()
 }
 
 /// Persists a healed table's refreshed full-file digest to the manifest: an
