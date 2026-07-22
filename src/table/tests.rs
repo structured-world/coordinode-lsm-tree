@@ -756,6 +756,45 @@ fn reopen_restricted_yields_a_distinct_clamped_view() -> crate::Result<()> {
     )
 }
 
+/// `reopen_restricted` must carry a REFRESHED full-file checksum (set by an
+/// in-place heal after recovery) into the reopened view: recovering the fresh
+/// `Inner` with the stale pre-heal digest would reinstall that stale digest
+/// into the manifest when a tight-space compaction swaps the restricted view
+/// in, making later integrity scans flag the healed file as corrupt again.
+#[test]
+fn reopen_restricted_preserves_a_refreshed_checksum() -> crate::Result<()> {
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
+    ];
+
+    test_with_table(
+        &items,
+        |table| {
+            let refreshed = crate::Checksum::from_raw(0xDEAD_BEEF_u128);
+            assert_ne!(
+                table.checksum(),
+                refreshed,
+                "sentinel digest must differ from the recovery digest",
+            );
+
+            let healed = table.with_refreshed_checksum(refreshed);
+            let restricted = healed.reopen_restricted(crate::UserKey::from(&b"b"[..]))?;
+
+            assert_eq!(
+                restricted.checksum(),
+                refreshed,
+                "the reopened restricted view must report the refreshed digest, \
+                 not the stale one captured at the original recovery",
+            );
+
+            Ok(())
+        },
+        None,
+        Some(|x| x),
+    )
+}
+
 #[test]
 fn punch_offset_for_locates_the_first_block_reaching_a_key() -> crate::Result<()> {
     let items = [
