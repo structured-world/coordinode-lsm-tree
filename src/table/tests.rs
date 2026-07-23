@@ -756,6 +756,50 @@ fn reopen_restricted_yields_a_distinct_clamped_view() -> crate::Result<()> {
     )
 }
 
+/// `scrub_block` must reject a block whose decoded ROLE differs from the
+/// caller's expected type, mirroring `load_block`'s swap-defence: an index
+/// entry misdirected at another (checksum-valid) block of a different role
+/// passes its payload checksum, so without the role check the scrub reports
+/// "clean" for a handle that no longer points at a data block at all.
+#[test]
+fn scrub_block_rejects_a_block_of_the_wrong_role() -> crate::Result<()> {
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
+    ];
+
+    test_with_table(
+        &items,
+        |table| {
+            // The TLI block is a valid, checksum-clean block of role Index —
+            // exactly what a misdirected data-block handle would land on.
+            let outcome = crate::table::util::scrub_block(
+                table.global_id(),
+                &table.path,
+                &table.file_accessor,
+                &table.regions.tli,
+                crate::table::block::BlockType::Data,
+                table.metadata.data_block_compression,
+                table.encryption.as_deref(),
+                table.metadata.ecc_params,
+                #[cfg(zstd_any)]
+                table.zstd_dictionary.as_deref(),
+                None,
+                #[cfg(feature = "metrics")]
+                &table.metrics,
+            );
+            assert!(
+                outcome.is_err(),
+                "a checksum-clean block of the WRONG role must be an \
+                 uncorrectable finding, not scrub clean: {outcome:?}",
+            );
+            Ok(())
+        },
+        None,
+        Some(|x| x),
+    )
+}
+
 /// A frame read through an OVER-SIZED (forged) index handle decodes cleanly —
 /// the payload checksum covers only `data_length` bytes, and the trailing
 /// garbage classifies as an unrecognized ECC trailer (`EccStatus::Unrecognized`)
