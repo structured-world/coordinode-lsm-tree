@@ -469,7 +469,7 @@ pub(crate) fn scrub_block(
         #[cfg(zstd_any)]
         zstd_dict,
     )?;
-    let (_block, ecc_status, recovery) = Block::from_file_with_recovery(
+    let (block, ecc_status, recovery) = Block::from_file_with_recovery(
         fd.as_ref(),
         *handle,
         crate::table::block::BlockIdentity {
@@ -480,6 +480,15 @@ pub(crate) fn scrub_block(
         },
         &transform,
     )?;
+    // Role check, mirroring `load_block`'s swap-defence: an index entry
+    // misdirected at another (checksum-valid) block of a different role must
+    // surface as an uncorrectable finding, not scrub clean.
+    if block.header.block_type != block_type {
+        return Err(crate::Error::InvalidTag((
+            "BlockType",
+            block.header.block_type.into(),
+        )));
+    }
 
     Ok(match ecc_status {
         crate::table::block::EccStatus::Corrected => {

@@ -990,6 +990,20 @@ impl Table {
     /// is recorded (and logged), not silently skipped, and the next block is
     /// still scrubbed. A block-index walk failure stops this table early (later
     /// offsets are untrustworthy) but other tables still scrub.
+    /// The on-disk ROLE of this table's data blocks: a columnar segment's
+    /// writer seals them as [`BlockType::Columnar`], a row-major one as
+    /// [`BlockType::Data`]. Scrub / heal walks pass this as the expected type
+    /// so the per-block role check (swap-defence against a misdirected index
+    /// entry) matches what the writer actually emitted.
+    #[cfg(feature = "std")]
+    fn data_block_role(&self) -> BlockType {
+        if self.metadata.columnar {
+            BlockType::Columnar
+        } else {
+            BlockType::Data
+        }
+    }
+
     #[cfg(feature = "std")]
     pub(crate) fn scrub_data_blocks(&self) -> crate::scrub::PatrolScrubReport {
         use crate::scrub::{PatrolScrubReport, ScrubError};
@@ -1029,7 +1043,7 @@ impl Table {
                 &self.path,
                 &self.file_accessor,
                 &handle,
-                BlockType::Data,
+                self.data_block_role(),
                 self.metadata.data_block_compression,
                 self.encryption.as_deref(),
                 self.metadata.ecc_params,
@@ -1177,12 +1191,7 @@ impl Table {
                 &self.path,
                 &self.file_accessor,
                 &handle,
-                // `BlockType::Data` here is not load-bearing for a columnar SST:
-                // the AAD block-type byte is reconstructed from the on-disk frame
-                // (see `reconstruct_block_aad`), not this argument, and ECC /
-                // checksum verification is header- and params-driven — so the
-                // decrypt + decode succeed regardless of the type passed here.
-                BlockType::Data,
+                self.data_block_role(),
                 self.metadata.data_block_compression,
                 self.encryption.as_deref(),
                 self.metadata.ecc_params,
