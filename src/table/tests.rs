@@ -756,6 +756,53 @@ fn reopen_restricted_yields_a_distinct_clamped_view() -> crate::Result<()> {
     )
 }
 
+/// A frame read through an OVER-SIZED (forged) index handle decodes cleanly —
+/// the payload checksum covers only `data_length` bytes, and the trailing
+/// garbage classifies as an unrecognized ECC trailer (`EccStatus::Unrecognized`)
+/// — but its raw bytes must NOT be marked verbatim-copy-safe: the salvage
+/// writer rejects the overlong frame against the header's on-disk size and the
+/// walk would drop a block whose payload actually verified. The load must fall
+/// back to the re-encode path (`verbatim = None`) instead.
+#[test]
+fn salvage_load_block_reencodes_an_over_read_frame() -> crate::Result<()> {
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
+    ];
+
+    test_with_table(
+        &items,
+        |table| {
+            let keyed = table
+                .data_block_handles()
+                .next()
+                .expect("a data block")
+                .expect("index entry decodes");
+            let handle = keyed.as_ref();
+
+            // Sanity: through the TRUE handle the block is verbatim-copy-safe.
+            let clean = table.salvage_load_block(handle, crate::table::block::BlockType::Data)?;
+            assert!(clean.verbatim.is_some(), "a clean read is verbatim-safe");
+
+            // Forged handle: 8 bytes of the following section leak into the
+            // frame (the index section follows the data blocks, so the file
+            // has bytes there).
+            let over = crate::table::BlockHandle::new(handle.offset(), handle.size() + 8);
+            let sb = table.salvage_load_block(&over, crate::table::block::BlockType::Data)?;
+            assert!(
+                sb.verbatim.is_none(),
+                "an over-read frame with an opaque trailer must fall back to \
+                 the re-encode path, not offer its overlong raw bytes for a \
+                 verbatim copy",
+            );
+
+            Ok(())
+        },
+        None,
+        Some(|x| x),
+    )
+}
+
 /// `reopen_restricted` must carry a REFRESHED full-file checksum (set by an
 /// in-place heal after recovery) into the reopened view: recovering the fresh
 /// `Inner` with the stale pre-heal digest would reinstall that stale digest
