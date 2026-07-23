@@ -710,6 +710,71 @@ fn repair_with_salvage_quarantines_an_unrecognized_ecc_tombstone_sst() -> crate:
     Ok(())
 }
 
+/// Repair's out-of-band block verify must apply the SAME caller-known-id
+/// cross-check as recovery when it reads the meta block for the ECC
+/// descriptor: a checksum-clean TAIL meta whose `table_id` AND ECC descriptor
+/// were forged (MID intact) is rejected by recovery's id check and falls back
+/// to the intact MID — but a verify probe that skips the id check for
+/// unencrypted reads accepts the forged tail, grades the healthy table
+/// degraded-UNSCANNED off the forged descriptor, and (for a range-tombstone
+/// SST salvage cannot re-emit) quarantines a perfectly healthy table.
+#[test]
+fn repair_with_salvage_keeps_a_healthy_rt_sst_with_a_forged_tail_meta() -> crate::Result<()> {
+    use crate::range_tombstone::RangeTombstone;
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, UserKey, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("7");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    // A HEALTHY range-tombstone SST under id 7 (salvage cannot re-emit range
+    // tombstones, so a wrong degraded-unscanned verdict is terminal for it).
+    {
+        let mut w = Writer::new(sst.clone(), 7, 0, Arc::clone(&fs))?;
+        for i in 0..8u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        w.write_range_tombstone(RangeTombstone::new(
+            UserKey::from(b"k00002".as_slice()),
+            UserKey::from(b"k00005".as_slice()),
+            2,
+        ));
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+    // Forge ONLY the tail meta (id 7 → 99 AND an unrecognized ECC
+    // descriptor); the MID mirror keeps the true id and descriptor.
+    forge_tail_meta_table_id(&sst, 99, true)?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.recovered, 1,
+        "the healthy table joins the rebuilt manifest via the intact MID \
+         meta: {:?}",
+        report.unreadable_files,
+    );
+    assert_eq!(
+        report.unreadable, 0,
+        "no quarantine for a healthy table whose forged tail the id \
+         cross-check rejects: {:?}",
+        report.unreadable_files,
+    );
+    Ok(())
+}
+
 /// A FAILED quarantine must abort the repair: the rebuilt manifest omits the
 /// unverifiable table, so a later `Tree::open` orphan-cleans the still-in-place
 /// original — installing that manifest after the move failed would let the
@@ -1033,11 +1098,16 @@ fn repair_with_salvage_rejects_an_unrecognized_ecc_tombstone_sst_with_a_corrupt_
 /// Patches `descriptor#page_ecc` to a non-canonical (unrecognized) value in
 /// both meta blocks of the SST at `path`, re-stamping each block's checksum
 /// so the frames stay checksum-clean.
-/// Overwrites the TAIL meta copy's `table_id` value with `forged_id` and
-/// restamps that block's checksum, leaving the mirrored `meta_mid` copy
-/// intact — the "only the tail id rotted" scenario a normal recovery survives
-/// via its expected-id cross-check + MID fallback.
-fn forge_tail_meta_table_id(path: &std::path::Path, forged_id: u64) -> crate::Result<()> {
+/// Overwrites the TAIL meta copy's `table_id` value with `forged_id` (and,
+/// when `forge_ecc_descriptor` is set, its `descriptor#page_ecc` value with an
+/// unrecognized scheme) and restamps that block's checksum, leaving the
+/// mirrored `meta_mid` copy intact — the "only the tail rotted" scenario a
+/// normal recovery survives via its expected-id cross-check + MID fallback.
+fn forge_tail_meta_table_id(
+    path: &std::path::Path,
+    forged_id: u64,
+    forge_ecc_descriptor: bool,
+) -> crate::Result<()> {
     use crate::coding::{Decode, Encode};
     use crate::table::block::Header;
 
@@ -1085,6 +1155,26 @@ fn forge_tail_meta_table_id(path: &std::path::Path, forged_id: u64) -> crate::Re
             panic!("table_id value within the payload");
         };
         value.copy_from_slice(&forged_id.to_le_bytes());
+
+        if forge_ecc_descriptor {
+            let needle = b"descriptor#page_ecc";
+            let Some(key_pos) = payload
+                .windows(needle.len())
+                .position(|w| w == needle.as_slice())
+            else {
+                panic!("descriptor key present verbatim (restart interval 1)");
+            };
+            let val_at = key_pos + needle.len();
+            assert_eq!(
+                payload.get(val_at).copied(),
+                Some(4),
+                "descriptor value length prefix",
+            );
+            let Some(value) = payload.get_mut(val_at + 1..val_at + 5) else {
+                panic!("descriptor value within the payload");
+            };
+            value.copy_from_slice(&[0u8, 8, 2, 1]);
+        }
     }
     let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(
         bytes.get(payload_range).unwrap_or(&[]),
@@ -1178,7 +1268,7 @@ fn repair_with_salvage_preserves_the_file_name_id_over_a_forged_tail_meta_id() -
     std::fs::write(&sst, &bytes)?;
 
     // Forge ONLY the tail meta's table_id (7 → 99); the MID mirror keeps 7.
-    forge_tail_meta_table_id(&sst, 99)?;
+    forge_tail_meta_table_id(&sst, 99, false)?;
 
     let report = Config::new(
         dir.path(),
