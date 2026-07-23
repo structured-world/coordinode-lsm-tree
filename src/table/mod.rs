@@ -716,7 +716,7 @@ impl Table {
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
         )?;
-        let (block, _status, recovery) = crate::table::block::Block::from_file_with_recovery(
+        let (block, status, recovery) = crate::table::block::Block::from_file_with_recovery(
             fd.as_ref(),
             *handle,
             crate::table::block::BlockIdentity {
@@ -788,7 +788,18 @@ impl Table {
                 && self.raw_block_parity_verifies(&raw, &header))
             .then(|| (raw.to_vec(), header, layout))
         };
-        let verbatim = if recovery.is_none() && !self.metadata.ecc_unrecognized && ecc_verbatim_ok {
+        // The PER-BLOCK status must be Ok too: `EccStatus::Unrecognized` means
+        // the frame carried trailing bytes the transform could not attribute
+        // (e.g. an over-sized forged index handle leaking the next section's
+        // bytes into the read) — the payload verified, but the raw frame is
+        // longer than the header's on-disk size and a verbatim copy would be
+        // rejected by the writer, dropping a recoverable block. Re-encode the
+        // verified payload instead.
+        let verbatim = if recovery.is_none()
+            && status == crate::table::block::EccStatus::Ok
+            && !self.metadata.ecc_unrecognized
+            && ecc_verbatim_ok
+        {
             capture_verbatim()
         } else {
             None
