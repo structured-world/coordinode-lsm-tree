@@ -180,7 +180,11 @@ fn block_verify_verdict(
         &**folder_fs,
         table_path,
         config.encryption.as_deref(),
-        table.metadata.id,
+        // Repair KNOWS the durable id (recovery already cross-checked it
+        // against the file name), so the verify probe enforces the same meta
+        // id check — a checksum-clean forged tail meta falls back to the
+        // intact MID mirror instead of dictating a forged ECC descriptor.
+        Some(table.metadata.id),
     );
     // A non-parity error is corruption regardless of any warnings.
     if !report
