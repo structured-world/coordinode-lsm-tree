@@ -367,26 +367,14 @@ pub(crate) fn salvage_with_context(
     // the two are necessarily equal (the open's AAD binds the caller's id).
     // A KV-separated source's entries hold ValueHandles into blob files, and
     // blob GC / relocation consults the table's linked_blob_files section to
-    // decide whether a blob is still referenced. The SOURCE's list is NOT
-    // authoritative: a section that parses but under-reports (a forged count
-    // word) would let GC delete a blob the copy still references, so the walk
-    // derives the links from the recovered indirections and unions the source
-    // list in (a source-only id stays — a dropped block may hold its last
-    // reference, and over-referencing only makes GC retain a blob longer,
-    // never breaks a live indirection). The read is BEST-EFFORT: an
-    // unreadable section must not abort the salvage — the derived links
-    // already cover every recovered row, and failing here would leave the
-    // whole table unrecovered over a non-authoritative side section (a
-    // source-only id is then simply unknowable — its blocks did not make it
-    // into the copy anyway). Read it BEFORE `Writer::new` creates `dest` so
-    // no fallible step sits between creation and the cleanup-wrapped walk.
-    let blob_links = table.list_blob_file_references().unwrap_or_else(|e| {
-        log::warn!(
-            "salvage: the source linked_blob_files section is unreadable ({e}); \
-             deriving the copy's links from its recovered indirections only",
-        );
-        None
-    });
+    // decide whether a blob is still referenced. The SOURCE's list is IGNORED
+    // entirely — it is not authoritative in either direction: a forged count
+    // word can under-report (hiding a blob GC would then delete) and a forged
+    // record can OVER-report an id that exists nowhere (a corrupt reference
+    // downstream consumers must never see). The walk derives the copy's links
+    // exactly from the indirections of its recovered rows: a dropped block's
+    // indirections do not exist in the copy, so no source-only id can ever be
+    // needed by it.
     let writer = crate::table::Writer::new(dest.clone(), table.metadata.id, 0, Arc::clone(fs))?
         .mirror_from(&table.metadata, table.has_zone_map())
         .use_encryption(options.encryption.clone());
@@ -394,13 +382,7 @@ pub(crate) fn salvage_with_context(
     let writer = writer.use_zstd_dictionary(options.zstd_dictionary.clone());
     let writer = writer;
 
-    let walk = match salvage_blocks(
-        &table,
-        writer,
-        comparator,
-        !delete_mask_unpositionable,
-        blob_links,
-    ) {
+    let walk = match salvage_blocks(&table, writer, comparator, !delete_mask_unpositionable) {
         Ok(walk) => walk,
         Err(e) => {
             // A `write` / `finish` failure after `Writer::new` created `dest`
@@ -576,7 +558,6 @@ fn salvage_blocks(
     mut writer: crate::table::Writer,
     comparator: &crate::comparator::SharedComparator,
     apply_delete_mask: bool,
-    source_blob_links: Option<Vec<crate::table::writer::LinkedFile>>,
 ) -> crate::Result<SalvageWalk> {
     use crate::table::block::ParsedItem;
     use alloc::format;
@@ -587,8 +568,9 @@ fn salvage_blocks(
     let mut entries_salvaged = 0u64;
     let mut dropped: Vec<DroppedBlock> = Vec::new();
     // Blob links DERIVED from the recovered entries' indirections, keyed by
-    // blob file id. Exact for the recovered copy (only emitted rows count);
-    // unioned with the source's own list before finish.
+    // blob file id — exact for the recovered copy (only emitted rows count).
+    // The source's own linked_blob_files section is deliberately not
+    // consulted: it is not authoritative in either direction (see the caller).
     let mut derived_blob_links: crate::HashMap<
         crate::vlog::BlobFileId,
         crate::table::writer::LinkedFile,
@@ -939,21 +921,12 @@ fn salvage_blocks(
 
     let wrote = blocks_salvaged > 0;
     if wrote {
-        // Blob links: the DERIVED map (exact for the recovered rows) unioned
-        // with any source-only ids (a dropped block may hold the last
-        // reference to a blob; over-referencing only makes GC retain it
-        // longer, never breaks a live indirection). The source list alone is
-        // not trusted — a parseable section with a forged count word would
-        // under-report and let GC delete a blob the copy still references.
+        // Blob links: EXACTLY the derived map. A dropped block's indirections
+        // do not exist in the copy, so no id beyond the recovered rows can be
+        // needed — and copying a source-only id would let a forged record
+        // plant a reference to a blob that exists nowhere.
         let mut links: Vec<crate::table::writer::LinkedFile> =
             derived_blob_links.into_values().collect();
-        if let Some(source_links) = source_blob_links {
-            for link in source_links {
-                if !links.iter().any(|l| l.blob_file_id == link.blob_file_id) {
-                    links.push(link);
-                }
-            }
-        }
         // Deterministic section order regardless of hash-map iteration.
         links.sort_unstable_by_key(|l| l.blob_file_id);
         for link in links {
