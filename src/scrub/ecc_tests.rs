@@ -742,6 +742,13 @@ fn heal_in_place_reports_a_failed_checksum_refresh() -> crate::Result<()> {
         "a failed manifest-digest refresh must be a scrub finding, not a \
          swallowed log line: {report:?}",
     );
+    // The public status must fail too: a caller following `is_ok()` would
+    // otherwise treat the scrub as clean while the manifest keeps a stale
+    // digest that flags the healed SST on every later integrity scan.
+    assert!(
+        !report.is_ok(),
+        "a scrub whose findings include a failed checksum refresh is not ok",
+    );
     Ok(())
 }
 
