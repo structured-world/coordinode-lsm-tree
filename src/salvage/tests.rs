@@ -328,6 +328,96 @@ fn salvage_rebuilds_blob_links_from_recovered_indirections() -> crate::Result<()
     Ok(())
 }
 
+/// A parseable `linked_blob_files` section that OVER-reports — carries a blob
+/// id no recovered `ValueHandle` actually references — must not have that
+/// source-only id copied into the salvaged table: the id may not exist under
+/// `blobs/` at all (a forged record), and a manifest whose table links a blob
+/// absent from the blob-file list is a corrupt reference downstream consumers
+/// must never see. The copy's links are the recovered indirections, exactly.
+#[test]
+fn salvage_drops_source_only_blob_links() -> crate::Result<()> {
+    use crate::AbstractTree;
+
+    let dir = tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let crate::AnyTree::Blob(tree) = crate::Config::new(
+        dir.path(),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+    .open()?
+    else {
+        unreachable!("kv separation configured");
+    };
+    let big = |i: u32| format!("{i:08}").repeat(512);
+    for i in 0u32..10 {
+        tree.insert(format!("key{i:05}"), big(i), u64::from(i) + 1);
+    }
+    tree.flush_active_memtable(10)?;
+    let source = {
+        let binding = tree.index.version_history.read().latest_version();
+        let Some(table) = binding.version.iter_tables().next() else {
+            panic!("flush produced one table");
+        };
+        (*table.path).clone()
+    };
+    drop(tree);
+
+    // Forge the FIRST link record's blob id (the leading u64 of the 32-byte
+    // record, right after the LE u32 count) to an id that exists nowhere.
+    const FORGED_ID: u64 = 9_999_999;
+    let pos = {
+        let mut f = std::fs::File::open(&source)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader
+            .toc()
+            .iter()
+            .find(|e| e.name() == b"linked_blob_files")
+        else {
+            panic!("the source must carry a linked_blob_files section");
+        };
+        usize::try_from(entry.pos()).unwrap_or(usize::MAX)
+    };
+    let mut bytes = std::fs::read(&source)?;
+    let Some(id_slot) = bytes.get_mut(pos + 4..pos + 12) else {
+        panic!("first link record within the file");
+    };
+    id_slot.copy_from_slice(&FORGED_ID.to_le_bytes());
+    std::fs::write(&source, &bytes)?;
+
+    // Sanity: the forgery took — the source reports the forged id.
+    let Some(forged) = open(source.clone(), &fs)?.list_blob_file_references()? else {
+        panic!("the forged section still parses");
+    };
+    assert!(
+        forged.iter().any(|l| l.blob_file_id == FORGED_ID),
+        "the source's section carries the forged id",
+    );
+
+    let dest = dir.path().join("salvaged");
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert!(report.is_complete(), "data blocks are healthy: {report:?}");
+
+    let Some(recovered_links) = open(dest, &fs)?.list_blob_file_references()? else {
+        panic!("the salvaged copy carries links derived from its indirections");
+    };
+    assert!(
+        !recovered_links.is_empty(),
+        "the recovered indirections reference the real blob file",
+    );
+    assert!(
+        !recovered_links.iter().any(|l| l.blob_file_id == FORGED_ID),
+        "a source-only id no recovered indirection references must not be \
+         copied into the salvaged table: {recovered_links:?}",
+    );
+    Ok(())
+}
+
 /// A KV-separated source whose `linked_blob_files` section is UNREADABLE (a
 /// count header claiming more records than the section holds) must not abort
 /// the salvage: the section is not authoritative — the walk derives the
