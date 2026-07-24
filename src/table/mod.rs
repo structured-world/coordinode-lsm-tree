@@ -848,14 +848,15 @@ impl Table {
             return Ok(None);
         };
         let header_len = crate::table::block::Header::header_len(header.block_type);
-        let data_len = header.data_length as usize;
-        // The frame was just read through the verified path, so these slices
-        // are consistent by construction; treat any inconsistency as
-        // "unverifiable" rather than panicking.
-        let (Some(payload), Some(trailer)) = (
-            raw.get(header_len..header_len + data_len),
-            raw.get(header_len + data_len..),
-        ) else {
+        // Checked: `data_length` comes from a re-read header, so a forged
+        // value must fail as "unverifiable", never wrap (32-bit `usize`).
+        let Some(payload_end) = header_len.checked_add(header.data_length as usize) else {
+            return Err(());
+        };
+        // Treat any frame inconsistency as "unverifiable" rather than panicking.
+        let (Some(payload), Some(trailer)) =
+            (raw.get(header_len..payload_end), raw.get(payload_end..))
+        else {
             return Err(());
         };
         let fresh = match params {
@@ -868,6 +869,15 @@ impl Table {
                 }
             }
         };
+        // The heal writes `fresh` back AT the trailer's offset, so the frame
+        // must hold EXACTLY that many trailer bytes: a shorter (or longer)
+        // on-disk trailer means the frame is malformed, and "healing" it
+        // would write past the frame's end into the next block's bytes,
+        // breaking the size-preserving heal contract. Unverifiable, not
+        // healable.
+        if trailer.len() != fresh.len() {
+            return Err(());
+        }
         if trailer == fresh {
             Ok(None)
         } else {
@@ -1254,8 +1264,22 @@ impl Table {
                     // rebuild arm would PERSIST parity computed over those
                     // corrupt bytes — turning a recoverable block into one
                     // whose ECC agrees with the corruption. Verify the
-                    // re-read payload against the header checksum first; a
-                    // mismatch is surfaced, never acted on.
+                    // re-read header's ROLE and its payload against the
+                    // header checksum first; a mismatch is surfaced, never
+                    // acted on.
+                    if raw_header.block_type != self.data_block_role() {
+                        report.uncorrectable_blocks += 1;
+                        report.errors.push(ScrubError::UncorrectableBlock {
+                            table_id: self.id(),
+                            path: self.path.to_path_buf(),
+                            block_offset,
+                            reason: alloc::string::String::from(
+                                "in-place heal: block scrubbed clean but its re-read \
+                                 header carries a different block role",
+                            ),
+                        });
+                        continue;
+                    }
                     let header_len = crate::table::block::Header::header_len(raw_header.block_type);
                     let payload_ok = raw
                         .get(header_len..header_len + raw_header.data_length as usize)
