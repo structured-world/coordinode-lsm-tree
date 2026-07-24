@@ -998,6 +998,7 @@ fn read_ecc_params_out_of_band(
     let toc = sfa_reader.toc();
     // Tail `meta` is authoritative; `meta_mid` is the early mirror written so a
     // single corrupt meta block doesn't lose the per-SST descriptor.
+    let mut unrecognized_seen = false;
     for name in [b"meta".as_slice(), b"meta_mid".as_slice()] {
         let Some((pos, len)) = toc.section(name).map(|e| (e.pos(), e.len())) else {
             continue;
@@ -1027,9 +1028,20 @@ fn read_ecc_params_out_of_band(
             expected_id,
             encryption,
         ) {
-            let state = if meta.ecc_unrecognized {
-                ScrubEcc::Unrecognized
-            } else if let Some(params) = meta.ecc_params {
+            if meta.ecc_unrecognized {
+                // A copy that decodes but carries an UNRECOGNIZED descriptor
+                // must not end the probe: a descriptor-only forge in the tail
+                // (its table id intact, so the cross-check passes) would
+                // otherwise condemn a healthy table whose MID mirror still
+                // holds the valid descriptor. Remember it and try the mirror;
+                // only when EVERY decodable copy agrees is the scheme
+                // genuinely unrecognized. (A forge TO a recognized scheme is
+                // not detectable this way — nothing distinguishes it from a
+                // legitimate descriptor without cross-copy arbitration.)
+                unrecognized_seen = true;
+                continue;
+            }
+            let state = if let Some(params) = meta.ecc_params {
                 ScrubEcc::Scheme(params)
             } else {
                 ScrubEcc::Off
@@ -1037,7 +1049,11 @@ fn read_ecc_params_out_of_band(
             return Ok(Some(state));
         }
     }
-    Ok(None)
+    Ok(if unrecognized_seen {
+        Some(ScrubEcc::Unrecognized)
+    } else {
+        None
+    })
 }
 
 struct PerFileScan {
