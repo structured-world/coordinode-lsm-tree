@@ -134,10 +134,15 @@ pub struct PatrolScrubReport {
 
 impl PatrolScrubReport {
     /// `true` when every block the scrub read was clean or successfully
-    /// corrected (no uncorrectable corruption was found).
+    /// corrected AND the sweep finished with no findings at all: no
+    /// uncorrectable corruption, no block-index walk that failed to
+    /// enumerate a table's blocks, and no manifest-digest refresh that
+    /// could not be persisted after an in-place heal. Any entry in
+    /// [`errors`](Self::errors) means the tree needs operator attention
+    /// even when every block that WAS read verified clean.
     #[must_use]
     pub fn is_ok(&self) -> bool {
-        self.uncorrectable_blocks == 0
+        self.uncorrectable_blocks == 0 && self.errors.is_empty()
     }
 
     /// Folds a per-SST partial report into this accumulator. `pub(crate)` for
