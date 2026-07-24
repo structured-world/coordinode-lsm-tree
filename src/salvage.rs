@@ -1117,6 +1117,21 @@ pub fn salvage_blob_file(
                         reason: BlobDropReason::Corrupt("frame carries an empty key".to_string()),
                     });
                 }
+                // A frame whose declared `real_val_len` disagrees with the
+                // bytes actually stored (`on_disk_val_len`; this path only
+                // salvages UNCOMPRESSED sources, so the two must be equal) is
+                // rejected by the live blob reader — re-emitting it would
+                // restamp a consistent length and launder a record live reads
+                // treat as corrupt. Drop it; the scanner is already past the
+                // frame, so the walk continues.
+                Ok(entry) if entry.uncompressed_len as usize != entry.value.len() => {
+                    dropped.push(DroppedBlob {
+                        reason: BlobDropReason::Corrupt(
+                            "frame's declared value length disagrees with its stored bytes"
+                                .to_string(),
+                        ),
+                    });
+                }
                 Ok(entry) => {
                     // Record the frame relocation BEFORE the write advances the
                     // writer: existing SST ValueHandles point at SOURCE frame
