@@ -756,6 +756,67 @@ fn reopen_restricted_yields_a_distinct_clamped_view() -> crate::Result<()> {
     )
 }
 
+/// `raw_block_parity_delta` must reject a frame whose on-disk trailer length
+/// differs from the freshly computed parity: returning `Ok(Some(fresh))` for
+/// a short trailer would make the in-place heal write MORE bytes than the
+/// frame holds at that offset — past the block's end, into the next block's
+/// bytes — violating the size-preserving heal contract. A length mismatch is
+/// an unverifiable frame, not a healable one.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn raw_block_parity_delta_rejects_a_trailer_length_mismatch() -> crate::Result<()> {
+    use crate::coding::Decode;
+
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
+    ];
+
+    test_with_table(
+        &items,
+        |table| {
+            let keyed = table
+                .data_block_handles()
+                .next()
+                .expect("a data block")
+                .expect("index entry decodes");
+            let handle = keyed.as_ref();
+            let file = std::fs::read(&*table.path)?;
+            let start = usize::try_from(handle.offset().0).unwrap_or(usize::MAX);
+            let Some(raw) = file.get(start..start + handle.size() as usize) else {
+                panic!("block frame within the file");
+            };
+            let header = crate::table::block::Header::decode_from(&mut &raw[..])?;
+
+            // Sanity: the intact frame's trailer verifies (no delta).
+            assert!(
+                matches!(table.raw_block_parity_delta(raw, &header), Ok(None)),
+                "the intact frame's parity trailer matches",
+            );
+
+            // A frame one byte SHORT of its trailer must be unverifiable —
+            // not a mismatch whose full-length rebuild the heal would write
+            // past the frame's end.
+            let Some(short) = raw.get(..raw.len() - 1) else {
+                panic!("frame is non-empty");
+            };
+            assert!(
+                table.raw_block_parity_delta(short, &header).is_err(),
+                "a trailer-length mismatch must be unverifiable, not healable",
+            );
+
+            Ok(())
+        },
+        None,
+        Some(|w: Writer| {
+            let Ok(params) = crate::table::block::EccParams::try_new(8, 2) else {
+                panic!("RS(8,2) params are valid");
+            };
+            w.use_ecc(Some(params))
+        }),
+    )
+}
+
 /// `scrub_block` must reject a block whose decoded ROLE differs from the
 /// caller's expected type, mirroring `load_block`'s swap-defence: an index
 /// entry misdirected at another (checksum-valid) block of a different role
