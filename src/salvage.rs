@@ -380,7 +380,6 @@ pub(crate) fn salvage_with_context(
         .use_encryption(options.encryption.clone());
     #[cfg(zstd_any)]
     let writer = writer.use_zstd_dictionary(options.zstd_dictionary.clone());
-    let writer = writer;
 
     let walk = match salvage_blocks(&table, writer, comparator, !delete_mask_unpositionable) {
         Ok(walk) => walk,
