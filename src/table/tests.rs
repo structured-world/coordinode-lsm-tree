@@ -850,9 +850,10 @@ fn scrub_block_rejects_a_block_of_the_wrong_role() -> crate::Result<()> {
                 &table.metrics,
             );
             assert!(
-                outcome.is_err(),
-                "a checksum-clean block of the WRONG role must be an \
-                 uncorrectable finding, not scrub clean: {outcome:?}",
+                matches!(outcome, Err(crate::Error::InvalidTag(("BlockType", _))),),
+                "a checksum-clean block of the WRONG role must fail the \
+                 role check specifically (not scrub clean, and not fail for \
+                 an unrelated reason): {outcome:?}",
             );
             Ok(())
         },
