@@ -778,8 +778,11 @@ impl Table {
             // Any mismatch falls back to the re-encode path, which emits the
             // VERIFIED first read's decoded payload with fresh framing.
             let header_len = crate::table::block::Header::header_len(header.block_type);
-            let payload_checksum_ok = raw
-                .get(header_len..header_len + header.data_length as usize)
+            // checked_add: a forged/rotted data_length can overflow the
+            // payload-end sum on 32-bit targets; overflow = not verbatim-safe.
+            let payload_checksum_ok = header_len
+                .checked_add(header.data_length as usize)
+                .and_then(|payload_end| raw.get(header_len..payload_end))
                 .is_some_and(|payload| {
                     crate::hash::hash128(payload) == header.checksum.into_u128()
                 });
@@ -1095,13 +1098,17 @@ impl Table {
 
     /// Detaches this table's live path from a multiply-linked inode so an
     /// in-place heal can write without touching the other links (checkpoint
-    /// snapshots): streams the file into a sibling `*.healtmp` copy, syncs it,
-    /// and atomically renames it over the live path. The returned handle is
-    /// the copy's (still valid after the rename), open read+write.
+    /// snapshots): streams the file into a sibling `*.healtmp-{n}` copy, syncs
+    /// it, and atomically renames it over the live path. The returned handle
+    /// is the copy's (still valid after the rename), open read+write.
     ///
-    /// Crash-safe: until the rename the live path is untouched, and a leftover
-    /// `*.healtmp` is unreferenced by any manifest, so recovery removes it as
-    /// an orphan.
+    /// The temp name carries a process-wide sequence number so two concurrent
+    /// heal scans of the same table can never remove or rename each other's
+    /// in-progress copy (cross-process exclusion comes from the directory
+    /// lock). Every pre-rename failure removes the copy before returning —
+    /// recovery refuses to open a tree whose `tables/` holds a file it cannot
+    /// parse as a table id, so an abandoned artifact must never outlive the
+    /// heal (recovery still sweeps `*.healtmp-*` left by a hard crash).
     #[cfg(feature = "page_ecc")]
     fn unshare_for_heal(
         &self,
@@ -1109,17 +1116,14 @@ impl Table {
     ) -> Result<Box<dyn crate::fs::FsFile>, alloc::string::String> {
         use std::io::Write;
 
+        static HEAL_TMP_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
         let len = source
             .metadata()
             .map_err(|e| alloc::format!("metadata: {e}"))?
             .len;
-        let tmp_path = self.path.with_extension("healtmp");
-        // A leftover copy from an interrupted unshare is stale: replace it.
-        match self.fs.remove_file(&tmp_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(alloc::format!("remove stale heal copy: {e}")),
-        }
+        let seq = HEAL_TMP_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let tmp_path = self.path.with_extension(alloc::format!("healtmp-{seq}"));
         let mut tmp = self
             .fs
             .open(
@@ -1128,39 +1132,51 @@ impl Table {
             )
             .map_err(|e| alloc::format!("create heal copy: {e}"))?;
 
-        let mut buf = alloc::vec![0u8; 1 << 20];
-        let mut off = 0u64;
-        while off < len {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "min() bounds the chunk by buf.len(), which fits usize"
-            )]
-            let want = buf.len().min((len - off) as usize);
-            let Some(chunk) = buf.get_mut(..want) else {
-                return Err(alloc::string::String::from("chunk within buffer"));
-            };
-            let n = source
-                .read_at(chunk, off)
-                .map_err(|e| alloc::format!("read source at {off}: {e}"))?;
-            if n < want {
-                // Fill-or-EOF contract: a short read here means the file
-                // shrank underneath us — abort rather than install a
-                // truncated copy.
-                return Err(alloc::format!(
-                    "short read at {off}: got {n} of {want} bytes"
-                ));
+        // Any failure past this point must take the copy with it (see above).
+        let mut copy = || -> Result<(), alloc::string::String> {
+            let mut buf = alloc::vec![0u8; 1 << 20];
+            let mut off = 0u64;
+            while off < len {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "the u64 min() is taken first, so the value is bounded by buf.len()"
+                )]
+                let want = (len - off).min(buf.len() as u64) as usize;
+                let Some(chunk) = buf.get_mut(..want) else {
+                    return Err(alloc::string::String::from("chunk within buffer"));
+                };
+                let n = source
+                    .read_at(chunk, off)
+                    .map_err(|e| alloc::format!("read source at {off}: {e}"))?;
+                if n < want {
+                    // Fill-or-EOF contract: a short read here means the file
+                    // shrank underneath us — abort rather than install a
+                    // truncated copy.
+                    return Err(alloc::format!(
+                        "short read at {off}: got {n} of {want} bytes"
+                    ));
+                }
+                tmp.write_all(chunk)
+                    .map_err(|e| alloc::format!("write heal copy at {off}: {e}"))?;
+                off += want as u64;
             }
-            tmp.write_all(chunk)
-                .map_err(|e| alloc::format!("write heal copy at {off}: {e}"))?;
-            off += want as u64;
+            // sync_all, not sync_data: the copy is a NEW file, its size must
+            // be durable before the rename publishes it.
+            tmp.sync_all()
+                .map_err(|e| alloc::format!("sync heal copy: {e}"))?;
+            self.fs
+                .rename(&tmp_path, &self.path)
+                .map_err(|e| alloc::format!("rename heal copy into place: {e}"))
+        };
+        if let Err(reason) = copy() {
+            if let Err(e) = self.fs.remove_file(&tmp_path) {
+                log::warn!(
+                    "failed to remove abandoned heal copy {}: {e}",
+                    tmp_path.display(),
+                );
+            }
+            return Err(reason);
         }
-        // sync_all, not sync_data: the copy is a NEW file, its size must be
-        // durable before the rename publishes it.
-        tmp.sync_all()
-            .map_err(|e| alloc::format!("sync heal copy: {e}"))?;
-        self.fs
-            .rename(&tmp_path, &self.path)
-            .map_err(|e| alloc::format!("rename heal copy into place: {e}"))?;
         if let Some(parent) = self.path.parent() {
             self.fs
                 .sync_directory(parent)
@@ -1205,6 +1221,14 @@ impl Table {
             sst_files_scanned: 1,
             ..PatrolScrubReport::default()
         };
+
+        // Excludes a concurrent checkpoint's link window for the whole
+        // probe-to-write span: a checkpoint that hard-links this SST between
+        // the link-count probe below and a write-back would capture bytes the
+        // heal is about to change, under a digest its immutable manifest
+        // already recorded. A table without an installed pause has no
+        // checkpoint machinery, so nothing can link it concurrently.
+        let _mutation_window = self.deletion_pause.get().map(|p| p.enter_mutation_window());
 
         // A single read+write handle for both the recovery read and the
         // write-back, opened directly (not via the read-only descriptor cache) so
@@ -1396,8 +1420,12 @@ impl Table {
                         continue;
                     }
                     let header_len = crate::table::block::Header::header_len(raw_header.block_type);
-                    let payload_ok = raw
-                        .get(header_len..header_len + raw_header.data_length as usize)
+                    // checked_add: a forged/rotted data_length can overflow
+                    // the payload-end sum on 32-bit targets; overflow is an
+                    // uncorrectable finding, not a panic.
+                    let payload_ok = header_len
+                        .checked_add(raw_header.data_length as usize)
+                        .and_then(|payload_end| raw.get(header_len..payload_end))
                         .is_some_and(|payload| {
                             crate::hash::hash128(payload) == raw_header.checksum.into_u128()
                         });

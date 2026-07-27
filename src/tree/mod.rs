@@ -4124,6 +4124,20 @@ impl Tree {
                     continue;
                 }
 
+                // An in-place heal detaches a hard-linked SST through a
+                // `{id}.healtmp-{n}` copy that is renamed over the live path;
+                // a hard crash between its creation and the rename leaves the
+                // artifact behind. It is never referenced by any manifest, so
+                // sweep it instead of failing the id parse below.
+                if table_file_name.contains(".healtmp") {
+                    log::warn!(
+                        "Removing abandoned heal copy: {}",
+                        table_file_path.display()
+                    );
+                    folder_fs.remove_file(&table_file_path)?;
+                    continue;
+                }
+
                 let table_id = table_file_name.parse::<TableId>().map_err(|e| {
                     log::error!("invalid table file name {table_file_name:?}: {e:?}");
                     crate::Error::Unrecoverable

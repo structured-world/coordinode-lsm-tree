@@ -692,6 +692,13 @@ pub fn run_checkpoint<T: AbstractTree>(
     // tables / blob files that compaction marks as deleted are held back.
     let _pause = deletion_pause.acquire();
 
+    // Hold the link window for the duration too: an in-place heal that has
+    // already probed an SST's link count as exclusive must not observe this
+    // checkpoint linking that SST mid-heal (the snapshot would capture bytes
+    // the heal is about to change, under a digest the checkpoint manifest
+    // already recorded). The heal side holds the read half per table.
+    let _link_window = deletion_pause.enter_link_window();
+
     // Capture the seqno BEFORE the flush. Sampling later (between flush
     // and `current_version()`) is unsafe: a concurrent writer can land
     // in the freshly-rotated active memtable, advance `visible_seqno`,
