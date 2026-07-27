@@ -460,6 +460,66 @@ fn open_ecc_tree_on(dir: &std::path::Path, fs: std::sync::Arc<dyn crate::fs::Fs>
     tree
 }
 
+/// Flips one parity-trailer byte of `block` in the SST at `path`. Payload
+/// checksums stay clean, so only the heal pass (which verifies trailers)
+/// notices; a heal then rebuilds the trailer in place.
+fn corrupt_parity_trailer_byte(
+    path: &std::path::Path,
+    block: &crate::table::BlockHandle,
+) -> crate::Result<()> {
+    use crate::coding::Decode;
+
+    let mut bytes = std::fs::read(path)?;
+    let base = block.offset().0 as usize;
+    let Some(mut cursor) = bytes.get(base..) else {
+        panic!("data block within the file");
+    };
+    let header = Header::decode_from(&mut cursor)?;
+    let trailer_pos = base + Header::header_len(header.block_type) + header.data_length as usize;
+    let Some(slot) = bytes.get_mut(trailer_pos) else {
+        panic!("parity trailer within the file");
+    };
+    *slot ^= 0xFF;
+    std::fs::write(path, &bytes)?;
+    Ok(())
+}
+
+/// Rebuilds the manifest from whatever is on disk, recording the digest of
+/// the CURRENT (possibly rotted) bytes, and asserts exactly one table was
+/// admitted. This is how the reconcile tests seed a manifest digest that
+/// disagrees with the ORIGINAL bytes a later heal restores.
+fn rebuild_manifest_over_current_bytes(dir: &std::path::Path) -> crate::Result<()> {
+    let report = crate::Config::new(
+        dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+    assert_eq!(report.recovered, 1, "{report:?}");
+    Ok(())
+}
+
+/// Opens a FaultFs-backed ECC tree at `dir` with a ONE-SHOT `Open` fault
+/// armed on the manifest edit log ("edits"), so the first digest refresh
+/// fails while the heal itself (which only touches the SST under tables/)
+/// proceeds. Returns the tree and the injector for the caller to `clear()`.
+fn open_ecc_tree_with_failing_edit_log(
+    dir: &std::path::Path,
+) -> (crate::Tree, std::sync::Arc<crate::fs::FaultInjector>) {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let fault = FaultFs::new(crate::fs::StdFs);
+    let injector = fault.injector();
+    let tree = open_ecc_tree_on(dir, std::sync::Arc::new(fault));
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
+            .on_path("edits")
+            .once(),
+    );
+    (tree, injector)
+}
+
 /// A failed raw re-read during the clean-block parity-trailer check is a
 /// finding, not a silent skip: the block's trailer could not be verified, so
 /// the heal pass reports it as uncorrectable and moves on (the remaining
@@ -732,47 +792,17 @@ fn heal_in_place_does_not_restamp_over_side_section_rot() -> crate::Result<()> {
 /// `verify_integrity` keeps flagging a now-healthy SST.
 #[test]
 fn heal_in_place_reconciles_a_stale_checksum_left_by_a_failed_refresh() -> crate::Result<()> {
-    use crate::coding::Decode;
-    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
-    use crate::io::ErrorKind;
-    use crate::{Config, SequenceNumberCounter};
-
     let dir = tempfile::tempdir()?;
     let (sst_path, block) = write_ecc_sst(dir.path());
 
-    // Rot one parity-trailer byte (payload checksums stay clean).
-    let mut bytes = std::fs::read(&sst_path)?;
-    let base = block.offset().0 as usize;
-    let Some(mut cursor) = bytes.get(base..) else {
-        panic!("first data block within the file");
-    };
-    let header = Header::decode_from(&mut cursor)?;
-    let trailer_pos = base + Header::header_len(header.block_type) + header.data_length as usize;
-    let Some(slot) = bytes.get_mut(trailer_pos) else {
-        panic!("parity trailer within the file");
-    };
-    *slot ^= 0xFF;
-    std::fs::write(&sst_path, &bytes)?;
-
-    // Manifest rebuild records the digest of the ROTTED bytes.
-    let report = Config::new(
-        dir.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .repair()?;
-    assert_eq!(report.recovered, 1, "{report:?}");
+    // Rot one parity-trailer byte, then let a manifest rebuild record the
+    // digest of the ROTTED bytes.
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
+    rebuild_manifest_over_current_bytes(dir.path())?;
 
     // FIRST heal pass: the trailer is rebuilt in place, but the manifest
     // refresh fails (injected fault on the edit-log open).
-    let fault = FaultFs::new(crate::fs::StdFs);
-    let injector = fault.injector();
-    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));
-    injector.arm(
-        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
-            .on_path("edits")
-            .once(),
-    );
+    let (tree, injector) = open_ecc_tree_with_failing_edit_log(dir.path());
     let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
     injector.clear();
     assert!(report.blocks_healed_in_place >= 1, "{report:?}");
@@ -807,38 +837,14 @@ fn heal_in_place_reconciles_a_stale_checksum_left_by_a_failed_refresh() -> crate
 /// stale digest, durably, on every scan.
 #[test]
 fn heal_in_place_refreshes_the_manifest_checksum() -> crate::Result<()> {
-    use crate::coding::Decode;
-    use crate::{Config, SequenceNumberCounter};
-
     let dir = tempfile::tempdir()?;
     let (sst_path, block) = write_ecc_sst(dir.path());
 
-    // Rot one parity-trailer byte (payload checksums stay clean).
-    let mut bytes = std::fs::read(&sst_path)?;
-    let base = block.offset().0 as usize;
-    let Some(mut cursor) = bytes.get(base..) else {
-        panic!("first data block within the file");
-    };
-    let header = Header::decode_from(&mut cursor)?;
-    let trailer_pos = base + Header::header_len(header.block_type) + header.data_length as usize;
-    let Some(slot) = bytes.get_mut(trailer_pos) else {
-        panic!("parity trailer within the file");
-    };
-    *slot ^= 0xFF;
-    std::fs::write(&sst_path, &bytes)?;
-
-    // A manifest rebuild admits the table with the digest of the ROTTED
-    // bytes (parity-only rot grades degraded-but-readable; the sole data
-    // block here carries no range tombstones, but a rebuild recomputes the
-    // digest from whatever is on disk either way — force the keep by
-    // rebuilding without salvage).
-    let report = Config::new(
-        dir.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .repair()?;
-    assert_eq!(report.recovered, 1, "{report:?}");
+    // Rot one parity-trailer byte, then let a manifest rebuild admit the
+    // table with the digest of the ROTTED bytes (parity-only rot grades
+    // degraded-but-readable, so the rebuild keeps the file as-is).
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
+    rebuild_manifest_over_current_bytes(dir.path())?;
 
     // Heal the trailer in place: the file's bytes return to their ORIGINAL
     // state, which no longer matches the rotted digest the rebuilt manifest
@@ -880,51 +886,20 @@ fn heal_in_place_refreshes_the_manifest_checksum() -> crate::Result<()> {
 /// `verify_integrity` — while the patrol report claims a clean heal.
 #[test]
 fn heal_in_place_reports_a_failed_checksum_refresh() -> crate::Result<()> {
-    use crate::coding::Decode;
-    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
-    use crate::io::ErrorKind;
-
     let dir = tempfile::tempdir()?;
     let (sst_path, block) = write_ecc_sst(dir.path());
 
-    // Rot one parity-trailer byte (payload checksums stay clean) so the heal
-    // pass rebuilds it in place.
-    let mut bytes = std::fs::read(&sst_path)?;
-    let base = block.offset().0 as usize;
-    let Some(mut cursor) = bytes.get(base..) else {
-        panic!("first data block within the file");
-    };
-    let header = Header::decode_from(&mut cursor)?;
-    let trailer_pos = base + Header::header_len(header.block_type) + header.data_length as usize;
-    let Some(slot) = bytes.get_mut(trailer_pos) else {
-        panic!("parity trailer within the file");
-    };
-    *slot ^= 0xFF;
-    std::fs::write(&sst_path, &bytes)?;
-
-    // Manifest rebuild records the digest of the ROTTED bytes, so the heal's
-    // reconciliation actually has a mismatch to persist (against a manifest
-    // that already holds the correct digest the reconciliation is a no-op
-    // and never touches the edit log).
-    let report = crate::Config::new(
-        dir.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .repair()?;
-    assert_eq!(report.recovered, 1, "{report:?}");
-
-    let fault = FaultFs::new(crate::fs::StdFs);
-    let injector = fault.injector();
-    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));
+    // Rot one parity-trailer byte, then let a manifest rebuild record the
+    // digest of the ROTTED bytes, so the heal's reconciliation actually has
+    // a mismatch to persist (against a manifest that already holds the
+    // correct digest the reconciliation is a no-op and never touches the
+    // edit log).
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
+    rebuild_manifest_over_current_bytes(dir.path())?;
 
     // Fail the manifest edit-log open the refresh performs; the heal itself
     // touches only the SST under tables/.
-    injector.arm(
-        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
-            .on_path("edits")
-            .once(),
-    );
+    let (tree, injector) = open_ecc_tree_with_failing_edit_log(dir.path());
     let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
     injector.clear();
 
@@ -958,9 +933,6 @@ fn heal_in_place_reports_a_failed_checksum_refresh() -> crate::Result<()> {
 /// the file is fully healed.
 #[test]
 fn heal_in_place_skips_the_checksum_refresh_while_corruption_remains() -> crate::Result<()> {
-    use crate::coding::Decode;
-    use crate::{Config, SequenceNumberCounter};
-
     let dir = tempfile::tempdir()?;
     let (sst_path, first) = write_ecc_sst(dir.path());
 
@@ -979,21 +951,11 @@ fn heal_in_place_skips_the_checksum_refresh_while_corruption_remains() -> crate:
         crate::table::BlockHandle::new(keyed.offset(), keyed.size())
     };
 
-    let mut bytes = std::fs::read(&sst_path)?;
-
     // Block 1: rot one parity-trailer byte (heal-in-place rebuilds it).
-    let base = first.offset().0 as usize;
-    let Some(mut cursor) = bytes.get(base..) else {
-        panic!("first data block within the file");
-    };
-    let header = Header::decode_from(&mut cursor)?;
-    let trailer_pos = base + Header::header_len(header.block_type) + header.data_length as usize;
-    let Some(slot) = bytes.get_mut(trailer_pos) else {
-        panic!("parity trailer within the file");
-    };
-    *slot ^= 0xFF;
+    corrupt_parity_trailer_byte(&sst_path, &first)?;
 
     // Block 2: wreck the whole payload+parity (uncorrectable, left for salvage).
+    let mut bytes = std::fs::read(&sst_path)?;
     let payload_start = second.offset().0 as usize + Header::MIN_LEN;
     let payload_end = second.offset().0 as usize + second.size() as usize;
     for slot in bytes
@@ -1005,13 +967,7 @@ fn heal_in_place_skips_the_checksum_refresh_while_corruption_remains() -> crate:
     std::fs::write(&sst_path, &bytes)?;
 
     // Manifest rebuild records the digest of the CORRUPT bytes.
-    let report = Config::new(
-        dir.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .repair()?;
-    assert_eq!(report.recovered, 1, "{report:?}");
+    rebuild_manifest_over_current_bytes(dir.path())?;
 
     // Heal pass: block 1's trailer is rebuilt, block 2 stays uncorrectable.
     let tree = open_ecc_tree(dir.path());
