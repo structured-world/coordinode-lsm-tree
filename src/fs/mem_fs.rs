@@ -509,6 +509,12 @@ impl FsFile for MemFile {
         })
     }
 
+    // MemFs has no inode concept ([`Fs::hard_link`] copies), so a file can
+    // never share its bytes with another name: the count is exactly 1.
+    fn hard_link_count(&self) -> io::Result<u64> {
+        Ok(1)
+    }
+
     fn set_len(&self, size: u64) -> io::Result<()> {
         if !self.writable {
             return Err(io::Error::other("set_len requires write access"));

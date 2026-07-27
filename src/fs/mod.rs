@@ -464,17 +464,21 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     /// same bytes, and writing in place would silently rewrite that snapshot
     /// too.
     ///
-    /// The default reports 1, which is exact for backends with no hard-link
-    /// concept ([`MemFs`]). Backends that support links but
-    /// cannot query the count (or platforms where the query is unavailable)
-    /// also report 1; callers treat the value as best-effort, not a proof of
-    /// exclusivity.
+    /// Backends with no hard-link concept ([`MemFs`], whose
+    /// [`Fs::hard_link`] copies) override this to return 1. Backends that CAN
+    /// share inodes but cannot determine the count keep the default error, so
+    /// in-place mutation paths fail closed (treat the file as shared) instead
+    /// of overwriting a snapshot through an unrecognized link.
     ///
     /// # Errors
     ///
-    /// Returns an I/O error if the link count cannot be retrieved.
+    /// Returns an I/O error if the link count cannot be retrieved; the
+    /// default returns [`ErrorKind::Unsupported`](crate::io::ErrorKind).
     fn hard_link_count(&self) -> io::Result<u64> {
-        Ok(1)
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "hard-link count unavailable",
+        ))
     }
 
     /// Truncates or extends the file to the specified length.
