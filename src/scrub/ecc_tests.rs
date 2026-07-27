@@ -612,6 +612,60 @@ fn heal_in_place_reports_a_failed_heal_reread_as_uncorrectable() -> crate::Resul
     Ok(())
 }
 
+/// An in-place heal must not mutate an inode a checkpoint hard-links: the
+/// checkpoint's manifest recorded the digest of the bytes AT SNAPSHOT TIME,
+/// and rewriting the shared inode underneath it permanently desynchronizes
+/// the snapshot from its own manifest (only the LIVE tree's digest is
+/// reconciled). The heal must instead break the link (heal a private copy of
+/// the live file), leaving the checkpoint's inode byte-identical to what its
+/// manifest describes.
+#[test]
+fn heal_in_place_does_not_mutate_a_hard_linked_checkpoint_inode() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst(dir.path());
+
+    // Rot one payload byte (RS-correctable) BEFORE the snapshot: the
+    // checkpoint captures the rotted bytes, exactly what its manifest
+    // would describe.
+    let corrupt_pos = block.offset().0 as usize + Header::MIN_LEN + 3;
+    let mut bytes = std::fs::read(&sst_path)?;
+    let slot = bytes.get_mut(corrupt_pos).expect("corrupt_pos in range");
+    *slot ^= 0x80;
+    std::fs::write(&sst_path, &bytes)?;
+
+    // Checkpoint-style hard link to the (rotted) SST. A separate directory
+    // outside the tree keeps recovery from treating it as an orphan.
+    let cp_dir = tempfile::tempdir_in(dir.path().parent().expect("tempdir has a parent"))?;
+    let link_path = cp_dir.path().join("checkpoint.sst");
+    std::fs::hard_link(&sst_path, &link_path)?;
+    let snapshot = std::fs::read(&link_path)?;
+
+    let tree = open_ecc_tree(dir.path());
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report.blocks_healed_in_place >= 1,
+        "the live file's fault is healed: {report:?}",
+    );
+    assert!(report.is_ok(), "{report:?}");
+
+    // The LIVE path carries the healed bytes...
+    let live = std::fs::read(&sst_path)?;
+    assert_ne!(
+        live, snapshot,
+        "the live path must expose the healed bytes after the scrub",
+    );
+    // ...while the checkpoint's inode still holds exactly the snapshot the
+    // checkpoint manifest describes.
+    let checkpoint = std::fs::read(&link_path)?;
+    assert_eq!(
+        checkpoint, snapshot,
+        "the checkpoint's hard-linked inode must keep its snapshot bytes: \
+         healing through a shared inode desynchronizes the checkpoint from \
+         its own manifest digest",
+    );
+    Ok(())
+}
+
 /// The digest reconciliation must not restamp over corruption the heal scan
 /// never looked at: the scan covers DATA blocks only, so rot in a side
 /// section (filter, zone map, range tombstones) leaves the scan clean while
