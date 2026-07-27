@@ -612,6 +612,80 @@ fn heal_in_place_reports_a_failed_heal_reread_as_uncorrectable() -> crate::Resul
     Ok(())
 }
 
+/// A manifest-digest refresh that FAILED (or a crash after the heal's
+/// `sync_data` but before the manifest update) must be RECONCILED by the next
+/// heal-in-place scrub: that later scrub sees only clean blocks (the bytes
+/// were already healed), so a refresh gated on "this pass healed something"
+/// never fires again and the stale digest survives forever — every later
+/// `verify_integrity` keeps flagging a now-healthy SST.
+#[test]
+fn heal_in_place_reconciles_a_stale_checksum_left_by_a_failed_refresh() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+    use crate::{Config, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst(dir.path());
+
+    // Rot one parity-trailer byte (payload checksums stay clean).
+    let mut bytes = std::fs::read(&sst_path)?;
+    let base = block.offset().0 as usize;
+    let Some(mut cursor) = bytes.get(base..) else {
+        panic!("first data block within the file");
+    };
+    let header = Header::decode_from(&mut cursor)?;
+    let trailer_pos = base + Header::header_len(header.block_type) + header.data_length as usize;
+    let Some(slot) = bytes.get_mut(trailer_pos) else {
+        panic!("parity trailer within the file");
+    };
+    *slot ^= 0xFF;
+    std::fs::write(&sst_path, &bytes)?;
+
+    // Manifest rebuild records the digest of the ROTTED bytes.
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+    assert_eq!(report.recovered, 1, "{report:?}");
+
+    // FIRST heal pass: the trailer is rebuilt in place, but the manifest
+    // refresh fails (injected fault on the edit-log open).
+    let fault = FaultFs::new(crate::fs::StdFs);
+    let injector = fault.injector();
+    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
+            .on_path("edits")
+            .once(),
+    );
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    injector.clear();
+    assert!(report.blocks_healed_in_place >= 1, "{report:?}");
+    assert!(
+        !report.is_ok(),
+        "the failed refresh is a finding: {report:?}"
+    );
+
+    // SECOND heal pass, fault gone: every block reads clean (nothing left to
+    // heal), yet the manifest still carries the rotted digest — the scrub
+    // must reconcile it, not skip the refresh because it healed nothing.
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report.is_ok(),
+        "a clean re-scan reconciles the pending refresh: {report:?}",
+    );
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        integrity.is_ok(),
+        "the reconciled manifest digest matches the healed file, got {:?}",
+        integrity.errors,
+    );
+    Ok(())
+}
+
 /// An in-place heal that changes the SST's bytes must REFRESH the manifest's
 /// full-file checksum. The heal itself restores the block's original bytes
 /// (whose digest usually matches the manifest), but a table admitted by a
