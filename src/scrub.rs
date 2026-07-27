@@ -384,28 +384,54 @@ fn refresh_healed_checksum(
     tree: &impl AbstractTree,
     table: &crate::table::Table,
 ) -> Option<ScrubError> {
-    let result = crate::repair::compute_table_checksum(&*table.fs, &table.path).and_then(|raw| {
-        let fresh = crate::Checksum::from_raw(raw);
-        if fresh == table.checksum() {
-            // Digest already agrees with the manifest: no pending heal to
-            // reconcile, no version upgrade to install.
-            return Ok(());
-        }
-        tree.refresh_table_checksum(table.id(), fresh)
-    });
-    match result {
+    let finding = |reason: String| {
+        log::warn!(
+            "failed to persist refreshed checksum for healed table #{}: {reason}",
+            table.id(),
+        );
+        Some(ScrubError::ChecksumRefreshFailed {
+            table_id: table.id(),
+            path: (*table.path).clone(),
+            reason,
+        })
+    };
+
+    let fresh = match crate::repair::compute_table_checksum(&*table.fs, &table.path) {
+        Ok(raw) => crate::Checksum::from_raw(raw),
+        Err(e) => return finding(e.to_string()),
+    };
+    if fresh == table.checksum() {
+        // Digest already agrees with the manifest: no pending heal to
+        // reconcile, no version upgrade to install.
+        return None;
+    }
+
+    // The heal scan covered DATA blocks only, so a digest mismatch is not
+    // yet attributable to a heal: rot in a side section (filter, zone map,
+    // range tombstones, block layout) also moves the digest while leaving
+    // the scan clean. Walk EVERY section out-of-band before installing the
+    // fresh digest: restamping over unverified bytes would launder the
+    // corruption into the manifest and blind `verify_integrity` to it.
+    // Fail closed on warnings too: an unrecognized-ECC or
+    // parity-unverifiable walk skipped bytes, so the file is not provably
+    // clean.
+    let walk = crate::verify::verify_sst_file_with_context(
+        &*table.fs,
+        &table.path,
+        table.encryption.as_deref(),
+        Some(table.id()),
+    );
+    if !walk.errors.is_empty() || !walk.warnings.is_empty() {
+        return finding(
+            "digest mismatch with corruption outside the scanned data blocks; \
+             the manifest digest was not refreshed"
+                .into(),
+        );
+    }
+
+    match tree.refresh_table_checksum(table.id(), fresh) {
         Ok(()) => None,
-        Err(e) => {
-            log::warn!(
-                "failed to persist refreshed checksum for healed table #{}: {e}",
-                table.id(),
-            );
-            Some(ScrubError::ChecksumRefreshFailed {
-                table_id: table.id(),
-                path: (*table.path).clone(),
-                reason: e.to_string(),
-            })
-        }
+        Err(e) => finding(e.to_string()),
     }
 }
 
