@@ -790,6 +790,18 @@ fn heal_in_place_reports_a_failed_checksum_refresh() -> crate::Result<()> {
     *slot ^= 0xFF;
     std::fs::write(&sst_path, &bytes)?;
 
+    // Manifest rebuild records the digest of the ROTTED bytes, so the heal's
+    // reconciliation actually has a mismatch to persist (against a manifest
+    // that already holds the correct digest the reconciliation is a no-op
+    // and never touches the edit log).
+    let report = crate::Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+    assert_eq!(report.recovered, 1, "{report:?}");
+
     let fault = FaultFs::new(crate::fs::StdFs);
     let injector = fault.injector();
     let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));

@@ -280,7 +280,7 @@ pub fn patrol_scrub(tree: &impl AbstractTree, options: &PatrolScrubOptions) -> P
         let mut report = PatrolScrubReport::default();
         for (idx, table) in tables.iter().enumerate() {
             let partial = scan_one(table, options);
-            let refresh = wants_checksum_refresh(&partial);
+            let refresh = options.heal_in_place && wants_checksum_refresh(&partial);
             report.merge(partial);
             if refresh && let Some(finding) = refresh_healed_checksum(tree, table) {
                 report.errors.push(finding);
@@ -303,15 +303,15 @@ pub fn patrol_scrub(tree: &impl AbstractTree, options: &PatrolScrubOptions) -> P
             .map(|_| {
                 scope.spawn(|| {
                     let mut local = PatrolScrubReport::default();
-                    // Table indexes whose scan healed blocks in place; the
-                    // manifest-digest refresh happens on the calling thread
-                    // after the workers join (it takes the tree's version
-                    // locks, which stay off the scan workers).
+                    // Table indexes whose heal scan qualifies for the
+                    // manifest-digest reconciliation; it happens on the
+                    // calling thread after the workers join (it takes the
+                    // tree's version locks, which stay off the scan workers).
                     let mut healed = Vec::new();
                     let mut idx = cursor.fetch_add(1, Ordering::Relaxed);
                     while let Some(table) = tables.get(idx) {
                         let partial = scan_one(table, options);
-                        if wants_checksum_refresh(&partial) {
+                        if options.heal_in_place && wants_checksum_refresh(&partial) {
                             healed.push(idx);
                         }
                         local.merge(partial);
@@ -354,31 +354,45 @@ pub fn patrol_scrub(tree: &impl AbstractTree, options: &PatrolScrubOptions) -> P
     report
 }
 
-/// Whether a per-SST scan warrants restamping the table's manifest digest:
-/// the scan must have healed at least one block (the bytes changed) AND left
-/// the file free of known corruption (no uncorrectable blocks, no findings).
-/// Restamping a partially-healed file would compute the fresh digest over the
-/// still-corrupt bytes, making a later `verify_integrity` pass on an SST with
-/// known, unrepaired corruption.
+/// Whether a per-SST HEAL scan warrants the manifest-digest reconciliation:
+/// the scan must have left the file free of known corruption (no
+/// uncorrectable blocks, no findings). Restamping a partially-healed file
+/// would compute the fresh digest over the still-corrupt bytes, making a
+/// later `verify_integrity` pass on an SST with known, unrepaired corruption.
+///
+/// Deliberately NOT gated on "this pass healed something": a refresh that
+/// failed on an earlier pass (or a crash between the heal's `sync_data` and
+/// the manifest update) leaves a stale digest that a later scan — which then
+/// reads only clean blocks — must still reconcile, or the mismatch survives
+/// forever. The reconciliation itself is a no-op when the digests already
+/// agree, so a clean scan of a healthy table costs one streaming read and no
+/// manifest write.
 fn wants_checksum_refresh(partial: &PatrolScrubReport) -> bool {
-    partial.blocks_healed_in_place > 0
-        && partial.uncorrectable_blocks == 0
-        && partial.errors.is_empty()
+    partial.uncorrectable_blocks == 0 && partial.errors.is_empty()
 }
 
-/// Persists a healed table's refreshed full-file digest to the manifest: an
-/// in-place heal rewrote bytes, so the digest captured at recovery is stale and
-/// a later verify (or repair) would flag the healed file against it. A failure
-/// is returned as a [`ScrubError::ChecksumRefreshFailed`] finding (the caller
-/// folds it into the report) — the healed bytes are durable either way, but a
-/// silently-stale manifest digest would make every later `verify_integrity`
-/// flag the freshly healed file while the patrol report claimed a clean heal.
+/// Reconciles a table's manifest digest with its on-disk bytes after a
+/// corruption-free heal scan: an in-place heal (this pass or an earlier one
+/// whose manifest update failed / was interrupted) may have left the digest
+/// captured at recovery stale, and a later verify (or repair) would flag the
+/// healed file against it. When the recomputed digest already matches the
+/// manifest, nothing is written. A failure is returned as a
+/// [`ScrubError::ChecksumRefreshFailed`] finding (the caller folds it into
+/// the report) — the healed bytes are durable either way, and the next heal
+/// scan retries the reconciliation.
 fn refresh_healed_checksum(
     tree: &impl AbstractTree,
     table: &crate::table::Table,
 ) -> Option<ScrubError> {
-    let result = crate::repair::compute_table_checksum(&*table.fs, &table.path)
-        .and_then(|raw| tree.refresh_table_checksum(table.id(), crate::Checksum::from_raw(raw)));
+    let result = crate::repair::compute_table_checksum(&*table.fs, &table.path).and_then(|raw| {
+        let fresh = crate::Checksum::from_raw(raw);
+        if fresh == table.checksum() {
+            // Digest already agrees with the manifest: no pending heal to
+            // reconcile, no version upgrade to install.
+            return Ok(());
+        }
+        tree.refresh_table_checksum(table.id(), fresh)
+    });
     match result {
         Ok(()) => None,
         Err(e) => {
