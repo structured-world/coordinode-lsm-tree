@@ -612,6 +612,64 @@ fn heal_in_place_reports_a_failed_heal_reread_as_uncorrectable() -> crate::Resul
     Ok(())
 }
 
+/// The digest reconciliation must not restamp over corruption the heal scan
+/// never looked at: the scan covers DATA blocks only, so rot in a side
+/// section (filter, zone map, range tombstones) leaves the scan clean while
+/// the file digest disagrees with the manifest; blindly installing the fresh
+/// digest would make `verify_integrity` accept the corrupted file, masking
+/// the rot until the side section is lazily loaded.
+#[test]
+fn heal_in_place_does_not_restamp_over_side_section_rot() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _) = write_ecc_sst(dir.path());
+
+    // Rot a 64-byte run inside the FILTER section's payload (well past the
+    // RS(8,2) correction budget): the data blocks stay clean, but the
+    // out-of-band section walk (and any later filter load) flags it.
+    let (pos, len) = {
+        let mut f = std::fs::File::open(&sst_path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"filter") else {
+            panic!("the SST must carry a filter section");
+        };
+        (entry.pos(), entry.len())
+    };
+    assert!(len > 128, "filter section large enough to rot: {len}");
+    let start = usize::try_from(pos).expect("filter offset fits usize") + 40;
+    let mut bytes = std::fs::read(&sst_path)?;
+    let Some(run) = bytes.get_mut(start..start + 64) else {
+        panic!("filter payload within the file");
+    };
+    for b in run {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&sst_path, &bytes)?;
+
+    // Heal scan: every DATA block reads clean, yet the file digest now
+    // disagrees with the manifest (the filter byte changed).
+    let tree = open_ecc_tree(dir.path());
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        !report.is_ok(),
+        "a digest mismatch the scan cannot attribute to a heal must be a \
+         finding, not silently restamped: {report:?}",
+    );
+
+    // The manifest keeps the ORIGINAL digest, so the corruption stays
+    // visible to integrity scans instead of being laundered into a fresh
+    // manifest entry.
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the corrupted file must keep failing verify_integrity: restamping \
+         its digest over unverified side sections would mask the rot",
+    );
+    Ok(())
+}
+
 /// A manifest-digest refresh that FAILED (or a crash after the heal's
 /// `sync_data` but before the manifest update) must be RECONCILED by the next
 /// heal-in-place scrub: that later scrub sees only clean blocks (the bytes
