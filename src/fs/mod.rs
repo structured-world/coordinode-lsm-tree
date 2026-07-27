@@ -465,7 +465,7 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     /// too.
     ///
     /// The default reports 1, which is exact for backends with no hard-link
-    /// concept ([`MemFs`](crate::MemFs)). Backends that support links but
+    /// concept ([`MemFs`]). Backends that support links but
     /// cannot query the count (or platforms where the query is unavailable)
     /// also report 1; callers treat the value as best-effort, not a proof of
     /// exclusivity.
