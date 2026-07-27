@@ -726,6 +726,57 @@ fn heal_in_place_does_not_mutate_a_hard_linked_checkpoint_inode() -> crate::Resu
     Ok(())
 }
 
+/// A failed unshare must not leave its `*.healtmp` artifact behind: recovery
+/// parses every non-special file under `tables/` as a numeric table id, so a
+/// leftover temp copy makes the NEXT open of the whole tree fail
+/// `Unrecoverable` — a heal that could not proceed must degrade to a
+/// read-only scan, not brick the reopen path.
+#[test]
+fn heal_in_place_cleans_up_the_temp_copy_when_the_unshare_fails() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _) = write_ecc_sst(dir.path());
+
+    // Hard-link the SST so the heal takes the unshare path.
+    let cp_dir = tempfile::tempdir_in(dir.path().parent().expect("tempdir has a parent"))?;
+    std::fs::hard_link(&sst_path, cp_dir.path().join("checkpoint.sst"))?;
+
+    // Fail the rename that publishes the heal copy: the copy was already
+    // created and written by then.
+    let fault = FaultFs::new(crate::fs::StdFs);
+    let injector = fault.injector();
+    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));
+    injector.arm(
+        FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::Other))
+            .on_path("healtmp")
+            .once(),
+    );
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    injector.clear();
+    assert!(
+        !report.is_ok(),
+        "the failed unshare is a finding: {report:?}"
+    );
+
+    // No temp artifact may survive the failure...
+    let leftovers: Vec<_> = std::fs::read_dir(sst_path.parent().expect("sst in tables dir"))?
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().contains("healtmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "a failed unshare must remove its temp copy: {leftovers:?}",
+    );
+
+    // ...and the tree must reopen: a heal failure must never brick recovery.
+    drop(tree);
+    let tree = open_ecc_tree(dir.path());
+    assert!(crate::verify::verify_integrity(&tree).is_ok());
+    Ok(())
+}
+
 /// The digest reconciliation must not restamp over corruption the heal scan
 /// never looked at: the scan covers DATA blocks only, so rot in a side
 /// section (filter, zone map, range tombstones) leaves the scan clean while
