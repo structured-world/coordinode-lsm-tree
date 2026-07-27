@@ -499,6 +499,10 @@ impl FsFile for FaultFile {
         self.inner.metadata()
     }
 
+    fn hard_link_count(&self) -> io::Result<u64> {
+        self.inner.hard_link_count()
+    }
+
     fn set_len(&self, size: u64) -> io::Result<()> {
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::SetLen, Some(&self.path)) {
             return Err(fault_error(kind, FaultOp::SetLen));

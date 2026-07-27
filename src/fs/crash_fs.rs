@@ -443,6 +443,10 @@ impl FsFile for CrashFile {
         self.inner.metadata()
     }
 
+    fn hard_link_count(&self) -> io::Result<u64> {
+        self.inner.hard_link_count()
+    }
+
     fn set_len(&self, size: u64) -> io::Result<()> {
         self.inner.set_len(size)
     }

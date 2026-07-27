@@ -325,6 +325,11 @@ impl FsFile for IoUringFile {
         })
     }
 
+    fn hard_link_count(&self) -> crate::io::Result<u64> {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(self.file.metadata()?.nlink())
+    }
+
     fn set_len(&self, size: u64) -> crate::io::Result<()> {
         self.file.set_len(size).map_err(crate::io::Error::from)
     }

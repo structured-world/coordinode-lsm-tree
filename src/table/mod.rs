@@ -1093,6 +1093,83 @@ impl Table {
         report
     }
 
+    /// Detaches this table's live path from a multiply-linked inode so an
+    /// in-place heal can write without touching the other links (checkpoint
+    /// snapshots): streams the file into a sibling `*.healtmp` copy, syncs it,
+    /// and atomically renames it over the live path. The returned handle is
+    /// the copy's (still valid after the rename), open read+write.
+    ///
+    /// Crash-safe: until the rename the live path is untouched, and a leftover
+    /// `*.healtmp` is unreferenced by any manifest, so recovery removes it as
+    /// an orphan.
+    #[cfg(feature = "page_ecc")]
+    fn unshare_for_heal(
+        &self,
+        source: &dyn crate::fs::FsFile,
+    ) -> Result<Box<dyn crate::fs::FsFile>, alloc::string::String> {
+        use std::io::Write;
+
+        let len = source
+            .metadata()
+            .map_err(|e| alloc::format!("metadata: {e}"))?
+            .len;
+        let tmp_path = self.path.with_extension("healtmp");
+        // A leftover copy from an interrupted unshare is stale: replace it.
+        match self.fs.remove_file(&tmp_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(alloc::format!("remove stale heal copy: {e}")),
+        }
+        let mut tmp = self
+            .fs
+            .open(
+                &tmp_path,
+                &FsOpenOptions::new().read(true).write(true).create_new(true),
+            )
+            .map_err(|e| alloc::format!("create heal copy: {e}"))?;
+
+        let mut buf = alloc::vec![0u8; 1 << 20];
+        let mut off = 0u64;
+        while off < len {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "min() bounds the chunk by buf.len(), which fits usize"
+            )]
+            let want = buf.len().min((len - off) as usize);
+            let Some(chunk) = buf.get_mut(..want) else {
+                return Err(alloc::string::String::from("chunk within buffer"));
+            };
+            let n = source
+                .read_at(chunk, off)
+                .map_err(|e| alloc::format!("read source at {off}: {e}"))?;
+            if n < want {
+                // Fill-or-EOF contract: a short read here means the file
+                // shrank underneath us — abort rather than install a
+                // truncated copy.
+                return Err(alloc::format!(
+                    "short read at {off}: got {n} of {want} bytes"
+                ));
+            }
+            tmp.write_all(chunk)
+                .map_err(|e| alloc::format!("write heal copy at {off}: {e}"))?;
+            off += want as u64;
+        }
+        // sync_all, not sync_data: the copy is a NEW file, its size must be
+        // durable before the rename publishes it.
+        tmp.sync_all()
+            .map_err(|e| alloc::format!("sync heal copy: {e}"))?;
+        self.fs
+            .rename(&tmp_path, &self.path)
+            .map_err(|e| alloc::format!("rename heal copy into place: {e}"))?;
+        if let Some(parent) = self.path.parent() {
+            self.fs
+                .sync_directory(parent)
+                .map_err(|e| alloc::format!("sync directory after rename: {e}"))?;
+        }
+        // The handle survives the rename (same inode, now the live path).
+        Ok(tmp)
+    }
+
     /// In-place ECC autoheal: like [`Self::scrub_data_blocks`], but PERSISTS each
     /// correction by writing the corrected block back at its existing offset
     /// (size-preserving) instead of scheduling a full-file healing rewrite.
@@ -1105,15 +1182,18 @@ impl Table {
     /// the block in its prior, still-RS-correctable state. Uncorrectable /
     /// unreadable blocks are recorded as findings and left for block salvage.
     ///
-    /// HARD-LINK SAFE by construction (checkpoints hard-link SSTs, sharing the
-    /// inode, so an in-place write reaches the checkpoint's copy too): every
-    /// write this pass performs restores the block's ORIGINAL bytes — the
-    /// recovered payload is the pre-rot payload and the recomputed parity
-    /// therefore equals the originally-written parity — so a linked checkpoint
-    /// heals along with the live file rather than diverging from its intended
-    /// content, and every torn intermediate state differs from the original by
-    /// at most the already-correctable rotted bits (still within the ECC
-    /// budget any reader can recover).
+    /// HARD-LINK SAFE by unsharing: checkpoints hard-link SSTs, and a
+    /// checkpoint's manifest records the digest of the bytes AT SNAPSHOT TIME,
+    /// which the checkpoint (immutable by design) can never reconcile the way
+    /// the live tree does. Writing through a shared inode would therefore
+    /// desynchronize the snapshot from its own manifest whenever the recorded
+    /// digest is not the original file's (a manifest rebuilt over rotted
+    /// bytes). When the opened file reports more than one link, the heal first
+    /// detaches the live path onto a private copy (copy + atomic rename) and
+    /// heals that, leaving every other link byte-identical to what its
+    /// manifest describes. Cached read-only descriptors may keep serving the
+    /// old inode until they are reopened; its bytes are unchanged, so reads
+    /// stay correct (ECC-corrected on the fly as before).
     ///
     /// `pub(crate)` for [`crate::scrub::patrol_scrub`] (heal-in-place enabled).
     #[cfg(feature = "page_ecc")]
@@ -1151,6 +1231,41 @@ impl Table {
                 return report;
             }
         };
+
+        // A multiply-linked inode (a checkpoint shares it) must not be healed
+        // through: detach the live path onto a private copy first. A failed
+        // link-count query is treated as shared (fail closed) — the copy path
+        // is safe either way.
+        let shared = match file.hard_link_count() {
+            Ok(n) => n > 1,
+            Err(e) => {
+                log::warn!(
+                    "in-place heal: link-count query failed for table {} at {}: {e}; \
+                     assuming the inode is shared",
+                    self.id(),
+                    self.path.display(),
+                );
+                true
+            }
+        };
+        if shared {
+            match self.unshare_for_heal(file.as_ref()) {
+                Ok(fresh) => file = fresh,
+                Err(reason) => {
+                    // Cannot break the link: record it and fall back to the
+                    // read-only scrub so corruption still surfaces without
+                    // mutating the shared inode.
+                    report.errors.push(ScrubError::BlockIndexUnreadable {
+                        table_id: self.id(),
+                        path: self.path.to_path_buf(),
+                        reason: alloc::format!("unshare hard-linked SST for heal: {reason}"),
+                    });
+                    report.merge(self.scrub_data_blocks());
+                    report.sst_files_scanned = 1;
+                    return report;
+                }
+            }
+        }
 
         let transform = match crate::table::util::build_block_transform(
             self.metadata.data_block_compression,

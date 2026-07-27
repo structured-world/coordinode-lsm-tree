@@ -83,6 +83,16 @@ impl FsFile for File {
         })
     }
 
+    #[cfg(unix)]
+    fn hard_link_count(&self) -> io::Result<u64> {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(Self::metadata(self)?.nlink())
+    }
+
+    // Non-Unix (Windows): `std` exposes the NTFS link count only behind the
+    // unstable `windows_by_handle` feature, so the trait default of 1 stays in
+    // effect. Callers already treat the count as best-effort.
+
     fn set_len(&self, size: u64) -> io::Result<()> {
         Self::set_len(self, size).map_err(io::Error::from)
     }
