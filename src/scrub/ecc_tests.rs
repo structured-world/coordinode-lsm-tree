@@ -726,6 +726,40 @@ fn heal_in_place_does_not_mutate_a_hard_linked_checkpoint_inode() -> crate::Resu
     Ok(())
 }
 
+/// A failed link-count probe must FAIL CLOSED: the heal cannot prove the
+/// inode is exclusive, so it must take the unshare (copy) path as if the file
+/// were shared — and still heal the detached copy, not skip the table or
+/// write through the possibly-shared inode.
+#[test]
+fn heal_in_place_treats_an_unknown_link_count_as_shared() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst(dir.path());
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
+
+    let fault = FaultFs::new(crate::fs::StdFs);
+    let injector = fault.injector();
+    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));
+    injector.arm(
+        FaultRule::new(FaultOp::HardLinkCount, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .once(),
+    );
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    injector.clear();
+
+    // The heal proceeded through the copy path: the trailer rot is healed and
+    // nothing surfaced as a finding.
+    assert!(
+        report.blocks_healed_in_place >= 1,
+        "fail-closed still heals (through the detached copy): {report:?}",
+    );
+    assert!(report.is_ok(), "{report:?}");
+    Ok(())
+}
+
 /// A failed unshare must not leave its `*.healtmp` artifact behind: recovery
 /// parses every non-special file under `tables/` as a numeric table id, so a
 /// leftover temp copy makes the NEXT open of the whole tree fail
@@ -743,13 +777,13 @@ fn heal_in_place_cleans_up_the_temp_copy_when_the_unshare_fails() -> crate::Resu
     let cp_dir = tempfile::tempdir_in(dir.path().parent().expect("tempdir has a parent"))?;
     std::fs::hard_link(&sst_path, cp_dir.path().join("checkpoint.sst"))?;
 
-    // Fail the rename that publishes the heal copy: the copy was already
-    // created and written by then.
+    // Fail the pre-publish sync of the heal copy: the copy was already
+    // created and fully written by then.
     let fault = FaultFs::new(crate::fs::StdFs);
     let injector = fault.injector();
     let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));
     injector.arm(
-        FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::Other))
+        FaultRule::new(FaultOp::SyncAll, Fault::Error(ErrorKind::Other))
             .on_path("healtmp")
             .once(),
     );
@@ -821,6 +855,17 @@ fn heal_in_place_does_not_restamp_over_side_section_rot() -> crate::Result<()> {
         !report.is_ok(),
         "a digest mismatch the scan cannot attribute to a heal must be a \
          finding, not silently restamped: {report:?}",
+    );
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| format!("{e:?}").contains("ChecksumRefreshFailed")),
+        "the finding must be the refused digest refresh: {report:?}",
+    );
+    assert_eq!(
+        report.uncorrectable_blocks, 0,
+        "the data blocks themselves stay clean: {report:?}",
     );
 
     // The manifest keeps the ORIGINAL digest, so the corruption stays

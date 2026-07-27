@@ -88,6 +88,10 @@ pub enum FaultOp {
     /// models a stat that races file creation or an inaccessible path, e.g. to
     /// exercise TOCTOU windows between an existence check and an open.
     Metadata,
+    /// [`FsFile::hard_link_count`] — link-count probe consulted before
+    /// in-place mutation. Failing it exercises the fail-closed path (treat
+    /// the file as shared).
+    HardLinkCount,
 }
 
 /// What a matched [`FaultRule`] does to the operation.
@@ -500,6 +504,12 @@ impl FsFile for FaultFile {
     }
 
     fn hard_link_count(&self) -> io::Result<u64> {
+        if let Some(Fault::Error(kind)) = self
+            .injector
+            .check(FaultOp::HardLinkCount, Some(&self.path))
+        {
+            return Err(fault_error(kind, FaultOp::HardLinkCount));
+        }
         self.inner.hard_link_count()
     }
 
