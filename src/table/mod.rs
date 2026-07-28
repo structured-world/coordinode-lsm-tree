@@ -1228,15 +1228,14 @@ impl Table {
         // reads 1 even though only checkpoint links remain — and the second
         // heal would write through the snapshot. Taken BEFORE the open so the
         // probed handle is always the current live inode.
+        //
+        // Checkpoint exclusion is NOT taken here: the patrol scrub holds the
+        // `DeletionPause` mutation window across BOTH this scan and the
+        // digest reconciliation that follows it (a checkpoint slipping in
+        // between them would link healed bytes under a stale digest), and a
+        // recursive read of that gate could deadlock against a waiting
+        // checkpoint writer.
         let _heal_exclusive = self.heal_lock.lock();
-
-        // Excludes a concurrent checkpoint's link window for the whole
-        // probe-to-write span: a checkpoint that hard-links this SST between
-        // the link-count probe below and a write-back would capture bytes the
-        // heal is about to change, under a digest its immutable manifest
-        // already recorded. A table without an installed pause has no
-        // checkpoint machinery, so nothing can link it concurrently.
-        let _mutation_window = self.deletion_pause.get().map(|p| p.enter_mutation_window());
 
         // A single read+write handle for both the recovery read and the
         // write-back, opened directly (not via the read-only descriptor cache) so

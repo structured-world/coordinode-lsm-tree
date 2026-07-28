@@ -269,7 +269,13 @@ impl PatrolScrubOptions {
 /// # }
 /// ```
 #[must_use]
-pub fn patrol_scrub(tree: &impl AbstractTree, options: &PatrolScrubOptions) -> PatrolScrubReport {
+// `Sync`: the parallel path shares `tree` with the scan workers so each can
+// reconcile its table's manifest digest inside the same checkpoint-exclusion
+// window as its heal scan (both tree types are `Sync`).
+pub fn patrol_scrub(
+    tree: &(impl AbstractTree + Sync),
+    options: &PatrolScrubOptions,
+) -> PatrolScrubReport {
     let version = tree.current_version();
     let tables: Vec<crate::table::Table> = version.iter_tables().cloned().collect();
 
@@ -279,12 +285,7 @@ pub fn patrol_scrub(tree: &impl AbstractTree, options: &PatrolScrubOptions) -> P
     if workers <= 1 {
         let mut report = PatrolScrubReport::default();
         for (idx, table) in tables.iter().enumerate() {
-            let partial = scan_one(table, options);
-            let refresh = options.heal_in_place && wants_checksum_refresh(&partial);
-            report.merge(partial);
-            if refresh && let Some(finding) = refresh_healed_checksum(tree, table) {
-                report.errors.push(finding);
-            }
+            report.merge(scan_and_reconcile(tree, table, options));
             // Inter-SST pause only; skip the sleep after the final table so a
             // finished scrub returns promptly instead of idling one extra
             // throttle interval.
@@ -303,18 +304,9 @@ pub fn patrol_scrub(tree: &impl AbstractTree, options: &PatrolScrubOptions) -> P
             .map(|_| {
                 scope.spawn(|| {
                     let mut local = PatrolScrubReport::default();
-                    // Table indexes whose heal scan qualifies for the
-                    // manifest-digest reconciliation; it happens on the
-                    // calling thread after the workers join (it takes the
-                    // tree's version locks, which stay off the scan workers).
-                    let mut healed = Vec::new();
                     let mut idx = cursor.fetch_add(1, Ordering::Relaxed);
                     while let Some(table) = tables.get(idx) {
-                        let partial = scan_one(table, options);
-                        if options.heal_in_place && wants_checksum_refresh(&partial) {
-                            healed.push(idx);
-                        }
-                        local.merge(partial);
+                        local.merge(scan_and_reconcile(tree, table, options));
                         // Claim the next SST first; only pause if this worker
                         // still has another table, so no worker sleeps after its
                         // final SST.
@@ -325,7 +317,7 @@ pub fn patrol_scrub(tree: &impl AbstractTree, options: &PatrolScrubOptions) -> P
                             std::thread::sleep(delay);
                         }
                     }
-                    (local, healed)
+                    local
                 })
             })
             .collect();
@@ -341,17 +333,42 @@ pub fn patrol_scrub(tree: &impl AbstractTree, options: &PatrolScrubOptions) -> P
     });
 
     let mut report = PatrolScrubReport::default();
-    for (partial, healed) in partials {
+    for partial in partials {
         report.merge(partial);
-        for idx in healed {
-            if let Some(table) = tables.get(idx)
-                && let Some(finding) = refresh_healed_checksum(tree, table)
-            {
-                report.errors.push(finding);
-            }
-        }
     }
     report
+}
+
+/// Scans one SST and, for a corruption-free heal scan, reconciles its
+/// manifest digest — all under ONE checkpoint-exclusion window: a checkpoint
+/// that slipped in between the heal's last write and the digest refresh
+/// would link the already-healed bytes while capturing the still-stale
+/// version digest, permanently desynchronizing the immutable checkpoint
+/// manifest from its own files. A table without an installed pause has no
+/// checkpoint machinery, so nothing can link it concurrently and the window
+/// is skipped; plain (non-heal) scrubs mutate nothing and never take it.
+fn scan_and_reconcile(
+    tree: &impl AbstractTree,
+    table: &crate::table::Table,
+    options: &PatrolScrubOptions,
+) -> PatrolScrubReport {
+    let _mutation_window = options
+        .heal_in_place
+        .then(|| {
+            table
+                .deletion_pause
+                .get()
+                .map(|p| p.enter_mutation_window())
+        })
+        .flatten();
+    let mut partial = scan_one(table, options);
+    if options.heal_in_place
+        && wants_checksum_refresh(&partial)
+        && let Some(finding) = refresh_healed_checksum(tree, table)
+    {
+        partial.errors.push(finding);
+    }
+    partial
 }
 
 /// Whether a per-SST HEAL scan warrants the manifest-digest reconciliation:
