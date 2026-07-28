@@ -127,3 +127,147 @@ fn patrol_scrub_parallel_over_many_ssts_visits_every_file() {
     assert!(report.blocks_scanned >= 4);
     assert!(report.is_ok());
 }
+
+/// Opens a plain (no ECC, no compression) tree whose flushed SSTs carry
+/// per-KV checksum footers.
+fn open_kv_checked_tree(dir: &std::path::Path) -> crate::Tree {
+    use crate::runtime_config::KvChecksumPolicy;
+
+    let AnyTree::Standard(tree) = Config::new(
+        dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_compression_policy(crate::config::CompressionPolicy::all(
+        crate::CompressionType::None,
+    ))
+    .open()
+    .expect("open kv-checked tree") else {
+        unreachable!("standard tree configured");
+    };
+    tree.update_runtime_config(|c| c.kv_checksums = KvChecksumPolicy::AllLevels)
+        .expect("enable kv checksums");
+    tree
+}
+
+/// Forges a STALE per-KV footer behind a RE-STAMPED block checksum in the
+/// first data block of the SST at `path`: flips one digest byte inside the
+/// footer's checksum array, then recomputes the block header checksum over
+/// the altered payload. Block-level verification then reads clean while
+/// per-KV verification still detects the mismatch.
+fn forge_stale_kv_footer(path: &std::path::Path) -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::table::block::Header;
+    use crate::table::block::kv_checksum::FOOTER_TAIL_LEN;
+
+    let mut bytes = std::fs::read(path)?;
+    // The data section is the first SFA section, so the first data block
+    // starts at its position.
+    let block_off = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"data") else {
+            panic!("the SST must carry a data section");
+        };
+        usize::try_from(entry.pos()).expect("data offset fits usize")
+    };
+    let Some(block) = bytes.get(block_off..) else {
+        panic!("data block within the file");
+    };
+    let mut cursor = block;
+    let header = Header::decode_from(&mut cursor)?;
+    let header_len = Header::header_len(header.block_type);
+    let payload_range =
+        block_off + header_len..block_off + header_len + header.data_length as usize;
+
+    // Flip the LAST byte of the digest array (just before the fixed
+    // algo+count tail), leaving the footer structurally intact.
+    {
+        let Some(payload) = bytes.get_mut(payload_range.clone()) else {
+            panic!("data payload within the file");
+        };
+        let digest_end = payload.len() - FOOTER_TAIL_LEN;
+        let Some(slot) = payload.get_mut(digest_end - 1) else {
+            panic!("digest array within the payload");
+        };
+        *slot ^= 0xFF;
+    }
+
+    // Re-stamp the block header checksum over the altered payload so the
+    // block-level walk reads clean.
+    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(
+        bytes.get(payload_range).unwrap_or(&[]),
+    ));
+    let new_header = Header {
+        checksum: new_checksum,
+        ..header
+    };
+    let mut hdr_bytes = Vec::with_capacity(header_len);
+    new_header.encode_into(&mut hdr_bytes)?;
+    let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
+        panic!("data header within the file");
+    };
+    hdr_dst.copy_from_slice(&hdr_bytes);
+    std::fs::write(path, &bytes)?;
+    Ok(())
+}
+
+/// The digest reconciliation must not restamp over a STALE per-KV footer
+/// hidden behind a re-stamped block checksum: neither the heal scan nor the
+/// out-of-band section walk decodes entries, so only the per-KV verification
+/// can catch it — without it, `verify_integrity` starts accepting a file
+/// that `verify_kv_checksums` still rejects.
+#[test]
+fn heal_scrub_does_not_restamp_over_a_stale_kv_footer() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sst_path = {
+        let tree = open_kv_checked_tree(dir.path());
+        for i in 0u64..500 {
+            tree.insert(format!("key-{i:06}"), format!("v{i:06}"), i);
+        }
+        tree.flush_active_memtable(500)?;
+        let binding = tree.version_history.read().latest_version();
+        let table = binding
+            .version
+            .iter_tables()
+            .next()
+            .expect("flush produced one table");
+        (*table.path).clone()
+    };
+
+    forge_stale_kv_footer(&sst_path)?;
+
+    // Heal scan: block checksums read clean (re-stamped), yet the file
+    // digest disagrees with the manifest.
+    let tree = open_kv_checked_tree(dir.path());
+    assert!(
+        crate::verify::verify_kv_checksums(&tree).is_err(),
+        "the forged footer must be detectable by per-KV verification",
+    );
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        !report.is_ok(),
+        "a digest mismatch over a stale per-KV footer must be a finding, \
+         not silently restamped: {report:?}",
+    );
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| format!("{e:?}").contains("ChecksumRefreshFailed")),
+        "the finding must be the refused digest refresh: {report:?}",
+    );
+
+    // The manifest keeps the ORIGINAL digest, so integrity scans keep
+    // flagging the forged file.
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the forged file must keep failing verify_integrity: restamping its \
+         digest over an unverified per-KV footer would mask the corruption",
+    );
+    Ok(())
+}
