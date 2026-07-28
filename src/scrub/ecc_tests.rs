@@ -771,6 +771,64 @@ fn heal_in_place_rebinds_the_descriptor_cache_after_an_unshare() -> crate::Resul
     Ok(())
 }
 
+/// The descriptor invalidation must happen as soon as the publish RENAME
+/// succeeds — even when the post-rename directory sync fails: the live path
+/// already points at the new inode, so bailing out before the invalidation
+/// leaves the cache pinned to the old checkpoint-linked inode, and a later
+/// heal (which sees one link on the new inode and does not unshare again)
+/// scrubs the stale inode while the live file rots.
+#[test]
+fn heal_in_place_rebinds_the_descriptor_cache_when_the_directory_sync_fails() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst(dir.path());
+
+    // Hard-link the SST so the FIRST heal takes the unshare path.
+    let cp_dir = tempfile::tempdir_in(dir.path().parent().expect("tempdir has a parent"))?;
+    std::fs::hard_link(&sst_path, cp_dir.path().join("checkpoint.sst"))?;
+
+    let fault = FaultFs::new(crate::fs::StdFs);
+    let injector = fault.injector();
+    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));
+
+    // Prime the descriptor cache with the ORIGINAL inode, then heal with the
+    // post-rename directory sync failing: the unshare errors out AFTER the
+    // rename has already replaced the live path.
+    assert!(tree.get("key-000000", crate::SeqNo::MAX)?.is_some());
+    injector.arm(
+        FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .once(),
+    );
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    injector.clear();
+    assert!(
+        !report.is_ok(),
+        "the failed unshare is a finding: {report:?}"
+    );
+
+    // A recoverable payload fault lands on the LIVE (post-rename) inode.
+    let corrupt_pos = block.offset().0 as usize + Header::MIN_LEN + 3;
+    let mut bytes = std::fs::read(&sst_path)?;
+    let slot = bytes
+        .get_mut(corrupt_pos)
+        .expect("corrupt_pos in range for the SST bytes");
+    *slot ^= 0x80;
+    std::fs::write(&sst_path, &bytes)?;
+
+    // SECOND heal on the SAME open tree: the scrub must see the live
+    // inode's fault as ECC-recoverable, not scrub the stale cached fd.
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report.blocks_healed_in_place >= 1,
+        "the live fault is ECC-recovered and healed in place: {report:?}",
+    );
+    assert!(report.is_ok(), "{report:?}");
+    Ok(())
+}
+
 /// A failed link-count probe must FAIL CLOSED: the heal cannot prove the
 /// inode is exclusive, so it must take the unshare (copy) path as if the file
 /// were shared — and still heal the detached copy, not skip the table or
