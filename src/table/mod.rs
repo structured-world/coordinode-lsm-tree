@@ -1222,6 +1222,14 @@ impl Table {
             ..PatrolScrubReport::default()
         };
 
+        // Serializes heals of THIS table for the whole open/probe/write span:
+        // with two overlapping heals, one can detach the live path while the
+        // other still holds a handle on the OLD inode — whose link count then
+        // reads 1 even though only checkpoint links remain — and the second
+        // heal would write through the snapshot. Taken BEFORE the open so the
+        // probed handle is always the current live inode.
+        let _heal_exclusive = self.heal_lock.lock();
+
         // Excludes a concurrent checkpoint's link window for the whole
         // probe-to-write span: a checkpoint that hard-links this SST between
         // the link-count probe below and a write-back would capture bytes the
@@ -4008,6 +4016,9 @@ impl Table {
                 background_deleter: once_cell::race::OnceBox::new(),
 
                 heal_hints: once_cell::race::OnceBox::new(),
+
+                #[cfg(all(feature = "std", feature = "page_ecc"))]
+                heal_lock: parking_lot::Mutex::new(()),
             }),
             None,
             None,
