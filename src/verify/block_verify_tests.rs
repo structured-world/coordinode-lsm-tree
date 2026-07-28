@@ -1123,6 +1123,68 @@ fn verify_checksum_with_throttle_completes_clean() {
     assert!(report.sst_files_scanned >= 2);
 }
 
+/// Raw sections carry NO per-section checksum (the SFA trailer checksum
+/// covers only the TOC bytes), so the walk must at least STRUCTURALLY
+/// validate `linked_blob_files`: a corrupted count prefix would otherwise
+/// pass the walk clean, and a heal-enabled scrub could restamp the manifest
+/// digest over a broken blob-link list that blob GC / relocation then
+/// misreads.
+#[test]
+fn verify_sst_file_flags_a_corrupt_blob_link_count() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // A KV-separated tree: large values go to a blob file, the SST carries
+    // a linked_blob_files section.
+    let crate::AnyTree::Blob(tree) = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+    .open()
+    .unwrap() else {
+        unreachable!("kv separation configured");
+    };
+    let big = |i: u32| format!("{i:08}").repeat(512);
+    for i in 0u32..10 {
+        tree.insert(format!("key{i:05}"), big(i), u64::from(i) + 1);
+    }
+    tree.flush_active_memtable(10).unwrap();
+    let sst_path = {
+        let binding = tree.index.version_history.read().latest_version();
+        let table = binding
+            .version
+            .iter_tables()
+            .next()
+            .expect("flush produced one table");
+        (*table.path).clone()
+    };
+    drop(tree);
+
+    // Corrupt the section's u32 count prefix: the payload length no longer
+    // matches `4 + count * 32`.
+    let pos = {
+        let mut f = std::fs::File::open(&sst_path).unwrap();
+        let reader = crate::sfa::Reader::from_reader(&mut f).expect("SFA trailer reads");
+        let entry = reader
+            .toc()
+            .iter()
+            .find(|e| e.name() == b"linked_blob_files")
+            .expect("the SST carries a linked_blob_files section");
+        usize::try_from(entry.pos()).expect("section offset fits usize")
+    };
+    let mut bytes = std::fs::read(&sst_path).unwrap();
+    *bytes.get_mut(pos).expect("count prefix within the file") ^= 0xFF;
+    std::fs::write(&sst_path, &bytes).unwrap();
+
+    let report = verify_sst_file_with_fs(&crate::fs::StdFs, &sst_path);
+    assert!(
+        !report.is_ok(),
+        "a corrupt blob-link count must fail the out-of-band walk, not be \
+         skipped as an unchecked raw section: {report:?}",
+    );
+}
+
 #[test]
 fn verify_checksum_with_throttle_does_not_sleep_after_last_sst() {
     // Regression: the throttle is an INTER-SST pause and must not fire after
