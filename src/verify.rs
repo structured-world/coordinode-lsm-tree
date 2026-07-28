@@ -1256,13 +1256,18 @@ const RAW_FORMAT_SECTIONS: &[&[u8]] = &[b"linked_blob_files", b"table_version", 
 ///
 /// This is SHAPE validation only: these sections carry no checksum, so rot
 /// inside a structurally valid payload is undetectable out-of-band.
-#[cfg(feature = "std")]
 fn raw_section_shape_error(
-    reader: &mut (impl std::io::Read + std::io::Seek),
+    reader: &mut io::BufReader<Box<dyn crate::fs::FsFile>>,
     name: &[u8],
     pos: u64,
     len: u64,
 ) -> Option<String> {
+    use alloc::string::ToString as _;
+    #[cfg(not(feature = "std"))]
+    use io::{Read as _, Seek as _, SeekFrom};
+    #[cfg(feature = "std")]
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
     match name {
         b"linked_blob_files" => {
             if len < 4 {
@@ -1270,7 +1275,7 @@ fn raw_section_shape_error(
                     "linked_blob_files section is {len} bytes, too short for its count prefix"
                 ));
             }
-            if let Err(e) = reader.seek(std::io::SeekFrom::Start(pos)) {
+            if let Err(e) = reader.seek(SeekFrom::Start(pos)) {
                 return Some(format!("seek to section start failed: {e}"));
             }
             let mut count_le = [0u8; 4];
