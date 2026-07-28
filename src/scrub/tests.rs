@@ -150,6 +150,101 @@ fn open_kv_checked_tree(dir: &std::path::Path) -> crate::Tree {
     tree
 }
 
+/// The digest reconciliation must not restamp over a `linked_blob_files`
+/// record whose blob id rotted WITHOUT changing the section's shape: the
+/// section carries no per-section checksum, so a flipped id byte passes the
+/// walk's structural validation — only deriving the id set from the table's
+/// own indirection entries can catch it. Restamping would hide a live blob
+/// from GC or point relocation at a nonexistent one.
+#[test]
+fn heal_scrub_does_not_restamp_over_a_forged_blob_link_id() -> crate::Result<()> {
+    // A KV-separated tree: large values go to a blob file, the SST carries
+    // indirections plus a linked_blob_files section.
+    let dir = tempfile::tempdir()?;
+    let sst_path = {
+        let AnyTree::Blob(tree) = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+        .open()?
+        else {
+            unreachable!("kv separation configured");
+        };
+        let big = |i: u32| format!("{i:08}").repeat(512);
+        for i in 0u32..10 {
+            tree.insert(format!("key{i:05}"), big(i), u64::from(i) + 1);
+        }
+        tree.flush_active_memtable(10)?;
+        let binding = tree.index.version_history.read().latest_version();
+        let Some(table) = binding.version.iter_tables().next() else {
+            panic!("flush produced one table");
+        };
+        (*table.path).clone()
+    };
+
+    // Flip one byte INSIDE the first record's blob_file_id: the count and
+    // section length stay valid, so the shape check passes.
+    let pos = {
+        let mut f = std::fs::File::open(&sst_path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader
+            .toc()
+            .iter()
+            .find(|e| e.name() == b"linked_blob_files")
+        else {
+            panic!("the SST carries a linked_blob_files section");
+        };
+        usize::try_from(entry.pos()).expect("section offset fits usize")
+    };
+    let mut bytes = std::fs::read(&sst_path)?;
+    let Some(slot) = bytes.get_mut(pos + 4) else {
+        panic!("first blob id within the file");
+    };
+    *slot ^= 0xFF;
+    std::fs::write(&sst_path, &bytes)?;
+
+    // Heal scan: data blocks read clean, the section is structurally valid,
+    // yet the file digest disagrees with the manifest.
+    let AnyTree::Blob(tree) = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+    .open()?
+    else {
+        unreachable!("kv separation configured");
+    };
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        !report.is_ok(),
+        "a digest mismatch over a forged blob-link id must be a finding, \
+         not silently restamped: {report:?}",
+    );
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| format!("{e:?}").contains("ChecksumRefreshFailed")),
+        "the finding must be the refused digest refresh: {report:?}",
+    );
+
+    // The manifest keeps the ORIGINAL digest, so integrity scans keep
+    // flagging the forged file.
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the forged file must keep failing verify_integrity: restamping its \
+         digest over an unverifiable blob-link list would mask the forgery",
+    );
+    Ok(())
+}
+
 /// The digest reconciliation must not restamp over a STALE per-KV footer
 /// hidden behind a re-stamped block checksum: neither the heal scan nor the
 /// out-of-band section walk decodes entries, so only the per-KV verification
