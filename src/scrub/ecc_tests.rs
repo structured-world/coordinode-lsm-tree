@@ -726,6 +726,51 @@ fn heal_in_place_does_not_mutate_a_hard_linked_checkpoint_inode() -> crate::Resu
     Ok(())
 }
 
+/// After an unshare detaches the live path onto a new inode, the table's
+/// descriptor cache may still hold the OLD inode's fd: a later heal on the
+/// same open tree would then SCRUB the stale inode (clean) while its
+/// re-read and write-back use the live file — a recoverable fault on the
+/// live copy reads as an unexplained checksum mismatch and is reported
+/// uncorrectable without ever attempting ECC recovery. The unshare must
+/// invalidate the cached descriptor.
+#[test]
+fn heal_in_place_rebinds_the_descriptor_cache_after_an_unshare() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst(dir.path());
+
+    // Hard-link the SST so the FIRST heal takes the unshare path.
+    let cp_dir = tempfile::tempdir_in(dir.path().parent().expect("tempdir has a parent"))?;
+    std::fs::hard_link(&sst_path, cp_dir.path().join("checkpoint.sst"))?;
+
+    let tree = open_ecc_tree(dir.path());
+
+    // Prime the descriptor cache with the ORIGINAL inode, then heal (the
+    // unshare renames a private copy over the live path).
+    assert!(tree.get("key-000000", crate::SeqNo::MAX)?.is_some());
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(report.is_ok(), "clean tree heals clean: {report:?}");
+
+    // A recoverable payload fault lands on the LIVE (post-rename) inode.
+    let corrupt_pos = block.offset().0 as usize + Header::MIN_LEN + 3;
+    let mut bytes = std::fs::read(&sst_path)?;
+    let slot = bytes
+        .get_mut(corrupt_pos)
+        .expect("corrupt_pos in range for the SST bytes");
+    *slot ^= 0x80;
+    std::fs::write(&sst_path, &bytes)?;
+
+    // SECOND heal on the SAME open tree: the scrub must see the live inode's
+    // fault as ECC-recoverable, not scrub a stale cached fd clean and then
+    // report the live mismatch as uncorrectable.
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report.blocks_healed_in_place >= 1,
+        "the live fault is ECC-recovered and healed in place: {report:?}",
+    );
+    assert!(report.is_ok(), "{report:?}");
+    Ok(())
+}
+
 /// A failed link-count probe must FAIL CLOSED: the heal cannot prove the
 /// inode is exclusive, so it must take the unshare (copy) path as if the file
 /// were shared — and still heal the detached copy, not skip the table or
