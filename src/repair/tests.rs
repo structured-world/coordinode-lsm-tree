@@ -752,7 +752,7 @@ fn repair_with_salvage_keeps_a_healthy_rt_sst_with_a_forged_tail_meta() -> crate
     }
     // Forge ONLY the tail meta (id 7 → 99 AND an unrecognized ECC
     // descriptor); the MID mirror keeps the true id and descriptor.
-    forge_tail_meta_table_id(&sst, Some(99), true)?;
+    forge_tail_meta_table_id(&sst, Some(99), Some([0u8, 8, 2, 1]))?;
 
     let report = Config::new(
         dir.path(),
@@ -817,7 +817,7 @@ fn repair_with_salvage_keeps_a_healthy_rt_sst_with_a_forged_tail_descriptor_only
     // Forge ONLY the tail meta's ECC descriptor — its table id stays the
     // TRUE 7, so the id cross-check passes; the MID mirror keeps the valid
     // descriptor.
-    forge_tail_meta_table_id(&sst, None, true)?;
+    forge_tail_meta_table_id(&sst, None, Some([0u8, 8, 2, 1]))?;
 
     let report = Config::new(
         dir.path(),
@@ -1164,15 +1164,15 @@ fn repair_with_salvage_rejects_an_unrecognized_ecc_tombstone_sst_with_a_corrupt_
 /// both meta blocks of the SST at `path`, re-stamping each block's checksum
 /// so the frames stay checksum-clean.
 /// Overwrites the TAIL meta copy's `table_id` value with `forged_id` (when
-/// `Some`) and/or, when `forge_ecc_descriptor` is set, its
-/// `descriptor#page_ecc` value with an unrecognized scheme, restamping that
-/// block's checksum and leaving the mirrored `meta_mid` copy intact — the
-/// "only the tail rotted" scenario a normal recovery survives via its
-/// expected-id cross-check + MID fallback.
+/// `Some`) and/or its `descriptor#page_ecc` value with `forge_descriptor`
+/// (when `Some` — an unrecognized OR forged-recognized 4-byte descriptor),
+/// restamping that block's checksum and leaving the mirrored `meta_mid`
+/// copy intact — the "only the tail rotted" scenario a normal recovery
+/// survives via its expected-id cross-check + MID fallback.
 fn forge_tail_meta_table_id(
     path: &std::path::Path,
     forged_id: Option<u64>,
-    forge_ecc_descriptor: bool,
+    forge_descriptor: Option<[u8; 4]>,
 ) -> crate::Result<()> {
     use crate::coding::{Decode, Encode};
     use crate::table::block::Header;
@@ -1224,7 +1224,7 @@ fn forge_tail_meta_table_id(
             value.copy_from_slice(&forged_id.to_le_bytes());
         }
 
-        if forge_ecc_descriptor {
+        if let Some(descriptor) = forge_descriptor {
             let needle = b"descriptor#page_ecc";
             let Some(key_pos) = payload
                 .windows(needle.len())
@@ -1241,7 +1241,7 @@ fn forge_tail_meta_table_id(
             let Some(value) = payload.get_mut(val_at + 1..val_at + 5) else {
                 panic!("descriptor value within the payload");
             };
-            value.copy_from_slice(&[0u8, 8, 2, 1]);
+            value.copy_from_slice(&descriptor);
         }
     }
     let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(
@@ -1336,7 +1336,7 @@ fn repair_with_salvage_preserves_the_file_name_id_over_a_forged_tail_meta_id() -
     std::fs::write(&sst, &bytes)?;
 
     // Forge ONLY the tail meta's table_id (7 → 99); the MID mirror keeps 7.
-    forge_tail_meta_table_id(&sst, Some(99), false)?;
+    forge_tail_meta_table_id(&sst, Some(99), None)?;
 
     let report = Config::new(
         dir.path(),
@@ -1533,6 +1533,61 @@ fn repair_with_salvage_quarantines_a_corrupt_delete_bitmap_sst() -> crate::Resul
     assert!(
         reason.contains("salvage failed") && reason.contains("resurrect"),
         "the reason names the refused delete resurrection, got: {reason}",
+    );
+    Ok(())
+}
+
+/// A tail meta whose ECC descriptor is forged to a DIFFERENT recognized
+/// scheme (here: `Off`) while its table id stays valid must not dictate the
+/// walk's trailer sizing: the probe must arbitrate against the intact MID
+/// mirror, and when two decodable copies disagree, fail safe (skip the
+/// ECC-dependent sections with a warning) instead of mis-walking parity
+/// bytes as block headers and condemning a healthy SST.
+#[test]
+fn verify_probe_distrusts_disagreeing_recognized_ecc_descriptors() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{InternalValue, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("7");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    {
+        let mut w = Writer::new(sst.clone(), 7, 0, Arc::clone(&fs))?
+            .use_ecc(Some(crate::table::block::EccParams::RS_4_2));
+        for i in 0..64u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Forge ONLY the tail descriptor to canonical `Off` (a RECOGNIZED
+    // state); the id stays valid, so the expected-id cross-check passes,
+    // and the MID mirror keeps the true RS descriptor.
+    forge_tail_meta_table_id(&sst, None, Some([0u8, 0, 0, 0]))?;
+
+    let report = crate::verify::verify_sst_file_with_fs(&*fs, &sst);
+    assert!(
+        report.errors.is_empty(),
+        "a healthy SST must not be condemned because one meta copy carries \
+         a forged recognized descriptor — the walk mis-sizes every parity \
+         trailer as a block header: {report:?}",
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| matches!(w, crate::verify::BlockVerifyWarning::UnrecognizedEcc { .. })),
+        "disagreeing decodable descriptors must surface as an \
+         indeterminate-ECC warning: {report:?}",
     );
     Ok(())
 }
