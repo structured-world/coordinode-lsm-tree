@@ -1266,8 +1266,10 @@ fn forge_tail_meta_table_id(
     #[cfg(feature = "page_ecc")]
     {
         let payload_end = payload_range.end;
-        let frame_end =
-            block_off + usize::try_from(section_len).expect("meta section length fits usize");
+        let Ok(section_len) = usize::try_from(section_len) else {
+            panic!("meta section length fits usize");
+        };
+        let frame_end = block_off + section_len;
         if frame_end > payload_end {
             let Some(payload) = bytes.get(payload_range) else {
                 panic!("meta payload within the file");
