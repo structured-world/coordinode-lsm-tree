@@ -1645,6 +1645,43 @@ impl Table {
         Ok(())
     }
 
+    /// Cross-checks the recorded `linked_blob_files` section against the
+    /// blob file ids actually referenced by this table's indirection
+    /// entries. The section carries NO per-section checksum, so
+    /// structurally valid rot (a flipped id byte) is invisible to the
+    /// out-of-band walk — the entries themselves are the only integrity
+    /// source. A no-op (`Ok`) for tables without the section.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when the recorded id set disagrees
+    /// with the derived one; any I/O / decode error from the full scan.
+    #[cfg(feature = "std")]
+    pub(crate) fn verify_blob_links(&self) -> crate::Result<()> {
+        use crate::coding::Decode;
+
+        let Some(recorded) = self.list_blob_file_references()? else {
+            return Ok(());
+        };
+        let mut derived = alloc::collections::BTreeSet::new();
+        for kv in self.scan()? {
+            let kv = kv?;
+            if kv.key.value_type == crate::ValueType::Indirection {
+                let mut cursor = &kv.value[..];
+                let ind = crate::blob_tree::handle::BlobIndirection::decode_from(&mut cursor)?;
+                derived.insert(ind.vhandle.blob_file_id);
+            }
+        }
+        let recorded_ids: alloc::collections::BTreeSet<_> =
+            recorded.iter().map(|l| l.blob_file_id).collect();
+        if derived != recorded_ids {
+            return Err(crate::Error::InvalidHeader(
+                "linked_blob_files disagrees with the table's indirection entries",
+            ));
+        }
+        Ok(())
+    }
+
     /// Loads the filter block (if any) and checks the bloom filter.
     ///
     /// Returns `Ok(BloomResult::Skip)` if the bloom filter says the key is definitely absent

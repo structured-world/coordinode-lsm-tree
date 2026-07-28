@@ -220,6 +220,14 @@ fn block_verify_verdict(
         // recovered descriptor, but an out-of-band unrecognized descriptor
         // already means nothing about the data was verified.)
         BlockVerifyVerdict::Corrupt
+    } else if table.verify_blob_links().is_err() {
+        // Same reasoning for the blob-link list: the section carries no
+        // per-section checksum, so the walk can only validate its SHAPE — a
+        // flipped blob id passes it. Cross-check against the table's own
+        // indirection entries (a no-op without the section); a mismatch is
+        // corruption, and salvage derives the links from the recovered
+        // indirections rather than copying the forged list.
+        BlockVerifyVerdict::Corrupt
     } else if !report.is_ok() {
         // Parity-ONLY rot: every payload checksum verified clean, only the
         // recovery margin is dead. The data is fully readable, so it grades

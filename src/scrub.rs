@@ -441,6 +441,17 @@ fn refresh_healed_checksum(
         ));
     }
 
+    // The `linked_blob_files` section carries no per-section checksum and
+    // the walk can only validate its SHAPE, so a flipped blob id passes it.
+    // Cross-check the recorded ids against the table's own indirection
+    // entries (a no-op without the section) before trusting the digest.
+    if let Err(e) = table.verify_blob_links() {
+        return finding(alloc::format!(
+            "digest mismatch with a blob-link cross-check failure ({e}); \
+             the manifest digest was not refreshed"
+        ));
+    }
+
     match tree.refresh_table_checksum(table.id(), fresh) {
         Ok(()) => None,
         Err(e) => finding(e.to_string()),
