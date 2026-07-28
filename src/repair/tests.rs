@@ -1537,6 +1537,77 @@ fn repair_with_salvage_quarantines_a_corrupt_delete_bitmap_sst() -> crate::Resul
     Ok(())
 }
 
+/// The per-KV gate must run BEFORE the parity-only degradation arm: on a
+/// footer-bearing Page-ECC SST, a stale footer behind a re-stamped block
+/// checksum also leaves the parity trailer mismatched, so the walk reports
+/// ONLY `EccParityMismatch` and the verdict graded the table
+/// `DegradedButReadable` — with range tombstones (which salvage refuses to
+/// re-emit) the keep-decision then rebuilt the manifest around an entry
+/// whose per-KV digest is known stale, instead of quarantining the table
+/// as corrupt.
+#[test]
+fn repair_grades_a_stale_kv_footer_corrupt_over_parity_only_degradation() -> crate::Result<()> {
+    use crate::range_tombstone::RangeTombstone;
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, UserKey, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    // A footer-bearing Page-ECC SST WITH a range tombstone, so salvage
+    // refuses it and the keep-decision path is the one under test.
+    {
+        use crate::runtime_config::{ChecksumAlgorithm, KvChecksumPolicy};
+
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?
+            .use_ecc(Some(crate::table::block::EccParams::RS_4_2))
+            .use_kv_checksums(KvChecksumPolicy::AllLevels, ChecksumAlgorithm::Xxh3_64);
+        for i in 0..8u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        w.write_range_tombstone(RangeTombstone::new(
+            UserKey::from(b"k00002".as_slice()),
+            UserKey::from(b"k00005".as_slice()),
+            2,
+        ));
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Stale footer + re-stamped block checksum: the parity trailer (not
+    // re-stamped) now mismatches too, so the walk reports ONLY
+    // EccParityMismatch while the block checksum reads clean.
+    crate::test_forge::forge_stale_kv_footer(&sst)?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair_with_salvage(true)?;
+
+    // The table is KNOWN corrupt (stale per-KV digest), and salvage cannot
+    // re-emit its range tombstones: it must be quarantined, never kept as a
+    // merely parity-degraded table.
+    assert_eq!(
+        report.recovered, 0,
+        "a stale-footer table must not be kept as parity-only degradation: {report:?}",
+    );
+    assert_eq!(
+        report.unreadable, 1,
+        "the corrupt table lands in quarantine: {report:?}",
+    );
+    Ok(())
+}
+
 /// The repair verdict must not declare a table clean on block checksums
 /// alone: a STALE per-KV footer behind a re-stamped block checksum passes
 /// the out-of-band walk, so repair would record a fresh whole-file digest
