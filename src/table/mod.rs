@@ -1182,6 +1182,12 @@ impl Table {
                 .sync_directory(parent)
                 .map_err(|e| alloc::format!("sync directory after rename: {e}"))?;
         }
+        // The descriptor cache still holds the OLD inode's fd: a later heal
+        // (or read) resolving through it would scrub the detached inode
+        // while writes target the live one, misreporting a live-only fault
+        // as an unexplained (uncorrectable) mismatch. Drop the stale entry
+        // so the next access reopens the live path.
+        self.file_accessor.remove_for_table(&self.global_id());
         // The handle survives the rename (same inode, now the live path).
         Ok(tmp)
     }
