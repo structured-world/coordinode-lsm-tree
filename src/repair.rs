@@ -219,6 +219,14 @@ fn block_verify_verdict(
         // between salvage (a rewrite under fully-verifiable framing) and
         // keeping the table when salvage cannot re-emit it.
         BlockVerifyVerdict::DegradedButReadable
+    } else if table.verify_kv_checksums().is_err() {
+        // The walk verifies raw block checksums but never DECODES entries,
+        // so a stale per-KV footer behind a re-stamped block checksum still
+        // reads clean at the block level. Footer-bearing tables must also
+        // pass the per-KV verification (a no-op without footers) before the
+        // table is declared clean — the salvage row path validates footers
+        // and drops the forged block, so route it there.
+        BlockVerifyVerdict::Corrupt
     } else {
         BlockVerifyVerdict::Clean
     }
