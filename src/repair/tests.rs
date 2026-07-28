@@ -1573,11 +1573,9 @@ fn repair_routes_a_stale_kv_footer_through_salvage() -> crate::Result<()> {
         }
         tree.flush_active_memtable(500)?;
         let binding = tree.version_history.read().latest_version();
-        let table = binding
-            .version
-            .iter_tables()
-            .next()
-            .expect("flush produced one table");
+        let Some(table) = binding.version.iter_tables().next() else {
+            panic!("flush produced one table");
+        };
         (*table.path).clone()
     };
 
@@ -1595,7 +1593,10 @@ fn repair_routes_a_stale_kv_footer_through_salvage() -> crate::Result<()> {
         let Some(entry) = reader.toc().iter().find(|e| e.name() == b"data") else {
             panic!("the SST must carry a data section");
         };
-        usize::try_from(entry.pos()).expect("data offset fits usize")
+        let Ok(off) = usize::try_from(entry.pos()) else {
+            panic!("data offset fits usize");
+        };
+        off
     };
     let Some(block) = bytes.get(block_off..) else {
         panic!("data block within the file");
