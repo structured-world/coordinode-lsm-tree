@@ -360,6 +360,13 @@ fn scan_and_reconcile(
     // restamping would erase the only record of it; skipping also spares
     // every ordinary SST the full-file digest read.
     let heals = options.heal_in_place && table.metadata.ecc_params.is_some();
+    // Serializes same-table heals for the WHOLE scan-to-reconcile span (not
+    // just the scan): with two overlapping heal patrols, A could compute a
+    // digest, B could heal a fresh fault and install its own, and A would
+    // then install the stale one. Also keeps the link-count probe honest
+    // (the probed handle is always the current live inode).
+    #[cfg(feature = "page_ecc")]
+    let _heal_exclusive = heals.then(|| table.heal_lock.lock());
     let _mutation_window = heals
         .then(|| {
             table

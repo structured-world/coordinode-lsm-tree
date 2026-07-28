@@ -223,14 +223,17 @@ pub struct Inner {
     // `no_std` + alloc (see `crate::heal_hints`).
     pub(crate) heal_hints: once_cell::race::OnceBox<Arc<crate::heal_hints::HealHints>>,
 
-    /// Serializes concurrent in-place heal scans of THIS table. Two
-    /// overlapping heals race through the link-count probe: one detaches the
-    /// live path onto a private copy, leaving the other's already-open handle
-    /// on the OLD inode — whose count then reads 1 even though only
-    /// checkpoint links remain, so that heal would write through the
-    /// snapshot. The whole open/probe/write span is exclusive per table.
-    // std+page_ecc: only the in-place heal takes it; `parking_lot` (not
-    // `spin`) because a heal scan is a long blocking operation.
+    /// Serializes concurrent in-place heal passes of THIS table, held by the
+    /// patrol scrub across the WHOLE scan-to-reconcile span. Two overlapping
+    /// heals race in two ways without it: through the link-count probe (one
+    /// detaches the live path onto a private copy, leaving the other's
+    /// already-open handle on the OLD inode — whose count then reads 1 even
+    /// though only checkpoint links remain, so that heal would write through
+    /// the snapshot), and through the digest reconciliation (A computes a
+    /// digest, B heals a fresh fault and installs its own, A installs the
+    /// stale one).
+    // std+page_ecc: only the heal-mode patrol scrub takes it; `parking_lot`
+    // (not `spin`) because a heal pass is a long blocking operation.
     #[cfg(all(feature = "std", feature = "page_ecc"))]
     pub(crate) heal_lock: parking_lot::Mutex<()>,
 }

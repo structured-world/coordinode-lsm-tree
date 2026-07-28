@@ -1228,20 +1228,15 @@ impl Table {
             ..PatrolScrubReport::default()
         };
 
-        // Serializes heals of THIS table for the whole open/probe/write span:
-        // with two overlapping heals, one can detach the live path while the
-        // other still holds a handle on the OLD inode — whose link count then
-        // reads 1 even though only checkpoint links remain — and the second
-        // heal would write through the snapshot. Taken BEFORE the open so the
-        // probed handle is always the current live inode.
-        //
-        // Checkpoint exclusion is NOT taken here: the patrol scrub holds the
-        // `DeletionPause` mutation window across BOTH this scan and the
-        // digest reconciliation that follows it (a checkpoint slipping in
-        // between them would link healed bytes under a stale digest), and a
-        // recursive read of that gate could deadlock against a waiting
-        // checkpoint writer.
-        let _heal_exclusive = self.heal_lock.lock();
+        // NEITHER exclusion is taken here — both are held by the patrol
+        // scrub across this scan AND the digest reconciliation that follows
+        // it, because re-acquiring either inside would deadlock:
+        // - the per-table `heal_lock` (a Mutex) serializes same-table heals
+        //   for the whole scan-to-reconcile span, so one patrol cannot
+        //   install a digest computed before another patrol's heal;
+        // - the `DeletionPause` mutation window excludes a checkpoint's link
+        //   pass for the same span, so a checkpoint cannot link healed bytes
+        //   under a stale digest.
 
         // A single read+write handle for both the recovery read and the
         // write-back, opened directly (not via the read-only descriptor cache) so
