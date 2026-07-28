@@ -429,6 +429,18 @@ fn refresh_healed_checksum(
         );
     }
 
+    // The walk verifies raw block checksums but never DECODES entries, so a
+    // stale per-KV footer behind a re-stamped block checksum still reads
+    // clean at the block level. Footer-bearing tables get the per-KV
+    // verification too before the digest is trusted (a table without
+    // footers makes this a no-op).
+    if let Err(e) = table.verify_kv_checksums() {
+        return finding(alloc::format!(
+            "digest mismatch with a per-KV verification failure ({e}); the \
+             manifest digest was not refreshed"
+        ));
+    }
+
     match tree.refresh_table_checksum(table.id(), fresh) {
         Ok(()) => None,
         Err(e) => finding(e.to_string()),
