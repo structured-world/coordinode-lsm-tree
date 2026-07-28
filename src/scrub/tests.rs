@@ -128,10 +128,12 @@ fn patrol_scrub_parallel_over_many_ssts_visits_every_file() {
     assert!(report.is_ok());
 }
 
-/// Opens a plain (no ECC, no compression) tree whose flushed SSTs carry
-/// per-KV checksum footers.
+/// Opens an uncompressed RS(8,2) Page-ECC tree whose flushed SSTs carry
+/// per-KV checksum footers. ECC because only Page-ECC tables get the
+/// heal-mode digest reconciliation these tests exercise.
+#[cfg(feature = "page_ecc")]
 fn open_kv_checked_tree(dir: &std::path::Path) -> crate::Tree {
-    use crate::runtime_config::KvChecksumPolicy;
+    use crate::runtime_config::{EccScheme, KvChecksumPolicy};
 
     let AnyTree::Standard(tree) = Config::new(
         dir,
@@ -141,6 +143,11 @@ fn open_kv_checked_tree(dir: &std::path::Path) -> crate::Tree {
     .data_block_compression_policy(crate::config::CompressionPolicy::all(
         crate::CompressionType::None,
     ))
+    .page_ecc(true)
+    .ecc_scheme(EccScheme::ReedSolomon {
+        data_shards: 8,
+        parity_shards: 2,
+    })
     .open()
     .expect("open kv-checked tree") else {
         unreachable!("standard tree configured");
@@ -219,10 +226,14 @@ fn heal_scrub_does_not_reconcile_a_non_ecc_table() -> crate::Result<()> {
 /// walk's structural validation — only deriving the id set from the table's
 /// own indirection entries can catch it. Restamping would hide a live blob
 /// from GC or point relocation at a nonexistent one.
+#[cfg(feature = "page_ecc")]
 #[test]
 fn heal_scrub_does_not_restamp_over_a_forged_blob_link_id() -> crate::Result<()> {
-    // A KV-separated tree: large values go to a blob file, the SST carries
-    // indirections plus a linked_blob_files section.
+    use crate::runtime_config::EccScheme;
+
+    // A KV-separated Page-ECC tree: large values go to a blob file, the SST
+    // carries indirections plus a linked_blob_files section (ECC because
+    // only Page-ECC tables get the heal-mode digest reconciliation).
     let dir = tempfile::tempdir()?;
     let sst_path = {
         let AnyTree::Blob(tree) = Config::new(
@@ -231,6 +242,11 @@ fn heal_scrub_does_not_restamp_over_a_forged_blob_link_id() -> crate::Result<()>
             SequenceNumberCounter::default(),
         )
         .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+        .page_ecc(true)
+        .ecc_scheme(EccScheme::ReedSolomon {
+            data_shards: 8,
+            parity_shards: 2,
+        })
         .open()?
         else {
             unreachable!("kv separation configured");
@@ -279,6 +295,11 @@ fn heal_scrub_does_not_restamp_over_a_forged_blob_link_id() -> crate::Result<()>
         SequenceNumberCounter::default(),
     )
     .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+    .page_ecc(true)
+    .ecc_scheme(EccScheme::ReedSolomon {
+        data_shards: 8,
+        parity_shards: 2,
+    })
     .open()?
     else {
         unreachable!("kv separation configured");
@@ -313,6 +334,7 @@ fn heal_scrub_does_not_restamp_over_a_forged_blob_link_id() -> crate::Result<()>
 /// out-of-band section walk decodes entries, so only the per-KV verification
 /// can catch it — without it, `verify_integrity` starts accepting a file
 /// that `verify_kv_checksums` still rejects.
+#[cfg(feature = "page_ecc")]
 #[test]
 fn heal_scrub_does_not_restamp_over_a_stale_kv_footer() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;

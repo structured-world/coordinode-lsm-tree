@@ -352,8 +352,15 @@ fn scan_and_reconcile(
     table: &crate::table::Table,
     options: &PatrolScrubOptions,
 ) -> PatrolScrubReport {
-    let _mutation_window = options
-        .heal_in_place
+    // Only a Page-ECC table can have had its bytes legitimately healed in
+    // place (this pass or an earlier one whose refresh failed), so only
+    // those get the digest reconciliation. On a table WITHOUT ECC a
+    // manifest digest mismatch is real evidence — an in-band alteration
+    // whose block checksums were re-stamped has NO other detector — and
+    // restamping would erase the only record of it; skipping also spares
+    // every ordinary SST the full-file digest read.
+    let heals = options.heal_in_place && table.metadata.ecc_params.is_some();
+    let _mutation_window = heals
         .then(|| {
             table
                 .deletion_pause
@@ -362,7 +369,7 @@ fn scan_and_reconcile(
         })
         .flatten();
     let mut partial = scan_one(table, options);
-    if options.heal_in_place
+    if heals
         && wants_checksum_refresh(&partial)
         && let Some(finding) = refresh_healed_checksum(tree, table)
     {
