@@ -1179,7 +1179,11 @@ fn verify_sst_file_flags_a_corrupt_blob_link_count() {
 
     let report = verify_sst_file_with_fs(&crate::fs::StdFs, &sst_path);
     assert!(
-        !report.is_ok(),
+        report.errors.iter().any(|e| matches!(
+            e,
+            BlockVerifyError::TocCorrupted { section_name, reason, .. }
+                if section_name == b"linked_blob_files" && reason.contains("blob-link count")
+        )),
         "a corrupt blob-link count must fail the out-of-band walk, not be \
          skipped as an unchecked raw section: {report:?}",
     );

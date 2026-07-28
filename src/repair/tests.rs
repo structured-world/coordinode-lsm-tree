@@ -1545,10 +1545,7 @@ fn repair_with_salvage_quarantines_a_corrupt_delete_bitmap_sst() -> crate::Resul
 /// forged block.
 #[test]
 fn repair_routes_a_stale_kv_footer_through_salvage() -> crate::Result<()> {
-    use crate::coding::{Decode, Encode};
     use crate::runtime_config::KvChecksumPolicy;
-    use crate::table::block::Header;
-    use crate::table::block::kv_checksum::FOOTER_TAIL_LEN;
     use crate::{AbstractTree, Config, SequenceNumberCounter};
 
     let dir = tempfile::tempdir()?;
@@ -1579,57 +1576,9 @@ fn repair_routes_a_stale_kv_footer_through_salvage() -> crate::Result<()> {
         (*table.path).clone()
     };
 
-    // Forge a stale footer: flip one digest byte inside the footer's
-    // checksum array of the FIRST data block, then re-stamp the block
-    // header checksum over the altered payload so the block-level walk
-    // reads clean.
-    let mut bytes = std::fs::read(&sst_path)?;
-    let block_off = {
-        let mut f = std::fs::File::open(&sst_path)?;
-        let reader = match crate::sfa::Reader::from_reader(&mut f) {
-            Ok(r) => r,
-            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
-        };
-        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"data") else {
-            panic!("the SST must carry a data section");
-        };
-        let Ok(off) = usize::try_from(entry.pos()) else {
-            panic!("data offset fits usize");
-        };
-        off
-    };
-    let Some(block) = bytes.get(block_off..) else {
-        panic!("data block within the file");
-    };
-    let mut cursor = block;
-    let header = Header::decode_from(&mut cursor)?;
-    let header_len = Header::header_len(header.block_type);
-    let payload_range =
-        block_off + header_len..block_off + header_len + header.data_length as usize;
-    {
-        let Some(payload) = bytes.get_mut(payload_range.clone()) else {
-            panic!("data payload within the file");
-        };
-        let digest_end = payload.len() - FOOTER_TAIL_LEN;
-        let Some(slot) = payload.get_mut(digest_end - 1) else {
-            panic!("digest array within the payload");
-        };
-        *slot ^= 0xFF;
-    }
-    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(
-        bytes.get(payload_range).unwrap_or(&[]),
-    ));
-    let new_header = Header {
-        checksum: new_checksum,
-        ..header
-    };
-    let mut hdr_bytes = Vec::with_capacity(header_len);
-    new_header.encode_into(&mut hdr_bytes)?;
-    let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
-        panic!("data header within the file");
-    };
-    hdr_dst.copy_from_slice(&hdr_bytes);
-    std::fs::write(&sst_path, &bytes)?;
+    // Forge a stale footer behind a re-stamped block checksum so the
+    // block-level walk reads clean while per-KV verification rejects it.
+    crate::test_forge::forge_stale_kv_footer(&sst_path)?;
 
     // Repair with salvage: the verdict must route the table through
     // salvage (which drops the forged block) instead of recording a fresh

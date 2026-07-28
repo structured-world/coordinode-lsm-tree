@@ -150,71 +150,6 @@ fn open_kv_checked_tree(dir: &std::path::Path) -> crate::Tree {
     tree
 }
 
-/// Forges a STALE per-KV footer behind a RE-STAMPED block checksum in the
-/// first data block of the SST at `path`: flips one digest byte inside the
-/// footer's checksum array, then recomputes the block header checksum over
-/// the altered payload. Block-level verification then reads clean while
-/// per-KV verification still detects the mismatch.
-fn forge_stale_kv_footer(path: &std::path::Path) -> crate::Result<()> {
-    use crate::coding::{Decode, Encode};
-    use crate::table::block::Header;
-    use crate::table::block::kv_checksum::FOOTER_TAIL_LEN;
-
-    let mut bytes = std::fs::read(path)?;
-    // The data section is the first SFA section, so the first data block
-    // starts at its position.
-    let block_off = {
-        let mut f = std::fs::File::open(path)?;
-        let reader = match crate::sfa::Reader::from_reader(&mut f) {
-            Ok(r) => r,
-            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
-        };
-        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"data") else {
-            panic!("the SST must carry a data section");
-        };
-        usize::try_from(entry.pos()).expect("data offset fits usize")
-    };
-    let Some(block) = bytes.get(block_off..) else {
-        panic!("data block within the file");
-    };
-    let mut cursor = block;
-    let header = Header::decode_from(&mut cursor)?;
-    let header_len = Header::header_len(header.block_type);
-    let payload_range =
-        block_off + header_len..block_off + header_len + header.data_length as usize;
-
-    // Flip the LAST byte of the digest array (just before the fixed
-    // algo+count tail), leaving the footer structurally intact.
-    {
-        let Some(payload) = bytes.get_mut(payload_range.clone()) else {
-            panic!("data payload within the file");
-        };
-        let digest_end = payload.len() - FOOTER_TAIL_LEN;
-        let Some(slot) = payload.get_mut(digest_end - 1) else {
-            panic!("digest array within the payload");
-        };
-        *slot ^= 0xFF;
-    }
-
-    // Re-stamp the block header checksum over the altered payload so the
-    // block-level walk reads clean.
-    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(
-        bytes.get(payload_range).unwrap_or(&[]),
-    ));
-    let new_header = Header {
-        checksum: new_checksum,
-        ..header
-    };
-    let mut hdr_bytes = Vec::with_capacity(header_len);
-    new_header.encode_into(&mut hdr_bytes)?;
-    let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
-        panic!("data header within the file");
-    };
-    hdr_dst.copy_from_slice(&hdr_bytes);
-    std::fs::write(path, &bytes)?;
-    Ok(())
-}
-
 /// The digest reconciliation must not restamp over a STALE per-KV footer
 /// hidden behind a re-stamped block checksum: neither the heal scan nor the
 /// out-of-band section walk decodes entries, so only the per-KV verification
@@ -238,7 +173,7 @@ fn heal_scrub_does_not_restamp_over_a_stale_kv_footer() -> crate::Result<()> {
         (*table.path).clone()
     };
 
-    forge_stale_kv_footer(&sst_path)?;
+    crate::test_forge::forge_stale_kv_footer(&sst_path)?;
 
     // Heal scan: block checksums read clean (re-stamped), yet the file
     // digest disagrees with the manifest.
