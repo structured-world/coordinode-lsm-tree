@@ -157,6 +157,100 @@ fn open_kv_checked_tree(dir: &std::path::Path) -> crate::Tree {
     tree
 }
 
+/// The blob-link cross-check must compare the COMPLETE accounting records,
+/// not just the id set: a record whose `bytes` counter rotted (ids intact)
+/// feeds `Version::with_dropped` fragmentation math, and a forged total can
+/// make `BlobFile::is_dead` prune a blob another table still references.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn heal_scrub_does_not_restamp_over_forged_blob_link_accounting() -> crate::Result<()> {
+    use crate::runtime_config::EccScheme;
+
+    let dir = tempfile::tempdir()?;
+    let sst_path = {
+        let AnyTree::Blob(tree) = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+        .page_ecc(true)
+        .ecc_scheme(EccScheme::ReedSolomon {
+            data_shards: 8,
+            parity_shards: 2,
+        })
+        .open()?
+        else {
+            unreachable!("kv separation configured");
+        };
+        let big = |i: u32| format!("{i:08}").repeat(512);
+        for i in 0u32..10 {
+            tree.insert(format!("key{i:05}"), big(i), u64::from(i) + 1);
+        }
+        tree.flush_active_memtable(10)?;
+        let binding = tree.index.version_history.read().latest_version();
+        let Some(table) = binding.version.iter_tables().next() else {
+            panic!("flush produced one table");
+        };
+        (*table.path).clone()
+    };
+
+    // Flip one byte inside the first record's `bytes` counter (record
+    // layout: id u64 | len u64 | bytes u64 | on_disk_bytes u64 after the
+    // u32 count): every id stays intact, the shape stays valid.
+    let pos = {
+        let mut f = std::fs::File::open(&sst_path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader
+            .toc()
+            .iter()
+            .find(|e| e.name() == b"linked_blob_files")
+        else {
+            panic!("the SST carries a linked_blob_files section");
+        };
+        usize::try_from(entry.pos()).expect("section offset fits usize")
+    };
+    let mut bytes = std::fs::read(&sst_path)?;
+    let Some(slot) = bytes.get_mut(pos + 4 + 16) else {
+        panic!("first record's bytes counter within the file");
+    };
+    *slot ^= 0xFF;
+    std::fs::write(&sst_path, &bytes)?;
+
+    let AnyTree::Blob(tree) = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+    .page_ecc(true)
+    .ecc_scheme(EccScheme::ReedSolomon {
+        data_shards: 8,
+        parity_shards: 2,
+    })
+    .open()?
+    else {
+        unreachable!("kv separation configured");
+    };
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| format!("{e:?}").contains("ChecksumRefreshFailed")),
+        "forged blob-link accounting must refuse the digest refresh: {report:?}",
+    );
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the forged accounting must keep failing verify_integrity",
+    );
+    Ok(())
+}
+
 /// A heal-mode scrub must NEVER reconcile the digest of a table WITHOUT
 /// Page-ECC: nothing can have legitimately healed its bytes in place, so a
 /// manifest-level digest mismatch on such a table is real evidence — an
