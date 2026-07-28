@@ -640,11 +640,11 @@ fn scan_one_table(table: &crate::table::Table) -> BlockVerifyReport {
 /// Pipeline per SST:
 ///
 /// 1. Open the file and parse the SFA trailer to obtain the TOC.
-/// 2. For each TOC section, skip if its name is in `RAW_FORMAT_SECTIONS`
-///    (those payloads are not `Header`-prefixed and are covered by the
-///    SFA-trailer checksum). Otherwise seek to the section's start
-///    offset and walk it as a contiguous block region in
-///    `[start, start + length)`.
+/// 2. For each TOC section, if its name is in `RAW_FORMAT_SECTIONS` (those
+///    payloads are not `Header`-prefixed and carry no per-section checksum)
+///    validate its structural shape instead of walking blocks. Otherwise
+///    seek to the section's start offset and walk it as a contiguous block
+///    region in `[start, start + length)`.
 /// 3. Inside each block region, decode each block's `Header` (which
 ///    validates the header's own XXH3), read the data segment, and
 ///    compare a fresh XXH3 over the data against `header.checksum`.
@@ -1123,12 +1123,13 @@ fn scan_sst_blocks(
     //   - `meta`              : block-format (metadata, authoritative)
     //
     // Block-format sections are walked block-by-block (each block
-    // prefixed with the standard `Header`). Raw-format sections are
-    // skipped — their integrity is covered by the SFA-trailer
-    // checksum verified at table-open time. New section names default
-    // to "walk" (must be added to `RAW_FORMAT_SECTIONS` if they're
-    // raw), so a forgotten-to-handle section fails loud rather than
-    // silently passing a corruption.
+    // prefixed with the standard `Header`). Raw-format sections carry
+    // NO per-section checksum (the SFA-trailer checksum covers only
+    // the TOC bytes), so they get structural shape validation via
+    // `raw_section_shape_error` instead of a block walk. New section
+    // names default to "walk" (must be added to `RAW_FORMAT_SECTIONS`
+    // if they're raw), so a forgotten-to-handle section fails loud
+    // rather than silently passing a corruption.
 
     let mut reader = BufReader::with_capacity(64 * 1024, file);
     let mut blocks_scanned: usize = 0;
@@ -1145,6 +1146,24 @@ fn scan_sst_blocks(
 
     for entry in toc.iter() {
         if RAW_FORMAT_SECTIONS.contains(&entry.name()) {
+            // Raw sections carry NO per-section checksum (the SFA trailer
+            // checksum covers only the TOC bytes), so validate their SHAPE
+            // where one is defined; a heal-enabled scrub relies on this walk
+            // before restamping the manifest digest, and skipping a broken
+            // blob-link list would launder it. Rot INSIDE a structurally
+            // valid payload (a flipped id byte) remains undetectable here —
+            // these sections have no integrity bytes to check against.
+            if let Some(reason) =
+                raw_section_shape_error(&mut reader, entry.name(), entry.pos(), entry.len())
+            {
+                errors.push(BlockVerifyError::TocCorrupted {
+                    table_id,
+                    path: path.to_path_buf(),
+                    section_name: entry.name().to_vec(),
+                    section_offset: entry.pos(),
+                    reason,
+                });
+            }
             continue;
         }
         let start = entry.pos();
@@ -1209,13 +1228,14 @@ fn scan_sst_blocks(
 }
 
 /// SFA TOC section names whose payload is NOT a sequence of `Block`s
-/// (i.e. NOT prefixed with the standard `Header`). The scrub skips
-/// these sections — their integrity is covered by the SFA-trailer
-/// checksum verified at table-open time. Every other section
-/// (`data` / `tli` / `tli_tail` / `index` / `filter_tli` / `filter` /
-/// `range_tombstones` / `meta` / `meta_mid`) is a `Header`-prefixed
-/// block run and gets walked. See `scan_sst_blocks` for the full
-/// section catalogue and the writer-side source of truth.
+/// (i.e. NOT prefixed with the standard `Header`). These sections carry NO
+/// per-section checksum (the SFA-trailer checksum covers only the TOC
+/// bytes), so the walk validates their SHAPE via
+/// [`raw_section_shape_error`] instead of decoding blocks. Every other
+/// section (`data` / `tli` / `tli_tail` / `index` / `filter_tli` /
+/// `filter` / `range_tombstones` / `meta` / `meta_mid`) is a
+/// `Header`-prefixed block run and gets walked. See `scan_sst_blocks` for
+/// the full section catalogue and the writer-side source of truth.
 ///
 /// `meta_separator` is the 4 KiB zero-padding section the writer
 /// emits between the MID and TAIL meta blocks so a single bad
@@ -1224,6 +1244,60 @@ fn scan_sst_blocks(
 /// to decode zeros as a `Header` and report a spurious
 /// `HeaderCorrupted` on every clean SST.
 const RAW_FORMAT_SECTIONS: &[&[u8]] = &[b"linked_blob_files", b"table_version", b"meta_separator"];
+
+/// Structural validation for the raw (non-block-format) sections; returns a
+/// human-readable reason when the section's payload cannot have the shape
+/// the writer emits.
+///
+/// - `linked_blob_files`: `u32 count` followed by `count` fixed 32-byte
+///   records — the length must be exactly `4 + count * 32`.
+/// - `table_version`: exactly one byte.
+/// - `meta_separator`: pure padding, any content is acceptable.
+///
+/// This is SHAPE validation only: these sections carry no checksum, so rot
+/// inside a structurally valid payload is undetectable out-of-band.
+#[cfg(feature = "std")]
+fn raw_section_shape_error(
+    reader: &mut (impl std::io::Read + std::io::Seek),
+    name: &[u8],
+    pos: u64,
+    len: u64,
+) -> Option<String> {
+    match name {
+        b"linked_blob_files" => {
+            if len < 4 {
+                return Some(format!(
+                    "linked_blob_files section is {len} bytes, too short for its count prefix"
+                ));
+            }
+            if let Err(e) = reader.seek(std::io::SeekFrom::Start(pos)) {
+                return Some(format!("seek to section start failed: {e}"));
+            }
+            let mut count_le = [0u8; 4];
+            if let Err(e) = reader.read_exact(&mut count_le) {
+                return Some(format!("reading the blob-link count failed: {e}"));
+            }
+            let count = u64::from(u32::from_le_bytes(count_le));
+            // 4 fixed u64 fields per record.
+            let expected = count
+                .checked_mul(32)
+                .and_then(|records| records.checked_add(4));
+            if expected != Some(len) {
+                return Some(format!(
+                    "blob-link count {count} disagrees with the section length {len} \
+                     (expected {} bytes)",
+                    expected.map_or_else(|| "overflowing".to_string(), |e| e.to_string()),
+                ));
+            }
+            None
+        }
+        b"table_version" => {
+            (len != 1).then(|| format!("table_version section is {len} bytes, expected 1"))
+        }
+        // Padding: carries no data, nothing to validate.
+        _ => None,
+    }
+}
 
 /// Plaintext upper bound on a single block's on-disk data segment
 /// length, mirroring `table::block::MAX_DECOMPRESSION_SIZE` (256 MiB).
