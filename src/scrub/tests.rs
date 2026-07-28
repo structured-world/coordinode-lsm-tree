@@ -150,6 +150,69 @@ fn open_kv_checked_tree(dir: &std::path::Path) -> crate::Tree {
     tree
 }
 
+/// A heal-mode scrub must NEVER reconcile the digest of a table WITHOUT
+/// Page-ECC: nothing can have legitimately healed its bytes in place, so a
+/// manifest-level digest mismatch on such a table is real evidence — an
+/// in-band alteration whose block checksums were re-stamped has NO other
+/// detector (no parity, no footers), and restamping the manifest digest
+/// would erase the only record of it. It also spares every ordinary SST
+/// the full-file digest read.
+#[test]
+fn heal_scrub_does_not_reconcile_a_non_ecc_table() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sst_path = {
+        let AnyTree::Standard(tree) = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_compression_policy(crate::config::CompressionPolicy::all(
+            crate::CompressionType::None,
+        ))
+        .open()?
+        else {
+            unreachable!("standard tree configured");
+        };
+        for i in 0u64..500 {
+            tree.insert(format!("key-{i:06}"), format!("v{i:06}"), i);
+        }
+        tree.flush_active_memtable(500)?;
+        let binding = tree.version_history.read().latest_version();
+        let Some(table) = binding.version.iter_tables().next() else {
+            panic!("flush produced one table");
+        };
+        (*table.path).clone()
+    };
+
+    // In-band alteration with a re-stamped block checksum: every frame reads
+    // internally valid, only the manifest digest disagrees.
+    crate::test_forge::forge_restamped_data_block(&sst_path)?;
+
+    let AnyTree::Standard(tree) = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_compression_policy(crate::config::CompressionPolicy::all(
+        crate::CompressionType::None,
+    ))
+    .open()?
+    else {
+        unreachable!("standard tree configured");
+    };
+    let _report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+
+    // The manifest keeps the ORIGINAL digest: on a non-ECC table it is the
+    // ONLY detector of a re-stamped in-band alteration.
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "a non-ECC table's digest mismatch must survive a heal scrub: \
+         restamping it would erase the only record of the alteration",
+    );
+    Ok(())
+}
+
 /// The digest reconciliation must not restamp over a `linked_blob_files`
 /// record whose blob id rotted WITHOUT changing the section's shape: the
 /// section carries no per-section checksum, so a flipped id byte passes the

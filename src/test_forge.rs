@@ -22,9 +22,30 @@
 // stays crate-internal either way and clippy::redundant_pub_crate fires on
 // the doubled restriction.
 pub fn forge_stale_kv_footer(path: &std::path::Path) -> crate::Result<()> {
+    use crate::table::block::kv_checksum::FOOTER_TAIL_LEN;
+    // The LAST byte of the digest array, just before the fixed algo+count
+    // tail — the footer stays structurally intact.
+    flip_and_restamp_first_data_block(path, FOOTER_TAIL_LEN + 1)
+}
+
+/// Flips the LAST payload byte of the first data block and re-stamps the
+/// block header checksum: the frame reads internally valid while its bytes
+/// no longer match what the manifest digest was computed over. For an
+/// uncompressed, footer-less SST this models an in-band alteration only the
+/// manifest-level digest can catch.
+pub fn forge_restamped_data_block(path: &std::path::Path) -> crate::Result<()> {
+    flip_and_restamp_first_data_block(path, 1)
+}
+
+/// Shared core: flips `payload[len - flip_from_end]` of the FIRST data
+/// block of the SST at `path`, then recomputes the block header checksum
+/// over the altered payload so block-level verification reads clean.
+fn flip_and_restamp_first_data_block(
+    path: &std::path::Path,
+    flip_from_end: usize,
+) -> crate::Result<()> {
     use crate::coding::{Decode, Encode};
     use crate::table::block::Header;
-    use crate::table::block::kv_checksum::FOOTER_TAIL_LEN;
 
     let mut bytes = std::fs::read(path)?;
     // The data section is the first SFA section, so the first data block
@@ -49,15 +70,13 @@ pub fn forge_stale_kv_footer(path: &std::path::Path) -> crate::Result<()> {
     let payload_range =
         block_off + header_len..block_off + header_len + header.data_length as usize;
 
-    // Flip the LAST byte of the digest array (just before the fixed
-    // algo+count tail), leaving the footer structurally intact.
     {
         let Some(payload) = bytes.get_mut(payload_range.clone()) else {
             panic!("data payload within the file");
         };
-        let digest_end = payload.len() - FOOTER_TAIL_LEN;
-        let Some(slot) = payload.get_mut(digest_end - 1) else {
-            panic!("digest array within the payload");
+        let flip_at = payload.len() - flip_from_end;
+        let Some(slot) = payload.get_mut(flip_at) else {
+            panic!("flip offset within the payload");
         };
         *slot ^= 0xFF;
     }
