@@ -206,6 +206,20 @@ fn block_verify_verdict(
         // self-describing meta blocks must not mask the skipped data /
         // index sections.
         BlockVerifyVerdict::DegradedUnscanned
+    } else if table.verify_kv_checksums().is_err() {
+        // The walk verifies raw block checksums but never DECODES entries,
+        // so a stale per-KV footer behind a re-stamped block checksum still
+        // reads clean at the block level. Footer-bearing tables must pass
+        // the per-KV verification (a no-op without footers) BEFORE the
+        // degradation arms below: a forged footer also leaves the parity
+        // trailer mismatched, and grading that "parity-only degradation"
+        // would let the keep-decision retain a table with a KNOWN-stale
+        // entry digest. The salvage row path validates footers and drops
+        // the forged block, so route it there. (Runs after the
+        // unrecognized-ECC arm: the live table opened under its OWN
+        // recovered descriptor, but an out-of-band unrecognized descriptor
+        // already means nothing about the data was verified.)
+        BlockVerifyVerdict::Corrupt
     } else if !report.is_ok() {
         // Parity-ONLY rot: every payload checksum verified clean, only the
         // recovery margin is dead. The data is fully readable, so it grades
@@ -219,14 +233,6 @@ fn block_verify_verdict(
         // between salvage (a rewrite under fully-verifiable framing) and
         // keeping the table when salvage cannot re-emit it.
         BlockVerifyVerdict::DegradedButReadable
-    } else if table.verify_kv_checksums().is_err() {
-        // The walk verifies raw block checksums but never DECODES entries,
-        // so a stale per-KV footer behind a re-stamped block checksum still
-        // reads clean at the block level. Footer-bearing tables must also
-        // pass the per-KV verification (a no-op without footers) before the
-        // table is declared clean — the salvage row path validates footers
-        // and drops the forged block, so route it there.
-        BlockVerifyVerdict::Corrupt
     } else {
         BlockVerifyVerdict::Clean
     }
