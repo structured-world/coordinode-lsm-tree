@@ -1178,7 +1178,7 @@ fn forge_tail_meta_table_id(
     use crate::table::block::Header;
 
     let mut bytes = std::fs::read(path)?;
-    let pos = {
+    let (pos, section_len) = {
         let mut f = std::fs::File::open(path)?;
         let reader = match crate::sfa::Reader::from_reader(&mut f) {
             Ok(r) => r,
@@ -1187,7 +1187,7 @@ fn forge_tail_meta_table_id(
         let Some(entry) = reader.toc().iter().find(|e| e.name() == b"meta") else {
             panic!("the SST must carry a meta section");
         };
-        entry.pos()
+        (entry.pos(), entry.len())
     };
     let block_off = usize::try_from(pos).unwrap_or(usize::MAX);
     let Some(block) = bytes.get(block_off..) else {
@@ -1244,9 +1244,10 @@ fn forge_tail_meta_table_id(
             value.copy_from_slice(&descriptor);
         }
     }
-    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(
-        bytes.get(payload_range).unwrap_or(&[]),
-    ));
+    let Some(payload) = bytes.get(payload_range.clone()) else {
+        panic!("meta payload within the file");
+    };
+    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(payload));
     let new_header = Header {
         checksum: new_checksum,
         ..header
@@ -1257,6 +1258,35 @@ fn forge_tail_meta_table_id(
         panic!("meta header within the file");
     };
     hdr_dst.copy_from_slice(&hdr_bytes);
+
+    // A parity-bearing meta frame (self-describing blocks always use the
+    // fixed RS(4,2) layout) must have its trailer recomputed over the
+    // forged payload, or the walk would flag the forge ITSELF as parity
+    // rot and mask what a test actually exercises.
+    #[cfg(feature = "page_ecc")]
+    {
+        let payload_end = payload_range.end;
+        let frame_end =
+            block_off + usize::try_from(section_len).expect("meta section length fits usize");
+        if frame_end > payload_end {
+            let Some(payload) = bytes.get(payload_range) else {
+                panic!("meta payload within the file");
+            };
+            let parity = crate::ecc::encode_parity(payload, 4, 2)?;
+            assert_eq!(
+                frame_end - payload_end,
+                parity.len(),
+                "the meta frame's trailer length matches the fixed RS(4,2) layout",
+            );
+            let Some(dst) = bytes.get_mut(payload_end..frame_end) else {
+                panic!("meta parity trailer within the file");
+            };
+            dst.copy_from_slice(&parity);
+        }
+    }
+    #[cfg(not(feature = "page_ecc"))]
+    let _ = section_len;
+
     std::fs::write(path, &bytes)?;
     Ok(())
 }
@@ -1543,6 +1573,7 @@ fn repair_with_salvage_quarantines_a_corrupt_delete_bitmap_sst() -> crate::Resul
 /// mirror, and when two decodable copies disagree, fail safe (skip the
 /// ECC-dependent sections with a warning) instead of mis-walking parity
 /// bytes as block headers and condemning a healthy SST.
+#[cfg(feature = "page_ecc")]
 #[test]
 fn verify_probe_distrusts_disagreeing_recognized_ecc_descriptors() -> crate::Result<()> {
     use crate::table::Writer;
@@ -1600,6 +1631,7 @@ fn verify_probe_distrusts_disagreeing_recognized_ecc_descriptors() -> crate::Res
 /// re-emit) the keep-decision then rebuilt the manifest around an entry
 /// whose per-KV digest is known stale, instead of quarantining the table
 /// as corrupt.
+#[cfg(feature = "page_ecc")]
 #[test]
 fn repair_grades_a_stale_kv_footer_corrupt_over_parity_only_degradation() -> crate::Result<()> {
     use crate::range_tombstone::RangeTombstone;

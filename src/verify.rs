@@ -957,6 +957,9 @@ pub(crate) fn verify_sst_file_with_context(
 }
 
 /// Per-SST ECC state as seen by the out-of-band scrub.
+// `PartialEq` + `Copy`: the probe compares the states decoded from the two
+// meta copies to arbitrate a forged descriptor.
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg(feature = "std")]
 enum ScrubEcc {
     /// ECC off — no parity trailer to skip.
@@ -996,9 +999,17 @@ fn read_ecc_params_out_of_band(
     let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let toc = sfa_reader.toc();
-    // Tail `meta` is authoritative; `meta_mid` is the early mirror written so a
-    // single corrupt meta block doesn't lose the per-SST descriptor.
+    // Tail `meta` is authoritative for CONTENT; for the ECC descriptor the
+    // two copies ARBITRATE each other: a single forged copy (its table id
+    // intact, so the cross-check passes) must not dictate the walk's trailer
+    // sizing, whether the forge decodes to an unrecognized value or to a
+    // DIFFERENT recognized state (a forged `Off` would make the walk read
+    // parity bytes as block headers and condemn a healthy SST). Both copies
+    // are read; when two decodable copies disagree in ANY way the probe
+    // fails safe with `Unrecognized` (skip the ECC-dependent sections with a
+    // warning) — nothing out-of-band can tell which copy is legitimate.
     let mut unrecognized_seen = false;
+    let mut recognized: Vec<ScrubEcc> = Vec::new();
     for name in [b"meta".as_slice(), b"meta_mid".as_slice()] {
         let Some((pos, len)) = toc.section(name).map(|e| (e.pos(), e.len())) else {
             continue;
@@ -1029,30 +1040,28 @@ fn read_ecc_params_out_of_band(
             encryption,
         ) {
             if meta.ecc_unrecognized {
-                // A copy that decodes but carries an UNRECOGNIZED descriptor
-                // must not end the probe: a descriptor-only forge in the tail
-                // (its table id intact, so the cross-check passes) would
-                // otherwise condemn a healthy table whose MID mirror still
-                // holds the valid descriptor. Remember it and try the mirror;
-                // only when EVERY decodable copy agrees is the scheme
-                // genuinely unrecognized. (A forge TO a recognized scheme is
-                // not detectable this way — nothing distinguishes it from a
-                // legitimate descriptor without cross-copy arbitration.)
                 unrecognized_seen = true;
                 continue;
             }
-            let state = if let Some(params) = meta.ecc_params {
+            recognized.push(if let Some(params) = meta.ecc_params {
                 ScrubEcc::Scheme(params)
             } else {
                 ScrubEcc::Off
-            };
-            return Ok(Some(state));
+            });
         }
     }
-    Ok(if unrecognized_seen {
-        Some(ScrubEcc::Unrecognized)
-    } else {
-        None
+    Ok(match recognized.as_slice() {
+        // Two decodable copies that agree: trustworthy.
+        [a, b] if a == b => Some(*a),
+        // Two decodable copies that DISAGREE: one is forged/rotted and the
+        // probe cannot tell which — fail safe.
+        [_, _] => Some(ScrubEcc::Unrecognized),
+        // One decodable recognized copy: a lone unrecognized sibling does
+        // not override it (a descriptor-only forge must not condemn a
+        // healthy table whose mirror still holds the valid descriptor).
+        [one] => Some(*one),
+        [] if unrecognized_seen => Some(ScrubEcc::Unrecognized),
+        [..] => None,
     })
 }
 
