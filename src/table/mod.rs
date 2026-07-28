@@ -1645,35 +1645,58 @@ impl Table {
     }
 
     /// Cross-checks the recorded `linked_blob_files` section against the
-    /// blob file ids actually referenced by this table's indirection
-    /// entries. The section carries NO per-section checksum, so
-    /// structurally valid rot (a flipped id byte) is invisible to the
-    /// out-of-band walk — the entries themselves are the only integrity
-    /// source. A no-op (`Ok`) for tables without the section.
+    /// COMPLETE accounting derived from this table's indirection entries
+    /// (per blob id: reference count, logical bytes, on-disk bytes). The
+    /// section carries NO per-section checksum, so structurally valid rot —
+    /// a flipped id byte OR a flipped counter byte — is invisible to the
+    /// out-of-band walk; the entries themselves are the only integrity
+    /// source, and the counters feed fragmentation math (a forged total can
+    /// make a blob file look dead while another table still references it).
+    /// Duplicate records for one id are rejected too. A no-op (`Ok`) for
+    /// tables without the section.
     ///
     /// # Errors
     ///
-    /// [`crate::Error::InvalidHeader`] when the recorded id set disagrees
-    /// with the derived one; any I/O / decode error from the full scan.
+    /// [`crate::Error::InvalidHeader`] when the recorded records disagree
+    /// with the derived ones; any I/O / decode error from the full scan.
     #[cfg(feature = "std")]
     pub(crate) fn verify_blob_links(&self) -> crate::Result<()> {
         use crate::coding::Decode;
+        use alloc::collections::BTreeMap;
 
         let Some(recorded) = self.list_blob_file_references()? else {
             return Ok(());
         };
-        let mut derived = alloc::collections::BTreeSet::new();
+        // (len, bytes, on_disk_bytes) per blob id, accumulated exactly the
+        // way the writer folds them from indirections.
+        let mut derived: BTreeMap<crate::vlog::BlobFileId, (usize, u64, u64)> = BTreeMap::new();
         for kv in self.scan()? {
             let kv = kv?;
             if kv.key.value_type == crate::ValueType::Indirection {
                 let mut cursor = &kv.value[..];
                 let ind = crate::blob_tree::handle::BlobIndirection::decode_from(&mut cursor)?;
-                derived.insert(ind.vhandle.blob_file_id);
+                let slot = derived.entry(ind.vhandle.blob_file_id).or_insert((0, 0, 0));
+                slot.0 += 1;
+                slot.1 += u64::from(ind.size);
+                slot.2 += u64::from(ind.vhandle.on_disk_size);
             }
         }
-        let recorded_ids: alloc::collections::BTreeSet<_> =
-            recorded.iter().map(|l| l.blob_file_id).collect();
-        if derived != recorded_ids {
+        let mut recorded_map: BTreeMap<crate::vlog::BlobFileId, (usize, u64, u64)> =
+            BTreeMap::new();
+        for link in &recorded {
+            if recorded_map
+                .insert(
+                    link.blob_file_id,
+                    (link.len, link.bytes, link.on_disk_bytes),
+                )
+                .is_some()
+            {
+                return Err(crate::Error::InvalidHeader(
+                    "linked_blob_files carries duplicate records for one blob id",
+                ));
+            }
+        }
+        if derived != recorded_map {
             return Err(crate::Error::InvalidHeader(
                 "linked_blob_files disagrees with the table's indirection entries",
             ));
