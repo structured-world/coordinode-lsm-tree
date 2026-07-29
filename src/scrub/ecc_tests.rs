@@ -785,7 +785,10 @@ fn heal_in_place_rebinds_the_descriptor_cache_when_the_directory_sync_fails() ->
     let dir = tempfile::tempdir()?;
     let (sst_path, block) = write_ecc_sst(dir.path());
 
-    // Hard-link the SST so the FIRST heal takes the unshare path.
+    // Rot one parity-trailer byte (the unshare only runs before the first
+    // write-back), then hard-link the SST so the FIRST heal takes the
+    // unshare path.
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
     let cp_dir = tempfile::tempdir_in(dir.path().parent().expect("tempdir has a parent"))?;
     std::fs::hard_link(&sst_path, cp_dir.path().join("checkpoint.sst"))?;
 
@@ -910,9 +913,12 @@ fn heal_in_place_cleans_up_the_temp_copy_when_the_unshare_fails() -> crate::Resu
     use crate::io::ErrorKind;
 
     let dir = tempfile::tempdir()?;
-    let (sst_path, _) = write_ecc_sst(dir.path());
+    let (sst_path, block) = write_ecc_sst(dir.path());
 
-    // Hard-link the SST so the heal takes the unshare path.
+    // Rot one parity-trailer byte (so the heal has something to WRITE — the
+    // unshare only runs before the first write-back), then hard-link the
+    // rotted SST so the heal takes the unshare path.
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
     let cp_dir = tempfile::tempdir_in(dir.path().parent().expect("tempdir has a parent"))?;
     std::fs::hard_link(&sst_path, cp_dir.path().join("checkpoint.sst"))?;
 
@@ -944,9 +950,15 @@ fn heal_in_place_cleans_up_the_temp_copy_when_the_unshare_fails() -> crate::Resu
     );
 
     // ...and the tree must reopen: a heal failure must never brick recovery.
+    // The trailer rot is still on disk (the write was refused), so the
+    // integrity scan keeps flagging it.
     drop(tree);
     let tree = open_ecc_tree(dir.path());
-    assert!(crate::verify::verify_integrity(&tree).is_ok());
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the refused heal leaves the rot in place and visible",
+    );
     Ok(())
 }
 

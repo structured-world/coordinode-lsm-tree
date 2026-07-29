@@ -117,6 +117,19 @@ pub(crate) enum RecoveryMode {
     },
 }
 
+/// Cached outcome of the heal's lazy hard-link probe/detach (see
+/// [`Table::ensure_unshared_for_write`]): the probe and copy run at most
+/// once per scan, and only when a write-back is actually needed.
+#[cfg(feature = "page_ecc")]
+enum UnshareState {
+    /// No write attempted yet: the link count has not been probed.
+    Unprobed,
+    /// The handle is safe to write through (exclusive, or already detached).
+    Ready,
+    /// The unshare failed; every write is refused with this reason.
+    Failed(alloc::string::String),
+}
+
 /// A disk segment (a.k.a. `Table`, `SSTable`, `SST`, `sorted string table`) that is located on disk
 ///
 /// A table is an immutable list of key-value pairs, split into compressed blocks.
@@ -1096,6 +1109,55 @@ impl Table {
         report
     }
 
+    /// Ensures the heal's handle may be WRITTEN through: probes the link
+    /// count on first use and detaches a multiply-linked inode onto a
+    /// private copy via [`Self::unshare_for_heal`]. The outcome is cached in
+    /// `state`, so the probe and copy run at most once per scan and only
+    /// when a write is actually needed (a clean scan never detaches a
+    /// checkpoint link). A failed link-count query is treated as shared
+    /// (fail closed) — the copy path is safe either way.
+    ///
+    /// # Errors
+    ///
+    /// The unshare failure reason when the write must NOT happen (the inode
+    /// may still be shared); repeated calls keep returning it.
+    #[cfg(feature = "page_ecc")]
+    fn ensure_unshared_for_write(
+        &self,
+        file: &mut Box<dyn crate::fs::FsFile>,
+        state: &mut UnshareState,
+    ) -> Result<(), alloc::string::String> {
+        match state {
+            UnshareState::Ready => Ok(()),
+            UnshareState::Failed(reason) => Err(reason.clone()),
+            UnshareState::Unprobed => {
+                let shared = match file.hard_link_count() {
+                    Ok(n) => n > 1,
+                    Err(e) => {
+                        log::warn!(
+                            "in-place heal: link-count query failed for table {} at {}: {e}; \
+                             assuming the inode is shared",
+                            self.id(),
+                            self.path.display(),
+                        );
+                        true
+                    }
+                };
+                if shared {
+                    match self.unshare_for_heal(file.as_ref()) {
+                        Ok(fresh) => *file = fresh,
+                        Err(reason) => {
+                            *state = UnshareState::Failed(reason.clone());
+                            return Err(reason);
+                        }
+                    }
+                }
+                *state = UnshareState::Ready;
+                Ok(())
+            }
+        }
+    }
+
     /// Detaches this table's live path from a multiply-linked inode so an
     /// in-place heal can write without touching the other links (checkpoint
     /// snapshots): streams the file into a sibling `*.healtmp-{n}` copy, syncs
@@ -1212,9 +1274,11 @@ impl Table {
     /// the live tree does. Writing through a shared inode would therefore
     /// desynchronize the snapshot from its own manifest whenever the recorded
     /// digest is not the original file's (a manifest rebuilt over rotted
-    /// bytes). When the opened file reports more than one link, the heal first
-    /// detaches the live path onto a private copy (copy + atomic rename) and
-    /// heals that, leaving every other link byte-identical to what its
+    /// bytes). Right before the FIRST write-back (lazily — a clean scan of a
+    /// linked healthy table performs zero writes and keeps the checkpoint's
+    /// disk sharing), the link count is probed and a multiply-linked live
+    /// path is detached onto a private copy (copy + atomic rename), which is
+    /// then healed, leaving every other link byte-identical to what its
     /// manifest describes. Cached read-only descriptors may keep serving the
     /// old inode until they are reopened; its bytes are unchanged, so reads
     /// stay correct (ECC-corrected on the fly as before).
@@ -1267,39 +1331,14 @@ impl Table {
         };
 
         // A multiply-linked inode (a checkpoint shares it) must not be healed
-        // through: detach the live path onto a private copy first. A failed
-        // link-count query is treated as shared (fail closed) — the copy path
-        // is safe either way.
-        let shared = match file.hard_link_count() {
-            Ok(n) => n > 1,
-            Err(e) => {
-                log::warn!(
-                    "in-place heal: link-count query failed for table {} at {}: {e}; \
-                     assuming the inode is shared",
-                    self.id(),
-                    self.path.display(),
-                );
-                true
-            }
-        };
-        if shared {
-            match self.unshare_for_heal(file.as_ref()) {
-                Ok(fresh) => file = fresh,
-                Err(reason) => {
-                    // Cannot break the link: record it and fall back to the
-                    // read-only scrub so corruption still surfaces without
-                    // mutating the shared inode.
-                    report.errors.push(ScrubError::BlockIndexUnreadable {
-                        table_id: self.id(),
-                        path: self.path.to_path_buf(),
-                        reason: alloc::format!("unshare hard-linked SST for heal: {reason}"),
-                    });
-                    report.merge(self.scrub_data_blocks());
-                    report.sst_files_scanned = 1;
-                    return report;
-                }
-            }
-        }
+        // through — but detaching costs a full-file copy and permanently
+        // ends the checkpoint's disk sharing, so it happens LAZILY: the link
+        // count is probed (and a shared inode detached onto a private copy)
+        // only right before the FIRST write-back. A clean scan of a linked
+        // healthy table therefore stays O(damage) = zero writes. The probe
+        // stays honest under the caller's mutation window: a checkpoint
+        // cannot link this SST anywhere inside the scan-to-write span.
+        let mut unshare_state = UnshareState::Unprobed;
 
         let transform = match crate::table::util::build_block_transform(
             self.metadata.data_block_compression,
@@ -1458,6 +1497,22 @@ impl Table {
                         // Trailer rot: persist the freshly computed parity at
                         // its on-disk position (header + payload unchanged).
                         Ok(Some(fresh)) => {
+                            // First write: make sure no checkpoint link
+                            // shares the inode (lazy detach).
+                            if let Err(reason) =
+                                self.ensure_unshared_for_write(&mut file, &mut unshare_state)
+                            {
+                                report.uncorrectable_blocks += 1;
+                                report.errors.push(ScrubError::UncorrectableBlock {
+                                    table_id: self.id(),
+                                    path: self.path.to_path_buf(),
+                                    block_offset,
+                                    reason: alloc::format!(
+                                        "unshare hard-linked SST for heal: {reason}"
+                                    ),
+                                });
+                                continue;
+                            }
                             let trailer_offset = block_offset
                                 + crate::table::block::Header::header_len(raw_header.block_type)
                                     as u64
@@ -1535,6 +1590,20 @@ impl Table {
                             continue;
                         }
                     };
+                    // First write: make sure no checkpoint link shares the
+                    // inode (lazy detach).
+                    if let Err(reason) =
+                        self.ensure_unshared_for_write(&mut file, &mut unshare_state)
+                    {
+                        report.uncorrectable_blocks += 1;
+                        report.errors.push(ScrubError::UncorrectableBlock {
+                            table_id: self.id(),
+                            path: self.path.to_path_buf(),
+                            block_offset,
+                            reason: alloc::format!("unshare hard-linked SST for heal: {reason}"),
+                        });
+                        continue;
+                    }
                     // Seek + write (std::io) and sync (crate::io) carry different
                     // error types, so each is handled separately; both render to
                     // text for the finding. `sync_data` (not `sync_all`): the file
