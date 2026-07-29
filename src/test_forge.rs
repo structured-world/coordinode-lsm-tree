@@ -37,6 +37,59 @@ pub fn forge_restamped_data_block(path: &std::path::Path) -> crate::Result<()> {
     flip_and_restamp_first_data_block(path, 1)
 }
 
+/// RELABELS the first block of the named SFA section to `forged` and
+/// re-encodes its header (fresh header CRC, payload and its checksum
+/// untouched): the block stays checksum-clean while its ROLE no longer
+/// matches the section that holds it, modelling a re-stamped `block_type`
+/// forge that only a section-vs-role cross-check can catch. The forged
+/// type must have the same header length as the original (all SST block
+/// types without `block_flags` do).
+pub fn forge_section_block_role(
+    path: &std::path::Path,
+    section: &[u8],
+    forged: crate::table::block::BlockType,
+) -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::table::block::Header;
+
+    let mut bytes = std::fs::read(path)?;
+    let block_off = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == section) else {
+            panic!("the SST must carry the targeted section");
+        };
+        usize::try_from(entry.pos()).expect("section offset fits usize")
+    };
+    let Some(block) = bytes.get(block_off..) else {
+        panic!("section block within the file");
+    };
+    let mut cursor = block;
+    let header = Header::decode_from(&mut cursor)?;
+    let header_len = Header::header_len(header.block_type);
+    assert_eq!(
+        header_len,
+        Header::header_len(forged),
+        "the forged role must keep the header length so the relabel is in place",
+    );
+
+    let new_header = Header {
+        block_type: forged,
+        ..header
+    };
+    let mut hdr_bytes = Vec::with_capacity(header_len);
+    new_header.encode_into(&mut hdr_bytes)?;
+    let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
+        panic!("section header within the file");
+    };
+    hdr_dst.copy_from_slice(&hdr_bytes);
+    std::fs::write(path, &bytes)?;
+    Ok(())
+}
+
 /// Shared core: flips `payload[len - flip_from_end]` of the FIRST data
 /// block of the SST at `path`, then recomputes the block header checksum
 /// over the altered payload so block-level verification reads clean.

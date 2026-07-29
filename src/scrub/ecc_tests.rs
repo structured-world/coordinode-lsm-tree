@@ -832,6 +832,64 @@ fn heal_in_place_rebinds_the_descriptor_cache_when_the_directory_sync_fails() ->
     Ok(())
 }
 
+/// The digest reconciliation must not restamp over a RELABELED section
+/// block: a checksum-clean block whose `block_type` was forged (a filter
+/// block re-stamped as Data) passes payload and parity verification, so
+/// only a section-vs-role cross-check in the out-of-band walk can catch
+/// it. Restamping would make `verify_integrity` accept an SST whose lazy
+/// filter load rejects the role at read time.
+#[test]
+fn heal_in_place_does_not_restamp_over_a_relabeled_section_block() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _) = write_ecc_sst(dir.path());
+
+    // Relabel the FIRST filter block as Data and re-stamp its header: the
+    // payload and its checksum are untouched, so every byte-level check
+    // stays clean while the role no longer matches the section.
+    crate::test_forge::forge_section_block_role(
+        &sst_path,
+        b"filter",
+        crate::table::block::BlockType::Data,
+    )?;
+
+    // Reopen with LAZY filters (no pinning): the default policy pins the L0
+    // filter at open, which loads it and rejects the role before the scrub
+    // even runs — the dangerous variant is the lazy one, where nothing
+    // touches the filter until a point read long after the restamp.
+    let crate::AnyTree::Standard(tree) = crate::Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .page_ecc(true)
+    .ecc_scheme(EccScheme::ReedSolomon {
+        data_shards: 8,
+        parity_shards: 2,
+    })
+    .filter_block_pinning_policy(crate::config::PinningPolicy::new([false]))
+    .open()
+    .expect("open ecc tree with lazy filters") else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| format!("{e:?}").contains("ChecksumRefreshFailed")),
+        "the relabeled block must refuse the digest refresh: {report:?}",
+    );
+
+    // The manifest keeps the ORIGINAL digest, so the forge stays visible.
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the relabeled SST must keep failing verify_integrity: restamping \
+         its digest would mask a forge only the role cross-check detects",
+    );
+    Ok(())
+}
+
 /// A heal scan over a HEALTHY hard-linked SST must not detach it: the
 /// unshare exists to protect a checkpoint from in-place writes, and a scan
 /// that finds nothing to write has no reason to stream the whole file into
