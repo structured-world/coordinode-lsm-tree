@@ -1226,6 +1226,7 @@ fn scan_sst_blocks(
             max_data_length: block_data_length_cap(max_enc_overhead),
             ecc,
             ecc_unrecognized,
+            expected_roles: expected_section_roles(entry.name()),
         };
         walk_block_region(&mut ctx, start, end);
     }
@@ -1253,6 +1254,30 @@ fn scan_sst_blocks(
 /// to decode zeros as a `Header` and report a spurious
 /// `HeaderCorrupted` on every clean SST.
 const RAW_FORMAT_SECTIONS: &[&[u8]] = &[b"linked_blob_files", b"table_version", b"meta_separator"];
+
+/// Block ROLE(S) the writer emits into each named block-format SFA section.
+/// The walk cross-checks every decoded header against its section: a
+/// checksum-clean block whose `block_type` was re-stamped (a filter block
+/// relabeled as Data) passes every byte-level check, so this is the only
+/// out-of-band detector before the heal's digest reconciliation would
+/// launder the forge into the manifest. `None` for a section name this
+/// build does not know — a future section must not be false-flagged.
+fn expected_section_roles(name: &[u8]) -> Option<&'static [crate::table::block::BlockType]> {
+    use crate::table::block::BlockType;
+    Some(match name {
+        b"data" => &[BlockType::Data, BlockType::Columnar],
+        b"index" | b"tli" | b"tli_tail" => &[BlockType::Index],
+        b"filter" | b"filter_tli" => &[BlockType::Filter],
+        b"range_tombstones" => &[BlockType::RangeTombstone],
+        b"meta" | b"meta_mid" => &[BlockType::Meta],
+        b"block_layout" => &[BlockType::BlockLayout],
+        b"seqno_bounds" => &[BlockType::SeqnoBounds],
+        b"zone_map" => &[BlockType::ZoneMap],
+        b"delete_bitmap" => &[BlockType::DeleteBitmap],
+        b"locator" => &[BlockType::Locator],
+        _ => return None,
+    })
+}
 
 /// Structural validation for the raw (non-block-format) sections; returns a
 /// human-readable reason when the section's payload cannot have the shape
@@ -1373,6 +1398,11 @@ struct WalkCtx<'a> {
     /// skipped (the caller warns once). Self-describing sections (`meta` /
     /// `meta_mid`) still size parity from `block_flags` and ARE walked.
     ecc_unrecognized: bool,
+    /// Roles the current section's blocks may legitimately carry (from
+    /// [`expected_section_roles`]); `None` for an unknown section name. A
+    /// decoded header whose `block_type` is not in the list is reported —
+    /// see the helper's docs for why this check is load-bearing.
+    expected_roles: Option<&'static [crate::table::block::BlockType]>,
 }
 
 fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) {
@@ -1434,6 +1464,25 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         // decides the whole section.
         if ctx.ecc_unrecognized && !Header::has_block_flags(header.block_type) {
             return;
+        }
+
+        // Role cross-check: a checksum-clean block whose `block_type` was
+        // re-stamped (a filter block relabeled as Data) passes every
+        // byte-level check below, so the section-vs-role comparison is the
+        // only out-of-band detector. Reported and then walked normally —
+        // the header is internally valid, so the offsets stay trustworthy.
+        if let Some(roles) = ctx.expected_roles
+            && !roles.contains(&header.block_type)
+        {
+            ctx.errors.push(BlockVerifyError::HeaderCorrupted {
+                table_id: ctx.table_id,
+                path: ctx.path.to_path_buf(),
+                offset,
+                reason: format!(
+                    "block role {:?} does not belong to this section (expected one of {roles:?})",
+                    header.block_type,
+                ),
+            });
         }
 
         // Count the block as "header-read" immediately on successful

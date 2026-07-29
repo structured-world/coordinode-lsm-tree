@@ -937,7 +937,10 @@ fn walk_block_region_reports_header_crossing_section_boundary() {
     let mut archive_bytes: Vec<u8> = Vec::new();
     {
         let mut writer = crate::sfa::Writer::from_writer(std::io::Cursor::new(&mut archive_bytes));
-        writer.start("data").unwrap();
+        // "meta", not "data": the section-vs-role cross-check would report
+        // a Meta block inside a data section as a SECOND error, and this
+        // test pins down exactly one (the boundary violation).
+        writer.start("meta").unwrap();
         writer.write_all(&header.encode_into_vec()).unwrap();
         writer.finish().unwrap();
     }
