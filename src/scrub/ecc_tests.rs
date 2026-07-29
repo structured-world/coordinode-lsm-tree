@@ -829,6 +829,42 @@ fn heal_in_place_rebinds_the_descriptor_cache_when_the_directory_sync_fails() ->
     Ok(())
 }
 
+/// A heal scan over a HEALTHY hard-linked SST must not detach it: the
+/// unshare exists to protect a checkpoint from in-place writes, and a scan
+/// that finds nothing to write has no reason to stream the whole file into
+/// a private copy. Detaching eagerly turns a heal patrol over a
+/// checkpointed database into O(database) writes and permanently doubles
+/// the disk usage of every linked SST, breaking the option's O(damage)
+/// contract.
+// Unix-gated for the `nlink` assertion (`std` exposes the NTFS count only
+// behind an unstable feature); the lazy-detach behaviour itself is
+// platform-independent.
+#[cfg(unix)]
+#[test]
+fn heal_in_place_keeps_a_healthy_sst_hard_linked() -> crate::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _) = write_ecc_sst(dir.path());
+
+    let cp_dir = tempfile::tempdir_in(dir.path().parent().expect("tempdir has a parent"))?;
+    std::fs::hard_link(&sst_path, cp_dir.path().join("checkpoint.sst"))?;
+
+    let tree = open_ecc_tree(dir.path());
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(report.is_ok(), "{report:?}");
+    assert_eq!(report.blocks_healed_in_place, 0, "nothing to heal");
+
+    assert_eq!(
+        std::fs::metadata(&sst_path)?.nlink(),
+        2,
+        "a clean scan must leave the checkpoint link in place: detaching \
+         without a write to protect it from costs a full-file copy and \
+         doubles the SST's disk usage",
+    );
+    Ok(())
+}
+
 /// A failed link-count probe must FAIL CLOSED: the heal cannot prove the
 /// inode is exclusive, so it must take the unshare (copy) path as if the file
 /// were shared — and still heal the detached copy, not skip the table or
