@@ -1177,17 +1177,19 @@ impl Table {
             }
             return Err(reason);
         }
+        // The rename has replaced the live path, so the descriptor cache now
+        // holds the OLD inode's fd: a later heal (or read) resolving through
+        // it would scrub the detached inode while writes target the live one,
+        // misreporting a live-only fault as an unexplained (uncorrectable)
+        // mismatch. Drop the stale entry IMMEDIATELY — before the durability
+        // sync below, whose failure must not leave the cache pinned to the
+        // dead inode — so the next access reopens the live path.
+        self.file_accessor.remove_for_table(&self.global_id());
         if let Some(parent) = self.path.parent() {
             self.fs
                 .sync_directory(parent)
                 .map_err(|e| alloc::format!("sync directory after rename: {e}"))?;
         }
-        // The descriptor cache still holds the OLD inode's fd: a later heal
-        // (or read) resolving through it would scrub the detached inode
-        // while writes target the live one, misreporting a live-only fault
-        // as an unexplained (uncorrectable) mismatch. Drop the stale entry
-        // so the next access reopens the live path.
-        self.file_accessor.remove_for_table(&self.global_id());
         // The handle survives the rename (same inode, now the live path).
         Ok(tmp)
     }
