@@ -358,8 +358,12 @@ fn scan_and_reconcile(
     // manifest digest mismatch is real evidence — an in-band alteration
     // whose block checksums were re-stamped has NO other detector — and
     // restamping would erase the only record of it; skipping also spares
-    // every ordinary SST the full-file digest read.
-    let heals = options.heal_in_place && table.metadata.ecc_params.is_some();
+    // every ordinary SST the full-file digest read. The COMPILED feature
+    // gates it too: without `page_ecc` an ECC table falls back to the
+    // read-only scrub (nothing can have healed), so reconciling would burn
+    // a digest read only to fail closed on the walk's parity warning.
+    let heals =
+        cfg!(feature = "page_ecc") && options.heal_in_place && table.metadata.ecc_params.is_some();
     // Serializes same-table heals for the WHOLE scan-to-reconcile span (not
     // just the scan): with two overlapping heal patrols, A could compute a
     // digest, B could heal a fresh fault and install its own, and A would
