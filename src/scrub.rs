@@ -446,10 +446,13 @@ fn refresh_healed_checksum(
     // range tombstones, block layout) also moves the digest while leaving
     // the scan clean. Walk EVERY section out-of-band before installing the
     // fresh digest: restamping over unverified bytes would launder the
-    // corruption into the manifest and blind `verify_integrity` to it.
-    // Fail closed on warnings too: an unrecognized-ECC or
-    // parity-unverifiable walk skipped bytes, so the file is not provably
-    // clean.
+    // corruption into the manifest and blind `verify_integrity` to it. The
+    // walk also cross-checks each block's role against its TOC section and
+    // compares the two FULLY-decoded meta mirrors, so a re-stamped
+    // internally-consistent forge (a relabeled block, a tail meta whose
+    // fields diverge from meta_mid) fails the refresh too. Fail closed on
+    // warnings as well: an unrecognized-ECC or parity-unverifiable walk
+    // skipped bytes, so the file is not provably clean.
     let walk = crate::verify::verify_sst_file_with_context(
         &*table.fs,
         &table.path,
