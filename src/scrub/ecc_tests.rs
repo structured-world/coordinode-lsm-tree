@@ -832,6 +832,44 @@ fn heal_in_place_rebinds_the_descriptor_cache_when_the_directory_sync_fails() ->
     Ok(())
 }
 
+/// The digest reconciliation must not restamp over DIVERGED metadata
+/// mirrors: a tail `meta` block whose payload was re-stamped to another
+/// internally-consistent value (a changed `compression#data`, ECC descriptor
+/// untouched) passes every byte-level check, and the in-memory table keeps
+/// serving reads from its previously loaded metadata — so only a FULL
+/// comparison of the decoded mirrors can catch it. Restamping would make
+/// `verify_integrity` accept a file whose next recovery prefers the altered
+/// tail and misreads every data block.
+#[test]
+fn heal_in_place_does_not_restamp_over_diverged_meta_mirrors() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _) = write_ecc_sst(dir.path());
+
+    // Re-stamp the TAIL meta's data-block compression from the written
+    // Lz4 (tag 1) to None (tag 0) — same value length, fresh block checksum
+    // and parity, `meta_mid` untouched.
+    crate::test_forge::forge_tail_meta_value(&sst_path, b"compression#data", &[0])?;
+
+    let tree = open_ecc_tree(dir.path());
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| format!("{e:?}").contains("ChecksumRefreshFailed")),
+        "diverged meta mirrors must refuse the digest refresh: {report:?}",
+    );
+
+    // The manifest keeps the ORIGINAL digest, so the forge stays visible.
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the forged SST must keep failing verify_integrity: restamping its \
+         digest would mask a forge only the mirror comparison detects",
+    );
+    Ok(())
+}
+
 /// The digest reconciliation must not restamp over a RELABELED section
 /// block: a checksum-clean block whose `block_type` was forged (a filter
 /// block re-stamped as Data) passes payload and parity verification, so

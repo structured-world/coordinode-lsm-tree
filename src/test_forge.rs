@@ -37,6 +37,111 @@ pub fn forge_restamped_data_block(path: &std::path::Path) -> crate::Result<()> {
     flip_and_restamp_first_data_block(path, 1)
 }
 
+/// REPLACES the value of `key` inside the TAIL `meta` block's payload with
+/// `forged_value` (same length), then re-stamps the block checksum and (on a
+/// parity-bearing build) recomputes the RS(4,2) trailer: the tail mirror
+/// stays internally consistent in every byte-level check while its DECODED
+/// metadata now disagrees with the intact `meta_mid` mirror — the shape only
+/// a full mirror comparison can catch. The key must be present verbatim
+/// (meta blocks use restart interval 1) with a one-byte length prefix
+/// matching `forged_value.len()`.
+pub fn forge_tail_meta_value(
+    path: &std::path::Path,
+    key: &[u8],
+    forged_value: &[u8],
+) -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::table::block::Header;
+
+    let mut bytes = std::fs::read(path)?;
+    let (pos, section_len) = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"meta") else {
+            panic!("the SST must carry a meta section");
+        };
+        (entry.pos(), entry.len())
+    };
+    let block_off = usize::try_from(pos).expect("meta offset fits usize");
+    let Some(block) = bytes.get(block_off..) else {
+        panic!("meta block within the file");
+    };
+    let mut cursor = block;
+    let header = Header::decode_from(&mut cursor)?;
+    let header_len = Header::header_len(header.block_type);
+    let payload_range =
+        block_off + header_len..block_off + header_len + header.data_length as usize;
+    {
+        let Some(payload) = bytes.get_mut(payload_range.clone()) else {
+            panic!("meta payload within the file");
+        };
+        let Some(key_pos) = payload.windows(key.len()).position(|w| w == key) else {
+            panic!("meta key present verbatim (restart interval 1)");
+        };
+        // Entry layout after the key bytes: value length (LEB128, one byte
+        // for these small values), then the value itself.
+        let val_at = key_pos + key.len();
+        assert_eq!(
+            payload.get(val_at).copied(),
+            u8::try_from(forged_value.len()).ok(),
+            "the forged value must keep the original length",
+        );
+        let Some(value) = payload.get_mut(val_at + 1..val_at + 1 + forged_value.len()) else {
+            panic!("meta value within the payload");
+        };
+        value.copy_from_slice(forged_value);
+    }
+    let Some(payload) = bytes.get(payload_range.clone()) else {
+        panic!("meta payload within the file");
+    };
+    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(payload));
+    let new_header = Header {
+        checksum: new_checksum,
+        ..header
+    };
+    let mut hdr_bytes = Vec::with_capacity(header_len);
+    new_header.encode_into(&mut hdr_bytes)?;
+    let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
+        panic!("meta header within the file");
+    };
+    hdr_dst.copy_from_slice(&hdr_bytes);
+
+    // A parity-bearing meta frame (self-describing blocks always use the
+    // fixed RS(4,2) layout) must have its trailer recomputed over the forged
+    // payload, or the walk would flag the forge ITSELF as parity rot.
+    #[cfg(feature = "page_ecc")]
+    {
+        let payload_end = payload_range.end;
+        let Ok(section_len) = usize::try_from(section_len) else {
+            panic!("meta section length fits usize");
+        };
+        let frame_end = block_off + section_len;
+        if frame_end > payload_end {
+            let Some(payload) = bytes.get(payload_range) else {
+                panic!("meta payload within the file");
+            };
+            let parity = crate::ecc::encode_parity(payload, 4, 2)?;
+            assert_eq!(
+                frame_end - payload_end,
+                parity.len(),
+                "the meta frame's trailer length matches the fixed RS(4,2) layout",
+            );
+            let Some(dst) = bytes.get_mut(payload_end..frame_end) else {
+                panic!("meta parity trailer within the file");
+            };
+            dst.copy_from_slice(&parity);
+        }
+    }
+    #[cfg(not(feature = "page_ecc"))]
+    let _ = section_len;
+
+    std::fs::write(path, &bytes)?;
+    Ok(())
+}
+
 /// INFLATES the trailer `item_count` of the first data block by one and
 /// re-stamps the block header checksum: the block stays checksum-clean but
 /// iterating it yields FEWER entries than the trailer declares, modelling a
