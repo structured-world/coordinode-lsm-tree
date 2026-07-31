@@ -1187,6 +1187,56 @@ fn scan_sst_blocks(
     let mut reader = BufReader::with_capacity(64 * 1024, file);
     let mut blocks_scanned: usize = 0;
     let mut errors: Vec<BlockVerifyError> = Vec::new();
+
+    // The writer emits sections strictly back-to-back (the first at offset 0,
+    // each next where the previous ended, the last ending where the TOC
+    // begins), so the entries must exactly tile `[0, toc_pos)`. The SFA
+    // trailer checksum is unkeyed, so a re-stamped TOC could otherwise OMIT a
+    // correctness-bearing entry entirely — `delete_bitmap` and
+    // `range_tombstones` are optional at parse time, so a vanished section
+    // resurrects deleted rows while every remaining block still passes its
+    // byte-level checks. The tiling gap the omission leaves is the only
+    // out-of-band trace; report it and keep walking the sections that ARE
+    // present (their findings are still valid).
+    {
+        let mut expected_pos: u64 = 0;
+        for entry in toc.iter() {
+            if entry.pos() != expected_pos {
+                errors.push(BlockVerifyError::TocCorrupted {
+                    table_id,
+                    path: path.to_path_buf(),
+                    section_name: entry.name().to_vec(),
+                    section_offset: entry.pos(),
+                    reason: format!(
+                        "section starts at {} but the previous section ended at \
+                         {expected_pos}; the gap hides an omitted TOC entry",
+                        entry.pos(),
+                    ),
+                });
+            }
+            // On overflow stop the tiling accumulation: the per-section walk
+            // below reports the same entry as TocCorrupted via its own
+            // checked_add, so no separate finding is needed here.
+            let Some(end) = entry.pos().checked_add(entry.len()) else {
+                expected_pos = u64::MAX;
+                break;
+            };
+            expected_pos = end;
+        }
+        if expected_pos != sfa_reader.toc_pos() {
+            errors.push(BlockVerifyError::TocCorrupted {
+                table_id,
+                path: path.to_path_buf(),
+                section_name: b"<tiling>".to_vec(),
+                section_offset: expected_pos,
+                reason: format!(
+                    "sections end at {expected_pos} but the TOC begins at {}; \
+                     a trailing TOC entry was omitted or truncated",
+                    sfa_reader.toc_pos(),
+                ),
+            });
+        }
+    }
     // One reusable data buffer across the whole SST — sized up via
     // `resize` per block instead of a fresh `vec![0u8; N]` allocation
     // each iteration. On large trees this turns thousands of malloc
