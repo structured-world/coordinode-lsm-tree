@@ -867,15 +867,47 @@ pub(crate) fn verify_sst_file_with_context(
     // the scan and reports spurious corruption. Surface the indeterminacy and
     // skip the walk.
     let mut ecc_unrecognized = false;
-    let ecc = match read_ecc_params_out_of_band(fs, path, encryption, known_table_id) {
-        Ok(Some(ScrubEcc::Off)) => None,
-        Ok(Some(ScrubEcc::Scheme(params))) => Some(params),
+    let probe = match read_ecc_params_out_of_band(fs, path, encryption, known_table_id) {
+        Ok(p) => p,
+        // Real file-open / SFA-trailer failure — preserve the underlying error
+        // rather than collapsing it into the undeterminable message below.
+        Err(error) => {
+            report.errors.push(BlockVerifyError::SstFileUnreadable {
+                table_id,
+                path: path.to_path_buf(),
+                error: error.into(),
+            });
+            return report;
+        }
+    };
+    // Both mirrors decode but their FULL metadata disagrees: one is
+    // forged/rotted to another internally-consistent payload (e.g. a changed
+    // compression tag with the ECC descriptor untouched). Every byte-level
+    // check passes on both, so this comparison is the only out-of-band
+    // detector — a recovery preferring the altered tail would misread every
+    // data block. Report and keep walking (block-level findings still add
+    // signal).
+    if probe.mirrors_diverge {
+        report.errors.push(BlockVerifyError::TocCorrupted {
+            table_id,
+            path: path.to_path_buf(),
+            section_name: b"meta".to_vec(),
+            section_offset: 0,
+            reason: alloc::string::String::from(
+                "the tail meta and meta_mid mirrors decode to different metadata; \
+                 one copy is forged or rotted behind a re-stamped checksum",
+            ),
+        });
+    }
+    let ecc = match probe.ecc {
+        Some(ScrubEcc::Off) => None,
+        Some(ScrubEcc::Scheme(params)) => Some(params),
         // The descriptor decodes to a scheme this build can't apply: the
         // SST-block trailer length isn't derivable, so those sections are
         // skipped during the walk. The self-describing `meta` / `meta_mid`
         // sections still size parity from `block_flags`, so corruption there
         // is NOT downgraded. Warn + continue (don't drop the whole scrub).
-        Ok(Some(ScrubEcc::Unrecognized)) => {
+        Some(ScrubEcc::Unrecognized) => {
             log::warn!(
                 "{}: unrecognized ECC scheme — skipping the ECC-dependent block \
                  sections; recompact to re-stamp with a supported scheme",
@@ -891,7 +923,7 @@ pub(crate) fn verify_sst_file_with_context(
         // File + trailer readable, but neither meta block decodes (corrupt
         // meta, or an encrypted SST with no key out-of-band). The ECC scheme is
         // undeterminable; skip the walk rather than mis-walk an ECC-bearing SST.
-        Ok(None) => {
+        None => {
             report.errors.push(BlockVerifyError::SstFileUnreadable {
                 table_id,
                 path: path.to_path_buf(),
@@ -902,16 +934,6 @@ pub(crate) fn verify_sst_file_with_context(
                      skipping the block walk — use verify_block_checksums on a live \
                      tree for ECC-aware verification",
                 ),
-            });
-            return report;
-        }
-        // Real file-open / SFA-trailer failure — preserve the underlying error
-        // rather than collapsing it into the undeterminable message above.
-        Err(error) => {
-            report.errors.push(BlockVerifyError::SstFileUnreadable {
-                table_id,
-                path: path.to_path_buf(),
-                error: error.into(),
             });
             return report;
         }
@@ -942,7 +964,9 @@ pub(crate) fn verify_sst_file_with_context(
     match scan_sst_blocks(fs, path, table_id, max_enc_overhead, ecc, ecc_unrecognized) {
         Ok(per_file) => {
             report.blocks_scanned = per_file.blocks_scanned;
-            report.errors = per_file.errors;
+            // extend, NOT assign: the mirror-divergence finding above must
+            // survive the block walk's own error list.
+            report.errors.extend(per_file.errors);
         }
         Err(error) => {
             report.errors.push(BlockVerifyError::SstFileUnreadable {
@@ -994,7 +1018,7 @@ fn read_ecc_params_out_of_band(
     path: &std::path::Path,
     encryption: Option<&dyn crate::encryption::EncryptionProvider>,
     known_table_id: Option<crate::TableId>,
-) -> std::io::Result<Option<ScrubEcc>> {
+) -> std::io::Result<EccProbe> {
     let mut probe = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
     let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -1010,6 +1034,12 @@ fn read_ecc_params_out_of_band(
     // warning) — nothing out-of-band can tell which copy is legitimate.
     let mut unrecognized_seen = false;
     let mut recognized: Vec<ScrubEcc> = Vec::new();
+    // The FULL decoded mirrors, compared beyond the ECC state below: a tail
+    // re-stamped to another internally-consistent payload (its ECC
+    // descriptor untouched) is detectable only by disagreeing with the
+    // intact `meta_mid`. Both are written from one parameter set, so any
+    // decoded difference is corruption or a forge.
+    let mut decoded: Vec<crate::table::meta::ParsedMeta> = Vec::new();
     for name in [b"meta".as_slice(), b"meta_mid".as_slice()] {
         let Some((pos, len)) = toc.section(name).map(|e| (e.pos(), e.len())) else {
             continue;
@@ -1048,9 +1078,11 @@ fn read_ecc_params_out_of_band(
             } else {
                 ScrubEcc::Off
             });
+            decoded.push(meta);
         }
     }
-    Ok(match recognized.as_slice() {
+    let mirrors_diverge = matches!(decoded.as_slice(), [a, b] if a != b);
+    let ecc = match recognized.as_slice() {
         // Two decodable copies that agree: trustworthy.
         [a, b] if a == b => Some(*a),
         // Two decodable copies that DISAGREE: one is forged/rotted and the
@@ -1062,7 +1094,19 @@ fn read_ecc_params_out_of_band(
         [one] => Some(*one),
         [] if unrecognized_seen => Some(ScrubEcc::Unrecognized),
         [..] => None,
+    };
+    Ok(EccProbe {
+        ecc,
+        mirrors_diverge,
     })
+}
+
+/// Result of [`read_ecc_params_out_of_band`]: the arbitrated ECC state plus
+/// whether the two FULLY-decoded meta mirrors disagree in any field.
+#[cfg(feature = "std")]
+struct EccProbe {
+    ecc: Option<ScrubEcc>,
+    mirrors_diverge: bool,
 }
 
 struct PerFileScan {

@@ -34,7 +34,10 @@ impl From<u128> for Timestamp {
     }
 }
 
-#[derive(Debug)]
+// `PartialEq`: the out-of-band verifier compares the two decoded meta
+// mirrors in FULL — a tail re-stamped to another internally-consistent
+// payload is detectable only by disagreeing with `meta_mid`.
+#[derive(Debug, PartialEq, Eq)]
 pub struct ParsedMeta {
     pub id: TableId,
     pub created_at: Timestamp,

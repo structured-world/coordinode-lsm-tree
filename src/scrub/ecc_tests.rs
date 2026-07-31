@@ -845,12 +845,17 @@ fn heal_in_place_does_not_restamp_over_diverged_meta_mirrors() -> crate::Result<
     let dir = tempfile::tempdir()?;
     let (sst_path, _) = write_ecc_sst(dir.path());
 
-    // Re-stamp the TAIL meta's data-block compression from the written
-    // Lz4 (tag 1) to None (tag 0) — same value length, fresh block checksum
-    // and parity, `meta_mid` untouched.
-    crate::test_forge::forge_tail_meta_value(&sst_path, b"compression#data", &[0])?;
-
+    // Open FIRST: the live tree keeps serving reads from its previously
+    // loaded metadata, so the forge below is invisible to the data/KV scan.
     let tree = open_ecc_tree(dir.path());
+
+    // Re-stamp the TAIL meta's data-block compression from the written
+    // None (tag 0, the default L0 policy) to Lz4 (tag 1) — same value
+    // length, fresh block checksum and parity, `meta_mid` untouched. Only
+    // the NEXT recovery would prefer the altered tail and misread every
+    // data block.
+    crate::test_forge::forge_tail_meta_value(&sst_path, b"compression#data", &[1])?;
+
     let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
     assert!(
         report

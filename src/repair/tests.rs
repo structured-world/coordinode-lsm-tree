@@ -1573,8 +1573,9 @@ fn repair_with_salvage_quarantines_a_corrupt_delete_bitmap_sst() -> crate::Resul
 /// scheme (here: `Off`) while its table id stays valid must not dictate the
 /// walk's trailer sizing: the probe must arbitrate against the intact MID
 /// mirror, and when two decodable copies disagree, fail safe (skip the
-/// ECC-dependent sections with a warning) instead of mis-walking parity
-/// bytes as block headers and condemning a healthy SST.
+/// ECC-dependent sections with a warning, plus the single mirror-divergence
+/// finding) instead of mis-walking parity bytes as block headers and
+/// condemning a healthy SST.
 #[cfg(feature = "page_ecc")]
 #[test]
 fn verify_probe_distrusts_disagreeing_recognized_ecc_descriptors() -> crate::Result<()> {
@@ -1608,11 +1609,23 @@ fn verify_probe_distrusts_disagreeing_recognized_ecc_descriptors() -> crate::Res
     forge_tail_meta_table_id(&sst, None, Some([0u8, 0, 0, 0]))?;
 
     let report = crate::verify::verify_sst_file_with_fs(&*fs, &sst);
+    // The forged tail IS a real finding: the full mirror comparison reports
+    // the divergence. What must NOT happen is the walk mis-sizing every
+    // parity trailer as a block header and condemning the data blocks — so
+    // the only error is the single mirror-divergence finding, never a
+    // HeaderCorrupted storm.
     assert!(
-        report.errors.is_empty(),
-        "a healthy SST must not be condemned because one meta copy carries \
-         a forged recognized descriptor — the walk mis-sizes every parity \
-         trailer as a block header: {report:?}",
+        report
+            .errors
+            .iter()
+            .all(|e| matches!(e, crate::verify::BlockVerifyError::TocCorrupted { .. })),
+        "a forged recognized descriptor must not condemn the data blocks — \
+         the walk mis-sizes every parity trailer as a block header: {report:?}",
+    );
+    assert_eq!(
+        report.errors.len(),
+        1,
+        "exactly the mirror-divergence finding: {report:?}",
     );
     assert!(
         report
