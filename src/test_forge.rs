@@ -91,6 +91,87 @@ pub fn forge_section_name(path: &std::path::Path, from: &[u8], to: &[u8]) -> cra
     Ok(())
 }
 
+/// OMITS an SFA TOC entry entirely and re-stamps the trailer's TOC checksum
+/// and length: the archive stays internally consistent while a whole section
+/// vanishes from every reader's sight (its bytes are still in the file, but
+/// nothing references them) — the shape only a TOC coverage check can catch,
+/// since every remaining block still passes its own byte-level checks.
+pub fn forge_section_omitted(path: &std::path::Path, name: &[u8]) -> crate::Result<()> {
+    let bytes = std::fs::read(path)?;
+    // SFA trailer layout (fixed size, at the very end of the file):
+    // magic "SFA!" | version u8 | checksum_type u8 | toc_checksum u128 LE |
+    // toc_pos u64 LE | toc_len u64 LE.
+    const TRAILER_SIZE: usize = 4 + 1 + 1 + 16 + 8 + 8;
+    let trailer_start = bytes.len() - TRAILER_SIZE;
+    let read_u64 = |bytes: &[u8], at: usize| {
+        let Some(b) = bytes.get(at..at + 8) else {
+            panic!("u64 field within the trailer");
+        };
+        u64::from_le_bytes(b.try_into().expect("8 bytes"))
+    };
+    let toc_pos = usize::try_from(read_u64(&bytes, trailer_start + 4 + 1 + 1 + 16))
+        .expect("toc_pos fits usize");
+    let toc_len = usize::try_from(read_u64(&bytes, trailer_start + 4 + 1 + 1 + 16 + 8))
+        .expect("toc_len fits usize");
+
+    // Parse the TOC: "TOC!" magic | count u32 LE | entries
+    // (pos u64 | len u64 | name_len u16 | name).
+    let toc = bytes.get(toc_pos..toc_pos + toc_len).expect("TOC region");
+    assert_eq!(toc.get(..4), Some(&b"TOC!"[..]), "TOC magic");
+    let count = u32::from_le_bytes(toc.get(4..8).expect("count").try_into().expect("4 bytes"));
+    let mut new_toc = Vec::with_capacity(toc.len());
+    new_toc.extend_from_slice(b"TOC!");
+    new_toc.extend_from_slice(&count.checked_sub(1).expect("TOC has entries").to_le_bytes());
+    let mut at = 8usize;
+    let mut omitted = false;
+    for _ in 0..count {
+        let entry_start = at;
+        at += 16;
+        let name_len = usize::from(u16::from_le_bytes(
+            toc.get(at..at + 2)
+                .expect("name_len")
+                .try_into()
+                .expect("2 bytes"),
+        ));
+        at += 2;
+        let entry_name = toc.get(at..at + name_len).expect("name");
+        at += name_len;
+        if entry_name == name {
+            omitted = true;
+        } else {
+            new_toc.extend_from_slice(toc.get(entry_start..at).expect("entry"));
+        }
+    }
+    assert!(omitted, "section name present in the TOC");
+
+    let fresh = {
+        let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
+        hasher.update(&new_toc);
+        hasher.digest128()
+    };
+    let mut out = Vec::with_capacity(toc_pos + new_toc.len() + TRAILER_SIZE);
+    out.extend_from_slice(bytes.get(..toc_pos).expect("pre-TOC prefix"));
+    out.extend_from_slice(&new_toc);
+    out.extend_from_slice(
+        bytes
+            .get(trailer_start..trailer_start + 4 + 1 + 1)
+            .expect("trailer head"),
+    );
+    out.extend_from_slice(&fresh.to_le_bytes());
+    out.extend_from_slice(
+        &u64::try_from(toc_pos)
+            .expect("toc_pos fits u64")
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(
+        &u64::try_from(new_toc.len())
+            .expect("TOC length fits u64")
+            .to_le_bytes(),
+    );
+    std::fs::write(path, &out)?;
+    Ok(())
+}
+
 /// REPLACES the value of `key` inside the TAIL `meta` block's payload with
 /// `forged_value` (same length), then re-stamps the block checksum and (on a
 /// parity-bearing build) recomputes the RS(4,2) trailer: the tail mirror

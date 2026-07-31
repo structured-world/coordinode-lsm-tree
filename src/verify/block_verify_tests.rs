@@ -517,6 +517,58 @@ fn verify_sst_file_clean_file_has_no_errors() {
     );
 }
 
+/// A re-stamped TOC that OMITS a correctness-bearing entry entirely (the SFA
+/// trailer checksum is unkeyed) must fail the walk closed: `delete_bitmap` /
+/// `range_tombstones` are optional at parse time, so a vanished section
+/// resurrects deleted rows while every remaining block still passes its
+/// byte-level checks. The writer emits sections strictly back-to-back, so the
+/// gap the omission leaves in the section tiling is the only out-of-band
+/// trace.
+#[test]
+fn verify_sst_file_flags_an_omitted_toc_section() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let cfg = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None));
+        let tree = cfg.open().unwrap();
+        for i in 0u64..100 {
+            let key = format!("k{i:08}");
+            tree.insert(key.as_bytes(), b"v", 1 + i);
+        }
+        // A range tombstone gives the SST the optional `range_tombstones`
+        // section whose omission the walk must catch.
+        tree.remove_range("k00000010", "k00000020", 200);
+        tree.flush_active_memtable(300).unwrap();
+        drop(tree);
+    }
+    let sst_path = pick_first_sst_path(dir.path());
+
+    // Sanity: intact file verifies clean.
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        report.is_ok(),
+        "intact SST must be clean: {:?}",
+        report.errors
+    );
+
+    crate::test_forge::forge_section_omitted(&sst_path, b"range_tombstones").unwrap();
+
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, BlockVerifyError::TocCorrupted { .. })),
+        "an omitted TOC entry leaves a tiling gap the walk must flag as \
+         TocCorrupted, got {:?}",
+        report.errors,
+    );
+}
+
 /// Exercises the file-open failure branch (the only path through
 /// `verify_sst_file` that converts an underlying `io::Error` into
 /// a `BlockVerifyError::SstFileUnreadable`). A missing file is the
