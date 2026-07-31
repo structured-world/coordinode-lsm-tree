@@ -282,6 +282,125 @@ pub(crate) fn salvage_with_context(
     comparator: &crate::comparator::SharedComparator,
     options: &SalvageOptions,
 ) -> crate::Result<SalvageReport> {
+    // Arbitrate DIVERGENT meta mirrors. When both copies decode under the
+    // expected id but disagree in ANY field, neither is provably genuine: an
+    // internally-consistent forged tail (a changed compression tag, a changed
+    // columnar descriptor) would make the tail-first open mis-decode every
+    // healthy data block and drop it — repair would then quarantine a table
+    // whose intact MID mirror recovers everything. Since no copy can be
+    // proven authoritative, run the walk under BOTH mirror orders and keep
+    // the attempt that recovers more.
+    let diverged = meta_mirrors_diverge(source, fs, options);
+    let tail = salvage_attempt(source, dest.clone(), fs, comparator, options, false);
+    if !diverged {
+        return tail;
+    }
+    // A tail attempt that saw blocks and dropped nothing cannot be improved
+    // on: the tie-break prefers the tail (authoritative-by-convention) copy.
+    if let Ok(r) = &tail
+        && r.blocks_total > 0
+        && r.dropped.is_empty()
+    {
+        return tail;
+    }
+    // The MID attempt writes to a sibling temp path so the tail attempt's
+    // output survives until the comparison. The `.healtmp-{n}` shape is the
+    // recovery-owned temp namespace: a hard crash mid-arbitration leaves an
+    // artifact the next open sweeps instead of failing the id parse.
+    static ARB_TMP_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let seq = ARB_TMP_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let mid_dest = dest.with_extension(alloc::format!("healtmp-{seq}"));
+    let mid = salvage_attempt(source, mid_dest.clone(), fs, comparator, options, true);
+
+    let score = |r: &crate::Result<SalvageReport>| match r {
+        Ok(rep) => rep.blocks_salvaged,
+        Err(_) => 0,
+    };
+    let mid_wins = match (&tail, &mid) {
+        // An erroring attempt never beats a successful one; between two
+        // successes, strictly more recovered blocks wins (ties keep tail).
+        (Err(_), Ok(_)) => true,
+        (_, Err(_)) => false,
+        (Ok(_), Ok(_)) => score(&mid) > score(&tail),
+    };
+    if mid_wins {
+        // Discard the tail attempt's output (if any) and move the MID
+        // attempt's copy into place, fixing up the reported path.
+        if let Ok(rep) = &tail
+            && rep.salvaged_path.is_some()
+        {
+            discard_partial(fs, &dest);
+        }
+        let mut rep = mid?;
+        if rep.salvaged_path.is_some() {
+            fs.rename(&mid_dest, &dest)?;
+            rep.salvaged_path = Some(dest);
+        }
+        Ok(rep)
+    } else {
+        if let Ok(rep) = &mid
+            && rep.salvaged_path.is_some()
+        {
+            discard_partial(fs, &mid_dest);
+        }
+        tail
+    }
+}
+
+/// Decodes BOTH meta mirrors under the caller's id/encryption context and
+/// reports whether they decode to DIVERGENT contents. Any unreadable copy is
+/// `false` — the ordinary tail-with-MID-fallback machinery already covers
+/// broken mirrors; arbitration is only for two VALID copies that disagree.
+fn meta_mirrors_diverge(
+    source: &std::path::Path,
+    fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
+    options: &SalvageOptions,
+) -> bool {
+    let Ok(mut file) = fs.open(source, &crate::fs::FsOpenOptions::new().read(true)) else {
+        return false;
+    };
+    let Ok(trailer) = crate::sfa::Reader::from_reader(&mut file) else {
+        return false;
+    };
+    let Ok(regions) = crate::table::regions::ParsedRegions::parse_from_toc(trailer.toc()) else {
+        return false;
+    };
+    let Some(mid_handle) = regions.metadata_mid else {
+        return false;
+    };
+    // Mirror recover_inner's id policy: an encrypted open always binds the
+    // caller's AAD id; an unencrypted one uses the out-of-band durable id
+    // when the caller knows it (repair), else no cross-check.
+    let expected_id = if options.encryption.is_some() {
+        Some(options.table_id)
+    } else {
+        options.expected_stored_id
+    };
+    let tail = crate::table::meta::ParsedMeta::load_with_handle(
+        &*file,
+        &regions.metadata,
+        expected_id,
+        options.encryption.as_deref(),
+    );
+    let mid = crate::table::meta::ParsedMeta::load_with_handle(
+        &*file,
+        &mid_handle,
+        expected_id,
+        options.encryption.as_deref(),
+    );
+    matches!((tail, mid), (Ok(t), Ok(m)) if t != m)
+}
+
+/// One salvage walk of `source` into `dest` under a fixed meta-mirror order
+/// (`prefer_mid_meta`; see [`salvage_with_context`] for the arbitration).
+fn salvage_attempt(
+    source: &std::path::Path,
+    dest: std::path::PathBuf,
+    fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
+    comparator: &crate::comparator::SharedComparator,
+    options: &SalvageOptions,
+    prefer_mid_meta: bool,
+) -> crate::Result<SalvageReport> {
     // Digest the source through the injected `Fs`, not `std::fs`: salvage runs
     // over MemFs / fault-injected / routed backends (repair passes its own `fs`),
     // where a direct `std::fs` read would miss the file or hash the wrong bytes.
@@ -319,6 +438,7 @@ pub(crate) fn salvage_with_context(
         // cross-check live, so a forged tail id falls back to the MID mirror.
         crate::table::RecoveryMode::Salvage {
             expected_id: options.expected_stored_id,
+            prefer_mid_meta,
         },
     )?;
 

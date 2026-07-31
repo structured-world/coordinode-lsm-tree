@@ -114,6 +114,12 @@ pub(crate) enum RecoveryMode {
         /// The durable table id known out-of-band, or `None` when the
         /// source's stored id is authoritative.
         expected_id: Option<TableId>,
+        /// Load the MID meta mirror FIRST (tail as fallback), inverting the
+        /// default tail-first order. Set by the salvage arbitration when the
+        /// two mirrors decode to DIVERGENT contents: neither copy can be
+        /// proven genuine, so salvage attempts both orders and keeps the
+        /// attempt that recovers more.
+        prefer_mid_meta: bool,
     },
 }
 
@@ -3488,7 +3494,7 @@ impl Table {
         // binds it, so decryption itself requires the right id.
         let expected_id = match mode {
             RecoveryMode::Live => Some(table_id),
-            RecoveryMode::Salvage { expected_id } => {
+            RecoveryMode::Salvage { expected_id, .. } => {
                 if encryption.is_some() {
                     Some(table_id)
                 } else {
@@ -3496,55 +3502,74 @@ impl Table {
                 }
             }
         };
+        // Salvage arbitration may invert the mirror order (see
+        // `RecoveryMode::Salvage::prefer_mid_meta`); live opens always load
+        // tail-first.
+        let prefer_mid_meta = matches!(
+            mode,
+            RecoveryMode::Salvage {
+                prefer_mid_meta: true,
+                ..
+            }
+        );
         // TAIL first (authoritative copy by convention; physically
         // identical content to MID — same `file_size`, same
         // `created_at`, same KV map — the only difference is which
         // SFA section is loaded). On any decode/decrypt/checksum
-        // failure fall back to the MID copy if present.
+        // failure fall back to the MID copy if present. Under salvage
+        // arbitration (`prefer_mid_meta`) the order is inverted: MID
+        // first, tail as the fallback.
+        let (first_handle, first_name, second, second_name) =
+            if prefer_mid_meta && let Some(mid_handle) = regions.metadata_mid {
+                (mid_handle, "MID", Some(regions.metadata), "TAIL")
+            } else {
+                (regions.metadata, "TAIL", regions.metadata_mid, "MID")
+            };
         let metadata = match ParsedMeta::load_with_handle(
             &*file,
-            &regions.metadata,
+            &first_handle,
             expected_id,
             encryption.as_deref(),
         ) {
             Ok(m) => m,
-            Err(tail_err) => {
-                if let Some(mid_handle) = regions.metadata_mid {
+            Err(first_err) => {
+                if let Some(second_handle) = second {
                     log::warn!(
-                        "TAIL meta block unreadable for {} ({tail_err}); falling back to MID copy",
+                        "{first_name} meta block unreadable for {} ({first_err}); \
+                         falling back to {second_name} copy",
                         file_path.display(),
                     );
                     // Match the PR contract: when BOTH copies fail,
-                    // surface the original TAIL error (callers care
-                    // about the authoritative copy's failure mode).
-                    // The MID failure goes to the log so it's not
-                    // silently dropped from diagnostics.
+                    // surface the FIRST error (callers care about the
+                    // preferred copy's failure mode). The fallback
+                    // failure goes to the log so it's not silently
+                    // dropped from diagnostics.
                     // MID and TAIL are byte-identical: same `file_size`
                     // (= `*self.meta.file_pos`, only bumped inside
                     // `spill_block`, unchanged between the two writes),
                     // same `created_at` (snapshotted once in
-                    // `finish()`), same KV map. MID payload is usable
+                    // `finish()`), same KV map. Either payload is usable
                     // directly — no sentinel patching, no
                     // `std::fs::metadata` (which would also bypass the
                     // pluggable `Fs` backend).
                     match ParsedMeta::load_with_handle(
                         &*file,
-                        &mid_handle,
+                        &second_handle,
                         expected_id,
                         encryption.as_deref(),
                     ) {
-                        Ok(mid) => mid,
-                        Err(mid_err) => {
+                        Ok(m) => m,
+                        Err(second_err) => {
                             log::warn!(
-                                "MID meta block also unreadable for {}: {mid_err}; \
-                                 returning original TAIL error",
+                                "{second_name} meta block also unreadable for {}: {second_err}; \
+                                 returning original {first_name} error",
                                 file_path.display(),
                             );
-                            return Err(tail_err);
+                            return Err(first_err);
                         }
                     }
                 } else {
-                    return Err(tail_err);
+                    return Err(first_err);
                 }
             }
         };
