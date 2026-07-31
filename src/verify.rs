@@ -1259,6 +1259,24 @@ fn scan_sst_blocks(
             });
             continue;
         }
+        // Fail CLOSED on a section name this build does not know: the SFA
+        // trailer checksum is unkeyed, so a re-stamped TOC can RENAME a
+        // known section out of every reader's sight while its blocks still
+        // pass their byte-level checks. Report and skip the region — its
+        // role expectation is unknowable, so a walk would prove nothing.
+        let Some(expected_roles) = expected_section_roles(entry.name()) else {
+            errors.push(BlockVerifyError::TocCorrupted {
+                table_id,
+                path: path.to_path_buf(),
+                section_name: entry.name().to_vec(),
+                section_offset: start,
+                reason: String::from(
+                    "unrecognized block-format section name; a renamed TOC entry \
+                     hides a known section from every reader",
+                ),
+            });
+            continue;
+        };
         let mut ctx = WalkCtx {
             reader: &mut reader,
             table_id,
@@ -1270,7 +1288,7 @@ fn scan_sst_blocks(
             max_data_length: block_data_length_cap(max_enc_overhead),
             ecc,
             ecc_unrecognized,
-            expected_roles: expected_section_roles(entry.name()),
+            expected_roles,
         };
         walk_block_region(&mut ctx, start, end);
     }
@@ -1304,8 +1322,15 @@ const RAW_FORMAT_SECTIONS: &[&[u8]] = &[b"linked_blob_files", b"table_version", 
 /// checksum-clean block whose `block_type` was re-stamped (a filter block
 /// relabeled as Data) passes every byte-level check, so this is the only
 /// out-of-band detector before the heal's digest reconciliation would
-/// launder the forge into the manifest. `None` for a section name this
-/// build does not know — a future section must not be false-flagged.
+/// launder the forge into the manifest.
+///
+/// `None` for a section name this build does not know — the CALLER fails
+/// closed on it (an error, not a skipped check): the SFA trailer checksum is
+/// unkeyed, so a re-stamped TOC can RENAME a known section (hiding it from
+/// every reader — vanished range tombstones resurrect deleted ranges) while
+/// each block inside still passes its byte-level checks. A future section
+/// name therefore requires extending this map in the same change that adds
+/// the writer section.
 fn expected_section_roles(name: &[u8]) -> Option<&'static [crate::table::block::BlockType]> {
     use crate::table::block::BlockType;
     Some(match name {
@@ -1443,10 +1468,11 @@ struct WalkCtx<'a> {
     /// `meta_mid`) still size parity from `block_flags` and ARE walked.
     ecc_unrecognized: bool,
     /// Roles the current section's blocks may legitimately carry (from
-    /// [`expected_section_roles`]); `None` for an unknown section name. A
-    /// decoded header whose `block_type` is not in the list is reported —
-    /// see the helper's docs for why this check is load-bearing.
-    expected_roles: Option<&'static [crate::table::block::BlockType]>,
+    /// [`expected_section_roles`]; the caller fails closed on an unknown
+    /// name before building this context). A decoded header whose
+    /// `block_type` is not in the list is reported — see the helper's docs
+    /// for why this check is load-bearing.
+    expected_roles: &'static [crate::table::block::BlockType],
 }
 
 fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) {
@@ -1515,16 +1541,14 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         // byte-level check below, so the section-vs-role comparison is the
         // only out-of-band detector. Reported and then walked normally —
         // the header is internally valid, so the offsets stay trustworthy.
-        if let Some(roles) = ctx.expected_roles
-            && !roles.contains(&header.block_type)
-        {
+        if !ctx.expected_roles.contains(&header.block_type) {
             ctx.errors.push(BlockVerifyError::HeaderCorrupted {
                 table_id: ctx.table_id,
                 path: ctx.path.to_path_buf(),
                 offset,
                 reason: format!(
-                    "block role {:?} does not belong to this section (expected one of {roles:?})",
-                    header.block_type,
+                    "block role {:?} does not belong to this section (expected one of {:?})",
+                    header.block_type, ctx.expected_roles,
                 ),
             });
         }
