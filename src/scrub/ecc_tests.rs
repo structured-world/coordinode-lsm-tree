@@ -931,6 +931,56 @@ fn heal_in_place_does_not_restamp_over_diverged_meta_mirrors() -> crate::Result<
     Ok(())
 }
 
+/// The digest reconciliation must not restamp over a FORGED `seqno_bounds`
+/// map: a payload re-stamped to another structurally valid map (fresh block
+/// checksum + parity, `min <= max`, ascending offsets) passes every
+/// byte-level and framing check, yet `scan_since_seqno` trusts it to SKIP
+/// blocks — zeroed bounds silently omit a block's live entries from every
+/// CDC / incremental scan. Only a cross-check against the blocks' decoded
+/// entries can catch it before the refresh legitimizes the forge.
+#[test]
+fn heal_in_place_does_not_restamp_over_a_forged_seqno_bounds() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // An ECC tree WITH the seqno_bounds section (off by default).
+    let sst_path = {
+        let tree = open_ecc_tree(dir.path());
+        tree.update_runtime_config(|c| c.seqno_in_index = true)?;
+        for i in 0u64..2_000 {
+            tree.insert(format!("key-{i:06}"), format!("v{i:06}"), i);
+        }
+        tree.flush_active_memtable(2_000).expect("flush");
+        let binding = tree.version_history.read().latest_version();
+        let table = binding
+            .version
+            .iter_tables()
+            .next()
+            .expect("flush produced one table");
+        (*table.path).clone()
+    };
+
+    let tree = open_ecc_tree(dir.path());
+    crate::test_forge::forge_seqno_bounds_zeroed_entry(&sst_path, Some((8, 2)))?;
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| format!("{e:?}").contains("ChecksumRefreshFailed")),
+        "a forged seqno_bounds map must refuse the digest refresh: {report:?}",
+    );
+
+    // The manifest keeps the ORIGINAL digest, so the forge stays visible.
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the forged SST must keep failing verify_integrity: restamping its \
+         digest would let scans silently skip live blocks",
+    );
+    Ok(())
+}
+
 /// The digest reconciliation must not restamp over a FORGED `tli_tail`: a
 /// tail mirror re-encoded to a truncated handle list is independently
 /// checksum-, parity-, and role-consistent, so the out-of-band walk reads it

@@ -396,6 +396,109 @@ pub fn forge_section_block_role(
     Ok(())
 }
 
+/// ZEROES the LAST entry's `[seqno_min, seqno_max]` inside the
+/// `seqno_bounds` section's payload and re-stamps the block checksum (plus,
+/// for a parity-bearing SST, the descriptor-scheme parity trailer): the map
+/// stays structurally valid (`min <= max`, offsets untouched) and every
+/// byte-level check reads clean, while `scan_since_seqno` now SKIPS the
+/// block for any window above zero — the shape only a cross-check against
+/// the block's actually-decoded entries can catch. `shards` is the SST's
+/// descriptor scheme (`None` for a parity-less table).
+pub fn forge_seqno_bounds_zeroed_entry(
+    path: &std::path::Path,
+    shards: Option<(u8, u8)>,
+) -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::table::block::Header;
+
+    let mut bytes = std::fs::read(path)?;
+    let (pos, section_len) = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"seqno_bounds") else {
+            panic!("the SST must carry a seqno_bounds section");
+        };
+        (entry.pos(), entry.len())
+    };
+    let block_off = usize::try_from(pos).expect("section offset fits usize");
+    let Some(block) = bytes.get(block_off..) else {
+        panic!("seqno_bounds block within the file");
+    };
+    let mut cursor = block;
+    let header = Header::decode_from(&mut cursor)?;
+    let header_len = Header::header_len(header.block_type);
+    let payload_range =
+        block_off + header_len..block_off + header_len + header.data_length as usize;
+    {
+        let Some(payload) = bytes.get_mut(payload_range.clone()) else {
+            panic!("seqno_bounds payload within the file");
+        };
+        // Wire layout: [count u32 LE] then count x [offset u64 | min u64 | max u64].
+        let count = u32::from_le_bytes(
+            payload
+                .get(..4)
+                .expect("count prefix")
+                .try_into()
+                .expect("4 bytes"),
+        ) as usize;
+        assert!(count >= 1, "the map records at least one block");
+        let min_at = 4 + (count - 1) * 24 + 8;
+        let Some(minmax) = payload.get_mut(min_at..min_at + 16) else {
+            panic!("last entry's bounds within the payload");
+        };
+        minmax.fill(0);
+    }
+    let Some(payload) = bytes.get(payload_range.clone()) else {
+        panic!("seqno_bounds payload within the file");
+    };
+    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(payload));
+    let new_header = Header {
+        checksum: new_checksum,
+        ..header
+    };
+    let mut hdr_bytes = Vec::with_capacity(header_len);
+    new_header.encode_into(&mut hdr_bytes)?;
+    let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
+        panic!("seqno_bounds header within the file");
+    };
+    hdr_dst.copy_from_slice(&hdr_bytes);
+
+    // Recompute the descriptor-scheme parity trailer over the forged payload
+    // so a parity-bearing SST reads clean rather than as parity rot.
+    #[cfg(feature = "page_ecc")]
+    if let Some((data_shards, parity_shards)) = shards {
+        let payload_end = payload_range.end;
+        let Ok(section_len) = usize::try_from(section_len) else {
+            panic!("section length fits usize");
+        };
+        let frame_end = block_off + section_len;
+        if frame_end > payload_end {
+            let Some(payload) = bytes.get(payload_range) else {
+                panic!("seqno_bounds payload within the file");
+            };
+            let parity =
+                crate::ecc::encode_parity(payload, data_shards.into(), parity_shards.into())?;
+            assert_eq!(
+                frame_end - payload_end,
+                parity.len(),
+                "the frame's trailer length matches the descriptor scheme",
+            );
+            let Some(dst) = bytes.get_mut(payload_end..frame_end) else {
+                panic!("parity trailer within the file");
+            };
+            dst.copy_from_slice(&parity);
+        }
+    }
+    #[cfg(not(feature = "page_ecc"))]
+    let _ = (section_len, shards);
+
+    std::fs::write(path, &bytes)?;
+    Ok(())
+}
+
 /// REPLACES the `tli_tail` mirror with a re-encoded index block whose LAST
 /// handle was dropped, shifting the following `meta` section and re-stamping
 /// the TOC + trailer: every byte-level check (checksum, parity, role) stays
