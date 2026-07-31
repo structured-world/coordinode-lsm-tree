@@ -109,6 +109,77 @@ fn salvage_recovers_all_blocks_under_a_forged_tli_tail() -> crate::Result<()> {
     Ok(())
 }
 
+/// A source whose `seqno_bounds` section is PRESENT but unreadable (the very
+/// rot salvage exists for) must still salvage into a copy WITH the section:
+/// the recover-time load degrades the in-memory map to empty best-effort, so
+/// mirroring from the loaded map would silently drop the section and the
+/// recovered copy would lose its seqno-scoped block-skip. Section presence,
+/// not map content, drives the mirror; the writer re-derives the ranges from
+/// the re-emitted entries.
+#[test]
+fn salvage_keeps_seqno_bounds_when_the_source_section_is_unreadable() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_seqno_in_index(true);
+    for i in 0u64..50 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Rot one payload byte of the seqno_bounds block WITHOUT re-stamping its
+    // checksum: the recover-time load fails and degrades the map to empty.
+    {
+        let (pos,) = {
+            let mut f = std::fs::File::open(&source)?;
+            let reader = match crate::sfa::Reader::from_reader(&mut f) {
+                Ok(r) => r,
+                Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+            };
+            let Some(entry) = reader.toc().iter().find(|e| e.name() == b"seqno_bounds") else {
+                panic!("the source carries a seqno_bounds section");
+            };
+            (usize::try_from(entry.pos()).expect("pos fits usize"),)
+        };
+        let mut bytes = std::fs::read(&source)?;
+        // Past the block header, inside the payload.
+        let at = pos + 40;
+        let Some(slot) = bytes.get_mut(at) else {
+            panic!("payload byte within the file");
+        };
+        *slot ^= 0xFF;
+        std::fs::write(&source, bytes)?;
+    }
+
+    let report = salvage_sst(&source, dest, &fs)?;
+    assert_eq!(
+        report.entries_salvaged, 50,
+        "all rows recovered: {report:?}"
+    );
+    let Some(salvaged) = report.salvaged_path else {
+        panic!("the data blocks are intact, a copy must be written");
+    };
+
+    // The recovered copy carries a fresh, readable seqno_bounds section.
+    let mut f = std::fs::File::open(&salvaged)?;
+    let reader = match crate::sfa::Reader::from_reader(&mut f) {
+        Ok(r) => r,
+        Err(e) => panic!("reading the salvaged SFA trailer failed: {e:?}"),
+    };
+    assert!(
+        reader.toc().iter().any(|e| e.name() == b"seqno_bounds"),
+        "the salvaged copy must keep the seqno_bounds section",
+    );
+    Ok(())
+}
+
 /// When BOTH meta mirrors decode under the expected id but DIVERGE (a forged,
 /// internally-consistent tail: `compression#data` re-stamped None -> Lz4,
 /// `meta_mid` untouched), the tail-first open decodes every data block under
