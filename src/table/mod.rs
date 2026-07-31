@@ -1829,6 +1829,144 @@ impl Table {
         Ok(())
     }
 
+    /// Cross-checks the recorded `seqno_bounds` section against the ACTUAL
+    /// per-block seqno ranges derived from decoding every data block's
+    /// entries. The section's block is checksum-clean to the out-of-band
+    /// walk even when its PAYLOAD was re-stamped to another structurally
+    /// valid map, and `scan_since_seqno` trusts it to SKIP blocks — a forged
+    /// range silently omits a block's live entries from every CDC /
+    /// incremental scan. Every recorded block must exist, every data block
+    /// must be recorded, and each recorded range must equal the decoded one.
+    /// A no-op for tables without the section.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when the recorded map disagrees with
+    /// the decoded entries; any I/O / decode error from the full scan.
+    #[cfg(feature = "std")]
+    pub(crate) fn verify_seqno_bounds(&self) -> crate::Result<()> {
+        use crate::table::block::ParsedItem as _;
+
+        // Re-read the section FROM DISK: the in-memory map was loaded at
+        // recover time, so an on-disk re-stamp after the open (the very
+        // forge this check exists for) would be invisible to it. Unlike the
+        // best-effort recover load, an unreadable section here is an error —
+        // the callers are deciding whether to trust the file's bytes.
+        let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
+        let trailer = crate::sfa::Reader::from_reader(&mut file)?;
+        let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
+        let Some(sb_handle) = regions.seqno_bounds else {
+            return Ok(());
+        };
+        let seqno_bounds = {
+            let block = Block::from_file(
+                &*file,
+                sb_handle,
+                crate::table::block::BlockIdentity {
+                    table_id: self.metadata.id,
+                    block_type: BlockType::SeqnoBounds,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                &{
+                    let t = match self.encryption.as_deref() {
+                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                        None => crate::table::block::BlockTransform::PLAIN,
+                    };
+                    if let Some(ecc) = self.metadata.ecc_params {
+                        t.with_ecc(ecc)
+                    } else {
+                        t
+                    }
+                },
+            )?;
+            if block.header.block_type != BlockType::SeqnoBounds {
+                return Err(crate::Error::InvalidTag((
+                    "BlockType",
+                    block.header.block_type.into(),
+                )));
+            }
+            crate::table::seqno_bounds::SeqnoBoundsMap::decode(&block.data)?
+        };
+        if seqno_bounds.is_empty() {
+            return Ok(());
+        }
+        let mut checked = 0usize;
+        for handle in self.block_index.iter() {
+            let handle = handle?;
+            let block_handle = BlockHandle::new(handle.offset(), handle.size());
+            let Some(recorded) = seqno_bounds.bounds_for(block_handle.offset().0) else {
+                return Err(crate::Error::InvalidHeader(
+                    "seqno_bounds is missing a data block's entry",
+                ));
+            };
+            let derived = {
+                #[cfg(feature = "columnar")]
+                if self.metadata.columnar {
+                    let block = self.load_block(
+                        &block_handle,
+                        BlockType::Columnar,
+                        self.metadata.data_block_compression,
+                        #[cfg(zstd_any)]
+                        self.zstd_dictionary.as_deref(),
+                    )?;
+                    let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
+                    let entries = crate::table::columnar::column_batch_to_entries(&batch)?;
+                    let mut seqnos = entries.iter().map(|e| e.key.seqno);
+                    let Some(first) = seqnos.next() else {
+                        return Err(crate::Error::InvalidHeader(
+                            "columnar data block decodes to zero rows",
+                        ));
+                    };
+                    Some(seqnos.fold((first, first), |(lo, hi), s| (lo.min(s), hi.max(s))))
+                } else {
+                    None
+                }
+                #[cfg(not(feature = "columnar"))]
+                None::<(SeqNo, SeqNo)>
+            };
+            let derived = if let Some(d) = derived {
+                d
+            } else {
+                let block = self.load_block(
+                    &block_handle,
+                    BlockType::Data,
+                    self.metadata.data_block_compression,
+                    #[cfg(zstd_any)]
+                    self.zstd_dictionary.as_deref(),
+                )?;
+                let data_block =
+                    DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())?;
+                let mut seqnos = data_block
+                    .try_iter(self.comparator.clone())?
+                    .map(|p| p.seqno());
+                let Some(first) = seqnos.next() else {
+                    return Err(crate::Error::InvalidHeader(
+                        "row data block decodes to zero entries",
+                    ));
+                };
+                seqnos.fold((first, first), |(lo, hi), s| (lo.min(s), hi.max(s)))
+            };
+            if derived != recorded {
+                return Err(crate::Error::InvalidHeader(
+                    "seqno_bounds disagrees with the block's decoded entries",
+                ));
+            }
+            checked = checked
+                .checked_add(1)
+                .ok_or(crate::Error::InvalidHeader("seqno_bounds"))?;
+        }
+        // Every recorded entry matched some walked block (offsets are unique
+        // on both sides), so equal counts mean the map records EXACTLY the
+        // table's blocks — a forged extra entry cannot hide among them.
+        if checked != seqno_bounds.len() {
+            return Err(crate::Error::InvalidHeader(
+                "seqno_bounds carries entries for blocks the index does not hold",
+            ));
+        }
+        Ok(())
+    }
+
     /// Loads the filter block (if any) and checks the bloom filter.
     ///
     /// Returns `Ok(BloomResult::Skip)` if the bloom filter says the key is definitely absent

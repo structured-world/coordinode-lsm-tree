@@ -496,7 +496,11 @@ fn salvage_attempt(
     // indirections do not exist in the copy, so no source-only id can ever be
     // needed by it.
     let writer = crate::table::Writer::new(dest.clone(), table.metadata.id, 0, Arc::clone(fs))?
-        .mirror_from(&table.metadata, table.has_zone_map())
+        .mirror_from(
+            &table.metadata,
+            table.has_zone_map(),
+            !table.seqno_bounds.is_empty(),
+        )
         .use_encryption(options.encryption.clone());
     #[cfg(zstd_any)]
     let writer = writer.use_zstd_dictionary(options.zstd_dictionary.clone());

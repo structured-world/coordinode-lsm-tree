@@ -236,6 +236,13 @@ fn block_verify_verdict(
         // copy, so the recovered SST is rebuilt from a single, fully
         // re-verified handle list.
         BlockVerifyVerdict::Corrupt
+    } else if table.verify_seqno_bounds().is_err() {
+        // The seqno_bounds block is checksum-clean to the walk even when
+        // its payload was re-stamped to another structurally valid map, and
+        // scan_since_seqno trusts it to SKIP blocks — keeping the table
+        // would silently omit live entries from every seqno-scoped scan.
+        // Salvage re-derives the bounds from the re-emitted entries.
+        BlockVerifyVerdict::Corrupt
     } else if !report.is_ok() {
         // Parity-ONLY rot: every payload checksum verified clean, only the
         // recovery margin is dead. The data is fully readable, so it grades

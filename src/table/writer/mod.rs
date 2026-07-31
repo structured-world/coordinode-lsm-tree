@@ -678,6 +678,7 @@ impl Writer {
         self,
         meta: &crate::table::meta::ParsedMeta,
         has_zone_map: bool,
+        has_seqno_bounds: bool,
     ) -> Self {
         // Mirror ECC only when this build can actually emit parity. Without the
         // `page_ecc` feature `with_ecc()` is the identity (no trailer is ever
@@ -701,7 +702,11 @@ impl Writer {
             // recovered rows back into PAX blocks), rather than degrading to a
             // row-major copy.
             .use_columnar(meta.columnar)
-            .use_zone_map(has_zone_map);
+            .use_zone_map(has_zone_map)
+            // A source with a seqno_bounds section keeps its seqno-scoped
+            // block-skip: the writer re-derives the per-block ranges from
+            // the re-emitted entries (never copies the source's map).
+            .use_seqno_in_index(has_seqno_bounds);
         // Re-emit per-KV checksum footers under the source's algorithm when it
         // carried them (an SST is footer-homogeneous, so `AllLevels` reproduces
         // the same per-block footer state).
