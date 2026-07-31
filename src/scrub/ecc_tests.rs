@@ -931,6 +931,44 @@ fn heal_in_place_does_not_restamp_over_diverged_meta_mirrors() -> crate::Result<
     Ok(())
 }
 
+/// The digest reconciliation must not restamp over a FORGED `tli_tail`: a
+/// tail mirror re-encoded to a truncated handle list is independently
+/// checksum-, parity-, and role-consistent, so the out-of-band walk reads it
+/// clean — yet `read_tli` prefers it on the next recovery, and the hidden
+/// block's keys silently vanish. Only a comparison of the two DECODED TLI
+/// mirrors can catch it before the digest refresh legitimizes the forge.
+#[test]
+fn heal_in_place_does_not_restamp_over_a_forged_tli_tail() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _) = write_ecc_sst(dir.path());
+
+    // Open FIRST (the live table already loaded its index), then forge.
+    let tree = open_ecc_tree(dir.path());
+    crate::test_forge::forge_tli_tail_truncated(
+        &sst_path,
+        0,
+        Some(crate::table::block::EccParams::try_new(8, 2)?),
+    )?;
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| format!("{e:?}").contains("ChecksumRefreshFailed")),
+        "diverged TLI mirrors must refuse the digest refresh: {report:?}",
+    );
+
+    // The manifest keeps the ORIGINAL digest, so the forge stays visible.
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the forged SST must keep failing verify_integrity: restamping its \
+         digest would hide a mirror only the decoded comparison detects",
+    );
+    Ok(())
+}
+
 /// The digest reconciliation must not restamp over a RELABELED section
 /// block: a checksum-clean block whose `block_type` was forged (a filter
 /// block re-stamped as Data) passes payload and parity verification, so

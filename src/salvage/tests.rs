@@ -69,6 +69,46 @@ fn salvage_blob_file_resyncs_a_frame_after_a_length_rot() -> crate::Result<()> {
     Ok(())
 }
 
+/// A forged `tli_tail` that DROPS a handle passes every byte-level check
+/// (fresh checksum, valid framing, Index role): a walk following the tail
+/// would silently skip the hidden block and "recover" a copy missing its
+/// keys — no drop, no error, just vanished rows. Pins that the salvage open
+/// walks the HEAD `tli` copy, so a forged tail cannot steer which blocks
+/// are recovered.
+#[test]
+fn salvage_recovers_all_blocks_under_a_forged_tli_tail() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // Tiny block budget so the SST spills several data blocks (several TLI
+    // handles — the forge needs at least two).
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+    for i in 0u64..64 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    crate::test_forge::forge_tli_tail_truncated(&source, 0, None)?;
+
+    let report = salvage_sst(&source, dest, &fs)?;
+    assert!(
+        report.dropped.is_empty(),
+        "every block is intact, nothing may drop: {report:?}",
+    );
+    assert_eq!(
+        report.entries_salvaged, 64,
+        "the block the forged tail hides must still be recovered: {report:?}",
+    );
+    Ok(())
+}
+
 /// When BOTH meta mirrors decode under the expected id but DIVERGE (a forged,
 /// internally-consistent tail: `compression#data` re-stamped None -> Lz4,
 /// `meta_mid` untouched), the tail-first open decodes every data block under

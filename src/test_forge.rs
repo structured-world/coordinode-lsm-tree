@@ -396,6 +396,178 @@ pub fn forge_section_block_role(
     Ok(())
 }
 
+/// REPLACES the `tli_tail` mirror with a re-encoded index block whose LAST
+/// handle was dropped, shifting the following `meta` section and re-stamping
+/// the TOC + trailer: every byte-level check (checksum, parity, role) stays
+/// clean while the tail mirror now DECODES to a different handle list than
+/// the intact head `tli` — the shape only a decoded mirror comparison can
+/// catch. `read_tli` prefers the tail on the next recovery, so the forged
+/// mirror silently hides the last data block's keys. The SST must be
+/// unencrypted and its index uncompressed; `ecc` is the table's descriptor
+/// scheme (`None` for a parity-less SST) so the forged block carries valid
+/// parity where the original did.
+pub fn forge_tli_tail_truncated(
+    path: &std::path::Path,
+    table_id: crate::TableId,
+    ecc: Option<crate::table::block::EccParams>,
+) -> crate::Result<()> {
+    use crate::table::block::{Block, BlockIdentity, BlockType};
+    use crate::table::{BlockHandle, BlockOffset, IndexBlock, KeyedBlockHandle};
+
+    let identity = BlockIdentity {
+        table_id,
+        block_type: BlockType::Index,
+        dict_id: 0,
+        window_log: 0,
+    };
+    let transform = {
+        let t = crate::table::block::BlockTransform::from_parts(
+            crate::CompressionType::None,
+            None,
+            #[cfg(zstd_any)]
+            None,
+        )?;
+        if let Some(ecc) = ecc {
+            t.with_ecc(ecc)
+        } else {
+            t
+        }
+    };
+
+    // Locate the sections and decode the tail mirror's handle list.
+    let bytes = std::fs::read(path)?;
+    const TRAILER_SIZE: usize = 4 + 1 + 1 + 16 + 8 + 8;
+    let trailer_start = bytes.len() - TRAILER_SIZE;
+    let read_u64 = |bytes: &[u8], at: usize| {
+        let Some(b) = bytes.get(at..at + 8) else {
+            panic!("u64 field within the trailer");
+        };
+        u64::from_le_bytes(b.try_into().expect("8 bytes"))
+    };
+    let toc_pos = usize::try_from(read_u64(&bytes, trailer_start + 4 + 1 + 1 + 16))
+        .expect("toc_pos fits usize");
+    let (tail_pos, tail_len) = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"tli_tail") else {
+            panic!("the SST must carry a tli_tail mirror");
+        };
+        (
+            usize::try_from(entry.pos()).expect("pos fits usize"),
+            usize::try_from(entry.len()).expect("len fits usize"),
+        )
+    };
+    let handles: Vec<KeyedBlockHandle> = {
+        let file = crate::fs::Fs::open(
+            &crate::fs::StdFs,
+            path,
+            &crate::fs::FsOpenOptions::new().read(true),
+        )?;
+        let block = Block::from_file(
+            &*file,
+            BlockHandle::new(
+                BlockOffset(u64::try_from(tail_pos).expect("pos fits u64")),
+                u32::try_from(tail_len).expect("tail section fits u32"),
+            ),
+            identity,
+            &transform,
+        )?;
+        use crate::table::block::ParsedItem as _;
+        let index = IndexBlock::new(block);
+        let mut iter = index.iter(crate::comparator::default_comparator());
+        let mut out = Vec::new();
+        while let Some(item) = iter.next() {
+            out.push(item.materialize(index.as_slice()));
+        }
+        out
+    };
+    assert!(
+        handles.len() >= 2,
+        "the forge needs at least two handles so dropping one leaves a valid index",
+    );
+
+    // Re-encode without the LAST handle and frame it as a fresh Index block.
+    let truncated = handles.get(..handles.len() - 1).expect("non-empty prefix");
+    let payload = IndexBlock::encode_into_vec(truncated)?;
+    let mut forged = Vec::new();
+    Block::write_into(&mut forged, &payload, identity, &transform)?;
+
+    // Rebuild the file: shift the trailing sections (`meta`), fix the TOC's
+    // `tli_tail` length + shifted positions, re-stamp the trailer.
+    let delta = forged.len() as i64 - tail_len as i64;
+    let mut out = Vec::with_capacity(bytes.len());
+    out.extend_from_slice(bytes.get(..tail_pos).expect("pre-tail prefix"));
+    out.extend_from_slice(&forged);
+    out.extend_from_slice(
+        bytes
+            .get(tail_pos + tail_len..toc_pos)
+            .expect("post-tail sections"),
+    );
+    let new_toc_pos = out.len();
+
+    // Rebuild the TOC from the old one, patching lengths/positions.
+    let toc_len = usize::try_from(read_u64(&bytes, trailer_start + 4 + 1 + 1 + 16 + 8))
+        .expect("toc_len fits usize");
+    let toc = bytes.get(toc_pos..toc_pos + toc_len).expect("TOC region");
+    assert_eq!(toc.get(..4), Some(&b"TOC!"[..]), "TOC magic");
+    let count = u32::from_le_bytes(toc.get(4..8).expect("count").try_into().expect("4 bytes"));
+    let mut new_toc = Vec::with_capacity(toc.len());
+    new_toc.extend_from_slice(toc.get(..8).expect("TOC header"));
+    let mut at = 8usize;
+    for _ in 0..count {
+        let pos = read_u64(toc, at);
+        let len = read_u64(toc, at + 8);
+        let name_len = usize::from(u16::from_le_bytes(
+            toc.get(at + 16..at + 18)
+                .expect("name_len")
+                .try_into()
+                .expect("2 bytes"),
+        ));
+        let name = toc.get(at + 18..at + 18 + name_len).expect("name");
+        let (new_pos, new_len) = if name == b"tli_tail" {
+            (pos, forged.len() as u64)
+        } else if pos > tail_pos as u64 {
+            (
+                pos.checked_add_signed(delta).expect("shifted pos fits u64"),
+                len,
+            )
+        } else {
+            (pos, len)
+        };
+        new_toc.extend_from_slice(&new_pos.to_le_bytes());
+        new_toc.extend_from_slice(&new_len.to_le_bytes());
+        new_toc.extend_from_slice(toc.get(at + 16..at + 18 + name_len).expect("name field"));
+        at += 18 + name_len;
+    }
+    let fresh = {
+        let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
+        hasher.update(&new_toc);
+        hasher.digest128()
+    };
+    out.extend_from_slice(&new_toc);
+    out.extend_from_slice(
+        bytes
+            .get(trailer_start..trailer_start + 4 + 1 + 1)
+            .expect("trailer head"),
+    );
+    out.extend_from_slice(&fresh.to_le_bytes());
+    out.extend_from_slice(
+        &u64::try_from(new_toc_pos)
+            .expect("toc_pos fits u64")
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(
+        &u64::try_from(new_toc.len())
+            .expect("TOC length fits u64")
+            .to_le_bytes(),
+    );
+    std::fs::write(path, &out)?;
+    Ok(())
+}
+
 /// Shared core: flips `payload[len - flip_from_end]` of the FIRST data
 /// block of the SST at `path`, then recomputes the block header checksum
 /// over the altered payload so block-level verification reads clean.
