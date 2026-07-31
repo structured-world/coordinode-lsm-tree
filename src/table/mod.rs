@@ -448,6 +448,16 @@ impl Table {
         self.regions.zone_map.is_some()
     }
 
+    /// Whether this segment carries a parallel `seqno_bounds` section. Unlike
+    /// the loaded map (best-effort at recover time — an unreadable section
+    /// degrades it to empty), this reflects actual SECTION presence, so a
+    /// source with rotted bounds still salvages into a copy WITH the section
+    /// (the writer re-derives the ranges from the re-emitted entries).
+    #[must_use]
+    pub fn has_seqno_bounds(&self) -> bool {
+        self.regions.seqno_bounds.is_some()
+    }
+
     /// The fraction of this segment's rows masked by its positional
     /// delete-bitmap, as a percentage in `0..=100`, or `None` when the segment
     /// carries no delete-bitmap (nothing masked).

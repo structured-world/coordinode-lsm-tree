@@ -499,7 +499,7 @@ fn salvage_attempt(
         .mirror_from(
             &table.metadata,
             table.has_zone_map(),
-            !table.seqno_bounds.is_empty(),
+            table.has_seqno_bounds(),
         )
         .use_encryption(options.encryption.clone());
     #[cfg(zstd_any)]
