@@ -289,6 +289,84 @@ fn blob_scanner_rejects_oversized_on_disk_len() -> crate::Result<()> {
     Ok(())
 }
 
+/// Rot that INFLATES a V3 frame's declared `on_disk_val_len` past the data
+/// section must not cost the readable tail: like a V3 checksum miss, the
+/// declared lengths are untrusted (no header CRC), so the scanner must
+/// resynchronize at the next frame magic instead of terminating — otherwise
+/// blob salvage drops every intact later record over one rotted length field.
+#[test]
+fn blob_scanner_v3_oversized_len_resyncs_to_next_frame() -> crate::Result<()> {
+    use crate::io::{LittleEndian, WriteBytesExt};
+    use std::io::Write;
+
+    let dir = tempdir()?;
+    let blob_file_path = dir.path().join("0");
+
+    let frames: [(&[u8], &[u8]); 2] = [(b"aaa", b"first_value"), (b"bbb", b"second_value")];
+    {
+        let file = std::fs::File::create(&blob_file_path)?;
+        let mut sfa_writer = crate::sfa::Writer::from_writer(file);
+        sfa_writer.start("data")?;
+        for (key, value) in frames {
+            let checksum = {
+                let mut hasher = xxhash_rust::xxh3::Xxh3::default();
+                hasher.update(key);
+                hasher.update(value);
+                hasher.digest128()
+            };
+            sfa_writer.write_all(b"BLOB")?;
+            sfa_writer.write_u128::<LittleEndian>(checksum)?;
+            sfa_writer.write_u64::<LittleEndian>(7)?; // seqno
+            #[expect(clippy::cast_possible_truncation, reason = "test key fits u16")]
+            sfa_writer.write_u16::<LittleEndian>(key.len() as u16)?;
+            #[expect(clippy::cast_possible_truncation, reason = "test value fits u32")]
+            sfa_writer.write_u32::<LittleEndian>(value.len() as u32)?;
+            #[expect(clippy::cast_possible_truncation, reason = "test value fits u32")]
+            sfa_writer.write_u32::<LittleEndian>(value.len() as u32)?;
+            sfa_writer.write_all(key)?;
+            sfa_writer.write_all(value)?;
+        }
+
+        sfa_writer.start("meta")?;
+        let metadata = crate::vlog::blob_file::meta::Metadata {
+            id: 0,
+            version: 3,
+            created_at: 0,
+            item_count: 2,
+            total_compressed_bytes: 23,
+            total_uncompressed_bytes: 23,
+            key_range: crate::KeyRange::new((b"aaa"[..].into(), b"bbb"[..].into())),
+            compression: crate::CompressionType::None,
+        };
+        metadata.encode_into(&mut sfa_writer)?;
+        sfa_writer.into_inner()?.sync_all()?;
+    }
+
+    // Inflate frame 1's on_disk_val_len field (frame offset 34..38: magic 4 +
+    // checksum 16 + seqno 8 + key_len 2 + real_val_len 4) so its declared end
+    // runs past the data section.
+    {
+        let mut bytes = std::fs::read(&blob_file_path)?;
+        bytes[34..38].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&blob_file_path, bytes)?;
+    }
+
+    let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
+    let first = scanner.next().unwrap();
+    assert!(
+        matches!(first, Err(crate::Error::InvalidHeader("Blob"))),
+        "the oversized declared length is still rejected: {first:?}",
+    );
+    let second = scanner
+        .next()
+        .expect("the intact second frame must survive the rotted first")?;
+    assert_eq!(second.key, Slice::from(&b"bbb"[..]));
+    assert_eq!(second.value, Slice::from(&b"second_value"[..]));
+    assert!(scanner.next().is_none());
+
+    Ok(())
+}
+
 /// Scanner rejects frames with invalid magic (neither V3 nor V4).
 #[test]
 fn blob_scanner_rejects_invalid_magic() -> crate::Result<()> {
