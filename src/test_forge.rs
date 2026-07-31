@@ -37,6 +37,60 @@ pub fn forge_restamped_data_block(path: &std::path::Path) -> crate::Result<()> {
     flip_and_restamp_first_data_block(path, 1)
 }
 
+/// RENAMES an SFA TOC section (same-length name) and re-stamps the trailer's
+/// TOC checksum: the archive stays internally consistent while a section the
+/// verifier knows disappears behind an unrecognized name — the shape only a
+/// fail-closed unknown-section check can catch (every block inside still
+/// passes its own byte-level checks).
+pub fn forge_section_name(path: &std::path::Path, from: &[u8], to: &[u8]) -> crate::Result<()> {
+    assert_eq!(from.len(), to.len(), "the rename must keep the name length");
+
+    let mut bytes = std::fs::read(path)?;
+    // SFA trailer layout (fixed size, at the very end of the file):
+    // magic "SFA!" | version u8 | checksum_type u8 | toc_checksum u128 LE |
+    // toc_pos u64 LE | toc_len u64 LE.
+    const TRAILER_SIZE: usize = 4 + 1 + 1 + 16 + 8 + 8;
+    let trailer_start = bytes.len() - TRAILER_SIZE;
+    let read_u64 = |bytes: &[u8], at: usize| {
+        let Some(b) = bytes.get(at..at + 8) else {
+            panic!("u64 field within the trailer");
+        };
+        u64::from_le_bytes(b.try_into().expect("8 bytes"))
+    };
+    let toc_pos = usize::try_from(read_u64(&bytes, trailer_start + 4 + 1 + 1 + 16))
+        .expect("toc_pos fits usize");
+    let toc_len = usize::try_from(read_u64(&bytes, trailer_start + 4 + 1 + 1 + 16 + 8))
+        .expect("toc_len fits usize");
+
+    {
+        let Some(toc) = bytes.get_mut(toc_pos..toc_pos + toc_len) else {
+            panic!("TOC region within the file");
+        };
+        let Some(name_at) = toc.windows(from.len()).position(|w| w == from) else {
+            panic!("section name present in the TOC");
+        };
+        let Some(dst) = toc.get_mut(name_at..name_at + to.len()) else {
+            panic!("section name within the TOC");
+        };
+        dst.copy_from_slice(to);
+    }
+
+    let Some(toc) = bytes.get(toc_pos..toc_pos + toc_len) else {
+        panic!("TOC region within the file");
+    };
+    let fresh = {
+        let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
+        hasher.update(toc);
+        hasher.digest128()
+    };
+    let Some(dst) = bytes.get_mut(trailer_start + 4 + 1 + 1..trailer_start + 4 + 1 + 1 + 16) else {
+        panic!("toc_checksum within the trailer");
+    };
+    dst.copy_from_slice(&fresh.to_le_bytes());
+    std::fs::write(path, &bytes)?;
+    Ok(())
+}
+
 /// REPLACES the value of `key` inside the TAIL `meta` block's payload with
 /// `forged_value` (same length), then re-stamps the block checksum and (on a
 /// parity-bearing build) recomputes the RS(4,2) trailer: the tail mirror
@@ -147,7 +201,10 @@ pub fn forge_tail_meta_value(
 /// iterating it yields FEWER entries than the trailer declares, modelling a
 /// truncated / partially-decodable entry region that a count cross-check
 /// must catch (the entry decoder turns a mid-stream parse failure into an
-/// ordinary end of iteration). The SST must be uncompressed.
+/// ordinary end of iteration). The SST must be uncompressed, and must carry
+/// NO parity trailer: this helper re-stamps only the header checksum (unlike
+/// [`forge_tail_meta_value`]), so a parity-bearing block would additionally
+/// read as parity rot rather than as a clean-but-under-decoding block.
 pub fn forge_inflated_item_count(path: &std::path::Path) -> crate::Result<()> {
     use crate::coding::{Decode, Encode};
     use crate::table::block::Header;

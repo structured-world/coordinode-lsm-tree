@@ -738,7 +738,10 @@ fn heal_in_place_rebinds_the_descriptor_cache_after_an_unshare() -> crate::Resul
     let dir = tempfile::tempdir()?;
     let (sst_path, block) = write_ecc_sst(dir.path());
 
-    // Hard-link the SST so the FIRST heal takes the unshare path.
+    // Rot one parity-trailer byte so the FIRST heal actually WRITES (the
+    // unshare runs lazily, only before the first write-back), then
+    // hard-link the SST so that write takes the unshare path.
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
     let cp_dir = tempfile::tempdir_in(dir.path().parent().expect("tempdir has a parent"))?;
     std::fs::hard_link(&sst_path, cp_dir.path().join("checkpoint.sst"))?;
 
@@ -748,7 +751,11 @@ fn heal_in_place_rebinds_the_descriptor_cache_after_an_unshare() -> crate::Resul
     // unshare renames a private copy over the live path).
     assert!(tree.get("key-000000", crate::SeqNo::MAX)?.is_some());
     let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
-    assert!(report.is_ok(), "clean tree heals clean: {report:?}");
+    assert!(report.is_ok(), "the trailer rebuild succeeds: {report:?}");
+    assert!(
+        report.blocks_healed_in_place >= 1,
+        "the first pass must write, so the unshare runs: {report:?}",
+    );
 
     // A recoverable payload fault lands on the LIVE (post-rename) inode.
     let corrupt_pos = block.offset().0 as usize + Header::MIN_LEN + 3;
@@ -829,6 +836,55 @@ fn heal_in_place_rebinds_the_descriptor_cache_when_the_directory_sync_fails() ->
         "the live fault is ECC-recovered and healed in place: {report:?}",
     );
     assert!(report.is_ok(), "{report:?}");
+    Ok(())
+}
+
+/// The digest reconciliation must not restamp over a RENAMED section: a
+/// TOC whose `filter` entry was re-labelled to an unknown name (trailer
+/// checksum re-stamped) hides the section from every reader while each
+/// block inside still passes its byte-level checks — an unknown
+/// block-format section must FAIL the walk closed, or the restamp would
+/// legitimize an archive whose known sections silently vanished.
+#[test]
+fn heal_in_place_does_not_restamp_over_a_renamed_section() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _) = write_ecc_sst(dir.path());
+
+    // Open FIRST (lazy filters, so the missing `filter` section is not
+    // touched by the scan), then rename the section in the TOC.
+    let crate::AnyTree::Standard(tree) = crate::Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .page_ecc(true)
+    .ecc_scheme(EccScheme::ReedSolomon {
+        data_shards: 8,
+        parity_shards: 2,
+    })
+    .filter_block_pinning_policy(crate::config::PinningPolicy::new([false]))
+    .open()
+    .expect("open ecc tree with lazy filters") else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+    crate::test_forge::forge_section_name(&sst_path, b"filter", b"filtex")?;
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| format!("{e:?}").contains("ChecksumRefreshFailed")),
+        "an unknown section name must refuse the digest refresh: {report:?}",
+    );
+
+    // The manifest keeps the ORIGINAL digest, so the forge stays visible.
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the renamed-section SST must keep failing verify_integrity: \
+         restamping its digest would legitimize the vanished section",
+    );
     Ok(())
 }
 
