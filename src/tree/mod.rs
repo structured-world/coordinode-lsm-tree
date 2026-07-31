@@ -4128,8 +4128,16 @@ impl Tree {
                 // `{id}.healtmp-{n}` copy that is renamed over the live path;
                 // a hard crash between its creation and the rename leaves the
                 // artifact behind. It is never referenced by any manifest, so
-                // sweep it instead of failing the id parse below.
-                if table_file_name.contains(".healtmp") {
+                // sweep it instead of failing the id parse below. Only the
+                // EXACT artifact shape (numeric id, numeric sequence) is owned
+                // cleanup state — a foreign name that merely contains
+                // `.healtmp` (an operator backup like `0.healtmp.backup`) must
+                // fall through to the id parse and fail recovery unharmed,
+                // never be deleted.
+                if let Some((id_part, seq_part)) = table_file_name.split_once(".healtmp-")
+                    && id_part.parse::<TableId>().is_ok()
+                    && seq_part.parse::<u64>().is_ok()
+                {
                     log::warn!(
                         "Removing abandoned heal copy: {}",
                         table_file_path.display()
