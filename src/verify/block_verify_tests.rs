@@ -728,15 +728,24 @@ fn walk_block_region_reports_data_read_error_on_truncated_data_segment() {
     let table_id: TableId = 42;
     let scan = scan_sst_blocks(&fs, path, table_id, 0, None, false)
         .expect("forged SFA must parse cleanly");
+    // The inflated section length ALSO breaks the TOC tiling invariant
+    // (the declared section end runs past where the TOC begins), so the
+    // walk reports the tiling finding alongside the read error.
     assert_eq!(
         scan.errors.len(),
-        1,
-        "expected exactly one error, got {:?}",
+        2,
+        "expected the tiling finding plus the read error, got {:?}",
         scan.errors,
     );
-    let err = scan.errors.first().unwrap();
     assert!(
-        matches!(
+        scan.errors
+            .iter()
+            .any(|e| matches!(e, BlockVerifyError::TocCorrupted { .. })),
+        "the inflated section length must break the TOC tiling: {:?}",
+        scan.errors,
+    );
+    assert!(
+        scan.errors.iter().any(|err| matches!(
             err,
             BlockVerifyError::DataReadError {
                 table_id: t,
@@ -744,9 +753,10 @@ fn walk_block_region_reports_data_read_error_on_truncated_data_segment() {
                 data_length: d,
                 ..
             } if *t == table_id && *d == DATA_LENGTH,
-        ),
+        )),
         "expected DataReadError {{ table_id: {table_id}, offset: 0, \
-         data_length: {DATA_LENGTH}, .. }}; got {err:?}",
+         data_length: {DATA_LENGTH}, .. }}; got {:?}",
+        scan.errors,
     );
     assert_eq!(
         scan.blocks_scanned, 1,
@@ -1035,20 +1045,30 @@ fn walk_block_region_reports_header_crossing_section_boundary() {
     let table_id: TableId = 7;
     let scan = scan_sst_blocks(&fs, path, table_id, 0, None, false)
         .expect("forged SFA must parse cleanly");
+    // The shrunken section length ALSO breaks the TOC tiling invariant
+    // (the sections no longer reach the TOC start), so the walk reports
+    // the tiling finding alongside the boundary violation.
     assert_eq!(
         scan.errors.len(),
-        1,
-        "expected exactly one error, got {:?}",
+        2,
+        "expected the tiling finding plus the boundary violation, got {:?}",
         scan.errors,
     );
-    let err = scan.errors.first().unwrap();
     assert!(
-        matches!(
+        scan.errors
+            .iter()
+            .any(|e| matches!(e, BlockVerifyError::TocCorrupted { .. })),
+        "the shrunken section length must break the TOC tiling: {:?}",
+        scan.errors,
+    );
+    assert!(
+        scan.errors.iter().any(|err| matches!(
             err,
             BlockVerifyError::HeaderCorrupted { table_id: t, offset: 0, reason, .. }
                 if *t == table_id && reason.contains("extends past the section end"),
-        ),
-        "expected a section-boundary HeaderCorrupted; got {err:?}",
+        )),
+        "expected a section-boundary HeaderCorrupted; got {:?}",
+        scan.errors,
     );
 }
 

@@ -338,9 +338,10 @@ fn blob_scanner_header_crc_rot_resyncs_to_next_frame() -> crate::Result<()> {
         matches!(first, Err(crate::Error::HeaderCrcMismatch { .. })),
         "the rotted length field fails the header CRC: {first:?}",
     );
-    let second = scanner
-        .next()
-        .expect("the intact second frame must survive the rotted first")?;
+    let Some(second) = scanner.next() else {
+        panic!("the intact second frame must survive the rotted first");
+    };
+    let second = second?;
     assert_eq!(second.key, Slice::from(&b"bbb"[..]));
     assert_eq!(second.value, Slice::from(&b"second_value"[..]));
     assert!(scanner.next().is_none());
@@ -369,9 +370,10 @@ fn blob_scanner_magic_rot_resyncs_to_next_frame() -> crate::Result<()> {
         matches!(first, Err(crate::Error::InvalidHeader("Blob"))),
         "the rotted magic is rejected: {first:?}",
     );
-    let second = scanner
-        .next()
-        .expect("the intact second frame must survive the rotted first")?;
+    let Some(second) = scanner.next() else {
+        panic!("the intact second frame must survive the rotted first");
+    };
+    let second = second?;
     assert_eq!(second.key, Slice::from(&b"bbb"[..]));
     assert_eq!(second.value, Slice::from(&b"second_value"[..]));
     assert!(scanner.next().is_none());

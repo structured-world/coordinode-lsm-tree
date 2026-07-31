@@ -580,9 +580,8 @@ pub fn forge_tli_tail_truncated(
         )?;
         use crate::table::block::ParsedItem as _;
         let index = IndexBlock::new(block);
-        let mut iter = index.iter(crate::comparator::default_comparator());
         let mut out = Vec::new();
-        while let Some(item) = iter.next() {
+        for item in index.iter(crate::comparator::default_comparator()) {
             out.push(item.materialize(index.as_slice()));
         }
         out
@@ -600,7 +599,8 @@ pub fn forge_tli_tail_truncated(
 
     // Rebuild the file: shift the trailing sections (`meta`), fix the TOC's
     // `tli_tail` length + shifted positions, re-stamp the trailer.
-    let delta = forged.len() as i64 - tail_len as i64;
+    let delta = i64::try_from(forged.len()).expect("forged block fits i64")
+        - i64::try_from(tail_len).expect("tail section fits i64");
     let mut out = Vec::with_capacity(bytes.len());
     out.extend_from_slice(bytes.get(..tail_pos).expect("pre-tail prefix"));
     out.extend_from_slice(&forged);
