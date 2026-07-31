@@ -135,7 +135,7 @@ impl Scanner {
 
         // Scan in chunks, overlapping by MAGIC_LEN - 1 bytes so a magic
         // straddling two chunks is still found.
-        let mut buf = [0u8; 64 * 1024];
+        let mut buf = alloc::vec![0u8; 64 * 1024];
         let mut pos = frame_offset + 1;
         while pos < self.data_end {
             self.inner.seek(SeekFrom::Start(pos))?;
@@ -155,7 +155,7 @@ impl Scanner {
                 self.inner.seek(SeekFrom::Start(pos + hit as u64))?;
                 return Ok(());
             }
-            if want <= MAGIC_LEN - 1 {
+            if want < MAGIC_LEN {
                 break;
             }
             pos += (want - (MAGIC_LEN - 1)) as u64;

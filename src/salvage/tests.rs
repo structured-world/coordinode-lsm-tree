@@ -47,7 +47,10 @@ fn salvage_blob_file_resyncs_a_legacy_v3_frame_after_a_length_rot() -> crate::Re
         let Some(entry) = reader.toc().iter().find(|e| e.name() == b"data") else {
             panic!("the blob file carries a data section");
         };
-        usize::try_from(entry.pos()).expect("data offset fits usize")
+        let Ok(pos) = usize::try_from(entry.pos()) else {
+            panic!("data offset fits usize");
+        };
+        pos
     };
     let frame_len = 38 + 4 + 8;
     let kl_off = data_start + frame_len + 4 + 16 + 8;
@@ -72,7 +75,9 @@ fn salvage_blob_file_resyncs_a_legacy_v3_frame_after_a_length_rot() -> crate::Re
     );
 
     // The recovered copy carries exactly the two intact records.
-    let salvaged = report.salvaged_path.expect("two records were salvaged");
+    let Some(salvaged) = report.salvaged_path else {
+        panic!("two records were salvaged");
+    };
     let keys: Vec<Vec<u8>> = BlobScanner::new(&salvaged, &*fs, 0)?
         .map(|r| r.map(|e| e.key.to_vec()))
         .collect::<crate::Result<_>>()?;
@@ -108,7 +113,7 @@ fn salvage_drops_a_row_block_that_decodes_fewer_entries_than_declared() -> crate
     // checksum: iteration now yields fewer entries than the block declares.
     crate::test_forge::forge_inflated_item_count(&source)?;
 
-    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    let report = salvage_sst(&source, dest, &fs)?;
     assert_eq!(
         report.entries_salvaged, 0,
         "an under-decoding block must not contribute recovered entries: {report:?}",
@@ -3299,12 +3304,18 @@ fn build_blob(
 }
 
 /// Builds a LEGACY V3 blob file at `path` (frames without the header CRC the
-/// V4 writer stamps): magic "BLOB" | xxh3-128(key || value) | seqno u64 |
-/// key_len u16 | real_val_len u32 | on_disk_val_len u32 | key | value,
+/// V4 writer stamps): `magic "BLOB" | xxh3-128(key || value) | seqno u64 |
+/// key_len u16 | real_val_len u32 | on_disk_val_len u32 | key | value`,
 /// wrapped in an SFA "data" section like the real writer emits.
 fn build_blob_v3(path: &std::path::Path, records: &[(&[u8], &[u8])]) -> crate::Result<()> {
     use std::io::Write as _;
 
+    let Some((first, _)) = records.first() else {
+        panic!("records non-empty");
+    };
+    let Some((last, _)) = records.last() else {
+        panic!("records non-empty");
+    };
     let file = std::fs::File::create(path)?;
     let mut w = crate::sfa::Writer::from_writer(file);
     w.start("data")?;
@@ -3336,15 +3347,7 @@ fn build_blob_v3(path: &std::path::Path, records: &[(&[u8], &[u8])]) -> crate::R
         item_count: records.len() as u64,
         total_compressed_bytes: 0,
         total_uncompressed_bytes: 0,
-        key_range: crate::KeyRange::new((
-            records
-                .first()
-                .expect("records non-empty")
-                .0
-                .to_vec()
-                .into(),
-            records.last().expect("records non-empty").0.to_vec().into(),
-        )),
+        key_range: crate::KeyRange::new((first.to_vec().into(), last.to_vec().into())),
         compression: crate::CompressionType::None,
     };
     meta.encode_into(&mut w)?;
