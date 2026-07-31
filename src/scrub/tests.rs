@@ -305,7 +305,18 @@ fn heal_scrub_does_not_reconcile_a_non_ecc_table() -> crate::Result<()> {
     else {
         unreachable!("standard tree configured");
     };
-    let _report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    // The reconciliation must be SKIPPED, not attempted-and-failed: a
+    // ChecksumRefreshFailed finding here would mean the non-ECC gate in the
+    // scan regressed even if the digest itself survived.
+    assert!(
+        !report
+            .errors
+            .iter()
+            .any(|e| format!("{e:?}").contains("ChecksumRefreshFailed")),
+        "a non-ECC table must skip the digest reconciliation entirely, not \
+         attempt and fail it: {report:?}",
+    );
 
     // The manifest keeps the ORIGINAL digest: on a non-ECC table it is the
     // ONLY detector of a re-stamped in-band alteration.
