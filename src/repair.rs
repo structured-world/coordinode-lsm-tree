@@ -383,6 +383,9 @@ fn try_salvage_table(
             // (the corrupt original stays in quarantine). An operator who
             // accepts the degradation salvages it explicitly via the opt-in.
             allow_delete_resurrection: false,
+            // The recovered SST is persisted at the tree's configured
+            // durability, matching the manifest rebuilt around it.
+            sync_mode: config.sync_mode,
         },
     )?;
     if report.salvaged_path.is_none() {

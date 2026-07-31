@@ -67,6 +67,12 @@ pub struct SalvageOptions {
     /// salvage closed instead, preserving delete semantics at the cost of
     /// recovering nothing from that SST.
     pub allow_delete_resurrection: bool,
+    /// Durability mode for the recovered copy's final sync (file + parent
+    /// directory). [`crate::repair`] passes the tree's `Config::sync_mode`,
+    /// so a Full-durability repair persists the salvaged SST as strongly as
+    /// the manifest it rebuilds around it; the standalone default is
+    /// [`crate::SyncMode::Normal`].
+    pub sync_mode: crate::fs::SyncMode,
 }
 
 /// Why a block could not be salvaged and had to be dropped.
@@ -501,6 +507,7 @@ fn salvage_attempt(
             table.has_zone_map(),
             table.has_seqno_bounds(),
         )
+        .use_sync_mode(options.sync_mode)
         .use_encryption(options.encryption.clone());
     #[cfg(zstd_any)]
     let writer = writer.use_zstd_dictionary(options.zstd_dictionary.clone());

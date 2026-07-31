@@ -3202,6 +3202,7 @@ fn salvage_recovers_an_encrypted_sst_with_the_provider() -> crate::Result<()> {
         table_id: 0,
         expected_stored_id: None,
         allow_delete_resurrection: false,
+        sync_mode: crate::fs::SyncMode::Normal,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
     assert_eq!(
@@ -3294,6 +3295,7 @@ fn salvage_recovers_a_dictionary_sst_with_the_dictionary() -> crate::Result<()> 
         table_id: 0,
         expected_stored_id: None,
         allow_delete_resurrection: false,
+        sync_mode: crate::fs::SyncMode::Normal,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
     assert_eq!(
@@ -3379,6 +3381,7 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
         table_id: 0,
         expected_stored_id: None,
         allow_delete_resurrection: false,
+        sync_mode: crate::fs::SyncMode::Normal,
     };
     let recovered_wrong = salvage_sst_with_options(&source, dest.clone(), &fs, &wrong)
         .map_or(0, |r| r.entries_salvaged);
@@ -3395,6 +3398,7 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
         table_id: TID,
         expected_stored_id: None,
         allow_delete_resurrection: false,
+        sync_mode: crate::fs::SyncMode::Normal,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
     assert_eq!(
