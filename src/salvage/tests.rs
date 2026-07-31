@@ -69,6 +69,53 @@ fn salvage_blob_file_resyncs_a_frame_after_a_length_rot() -> crate::Result<()> {
     Ok(())
 }
 
+/// When BOTH meta mirrors decode under the expected id but DIVERGE (a forged,
+/// internally-consistent tail: `compression#data` re-stamped None -> Lz4,
+/// `meta_mid` untouched), the tail-first open decodes every data block under
+/// the wrong codec, drops them all, and repair would quarantine a table whose
+/// intact MID mirror recovers everything. Salvage must arbitrate the mirrors
+/// and keep the attempt that recovers more.
+#[cfg(feature = "lz4")]
+#[test]
+fn salvage_arbitrates_divergent_meta_mirrors() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0u64..100 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Forge the TAIL meta's data-block compression from the written None
+    // (tag 0) to Lz4 (tag 1) — fresh block checksum, `meta_mid` untouched.
+    crate::test_forge::forge_tail_meta_value(&source, b"compression#data", &[1])?;
+
+    let report = salvage_sst(&source, dest, &fs)?;
+    assert!(report.blocks_total > 0, "the walk saw the data blocks");
+    assert_eq!(
+        report.blocks_salvaged, report.blocks_total,
+        "every block is recoverable through the intact MID mirror: {report:?}",
+    );
+    assert_eq!(
+        report.entries_salvaged, 100,
+        "all rows recovered: {report:?}"
+    );
+    assert!(
+        report.dropped.is_empty(),
+        "nothing should drop under the intact mirror: {report:?}",
+    );
+    assert!(report.salvaged_path.is_some(), "a copy was written");
+    Ok(())
+}
+
 /// A checksum-clean row block that ITERATES to fewer entries than its
 /// trailer declares must be dropped, not marked recovered: the entry decoder
 /// turns a mid-stream parse failure into an ordinary end of iteration, so a
