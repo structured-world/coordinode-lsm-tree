@@ -37,6 +37,69 @@ pub fn forge_restamped_data_block(path: &std::path::Path) -> crate::Result<()> {
     flip_and_restamp_first_data_block(path, 1)
 }
 
+/// INFLATES the trailer `item_count` of the first data block by one and
+/// re-stamps the block header checksum: the block stays checksum-clean but
+/// iterating it yields FEWER entries than the trailer declares, modelling a
+/// truncated / partially-decodable entry region that a count cross-check
+/// must catch (the entry decoder turns a mid-stream parse failure into an
+/// ordinary end of iteration). The SST must be uncompressed.
+pub fn forge_inflated_item_count(path: &std::path::Path) -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::table::block::Header;
+
+    let mut bytes = std::fs::read(path)?;
+    let block_off = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"data") else {
+            panic!("the SST must carry a data section");
+        };
+        usize::try_from(entry.pos()).expect("data offset fits usize")
+    };
+    let Some(block) = bytes.get(block_off..) else {
+        panic!("data block within the file");
+    };
+    let mut cursor = block;
+    let header = Header::decode_from(&mut cursor)?;
+    let header_len = Header::header_len(header.block_type);
+    let payload_range =
+        block_off + header_len..block_off + header_len + header.data_length as usize;
+
+    // The item count is the LAST u32 of the block payload (the trailer's
+    // final field).
+    {
+        let Some(payload) = bytes.get_mut(payload_range.clone()) else {
+            panic!("data payload within the file");
+        };
+        let count_at = payload.len() - core::mem::size_of::<u32>();
+        let Some(count_le) = payload.get_mut(count_at..) else {
+            panic!("item count within the payload");
+        };
+        let count = u32::from_le_bytes(count_le.try_into().expect("4 bytes"));
+        count_le.copy_from_slice(&(count + 1).to_le_bytes());
+    }
+
+    let Some(payload) = bytes.get(payload_range) else {
+        panic!("data payload within the file");
+    };
+    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(payload));
+    let new_header = Header {
+        checksum: new_checksum,
+        ..header
+    };
+    let mut hdr_bytes = Vec::with_capacity(header_len);
+    new_header.encode_into(&mut hdr_bytes)?;
+    let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
+        panic!("data header within the file");
+    };
+    hdr_dst.copy_from_slice(&hdr_bytes);
+    std::fs::write(path, &bytes)?;
+    Ok(())
+}
+
 /// RELABELS the first block of the named SFA section to `forged` and
 /// re-encodes its header (fresh header CRC, payload and its checksum
 /// untouched): the block stays checksum-clean while its ROLE no longer

@@ -11,6 +11,49 @@ use alloc::sync::Arc;
 use tempfile::tempdir;
 use test_log::test;
 
+/// A checksum-clean row block that ITERATES to fewer entries than its
+/// trailer declares must be dropped, not marked recovered: the entry decoder
+/// turns a mid-stream parse failure into an ordinary end of iteration, so a
+/// block with a valid prefix and a malformed tail would otherwise be
+/// counted salvaged while silently losing the remaining keys (or byte-copied
+/// verbatim, still malformed).
+#[test]
+fn salvage_drops_a_row_block_that_decodes_fewer_entries_than_declared() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0u64..3 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Inflate the trailer's item count by one behind a re-stamped block
+    // checksum: iteration now yields fewer entries than the block declares.
+    crate::test_forge::forge_inflated_item_count(&source)?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert_eq!(
+        report.entries_salvaged, 0,
+        "an under-decoding block must not contribute recovered entries: {report:?}",
+    );
+    assert!(
+        report
+            .dropped
+            .iter()
+            .any(|d| matches!(d.reason, DropReason::DecodeError(_))),
+        "the count mismatch is a dropped DecodeError, not a clean recovery: {report:?}",
+    );
+    Ok(())
+}
+
 /// Regression: a data block can hold several MVCC versions of one user key
 /// (same key, descending seqno). The verbatim copy-through path must accept
 /// equal user keys — only columnar *ingest* requires strictly-unique keys — so
