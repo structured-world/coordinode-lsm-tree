@@ -11,6 +11,75 @@ use alloc::sync::Arc;
 use tempfile::tempdir;
 use test_log::test;
 
+/// A LEGACY V3 blob frame has no header CRC, so bit rot in its declared
+/// `key_len` / `on_disk_val_len` makes the scanner consume the WRONG number
+/// of bytes before the checksum fails: its cursor then sits inside the next
+/// frame, not on its boundary. The salvage walk must resynchronize at the
+/// next real frame instead of trusting the desynchronized cursor — without
+/// that, the following read hits invalid magic and every otherwise-readable
+/// record in the tail is dropped.
+#[test]
+fn salvage_blob_file_resyncs_a_legacy_v3_frame_after_a_length_rot() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("blob_v3");
+    let dest = dir.path().join("blob_v3_salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    build_blob_v3(
+        &source,
+        &[
+            (b"aaaa", b"AAAAAAAA"),
+            (b"bbbb", b"BBBBBBBB"),
+            (b"cccc", b"CCCCCCCC"),
+        ],
+    )?;
+
+    // Rot the SECOND frame's key_len (4 -> 6): the scanner consumes two
+    // extra bytes of "key" and drifts two bytes into the third frame.
+    // V3 frame layout: magic 4 | checksum 16 | seqno 8 | key_len 2 |
+    // real_val_len 4 | on_disk_val_len 4 | key | value = 38 + 4 + 8 bytes.
+    let data_start = {
+        let mut f = std::fs::File::open(&source)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"data") else {
+            panic!("the blob file carries a data section");
+        };
+        usize::try_from(entry.pos()).expect("data offset fits usize")
+    };
+    let frame_len = 38 + 4 + 8;
+    let kl_off = data_start + frame_len + 4 + 16 + 8;
+    let mut bytes = std::fs::read(&source)?;
+    let Some(slot) = bytes.get_mut(kl_off..kl_off + 2) else {
+        panic!("second frame's key_len within the file");
+    };
+    slot.copy_from_slice(&6u16.to_le_bytes());
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_blob_file(&source, dest, &fs, 0)?;
+    assert_eq!(
+        report.records_salvaged, 2,
+        "the frames before AND after the rotted one are recovered: {report:?}",
+    );
+    assert!(
+        report
+            .dropped
+            .iter()
+            .any(|d| matches!(d.reason, BlobDropReason::ChecksumMismatch)),
+        "the rotted frame drops as a checksum mismatch: {report:?}",
+    );
+
+    // The recovered copy carries exactly the two intact records.
+    let salvaged = report.salvaged_path.expect("two records were salvaged");
+    let keys: Vec<Vec<u8>> = BlobScanner::new(&salvaged, &*fs, 0)?
+        .map(|r| r.map(|e| e.key.to_vec()))
+        .collect::<crate::Result<_>>()?;
+    assert_eq!(keys, vec![b"aaaa".to_vec(), b"cccc".to_vec()]);
+    Ok(())
+}
+
 /// A checksum-clean row block that ITERATES to fewer entries than its
 /// trailer declares must be dropped, not marked recovered: the entry decoder
 /// turns a mid-stream parse failure into an ordinary end of iteration, so a
@@ -3226,6 +3295,60 @@ fn build_blob(
         writer.write(k, 0, v)?;
     }
     writer.finish()?;
+    Ok(())
+}
+
+/// Builds a LEGACY V3 blob file at `path` (frames without the header CRC the
+/// V4 writer stamps): magic "BLOB" | xxh3-128(key || value) | seqno u64 |
+/// key_len u16 | real_val_len u32 | on_disk_val_len u32 | key | value,
+/// wrapped in an SFA "data" section like the real writer emits.
+fn build_blob_v3(path: &std::path::Path, records: &[(&[u8], &[u8])]) -> crate::Result<()> {
+    use std::io::Write as _;
+
+    let file = std::fs::File::create(path)?;
+    let mut w = crate::sfa::Writer::from_writer(file);
+    w.start("data")?;
+    for (k, v) in records {
+        let checksum = {
+            let mut hasher = xxhash_rust::xxh3::Xxh3::default();
+            hasher.update(k);
+            hasher.update(v);
+            hasher.digest128()
+        };
+        w.write_all(crate::vlog::blob_file::writer::BLOB_HEADER_MAGIC_V3)?;
+        w.write_all(&checksum.to_le_bytes())?;
+        w.write_all(&0u64.to_le_bytes())?;
+        #[expect(clippy::cast_possible_truncation, reason = "test keys/values are tiny")]
+        {
+            w.write_all(&(k.len() as u16).to_le_bytes())?;
+            w.write_all(&(v.len() as u32).to_le_bytes())?;
+            w.write_all(&(v.len() as u32).to_le_bytes())?;
+        }
+        w.write_all(k)?;
+        w.write_all(v)?;
+    }
+    // The meta section the salvage preamble reads for the compression check.
+    w.start("meta")?;
+    let meta = crate::vlog::blob_file::meta::Metadata {
+        id: 0,
+        version: 3,
+        created_at: 0,
+        item_count: records.len() as u64,
+        total_compressed_bytes: 0,
+        total_uncompressed_bytes: 0,
+        key_range: crate::KeyRange::new((
+            records
+                .first()
+                .expect("records non-empty")
+                .0
+                .to_vec()
+                .into(),
+            records.last().expect("records non-empty").0.to_vec().into(),
+        )),
+        compression: crate::CompressionType::None,
+    };
+    meta.encode_into(&mut w)?;
+    w.finish()?;
     Ok(())
 }
 
