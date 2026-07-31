@@ -828,6 +828,27 @@ fn salvage_blocks(
                                 prev_end = Some(end_key);
                                 continue;
                             }
+                            // The entry decoder turns a mid-stream parse
+                            // failure into an ordinary end of iteration, so a
+                            // checksum-clean block with a valid prefix and a
+                            // malformed tail yields FEWER entries than its
+                            // trailer declares. Accepting the prefix would
+                            // silently lose the remaining keys (or byte-copy
+                            // the still-malformed block verbatim) — drop the
+                            // block instead.
+                            if entries.len() != data_block.len() {
+                                dropped.push(classify_drop(
+                                    &crate::Error::InvalidHeader(
+                                        "row block iterates to fewer entries than its \
+                                         trailer declares",
+                                    ),
+                                    offset,
+                                    prev_end.as_ref(),
+                                    &end_key,
+                                ));
+                                prev_end = Some(end_key);
+                                continue;
+                            }
                             let count = entries.len() as u64;
                             // Indirections BEFORE emit: an entry tagged as an
                             // indirection whose value fails to decode is
