@@ -124,6 +124,49 @@ impl Scanner {
     // external callers. All internal usage goes through `new()` / `resume()`.
 }
 
+impl Scanner {
+    /// Repositions the reader at the next frame magic strictly AFTER
+    /// `frame_offset`, or at the data-section end when none remains. Used
+    /// after a V3 checksum miss, where the frame's unvalidated `key_len` /
+    /// `on_disk_val_len` may have desynchronized the cursor (V3 carries no
+    /// header CRC, so the consumed lengths are untrusted).
+    fn resync_after_untrusted_lengths(&mut self, frame_offset: u64) -> crate::Result<()> {
+        const MAGIC_LEN: usize = BLOB_HEADER_MAGIC_V4.len();
+
+        // Scan in chunks, overlapping by MAGIC_LEN - 1 bytes so a magic
+        // straddling two chunks is still found.
+        let mut buf = [0u8; 64 * 1024];
+        let mut pos = frame_offset + 1;
+        while pos < self.data_end {
+            self.inner.seek(SeekFrom::Start(pos))?;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "min() bounds the window by the buffer length, which fits usize"
+            )]
+            let want = (self.data_end - pos).min(buf.len() as u64) as usize;
+            let Some(window) = buf.get_mut(..want) else {
+                break;
+            };
+            self.inner.read_exact(window)?;
+            if let Some(hit) = window
+                .windows(MAGIC_LEN)
+                .position(|w| w == BLOB_HEADER_MAGIC_V3 || w == BLOB_HEADER_MAGIC_V4)
+            {
+                self.inner.seek(SeekFrom::Start(pos + hit as u64))?;
+                return Ok(());
+            }
+            if want <= MAGIC_LEN - 1 {
+                break;
+            }
+            pos += (want - (MAGIC_LEN - 1)) as u64;
+        }
+        // No further frame: park at the section end so the next call
+        // terminates cleanly.
+        self.inner.seek(SeekFrom::Start(self.data_end))?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct ScanEntry {
     pub key: UserKey,
@@ -240,6 +283,21 @@ impl Iterator for Scanner {
                     "Checksum mismatch for blob>{}@{offset}, got={checksum}, expected={expected_checksum}",
                     self.blob_file_id,
                 );
+
+                // A V4 frame's key/value lengths were validated by the header
+                // CRC before being consumed, so the cursor already sits on
+                // the next frame boundary. A V3 frame has NO header CRC: rot
+                // in its declared lengths makes the read above consume the
+                // WRONG number of bytes, leaving the cursor inside (or past)
+                // subsequent frames — every readable record in the tail
+                // would then be lost to an invalid-magic stop. Resynchronize
+                // by scanning forward for the next frame magic; a false
+                // match inside a value payload just fails its own checksum
+                // and resynchronizes again, strictly forward.
+                if !frame_is_v4 && let Err(e) = self.resync_after_untrusted_lengths(offset) {
+                    self.is_terminated = true;
+                    return Some(Err(e));
+                }
 
                 return Some(Err(crate::Error::ChecksumMismatch {
                     got: Checksum::from_raw(checksum),
