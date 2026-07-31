@@ -195,6 +195,11 @@ impl FaultRule {
 #[derive(Default)]
 pub struct FaultInjector {
     rules: spin::Mutex<Vec<FaultRule>>,
+    /// Observed `(path, mode)` pairs from every file-level `sync_all_with` /
+    /// `sync_data_with`, in call order — lets a test assert WHICH durability
+    /// mode a component synced its files at (e.g. a salvage writer honouring
+    /// `Config::sync_mode`), which the pass-through delegation cannot show.
+    sync_log: spin::Mutex<Vec<(PathBuf, SyncMode)>>,
 }
 
 impl FaultInjector {
@@ -215,6 +220,24 @@ impl FaultInjector {
     /// Removes all armed rules.
     pub fn clear(&self) {
         self.rules.lock().clear();
+    }
+
+    /// Records one file-level mode-carrying sync observation (see
+    /// [`Self::sync_modes_for`]).
+    fn record_sync(&self, path: &Path, mode: SyncMode) {
+        self.sync_log.lock().push((path.to_path_buf(), mode));
+    }
+
+    /// The [`SyncMode`]s observed via `sync_all_with` / `sync_data_with` on
+    /// files whose path contains `substr`, in call order.
+    #[must_use]
+    pub fn sync_modes_for(&self, substr: &str) -> Vec<SyncMode> {
+        self.sync_log
+            .lock()
+            .iter()
+            .filter(|(p, _)| p.to_string_lossy().contains(substr))
+            .map(|(_, m)| *m)
+            .collect()
     }
 
     /// Consults the rules for an operation of `op` at `path`, advancing the
@@ -486,6 +509,7 @@ impl FsFile for FaultFile {
     }
 
     fn sync_all_with(&self, mode: SyncMode) -> io::Result<()> {
+        self.injector.record_sync(&self.path, mode);
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::SyncAll, Some(&self.path)) {
             return Err(fault_error(kind, FaultOp::SyncAll));
         }
@@ -493,6 +517,7 @@ impl FsFile for FaultFile {
     }
 
     fn sync_data_with(&self, mode: SyncMode) -> io::Result<()> {
+        self.injector.record_sync(&self.path, mode);
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::SyncData, Some(&self.path)) {
             return Err(fault_error(kind, FaultOp::SyncData));
         }

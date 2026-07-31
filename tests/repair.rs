@@ -707,6 +707,64 @@ fn repair_with_salvage_recovers_a_block_corrupt_sst() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A salvaging repair must persist the recovered SST at the CONFIGURED
+/// durability: with `Config::sync_mode = Full`, the rebuilt manifest is
+/// synced Full while a salvage writer left at its Normal default would give
+/// the freshly recovered SST weaker durability than everything around it —
+/// a repair reported as durable could lose the recovered file across power
+/// failure on platforms where Full means `F_FULLFSYNC`.
+#[test]
+fn repair_with_salvage_syncs_the_recovered_sst_at_the_configured_mode() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::{FaultFs, Fs, StdFs, SyncMode};
+    use std::sync::Arc;
+
+    let dir = lsm_tree::get_tmp_folder();
+    {
+        let tree = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0..500 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let ssts = sorted_sst_paths(dir.path());
+    let victim = ssts.first().expect("an SST to corrupt");
+    corrupt_data_region(victim)?;
+    nuke_manifest(dir.path())?;
+
+    // Repair under Full durability through a sync-observing Fs.
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .sync_mode(SyncMode::Full)
+    .with_shared_fs(fs)
+    .repair_with_salvage(true)?;
+    assert_eq!(report.salvaged, 1, "{:?}", report.unreadable_files);
+
+    // The salvaged table file (under tables/) must have been synced at the
+    // configured Full mode, not the salvage writer's Normal default.
+    let modes = injector.sync_modes_for("tables");
+    assert!(
+        !modes.is_empty(),
+        "the salvage writer syncs the recovered SST through the injected Fs",
+    );
+    assert!(
+        modes.contains(&SyncMode::Full),
+        "the recovered SST must be synced at the configured Full mode, got {modes:?}",
+    );
+    Ok(())
+}
+
 /// An SST whose container (SFA trailer) is corrupt cannot be opened even in
 /// salvage mode, so repair reports it unreadable rather than salvaging it.
 #[test]
