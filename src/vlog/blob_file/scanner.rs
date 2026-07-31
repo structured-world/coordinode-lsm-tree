@@ -255,7 +255,19 @@ impl Iterator for Scanner {
                 .and_then(|x| x.checked_add(u64::from(key_len)))
                 .and_then(|x| x.checked_add(u64::from(on_disk_val_len)));
             if frame_end.is_none_or(|end| end > self.data_end) {
-                self.is_terminated = true;
+                // A V4 header CRC has already vouched for the lengths above,
+                // so an over-long declared end means the file itself is
+                // truncated — nothing past it can be readable; terminate. A
+                // V3 frame has NO header CRC: an inflated length is rot in
+                // the header, exactly as untrusted as one that breaks the
+                // payload checksum, so resynchronize at the next frame magic
+                // instead of losing every intact later frame.
+                if frame_is_v4 {
+                    self.is_terminated = true;
+                } else if let Err(e) = self.resync_after_untrusted_lengths(offset) {
+                    self.is_terminated = true;
+                    return Some(Err(e));
+                }
                 return Some(Err(crate::Error::InvalidHeader("Blob")));
             }
         }
