@@ -4,7 +4,7 @@
 
 // Format constants live in writer (the format definition site).
 // Extracting to a shared module is an upstream structural decision.
-use super::writer::{BLOB_HEADER_MAGIC_V3, BLOB_HEADER_MAGIC_V4, validate_header_crc};
+use super::writer::{BLOB_HEADER_MAGIC, validate_header_crc};
 use crate::fs::{Fs, FsFile, FsOpenOptions};
 use crate::io::BufReader;
 use crate::io::{LittleEndian, ReadBytesExt};
@@ -127,11 +127,13 @@ impl Scanner {
 impl Scanner {
     /// Repositions the reader at the next frame magic strictly AFTER
     /// `frame_offset`, or at the data-section end when none remains. Used
-    /// after a V3 checksum miss, where the frame's unvalidated `key_len` /
-    /// `on_disk_val_len` may have desynchronized the cursor (V3 carries no
-    /// header CRC, so the consumed lengths are untrusted).
-    fn resync_after_untrusted_lengths(&mut self, frame_offset: u64) -> crate::Result<()> {
-        const MAGIC_LEN: usize = BLOB_HEADER_MAGIC_V4.len();
+    /// after HEADER rot (bad magic, header-CRC mismatch), where the frame's
+    /// lengths cannot be trusted to locate the next frame — without the
+    /// forward magic scan one rotted header would cost every readable later
+    /// frame. A false match inside a value payload fails its own header CRC
+    /// or payload checksum and resynchronizes again, strictly forward.
+    fn resync_to_next_frame(&mut self, frame_offset: u64) -> crate::Result<()> {
+        const MAGIC_LEN: usize = BLOB_HEADER_MAGIC.len();
 
         // Scan in chunks, overlapping by MAGIC_LEN - 1 bytes so a magic
         // straddling two chunks is still found.
@@ -150,7 +152,7 @@ impl Scanner {
             self.inner.read_exact(window)?;
             if let Some(hit) = window
                 .windows(MAGIC_LEN)
-                .position(|w| w == BLOB_HEADER_MAGIC_V3 || w == BLOB_HEADER_MAGIC_V4)
+                .position(|w| w == BLOB_HEADER_MAGIC)
             {
                 self.inner.seek(SeekFrom::Start(pos + hit as u64))?;
                 return Ok(());
@@ -199,15 +201,20 @@ impl Iterator for Scanner {
             return None;
         }
 
-        let frame_is_v4;
-
         {
-            let mut buf = [0; BLOB_HEADER_MAGIC_V4.len()];
+            let mut buf = [0; BLOB_HEADER_MAGIC.len()];
             fail_iter!(self.inner.read_exact(&mut buf));
 
-            frame_is_v4 = buf == BLOB_HEADER_MAGIC_V4;
-            if !frame_is_v4 && buf != BLOB_HEADER_MAGIC_V3 {
-                self.is_terminated = true;
+            if buf != BLOB_HEADER_MAGIC {
+                // Header rot: the frame's lengths are unreadable, so the
+                // next frame cannot be located from this one. Resynchronize
+                // at the next frame magic so one rotted header does not
+                // cost every readable later frame (record-granular
+                // salvage); the frame itself is lost either way.
+                if let Err(e) = self.resync_to_next_frame(offset) {
+                    self.is_terminated = true;
+                    return Some(Err(e));
+                }
                 return Some(Err(crate::Error::InvalidHeader("Blob")));
             }
         }
@@ -221,31 +228,30 @@ impl Iterator for Scanner {
 
         let on_disk_val_len = fail_iter!(self.inner.read_u32::<LittleEndian>());
 
-        // V4: read and validate header CRC using shared validator.
-        // On CRC failure, terminate the scanner so subsequent next() calls
-        // don't read from a mid-frame stream position.
-        let stored_header_crc = if frame_is_v4 {
+        // Read and validate the header CRC. On a mismatch the consumed
+        // lengths are untrusted (any of them may be the rotted field), so
+        // resynchronize at the next frame magic instead of terminating —
+        // continuing from a length-derived position could desynchronize,
+        // and stopping would drop every readable later frame.
+        let stored_header_crc = {
             let crc = fail_iter!(self.inner.read_u32::<LittleEndian>());
             if let Err(e) = validate_header_crc(seqno, key_len, real_val_len, on_disk_val_len, crc)
             {
-                self.is_terminated = true;
+                if let Err(e2) = self.resync_to_next_frame(offset) {
+                    self.is_terminated = true;
+                    return Some(Err(e2));
+                }
                 return Some(Err(e));
             }
-            Some(crc)
-        } else {
-            None
+            crc
         };
 
         // Verify the declared frame payload fits within the data section
-        // before allocating buffers. Without this, a corrupted key_len or
-        // on_disk_val_len could cause a huge allocation or read past
-        // data_end into the TOC/trailer region.
+        // before allocating buffers. The header CRC has already vouched for
+        // the lengths, so an over-long declared end means the file itself
+        // is truncated — nothing past it can be readable; terminate.
         {
-            let header_len = if frame_is_v4 {
-                super::writer::BLOB_HEADER_LEN_V4 as u64
-            } else {
-                super::writer::BLOB_HEADER_LEN_V3 as u64
-            };
+            let header_len = super::writer::BLOB_HEADER_LEN as u64;
             // `key_len` / `on_disk_val_len` come from the on-disk frame header and
             // may be corrupt. Use checked adds so a value that overflows u64 fails
             // loudly here (treated as "does not fit") instead of saturating to
@@ -255,19 +261,7 @@ impl Iterator for Scanner {
                 .and_then(|x| x.checked_add(u64::from(key_len)))
                 .and_then(|x| x.checked_add(u64::from(on_disk_val_len)));
             if frame_end.is_none_or(|end| end > self.data_end) {
-                // A V4 header CRC has already vouched for the lengths above,
-                // so an over-long declared end means the file itself is
-                // truncated — nothing past it can be readable; terminate. A
-                // V3 frame has NO header CRC: an inflated length is rot in
-                // the header, exactly as untrusted as one that breaks the
-                // payload checksum, so resynchronize at the next frame magic
-                // instead of losing every intact later frame.
-                if frame_is_v4 {
-                    self.is_terminated = true;
-                } else if let Err(e) = self.resync_after_untrusted_lengths(offset) {
-                    self.is_terminated = true;
-                    return Some(Err(e));
-                }
+                self.is_terminated = true;
                 return Some(Err(crate::Error::InvalidHeader("Blob")));
             }
         }
@@ -284,9 +278,7 @@ impl Iterator for Scanner {
                 let mut hasher = xxhash_rust::xxh3::Xxh3::default();
                 hasher.update(&key);
                 hasher.update(&value);
-                if let Some(hcrc) = stored_header_crc {
-                    hasher.update(&hcrc.to_le_bytes());
-                }
+                hasher.update(&stored_header_crc.to_le_bytes());
                 hasher.digest128()
             };
 
@@ -296,21 +288,10 @@ impl Iterator for Scanner {
                     self.blob_file_id,
                 );
 
-                // A V4 frame's key/value lengths were validated by the header
+                // The frame's key/value lengths were validated by the header
                 // CRC before being consumed, so the cursor already sits on
-                // the next frame boundary. A V3 frame has NO header CRC: rot
-                // in its declared lengths makes the read above consume the
-                // WRONG number of bytes, leaving the cursor inside (or past)
-                // subsequent frames — every readable record in the tail
-                // would then be lost to an invalid-magic stop. Resynchronize
-                // by scanning forward for the next frame magic; a false
-                // match inside a value payload just fails its own checksum
-                // and resynchronizes again, strictly forward.
-                if !frame_is_v4 && let Err(e) = self.resync_after_untrusted_lengths(offset) {
-                    self.is_terminated = true;
-                    return Some(Err(e));
-                }
-
+                // the next frame boundary: payload rot costs exactly this
+                // one record, no resynchronization needed.
                 return Some(Err(crate::Error::ChecksumMismatch {
                     got: Checksum::from_raw(checksum),
                     expected: Checksum::from_raw(expected_checksum),

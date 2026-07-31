@@ -47,24 +47,22 @@ fn check_size_cap(len: usize) -> crate::Result<()> {
 // Note: these constants are `pub` for crate-internal use but the parent
 // `vlog` module is NOT exported from `lib.rs`, so they are not public API.
 
-/// V3 blob frame magic (no header checksum).
-pub const BLOB_HEADER_MAGIC_V3: &[u8] = b"BLOB";
+/// Blob frame magic. This is the ONLY readable frame shape: the engine
+/// supports exactly one on-disk format (see [`crate::FormatVersion`]) — a
+/// frame under any other magic (including the retired pre-V5 `b"BLOB"`
+/// layout without a header CRC) is corruption, not a compat case.
+pub const BLOB_HEADER_MAGIC: &[u8] = b"BLO4";
 
-/// V4 blob frame magic (includes header checksum).
-pub const BLOB_HEADER_MAGIC_V4: &[u8] = b"BLO4";
-
-/// V3 blob frame header length (38 bytes, no `header_crc`).
-pub const BLOB_HEADER_LEN_V3: usize = BLOB_HEADER_MAGIC_V3.len()
+/// Blob frame header length (42 bytes, includes `header_crc`).
+pub const BLOB_HEADER_LEN: usize = BLOB_HEADER_MAGIC.len()
     + core::mem::size_of::<u128>() // Checksum
     + core::mem::size_of::<u64>() // SeqNo
     + core::mem::size_of::<u16>() // Key length
     + core::mem::size_of::<u32>() // Real value length
-    + core::mem::size_of::<u32>(); // On-disk value length
+    + core::mem::size_of::<u32>() // On-disk value length
+    + core::mem::size_of::<u32>(); // Header CRC
 
-/// V4 blob frame header length (42 bytes, includes `header_crc`).
-pub const BLOB_HEADER_LEN_V4: usize = BLOB_HEADER_LEN_V3 + core::mem::size_of::<u32>(); // Header CRC
-
-/// Compute V4 header CRC from header fields.
+/// Compute the frame header CRC from header fields.
 /// Returns a 4-byte truncated xxh3 hash.
 #[expect(
     clippy::cast_possible_truncation,
@@ -84,7 +82,7 @@ pub(super) fn compute_header_crc(
     hasher.digest() as u32
 }
 
-/// Validate V4 header CRC: recompute from header fields and compare
+/// Validate the frame header CRC: recompute from header fields and compare
 /// against the stored value.
 pub(super) fn validate_header_crc(
     seqno: u64,
@@ -312,7 +310,7 @@ impl Writer {
         self.uncompressed_bytes += u64::from(uncompressed_len);
 
         // NOTE:
-        // V4 BLOB HEADER LAYOUT
+        // BLOB HEADER LAYOUT
         //
         // [MAGIC_BYTES; 4B]    - b"BLO4"
         // [Checksum; 16B]      - xxh3_128(key + value + header_crc_le)
@@ -344,7 +342,7 @@ impl Writer {
         };
 
         // Write header
-        self.writer.write_all(BLOB_HEADER_MAGIC_V4)?;
+        self.writer.write_all(BLOB_HEADER_MAGIC)?;
 
         // Write data checksum
         self.writer.write_u128::<LittleEndian>(checksum)?;
@@ -368,7 +366,7 @@ impl Writer {
         self.writer.write_all(&value)?;
 
         // Update offset
-        self.offset += BLOB_HEADER_LEN_V4 as u64;
+        self.offset += BLOB_HEADER_LEN as u64;
         self.offset += key.len() as u64;
         self.offset += value.len() as u64;
 

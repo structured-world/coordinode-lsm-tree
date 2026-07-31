@@ -1137,16 +1137,29 @@ pub fn salvage_blob_file(
                     offset_remap.push((entry.offset, salvaged_offset));
                     records_salvaged += 1;
                 }
-                // The scanner repositions at the next frame after a checksum miss,
-                // so a bit-rotted record costs only itself and the walk continues.
+                // Payload rot: the frame's lengths were CRC-vouched, so the
+                // scanner already sits on the next frame boundary — a
+                // bit-rotted record costs only itself and the walk continues.
                 Err(crate::Error::ChecksumMismatch { .. }) => dropped.push(DroppedBlob {
                     reason: BlobDropReason::ChecksumMismatch,
                 }),
-                // A structural / IO error: the scanner does not re-sync from it
-                // (only a checksum miss repositions), and an error that leaves the
-                // read position before `data_end` without terminating would make
-                // the iterator keep yielding it. Record the corruption and stop the
-                // walk — this is the last record it can inspect.
+                // Header rot (rotted magic or a length field caught by the
+                // header CRC): the scanner has RESYNCHRONIZED at the next
+                // frame magic (or terminated, when the CRC-vouched frame end
+                // overruns the data section — real truncation), so the walk
+                // safely continues either way.
+                Err(
+                    e @ (crate::Error::HeaderCrcMismatch { .. } | crate::Error::InvalidHeader(_)),
+                ) => {
+                    dropped.push(DroppedBlob {
+                        reason: BlobDropReason::Corrupt(format!("{e:?}")),
+                    });
+                }
+                // Any other error (I/O, allocation): the scanner does not
+                // re-sync from it, and an error that leaves the read position
+                // before `data_end` without terminating would make the
+                // iterator keep yielding it. Record the corruption and stop
+                // the walk — this is the last record it can inspect.
                 Err(e) => {
                     dropped.push(DroppedBlob {
                         reason: BlobDropReason::Corrupt(format!("{e:?}")),

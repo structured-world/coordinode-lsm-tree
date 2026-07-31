@@ -3288,7 +3288,9 @@ impl Tree {
             log::error!(
                 "It looks like you are trying to open a V1 database - the database needs a manual migration, however a migration tool is not provided, as V1 is extremely outdated."
             );
-            return Err(crate::Error::InvalidVersion(FormatVersion::V1.into()));
+            // Literal discriminant: V1 is a retired format and FormatVersion
+            // carries no legacy variants (V5-only contract).
+            return Err(crate::Error::InvalidVersion(1));
         }
 
         // Decide between recovery and fresh creation atomically by attempting
@@ -3835,8 +3837,14 @@ impl Tree {
             )?;
             let manifest = Manifest::decode_from(&mut archive_reader)?;
 
-            if !matches!(manifest.version, FormatVersion::V5) {
-                return Err(crate::Error::InvalidVersion(manifest.version.into()));
+            // V5 is the only variant `FormatVersion` can decode to (the
+            // engine reads exactly one on-disk format, no legacy paths), so
+            // a pre-V5 manifest already failed decode_from with
+            // InvalidVersion. This match stays as the explicit gate the
+            // format contract documents — and as the compile-time hook that
+            // forces a review of the open path when a new variant is added.
+            match manifest.version {
+                FormatVersion::V5 => {}
             }
 
             let supplied_name = config.comparator.name();

@@ -13,9 +13,7 @@ use crate::{
     fs::FsFile,
     vlog::{
         ValueHandle,
-        blob_file::writer::{
-            BLOB_HEADER_LEN_V4, BLOB_HEADER_MAGIC_V3, BLOB_HEADER_MAGIC_V4, validate_header_crc,
-        },
+        blob_file::writer::{BLOB_HEADER_LEN, BLOB_HEADER_MAGIC, validate_header_crc},
     },
 };
 #[cfg(feature = "std")]
@@ -78,13 +76,7 @@ impl<'a> Reader<'a> {
             return Err(crate::Error::InvalidHeader("Blob"));
         }
 
-        // Always read with V4 (max) header size so that version detection
-        // is self-describing from the frame magic — no dependency on
-        // metadata version which could be corrupted independently.
-        // For V3 frames, the extra 4 bytes read are harmless: they come
-        // from the next frame or metadata section (which always follows),
-        // and raw_data is sliced to exact on_disk_val_len before use.
-        let add_size = (BLOB_HEADER_LEN_V4 as u64) + (key.len() as u64);
+        let add_size = (BLOB_HEADER_LEN as u64) + (key.len() as u64);
 
         // Validate the full on-disk read size (header + key + value) against the limit.
         // Allow header+key overhead on top of the data cap.
@@ -120,9 +112,10 @@ impl<'a> Reader<'a> {
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
 
-        // Determine format from frame magic — self-describing, no metadata dependency.
-        let frame_is_v4 = magic == BLOB_HEADER_MAGIC_V4;
-        if !frame_is_v4 && magic != BLOB_HEADER_MAGIC_V3 {
+        // Exactly one frame format exists (V5-only on-disk contract): any
+        // other magic — including the retired pre-V5 `b"BLOB"` layout — is
+        // corruption or a misdirected handle, never a compat case.
+        if magic != BLOB_HEADER_MAGIC {
             return Err(crate::Error::InvalidHeader("Blob"));
         }
 
@@ -135,22 +128,18 @@ impl<'a> Reader<'a> {
 
         let on_disk_val_len = reader.read_u32::<LittleEndian>()?;
 
-        // V4: read and validate header CRC before cross-checks.
+        // Read and validate the header CRC before cross-checks.
         // Uses the on-disk CRC value (not recomputed) in data checksum
         // verification so that recomputing header_crc after tampering
         // header fields is still caught by the data checksum.
-        let stored_header_crc = if frame_is_v4 {
+        let stored_header_crc = {
             let crc = reader.read_u32::<LittleEndian>()?;
             #[expect(
                 clippy::cast_possible_truncation,
                 reason = "real_val_len originates as u32, round-tripped through usize; lossless on supported targets"
             )]
             validate_header_crc(seqno, key_len, real_val_len as u32, on_disk_val_len, crc)?;
-            Some(crc)
-        } else {
-            // V3: seqno is unused (not covered by any checksum).
-            let _ = seqno;
-            None
+            crc
         };
 
         // Cross-check header fields against caller-provided inputs to catch
@@ -168,12 +157,7 @@ impl<'a> Reader<'a> {
             });
         }
 
-        // Actual header length determined from frame magic, not metadata.
-        let header_len = if frame_is_v4 {
-            BLOB_HEADER_LEN_V4
-        } else {
-            crate::vlog::blob_file::writer::BLOB_HEADER_LEN_V3
-        };
+        let header_len = BLOB_HEADER_LEN;
 
         // Zero-copy view of the on-disk key bytes for checksum and cross-check.
         // The full blob record is already in `value`, so slicing avoids an extra
@@ -187,25 +171,21 @@ impl<'a> Reader<'a> {
             return Err(crate::Error::InvalidHeader("Blob"));
         }
 
-        // Slice exactly on_disk_val_len bytes — important for V3 backward
-        // compat where the read buffer is 4 bytes larger than the actual frame
-        // (over-read from using V4 max header size).
+        // Slice exactly on_disk_val_len bytes.
         // No usize overflow: on_disk_val_len is u32, data_offset is ~42+key_len,
         // and total is bounded by MAX_DECOMPRESSION_SIZE (256 MiB) cap check above.
         let data_offset = header_len + key.len();
         let raw_data = value.slice(data_offset..data_offset + on_disk_val_len as usize);
 
         {
-            // Checksum covers on-disk key + raw value data (upstream #277).
-            // V4 additionally includes header_crc bytes so that recomputing
-            // header_crc after tampering header fields is still detected.
+            // Checksum covers on-disk key + raw value data (upstream #277)
+            // plus the header_crc bytes, so that recomputing header_crc
+            // after tampering header fields is still detected.
             let checksum = {
                 let mut hasher = xxhash_rust::xxh3::Xxh3::default();
                 hasher.update(&on_disk_key);
                 hasher.update(&raw_data);
-                if let Some(hcrc) = stored_header_crc {
-                    hasher.update(&hcrc.to_le_bytes());
-                }
+                hasher.update(&stored_header_crc.to_le_bytes());
                 hasher.digest128()
             };
 
