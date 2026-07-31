@@ -134,7 +134,9 @@ impl<'a> Reader<'a> {
         // header fields is still caught by the data checksum.
         let stored_header_crc = {
             let crc = reader.read_u32::<LittleEndian>()?;
-            #[expect(
+            // `allow`, not `expect`: on 32-bit targets usize == u32 and the
+            // lint never fires, which would make an `expect` unfulfilled.
+            #[allow(
                 clippy::cast_possible_truncation,
                 reason = "real_val_len originates as u32, round-tripped through usize; lossless on supported targets"
             )]

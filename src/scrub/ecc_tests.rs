@@ -874,7 +874,7 @@ fn heal_in_place_does_not_restamp_over_a_renamed_section() -> crate::Result<()> 
         report
             .errors
             .iter()
-            .any(|e| format!("{e:?}").contains("ChecksumRefreshFailed")),
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
         "an unknown section name must refuse the digest refresh: {report:?}",
     );
 
@@ -917,7 +917,7 @@ fn heal_in_place_does_not_restamp_over_diverged_meta_mirrors() -> crate::Result<
         report
             .errors
             .iter()
-            .any(|e| format!("{e:?}").contains("ChecksumRefreshFailed")),
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
         "diverged meta mirrors must refuse the digest refresh: {report:?}",
     );
 
@@ -967,7 +967,7 @@ fn heal_in_place_does_not_restamp_over_a_forged_seqno_bounds() -> crate::Result<
         report
             .errors
             .iter()
-            .any(|e| format!("{e:?}").contains("ChecksumRefreshFailed")),
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
         "a forged seqno_bounds map must refuse the digest refresh: {report:?}",
     );
 
@@ -1005,7 +1005,7 @@ fn heal_in_place_does_not_restamp_over_a_forged_tli_tail() -> crate::Result<()> 
         report
             .errors
             .iter()
-            .any(|e| format!("{e:?}").contains("ChecksumRefreshFailed")),
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
         "diverged TLI mirrors must refuse the digest refresh: {report:?}",
     );
 
@@ -1063,7 +1063,7 @@ fn heal_in_place_does_not_restamp_over_a_relabeled_section_block() -> crate::Res
         report
             .errors
             .iter()
-            .any(|e| format!("{e:?}").contains("ChecksumRefreshFailed")),
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
         "the relabeled block must refuse the digest refresh: {report:?}",
     );
 
@@ -1256,7 +1256,7 @@ fn heal_in_place_does_not_restamp_over_side_section_rot() -> crate::Result<()> {
         report
             .errors
             .iter()
-            .any(|e| format!("{e:?}").contains("ChecksumRefreshFailed")),
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
         "the finding must be the refused digest refresh: {report:?}",
     );
     assert_eq!(
@@ -1403,7 +1403,7 @@ fn heal_in_place_reports_a_failed_checksum_refresh() -> crate::Result<()> {
         report
             .errors
             .iter()
-            .any(|e| format!("{e:?}").contains("ChecksumRefreshFailed")),
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
         "a failed manifest-digest refresh must be a scrub finding, not a \
          swallowed log line: {report:?}",
     );

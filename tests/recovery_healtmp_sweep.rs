@@ -65,10 +65,9 @@ fn recovery_with_non_artifact_healtmp_name_fails_without_deleting() -> lsm_tree:
 
         let result = open(&folder);
         assert!(
-            result.is_err(),
+            matches!(result, Err(lsm_tree::Error::Unrecoverable)),
             "recovery must refuse the unrecognized file {foreign_name:?} instead of deleting it"
         );
-        drop(result);
         assert!(
             foreign.try_exists()?,
             "recovery must never delete the foreign file {foreign_name:?}"

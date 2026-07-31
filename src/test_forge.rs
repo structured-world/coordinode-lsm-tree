@@ -66,7 +66,33 @@ pub fn forge_section_name(path: &std::path::Path, from: &[u8], to: &[u8]) -> cra
         let Some(toc) = bytes.get_mut(toc_pos..toc_pos + toc_len) else {
             panic!("TOC region within the file");
         };
-        let Some(name_at) = toc.windows(from.len()).position(|w| w == from) else {
+        // Walk the parsed TOC entries instead of searching raw bytes: a raw
+        // window search on `b"filter"` would also match inside the
+        // `filter_tli` entry's name. Layout: "TOC!" | count u32 LE | entries
+        // (pos u64 | len u64 | name_len u16 | name).
+        let count = u32::from_le_bytes(
+            toc.get(4..8)
+                .expect("count prefix")
+                .try_into()
+                .expect("4 bytes"),
+        );
+        let mut at = 8usize;
+        let mut name_at = None;
+        for _ in 0..count {
+            let name_len = usize::from(u16::from_le_bytes(
+                toc.get(at + 16..at + 18)
+                    .expect("name_len")
+                    .try_into()
+                    .expect("2 bytes"),
+            ));
+            let entry_name = toc.get(at + 18..at + 18 + name_len).expect("name");
+            if entry_name == from {
+                name_at = Some(at + 18);
+                break;
+            }
+            at += 18 + name_len;
+        }
+        let Some(name_at) = name_at else {
             panic!("section name present in the TOC");
         };
         let Some(dst) = toc.get_mut(name_at..name_at + to.len()) else {

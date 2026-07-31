@@ -153,6 +153,16 @@ fn salvage_arbitrates_divergent_meta_mirrors() -> crate::Result<()> {
         "nothing should drop under the intact mirror: {report:?}",
     );
     assert!(report.salvaged_path.is_some(), "a copy was written");
+
+    // The MID attempt's sibling temp path must not survive the arbitration:
+    // the winner is renamed over dest, the loser is discarded.
+    for entry in std::fs::read_dir(dir.path())? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        assert!(
+            !name.contains(".healtmp-"),
+            "the arbitration temp file must be renamed or removed, found {name:?}",
+        );
+    }
     Ok(())
 }
 
