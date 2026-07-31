@@ -228,6 +228,14 @@ fn block_verify_verdict(
         // corruption, and salvage derives the links from the recovered
         // indirections rather than copying the forged list.
         BlockVerifyVerdict::Corrupt
+    } else if table.verify_tli_mirrors().is_err() {
+        // Each TLI mirror is independently checksum-clean to the walk, but a
+        // forged copy that DECODES to a different handle list would steer
+        // the next recovery (which prefers the tail) away from real blocks.
+        // Diverging decoded mirrors are corruption; salvage walks the HEAD
+        // copy, so the recovered SST is rebuilt from a single, fully
+        // re-verified handle list.
+        BlockVerifyVerdict::Corrupt
     } else if !report.is_ok() {
         // Parity-ONLY rot: every payload checksum verified clean, only the
         // recovery margin is dead. The data is fully readable, so it grades

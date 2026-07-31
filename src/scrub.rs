@@ -490,6 +490,17 @@ fn refresh_healed_checksum(
         ));
     }
 
+    // Each TLI mirror verified independently clean above, but a forged tail
+    // that DECODES to a different handle list than the head passes every
+    // byte-level check — and the next recovery prefers the tail, silently
+    // hiding blocks. Compare the decoded mirrors before trusting the digest.
+    if let Err(e) = table.verify_tli_mirrors() {
+        return finding(alloc::format!(
+            "digest mismatch with a TLI mirror comparison failure ({e}); \
+             the manifest digest was not refreshed"
+        ));
+    }
+
     match tree.refresh_table_checksum(table.id(), fresh) {
         Ok(()) => None,
         Err(e) => finding(e.to_string()),

@@ -1782,6 +1782,53 @@ impl Table {
         Ok(())
     }
 
+    /// Compares the two DECODED TLI mirrors (head `tli` vs `tli_tail`). Each
+    /// copy is independently checksum- (and parity-)consistent, so a forged
+    /// tail that encodes a DIFFERENT handle list passes every byte-level
+    /// check while the pinned / partitioned read path prefers it on the next
+    /// recovery — omitted or redirected handles make keys disappear even
+    /// though the physical data section verifies clean. The writer re-encodes
+    /// the same `tli_bytes` into both sections, so the decoded payloads must
+    /// be identical (ciphertext may differ per encryption nonce). A no-op for
+    /// tables without a tail mirror.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when the decoded mirrors differ; any
+    /// I/O / decode error while loading either copy (an unreadable mirror is
+    /// equally untrustworthy for the callers' restamp / keep decisions).
+    #[cfg(feature = "std")]
+    pub(crate) fn verify_tli_mirrors(&self) -> crate::Result<()> {
+        let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
+        let trailer = crate::sfa::Reader::from_reader(&mut file)?;
+        let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
+        let Some(tail_handle) = regions.tli_tail else {
+            return Ok(());
+        };
+        let head = Self::read_tli_at(
+            &*file,
+            regions.tli,
+            self.metadata.id,
+            self.metadata.index_block_compression,
+            self.encryption.as_deref(),
+            self.metadata.ecc_params,
+        )?;
+        let tail = Self::read_tli_at(
+            &*file,
+            tail_handle,
+            self.metadata.id,
+            self.metadata.index_block_compression,
+            self.encryption.as_deref(),
+            self.metadata.ecc_params,
+        )?;
+        if head.as_slice() != tail.as_slice() {
+            return Err(crate::Error::InvalidHeader(
+                "tli_tail decodes to a different handle list than the head tli",
+            ));
+        }
+        Ok(())
+    }
+
     /// Loads the filter block (if any) and checks the bloom filter.
     ///
     /// Returns `Ok(BloomResult::Skip)` if the bloom filter says the key is definitely absent
