@@ -188,7 +188,10 @@ impl Metadata {
         // Exactly one blob-file format is readable (V5-only on-disk
         // contract): version 4 is what the current writer stamps. Anything
         // else — including the retired version 3 — is corruption or an
-        // unsupported file, never a compat case.
+        // unsupported file, never a compat case. Covered end-to-end by
+        // `tests::test_blob_file_meta_retired_version_rejected`, which
+        // serializes a version-3 block through the production encoder and
+        // asserts this rejection.
         if version != 4 {
             return Err(crate::Error::InvalidHeader("BlobFileMeta"));
         }
