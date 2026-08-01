@@ -1781,3 +1781,57 @@ fn repair_routes_a_stale_kv_footer_through_salvage() -> crate::Result<()> {
     crate::verify::verify_kv_checksums(&tree)?;
     Ok(())
 }
+
+/// A FOOTER-LESS SST whose data block declares more entries than it decodes
+/// (a re-stamped trailer item count) must be routed through salvage, not
+/// graded Clean. verify_kv_checksums is a no-op without footers and the
+/// out-of-band walk verifies only the outer frame, so only a full-decode
+/// completeness check catches the truncated tail before repair rebuilds the
+/// manifest around a block whose keys a later scan silently omits.
+#[test]
+fn repair_routes_an_under_decoding_footerless_block_through_salvage() -> crate::Result<()> {
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+
+    // Flush one uncompressed, FOOTER-LESS SST (default kv_checksums = Off).
+    let sst_path = {
+        let crate::AnyTree::Standard(tree) = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_compression_policy(crate::config::CompressionPolicy::all(
+            crate::CompressionType::None,
+        ))
+        .open()?
+        else {
+            unreachable!("standard tree configured");
+        };
+        for i in 0u64..500 {
+            tree.insert(format!("key-{i:06}"), format!("v{i:06}"), i);
+        }
+        tree.flush_active_memtable(500)?;
+        let binding = tree.version_history.read().latest_version();
+        let Some(table) = binding.version.iter_tables().next() else {
+            panic!("flush produced one table");
+        };
+        (*table.path).clone()
+    };
+
+    // Inflate the first data block's trailer item count behind a re-stamped
+    // block checksum: iteration yields fewer entries than declared.
+    crate::test_forge::forge_inflated_item_count(&sst_path)?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.salvaged, 1,
+        "the under-decoding footer-less table must be routed through salvage: {report:?}",
+    );
+    Ok(())
+}
