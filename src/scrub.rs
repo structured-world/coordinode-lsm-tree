@@ -567,6 +567,18 @@ fn refresh_healed_checksum(
         ));
     }
 
+    // Both meta mirrors re-stamped CONSISTENTLY pass the mirror comparison,
+    // yet run selection trusts the recorded key range to route reads AROUND
+    // this table — a narrowed range silently hides real keys and the range
+    // tombstones that mask older tables. Cross-check the recorded bounds
+    // against the decoded contents before trusting the digest.
+    if let Err(e) = table.verify_metadata_bounds() {
+        return finding(alloc::format!(
+            "digest mismatch with a metadata-bounds cross-check failure ({e}); \
+             the manifest digest was not refreshed"
+        ));
+    }
+
     // AUTHORITATIVE content has no cross-check, so an UNATTRIBUTED mismatch
     // (the pre-heal digest was not probed equal to the manifest, proving the
     // difference is exactly this pass's verified corrections) must not be

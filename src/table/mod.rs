@@ -2523,6 +2523,134 @@ impl Table {
         Ok(())
     }
 
+    /// Cross-checks the recorded metadata BOUNDS against the table's decoded
+    /// contents. Both meta mirrors re-stamped CONSISTENTLY (fresh checksums
+    /// and parity) pass every byte-level check and the mirror comparison,
+    /// yet run selection trusts `key#min`/`key#max` to route reads AROUND
+    /// this table — a narrowed range silently hides real keys (and the range
+    /// tombstones that mask older tables). Checks, against the ON-DISK meta:
+    /// - the recorded key range COVERS the decoded first/last data keys and
+    ///   every recorded range tombstone's bounds (covers, not equals: the
+    ///   writer legitimately widens the range over tombstone-only spans);
+    /// - the recorded `item_count` equals the decoded entry count (the
+    ///   tombstone sentinel is an on-disk entry counted on both sides).
+    /// The seqno bounds are deliberately NOT compared: the writer excludes
+    /// the tombstone sentinel's synthetic seqno from the recorded range, so
+    /// the decoded range can legitimately exceed it.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when the recorded bounds disagree
+    /// with the decoded contents; any I/O / decode error from the full scan.
+    #[cfg(feature = "std")]
+    pub(crate) fn verify_metadata_bounds(&self) -> crate::Result<()> {
+        // Re-read the meta FROM DISK: the in-memory copy was parsed at
+        // recover time, so an on-disk re-stamp after the open (the very
+        // forge this check exists for) would be invisible to it.
+        let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
+        let trailer = crate::sfa::Reader::from_reader(&mut file)?;
+        let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
+        // Tail-first with MID fallback, mirroring recovery: the next open
+        // trusts the same copy, and a table living off its intact MID mirror
+        // (unreadable forged tail) must be judged by THAT copy's bounds.
+        let meta = match crate::table::meta::ParsedMeta::load_with_handle(
+            &*file,
+            &regions.metadata,
+            Some(self.metadata.id),
+            self.encryption.as_deref(),
+        ) {
+            Ok(meta) => meta,
+            Err(tail_err) => {
+                let Some(mid_handle) = regions.metadata_mid else {
+                    return Err(tail_err);
+                };
+                crate::table::meta::ParsedMeta::load_with_handle(
+                    &*file,
+                    &mid_handle,
+                    Some(self.metadata.id),
+                    self.encryption.as_deref(),
+                )?
+            }
+        };
+
+        let mut count: u64 = 0;
+        let mut first_key: Option<UserKey> = None;
+        let mut last_key: Option<UserKey> = None;
+        for handle in self.block_index.iter() {
+            let handle = handle?;
+            let block_handle = BlockHandle::new(handle.offset(), handle.size());
+            let entries = self.decode_block_entries(&block_handle)?;
+            count = count
+                .checked_add(entries.len() as u64)
+                .ok_or(crate::Error::InvalidHeader("meta bounds"))?;
+            if first_key.is_none() {
+                first_key = entries.first().map(|e| e.key.user_key.clone());
+            }
+            if let Some(last) = entries.last() {
+                last_key = Some(last.key.user_key.clone());
+            }
+        }
+        if count != meta.item_count {
+            return Err(crate::Error::InvalidHeader(
+                "meta item_count disagrees with the decoded entry count",
+            ));
+        }
+        let cmp = &self.comparator;
+        let covers = |key: &[u8]| {
+            cmp.compare(meta.key_range.min().as_ref(), key) != core::cmp::Ordering::Greater
+                && cmp.compare(meta.key_range.max().as_ref(), key) != core::cmp::Ordering::Less
+        };
+        if let (Some(first), Some(last)) = (&first_key, &last_key)
+            && !(covers(first.as_ref()) && covers(last.as_ref()))
+        {
+            return Err(crate::Error::InvalidHeader(
+                "meta key range does not cover the decoded data keys",
+            ));
+        }
+
+        // Range tombstones mask entries in OLDER tables during reads and
+        // merges, so a key range narrowed below a tombstone's extent routes
+        // reads around this table and resurrects the data it deletes.
+        if let Some(rt_handle) = regions.range_tombstones {
+            let block = Block::from_file(
+                &*file,
+                rt_handle,
+                crate::table::block::BlockIdentity {
+                    table_id: self.metadata.id,
+                    block_type: BlockType::RangeTombstone,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                &{
+                    let t = match self.encryption.as_deref() {
+                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                        None => crate::table::block::BlockTransform::PLAIN,
+                    };
+                    if let Some(ecc) = self.metadata.ecc_params {
+                        t.with_ecc(ecc)
+                    } else {
+                        t
+                    }
+                },
+            )?;
+            if block.header.block_type != BlockType::RangeTombstone {
+                return Err(crate::Error::InvalidTag((
+                    "BlockType",
+                    block.header.block_type.into(),
+                )));
+            }
+            let tombstones = Self::decode_range_tombstones(&block, self.comparator.as_ref())?;
+            for rt in &tombstones {
+                if !(covers(rt.start.as_ref()) && covers(rt.end.as_ref())) {
+                    return Err(crate::Error::InvalidHeader(
+                        "meta key range does not cover a recorded range tombstone",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Decodes one data block's entries (row or columnar) into
     /// [`InternalValue`]s, for the semantic cross-check gates.
     #[cfg(feature = "std")]

@@ -265,6 +265,21 @@ fn block_verify_verdict(
         // that disagrees with the decoded blocks is corruption; salvage
         // rebuilds the locator from the re-emitted entries.
         BlockVerifyVerdict::Corrupt
+    } else if table.verify_filter().is_err() {
+        // A checksum-clean filter re-stamped to another parseable filter
+        // makes check_bloom silently skip point reads for any key turned
+        // into a false negative. An existing key the filter reports as
+        // definitely absent is corruption; salvage rebuilds the filter from
+        // the re-emitted keys.
+        BlockVerifyVerdict::Corrupt
+    } else if table.verify_metadata_bounds().is_err() {
+        // Both meta mirrors re-stamped CONSISTENTLY pass the mirror
+        // comparison, yet run selection trusts the recorded key range — a
+        // narrowed range hides real keys (and the range tombstones masking
+        // older tables). Bounds that disagree with the decoded contents are
+        // corruption; salvage re-derives the metadata from the re-emitted
+        // entries.
+        BlockVerifyVerdict::Corrupt
     } else if !report.is_ok() {
         // Parity-ONLY rot: every payload checksum verified clean, only the
         // recovery margin is dead. The data is fully readable, so it grades
