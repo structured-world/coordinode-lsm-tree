@@ -622,6 +622,9 @@ fn refresh_healed_checksum(
             }
             Err(e) => return finding(e.to_string()),
         }
+        // `kv_checksum_algo` is the per-SST footer descriptor on `ParsedMeta`
+        // (`Some(algo)` when every data block carries a per-KV footer under
+        // `algo`) — the same field the per-KV verify path reads above.
         if table.metadata.kv_checksum_algo.is_none() {
             return finding(
                 "digest mismatch not attributable to this pass's heal on a \
