@@ -243,6 +243,14 @@ fn block_verify_verdict(
         // would silently omit live entries from every seqno-scoped scan.
         // Salvage re-derives the bounds from the re-emitted entries.
         BlockVerifyVerdict::Corrupt
+    } else if table.verify_block_entry_counts().is_err() {
+        // The out-of-band walk verifies only the outer frame and the per-KV
+        // gate is a no-op without footers, so a checksum-clean block whose
+        // trailer declares more entries than it decodes (a valid prefix, a
+        // malformed tail) grades clean while a later scan silently omits the
+        // tail. Full-decode every block; a count mismatch routes the table
+        // through salvage (whose row path drops the under-decoding block).
+        BlockVerifyVerdict::Corrupt
     } else if !report.is_ok() {
         // Parity-ONLY rot: every payload checksum verified clean, only the
         // recovery margin is dead. The data is fully readable, so it grades

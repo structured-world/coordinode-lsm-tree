@@ -1977,6 +1977,66 @@ impl Table {
         Ok(())
     }
 
+    /// Fully DECODES every data block and checks its entry count against the
+    /// trailer's declared item count. The out-of-band walk verifies only the
+    /// outer frame, and `verify_kv_checksums` is a no-op for a footer-less
+    /// SST, so a checksum- and parity-consistent block with a valid prefix
+    /// followed by a malformed entry is otherwise graded clean: the entry
+    /// decoder turns a mid-stream parse failure into an ordinary end of
+    /// iteration, so a later scan silently omits the malformed tail. Decoding
+    /// to fewer (or more) entries than the trailer declares is corruption.
+    /// Covers both row-major and columnar blocks.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when a block decodes to a different
+    /// entry count than its trailer declares; any I/O / decode error from the
+    /// full scan.
+    #[cfg(feature = "std")]
+    pub(crate) fn verify_block_entry_counts(&self) -> crate::Result<()> {
+        for handle in self.block_index.iter() {
+            let handle = handle?;
+            let block_handle = BlockHandle::new(handle.offset(), handle.size());
+            #[cfg(feature = "columnar")]
+            if self.metadata.columnar {
+                let block = self.load_block(
+                    &block_handle,
+                    BlockType::Columnar,
+                    self.metadata.data_block_compression,
+                    #[cfg(zstd_any)]
+                    self.zstd_dictionary.as_deref(),
+                )?;
+                // `column_batch_to_entries` fully materializes the rows, so a
+                // malformed batch fails here rather than truncating silently.
+                let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
+                let entries = crate::table::columnar::column_batch_to_entries(&batch)?;
+                if entries.len() != batch.row_count as usize {
+                    return Err(crate::Error::InvalidHeader(
+                        "columnar block decodes to fewer rows than its batch declares",
+                    ));
+                }
+                continue;
+            }
+            let block = self.load_block(
+                &block_handle,
+                BlockType::Data,
+                self.metadata.data_block_compression,
+                #[cfg(zstd_any)]
+                self.zstd_dictionary.as_deref(),
+            )?;
+            let data_block =
+                DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())?;
+            let declared = data_block.len();
+            let decoded = data_block.try_iter(self.comparator.clone())?.count();
+            if decoded != declared {
+                return Err(crate::Error::InvalidHeader(
+                    "data block decodes to fewer entries than its trailer declares",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Loads the filter block (if any) and checks the bloom filter.
     ///
     /// Returns `Ok(BloomResult::Skip)` if the bloom filter says the key is definitely absent

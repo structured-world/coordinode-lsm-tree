@@ -513,6 +513,17 @@ fn refresh_healed_checksum(
         ));
     }
 
+    // The walk verifies only the outer frame, so a checksum-clean block whose
+    // trailer declares more entries than it decodes reads clean; full-decode
+    // every block and confirm the counts match before trusting the digest,
+    // or restamping would legitimize a silently-truncated tail.
+    if let Err(e) = table.verify_block_entry_counts() {
+        return finding(alloc::format!(
+            "digest mismatch with a block entry-count mismatch ({e}); \
+             the manifest digest was not refreshed"
+        ));
+    }
+
     match tree.refresh_table_checksum(table.id(), fresh) {
         Ok(()) => None,
         Err(e) => finding(e.to_string()),
