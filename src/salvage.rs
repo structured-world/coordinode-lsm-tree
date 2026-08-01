@@ -71,7 +71,7 @@ pub struct SalvageOptions {
     /// directory). [`crate::repair`] passes the tree's `Config::sync_mode`,
     /// so a Full-durability repair persists the salvaged SST as strongly as
     /// the manifest it rebuilds around it; the standalone default is
-    /// [`crate::SyncMode::Normal`].
+    /// [`crate::fs::SyncMode::Normal`].
     pub sync_mode: crate::fs::SyncMode,
 }
 
