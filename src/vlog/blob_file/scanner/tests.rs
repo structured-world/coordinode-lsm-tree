@@ -381,6 +381,143 @@ fn blob_scanner_magic_rot_resyncs_to_next_frame() -> crate::Result<()> {
     Ok(())
 }
 
+/// Writes three frames where frame 1's VALUE embeds a fake frame header
+/// (real magic + header-CRC-valid fields) whose declared lengths end exactly
+/// at frame 3's offset — the shape a resynchronizing scan must not trust.
+/// `fake_extra_len` widens the fake on-disk value length beyond that (0 =
+/// "skip exactly frame 2"; large = "declare past the data section").
+/// Returns the blob file path.
+fn write_frames_with_embedded_fake_header(
+    dir: &std::path::Path,
+    fake_extra_len: u32,
+) -> crate::Result<std::path::PathBuf> {
+    use crate::vlog::blob_file::writer::{BLOB_HEADER_LEN, compute_header_crc};
+
+    let blob_file_path = dir.join("0");
+
+    // Layout (data section starts at file offset 0):
+    //   f1: header 42 + key "aaa" (3) + value 52   -> [0, 97)
+    //   f2: header 42 + key "bbb" (3) + "second_value" (12) -> [97, 154)
+    //   f3: header 42 + key "ccc" (3) + "third_value" (11)  -> [154, 210)
+    // The fake header sits inside f1's value at absolute offset 55
+    // (10-byte prefix), so a resync from f1's rotted magic finds it first.
+    let header = BLOB_HEADER_LEN as u64;
+    let f2_off = header + 3 + 52;
+    let f3_off = f2_off + header + 3 + 12;
+    let fake_pos = header + 3 + 10;
+    // Declared end = fake_pos + header + fake_key(3) + odl == f3_off (+extra).
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test layout offsets are tiny"
+    )]
+    let odl = (f3_off - fake_pos - header - 3) as u32 + fake_extra_len;
+    let fake_seqno = 1u64;
+    let crc = compute_header_crc(fake_seqno, 3, odl, odl);
+
+    let mut fake = Vec::with_capacity(BLOB_HEADER_LEN);
+    fake.extend_from_slice(BLOB_HEADER_MAGIC);
+    fake.extend_from_slice(&0u128.to_le_bytes()); // payload checksum: never matches
+    fake.extend_from_slice(&fake_seqno.to_le_bytes());
+    fake.extend_from_slice(&3u16.to_le_bytes());
+    fake.extend_from_slice(&odl.to_le_bytes());
+    fake.extend_from_slice(&odl.to_le_bytes());
+    fake.extend_from_slice(&crc.to_le_bytes());
+    assert_eq!(fake.len(), BLOB_HEADER_LEN, "fake header fills the layout");
+
+    let mut value1 = alloc::vec![0xAAu8; 10];
+    value1.extend_from_slice(&fake);
+    assert_eq!(value1.len(), 52, "f1 value matches the planned layout");
+
+    let mut writer = BlobFileWriter::new(&blob_file_path, 0, 0, &StdFs)?;
+    writer.write(b"aaa", 7, &value1)?;
+    writer.write(b"bbb", 7, b"second_value")?;
+    writer.write(b"ccc", 7, b"third_value")?;
+    writer.finish()?;
+
+    // Rot f1's real magic so the scan resynchronizes into f1's value and
+    // lands on the embedded fake magic.
+    let mut bytes = std::fs::read(&blob_file_path)?;
+    bytes[0] ^= 0xFF;
+    std::fs::write(&blob_file_path, bytes)?;
+    Ok(blob_file_path)
+}
+
+/// A resync CANDIDATE whose payload checksum fails must not have its
+/// declared lengths trusted: the candidate magic came from user-controlled
+/// value bytes, so a CRC-valid fake header can declare an end past intact
+/// later records. The scanner must resynchronize again strictly after the
+/// candidate instead of continuing from its declared end — otherwise the
+/// fake frame silently costs frame 2.
+#[test]
+fn blob_scanner_resyncs_again_when_a_candidate_frame_fails_its_checksum() -> crate::Result<()> {
+    let dir = tempdir()?;
+    // Fake declared end == frame 3's offset: trusting it skips frame 2.
+    let blob_file_path = write_frames_with_embedded_fake_header(dir.path(), 0)?;
+
+    let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
+    let first = scanner.next().unwrap();
+    assert!(
+        matches!(first, Err(crate::Error::InvalidHeader("Blob"))),
+        "the rotted real magic is rejected: {first:?}",
+    );
+    let second = scanner.next().unwrap();
+    assert!(
+        matches!(second, Err(crate::Error::ChecksumMismatch { .. })),
+        "the fake candidate fails its payload checksum: {second:?}",
+    );
+    let Some(third) = scanner.next() else {
+        panic!("the intact second frame must survive the fake candidate");
+    };
+    let third = third?;
+    assert_eq!(
+        third.key,
+        Slice::from(&b"bbb"[..]),
+        "frame 2 is recovered, not skipped by the fake declared end",
+    );
+    assert_eq!(third.value, Slice::from(&b"second_value"[..]));
+    let fourth = scanner.next().expect("frame 3 follows")?;
+    assert_eq!(fourth.key, Slice::from(&b"ccc"[..]));
+    assert!(scanner.next().is_none());
+    Ok(())
+}
+
+/// A resync CANDIDATE whose declared end exceeds the data section must not
+/// TERMINATE the scan: for a chained (writer-vouched) frame that means real
+/// truncation, but a candidate's lengths come from user-controlled bytes —
+/// terminating hands one crafted value the whole readable tail. The scanner
+/// must resynchronize past the candidate instead.
+#[test]
+fn blob_scanner_resyncs_when_a_candidate_frame_declares_past_the_section() -> crate::Result<()> {
+    let dir = tempdir()?;
+    // Fake declared end far past the data section: bounds-reject the candidate.
+    let blob_file_path = write_frames_with_embedded_fake_header(dir.path(), 1_000_000)?;
+
+    let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
+    let first = scanner.next().unwrap();
+    assert!(
+        matches!(first, Err(crate::Error::InvalidHeader("Blob"))),
+        "the rotted real magic is rejected: {first:?}",
+    );
+    let second = scanner.next().unwrap();
+    assert!(
+        matches!(second, Err(crate::Error::InvalidHeader("Blob"))),
+        "the fake candidate is bounds-rejected: {second:?}",
+    );
+    let Some(third) = scanner.next() else {
+        panic!("the intact second frame must survive the fake candidate");
+    };
+    let third = third?;
+    assert_eq!(
+        third.key,
+        Slice::from(&b"bbb"[..]),
+        "frame 2 is recovered, not lost to a terminated scan",
+    );
+    let fourth = scanner.next().expect("frame 3 follows")?;
+    assert_eq!(fourth.key, Slice::from(&b"ccc"[..]));
+    assert!(scanner.next().is_none());
+    Ok(())
+}
+
 /// Scanner rejects frames with invalid magic (neither V3 nor V4).
 #[test]
 fn blob_scanner_rejects_invalid_magic() -> crate::Result<()> {
