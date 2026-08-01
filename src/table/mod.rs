@@ -1142,6 +1142,7 @@ impl Table {
         &self,
         file: &mut Box<dyn crate::fs::FsFile>,
         state: &mut UnshareState,
+        sync_mode: crate::fs::SyncMode,
     ) -> Result<(), alloc::string::String> {
         match state {
             UnshareState::Ready => Ok(()),
@@ -1160,7 +1161,7 @@ impl Table {
                     }
                 };
                 if shared {
-                    match self.unshare_for_heal(file.as_ref()) {
+                    match self.unshare_for_heal(file.as_ref(), sync_mode) {
                         Ok(fresh) => *file = fresh,
                         Err(reason) => {
                             *state = UnshareState::Failed(reason.clone());
@@ -1191,6 +1192,7 @@ impl Table {
     fn unshare_for_heal(
         &self,
         source: &dyn crate::fs::FsFile,
+        sync_mode: crate::fs::SyncMode,
     ) -> Result<Box<dyn crate::fs::FsFile>, alloc::string::String> {
         use std::io::Write;
 
@@ -1239,8 +1241,10 @@ impl Table {
                 off += want as u64;
             }
             // sync_all, not sync_data: the copy is a NEW file, its size must
-            // be durable before the rename publishes it.
-            tmp.sync_all()
+            // be durable before the rename publishes it. Mode-aware: the
+            // caller selected the tree's durability (Normal skips the macOS
+            // F_FULLFSYNC hardware barrier, same as the flush path).
+            tmp.sync_all_with(sync_mode)
                 .map_err(|e| alloc::format!("sync heal copy: {e}"))?;
             self.fs
                 .rename(&tmp_path, &self.path)
@@ -1265,7 +1269,7 @@ impl Table {
         self.file_accessor.remove_for_table(&self.global_id());
         if let Some(parent) = self.path.parent() {
             self.fs
-                .sync_directory(parent)
+                .sync_directory_with(parent, sync_mode)
                 .map_err(|e| alloc::format!("sync directory after rename: {e}"))?;
         }
         // The handle survives the rename (same inode, now the live path).
@@ -1310,8 +1314,18 @@ impl Table {
     /// disagreed with the manifest.
     ///
     /// `pub(crate)` for [`crate::scrub::patrol_scrub`] (heal-in-place enabled).
+    /// `sync_mode` is the tree's configured durability
+    /// ([`Config::sync_mode`](crate::config::Config::sync_mode)): every
+    /// write-back, the unshare copy, and the post-rename directory sync
+    /// honor it, so a patrol with many corrections does not pay a macOS
+    /// `F_FULLFSYNC` hardware barrier per block when the caller selected
+    /// [`SyncMode::Normal`](crate::fs::SyncMode::Normal).
+    ///
     #[cfg(feature = "page_ecc")]
-    pub(crate) fn heal_data_blocks_in_place(&self) -> (crate::scrub::PatrolScrubReport, bool) {
+    pub(crate) fn heal_data_blocks_in_place(
+        &self,
+        sync_mode: crate::fs::SyncMode,
+    ) -> (crate::scrub::PatrolScrubReport, bool) {
         use crate::scrub::{PatrolScrubReport, ScrubError};
         use std::io::{Seek, SeekFrom, Write};
 
@@ -1536,9 +1550,11 @@ impl Table {
                                 .get_or_insert_with(|| self.pre_heal_digest_matches());
                             // First write: make sure no checkpoint link
                             // shares the inode (lazy detach).
-                            if let Err(reason) =
-                                self.ensure_unshared_for_write(&mut file, &mut unshare_state)
-                            {
+                            if let Err(reason) = self.ensure_unshared_for_write(
+                                &mut file,
+                                &mut unshare_state,
+                                sync_mode,
+                            ) {
                                 report.uncorrectable_blocks += 1;
                                 report.errors.push(ScrubError::UncorrectableBlock {
                                     table_id: self.id(),
@@ -1558,7 +1574,9 @@ impl Table {
                                 .seek(SeekFrom::Start(trailer_offset))
                                 .and_then(|_| file.write_all(&fresh));
                             let durable = match write_back {
-                                Ok(()) => file.sync_data().map_err(|e| alloc::format!("sync: {e}")),
+                                Ok(()) => file
+                                    .sync_data_with(sync_mode)
+                                    .map_err(|e| alloc::format!("sync: {e}")),
                                 Err(e) => Err(alloc::format!("write: {e}")),
                             };
                             if let Err(reason) = durable {
@@ -1633,7 +1651,7 @@ impl Table {
                     // First write: make sure no checkpoint link shares the
                     // inode (lazy detach).
                     if let Err(reason) =
-                        self.ensure_unshared_for_write(&mut file, &mut unshare_state)
+                        self.ensure_unshared_for_write(&mut file, &mut unshare_state, sync_mode)
                     {
                         report.uncorrectable_blocks += 1;
                         report.errors.push(ScrubError::UncorrectableBlock {
@@ -1654,7 +1672,9 @@ impl Table {
                         .seek(SeekFrom::Start(block_offset))
                         .and_then(|_| file.write_all(&frame));
                     let durable = match write_back {
-                        Ok(()) => file.sync_data().map_err(|e| alloc::format!("sync: {e}")),
+                        Ok(()) => file
+                            .sync_data_with(sync_mode)
+                            .map_err(|e| alloc::format!("sync: {e}")),
                         Err(e) => Err(alloc::format!("write: {e}")),
                     };
                     if let Err(reason) = durable {

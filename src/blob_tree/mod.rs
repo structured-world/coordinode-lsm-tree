@@ -398,6 +398,11 @@ impl AbstractTree for BlobTree {
         self.index.refresh_table_checksum(table_id, checksum)
     }
 
+    fn sync_mode(&self) -> crate::fs::SyncMode {
+        // SSTs live in the index tree; its durability mode governs them.
+        self.index.sync_mode()
+    }
+
     fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
         // Forward the index tree's compaction state (the default impl would
         // always report idle), and mark value bytes as NOT user values: large

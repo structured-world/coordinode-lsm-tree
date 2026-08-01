@@ -120,6 +120,14 @@ pub trait AbstractTree: sealed::Sealed {
         checksum: crate::checksum::Checksum,
     ) -> crate::Result<()>;
 
+    /// The tree's configured durability mode
+    /// ([`Config::sync_mode`](crate::config::Config::sync_mode)). Maintenance
+    /// paths that write outside the flush pipeline (the in-place heal) read
+    /// it here so their syncs honor the same durability the tree's own
+    /// writes use.
+    #[doc(hidden)]
+    fn sync_mode(&self) -> crate::fs::SyncMode;
+
     /// Returns a read-only snapshot of the tree's on-disk storage footprint:
     /// total used bytes, entry count, the average shape of a stored entry
     /// (average key / value bytes), and an estimate of how many more

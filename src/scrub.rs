@@ -379,7 +379,7 @@ fn scan_and_reconcile(
                 .map(|p| p.enter_mutation_window())
         })
         .flatten();
-    let (mut partial, heal_attributable) = scan_one(table, options);
+    let (mut partial, heal_attributable) = scan_one(table, options, tree.sync_mode());
     if heals
         && wants_checksum_refresh(&partial)
         && let Some(finding) = refresh_healed_checksum(tree, table, heal_attributable)
@@ -607,6 +607,7 @@ fn refresh_healed_checksum(
 fn scan_one(
     table: &crate::table::Table,
     options: &PatrolScrubOptions,
+    sync_mode: crate::fs::SyncMode,
 ) -> (PatrolScrubReport, bool) {
     // In-place heal only applies to SSTs written with Page-ECC parity — there is
     // nothing to reconstruct without it. A table with no ECC still needs its
@@ -615,9 +616,9 @@ fn scan_one(
     // whose per-block reconstruction is a no-op there.
     #[cfg(feature = "page_ecc")]
     if options.heal_in_place && table.metadata.ecc_params.is_some() {
-        return table.heal_data_blocks_in_place();
+        return table.heal_data_blocks_in_place(sync_mode);
     }
-    let _ = options;
+    let _ = (options, sync_mode);
     (table.scrub_data_blocks(), false)
 }
 

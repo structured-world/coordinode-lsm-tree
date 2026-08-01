@@ -455,6 +455,10 @@ impl AbstractTree for Tree {
         )
     }
 
+    fn sync_mode(&self) -> crate::fs::SyncMode {
+        self.config.sync_mode
+    }
+
     fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
         // One version snapshot reused for the footprint and the full-compaction
         // estimate below: a second `current_version()` could race a concurrent
