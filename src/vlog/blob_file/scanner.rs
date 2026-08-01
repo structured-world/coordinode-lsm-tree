@@ -31,6 +31,15 @@ pub struct Scanner {
 
     /// Byte offset where the "data" section ends (from the SFA TOC).
     data_end: u64,
+
+    /// Whether the CURRENT read position came from a forward magic
+    /// resynchronization rather than a writer-chained frame end. A resync
+    /// candidate's magic may sit inside a damaged record's user-controlled
+    /// value bytes, so until the candidate fully validates its declared
+    /// lengths are untrusted: a rejection (bounds or payload checksum)
+    /// resynchronizes again strictly past the candidate instead of trusting
+    /// its declared end or terminating. Cleared once a frame validates.
+    resynced: bool,
 }
 
 impl Scanner {
@@ -117,6 +126,9 @@ impl Scanner {
             inner: file_reader,
             is_terminated: false,
             data_end,
+            // The opening position is writer-chained (data start or a carried
+            // frame boundary), never a magic-scan candidate.
+            resynced: false,
         })
     }
     // No `with_reader` constructor: Scanner is crate-private (parent
@@ -155,6 +167,9 @@ impl Scanner {
                 .position(|w| w == BLOB_HEADER_MAGIC)
             {
                 self.inner.seek(SeekFrom::Start(pos + hit as u64))?;
+                // The next frame is a magic-scan CANDIDATE: its lengths stay
+                // untrusted until the frame fully validates.
+                self.resynced = true;
                 return Ok(());
             }
             if want < MAGIC_LEN {
@@ -247,9 +262,14 @@ impl Iterator for Scanner {
         };
 
         // Verify the declared frame payload fits within the data section
-        // before allocating buffers. The header CRC has already vouched for
-        // the lengths, so an over-long declared end means the file itself
-        // is truncated — nothing past it can be readable; terminate.
+        // before allocating buffers. For a writer-chained frame the header
+        // CRC has vouched for the lengths, so an over-long declared end means
+        // the file itself is truncated — nothing past it can be readable;
+        // terminate. For a RESYNC CANDIDATE the CRC only proves internal
+        // consistency (the magic may sit inside a damaged record's
+        // user-controlled bytes, CRC computed over fake fields), so the
+        // over-long end condemns the candidate, not the tail: resynchronize
+        // strictly past it.
         {
             let header_len = super::writer::BLOB_HEADER_LEN as u64;
             // `key_len` / `on_disk_val_len` come from the on-disk frame header and
@@ -261,7 +281,14 @@ impl Iterator for Scanner {
                 .and_then(|x| x.checked_add(u64::from(key_len)))
                 .and_then(|x| x.checked_add(u64::from(on_disk_val_len)));
             if frame_end.is_none_or(|end| end > self.data_end) {
-                self.is_terminated = true;
+                if self.resynced {
+                    if let Err(e) = self.resync_to_next_frame(offset) {
+                        self.is_terminated = true;
+                        return Some(Err(e));
+                    }
+                } else {
+                    self.is_terminated = true;
+                }
                 return Some(Err(crate::Error::InvalidHeader("Blob")));
             }
         }
@@ -288,16 +315,29 @@ impl Iterator for Scanner {
                     self.blob_file_id,
                 );
 
-                // The frame's key/value lengths were validated by the header
-                // CRC before being consumed, so the cursor already sits on
-                // the next frame boundary: payload rot costs exactly this
-                // one record, no resynchronization needed.
+                // For a writer-chained frame the lengths were validated by
+                // the header CRC, so the cursor already sits on the next
+                // frame boundary: payload rot costs exactly this one record,
+                // no resynchronization needed. A RESYNC CANDIDATE's lengths
+                // are untrusted (a CRC-valid fake header inside a damaged
+                // record's value can declare an end past intact records), so
+                // its rejection resumes the magic search strictly past the
+                // candidate instead of trusting where its lengths landed.
+                if self.resynced
+                    && let Err(e) = self.resync_to_next_frame(offset)
+                {
+                    self.is_terminated = true;
+                    return Some(Err(e));
+                }
                 return Some(Err(crate::Error::ChecksumMismatch {
                     got: Checksum::from_raw(checksum),
                     expected: Checksum::from_raw(expected_checksum),
                 }));
             }
         }
+
+        // The frame fully validated: later positions are writer-chained again.
+        self.resynced = false;
 
         // The reader is now positioned at the next frame: capture it as the exact
         // punch / resume boundary for this frame.
