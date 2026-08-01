@@ -68,6 +68,40 @@ fn write_ecc_sst(dir: &std::path::Path) -> (std::path::PathBuf, crate::table::Bl
     ((*table.path).clone(), handle)
 }
 
+/// As [`write_ecc_sst`], but with per-KV checksum footers
+/// (`KvChecksumPolicy::AllLevels`). Footered tables keep the stale-digest
+/// reconcile available on a later clean pass (their value bytes re-derive
+/// authentication through the per-KV gate), so reconcile tests use this
+/// fixture.
+fn write_ecc_sst_footered(
+    dir: &std::path::Path,
+) -> (std::path::PathBuf, crate::table::BlockHandle) {
+    let tree = open_ecc_tree(dir);
+    tree.update_runtime_config(|c| {
+        c.kv_checksums = crate::runtime_config::KvChecksumPolicy::AllLevels;
+    })
+    .expect("enable kv checksums");
+    for i in 0u64..2_000 {
+        tree.insert(format!("key-{i:06}"), format!("v{i:06}"), i);
+    }
+    tree.flush_active_memtable(2_000).expect("flush");
+
+    let binding = tree.version_history.read().latest_version();
+    let table = binding
+        .version
+        .iter_tables()
+        .next()
+        .expect("flush produced one table");
+    let keyed = table
+        .block_index
+        .iter()
+        .next()
+        .expect("table has at least one data block")
+        .expect("block index entry decodes");
+    let handle = crate::table::BlockHandle::new(keyed.offset(), keyed.size());
+    ((*table.path).clone(), handle)
+}
+
 /// As [`write_ecc_sst`], plus a range tombstone so the SST carries the
 /// `range_tombstones` section — the deletion metadata the digest
 /// reconciliation cannot semantically authenticate.
@@ -1514,7 +1548,10 @@ fn heal_in_place_does_not_restamp_over_side_section_rot() -> crate::Result<()> {
 #[test]
 fn heal_in_place_reconciles_a_stale_checksum_left_by_a_failed_refresh() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (sst_path, block) = write_ecc_sst(dir.path());
+    // Footered: the later clean pass has no heal attribution, and only a
+    // table whose value bytes re-derive authentication through the per-KV
+    // gate may be reconciled without it.
+    let (sst_path, block) = write_ecc_sst_footered(dir.path());
 
     // Rot one parity-trailer byte, then let a manifest rebuild record the
     // digest of the ROTTED bytes.

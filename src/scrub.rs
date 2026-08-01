@@ -567,15 +567,22 @@ fn refresh_healed_checksum(
         ));
     }
 
-    // range_tombstones / delete_bitmap are AUTHORITATIVE deletion metadata:
-    // nothing in-file can re-derive which rows or ranges were genuinely
-    // deleted, so unlike every section above a re-stamped payload has NO
-    // cross-check. The digest may cover them only when the mismatch is
-    // provably this pass's own work — the pre-heal bytes matched the
-    // manifest, so the file now differs by exactly the verified corrections.
-    // Anything else fails closed: the stale digest keeps the alteration
-    // visible to verify_integrity, and the finding recurs until an operator
-    // rewrites the table (compaction) or re-admits it (repair).
+    // AUTHORITATIVE content has no cross-check, so an UNATTRIBUTED mismatch
+    // (the pre-heal digest was not probed equal to the manifest, proving the
+    // difference is exactly this pass's verified corrections) must not be
+    // restamped over it. Two authoritative surfaces:
+    // - range_tombstones / delete_bitmap: nothing in-file can re-derive
+    //   which rows or ranges were genuinely deleted;
+    // - VALUE bytes of a footer-less table: every gate above authenticates
+    //   keys, counts, and derived side structures, but a value changed
+    //   behind a re-stamped block checksum decodes cleanly — the manifest
+    //   digest is its only record. Footer-BEARING tables re-derive value
+    //   authentication through verify_kv_checksums above, so their
+    //   stale-digest reconcile (a refresh interrupted on an earlier pass)
+    //   stays available.
+    // Failing closed keeps the alteration visible to verify_integrity, and
+    // the finding recurs until an operator rewrites the table (compaction)
+    // or re-admits it (repair).
     if !heal_attributable {
         match table.has_deletion_metadata() {
             Ok(false) => {}
@@ -589,6 +596,14 @@ fn refresh_healed_checksum(
                 );
             }
             Err(e) => return finding(e.to_string()),
+        }
+        if table.metadata.kv_checksum_algo.is_none() {
+            return finding(
+                "digest mismatch not attributable to this pass's heal on a \
+                 footer-less table, whose value bytes have no per-entry \
+                 authentication; the manifest digest was not refreshed"
+                    .into(),
+            );
         }
     }
 
