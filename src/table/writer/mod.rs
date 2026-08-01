@@ -672,7 +672,12 @@ impl Writer {
     /// `has_zone_map` is the source's ACTUAL zone-map presence (a section, not
     /// a metadata property — the caller reads it off the open table): a row SST
     /// written with the zone-map policy keeps its zone map, and a columnar SST
-    /// without one does not gain one.
+    /// without one does not gain one. `has_seqno_bounds` is likewise the
+    /// source's actual `seqno_bounds` SECTION presence (`Table::has_seqno_bounds`,
+    /// `regions.seqno_bounds.is_some()`), NOT whether the best-effort loaded map
+    /// happens to be non-empty — so a source whose section is present but
+    /// unreadable still salvages into a copy that carries one (the writer
+    /// re-derives the ranges from the re-emitted entries).
     #[must_use]
     pub(crate) fn mirror_from(
         self,
