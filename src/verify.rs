@@ -1381,6 +1381,16 @@ const RAW_FORMAT_SECTIONS: &[&[u8]] = &[b"linked_blob_files", b"table_version", 
 /// each block inside still passes its byte-level checks. A future section
 /// name therefore requires extending this map in the same change that adds
 /// the writer section.
+///
+/// This role check is BYTE-LEVEL only. A section whose block is
+/// checksum-clean and correctly-roled but whose PAYLOAD was re-stamped to
+/// another structurally valid value (a redirected `locator`, a shrunk
+/// `zone_map` range, a widened `seqno_bounds`) passes here yet still lies to
+/// the read path. Those SEMANTIC cross-checks — comparing the section's
+/// decoded content against the blocks it summarizes — live on `Table`
+/// (`verify_locator` / `verify_zone_map` / `verify_seqno_bounds` /
+/// `verify_tli_mirrors` / `verify_block_entry_counts`) and are driven by the
+/// repair verdict and the heal digest reconciliation, not by this walk.
 fn expected_section_roles(name: &[u8]) -> Option<&'static [crate::table::block::BlockType]> {
     use crate::table::block::BlockType;
     Some(match name {
