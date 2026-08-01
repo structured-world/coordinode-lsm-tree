@@ -1876,29 +1876,32 @@ impl Table {
         Ok(())
     }
 
-    /// Compares the two DECODED TLI mirrors (head `tli` vs `tli_tail`). Each
-    /// copy is independently checksum- (and parity-)consistent, so a forged
-    /// tail that encodes a DIFFERENT handle list passes every byte-level
-    /// check while the pinned / partitioned read path prefers it on the next
-    /// recovery — omitted or redirected handles make keys disappear even
-    /// though the physical data section verifies clean. The writer re-encodes
-    /// the same `tli_bytes` into both sections, so the decoded payloads must
-    /// be identical (ciphertext may differ per encryption nonce). A no-op for
-    /// tables without a tail mirror.
+    /// Compares the two DECODED TLI mirrors (head `tli` vs `tli_tail`) and
+    /// validates the decoded handle list against the PHYSICAL section
+    /// layout. Each copy is independently checksum- (and parity-)consistent,
+    /// so a forged tail that encodes a DIFFERENT handle list passes every
+    /// byte-level check — and BOTH mirrors forged to the SAME list pass the
+    /// equality comparison too, since two forged copies prove nothing about
+    /// the data blocks. The writer emits blocks strictly back-to-back, so
+    /// the decoded handles must exactly TILE their section: in full-index
+    /// mode the handles tile the `data` section; in partitioned mode the TLI
+    /// handles tile the `index` section and the partitions' concatenated
+    /// data handles tile the `data` section. An omitted, redirected, or
+    /// duplicated handle leaves a gap or an overlap.
     ///
     /// # Errors
     ///
-    /// [`crate::Error::InvalidHeader`] when the decoded mirrors differ; any
-    /// I/O / decode error while loading either copy (an unreadable mirror is
-    /// equally untrustworthy for the callers' restamp / keep decisions).
+    /// [`crate::Error::InvalidHeader`] when the decoded mirrors differ or
+    /// the handle list does not tile the physical sections; any I/O / decode
+    /// error while loading either copy (an unreadable mirror is equally
+    /// untrustworthy for the callers' restamp / keep decisions).
     #[cfg(feature = "std")]
     pub(crate) fn verify_tli_mirrors(&self) -> crate::Result<()> {
+        use crate::table::block::ParsedItem as _;
+
         let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
         let trailer = crate::sfa::Reader::from_reader(&mut file)?;
         let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
-        let Some(tail_handle) = regions.tli_tail else {
-            return Ok(());
-        };
         let head = Self::read_tli_at(
             &*file,
             regions.tli,
@@ -1907,20 +1910,91 @@ impl Table {
             self.encryption.as_deref(),
             self.metadata.ecc_params,
         )?;
-        let tail = Self::read_tli_at(
-            &*file,
-            tail_handle,
-            self.metadata.id,
-            self.metadata.index_block_compression,
-            self.encryption.as_deref(),
-            self.metadata.ecc_params,
-        )?;
-        if head.as_slice() != tail.as_slice() {
+        if let Some(tail_handle) = regions.tli_tail {
+            let tail = Self::read_tli_at(
+                &*file,
+                tail_handle,
+                self.metadata.id,
+                self.metadata.index_block_compression,
+                self.encryption.as_deref(),
+                self.metadata.ecc_params,
+            )?;
+            if head.as_slice() != tail.as_slice() {
+                return Err(crate::Error::InvalidHeader(
+                    "tli_tail decodes to a different handle list than the head tli",
+                ));
+            }
+        }
+
+        // Structural coverage: the decoded handles must tile their section.
+        let data_section = trailer
+            .toc()
+            .section(b"data")
+            .ok_or(crate::Error::InvalidHeader("data section missing"))?;
+        head.try_iter(self.comparator.clone())?;
+        let handles: alloc::vec::Vec<BlockHandle> = head
+            .iter(self.comparator.clone())
+            .map(|i| i.materialize(head.as_slice()).into_inner())
+            .collect();
+        if let Some(index_handle) = regions.index {
+            // Partitioned: the TLI addresses index partitions inside the
+            // `index` section; the partitions address the data blocks.
+            let index_section = trailer
+                .toc()
+                .section(b"index")
+                .ok_or(crate::Error::InvalidHeader("index section missing"))?;
+            let _ = index_handle;
+            if !Self::frames_tile_section(&handles, index_section.pos(), index_section.len()) {
+                return Err(crate::Error::InvalidHeader(
+                    "tli handles do not tile the index section",
+                ));
+            }
+            let mut data_handles = alloc::vec::Vec::new();
+            for handle in &handles {
+                let part = Self::read_tli_at(
+                    &*file,
+                    *handle,
+                    self.metadata.id,
+                    self.metadata.index_block_compression,
+                    self.encryption.as_deref(),
+                    self.metadata.ecc_params,
+                )?;
+                part.try_iter(self.comparator.clone())?;
+                data_handles.extend(
+                    part.iter(self.comparator.clone())
+                        .map(|i| i.materialize(part.as_slice()).into_inner()),
+                );
+            }
+            if !Self::frames_tile_section(&data_handles, data_section.pos(), data_section.len()) {
+                return Err(crate::Error::InvalidHeader(
+                    "index partitions' data handles do not tile the data section",
+                ));
+            }
+        } else if !Self::frames_tile_section(&handles, data_section.pos(), data_section.len()) {
             return Err(crate::Error::InvalidHeader(
-                "tli_tail decodes to a different handle list than the head tli",
+                "tli data handles do not tile the data section",
             ));
         }
         Ok(())
+    }
+
+    /// Whether `handles`, in order, exactly tile `[pos, pos + len)`: the
+    /// first starts at `pos`, each next starts where the previous ended, and
+    /// the last ends at `pos + len`. The writer emits blocks back-to-back,
+    /// so any omitted, redirected, or duplicated handle breaks the tiling.
+    #[cfg(feature = "std")]
+    fn frames_tile_section(handles: &[BlockHandle], pos: u64, len: u64) -> bool {
+        let mut at = pos;
+        for handle in handles {
+            if handle.offset().0 != at {
+                return false;
+            }
+            at = match at.checked_add(u64::from(handle.size())) {
+                Some(v) => v,
+                None => return false,
+            };
+        }
+        pos.checked_add(len) == Some(at)
     }
 
     /// Cross-checks the recorded `seqno_bounds` section against the ACTUAL
