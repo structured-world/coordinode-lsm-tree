@@ -360,6 +360,38 @@ pub(crate) fn salvage_with_context(
         {
             discard_partial(fs, &dest);
         }
+        // Ownership gate: only the tail attempt ever CREATES `dest`
+        // (create_new), and its output was discarded above — so a `dest`
+        // that still exists here predates this salvage (the tail attempt
+        // failed against the occupied path). Renaming the MID copy over it
+        // would silently destroy an unrelated file that the occupied-path
+        // failure is supposed to protect; surface the tail attempt's own
+        // failure instead and take the MID copy with it.
+        match fs.exists(&dest) {
+            Ok(false) => {}
+            Ok(true) => {
+                if let Ok(rep) = &mid
+                    && rep.salvaged_path.is_some()
+                {
+                    discard_partial(fs, &mid_dest);
+                }
+                return match tail {
+                    Err(e) => Err(e),
+                    Ok(_) => Err(crate::Error::Io(crate::io::Error::new(
+                        crate::io::ErrorKind::AlreadyExists,
+                        "salvage destination already exists",
+                    ))),
+                };
+            }
+            Err(e) => {
+                if let Ok(rep) = &mid
+                    && rep.salvaged_path.is_some()
+                {
+                    discard_partial(fs, &mid_dest);
+                }
+                return Err(e.into());
+            }
+        }
         let mut rep = mid?;
         if rep.salvaged_path.is_some() {
             fs.rename(&mid_dest, &dest)?;
