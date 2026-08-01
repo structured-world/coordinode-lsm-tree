@@ -211,6 +211,31 @@ pub fn forge_tail_meta_value(
     key: &[u8],
     forged_value: &[u8],
 ) -> crate::Result<()> {
+    forge_meta_value_in_section(path, b"meta", key, forged_value)
+}
+
+/// As [`forge_tail_meta_value`], but applied to BOTH meta mirrors (`meta`
+/// and `meta_mid`) so the copies stay CONSISTENT with each other: the mirror
+/// comparison passes and only a cross-check of the decoded field against the
+/// table's actual data can catch the forge.
+pub fn forge_meta_value_both_mirrors(
+    path: &std::path::Path,
+    key: &[u8],
+    forged_value: &[u8],
+) -> crate::Result<()> {
+    forge_meta_value_in_section(path, b"meta", key, forged_value)?;
+    forge_meta_value_in_section(path, b"meta_mid", key, forged_value)
+}
+
+/// Shared body of the meta-value forges: patches `key`'s value inside the
+/// named meta section's payload and re-stamps the block checksum plus, on a
+/// parity-bearing build, the fixed RS(4,2) trailer.
+fn forge_meta_value_in_section(
+    path: &std::path::Path,
+    section: &[u8],
+    key: &[u8],
+    forged_value: &[u8],
+) -> crate::Result<()> {
     use crate::coding::{Decode, Encode};
     use crate::table::block::Header;
 
@@ -221,8 +246,8 @@ pub fn forge_tail_meta_value(
             Ok(r) => r,
             Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
         };
-        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"meta") else {
-            panic!("the SST must carry a meta section");
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == section) else {
+            panic!("the SST must carry the requested meta section");
         };
         (entry.pos(), entry.len())
     };

@@ -1117,6 +1117,43 @@ fn heal_in_place_does_not_restamp_over_a_forged_footerless_value() -> crate::Res
     Ok(())
 }
 
+/// The digest reconciliation must not restamp over FORGED metadata KEY
+/// BOUNDS: both meta mirrors re-stamped CONSISTENTLY to a narrower
+/// `key#max` (fresh checksums and parity) pass every byte-level check and
+/// the full mirror comparison — only a cross-check of the recorded range
+/// against the decoded data keys can catch it. Restamping would make run
+/// selection trust the forged range and silently skip this table for real
+/// keys outside it. The fixture is footered, so the forge is not
+/// pre-empted by the footer-less attribution rule.
+#[test]
+fn heal_in_place_does_not_restamp_over_forged_meta_key_bounds() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _) = write_ecc_sst_footered(dir.path());
+
+    let tree = open_ecc_tree(dir.path());
+    // Real keys run up to "key-001999"; narrow the recorded max below half
+    // the key space (same value length keeps the frame geometry).
+    crate::test_forge::forge_meta_value_both_mirrors(&sst_path, b"key#max", b"key-000999")?;
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
+        "forged meta key bounds must refuse the digest refresh: {report:?}",
+    );
+
+    // The manifest keeps the ORIGINAL digest, so the forge stays visible.
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the forged SST must keep failing verify_integrity: restamping its \
+         digest would let run selection silently skip real keys",
+    );
+    Ok(())
+}
+
 /// A LEGITIMATE heal on a tombstone-bearing table must still reconcile the
 /// manifest digest: attribution (the pre-write digest matched the manifest,
 /// so the file now differs by exactly this pass's verified corrections)
