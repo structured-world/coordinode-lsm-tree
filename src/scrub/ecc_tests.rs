@@ -931,6 +931,54 @@ fn heal_in_place_does_not_restamp_over_diverged_meta_mirrors() -> crate::Result<
     Ok(())
 }
 
+/// The digest reconciliation must not restamp over a FORGED `zone_map`: a
+/// payload re-stamped to another structurally valid map (a changed max
+/// value, fresh block checksum + parity) passes every byte-level and framing
+/// check, yet a predicate scan trusts its min/max to SKIP blocks — a shrunk
+/// range silently omits matching rows. Only a cross-check against the blocks'
+/// decoded key ranges can catch it before the refresh legitimizes the forge.
+#[test]
+fn heal_in_place_does_not_restamp_over_a_forged_zone_map() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // An ECC tree WITH the zone_map section (off by default).
+    let sst_path = {
+        let tree = open_ecc_tree(dir.path());
+        tree.update_runtime_config(|c| c.zone_map = true)?;
+        for i in 0u64..2_000 {
+            tree.insert(format!("key-{i:06}"), format!("v{i:06}"), i);
+        }
+        tree.flush_active_memtable(2_000).expect("flush");
+        let binding = tree.version_history.read().latest_version();
+        let table = binding
+            .version
+            .iter_tables()
+            .next()
+            .expect("flush produced one table");
+        (*table.path).clone()
+    };
+
+    let tree = open_ecc_tree(dir.path());
+    crate::test_forge::forge_flip_section_last_payload_byte(&sst_path, b"zone_map", Some((8, 2)))?;
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
+        "a forged zone_map must refuse the digest refresh: {report:?}",
+    );
+
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the forged SST must keep failing verify_integrity: restamping its \
+         digest would let predicate scans silently skip matching blocks",
+    );
+    Ok(())
+}
+
 /// The digest reconciliation must not restamp over a FORGED `seqno_bounds`
 /// map: a payload re-stamped to another structurally valid map (fresh block
 /// checksum + parity, `min <= max`, ascending offsets) passes every

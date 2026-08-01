@@ -422,6 +422,99 @@ pub fn forge_section_block_role(
     Ok(())
 }
 
+/// Flips the LAST byte of a named section's PAYLOAD and re-stamps the block
+/// checksum (plus, for a parity-bearing SST, the descriptor-scheme parity
+/// trailer). The section stays structurally valid and every byte-level check
+/// reads clean while its decoded content now disagrees with the blocks it
+/// summarizes — the shape only a content cross-check can catch. For the
+/// `zone_map` section the last payload byte is the last byte of the final
+/// block's `max` value, so this narrows/changes a recorded key range.
+/// `shards` is the SST's descriptor scheme (`None` for a parity-less table).
+pub fn forge_flip_section_last_payload_byte(
+    path: &std::path::Path,
+    section: &[u8],
+    shards: Option<(u8, u8)>,
+) -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::table::block::Header;
+
+    let mut bytes = std::fs::read(path)?;
+    let (pos, section_len) = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == section) else {
+            panic!("the SST must carry the targeted section");
+        };
+        (entry.pos(), entry.len())
+    };
+    let block_off = usize::try_from(pos).expect("section offset fits usize");
+    let Some(block) = bytes.get(block_off..) else {
+        panic!("section block within the file");
+    };
+    let mut cursor = block;
+    let header = Header::decode_from(&mut cursor)?;
+    let header_len = Header::header_len(header.block_type);
+    let payload_range =
+        block_off + header_len..block_off + header_len + header.data_length as usize;
+    {
+        let Some(payload) = bytes.get_mut(payload_range.clone()) else {
+            panic!("section payload within the file");
+        };
+        let last = payload.len() - 1;
+        let Some(slot) = payload.get_mut(last) else {
+            panic!("payload is non-empty");
+        };
+        *slot ^= 0xFF;
+    }
+    let Some(payload) = bytes.get(payload_range.clone()) else {
+        panic!("section payload within the file");
+    };
+    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(payload));
+    let new_header = Header {
+        checksum: new_checksum,
+        ..header
+    };
+    let mut hdr_bytes = Vec::with_capacity(header_len);
+    new_header.encode_into(&mut hdr_bytes)?;
+    let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
+        panic!("section header within the file");
+    };
+    hdr_dst.copy_from_slice(&hdr_bytes);
+
+    #[cfg(feature = "page_ecc")]
+    if let Some((data_shards, parity_shards)) = shards {
+        let payload_end = payload_range.end;
+        let Ok(section_len) = usize::try_from(section_len) else {
+            panic!("section length fits usize");
+        };
+        let frame_end = block_off + section_len;
+        if frame_end > payload_end {
+            let Some(payload) = bytes.get(payload_range) else {
+                panic!("section payload within the file");
+            };
+            let parity =
+                crate::ecc::encode_parity(payload, data_shards.into(), parity_shards.into())?;
+            assert_eq!(
+                frame_end - payload_end,
+                parity.len(),
+                "the frame's trailer length matches the descriptor scheme",
+            );
+            let Some(dst) = bytes.get_mut(payload_end..frame_end) else {
+                panic!("parity trailer within the file");
+            };
+            dst.copy_from_slice(&parity);
+        }
+    }
+    #[cfg(not(feature = "page_ecc"))]
+    let _ = (section_len, shards);
+
+    std::fs::write(path, &bytes)?;
+    Ok(())
+}
+
 /// ZEROES the LAST entry's `[seqno_min, seqno_max]` inside the
 /// `seqno_bounds` section's payload and re-stamps the block checksum (plus,
 /// for a parity-bearing SST, the descriptor-scheme parity trailer): the map
