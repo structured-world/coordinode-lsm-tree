@@ -757,6 +757,82 @@ pub fn forge_value_byte_in_first_data_block(
     Ok(())
 }
 
+/// Forges the `block_layout` section by SHIFTING a MIDDLE cumulative end of
+/// the first recorded entry down to the midpoint of its neighbors, then
+/// re-stamps the block checksum plus, for a parity-bearing SST, the parity
+/// trailer. The map stays structurally valid (strictly ascending offsets,
+/// inner count >= 2, final end untouched) and every byte-level check reads
+/// clean, while the recorded boundary now disagrees with the zstd frame's
+/// real inner-block layout — the shape only a decode-derived cross-check
+/// can catch. `shards` is the SST's descriptor scheme (`None` for a
+/// parity-less table).
+pub fn forge_block_layout_shift_middle_end(
+    path: &std::path::Path,
+    shards: Option<(u8, u8)>,
+) -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::table::block::Header;
+
+    let bytes = std::fs::read(path)?;
+    let pos = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"block_layout") else {
+            panic!("the SST must carry a block_layout section");
+        };
+        entry.pos()
+    };
+    let block_off = usize::try_from(pos).expect("section offset fits usize");
+    let Some(block) = bytes.get(block_off..) else {
+        panic!("section block within the file");
+    };
+    let mut cursor = block;
+    let header = Header::decode_from(&mut cursor)?;
+    let header_len = Header::header_len(header.block_type);
+    let Some(payload) =
+        bytes.get(block_off + header_len..block_off + header_len + header.data_length as usize)
+    else {
+        panic!("section payload within the file");
+    };
+
+    // Wire layout: [count u32] then per entry [offset u64 | inner u32 |
+    // inner x end u32]. Patch the FIRST entry's second-to-last end.
+    let read_u32 = |at: usize| {
+        u32::from_le_bytes(
+            payload
+                .get(at..at + 4)
+                .expect("u32 within the payload")
+                .try_into()
+                .expect("4 bytes"),
+        )
+    };
+    assert!(read_u32(0) >= 1, "the map records at least one block");
+    let inner = read_u32(12) as usize;
+    assert!(inner >= 2, "a recorded block has at least two inner blocks");
+    let target_at = 16 + (inner - 2) * 4;
+    let prev = if inner >= 3 {
+        read_u32(target_at - 4)
+    } else {
+        0
+    };
+    let current = read_u32(target_at);
+    assert!(
+        current > prev + 1,
+        "the target boundary must leave room for a shifted midpoint",
+    );
+    let shifted = prev + (current - prev) / 2;
+
+    let mut candidate = payload.to_vec();
+    let Some(dst) = candidate.get_mut(target_at..target_at + 4) else {
+        panic!("target end within the payload");
+    };
+    dst.copy_from_slice(&shifted.to_le_bytes());
+    forge_replace_section_payload(path, b"block_layout", &candidate, shards)
+}
+
 /// Forges the `filter` section so that the key hashing to `target_hash`
 /// becomes a FALSE NEGATIVE: searches for a single payload byte whose flip
 /// makes the (still parseable) `BuRR` filter report the hash as definitely

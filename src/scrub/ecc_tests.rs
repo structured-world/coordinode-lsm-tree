@@ -1117,6 +1117,100 @@ fn heal_in_place_does_not_restamp_over_a_forged_footerless_value() -> crate::Res
     Ok(())
 }
 
+/// As [`write_ecc_sst_footered`], but with 256 KiB zstd data blocks over
+/// ~600 KiB of KV so at least one data block splits into >= 2 inner zstd
+/// blocks and the SST carries a `block_layout` section.
+fn write_ecc_zstd_multiblock_sst(dir: &std::path::Path) -> std::path::PathBuf {
+    let crate::AnyTree::Standard(tree) = crate::Config::new(
+        dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .page_ecc(true)
+    .ecc_scheme(EccScheme::ReedSolomon {
+        data_shards: 8,
+        parity_shards: 2,
+    })
+    .data_block_size_policy(crate::config::BlockSizePolicy::all(256 * 1024))
+    .data_block_compression_policy(crate::config::CompressionPolicy::all(
+        crate::CompressionType::Zstd(19),
+    ))
+    .open()
+    .expect("open ecc zstd tree") else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+    tree.update_runtime_config(|c| {
+        c.kv_checksums = crate::runtime_config::KvChecksumPolicy::AllLevels;
+    })
+    .expect("enable kv checksums");
+    for i in 0u64..20_000 {
+        tree.insert(format!("key-{i:012}"), format!("value-{i:08}-payload"), i);
+    }
+    tree.flush_active_memtable(20_000).expect("flush");
+
+    let binding = tree.version_history.read().latest_version();
+    let table = binding
+        .version
+        .iter_tables()
+        .next()
+        .expect("flush produced one table");
+    assert!(
+        table.regions.block_layout.is_some(),
+        "the multi-inner-block fixture must carry a block_layout section",
+    );
+    (*table.path).clone()
+}
+
+/// The digest reconciliation must not restamp over a FORGED `block_layout`:
+/// a middle cumulative end shifted to another structurally valid value
+/// (fresh block checksum + parity) passes every byte-level and framing
+/// check — no gate compares the recorded boundaries with the zstd frames'
+/// real inner-block layout — yet the partial range-read path trusts it to
+/// bound decompression, silently omitting keys from the mis-mapped span.
+#[test]
+fn heal_in_place_does_not_restamp_over_a_forged_block_layout() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sst_path = write_ecc_zstd_multiblock_sst(dir.path());
+
+    let crate::AnyTree::Standard(tree) = crate::Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .page_ecc(true)
+    .ecc_scheme(EccScheme::ReedSolomon {
+        data_shards: 8,
+        parity_shards: 2,
+    })
+    .data_block_size_policy(crate::config::BlockSizePolicy::all(256 * 1024))
+    .data_block_compression_policy(crate::config::CompressionPolicy::all(
+        crate::CompressionType::Zstd(19),
+    ))
+    .open()
+    .expect("reopen ecc zstd tree") else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+    crate::test_forge::forge_block_layout_shift_middle_end(&sst_path, Some((8, 2)))?;
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
+        "a forged block_layout must refuse the digest refresh: {report:?}",
+    );
+
+    // The manifest keeps the ORIGINAL digest, so the forge stays visible.
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the forged SST must keep failing verify_integrity: restamping its \
+         digest would let partial range reads silently omit keys",
+    );
+    Ok(())
+}
+
 /// The digest reconciliation must not restamp over TLI mirrors forged
 /// CONSISTENTLY: both copies re-encoded to the same truncated handle list
 /// (fresh checksums, parity, Index role) pass every byte-level check AND
