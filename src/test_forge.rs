@@ -606,7 +606,7 @@ pub fn forge_replace_section_payload(
 
 /// Forges the `filter` section so that the key hashing to `target_hash`
 /// becomes a FALSE NEGATIVE: searches for a single payload byte whose flip
-/// makes the (still parseable) BuRR filter report the hash as definitely
+/// makes the (still parseable) `BuRR` filter report the hash as definitely
 /// absent, then re-stamps the block checksum plus, for a parity-bearing SST,
 /// the block's parity trailer. Every byte-level and framing check reads
 /// clean while a point read for that key is silently skipped — the shape

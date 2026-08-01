@@ -1087,7 +1087,7 @@ fn heal_in_place_reconciles_a_tombstone_bearing_table_after_a_legit_heal() -> cr
 }
 
 /// The digest reconciliation must not restamp over a FORGED `filter`: a
-/// payload altered to another parseable BuRR filter (fresh block checksum +
+/// payload altered to another parseable `BuRR` filter (fresh block checksum +
 /// parity) passes every byte-level, framing, and role check — the walk never
 /// probes the filter against the table's keys — yet `check_bloom` trusts it
 /// to SKIP point reads, so a key made into a false negative silently
