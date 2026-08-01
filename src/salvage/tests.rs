@@ -249,6 +249,58 @@ fn salvage_arbitrates_divergent_meta_mirrors() -> crate::Result<()> {
     Ok(())
 }
 
+/// A PRE-EXISTING destination must survive a divergent-mirror salvage: the
+/// tail attempt correctly fails its `create_new` open, but the MID attempt
+/// writes to a sibling temp path and wins the arbitration — publishing it
+/// by renaming over `dest` would silently destroy an unrelated file that an
+/// API call refusing "destination occupied" is supposed to leave untouched.
+#[test]
+fn salvage_refuses_to_overwrite_a_preexisting_destination() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0u64..100 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Divergent mirrors, so the arbitration runs a MID attempt after the
+    // tail attempt fails on the occupied destination.
+    crate::test_forge::forge_tail_meta_value(&source, b"compression#data", &[1])?;
+
+    // An unrelated file already occupies the destination.
+    let sentinel = b"unrelated pre-existing file".to_vec();
+    std::fs::write(&dest, &sentinel)?;
+
+    let result = salvage_sst(&source, dest.clone(), &fs);
+    assert!(
+        result.is_err(),
+        "an occupied destination must fail the salvage: {result:?}",
+    );
+    assert_eq!(
+        std::fs::read(&dest)?,
+        sentinel,
+        "the pre-existing destination must survive byte-for-byte",
+    );
+    // The losing / refused MID copy must not leak its temp file either.
+    for entry in std::fs::read_dir(dir.path())? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        assert!(
+            !name.contains(".healtmp-"),
+            "the refused MID attempt must clean up its temp copy, found {name:?}",
+        );
+    }
+    Ok(())
+}
+
 /// DIVERGENT meta mirrors disable the verbatim copy-through: a divergence
 /// confined to a DECODE-TRANSPARENT layout field (`restart_interval#data` —
 /// full block decoding is trailer-driven, so every block still reads clean
