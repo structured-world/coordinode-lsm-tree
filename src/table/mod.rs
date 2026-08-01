@@ -2607,7 +2607,10 @@ impl Table {
     ///   every recorded range tombstone's bounds (covers, not equals: the
     ///   writer legitimately widens the range over tombstone-only spans);
     /// - the recorded `item_count` equals the decoded entry count (the
-    ///   tombstone sentinel is an on-disk entry counted on both sides).
+    ///   tombstone sentinel is an on-disk entry counted on both sides);
+    /// - the recorded `data_block_count` equals the indexed block count
+    ///   ([`Table::scan`] hands it to the compaction scanner, which stops
+    ///   after that many blocks — a smaller forge drops the tail).
     ///
     /// The seqno bounds are deliberately NOT compared: the writer excludes
     /// the tombstone sentinel's synthetic seqno from the recorded range, so
@@ -2649,6 +2652,7 @@ impl Table {
         };
 
         let mut count: u64 = 0;
+        let mut block_count: u64 = 0;
         let mut first_key: Option<UserKey> = None;
         let mut last_key: Option<UserKey> = None;
         for handle in self.block_index.iter() {
@@ -2657,6 +2661,9 @@ impl Table {
             let entries = self.decode_block_entries(&block_handle)?;
             count = count
                 .checked_add(entries.len() as u64)
+                .ok_or(crate::Error::InvalidHeader("meta bounds"))?;
+            block_count = block_count
+                .checked_add(1)
                 .ok_or(crate::Error::InvalidHeader("meta bounds"))?;
             if first_key.is_none() {
                 first_key = entries.first().map(|e| e.key.user_key.clone());
@@ -2668,6 +2675,14 @@ impl Table {
         if count != meta.item_count {
             return Err(crate::Error::InvalidHeader(
                 "meta item_count disagrees with the decoded entry count",
+            ));
+        }
+        // `Table::scan` hands the recorded count to the compaction scanner,
+        // which stops after that many blocks: a count re-stamped SMALLER
+        // silently drops every key in the omitted tail from rewrites.
+        if block_count != meta.data_block_count {
+            return Err(crate::Error::InvalidHeader(
+                "meta data_block_count disagrees with the indexed block count",
             ));
         }
         let cmp = &self.comparator;
