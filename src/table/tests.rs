@@ -541,7 +541,7 @@ fn block_layout_section_roundtrips_for_large_zstd_blocks() {
         "large multi-inner-block table must carry a block_layout section",
     );
     assert!(
-        table.block_layout.len() >= 1,
+        !table.block_layout.is_empty(),
         "at least one data block must have a recorded inner-block layout",
     );
     // Every recorded entry must have strictly increasing cumulative ends whose

@@ -140,6 +140,11 @@ impl BlockLayoutMap {
         self.entries.len()
     }
 
+    /// Whether the map records no blocks at all.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Recorded block offsets, ascending. Test-only enumeration helper.
     /// Its sole caller is the zstd large-block roundtrip test, so it is gated
     /// to that feature to stay dead-code-clean in every other test build.

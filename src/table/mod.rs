@@ -2608,6 +2608,7 @@ impl Table {
     ///   writer legitimately widens the range over tombstone-only spans);
     /// - the recorded `item_count` equals the decoded entry count (the
     ///   tombstone sentinel is an on-disk entry counted on both sides).
+    ///
     /// The seqno bounds are deliberately NOT compared: the writer excludes
     /// the tombstone sentinel's synthetic seqno from the recorded range, so
     /// the decoded range can legitimately exceed it.
@@ -2723,6 +2724,154 @@ impl Table {
             }
         }
         Ok(())
+    }
+
+    /// Cross-checks the recorded `block_layout` section against the ACTUAL
+    /// inner-block boundaries of each zstd data frame, derived by stepwise
+    /// partial decodes. The section's block is checksum-clean to the walk
+    /// even when a cumulative end was re-stamped to another structurally
+    /// valid value, and the partial range-read path trusts it to bound
+    /// decompression — a mis-mapped boundary silently omits keys from the
+    /// affected span. Every recorded entry must belong to a real data block,
+    /// its ends must be strictly increasing, each prefix decode must land
+    /// exactly on its recorded boundary, and the final end must exhaust the
+    /// frame. A no-op for tables without the section, for encrypted tables
+    /// (the lazy path never engages there — the plaintext frame requires a
+    /// whole-block decrypt), and on builds without zstd.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when the recorded layout disagrees
+    /// with the frames; any I/O / decode error from the frame reads.
+    #[cfg(feature = "std")]
+    pub(crate) fn verify_block_layout(&self) -> crate::Result<()> {
+        #[cfg(not(feature = "zstd"))]
+        {
+            // Without zstd no data block splits and the lazy path does not
+            // exist; a zstd-compressed table is unreadable on this build
+            // anyway (the decode gates fail first).
+            Ok(())
+        }
+        #[cfg(feature = "zstd")]
+        {
+            const ERR: crate::Error =
+                crate::Error::InvalidHeader("block_layout disagrees with the frames' inner blocks");
+
+            // Re-read the section FROM DISK: the in-memory map was loaded at
+            // recover time, so an on-disk re-stamp after the open (the very
+            // forge this check exists for) would be invisible to it.
+            let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
+            let trailer = crate::sfa::Reader::from_reader(&mut file)?;
+            let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
+            let Some(bl_handle) = regions.block_layout else {
+                return Ok(());
+            };
+            // The lazy partial-decode path never engages for an encrypted
+            // table (the plaintext frame is only available after a
+            // whole-block decrypt), so its layout is never consulted — and
+            // the raw frame needed for the cross-check is equally
+            // unreachable without decrypting whole blocks.
+            if self.encryption.is_some() {
+                return Ok(());
+            }
+            let map = {
+                let block = Block::from_file(
+                    &*file,
+                    bl_handle,
+                    crate::table::block::BlockIdentity {
+                        table_id: self.metadata.id,
+                        block_type: BlockType::BlockLayout,
+                        dict_id: 0,
+                        window_log: 0,
+                    },
+                    &{
+                        let t = crate::table::block::BlockTransform::PLAIN;
+                        if let Some(ecc) = self.metadata.ecc_params {
+                            t.with_ecc(ecc)
+                        } else {
+                            t
+                        }
+                    },
+                )?;
+                if block.header.block_type != BlockType::BlockLayout {
+                    return Err(crate::Error::InvalidTag((
+                        "BlockType",
+                        block.header.block_type.into(),
+                    )));
+                }
+                crate::table::block_layout::BlockLayoutMap::decode(&block.data)?
+            };
+            if map.is_empty() {
+                return Ok(());
+            }
+
+            let transform = crate::table::util::build_block_transform(
+                self.metadata.data_block_compression,
+                None,
+                self.metadata.ecc_params,
+                #[cfg(zstd_any)]
+                self.zstd_dictionary.as_deref(),
+            )?;
+            let mut recorded_seen = 0usize;
+            for handle in self.block_index.iter() {
+                let handle = handle?;
+                let block_handle = BlockHandle::new(handle.offset(), handle.size());
+                let Some(ends) = map.ends_for(block_handle.offset().0) else {
+                    continue;
+                };
+                recorded_seen = recorded_seen
+                    .checked_add(1)
+                    .ok_or(crate::Error::InvalidHeader("block_layout"))?;
+                if !ends.iter().zip(ends.iter().skip(1)).all(|(a, b)| a < b) {
+                    return Err(ERR);
+                }
+                let (header, frame, _recovery) =
+                    Block::read_data_frame(&*file, block_handle, &transform)?;
+                if ends.last() != Some(&header.uncompressed_length) {
+                    return Err(ERR);
+                }
+                // Stepwise COLD prefix decodes: each recorded boundary must
+                // be exactly where the frame's k-th inner block ends. The
+                // per-block quadratic cost is bounded by the handful of
+                // inner blocks a data block splits into.
+                let mut src = std::io::Cursor::new(frame.as_ref());
+                let mut decoder = structured_zstd::decoding::FrameDecoder::new();
+                for (idx, &end) in ends.iter().enumerate() {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "inner-block index is bounded by ends.len(), well within u32"
+                    )]
+                    let end_block = (idx + 1) as u32;
+                    src.set_position(0);
+                    decoder
+                        .reset(&mut src)
+                        .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
+                    let pd = decoder
+                        .decode_blocks_partial(&mut src, 0, end_block, None, false)
+                        .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
+                    if pd.stopped_at.is_some()
+                        || pd.blocks_decoded != end_block
+                        || pd.data.len() != end as usize
+                    {
+                        return Err(ERR);
+                    }
+                    // The final recorded end must EXHAUST the frame: extra
+                    // unrecorded inner blocks would hide data past the map.
+                    if idx + 1 == ends.len() && !pd.frame_finished {
+                        return Err(ERR);
+                    }
+                }
+            }
+            // Every recorded entry matched a walked block (offsets are unique
+            // on both sides), so equal counts mean the map records ONLY the
+            // table's blocks.
+            if recorded_seen != map.len() {
+                return Err(crate::Error::InvalidHeader(
+                    "block_layout carries entries for blocks the index does not hold",
+                ));
+            }
+            Ok(())
+        }
     }
 
     /// Decodes one data block's entries (row or columnar) into

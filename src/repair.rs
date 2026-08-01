@@ -272,6 +272,13 @@ fn block_verify_verdict(
         // definitely absent is corruption; salvage rebuilds the filter from
         // the re-emitted keys.
         BlockVerifyVerdict::Corrupt
+    } else if table.verify_block_layout().is_err() {
+        // A checksum-clean block_layout re-stamped to another structurally
+        // valid boundary set mis-maps the partial range-read path's
+        // decompression bounds, silently omitting keys. Boundaries that
+        // disagree with the frames' actual inner blocks are corruption;
+        // salvage re-derives the layout when re-encoding.
+        BlockVerifyVerdict::Corrupt
     } else if table.verify_metadata_bounds().is_err() {
         // Both meta mirrors re-stamped CONSISTENTLY pass the mirror
         // comparison, yet run selection trusts the recorded key range — a

@@ -567,6 +567,19 @@ fn refresh_healed_checksum(
         ));
     }
 
+    // The block_layout block is checksum-clean to the walk even when a
+    // cumulative end was re-stamped to another structurally valid value, and
+    // the partial range-read path trusts it to bound decompression — a
+    // mis-mapped boundary silently omits keys. Cross-check every recorded
+    // boundary against the frames' actual inner blocks (a no-op without the
+    // section) before trusting the digest.
+    if let Err(e) = table.verify_block_layout() {
+        return finding(alloc::format!(
+            "digest mismatch with a block-layout cross-check failure ({e}); \
+             the manifest digest was not refreshed"
+        ));
+    }
+
     // Both meta mirrors re-stamped CONSISTENTLY pass the mirror comparison,
     // yet run selection trusts the recorded key range to route reads AROUND
     // this table — a narrowed range silently hides real keys and the range

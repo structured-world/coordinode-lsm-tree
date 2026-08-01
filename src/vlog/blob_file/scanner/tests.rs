@@ -475,7 +475,10 @@ fn blob_scanner_resyncs_again_when_a_candidate_frame_fails_its_checksum() -> cra
         "frame 2 is recovered, not skipped by the fake declared end",
     );
     assert_eq!(third.value, Slice::from(&b"second_value"[..]));
-    let fourth = scanner.next().expect("frame 3 follows")?;
+    let Some(fourth) = scanner.next() else {
+        panic!("frame 3 follows");
+    };
+    let fourth = fourth?;
     assert_eq!(fourth.key, Slice::from(&b"ccc"[..]));
     assert!(scanner.next().is_none());
     Ok(())
@@ -512,7 +515,10 @@ fn blob_scanner_resyncs_when_a_candidate_frame_declares_past_the_section() -> cr
         Slice::from(&b"bbb"[..]),
         "frame 2 is recovered, not lost to a terminated scan",
     );
-    let fourth = scanner.next().expect("frame 3 follows")?;
+    let Some(fourth) = scanner.next() else {
+        panic!("frame 3 follows");
+    };
+    let fourth = fourth?;
     assert_eq!(fourth.key, Slice::from(&b"ccc"[..]));
     assert!(scanner.next().is_none());
     Ok(())
