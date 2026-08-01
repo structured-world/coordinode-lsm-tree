@@ -180,6 +180,15 @@ fn salvage_keeps_seqno_bounds_when_the_source_section_is_unreadable() -> crate::
         reader.toc().iter().any(|e| e.name() == b"seqno_bounds"),
         "the salvaged copy must keep the seqno_bounds section",
     );
+
+    // TOC presence is only shape: a fresh-but-undecodable re-emit (the exact
+    // degradation the rotted source carries) would keep both the TOC check
+    // and `has_seqno_bounds` green, since recover silently degrades an
+    // unreadable map to empty. `verify_seqno_bounds` re-reads the section
+    // from disk, decodes it, and cross-checks every recorded range against
+    // the blocks' decoded entries.
+    let reopened = open(salvaged, &fs)?;
+    reopened.verify_seqno_bounds()?;
     Ok(())
 }
 
