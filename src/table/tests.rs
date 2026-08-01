@@ -3105,14 +3105,78 @@ fn heal_data_blocks_in_place_restores_a_secded_block_byte_for_byte() -> crate::R
     assert_ne!(bytes, original, "the seeded fault changed the file");
 
     let table = recover_table_on(&file, checksum, Arc::clone(&fs));
-    let (report, _) = table.heal_data_blocks_in_place(crate::fs::SyncMode::Full);
+    let (report, attributable) = table.heal_data_blocks_in_place(crate::fs::SyncMode::Full);
     assert_eq!(report.blocks_healed_in_place, 1, "{report:?}");
     assert_eq!(report.uncorrectable_blocks, 0, "{report:?}");
+    // The manifest digest is the HEALTHY file's, but the seeded fault changed
+    // the bytes before the heal ran: the pre-heal digest cannot match, so the
+    // mismatch is NOT attributable to this pass's writes.
+    assert!(
+        !attributable,
+        "a pre-heal digest differing from the manifest must not attribute",
+    );
 
     let healed = std::fs::read(&file)?;
     assert_eq!(
         healed, original,
         "SEC-DED in-place heal restores the block byte-for-byte",
+    );
+    Ok(())
+}
+
+/// The heal reports ATTRIBUTION (`true`) when the file's digest right before
+/// its first write-back matches the manifest digest: parity-trailer rot with
+/// the manifest digest recomputed over the ROTTED bytes (the shape a manifest
+/// rebuild leaves behind) makes the post-heal mismatch provably the heal's
+/// own work — the flag that lets the digest reconciliation restamp tables
+/// whose authoritative content (deletion metadata, footer-less values) has
+/// no semantic cross-check.
+#[cfg(feature = "page_ecc")]
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "in-file block offset fits usize; only narrows on 32-bit targets"
+)]
+fn heal_data_blocks_in_place_attributes_a_matching_pre_heal_digest() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::table::block::{EccParams, Header};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(crate::fs::StdFs);
+    let healthy = build_ecc_sst_for_heal(&file, Arc::clone(&fs), EccParams::RS_4_2, 200);
+    let first_off =
+        first_data_block_offset(&recover_table_on(&file, healthy, Arc::clone(&fs))) as usize;
+
+    // Rot one parity-trailer byte of the first data block: the payload stays
+    // checksum-clean, only the heal's trailer verification notices.
+    let mut bytes = std::fs::read(&file)?;
+    let Some(mut cursor) = bytes.get(first_off..) else {
+        panic!("first data block within the file");
+    };
+    let header = Header::decode_from(&mut cursor)?;
+    let trailer_pos =
+        first_off + Header::header_len(header.block_type) + header.data_length as usize;
+    let Some(slot) = bytes.get_mut(trailer_pos) else {
+        panic!("parity trailer within the file");
+    };
+    *slot ^= 0xFF;
+    std::fs::write(&file, &bytes)?;
+
+    // The manifest digest covers the ROTTED bytes (a manifest rebuild admits
+    // the degraded-but-readable file as-is), so the pre-heal probe matches.
+    let rotted = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &file)?);
+    let table = recover_table_on(&file, rotted, Arc::clone(&fs));
+    let (report, attributable) = table.heal_data_blocks_in_place(crate::fs::SyncMode::Full);
+    assert_eq!(
+        report.blocks_healed_in_place, 1,
+        "the rotted trailer is rebuilt in place: {report:?}",
+    );
+    assert_eq!(report.uncorrectable_blocks, 0, "{report:?}");
+    assert!(
+        attributable,
+        "a pre-heal digest matching the manifest attributes the mismatch to \
+         this pass's own verified corrections",
     );
     Ok(())
 }
