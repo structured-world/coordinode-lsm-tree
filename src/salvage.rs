@@ -340,6 +340,15 @@ pub(crate) fn salvage_with_context(
         let mut rep = mid?;
         if rep.salvaged_path.is_some() {
             fs.rename(&mid_dest, &dest)?;
+            // The MID attempt's writer made the directory entry durable only
+            // under the `mid_dest` name; the rename is a fresh directory
+            // mutation, so without its own sync a power loss can leave the
+            // manifest referencing a `dest` that reappears only under the
+            // temporary name. Same mode-aware publish discipline as the
+            // writer's own finish.
+            if let Some(parent) = dest.parent() {
+                fs.sync_directory_with(parent, options.sync_mode)?;
+            }
             rep.salvaged_path = Some(dest);
         }
         Ok(rep)
