@@ -604,6 +604,122 @@ pub fn forge_replace_section_payload(
     Ok(())
 }
 
+/// Forges the `filter` section so that the key hashing to `target_hash`
+/// becomes a FALSE NEGATIVE: searches for a single payload byte whose flip
+/// makes the (still parseable) BuRR filter report the hash as definitely
+/// absent, then re-stamps the block checksum plus, for a parity-bearing SST,
+/// the block's parity trailer. Every byte-level and framing check reads
+/// clean while a point read for that key is silently skipped — the shape
+/// only a probe of the filter against the blocks' decoded keys can catch.
+///
+/// Operates on the FIRST filter block of the section (in partitioned mode
+/// that is the partition covering the lowest keys, so pass the hash of the
+/// table's first key). The table must be unencrypted (the payload is probed
+/// as plaintext). `shards` is the SST's descriptor scheme (`None` for a
+/// parity-less table).
+pub fn forge_filter_false_negative(
+    path: &std::path::Path,
+    target_hash: u64,
+    shards: Option<(u8, u8)>,
+) -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::table::block::Header;
+    use crate::table::filter::ribbon::burr::contains_hash_from_bytes;
+
+    let mut bytes = std::fs::read(path)?;
+    let (pos, section_len) = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"filter") else {
+            panic!("the SST must carry a filter section");
+        };
+        (entry.pos(), entry.len())
+    };
+    let block_off = usize::try_from(pos).expect("section offset fits usize");
+    let Some(block) = bytes.get(block_off..) else {
+        panic!("section block within the file");
+    };
+    let mut cursor = block;
+    let header = Header::decode_from(&mut cursor)?;
+    let header_len = Header::header_len(header.block_type);
+    let payload_range =
+        block_off + header_len..block_off + header_len + header.data_length as usize;
+    let Some(payload) = bytes.get(payload_range.clone()) else {
+        panic!("section payload within the file");
+    };
+    assert!(
+        matches!(contains_hash_from_bytes(payload, target_hash), Ok(true)),
+        "the target key must be present in the healthy filter",
+    );
+    // Search for one byte whose flip turns the target hash into a false
+    // negative while the filter still PARSES (a parse failure would be an
+    // unreadable filter, not the silent-skip shape this forge models).
+    let mut candidate = payload.to_vec();
+    let flipped_at = (0..candidate.len()).find(|&i| {
+        let Some(slot) = candidate.get_mut(i) else {
+            return false;
+        };
+        *slot ^= 0xFF;
+        let miss = matches!(contains_hash_from_bytes(&candidate, target_hash), Ok(false));
+        if !miss {
+            let Some(slot) = candidate.get_mut(i) else {
+                return false;
+            };
+            *slot ^= 0xFF;
+        }
+        miss
+    });
+    assert!(
+        flipped_at.is_some(),
+        "some payload byte flip must produce a parseable false-negative filter",
+    );
+    {
+        let Some(dst) = bytes.get_mut(payload_range.clone()) else {
+            panic!("section payload within the file");
+        };
+        dst.copy_from_slice(&candidate);
+    }
+    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(&candidate));
+    let new_header = Header {
+        checksum: new_checksum,
+        ..header
+    };
+    let mut hdr_bytes = Vec::with_capacity(header_len);
+    new_header.encode_into(&mut hdr_bytes)?;
+    let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
+        panic!("section header within the file");
+    };
+    hdr_dst.copy_from_slice(&hdr_bytes);
+
+    // Re-stamp THIS block's parity trailer only (the section may hold more
+    // partition blocks after it, each with its own frame).
+    #[cfg(feature = "page_ecc")]
+    if let Some((data_shards, parity_shards)) = shards {
+        let payload_end = payload_range.end;
+        let parity =
+            crate::ecc::encode_parity(&candidate, data_shards.into(), parity_shards.into())?;
+        let Ok(section_len) = usize::try_from(section_len) else {
+            panic!("section length fits usize");
+        };
+        assert!(
+            payload_end + parity.len() <= block_off + section_len,
+            "the parity trailer stays within the section",
+        );
+        let Some(dst) = bytes.get_mut(payload_end..payload_end + parity.len()) else {
+            panic!("parity trailer within the file");
+        };
+        dst.copy_from_slice(&parity);
+    }
+    #[cfg(not(feature = "page_ecc"))]
+    let _ = (section_len, shards);
+
+    std::fs::write(path, &bytes)?;
+    Ok(())
+}
+
 /// ZEROES the LAST entry's `[seqno_min, seqno_max]` inside the
 /// `seqno_bounds` section's payload and re-stamps the block checksum (plus,
 /// for a parity-bearing SST, the descriptor-scheme parity trailer): the map

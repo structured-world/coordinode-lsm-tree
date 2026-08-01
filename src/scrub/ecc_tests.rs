@@ -979,6 +979,46 @@ fn heal_in_place_does_not_restamp_over_a_forged_zone_map() -> crate::Result<()> 
     Ok(())
 }
 
+/// The digest reconciliation must not restamp over a FORGED `filter`: a
+/// payload altered to another parseable BuRR filter (fresh block checksum +
+/// parity) passes every byte-level, framing, and role check — the walk never
+/// probes the filter against the table's keys — yet `check_bloom` trusts it
+/// to SKIP point reads, so a key made into a false negative silently
+/// disappears from every read. Only a probe of each decoded key against the
+/// filter can catch it before the refresh legitimizes the forge.
+#[test]
+fn heal_in_place_does_not_restamp_over_a_forged_filter() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _) = write_ecc_sst(dir.path());
+
+    let tree = open_ecc_tree(dir.path());
+    // The forge targets the section's FIRST filter block, which covers the
+    // table's lowest keys — make its first key the false negative.
+    crate::test_forge::forge_filter_false_negative(
+        &sst_path,
+        crate::hash::hash64(b"key-000000"),
+        Some((8, 2)),
+    )?;
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
+        "a forged filter must refuse the digest refresh: {report:?}",
+    );
+
+    // The manifest keeps the ORIGINAL digest, so the forge stays visible.
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the forged SST must keep failing verify_integrity: restamping its \
+         digest would let point reads silently miss existing keys",
+    );
+    Ok(())
+}
+
 /// The digest reconciliation must not restamp over a FORGED `seqno_bounds`
 /// map: a payload re-stamped to another structurally valid map (fresh block
 /// checksum + parity, `min <= max`, ascending offsets) passes every
