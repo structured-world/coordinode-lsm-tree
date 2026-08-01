@@ -249,6 +249,54 @@ fn salvage_arbitrates_divergent_meta_mirrors() -> crate::Result<()> {
     Ok(())
 }
 
+/// DIVERGENT meta mirrors disable the verbatim copy-through: a divergence
+/// confined to a DECODE-TRANSPARENT layout field (`restart_interval#data` —
+/// full block decoding is trailer-driven, so every block still reads clean
+/// and nothing drops) lets the tail-first attempt finish perfectly, yet a
+/// byte-copied block keeps the ORIGINAL encoding while the copy's meta is
+/// stamped with the forged interval. The partial-decode read path
+/// reconstructs prefix-compressed entries FROM that metadata interval, so
+/// the inconsistent pair silently truncates synthesized blocks. Since
+/// neither mirror is provably genuine, every block must be RE-ENCODED under
+/// the chosen meta — self-consistent whichever mirror wins.
+#[test]
+fn salvage_reencodes_all_blocks_when_meta_mirrors_diverge() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0u64..100 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Forge the TAIL meta's data restart interval from the written 16 to 4 —
+    // fresh block checksum, `meta_mid` untouched. Blocks keep decoding
+    // (trailer-driven), so the tail attempt sees zero drops.
+    crate::test_forge::forge_tail_meta_value(&source, b"restart_interval#data", &[4])?;
+
+    let report = salvage_sst(&source, dest, &fs)?;
+    assert_eq!(
+        report.entries_salvaged, 100,
+        "all rows recovered: {report:?}"
+    );
+    assert!(report.salvaged_path.is_some(), "a copy was written");
+    assert_eq!(
+        report.blocks_copied_verbatim, 0,
+        "divergent mirrors must force the re-encode path: a byte-copied \
+         block would keep the original encoding under the chosen meta's \
+         forged layout: {report:?}",
+    );
+    Ok(())
+}
+
 /// A checksum-clean row block that ITERATES to fewer entries than its
 /// trailer declares must be dropped, not marked recovered: the entry decoder
 /// turns a mid-stream parse failure into an ordinary end of iteration, so a
