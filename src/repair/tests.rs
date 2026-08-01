@@ -1784,7 +1784,7 @@ fn repair_routes_a_stale_kv_footer_through_salvage() -> crate::Result<()> {
 
 /// A FOOTER-LESS SST whose data block declares more entries than it decodes
 /// (a re-stamped trailer item count) must be routed through salvage, not
-/// graded Clean. verify_kv_checksums is a no-op without footers and the
+/// graded Clean. `verify_kv_checksums` is a no-op without footers and the
 /// out-of-band walk verifies only the outer frame, so only a full-decode
 /// completeness check catches the truncated tail before repair rebuilds the
 /// manifest around a block whose keys a later scan silently omits.

@@ -4841,6 +4841,79 @@ fn write_columnar_batch_accounts_tombstones_seqno_bounds_and_restart_locator() -
     Ok(())
 }
 
+/// `verify_locator` must reject a locator re-stamped to resolve a key to a
+/// block OTHER than the one holding its newest version: every byte-level
+/// check reads clean, but `point_read_inner` trusts the answer and can return
+/// a stale value from the mispointed block without falling back to the index.
+/// An intact locator passes; a redirected one fails.
+#[test]
+fn verify_locator_rejects_a_redirected_key_mapping() -> crate::Result<()> {
+    use crate::config::{LocatorPolicyEntry, LocatorPrecision};
+    use crate::table::locator::{LocatorSpec, build_locator_section};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("t");
+
+    // Small blocks so several data blocks (several block_ids) exist.
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_data_block_size(128)
+        .use_locator(LocatorPolicyEntry::Enabled {
+            precision: LocatorPrecision::Block,
+            block_id_bits: None,
+            slot_bits: None,
+        });
+    for i in 0u64..200 {
+        writer.write(crate::InternalValue::from_components(
+            format!("key-{i:04}").into_bytes(),
+            format!("v{i:04}").into_bytes(),
+            i + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    // Intact locator verifies clean.
+    table.verify_locator()?;
+
+    // Rebuild the SAME ribbon (same key set, same widths → byte-identical
+    // length) but redirect the FIRST key to a DIFFERENT block ordinal.
+    let mut triples: Vec<(u64, u64, u64)> = Vec::new();
+    let block_count = table.block_index.iter().count() as u64;
+    assert!(block_count >= 2, "need multiple blocks to redirect between");
+    let mut seen = std::collections::HashSet::new();
+    for (ordinal, handle) in table.block_index.iter().enumerate() {
+        let handle = handle?;
+        let block_handle = crate::table::BlockHandle::new(handle.offset(), handle.size());
+        let entries = table.decode_block_entries(&block_handle)?;
+        for e in entries {
+            let uk = e.key.user_key.to_vec();
+            if seen.insert(uk.clone()) {
+                triples.push((crate::hash::hash64(&uk), ordinal as u64, 0));
+            }
+        }
+    }
+    // Redirect the first key to a different existing block.
+    let orig = triples[0].1;
+    triples[0].1 = if orig == 0 { block_count - 1 } else { 0 };
+    let spec = LocatorSpec {
+        precision: LocatorPrecision::Block,
+        block_id_bits: None,
+        slot_bits: None,
+    };
+    let forged = build_locator_section(&triples, spec).expect("forged section builds");
+
+    crate::test_forge::forge_replace_section_payload(&file, b"locator", &forged, None)?;
+
+    let table = recover_test_table(&file, checksum)?;
+    let result = table.verify_locator();
+    assert!(
+        matches!(result, Err(crate::Error::InvalidHeader(_))),
+        "a redirected locator must be rejected, got {result:?}",
+    );
+    Ok(())
+}
+
 #[cfg(feature = "columnar")]
 #[test]
 fn write_columnar_batch_on_an_empty_batch_writes_no_block() -> crate::Result<()> {

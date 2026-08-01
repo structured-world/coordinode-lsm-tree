@@ -258,6 +258,13 @@ fn block_verify_verdict(
         // corruption; salvage re-derives the zone map from the re-emitted
         // blocks.
         BlockVerifyVerdict::Corrupt
+    } else if table.verify_locator().is_err() {
+        // A checksum-clean locator re-stamped to resolve a key to a block
+        // other than its newest-version block would make point_read return a
+        // stale value without falling back to the sorted index. A mapping
+        // that disagrees with the decoded blocks is corruption; salvage
+        // rebuilds the locator from the re-emitted entries.
+        BlockVerifyVerdict::Corrupt
     } else if !report.is_ok() {
         // Parity-ONLY rot: every payload checksum verified clean, only the
         // recovery margin is dead. The data is fully readable, so it grades

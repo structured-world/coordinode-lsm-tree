@@ -536,6 +536,18 @@ fn refresh_healed_checksum(
         ));
     }
 
+    // The locator block is checksum-clean to the walk even when re-stamped to
+    // resolve a key to a block other than its newest-version block, and
+    // point_read trusts its answer. Cross-check every key's mapping against
+    // its decoded newest-version block (a no-op without the section) before
+    // trusting the digest.
+    if let Err(e) = table.verify_locator() {
+        return finding(alloc::format!(
+            "digest mismatch with a locator cross-check failure ({e}); \
+             the manifest digest was not refreshed"
+        ));
+    }
+
     match tree.refresh_table_checksum(table.id(), fresh) {
         Ok(()) => None,
         Err(e) => finding(e.to_string()),

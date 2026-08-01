@@ -137,7 +137,7 @@ fn salvage_keeps_seqno_bounds_when_the_source_section_is_unreadable() -> crate::
     // Rot one payload byte of the seqno_bounds block WITHOUT re-stamping its
     // checksum: the recover-time load fails and degrades the map to empty.
     {
-        let (pos,) = {
+        let pos = {
             let mut f = std::fs::File::open(&source)?;
             let reader = match crate::sfa::Reader::from_reader(&mut f) {
                 Ok(r) => r,
@@ -146,7 +146,10 @@ fn salvage_keeps_seqno_bounds_when_the_source_section_is_unreadable() -> crate::
             let Some(entry) = reader.toc().iter().find(|e| e.name() == b"seqno_bounds") else {
                 panic!("the source carries a seqno_bounds section");
             };
-            (usize::try_from(entry.pos()).expect("pos fits usize"),)
+            let Ok(pos) = usize::try_from(entry.pos()) else {
+                panic!("pos fits usize");
+            };
+            pos
         };
         let mut bytes = std::fs::read(&source)?;
         // Past the block header, inside the payload.

@@ -2053,8 +2053,6 @@ impl Table {
     /// the decoded blocks; any I/O / decode error from the full scan.
     #[cfg(feature = "std")]
     pub(crate) fn verify_zone_map(&self) -> crate::Result<()> {
-        use crate::table::block::ParsedItem as _;
-
         // Re-read the section FROM DISK: the in-memory map is best-effort at
         // recover time, so an on-disk re-stamp after the open is invisible to
         // it. An unreadable section is an error here (the caller is deciding
@@ -2189,6 +2187,131 @@ impl Table {
             last.key.user_key.to_vec(),
             entries.len(),
         ))
+    }
+
+    /// Cross-checks the recorded `locator` section against the ACTUAL
+    /// key → newest-version-block mapping derived from decoding every data
+    /// block. A checksum- and parity-consistent forged locator is accepted by
+    /// the out-of-band walk on its block role alone, but `point_read_inner`
+    /// trusts its answer and reads the addressed block directly: a locator
+    /// redirected from a key's newest-version block to a LATER block holding
+    /// an OLDER version returns that stale value without falling back to the
+    /// sorted index. A correctly-built locator answers every in-table key
+    /// with the block holding its newest version (the FIRST block covering
+    /// it, since blocks are sorted by key then descending seqno), so any key
+    /// whose locator answer points at a different block is corruption. A
+    /// no-op for tables without the section.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when a key's locator answer disagrees
+    /// with its decoded newest-version block; any I/O / decode error from the
+    /// full scan.
+    #[cfg(feature = "std")]
+    pub(crate) fn verify_locator(&self) -> crate::Result<()> {
+        // Re-read the section FROM DISK and pair it with the ordinal → handle
+        // map (the writer's block_id order == index order), mirroring the open
+        // path. An unreadable section is an error here (the caller is deciding
+        // whether to trust the bytes), unlike the best-effort open load.
+        let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
+        let trailer = crate::sfa::Reader::from_reader(&mut file)?;
+        let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
+        let Some(loc_handle) = regions.locator else {
+            return Ok(());
+        };
+        let block = Block::from_file(
+            &*file,
+            loc_handle,
+            crate::table::block::BlockIdentity {
+                table_id: self.metadata.id,
+                block_type: BlockType::Locator,
+                dict_id: 0,
+                window_log: 0,
+            },
+            &{
+                let t = match self.encryption.as_deref() {
+                    Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                    None => crate::table::block::BlockTransform::PLAIN,
+                };
+                if let Some(ecc) = self.metadata.ecc_params {
+                    t.with_ecc(ecc)
+                } else {
+                    t
+                }
+            },
+        )?;
+        if block.header.block_type != BlockType::Locator {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                block.header.block_type.into(),
+            )));
+        }
+        let blocks: Vec<BlockHandle> = self
+            .block_index
+            .iter()
+            .map(|r| r.map(|kbh| *kbh.as_ref()))
+            .collect::<crate::Result<Vec<_>>>()?;
+        let locator = crate::table::locator::LoadedLocator::new(block.data, blocks);
+
+        // Walk blocks in index (block_id) order; the FIRST time a user key
+        // appears is its newest version, so that block is the locator's
+        // expected answer. `seen` dedups across blocks (a key's older
+        // versions in later blocks must not overwrite the expectation).
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for handle in self.block_index.iter() {
+            let handle = handle?;
+            let block_handle = BlockHandle::new(handle.offset(), handle.size());
+            let entries = self.decode_block_entries(&block_handle)?;
+            for entry in entries {
+                let user_key = entry.key.user_key.to_vec();
+                if !seen.insert(user_key.clone()) {
+                    continue;
+                }
+                let key_hash = crate::hash::hash64(&user_key);
+                if let Some((located, _)) = locator.locate_block(key_hash)?
+                    && located.offset() != block_handle.offset()
+                {
+                    return Err(crate::Error::InvalidHeader(
+                        "locator resolves a key to a block other than its newest-version block",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Decodes one data block's entries (row or columnar) into
+    /// [`InternalValue`]s, for the semantic cross-check gates.
+    #[cfg(feature = "std")]
+    fn decode_block_entries(
+        &self,
+        block_handle: &BlockHandle,
+    ) -> crate::Result<Vec<InternalValue>> {
+        use crate::table::block::ParsedItem as _;
+        #[cfg(feature = "columnar")]
+        if self.metadata.columnar {
+            let block = self.load_block(
+                block_handle,
+                BlockType::Columnar,
+                self.metadata.data_block_compression,
+                #[cfg(zstd_any)]
+                self.zstd_dictionary.as_deref(),
+            )?;
+            let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
+            return crate::table::columnar::column_batch_to_entries(&batch);
+        }
+        let block = self.load_block(
+            block_handle,
+            BlockType::Data,
+            self.metadata.data_block_compression,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+        )?;
+        let data_block = DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())?;
+        Ok(data_block
+            .try_iter(self.comparator.clone())?
+            .map(|p| p.materialize(data_block.as_slice()))
+            .collect())
     }
 
     /// Loads the filter block (if any) and checks the bloom filter.
