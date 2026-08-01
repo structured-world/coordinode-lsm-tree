@@ -2037,6 +2037,160 @@ impl Table {
         Ok(())
     }
 
+    /// Cross-checks the recorded `zone_map` section against the ACTUAL
+    /// per-block statistics derived from decoding every data block. The
+    /// section's block is checksum-clean to the out-of-band walk even when
+    /// its PAYLOAD was re-stamped to another structurally valid map, and
+    /// `columnar_scan` trusts its min/max to SKIP blocks — a forged range
+    /// silently omits matching rows. Each block records one synthetic column
+    /// (whole-block key range + row count); every block must be recorded and
+    /// its recorded stats must equal the decoded ones. A no-op for tables
+    /// without the section.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when the recorded map disagrees with
+    /// the decoded blocks; any I/O / decode error from the full scan.
+    #[cfg(feature = "std")]
+    pub(crate) fn verify_zone_map(&self) -> crate::Result<()> {
+        use crate::table::block::ParsedItem as _;
+
+        // Re-read the section FROM DISK: the in-memory map is best-effort at
+        // recover time, so an on-disk re-stamp after the open is invisible to
+        // it. An unreadable section is an error here (the caller is deciding
+        // whether to trust the file's bytes), unlike the best-effort load.
+        let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
+        let trailer = crate::sfa::Reader::from_reader(&mut file)?;
+        let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
+        let Some(zm_handle) = regions.zone_map else {
+            return Ok(());
+        };
+        let zone_map = {
+            let block = Block::from_file(
+                &*file,
+                zm_handle,
+                crate::table::block::BlockIdentity {
+                    table_id: self.metadata.id,
+                    block_type: BlockType::ZoneMap,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                &{
+                    let t = match self.encryption.as_deref() {
+                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                        None => crate::table::block::BlockTransform::PLAIN,
+                    };
+                    if let Some(ecc) = self.metadata.ecc_params {
+                        t.with_ecc(ecc)
+                    } else {
+                        t
+                    }
+                },
+            )?;
+            if block.header.block_type != BlockType::ZoneMap {
+                return Err(crate::Error::InvalidTag((
+                    "BlockType",
+                    block.header.block_type.into(),
+                )));
+            }
+            crate::table::zone_map::ZoneMap::decode(&block.data)?
+        };
+        if zone_map.is_empty() {
+            return Ok(());
+        }
+        let mut checked = 0usize;
+        for handle in self.block_index.iter() {
+            let handle = handle?;
+            let block_handle = BlockHandle::new(handle.offset(), handle.size());
+            let Some(recorded) = zone_map.columns_for(block_handle.offset().0) else {
+                return Err(crate::Error::InvalidHeader(
+                    "zone_map is missing a data block's entry",
+                ));
+            };
+            // The writer records exactly one synthetic whole-block column.
+            let [col] = recorded else {
+                return Err(crate::Error::InvalidHeader(
+                    "zone_map block does not carry exactly one synthetic column",
+                ));
+            };
+            // Derive (min_key, max_key, row_count) from the decoded block.
+            let (min_key, max_key, rows) = {
+                #[cfg(feature = "columnar")]
+                if self.metadata.columnar {
+                    let block = self.load_block(
+                        &block_handle,
+                        BlockType::Columnar,
+                        self.metadata.data_block_compression,
+                        #[cfg(zstd_any)]
+                        self.zstd_dictionary.as_deref(),
+                    )?;
+                    let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
+                    let entries = crate::table::columnar::column_batch_to_entries(&batch)?;
+                    let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
+                        return Err(crate::Error::InvalidHeader(
+                            "columnar data block decodes to zero rows",
+                        ));
+                    };
+                    (
+                        first.key.user_key.to_vec(),
+                        last.key.user_key.to_vec(),
+                        entries.len(),
+                    )
+                } else {
+                    self.zone_stats_from_row_block(&block_handle)?
+                }
+                #[cfg(not(feature = "columnar"))]
+                self.zone_stats_from_row_block(&block_handle)?
+            };
+            if col.min != min_key || col.max != max_key || col.row_count as usize != rows {
+                return Err(crate::Error::InvalidHeader(
+                    "zone_map disagrees with the block's decoded key range or row count",
+                ));
+            }
+            checked = checked
+                .checked_add(1)
+                .ok_or(crate::Error::InvalidHeader("zone_map"))?;
+        }
+        if checked != zone_map.len() {
+            return Err(crate::Error::InvalidHeader(
+                "zone_map carries entries for blocks the index does not hold",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Derives `(min_user_key, max_user_key, row_count)` from a decoded ROW
+    /// data block, for the [`Self::verify_zone_map`] cross-check.
+    #[cfg(feature = "std")]
+    fn zone_stats_from_row_block(
+        &self,
+        block_handle: &BlockHandle,
+    ) -> crate::Result<(Vec<u8>, Vec<u8>, usize)> {
+        use crate::table::block::ParsedItem as _;
+        let block = self.load_block(
+            block_handle,
+            BlockType::Data,
+            self.metadata.data_block_compression,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+        )?;
+        let data_block = DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())?;
+        let entries: Vec<_> = data_block
+            .try_iter(self.comparator.clone())?
+            .map(|p| p.materialize(data_block.as_slice()))
+            .collect();
+        let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
+            return Err(crate::Error::InvalidHeader(
+                "row data block decodes to zero entries",
+            ));
+        };
+        Ok((
+            first.key.user_key.to_vec(),
+            last.key.user_key.to_vec(),
+            entries.len(),
+        ))
+    }
+
     /// Loads the filter block (if any) and checks the bloom filter.
     ///
     /// Returns `Ok(BloomResult::Skip)` if the bloom filter says the key is definitely absent

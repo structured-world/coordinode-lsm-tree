@@ -251,6 +251,13 @@ fn block_verify_verdict(
         // tail. Full-decode every block; a count mismatch routes the table
         // through salvage (whose row path drops the under-decoding block).
         BlockVerifyVerdict::Corrupt
+    } else if table.verify_zone_map().is_err() {
+        // A checksum-clean zone_map re-stamped to another structurally valid
+        // map would let a predicate scan skip blocks its forged min/max
+        // excludes, silently omitting matching rows. Diverging stats are
+        // corruption; salvage re-derives the zone map from the re-emitted
+        // blocks.
+        BlockVerifyVerdict::Corrupt
     } else if !report.is_ok() {
         // Parity-ONLY rot: every payload checksum verified clean, only the
         // recovery margin is dead. The data is fully readable, so it grades

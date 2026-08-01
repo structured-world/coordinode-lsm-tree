@@ -524,6 +524,18 @@ fn refresh_healed_checksum(
         ));
     }
 
+    // The zone_map block is checksum-clean to the walk even when its payload
+    // was re-stamped to another structurally valid map, and a predicate scan
+    // trusts its min/max to SKIP blocks. Cross-check every recorded range
+    // against the blocks' decoded key ranges (a no-op without the section)
+    // before trusting the digest.
+    if let Err(e) = table.verify_zone_map() {
+        return finding(alloc::format!(
+            "digest mismatch with a zone-map cross-check failure ({e}); \
+             the manifest digest was not refreshed"
+        ));
+    }
+
     match tree.refresh_table_checksum(table.id(), fresh) {
         Ok(()) => None,
         Err(e) => finding(e.to_string()),
