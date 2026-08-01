@@ -1299,9 +1299,19 @@ impl Table {
     /// old inode until they are reopened; its bytes are unchanged, so reads
     /// stay correct (ECC-corrected on the fly as before).
     ///
+    /// Returns the scrub report plus an ATTRIBUTION flag: `true` when the
+    /// file's digest was computed right before this pass's FIRST write and it
+    /// matched the manifest digest — every byte the file now differs from
+    /// the manifest state by is provably one of this pass's verified
+    /// corrections. The digest reconciliation uses it to decide whether a
+    /// post-heal mismatch may cover sections that cannot be semantically
+    /// authenticated (deletion metadata). `false` whenever nothing was
+    /// written, the pre-write digest could not be computed, or it already
+    /// disagreed with the manifest.
+    ///
     /// `pub(crate)` for [`crate::scrub::patrol_scrub`] (heal-in-place enabled).
     #[cfg(feature = "page_ecc")]
-    pub(crate) fn heal_data_blocks_in_place(&self) -> crate::scrub::PatrolScrubReport {
+    pub(crate) fn heal_data_blocks_in_place(&self) -> (crate::scrub::PatrolScrubReport, bool) {
         use crate::scrub::{PatrolScrubReport, ScrubError};
         use std::io::{Seek, SeekFrom, Write};
 
@@ -1342,7 +1352,7 @@ impl Table {
                 report.merge(self.scrub_data_blocks());
                 // Both passes stamped this SST as scanned; it is one file.
                 report.sst_files_scanned = 1;
-                return report;
+                return (report, false);
             }
         };
 
@@ -1355,6 +1365,13 @@ impl Table {
         // stays honest under the caller's mutation window: a checkpoint
         // cannot link this SST anywhere inside the scan-to-write span.
         let mut unshare_state = UnshareState::Unprobed;
+
+        // Attribution for the digest reconciliation: computed LAZILY right
+        // before the first write-back (same discipline as the unshare probe,
+        // so a clean scan pays nothing), while the file still holds its
+        // pre-heal bytes. A match against the manifest digest proves every
+        // later difference is one of this pass's verified corrections.
+        let mut pre_heal_matched: Option<bool> = None;
 
         let transform = match crate::table::util::build_block_transform(
             self.metadata.data_block_compression,
@@ -1370,7 +1387,7 @@ impl Table {
                     path: self.path.to_path_buf(),
                     reason: alloc::format!("build transform for heal: {e:?}"),
                 });
-                return report;
+                return (report, false);
             }
         };
 
@@ -1513,6 +1530,10 @@ impl Table {
                         // Trailer rot: persist the freshly computed parity at
                         // its on-disk position (header + payload unchanged).
                         Ok(Some(fresh)) => {
+                            // Still the pre-heal bytes: capture attribution
+                            // before the first write lands.
+                            let _ = pre_heal_matched
+                                .get_or_insert_with(|| self.pre_heal_digest_matches());
                             // First write: make sure no checkpoint link
                             // shares the inode (lazy detach).
                             if let Err(reason) =
@@ -1606,6 +1627,9 @@ impl Table {
                             continue;
                         }
                     };
+                    // Still the pre-heal bytes: capture attribution before
+                    // the first write lands.
+                    let _ = pre_heal_matched.get_or_insert_with(|| self.pre_heal_digest_matches());
                     // First write: make sure no checkpoint link shares the
                     // inode (lazy detach).
                     if let Err(reason) =
@@ -1670,7 +1694,47 @@ impl Table {
             }
         }
 
-        report
+        (report, pre_heal_matched == Some(true))
+    }
+
+    /// Whether the file's CURRENT digest equals the manifest digest — the
+    /// attribution probe [`Self::heal_data_blocks_in_place`] takes right
+    /// before its first write-back. A failed digest read grades `false`
+    /// (unattributable), never an error: attribution only widens what the
+    /// reconciliation may refresh, so losing it fails closed.
+    #[cfg(feature = "page_ecc")]
+    fn pre_heal_digest_matches(&self) -> bool {
+        match crate::repair::compute_table_checksum(&*self.fs, &self.path) {
+            Ok(raw) => crate::Checksum::from_raw(raw) == self.checksum(),
+            Err(e) => {
+                log::warn!(
+                    "pre-heal digest probe failed for table #{} at {}: {e}",
+                    self.id(),
+                    self.path.display(),
+                );
+                false
+            }
+        }
+    }
+
+    /// Whether the ON-DISK file carries deletion metadata the digest
+    /// reconciliation cannot semantically authenticate: a `range_tombstones`
+    /// or `delete_bitmap` section. These are AUTHORITATIVE — nothing in-file
+    /// can re-derive which rows or ranges were genuinely deleted — so unlike
+    /// the derived sections (zone map, seqno bounds, locator, filter) a
+    /// re-stamped payload has no cross-check. Read from the file's TOC, not
+    /// the recover-time regions, for the same distrust-of-memory reason as
+    /// the other gates.
+    ///
+    /// # Errors
+    ///
+    /// Any I/O / decode error from reading the SFA trailer.
+    #[cfg(feature = "std")]
+    pub(crate) fn has_deletion_metadata(&self) -> crate::Result<bool> {
+        let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
+        let trailer = crate::sfa::Reader::from_reader(&mut file)?;
+        let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
+        Ok(regions.range_tombstones.is_some() || regions.delete_bitmap.is_some())
     }
 
     /// Scrub: verifies the per-KV checksum footer of every data block in this

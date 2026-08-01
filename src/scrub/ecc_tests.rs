@@ -1049,6 +1049,43 @@ fn heal_in_place_does_not_restamp_over_altered_range_tombstones() -> crate::Resu
     Ok(())
 }
 
+/// A LEGITIMATE heal on a tombstone-bearing table must still reconcile the
+/// manifest digest: attribution (the pre-write digest matched the manifest,
+/// so the file now differs by exactly this pass's verified corrections)
+/// proves the deletion metadata itself is untouched — the fail-closed rule
+/// for unattributable mismatches must not permanently flag every healed
+/// table that happens to carry range tombstones.
+#[test]
+fn heal_in_place_reconciles_a_tombstone_bearing_table_after_a_legit_heal() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst_with_range_tombstone(dir.path());
+
+    // Rot one parity-trailer byte, then let a manifest rebuild record the
+    // digest of the ROTTED bytes: the heal restores the original trailer,
+    // so the reconciliation has a real mismatch to persist.
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
+    rebuild_manifest_over_current_bytes(dir.path())?;
+
+    let tree = open_ecc_tree(dir.path());
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report.blocks_healed_in_place >= 1,
+        "the rotted trailer is rebuilt in place: {report:?}",
+    );
+    assert!(
+        report.is_ok(),
+        "an attributable heal reconciles the digest despite the deletion \
+         metadata: {report:?}",
+    );
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        integrity.is_ok(),
+        "the healed table verifies clean against the refreshed digest, got {:?}",
+        integrity.errors,
+    );
+    Ok(())
+}
+
 /// The digest reconciliation must not restamp over a FORGED `filter`: a
 /// payload altered to another parseable BuRR filter (fresh block checksum +
 /// parity) passes every byte-level, framing, and role check — the walk never

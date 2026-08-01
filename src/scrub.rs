@@ -379,10 +379,10 @@ fn scan_and_reconcile(
                 .map(|p| p.enter_mutation_window())
         })
         .flatten();
-    let mut partial = scan_one(table, options);
+    let (mut partial, heal_attributable) = scan_one(table, options);
     if heals
         && wants_checksum_refresh(&partial)
-        && let Some(finding) = refresh_healed_checksum(tree, table)
+        && let Some(finding) = refresh_healed_checksum(tree, table, heal_attributable)
     {
         partial.errors.push(finding);
     }
@@ -415,9 +415,16 @@ fn wants_checksum_refresh(partial: &PatrolScrubReport) -> bool {
 /// [`ScrubError::ChecksumRefreshFailed`] finding (the caller folds it into
 /// the report) — the healed bytes are durable either way, and the next heal
 /// scan retries the reconciliation.
+/// `heal_attributable` comes from the heal scan: `true` when the file's
+/// digest was probed right before the pass's first write-back and matched
+/// the manifest, so every byte the file now differs by is provably one of
+/// that pass's verified corrections. It is what lets a table carrying
+/// deletion metadata — which no semantic gate can authenticate — still be
+/// reconciled after a legitimate heal.
 fn refresh_healed_checksum(
     tree: &impl AbstractTree,
     table: &crate::table::Table,
+    heal_attributable: bool,
 ) -> Option<ScrubError> {
     let finding = |reason: String| {
         log::warn!(
@@ -560,6 +567,31 @@ fn refresh_healed_checksum(
         ));
     }
 
+    // range_tombstones / delete_bitmap are AUTHORITATIVE deletion metadata:
+    // nothing in-file can re-derive which rows or ranges were genuinely
+    // deleted, so unlike every section above a re-stamped payload has NO
+    // cross-check. The digest may cover them only when the mismatch is
+    // provably this pass's own work — the pre-heal bytes matched the
+    // manifest, so the file now differs by exactly the verified corrections.
+    // Anything else fails closed: the stale digest keeps the alteration
+    // visible to verify_integrity, and the finding recurs until an operator
+    // rewrites the table (compaction) or re-admits it (repair).
+    if !heal_attributable {
+        match table.has_deletion_metadata() {
+            Ok(false) => {}
+            Ok(true) => {
+                return finding(
+                    "digest mismatch not attributable to this pass's heal on a \
+                     table carrying deletion metadata (range tombstones / delete \
+                     bitmap), which no cross-check can authenticate; the manifest \
+                     digest was not refreshed"
+                        .into(),
+                );
+            }
+            Err(e) => return finding(e.to_string()),
+        }
+    }
+
     match tree.refresh_table_checksum(table.id(), fresh) {
         Ok(()) => None,
         Err(e) => finding(e.to_string()),
@@ -569,7 +601,13 @@ fn refresh_healed_checksum(
 /// Scans one SST: heals corrections in place when
 /// [`heal_in_place`](PatrolScrubOptions::heal_in_place) is set (and `page_ecc` is
 /// built), otherwise runs the classic correct-on-read + schedule-rewrite scrub.
-fn scan_one(table: &crate::table::Table, options: &PatrolScrubOptions) -> PatrolScrubReport {
+/// The `bool` is the heal-attribution flag (see
+/// [`refresh_healed_checksum`]); always `false` on the read-only scrub path,
+/// which never writes.
+fn scan_one(
+    table: &crate::table::Table,
+    options: &PatrolScrubOptions,
+) -> (PatrolScrubReport, bool) {
     // In-place heal only applies to SSTs written with Page-ECC parity — there is
     // nothing to reconstruct without it. A table with no ECC still needs its
     // integrity checked, so it takes the normal scrub path (which verifies each
@@ -580,7 +618,7 @@ fn scan_one(table: &crate::table::Table, options: &PatrolScrubOptions) -> Patrol
         return table.heal_data_blocks_in_place();
     }
     let _ = options;
-    table.scrub_data_blocks()
+    (table.scrub_data_blocks(), false)
 }
 
 #[cfg(test)]
