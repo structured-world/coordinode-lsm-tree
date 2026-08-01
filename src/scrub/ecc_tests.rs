@@ -1290,6 +1290,48 @@ fn heal_in_place_does_not_restamp_over_forged_meta_key_bounds() -> crate::Result
     Ok(())
 }
 
+/// The digest reconciliation must not restamp over a FORGED metadata BLOCK
+/// COUNT: both mirrors re-stamped consistently to a smaller
+/// `block_count#data` (fresh checksums and parity) pass every byte-level
+/// check and the mirror comparison, and the bounds gate's key/item checks
+/// stay clean (the blocks themselves are untouched) — yet `Table::scan`
+/// hands the recorded count to the compaction scanner, which stops after
+/// that many blocks: a rewrite silently drops every key in the omitted
+/// tail. Footered fixture, so the forge is not pre-empted by the
+/// footer-less attribution rule.
+#[test]
+fn heal_in_place_does_not_restamp_over_a_forged_data_block_count() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _) = write_ecc_sst_footered(dir.path());
+
+    let tree = open_ecc_tree(dir.path());
+    // The fixture writes 9 data blocks; record 1 (little-endian u64, same
+    // value length keeps the frame geometry).
+    crate::test_forge::forge_meta_value_both_mirrors(
+        &sst_path,
+        b"block_count#data",
+        &1u64.to_le_bytes(),
+    )?;
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
+        "a forged data-block count must refuse the digest refresh: {report:?}",
+    );
+
+    // The manifest keeps the ORIGINAL digest, so the forge stays visible.
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the forged SST must keep failing verify_integrity: restamping its \
+         digest would let compaction scans silently drop the omitted blocks",
+    );
+    Ok(())
+}
+
 /// A LEGITIMATE heal on a tombstone-bearing table must still reconcile the
 /// manifest digest: attribution (the pre-write digest matched the manifest,
 /// so the file now differs by exactly this pass's verified corrections)
