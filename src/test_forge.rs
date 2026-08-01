@@ -991,6 +991,33 @@ pub fn forge_tli_tail_truncated(
     table_id: crate::TableId,
     ecc: Option<crate::table::block::EccParams>,
 ) -> crate::Result<()> {
+    let forged = truncated_tli_frame(path, table_id, ecc)?;
+    replace_section_frame(path, b"tli_tail", &forged)
+}
+
+/// As [`forge_tli_tail_truncated`], but applied to BOTH mirrors (`tli` and
+/// `tli_tail`) so the copies stay CONSISTENT with each other: the decoded
+/// mirror comparison passes and only a structural check of the handle list
+/// against the physical data section can catch the dropped handle.
+pub fn forge_tli_mirrors_truncated(
+    path: &std::path::Path,
+    table_id: crate::TableId,
+    ecc: Option<crate::table::block::EccParams>,
+) -> crate::Result<()> {
+    let forged = truncated_tli_frame(path, table_id, ecc)?;
+    replace_section_frame(path, b"tli", &forged)?;
+    replace_section_frame(path, b"tli_tail", &forged)
+}
+
+/// Decodes the `tli_tail` mirror's handle list, drops the LAST handle, and
+/// returns the re-encoded Index frame (checksum-, role-, and, under `ecc`,
+/// parity-consistent). The SST must be unencrypted and its index
+/// uncompressed.
+fn truncated_tli_frame(
+    path: &std::path::Path,
+    table_id: crate::TableId,
+    ecc: Option<crate::table::block::EccParams>,
+) -> crate::Result<Vec<u8>> {
     use crate::table::block::{Block, BlockIdentity, BlockType};
     use crate::table::{BlockHandle, BlockOffset, IndexBlock, KeyedBlockHandle};
 
@@ -1014,18 +1041,6 @@ pub fn forge_tli_tail_truncated(
         }
     };
 
-    // Locate the sections and decode the tail mirror's handle list.
-    let bytes = std::fs::read(path)?;
-    const TRAILER_SIZE: usize = 4 + 1 + 1 + 16 + 8 + 8;
-    let trailer_start = bytes.len() - TRAILER_SIZE;
-    let read_u64 = |bytes: &[u8], at: usize| {
-        let Some(b) = bytes.get(at..at + 8) else {
-            panic!("u64 field within the trailer");
-        };
-        u64::from_le_bytes(b.try_into().expect("8 bytes"))
-    };
-    let toc_pos = usize::try_from(read_u64(&bytes, trailer_start + 4 + 1 + 1 + 16))
-        .expect("toc_pos fits usize");
     let (tail_pos, tail_len) = {
         let mut f = std::fs::File::open(path)?;
         let reader = match crate::sfa::Reader::from_reader(&mut f) {
@@ -1073,18 +1088,56 @@ pub fn forge_tli_tail_truncated(
     let payload = IndexBlock::encode_into_vec(truncated)?;
     let mut forged = Vec::new();
     Block::write_into(&mut forged, &payload, identity, &transform)?;
+    Ok(forged)
+}
 
-    // Rebuild the file: shift the trailing sections (`meta`), fix the TOC's
-    // `tli_tail` length + shifted positions, re-stamp the trailer.
+/// Replaces the named single-block section's bytes with `forged`, shifting
+/// every later section, patching the TOC's length + positions, and
+/// re-stamping the trailer. The rebuilt archive stays internally consistent
+/// in every byte-level check.
+fn replace_section_frame(
+    path: &std::path::Path,
+    section: &[u8],
+    forged: &[u8],
+) -> crate::Result<()> {
+    let bytes = std::fs::read(path)?;
+    const TRAILER_SIZE: usize = 4 + 1 + 1 + 16 + 8 + 8;
+    let trailer_start = bytes.len() - TRAILER_SIZE;
+    let read_u64 = |bytes: &[u8], at: usize| {
+        let Some(b) = bytes.get(at..at + 8) else {
+            panic!("u64 field within the trailer");
+        };
+        u64::from_le_bytes(b.try_into().expect("8 bytes"))
+    };
+    let toc_pos = usize::try_from(read_u64(&bytes, trailer_start + 4 + 1 + 1 + 16))
+        .expect("toc_pos fits usize");
+    let (section_pos, section_len) = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == section) else {
+            panic!("the SST must carry the section to replace");
+        };
+        (
+            usize::try_from(entry.pos()).expect("pos fits usize"),
+            usize::try_from(entry.len()).expect("len fits usize"),
+        )
+    };
+
+    // Rebuild the file: splice the forged frame in, shift the trailing
+    // sections, fix the TOC's length + shifted positions, re-stamp the
+    // trailer.
     let delta = i64::try_from(forged.len()).expect("forged block fits i64")
-        - i64::try_from(tail_len).expect("tail section fits i64");
+        - i64::try_from(section_len).expect("section fits i64");
     let mut out = Vec::with_capacity(bytes.len());
-    out.extend_from_slice(bytes.get(..tail_pos).expect("pre-tail prefix"));
-    out.extend_from_slice(&forged);
+    out.extend_from_slice(bytes.get(..section_pos).expect("pre-section prefix"));
+    out.extend_from_slice(forged);
     out.extend_from_slice(
         bytes
-            .get(tail_pos + tail_len..toc_pos)
-            .expect("post-tail sections"),
+            .get(section_pos + section_len..toc_pos)
+            .expect("post-section sections"),
     );
     let new_toc_pos = out.len();
 
@@ -1107,9 +1160,9 @@ pub fn forge_tli_tail_truncated(
                 .expect("2 bytes"),
         ));
         let name = toc.get(at + 18..at + 18 + name_len).expect("name");
-        let (new_pos, new_len) = if name == b"tli_tail" {
+        let (new_pos, new_len) = if name == section {
             (pos, forged.len() as u64)
-        } else if pos > tail_pos as u64 {
+        } else if pos > section_pos as u64 {
             (
                 pos.checked_add_signed(delta).expect("shifted pos fits u64"),
                 len,

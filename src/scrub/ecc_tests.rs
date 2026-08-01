@@ -1117,6 +1117,48 @@ fn heal_in_place_does_not_restamp_over_a_forged_footerless_value() -> crate::Res
     Ok(())
 }
 
+/// The digest reconciliation must not restamp over TLI mirrors forged
+/// CONSISTENTLY: both copies re-encoded to the same truncated handle list
+/// (fresh checksums, parity, Index role) pass every byte-level check AND
+/// the decoded mirror comparison — the equality of two forged copies proves
+/// nothing. Only a structural check of the decoded handles against the
+/// physical data section (the writer emits data blocks back-to-back, so the
+/// handles must exactly TILE it) can catch the dropped handle before the
+/// next recovery loads the forged list and range scans silently lose the
+/// unreachable block. Footered fixture, so the forge is not pre-empted by
+/// the footer-less attribution rule.
+#[test]
+fn heal_in_place_does_not_restamp_over_consistently_forged_tli_mirrors() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _) = write_ecc_sst_footered(dir.path());
+
+    // Open FIRST (the live table already loaded its index), then forge.
+    let tree = open_ecc_tree(dir.path());
+    crate::test_forge::forge_tli_mirrors_truncated(
+        &sst_path,
+        0,
+        Some(crate::table::block::EccParams::try_new(8, 2)?),
+    )?;
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
+        "consistently forged TLI mirrors must refuse the digest refresh: {report:?}",
+    );
+
+    // The manifest keeps the ORIGINAL digest, so the forge stays visible.
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the forged SST must keep failing verify_integrity: restamping its \
+         digest would let the next recovery hide the dropped block",
+    );
+    Ok(())
+}
+
 /// The digest reconciliation must not restamp over FORGED metadata KEY
 /// BOUNDS: both meta mirrors re-stamped CONSISTENTLY to a narrower
 /// `key#max` (fresh checksums and parity) pass every byte-level check and
