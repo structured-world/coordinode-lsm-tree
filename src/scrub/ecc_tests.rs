@@ -1049,6 +1049,40 @@ fn heal_in_place_does_not_restamp_over_altered_range_tombstones() -> crate::Resu
     Ok(())
 }
 
+/// The digest reconciliation must not restamp over a FORGED VALUE in a
+/// footer-less (default) table: a value byte changed behind a re-stamped
+/// block checksum + parity decodes cleanly with the same keys, seqnos, and
+/// counts, so every derived-metadata cross-check passes — the manifest
+/// digest is the ONLY record of the original value bytes, and refreshing it
+/// without attribution to this pass's own heal writes would erase that
+/// record permanently.
+#[test]
+fn heal_in_place_does_not_restamp_over_a_forged_footerless_value() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _) = write_ecc_sst(dir.path());
+
+    let tree = open_ecc_tree(dir.path());
+    crate::test_forge::forge_value_byte_in_first_data_block(&sst_path, Some((8, 2)))?;
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
+        "a forged footer-less value must refuse the digest refresh: {report:?}",
+    );
+
+    // The manifest keeps the ORIGINAL digest, so the forge stays visible.
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the forged SST must keep failing verify_integrity: restamping its \
+         digest would erase the only record of the original value bytes",
+    );
+    Ok(())
+}
+
 /// A LEGITIMATE heal on a tombstone-bearing table must still reconcile the
 /// manifest digest: attribution (the pre-write digest matched the manifest,
 /// so the file now differs by exactly this pass's verified corrections)

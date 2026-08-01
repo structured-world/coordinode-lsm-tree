@@ -604,6 +604,134 @@ pub fn forge_replace_section_payload(
     Ok(())
 }
 
+/// Forges a VALUE inside the first data block of a footer-less, uncompressed
+/// SST: searches for a payload byte whose flip leaves the block fully
+/// decodable with the SAME keys, seqnos, and entry count while at least one
+/// VALUE differs, then re-stamps the block checksum plus, for a
+/// parity-bearing SST, the block's parity trailer. Every byte-level check
+/// and every derived-metadata cross-check (keys, counts, layout) reads clean
+/// — the manifest digest is the only remaining record of the original value
+/// bytes. `shards` is the SST's descriptor scheme (`None` for a parity-less
+/// table).
+pub fn forge_value_byte_in_first_data_block(
+    path: &std::path::Path,
+    shards: Option<(u8, u8)>,
+) -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::table::block::{Header, ParsedItem as _};
+
+    let mut bytes = std::fs::read(path)?;
+    let block_off = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"data") else {
+            panic!("the SST must carry a data section");
+        };
+        usize::try_from(entry.pos()).expect("data offset fits usize")
+    };
+    let Some(block) = bytes.get(block_off..) else {
+        panic!("data block within the file");
+    };
+    let mut cursor = block;
+    let header = Header::decode_from(&mut cursor)?;
+    let header_len = Header::header_len(header.block_type);
+    let payload_range =
+        block_off + header_len..block_off + header_len + header.data_length as usize;
+    let Some(payload) = bytes.get(payload_range.clone()) else {
+        panic!("data payload within the file");
+    };
+
+    // Decode entries from a candidate payload; None when it fails to decode.
+    let decode = |payload: &[u8]| -> Option<alloc::vec::Vec<crate::InternalValue>> {
+        let block = crate::table::Block {
+            header: Header {
+                checksum: crate::Checksum::from_raw(crate::hash::hash128(payload)),
+                ..header
+            },
+            data: crate::Slice::from(payload.to_vec()),
+        };
+        let data_block = crate::table::DataBlock::from_loaded(block, false).ok()?;
+        let data = data_block.inner.data.clone();
+        let iter = data_block
+            .try_iter(crate::comparator::default_comparator())
+            .ok()?;
+        Some(iter.map(|p| p.materialize(&data)).collect())
+    };
+    let Some(baseline) = decode(payload) else {
+        panic!("the healthy first data block decodes");
+    };
+
+    // Search for a flip that changes ONLY a value: same count, same keys,
+    // same seqnos and value types, at least one differing value.
+    let mut candidate = payload.to_vec();
+    let flipped_at = (0..candidate.len()).find(|&i| {
+        let Some(slot) = candidate.get_mut(i) else {
+            return false;
+        };
+        *slot ^= 0xFF;
+        let ok = decode(&candidate).is_some_and(|entries| {
+            entries.len() == baseline.len()
+                && entries
+                    .iter()
+                    .zip(&baseline)
+                    .all(|(a, b)| a.key == b.key && a.value.len() == b.value.len())
+                && entries
+                    .iter()
+                    .zip(&baseline)
+                    .any(|(a, b)| a.value != b.value)
+        });
+        if !ok {
+            let Some(slot) = candidate.get_mut(i) else {
+                return false;
+            };
+            *slot ^= 0xFF;
+        }
+        ok
+    });
+    assert!(
+        flipped_at.is_some(),
+        "some payload byte flip must alter only a value while the block stays decodable",
+    );
+    {
+        let Some(dst) = bytes.get_mut(payload_range.clone()) else {
+            panic!("data payload within the file");
+        };
+        dst.copy_from_slice(&candidate);
+    }
+    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(&candidate));
+    let new_header = Header {
+        checksum: new_checksum,
+        ..header
+    };
+    let mut hdr_bytes = Vec::with_capacity(header_len);
+    new_header.encode_into(&mut hdr_bytes)?;
+    let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
+        panic!("data header within the file");
+    };
+    hdr_dst.copy_from_slice(&hdr_bytes);
+
+    // Re-stamp THIS block's parity trailer (the data section holds more
+    // blocks after it, each with its own frame).
+    #[cfg(feature = "page_ecc")]
+    if let Some((data_shards, parity_shards)) = shards {
+        let payload_end = payload_range.end;
+        let parity =
+            crate::ecc::encode_parity(&candidate, data_shards.into(), parity_shards.into())?;
+        let Some(dst) = bytes.get_mut(payload_end..payload_end + parity.len()) else {
+            panic!("parity trailer within the file");
+        };
+        dst.copy_from_slice(&parity);
+    }
+    #[cfg(not(feature = "page_ecc"))]
+    let _ = shards;
+
+    std::fs::write(path, &bytes)?;
+    Ok(())
+}
+
 /// Forges the `filter` section so that the key hashing to `target_hash`
 /// becomes a FALSE NEGATIVE: searches for a single payload byte whose flip
 /// makes the (still parseable) `BuRR` filter report the hash as definitely
