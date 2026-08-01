@@ -297,7 +297,22 @@ pub(crate) fn salvage_with_context(
     // proven authoritative, run the walk under BOTH mirror orders and keep
     // the attempt that recovers more.
     let diverged = meta_mirrors_diverge(source, fs, options);
-    let tail = salvage_attempt(source, dest.clone(), fs, comparator, options, false);
+    // Divergent mirrors disable the verbatim copy-through: neither copy is
+    // provably genuine, and a divergence confined to a DECODE-TRANSPARENT
+    // layout field (a re-stamped restart interval — full block decoding is
+    // trailer-driven) would byte-copy blocks whose encoding disagrees with
+    // the chosen meta, silently truncating the partial-decode read path's
+    // synthesized blocks. Re-encoding under the chosen meta keeps the copy
+    // self-consistent whichever mirror wins.
+    let tail = salvage_attempt(
+        source,
+        dest.clone(),
+        fs,
+        comparator,
+        options,
+        false,
+        !diverged,
+    );
     if !diverged {
         return tail;
     }
@@ -316,7 +331,15 @@ pub(crate) fn salvage_with_context(
     static ARB_TMP_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     let seq = ARB_TMP_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mid_dest = dest.with_extension(alloc::format!("healtmp-{seq}"));
-    let mid = salvage_attempt(source, mid_dest.clone(), fs, comparator, options, true);
+    let mid = salvage_attempt(
+        source,
+        mid_dest.clone(),
+        fs,
+        comparator,
+        options,
+        true,
+        false,
+    );
 
     let score = |r: &crate::Result<SalvageReport>| match r {
         Ok(rep) => rep.blocks_salvaged,
@@ -415,6 +438,7 @@ fn salvage_attempt(
     comparator: &crate::comparator::SharedComparator,
     options: &SalvageOptions,
     prefer_mid_meta: bool,
+    allow_verbatim: bool,
 ) -> crate::Result<SalvageReport> {
     // Digest the source through the injected `Fs`, not `std::fs`: salvage runs
     // over MemFs / fault-injected / routed backends (repair passes its own `fs`),
@@ -521,7 +545,13 @@ fn salvage_attempt(
     #[cfg(zstd_any)]
     let writer = writer.use_zstd_dictionary(options.zstd_dictionary.clone());
 
-    let walk = match salvage_blocks(&table, writer, comparator, !delete_mask_unpositionable) {
+    let walk = match salvage_blocks(
+        &table,
+        writer,
+        comparator,
+        !delete_mask_unpositionable,
+        allow_verbatim,
+    ) {
         Ok(walk) => walk,
         Err(e) => {
             // A `write` / `finish` failure after `Writer::new` created `dest`
@@ -697,6 +727,7 @@ fn salvage_blocks(
     mut writer: crate::table::Writer,
     comparator: &crate::comparator::SharedComparator,
     apply_delete_mask: bool,
+    allow_verbatim: bool,
 ) -> crate::Result<SalvageWalk> {
     use crate::table::block::ParsedItem;
     use alloc::format;
@@ -820,11 +851,16 @@ fn salvage_blocks(
                     // walking, exactly like a row-major block whose entries fail
                     // to decode. Only writer errors (I/O to the destination)
                     // stay hard errors.
-                    Ok(sb) => match crate::table::columnar::ColumnBatch::decode(&sb.block.data)
-                        .and_then(|batch| {
-                            crate::table::columnar::column_batch_to_entries(&batch)
-                                .map(|entries| (batch, entries))
-                        }) {
+                    Ok(mut sb) => match {
+                        if !allow_verbatim {
+                            sb.verbatim = None;
+                        }
+                        crate::table::columnar::ColumnBatch::decode(&sb.block.data)
+                    }
+                    .and_then(|batch| {
+                        crate::table::columnar::column_batch_to_entries(&batch)
+                            .map(|entries| (batch, entries))
+                    }) {
                         // A real writer never emits an empty data block, so a
                         // checksum-clean ZERO-ROW batch is malformed input:
                         // the writer primitives below would emit NOTHING for
@@ -921,7 +957,10 @@ fn salvage_blocks(
         // Row source: a clean block is byte-copied verbatim; an ECC-recovered block
         // is re-emitted entry by entry from its healed payload.
         match table.salvage_load_block(keyed.as_ref(), crate::table::block::BlockType::Data) {
-            Ok(sb) => {
+            Ok(mut sb) => {
+                if !allow_verbatim {
+                    sb.verbatim = None;
+                }
                 // Footer presence is a per-SST property (`kv_checksum_algo`), not a
                 // per-block header flag, so the descriptor supplies it here.
                 let has_kv_footer = table.metadata.kv_checksum_algo.is_some();
