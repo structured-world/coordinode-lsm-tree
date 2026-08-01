@@ -548,6 +548,18 @@ fn refresh_healed_checksum(
         ));
     }
 
+    // The filter block is checksum-clean to the walk even when its payload
+    // was re-stamped to another parseable filter, and check_bloom trusts it
+    // to SKIP point reads — a key made into a false negative silently
+    // disappears from every read. Probe every decoded key against the
+    // on-disk filter (a no-op without one) before trusting the digest.
+    if let Err(e) = table.verify_filter() {
+        return finding(alloc::format!(
+            "digest mismatch with a filter cross-check failure ({e}); \
+             the manifest digest was not refreshed"
+        ));
+    }
+
     match tree.refresh_table_checksum(table.id(), fresh) {
         Ok(()) => None,
         Err(e) => finding(e.to_string()),

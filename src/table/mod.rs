@@ -2280,6 +2280,165 @@ impl Table {
         Ok(())
     }
 
+    /// Probes every decoded data key against the on-disk `filter` section:
+    /// each key the table holds must be reported as POSSIBLY PRESENT. A
+    /// checksum- and parity-consistent forged filter is accepted by the
+    /// out-of-band walk on its framing and role alone — the walk never
+    /// probes it — but `check_bloom` trusts it to SKIP point reads, so a key
+    /// made into a false negative silently disappears from every read. A
+    /// false positive is unprovable (it is the filter's normal error mode),
+    /// but a false NEGATIVE on an existing key is corruption by
+    /// construction. A no-op for tables without a filter.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when the filter reports an existing
+    /// key as definitely absent; any I/O / decode error from the full scan.
+    #[cfg(feature = "std")]
+    pub(crate) fn verify_filter(&self) -> crate::Result<()> {
+        // Re-read the filter FROM DISK: the open path PINS the filter (or
+        // its partition index) in memory at recover time, so an on-disk
+        // re-stamp after the open (the very forge this check exists for)
+        // would be invisible to `check_bloom`. An unreadable filter is an
+        // error here (the caller is deciding whether to trust the bytes),
+        // unlike the read path's permissive empty-payload sentinel.
+        let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
+        let trailer = crate::sfa::Reader::from_reader(&mut file)?;
+        let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
+        if regions.filter.is_none() && regions.filter_tli.is_none() {
+            return Ok(());
+        }
+        let filter_transform = {
+            let t = match self.encryption.as_deref() {
+                Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                None => crate::table::block::BlockTransform::PLAIN,
+            };
+            if let Some(ecc) = self.metadata.ecc_params {
+                t.with_ecc(ecc)
+            } else {
+                t
+            }
+        };
+        let load_filter_block =
+            |handle: BlockHandle| -> crate::Result<crate::table::filter::block::FilterBlock> {
+                let block = Block::from_file(
+                    &*file,
+                    handle,
+                    crate::table::block::BlockIdentity {
+                        table_id: self.metadata.id,
+                        block_type: BlockType::Filter,
+                        dict_id: 0,
+                        window_log: 0,
+                    },
+                    &filter_transform,
+                )?;
+                if block.header.block_type != BlockType::Filter {
+                    return Err(crate::Error::InvalidTag((
+                        "BlockType",
+                        block.header.block_type.into(),
+                    )));
+                }
+                Ok(crate::table::filter::block::FilterBlock::new(block))
+            };
+
+        // Partitioned mode: the partition index maps a key to its filter
+        // block. Loaded from disk for the same reason as the filter itself.
+        let filter_index = if let Some(idx_handle) = regions.filter_tli {
+            let block = Block::from_file(
+                &*file,
+                idx_handle,
+                crate::table::block::BlockIdentity {
+                    table_id: self.metadata.id,
+                    block_type: BlockType::Index,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                &{
+                    let t = crate::table::block::BlockTransform::from_parts(
+                        self.metadata.index_block_compression,
+                        self.encryption.as_deref(),
+                        #[cfg(zstd_any)]
+                        None,
+                    )?;
+                    if let Some(ecc) = self.metadata.ecc_params {
+                        t.with_ecc(ecc)
+                    } else {
+                        t
+                    }
+                },
+            )?;
+            if block.header.block_type != BlockType::Index {
+                return Err(crate::Error::InvalidTag((
+                    "BlockType",
+                    block.header.block_type.into(),
+                )));
+            }
+            let idx = IndexBlock::new(block);
+            idx.try_iter(self.comparator.clone())?;
+            Some(idx)
+        } else {
+            None
+        };
+        let full_filter = if filter_index.is_none() {
+            regions.filter.map(load_filter_block).transpose()?
+        } else {
+            None
+        };
+
+        // Partition blocks are shared by many keys; memoize by file offset so
+        // the probe loop reads each partition once.
+        let mut partitions: std::collections::BTreeMap<
+            u64,
+            crate::table::filter::block::FilterBlock,
+        > = std::collections::BTreeMap::new();
+
+        let mut prev_key: Option<Vec<u8>> = None;
+        for handle in self.block_index.iter() {
+            let handle = handle?;
+            let block_handle = BlockHandle::new(handle.offset(), handle.size());
+            let entries = self.decode_block_entries(&block_handle)?;
+            for entry in entries {
+                // Blocks are sorted by key then descending seqno, so a key's
+                // older versions are always adjacent — one probe per key.
+                if prev_key.as_deref() == Some(entry.key.user_key.as_ref()) {
+                    continue;
+                }
+                let user_key = entry.key.user_key.to_vec();
+                let key_hash = crate::hash::hash64(&user_key);
+                let maybe_present = if let Some(idx) = &filter_index {
+                    let mut iter = idx.iter(self.comparator.clone());
+                    iter.seek(&user_key, crate::seqno::MAX_SEQNO);
+                    let Some(part_handle) = iter.next() else {
+                        // A key past the last partition is a definite miss on
+                        // the read path — a false negative by construction.
+                        return Err(crate::Error::InvalidHeader(
+                            "filter partition index does not cover an existing key",
+                        ));
+                    };
+                    let part_handle = part_handle.materialize(idx.as_slice()).into_inner();
+                    let filter = match partitions.entry(part_handle.offset().0) {
+                        std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(e) => {
+                            e.insert(load_filter_block(part_handle)?)
+                        }
+                    };
+                    filter.maybe_contains_hash(key_hash)?
+                } else if let Some(filter) = &full_filter {
+                    filter.maybe_contains_hash(key_hash)?
+                } else {
+                    true
+                };
+                if !maybe_present {
+                    return Err(crate::Error::InvalidHeader(
+                        "filter reports an existing key as definitely absent",
+                    ));
+                }
+                prev_key = Some(user_key);
+            }
+        }
+        Ok(())
+    }
+
     /// Decodes one data block's entries (row or columnar) into
     /// [`InternalValue`]s, for the semantic cross-check gates.
     #[cfg(feature = "std")]
