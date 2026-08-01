@@ -68,6 +68,35 @@ fn write_ecc_sst(dir: &std::path::Path) -> (std::path::PathBuf, crate::table::Bl
     ((*table.path).clone(), handle)
 }
 
+/// As [`write_ecc_sst`], plus a range tombstone so the SST carries the
+/// `range_tombstones` section — the deletion metadata the digest
+/// reconciliation cannot semantically authenticate.
+fn write_ecc_sst_with_range_tombstone(
+    dir: &std::path::Path,
+) -> (std::path::PathBuf, crate::table::BlockHandle) {
+    let tree = open_ecc_tree(dir);
+    for i in 0u64..2_000 {
+        tree.insert(format!("key-{i:06}"), format!("v{i:06}"), i);
+    }
+    tree.remove_range("key-000100", "key-000200", 2_000);
+    tree.flush_active_memtable(2_100).expect("flush");
+
+    let binding = tree.version_history.read().latest_version();
+    let table = binding
+        .version
+        .iter_tables()
+        .next()
+        .expect("flush produced one table");
+    let keyed = table
+        .block_index
+        .iter()
+        .next()
+        .expect("table has at least one data block")
+        .expect("block index entry decodes");
+    let handle = crate::table::BlockHandle::new(keyed.offset(), keyed.size());
+    ((*table.path).clone(), handle)
+}
+
 #[test]
 fn patrol_scrub_corrects_seeded_single_bit_fault_and_schedules_heal() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -975,6 +1004,47 @@ fn heal_in_place_does_not_restamp_over_a_forged_zone_map() -> crate::Result<()> 
         !integrity.is_ok(),
         "the forged SST must keep failing verify_integrity: restamping its \
          digest would let predicate scans silently skip matching blocks",
+    );
+    Ok(())
+}
+
+/// The digest reconciliation must not restamp over ALTERED deletion
+/// metadata: a `range_tombstones` payload changed to another value (fresh
+/// block checksum + parity) passes every byte-level, framing, and role
+/// check, and NO semantic gate can authenticate which ranges were genuinely
+/// deleted — the tombstones ARE the source of truth, there is nothing
+/// in-file to cross-check them against. Refreshing the digest would
+/// permanently legitimize the alteration: later reads either resurrect
+/// deleted data or hide previously live data. The refresh must fail closed
+/// unless the mismatch is provably attributable to this pass's own heal
+/// writes.
+#[test]
+fn heal_in_place_does_not_restamp_over_altered_range_tombstones() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _) = write_ecc_sst_with_range_tombstone(dir.path());
+
+    let tree = open_ecc_tree(dir.path());
+    crate::test_forge::forge_flip_section_last_payload_byte(
+        &sst_path,
+        b"range_tombstones",
+        Some((8, 2)),
+    )?;
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
+        "altered range tombstones must refuse the digest refresh: {report:?}",
+    );
+
+    // The manifest keeps the ORIGINAL digest, so the alteration stays visible.
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the altered SST must keep failing verify_integrity: restamping its \
+         digest would let reads resurrect deleted data or hide live data",
     );
     Ok(())
 }
