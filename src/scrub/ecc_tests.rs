@@ -1290,6 +1290,43 @@ fn heal_in_place_does_not_restamp_over_forged_meta_key_bounds() -> crate::Result
     Ok(())
 }
 
+/// The digest reconciliation must not restamp over a FORGED KV-footer
+/// DESCRIPTOR: both meta mirrors re-stamped with `descriptor#kv_checksum`
+/// set to off while the footer-bearing data blocks are left intact. The
+/// mirror walk accepts the matching copies, and the in-memory descriptor is
+/// still the recovery-time `Some(algo)` so `verify_kv_checksums` passes —
+/// yet after reopen the on-disk `None` descriptor stops footer stripping,
+/// so point reads misread footer bytes as the data-block trailer. The
+/// disk-fresh descriptor must be cross-checked against the recovery-time
+/// one before trusting the metadata.
+#[test]
+fn heal_in_place_does_not_restamp_over_a_forged_kv_checksum_descriptor() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _) = write_ecc_sst_footered(dir.path());
+
+    // Open FIRST so the live table keeps its recovery-time Some(algo), then
+    // forge the on-disk descriptor to off (byte 0) in both mirrors.
+    let tree = open_ecc_tree(dir.path());
+    crate::test_forge::forge_meta_value_both_mirrors(&sst_path, b"descriptor#kv_checksum", &[0])?;
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
+        "a forged kv-checksum descriptor must refuse the digest refresh: {report:?}",
+    );
+
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the forged SST must keep failing verify_integrity: restamping its \
+         digest would let point reads misread footer bytes as the trailer",
+    );
+    Ok(())
+}
+
 /// The digest reconciliation must not restamp over a FORGED metadata BLOCK
 /// COUNT: both mirrors re-stamped consistently to a smaller
 /// `block_count#data` (fresh checksums and parity) pass every byte-level
