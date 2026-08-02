@@ -1418,7 +1418,7 @@ pub fn forge_tli_binary_index_pointer(
 }
 
 /// Re-encodes the `zone_map` section WITHOUT its LAST block entry (fresh
-/// checksum, ZoneMap role): paired with a TLI forge hiding the same
+/// checksum, `ZoneMap` role): paired with a TLI forge hiding the same
 /// trailing block, the positioning chain over the remaining indexed
 /// blocks stays self-consistent — the omitted block is invisible to every
 /// index-driven check and only a physical data-section walk can find it.

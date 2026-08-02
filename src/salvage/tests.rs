@@ -257,7 +257,7 @@ fn verify_tli_mirrors_rejects_a_section_spanning_handle() -> crate::Result<()> {
 
     crate::test_forge::forge_tli_mirrors_span_single_handle(&source, 0)?;
 
-    let table = open(source.clone(), &fs)?;
+    let table = open(source, &fs)?;
     assert!(
         table.verify_tli_mirrors().is_err(),
         "a handle spanning several physical blocks must fail the mirror gate",
