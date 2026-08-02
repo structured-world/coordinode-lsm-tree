@@ -746,6 +746,74 @@ fn salvage_recovers_a_reclaimable_weak_tombstone_pair() -> crate::Result<()> {
     Ok(())
 }
 
+/// The rebuilt filter must carry the source's PREFIX hashes: the extractor
+/// is configuration (not persisted in the SST), so the salvage writer can
+/// only index prefixes when the caller threads the tree's extractor
+/// through [`SalvageOptions::prefix_extractor`]. Without it the salvaged
+/// copy's filter holds complete-key hashes only, `maybe_contains_prefix`
+/// reports every indexed prefix as definitely absent, and the copy's rows
+/// silently vanish from prefix scans.
+#[test]
+fn salvage_preserves_prefix_filter_hashes() -> crate::Result<()> {
+    /// First four key bytes, mirroring the tree-level extractor fixtures.
+    struct FixedLengthPrefix;
+    impl crate::prefix::PrefixExtractor for FixedLengthPrefix {
+        fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+            key.get(..4).map_or_else(
+                || Box::new(std::iter::empty()) as Box<dyn Iterator<Item = &'a [u8]>>,
+                |p| Box::new(std::iter::once(p)),
+            )
+        }
+
+        fn is_valid_scan_boundary(&self, prefix: &[u8]) -> bool {
+            prefix.len() == 4
+        }
+    }
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let extractor: Arc<dyn crate::prefix::PrefixExtractor> = Arc::new(FixedLengthPrefix);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_prefix_extractor(Some(Arc::clone(&extractor)));
+    for i in 0u32..100 {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Sanity: the SOURCE's filter answers the prefix probes (keys are
+    // `key000NN`, so the indexed 4-byte prefixes are `key0`).
+    let prefix_hash = crate::hash::hash64(b"key0");
+    {
+        let table = open(source.clone(), &fs)?;
+        assert!(
+            table.maybe_contains_prefix(prefix_hash)?,
+            "the source filter indexes the prefix",
+        );
+    }
+
+    let options = SalvageOptions {
+        prefix_extractor: Some(Arc::clone(&extractor)),
+        ..SalvageOptions::default()
+    };
+    let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
+    assert_eq!(
+        report.entries_salvaged, 100,
+        "all rows recovered: {report:?}"
+    );
+
+    // A missing prefix hash is a DEFINITE-absent answer from the rebuilt
+    // filter — the salvaged copy would silently vanish from prefix scans.
+    let table = open(dest, &fs)?;
+    assert!(
+        table.maybe_contains_prefix(prefix_hash)?,
+        "the salvaged copy's filter must keep the source's prefix hashes",
+    );
+    Ok(())
+}
+
 fn iv(i: u32) -> InternalValue {
     InternalValue::from_components(
         format!("key{i:05}").into_bytes(),
@@ -3645,6 +3713,7 @@ fn salvage_recovers_an_encrypted_sst_with_the_provider() -> crate::Result<()> {
         expected_stored_id: None,
         allow_delete_resurrection: false,
         sync_mode: crate::fs::SyncMode::Normal,
+        prefix_extractor: None,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
     assert_eq!(
@@ -3738,6 +3807,7 @@ fn salvage_recovers_a_dictionary_sst_with_the_dictionary() -> crate::Result<()> 
         expected_stored_id: None,
         allow_delete_resurrection: false,
         sync_mode: crate::fs::SyncMode::Normal,
+        prefix_extractor: None,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
     assert_eq!(
@@ -3824,6 +3894,7 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
         expected_stored_id: None,
         allow_delete_resurrection: false,
         sync_mode: crate::fs::SyncMode::Normal,
+        prefix_extractor: None,
     };
     let recovered_wrong = salvage_sst_with_options(&source, dest.clone(), &fs, &wrong)
         .map_or(0, |r| r.entries_salvaged);
@@ -3841,6 +3912,7 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
         expected_stored_id: None,
         allow_delete_resurrection: false,
         sync_mode: crate::fs::SyncMode::Normal,
+        prefix_extractor: None,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
     assert_eq!(

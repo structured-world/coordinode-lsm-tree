@@ -73,6 +73,15 @@ pub struct SalvageOptions {
     /// the manifest it rebuilds around it; the standalone default is
     /// [`crate::fs::SyncMode::Normal`].
     pub sync_mode: crate::fs::SyncMode,
+    /// Prefix extractor matching the tree's
+    /// [`Config::prefix_extractor`](crate::config::Config::prefix_extractor),
+    /// or `None` when the tree indexes no prefixes. The extractor is not
+    /// persisted in the SST (it is configuration), so the rebuilt filter can
+    /// only carry the source's prefix hashes when the caller supplies it —
+    /// without it, prefix scans see the salvaged copy as a false negative
+    /// and its matching rows vanish from every prefix read.
+    /// [`crate::repair`] passes the tree's configured extractor.
+    pub prefix_extractor: Option<Arc<dyn crate::prefix::PrefixExtractor>>,
 }
 
 /// Why a block could not be salvaged and had to be dropped.

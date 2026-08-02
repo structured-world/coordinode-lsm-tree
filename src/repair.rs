@@ -442,6 +442,7 @@ fn try_salvage_table(
             // The recovered SST is persisted at the tree's configured
             // durability, matching the manifest rebuilt around it.
             sync_mode: config.sync_mode,
+            prefix_extractor: None,
         },
     )?;
     if report.salvaged_path.is_none() {
