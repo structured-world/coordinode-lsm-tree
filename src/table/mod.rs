@@ -1932,10 +1932,11 @@ impl Table {
             .section(b"data")
             .ok_or(crate::Error::InvalidHeader("data section missing"))?;
         head.try_iter(self.comparator.clone())?;
-        let handles: alloc::vec::Vec<BlockHandle> = head
+        let keyed: alloc::vec::Vec<KeyedBlockHandle> = head
             .iter(self.comparator.clone())
-            .map(|i| i.materialize(head.as_slice()).into_inner())
+            .map(|i| i.materialize(head.as_slice()))
             .collect();
+        let handles: alloc::vec::Vec<BlockHandle> = keyed.iter().map(|k| *k.as_ref()).collect();
         if let Some(index_handle) = regions.index {
             // Partitioned: the TLI addresses index partitions inside the
             // `index` section; the partitions address the data blocks.
@@ -1960,19 +1961,58 @@ impl Table {
                     self.metadata.ecc_params,
                 )?;
                 part.try_iter(self.comparator.clone())?;
-                data_handles.extend(
-                    part.iter(self.comparator.clone())
-                        .map(|i| i.materialize(part.as_slice()).into_inner()),
-                );
+                let part_keyed: alloc::vec::Vec<KeyedBlockHandle> = part
+                    .iter(self.comparator.clone())
+                    .map(|i| i.materialize(part.as_slice()))
+                    .collect();
+                for k in &part_keyed {
+                    self.verify_separator_matches_block(k)?;
+                }
+                data_handles.extend(part_keyed.iter().map(|k| *k.as_ref()));
             }
             if !Self::frames_tile_section(&data_handles, data_section.pos(), data_section.len()) {
                 return Err(crate::Error::InvalidHeader(
                     "index partitions' data handles do not tile the data section",
                 ));
             }
-        } else if !Self::frames_tile_section(&handles, data_section.pos(), data_section.len()) {
+        } else {
+            if !Self::frames_tile_section(&handles, data_section.pos(), data_section.len()) {
+                return Err(crate::Error::InvalidHeader(
+                    "tli data handles do not tile the data section",
+                ));
+            }
+            for k in &keyed {
+                self.verify_separator_matches_block(k)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Confirms a leaf index entry's SEPARATOR (its `end_key`) equals the
+    /// addressed data block's actual decoded last key. A forged separator
+    /// re-stamped to another still-sorted value passes the mirror comparison
+    /// and section tiling (both ignore the keys), yet the index binary
+    /// search routes keys in `(forged_separator, real_last_key]` to the wrong
+    /// block — `point_read` then misses existing keys. The in-memory
+    /// reachability probe does not catch this on the heal path (the live
+    /// table keeps its correct recovery-time index), so the disk-fresh
+    /// separator must be checked against the block's decoded final key here.
+    #[cfg(feature = "std")]
+    fn verify_separator_matches_block(&self, keyed: &KeyedBlockHandle) -> crate::Result<()> {
+        let block_handle = BlockHandle::new(keyed.offset(), keyed.size());
+        let entries = self.decode_block_entries(&block_handle)?;
+        let Some(last) = entries.last() else {
             return Err(crate::Error::InvalidHeader(
-                "tli data handles do not tile the data section",
+                "tli separator addresses a data block that decodes to zero entries",
+            ));
+        };
+        if self
+            .comparator
+            .compare(keyed.end_key().as_ref(), last.key.user_key.as_ref())
+            != core::cmp::Ordering::Equal
+        {
+            return Err(crate::Error::InvalidHeader(
+                "tli separator does not match the addressed block's decoded last key",
             ));
         }
         Ok(())
