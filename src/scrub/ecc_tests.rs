@@ -1290,6 +1290,95 @@ fn heal_in_place_does_not_restamp_over_forged_meta_key_bounds() -> crate::Result
     Ok(())
 }
 
+/// A footered, uncompressed ECC SST whose data blocks carry an embedded
+/// HASH INDEX (non-zero `data_block_hash_ratio`), for the hash-index forge.
+fn write_ecc_sst_footered_hashed(dir: &std::path::Path) -> std::path::PathBuf {
+    let crate::AnyTree::Standard(tree) = crate::Config::new(
+        dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .page_ecc(true)
+    .ecc_scheme(EccScheme::ReedSolomon {
+        data_shards: 8,
+        parity_shards: 2,
+    })
+    .data_block_compression_policy(crate::config::CompressionPolicy::all(
+        crate::CompressionType::None,
+    ))
+    .data_block_hash_ratio_policy(crate::config::HashRatioPolicy::all(2.0))
+    .open()
+    .expect("open ecc hashed tree") else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+    tree.update_runtime_config(|c| {
+        c.kv_checksums = crate::runtime_config::KvChecksumPolicy::AllLevels;
+    })
+    .expect("enable kv checksums");
+    for i in 0u64..2_000 {
+        tree.insert(format!("key-{i:06}"), format!("v{i:06}"), i);
+    }
+    tree.flush_active_memtable(2_000).expect("flush");
+
+    let binding = tree.version_history.read().latest_version();
+    let table = binding
+        .version
+        .iter_tables()
+        .next()
+        .expect("flush produced one table");
+    (*table.path).clone()
+}
+
+/// The digest reconciliation must not restamp over a FORGED embedded HASH
+/// INDEX: filling the first block's hash index with `MARKER_FREE` leaves
+/// every logical entry, per-KV footer, and the outer block checksum intact,
+/// so a sequential decode and the count / key / seqno gates all pass — yet
+/// after reopen `point_read` trusts the hash index and returns `None` for
+/// every existing key in that block. The indexes must be probed against the
+/// decoded keys before the digest is trusted.
+#[test]
+fn heal_in_place_does_not_restamp_over_a_forged_hash_index() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sst_path = write_ecc_sst_footered_hashed(dir.path());
+
+    let crate::AnyTree::Standard(tree) = crate::Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .page_ecc(true)
+    .ecc_scheme(EccScheme::ReedSolomon {
+        data_shards: 8,
+        parity_shards: 2,
+    })
+    .data_block_compression_policy(crate::config::CompressionPolicy::all(
+        crate::CompressionType::None,
+    ))
+    .data_block_hash_ratio_policy(crate::config::HashRatioPolicy::all(2.0))
+    .open()
+    .expect("reopen ecc hashed tree") else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+    crate::test_forge::forge_hash_index_all_free(&sst_path, Some((8, 2)))?;
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
+        "a forged hash index must refuse the digest refresh: {report:?}",
+    );
+
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the forged SST must keep failing verify_integrity: restamping its \
+         digest would let point reads miss existing keys",
+    );
+    Ok(())
+}
+
 /// The digest reconciliation must not restamp over FORGED metadata SEQUENCE
 /// bounds: on a footer-bearing table WITHOUT deletion metadata (no sentinel
 /// to complicate the bounds), both meta mirrors re-stamped with `seqno#min`

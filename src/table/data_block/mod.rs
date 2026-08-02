@@ -697,6 +697,25 @@ impl DataBlock {
         }
     }
 
+    /// Test-only: the `(offset, len)` span of the embedded hash index within
+    /// this block's (footer-stripped) `inner.data`, or `None` when the block
+    /// carries no hash index. Used by the forgery helpers to corrupt the
+    /// hash index in place.
+    #[cfg(test)]
+    pub(crate) fn hash_index_span(&self) -> Option<(usize, usize)> {
+        use core::mem::size_of;
+
+        let trailer = Trailer::new(&self.inner);
+        let offset = size_of::<u8>() + size_of::<u8>() + size_of::<u32>() + size_of::<u32>();
+        let mut reader = trailer.as_slice().get(offset..)?;
+        let hash_index_len = reader.read_u32::<LittleEndian>().ok()?;
+        let hash_index_offset = reader.read_u32::<LittleEndian>().ok()?;
+        if hash_index_len == 0 {
+            return None;
+        }
+        Some((hash_index_offset as usize, hash_index_len as usize))
+    }
+
     /// Returns the number of hash buckets.
     #[must_use]
     pub fn hash_bucket_count(&self) -> Option<usize> {

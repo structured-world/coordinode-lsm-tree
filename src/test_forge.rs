@@ -971,6 +971,109 @@ pub fn forge_block_layout_shift_middle_end(
     forge_replace_section_payload(path, b"block_layout", &candidate, shards)
 }
 
+/// Fills the first data block's embedded HASH INDEX with `MARKER_FREE` and
+/// re-stamps the block header checksum plus, for a parity-bearing SST, the
+/// block's parity trailer. Every logical entry, per-KV footer, and the outer
+/// block checksum stay valid, so a sequential decode and the count / key /
+/// seqno gates all pass — yet `point_read` trusts the hash index and returns
+/// `None` for every existing key. The SST must be uncompressed and
+/// unencrypted (the hash index is patched in place through the on-disk
+/// payload) and its blocks must carry a hash index (a non-zero
+/// `data_block_hash_ratio`). `shards` is the SST's descriptor scheme
+/// (`None` for a parity-less table).
+pub fn forge_hash_index_all_free(
+    path: &std::path::Path,
+    shards: Option<(u8, u8)>,
+) -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::table::block::hash_index::MARKER_FREE;
+    use crate::table::block::{Block, Header};
+    use crate::table::{DataBlock, block::BlockType};
+
+    let mut bytes = std::fs::read(path)?;
+    let block_off = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"data") else {
+            panic!("the SST must carry a data section");
+        };
+        usize::try_from(entry.pos()).expect("data offset fits usize")
+    };
+    let Some(block) = bytes.get(block_off..) else {
+        panic!("data block within the file");
+    };
+    let mut cursor = block;
+    let header = Header::decode_from(&mut cursor)?;
+    let header_len = Header::header_len(header.block_type);
+    let payload_range =
+        block_off + header_len..block_off + header_len + header.data_length as usize;
+    let Some(payload) = bytes.get(payload_range.clone()) else {
+        panic!("data payload within the file");
+    };
+
+    // Locate the hash index within the footer-stripped inner block. For an
+    // uncompressed block the inner data is a prefix of the on-disk payload,
+    // so the inner offset maps straight through.
+    let (hi_offset, hi_len) = {
+        let loaded = Block {
+            header: Header {
+                block_type: BlockType::Data,
+                ..header
+            },
+            data: crate::Slice::from(payload.to_vec()),
+        };
+        let data_block = DataBlock::from_loaded(loaded, true)?;
+        data_block
+            .hash_index_span()
+            .expect("the block must carry a hash index")
+    };
+    {
+        let start = payload_range.start + hi_offset;
+        let Some(region) = bytes.get_mut(start..start + hi_len) else {
+            panic!("hash index within the payload");
+        };
+        region.fill(MARKER_FREE);
+    }
+
+    // Re-stamp the block header checksum over the altered payload.
+    let Some(payload) = bytes.get(payload_range.clone()) else {
+        panic!("data payload within the file");
+    };
+    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(payload));
+    let new_header = Header {
+        checksum: new_checksum,
+        ..header
+    };
+    let mut hdr_bytes = Vec::with_capacity(header_len);
+    new_header.encode_into(&mut hdr_bytes)?;
+    let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
+        panic!("data header within the file");
+    };
+    hdr_dst.copy_from_slice(&hdr_bytes);
+
+    #[cfg(feature = "page_ecc")]
+    if let Some((data_shards, parity_shards)) = shards {
+        let payload_end = payload_range.end;
+        let parity = crate::ecc::encode_parity(
+            bytes.get(payload_range).expect("payload"),
+            data_shards.into(),
+            parity_shards.into(),
+        )?;
+        let Some(dst) = bytes.get_mut(payload_end..payload_end + parity.len()) else {
+            panic!("parity trailer within the file");
+        };
+        dst.copy_from_slice(&parity);
+    }
+    #[cfg(not(feature = "page_ecc"))]
+    let _ = shards;
+
+    std::fs::write(path, &bytes)?;
+    Ok(())
+}
+
 /// Forges the `filter` section so that the key hashing to `target_hash`
 /// becomes a FALSE NEGATIVE: searches for a single payload byte whose flip
 /// makes the (still parseable) `BuRR` filter report the hash as definitely
