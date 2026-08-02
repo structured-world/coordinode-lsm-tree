@@ -656,7 +656,7 @@ fn classify_drop(
     e: &crate::Error,
     offset: u64,
     prev_end: Option<&UserKey>,
-    end_key: &UserKey,
+    end_key: Option<&UserKey>,
 ) -> DroppedBlock {
     use alloc::format;
     let reason = match e {
@@ -670,10 +670,10 @@ fn classify_drop(
         offset,
         section: b"data".to_vec(),
         reason,
-        key_range: Some((
-            prev_end.cloned().unwrap_or_else(UserKey::empty),
-            end_key.clone(),
-        )),
+        // A gap-probed block (omitted by a forged index) has no separator,
+        // so its key range is unknown until decode — `None`, like a block
+        // whose index entry is lost.
+        key_range: end_key.map(|ek| (prev_end.cloned().unwrap_or_else(UserKey::empty), ek.clone())),
     }
 }
 
@@ -740,6 +740,64 @@ fn fold_blob_links(
     }
 }
 
+/// Frames the block starting at `offset` by reading its HEADER straight from
+/// the file: the on-disk span is header + payload + parity trailer (data
+/// blocks carry no `block_flags` byte, so the trailer is sized from the
+/// per-SST descriptor scheme). The forged-index gap walk uses this — the
+/// writer emits blocks back-to-back, so the physical data-section tiling is
+/// ground truth. A header that fails to decode, or a span leaving the
+/// section, means the bytes are not frameable as a block.
+fn probe_block_handle_at(
+    table: &crate::table::Table,
+    offset: u64,
+    section_end: u64,
+) -> crate::Result<crate::table::BlockHandle> {
+    use crate::coding::Decode;
+    use crate::table::block::Header;
+
+    let file = table
+        .fs
+        .open(&table.path, &crate::fs::FsOpenOptions::new().read(true))?;
+    // Positional read of the largest possible header (block_flags-bearing
+    // types are one byte longer than the SST minimum); a short read only
+    // matters if it cuts into the bytes `decode_from` actually consumes.
+    let mut buf = [0u8; Header::MAX_LEN];
+    let got = file.read_at(&mut buf, offset)?;
+    let mut cursor = buf.get(..got).ok_or(crate::Error::InvalidHeader(
+        "gap block header read out of bounds",
+    ))?;
+    let header = Header::decode_from(&mut cursor)?;
+    let header_len = Header::header_len(header.block_type) as u64;
+    let parity_len = table.metadata.ecc_params.map_or(0, |scheme| {
+        u64::from(crate::table::block::expected_parity_len(
+            header.data_length,
+            scheme,
+        ))
+    });
+    let total = header_len
+        .checked_add(u64::from(header.data_length))
+        .and_then(|t| t.checked_add(parity_len))
+        .ok_or(crate::Error::InvalidHeader(
+            "gap block span overflows the file",
+        ))?;
+    let end = offset
+        .checked_add(total)
+        .ok_or(crate::Error::InvalidHeader(
+            "gap block span overflows the file",
+        ))?;
+    if end > section_end {
+        return Err(crate::Error::InvalidHeader(
+            "gap block extends past the data section",
+        ));
+    }
+    let size = u32::try_from(total)
+        .map_err(|_| crate::Error::InvalidHeader("gap block span exceeds the block size limit"))?;
+    Ok(crate::table::BlockHandle::new(
+        crate::table::BlockOffset(offset),
+        size,
+    ))
+}
+
 /// Walks `table`'s data blocks in index order, re-emitting every block that
 /// loads and decodes cleanly into `writer` and recording the rest.
 ///
@@ -789,25 +847,99 @@ fn salvage_blocks(
     // `(end_key[N-1], end_key[N]]`).
     let mut prev_end: Option<UserKey> = None;
 
+    // Enumerate the index handles first. A corrupt index entry stops the
+    // collection after reporting it: once the index stream desyncs, later
+    // entries are unknowable (the physical fallback below only runs for a
+    // CLEANLY enumerated index, whose omissions are forgery, not rot).
+    let mut indexed: Vec<crate::table::KeyedBlockHandle> = Vec::new();
+    let mut index_broken = false;
     for handle in table.data_block_handles() {
-        blocks_total += 1;
-        let keyed = match handle {
-            Ok(k) => k,
+        match handle {
+            Ok(k) => indexed.push(k),
             Err(e) => {
-                // A corrupt index entry: the block's handle and range are
-                // unknown, and once the index stream desyncs later offsets are
-                // unknowable too, so stop the walk after reporting it.
                 dropped.push(DroppedBlock {
                     offset: 0,
                     section: b"index".to_vec(),
                     reason: DropReason::HeaderCorrupted(format!("{e:?}")),
                     key_range: None,
                 });
+                index_broken = true;
                 break;
             }
+        }
+    }
+
+    // Cross-check a cleanly enumerated index against the PHYSICAL data
+    // section: both TLI mirrors forged to the SAME handle list pass every
+    // byte-level check and the mirror comparison, so an OMITTED handle is
+    // invisible to the open — the writer emits blocks back-to-back, making
+    // the section tiling the only ground truth. Frame each uncovered byte
+    // range from its block headers and salvage those blocks too (their end
+    // key is unknown until decode); an unframeable gap is reported dropped,
+    // never silently skipped.
+    let mut items: Vec<(crate::table::BlockHandle, Option<UserKey>)> = Vec::new();
+    let data_section = if index_broken {
+        None
+    } else {
+        let mut file = table
+            .fs
+            .open(&table.path, &crate::fs::FsOpenOptions::new().read(true))?;
+        crate::sfa::Reader::from_reader(&mut file)
+            .ok()
+            .and_then(|t| t.toc().section(b"data").map(|s| (s.pos(), s.len())))
+    };
+    if let Some((section_pos, section_len)) = data_section {
+        let section_end = section_pos.saturating_add(section_len);
+        let mut probe_gap = |from: u64,
+                             to: u64,
+                             items: &mut Vec<(crate::table::BlockHandle, Option<UserKey>)>,
+                             dropped: &mut Vec<DroppedBlock>| {
+            let mut at = from;
+            while at < to {
+                match probe_block_handle_at(table, at, to) {
+                    Ok(h) => {
+                        let next = at + u64::from(h.size());
+                        items.push((h, None));
+                        at = next;
+                    }
+                    Err(e) => {
+                        // Unframeable bytes the index does not cover: report
+                        // the loss instead of silently skipping it.
+                        dropped.push(DroppedBlock {
+                            offset: at,
+                            section: b"data".to_vec(),
+                            reason: DropReason::HeaderCorrupted(format!("{e:?}")),
+                            key_range: None,
+                        });
+                        break;
+                    }
+                }
+            }
         };
-        let end_key = keyed.end_key().clone();
-        let offset = *keyed.as_ref().offset();
+        let mut cursor = section_pos;
+        for keyed in indexed {
+            let off = *keyed.as_ref().offset();
+            if off > cursor {
+                probe_gap(cursor, off, &mut items, &mut dropped);
+            }
+            let next = off.saturating_add(u64::from(keyed.as_ref().size()));
+            items.push((*keyed.as_ref(), Some(keyed.end_key().clone())));
+            cursor = cursor.max(next);
+        }
+        if cursor < section_end {
+            probe_gap(cursor, section_end, &mut items, &mut dropped);
+        }
+    } else {
+        // Broken index or unreadable TOC: walk exactly what the index gave.
+        for keyed in indexed {
+            let handle = *keyed.as_ref();
+            items.push((handle, Some(keyed.end_key().clone())));
+        }
+    }
+
+    for (block_handle, end_key) in items {
+        blocks_total += 1;
+        let offset = *block_handle.offset();
 
         // Columnar source: a clean block is byte-copied verbatim — preserving its
         // PAX value sub-columns, zone map, and per-row seqnos without the transpose
@@ -833,7 +965,7 @@ fn salvage_blocks(
             if table.has_delete_bitmap_section() && apply_delete_mask {
                 // Re-emit each block as a delete-masked batch so the recovered copy
                 // keeps any (readable) deletes applied.
-                match table.load_columnar_block_masked(keyed.as_ref()) {
+                match table.load_columnar_block_masked(&block_handle) {
                     Ok(Some(batch)) => {
                         let rows = u64::from(batch.row_count);
                         // Indirections of the SURVIVING (unmasked) rows,
@@ -846,9 +978,9 @@ fn salvage_blocks(
                                     &e,
                                     offset,
                                     prev_end.as_ref(),
-                                    &end_key,
+                                    end_key.as_ref(),
                                 ));
-                                prev_end = Some(end_key);
+                                prev_end = end_key.or(prev_end);
                                 continue;
                             }
                         };
@@ -869,7 +1001,7 @@ fn salvage_blocks(
                                     &e,
                                     offset,
                                     prev_end.as_ref(),
-                                    &end_key,
+                                    end_key.as_ref(),
                                 ));
                             }
                             Err(e) => return Err(e),
@@ -877,11 +1009,16 @@ fn salvage_blocks(
                     }
                     // Wholly-deleted block: nothing to recover, nothing lost.
                     Ok(None) => {}
-                    Err(e) => dropped.push(classify_drop(&e, offset, prev_end.as_ref(), &end_key)),
+                    Err(e) => dropped.push(classify_drop(
+                        &e,
+                        offset,
+                        prev_end.as_ref(),
+                        end_key.as_ref(),
+                    )),
                 }
             } else {
                 match table
-                    .salvage_load_block(keyed.as_ref(), crate::table::block::BlockType::Columnar)
+                    .salvage_load_block(&block_handle, crate::table::block::BlockType::Columnar)
                 {
                     // Row materialization validates the batch content (framing,
                     // value-type tags, key invariants) beyond the outer frame
@@ -912,7 +1049,7 @@ fn salvage_blocks(
                                 &crate::Error::InvalidHeader("columnar: zero-row data block"),
                                 offset,
                                 prev_end.as_ref(),
-                                &end_key,
+                                end_key.as_ref(),
                             ));
                         }
                         Ok((batch, entries)) => {
@@ -928,9 +1065,9 @@ fn salvage_blocks(
                                         &e,
                                         offset,
                                         prev_end.as_ref(),
-                                        &end_key,
+                                        end_key.as_ref(),
                                     ));
-                                    prev_end = Some(end_key);
+                                    prev_end = end_key.or(prev_end);
                                     continue;
                                 }
                             };
@@ -976,26 +1113,36 @@ fn salvage_blocks(
                                         &e,
                                         offset,
                                         prev_end.as_ref(),
-                                        &end_key,
+                                        end_key.as_ref(),
                                     ));
                                 }
                                 Err(e) => return Err(e),
                             }
                         }
                         Err(e) => {
-                            dropped.push(classify_drop(&e, offset, prev_end.as_ref(), &end_key));
+                            dropped.push(classify_drop(
+                                &e,
+                                offset,
+                                prev_end.as_ref(),
+                                end_key.as_ref(),
+                            ));
                         }
                     },
-                    Err(e) => dropped.push(classify_drop(&e, offset, prev_end.as_ref(), &end_key)),
+                    Err(e) => dropped.push(classify_drop(
+                        &e,
+                        offset,
+                        prev_end.as_ref(),
+                        end_key.as_ref(),
+                    )),
                 }
             }
-            prev_end = Some(end_key);
+            prev_end = end_key.or(prev_end);
             continue;
         }
 
         // Row source: a clean block is byte-copied verbatim; an ECC-recovered block
         // is re-emitted entry by entry from its healed payload.
-        match table.salvage_load_block(keyed.as_ref(), crate::table::block::BlockType::Data) {
+        match table.salvage_load_block(&block_handle, crate::table::block::BlockType::Data) {
             Ok(mut sb) => {
                 if !allow_verbatim {
                     sb.verbatim = None;
@@ -1017,8 +1164,13 @@ fn salvage_blocks(
                         table.metadata.kv_checksum_algo,
                     )
                 {
-                    dropped.push(classify_drop(&e, offset, prev_end.as_ref(), &end_key));
-                    prev_end = Some(end_key);
+                    dropped.push(classify_drop(
+                        &e,
+                        offset,
+                        prev_end.as_ref(),
+                        end_key.as_ref(),
+                    ));
+                    prev_end = end_key.or(prev_end);
                     continue;
                 }
                 match crate::table::DataBlock::from_loaded(sb.block, has_kv_footer) {
@@ -1041,9 +1193,9 @@ fn salvage_blocks(
                                     ),
                                     offset,
                                     prev_end.as_ref(),
-                                    &end_key,
+                                    end_key.as_ref(),
                                 ));
-                                prev_end = Some(end_key);
+                                prev_end = end_key.or(prev_end);
                                 continue;
                             }
                             // The entry decoder turns a mid-stream parse
@@ -1062,9 +1214,9 @@ fn salvage_blocks(
                                     ),
                                     offset,
                                     prev_end.as_ref(),
-                                    &end_key,
+                                    end_key.as_ref(),
                                 ));
-                                prev_end = Some(end_key);
+                                prev_end = end_key.or(prev_end);
                                 continue;
                             }
                             let count = entries.len() as u64;
@@ -1079,9 +1231,9 @@ fn salvage_blocks(
                                         &e,
                                         offset,
                                         prev_end.as_ref(),
-                                        &end_key,
+                                        end_key.as_ref(),
                                     ));
-                                    prev_end = Some(end_key);
+                                    prev_end = end_key.or(prev_end);
                                     continue;
                                 }
                             };
@@ -1125,7 +1277,7 @@ fn salvage_blocks(
                                         &e,
                                         offset,
                                         prev_end.as_ref(),
-                                        &end_key,
+                                        end_key.as_ref(),
                                     ));
                                 }
                                 Err(e) => return Err(e),
@@ -1135,26 +1287,29 @@ fn salvage_blocks(
                             offset,
                             section: b"data".to_vec(),
                             reason: DropReason::DecodeError(format!("{e:?}")),
-                            key_range: Some((
-                                prev_end.clone().unwrap_or_else(UserKey::empty),
-                                end_key.clone(),
-                            )),
+                            key_range: end_key.as_ref().map(|ek| {
+                                (prev_end.clone().unwrap_or_else(UserKey::empty), ek.clone())
+                            }),
                         }),
                     },
                     Err(e) => dropped.push(DroppedBlock {
                         offset,
                         section: b"data".to_vec(),
                         reason: DropReason::DecodeError(format!("{e:?}")),
-                        key_range: Some((
-                            prev_end.clone().unwrap_or_else(UserKey::empty),
-                            end_key.clone(),
-                        )),
+                        key_range: end_key.as_ref().map(|ek| {
+                            (prev_end.clone().unwrap_or_else(UserKey::empty), ek.clone())
+                        }),
                     }),
                 }
             }
-            Err(e) => dropped.push(classify_drop(&e, offset, prev_end.as_ref(), &end_key)),
+            Err(e) => dropped.push(classify_drop(
+                &e,
+                offset,
+                prev_end.as_ref(),
+                end_key.as_ref(),
+            )),
         }
-        prev_end = Some(end_key);
+        prev_end = end_key.or(prev_end);
     }
 
     let wrote = blocks_salvaged > 0;
