@@ -5104,49 +5104,67 @@ impl Table {
         };
 
         let pinned_filter_index = if let Some(filter_tli_handle) = regions.filter_tli {
-            let block = Block::from_file(
-                file_handle.as_ref(),
-                filter_tli_handle,
-                crate::table::block::BlockIdentity {
-                    table_id: metadata.id,
-                    block_type: BlockType::Index,
-                    dict_id: 0,
-                    window_log: 0,
-                },
-                &{
-                    // Filter TLI is an Index (SST) block: no block_flags byte,
-                    // so ECC presence comes from the per-SST descriptor.
-                    let t = crate::table::block::BlockTransform::from_parts(
-                        metadata.index_block_compression,
-                        encryption.as_deref(),
-                        #[cfg(zstd_any)]
-                        None,
-                    )?;
-                    if let Some(ecc) = metadata.ecc_params {
-                        t.with_ecc(ecc)
-                    } else {
-                        t
-                    }
-                },
-            )?;
-            if block.header.block_type != BlockType::Index {
-                return Err(crate::Error::InvalidTag((
-                    "BlockType",
-                    block.header.block_type.into(),
-                )));
+            let load = || -> crate::Result<IndexBlock> {
+                let block = Block::from_file(
+                    file_handle.as_ref(),
+                    filter_tli_handle,
+                    crate::table::block::BlockIdentity {
+                        table_id: metadata.id,
+                        block_type: BlockType::Index,
+                        dict_id: 0,
+                        window_log: 0,
+                    },
+                    &{
+                        // Filter TLI is an Index (SST) block: no block_flags byte,
+                        // so ECC presence comes from the per-SST descriptor.
+                        let t = crate::table::block::BlockTransform::from_parts(
+                            metadata.index_block_compression,
+                            encryption.as_deref(),
+                            #[cfg(zstd_any)]
+                            None,
+                        )?;
+                        if let Some(ecc) = metadata.ecc_params {
+                            t.with_ecc(ecc)
+                        } else {
+                            t
+                        }
+                    },
+                )?;
+                if block.header.block_type != BlockType::Index {
+                    return Err(crate::Error::InvalidTag((
+                        "BlockType",
+                        block.header.block_type.into(),
+                    )));
+                }
+                let idx = IndexBlock::new(block);
+                // Validate filter index trailer eagerly (same as FullBlockIndex::new)
+                // so later iter() calls cannot panic on malformed blocks.
+                idx.try_iter(comparator.clone())?;
+                Ok(idx)
+            };
+            match load() {
+                Ok(idx) => Some(idx),
+                // Salvage never consults the source's filter — the
+                // destination writer rebuilds it from the recovered keys —
+                // so an unreadable filter index must not cost the
+                // recoverable data (a live open still fails closed).
+                Err(e) if salvage => {
+                    log::warn!(
+                        "filter index for table {:?} is unreadable ({e}); salvaging \
+                         without it (the recovered copy re-derives its filter)",
+                        metadata.id
+                    );
+                    None
+                }
+                Err(e) => return Err(e),
             }
-            let idx = IndexBlock::new(block);
-            // Validate filter index trailer eagerly (same as FullBlockIndex::new)
-            // so later iter() calls cannot panic on malformed blocks.
-            idx.try_iter(comparator.clone())?;
-            Some(idx)
         } else {
             None
         };
 
         // TODO: FilterBlock newtype
         let pinned_filter_block = if pinned_filter_index.is_none() && pin_filter {
-            regions
+            let loaded = regions
                 .filter
                 .map(|filter_handle| {
                     log::debug!(
@@ -5192,7 +5210,22 @@ impl Table {
 
                     Ok::<_, crate::Error>(FilterBlock::new(block))
                 })
-                .transpose()?
+                .transpose();
+            match loaded {
+                Ok(block) => block,
+                // Same salvage degradation as the filter index above: the
+                // walk never probes the source filter, the recovered copy
+                // re-derives its own.
+                Err(e) if salvage => {
+                    log::warn!(
+                        "filter block for table {:?} is unreadable ({e}); salvaging \
+                         without it (the recovered copy re-derives its filter)",
+                        metadata.id
+                    );
+                    None
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             None
         };
