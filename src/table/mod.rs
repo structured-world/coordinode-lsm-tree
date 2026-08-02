@@ -515,6 +515,60 @@ impl Table {
         )
     }
 
+    /// Loads a data-carrying block STRAIGHT FROM THE FILE, bypassing the
+    /// block cache in both directions, for the semantic reconcile gates: a
+    /// block read before an on-disk alteration leaves its pristine copy
+    /// cached, and a gate served that stale original would judge bytes
+    /// other than the ones the digest refresh is about to trust. Reuses the
+    /// cached file descriptor but never consults or populates the block
+    /// cache (the cold verification blocks must not evict the live working
+    /// set either). Decodes under the table's data-block codec context, so
+    /// it fits every gate that walks `block_index` (Data or Columnar role).
+    // Compiled under no_std alongside its `verify_kv_checksums` consumer,
+    // which is itself dead there (the verify/scrub caller is std-gated).
+    #[cfg_attr(
+        not(feature = "std"),
+        allow(
+            dead_code,
+            reason = "gate-only loader; the verify/scrub consumers are std-gated"
+        )
+    )]
+    fn load_block_from_disk(
+        &self,
+        handle: &BlockHandle,
+        block_type: BlockType,
+    ) -> crate::Result<Block> {
+        let (fd, _cache_event) = self
+            .file_accessor
+            .get_or_open_table(&self.global_id(), &self.path)?;
+        let transform = crate::table::util::build_block_transform(
+            self.metadata.data_block_compression,
+            self.encryption.as_deref(),
+            self.metadata.ecc_params,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+        )?;
+        let block = Block::from_file(
+            fd.as_ref(),
+            *handle,
+            crate::table::block::BlockIdentity {
+                table_id: self.metadata.id,
+                block_type,
+                dict_id: self.metadata.data_block_compression.dict_id(),
+                window_log: 0,
+            },
+            &transform,
+        )?;
+        // Swap-defence role check, mirroring `load_block`.
+        if block.header.block_type != block_type {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                block.header.block_type.into(),
+            )));
+        }
+        Ok(block)
+    }
+
     /// Loads (and, for columnar SSTs, reconstructs + delete-masks) a data block.
     /// Returns `Ok(None)` when a columnar block is wholly deleted by the
     /// positional mask, so the caller treats it as carrying no keys.
@@ -1798,14 +1852,11 @@ impl Table {
             let handle = handle?;
             let block_handle = BlockHandle::new(handle.offset(), handle.size());
             // Load the RAW block (footer intact) — do NOT route through
-            // `load_data_block`, which strips the footer via `from_loaded`.
-            let block = self.load_block(
-                &block_handle,
-                BlockType::Data,
-                self.metadata.data_block_compression,
-                #[cfg(zstd_any)]
-                self.zstd_dictionary.as_deref(),
-            )?;
+            // `load_data_block`, which strips the footer via `from_loaded` —
+            // and DISK-FRESH: a pristine copy cached before an on-disk
+            // re-stamp would otherwise pass this gate for a file whose
+            // stale footer no longer matches its altered value bytes.
+            let block = self.load_block_from_disk(&block_handle, BlockType::Data)?;
             DataBlock::verify_kv_checked(
                 &block.data,
                 block.header,
@@ -2111,13 +2162,7 @@ impl Table {
             let derived = {
                 #[cfg(feature = "columnar")]
                 if self.metadata.columnar {
-                    let block = self.load_block(
-                        &block_handle,
-                        BlockType::Columnar,
-                        self.metadata.data_block_compression,
-                        #[cfg(zstd_any)]
-                        self.zstd_dictionary.as_deref(),
-                    )?;
+                    let block = self.load_block_from_disk(&block_handle, BlockType::Columnar)?;
                     let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
                     let entries = crate::table::columnar::column_batch_to_entries(&batch)?;
                     let mut seqnos = entries.iter().map(|e| e.key.seqno);
@@ -2136,13 +2181,7 @@ impl Table {
             let derived = if let Some(d) = derived {
                 d
             } else {
-                let block = self.load_block(
-                    &block_handle,
-                    BlockType::Data,
-                    self.metadata.data_block_compression,
-                    #[cfg(zstd_any)]
-                    self.zstd_dictionary.as_deref(),
-                )?;
+                let block = self.load_block_from_disk(&block_handle, BlockType::Data)?;
                 let data_block =
                     DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())?;
                 let mut seqnos = data_block
@@ -2197,13 +2236,7 @@ impl Table {
             let block_handle = BlockHandle::new(handle.offset(), handle.size());
             #[cfg(feature = "columnar")]
             if self.metadata.columnar {
-                let block = self.load_block(
-                    &block_handle,
-                    BlockType::Columnar,
-                    self.metadata.data_block_compression,
-                    #[cfg(zstd_any)]
-                    self.zstd_dictionary.as_deref(),
-                )?;
+                let block = self.load_block_from_disk(&block_handle, BlockType::Columnar)?;
                 // `column_batch_to_entries` fully materializes the rows, so a
                 // malformed batch fails here rather than truncating silently.
                 let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
@@ -2215,13 +2248,7 @@ impl Table {
                 }
                 continue;
             }
-            let block = self.load_block(
-                &block_handle,
-                BlockType::Data,
-                self.metadata.data_block_compression,
-                #[cfg(zstd_any)]
-                self.zstd_dictionary.as_deref(),
-            )?;
+            let block = self.load_block_from_disk(&block_handle, BlockType::Data)?;
             let data_block =
                 DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())?;
             let declared = data_block.len();
@@ -2313,13 +2340,7 @@ impl Table {
             let (min_key, max_key, rows) = {
                 #[cfg(feature = "columnar")]
                 if self.metadata.columnar {
-                    let block = self.load_block(
-                        &block_handle,
-                        BlockType::Columnar,
-                        self.metadata.data_block_compression,
-                        #[cfg(zstd_any)]
-                        self.zstd_dictionary.as_deref(),
-                    )?;
+                    let block = self.load_block_from_disk(&block_handle, BlockType::Columnar)?;
                     let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
                     let entries = crate::table::columnar::column_batch_to_entries(&batch)?;
                     let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
@@ -2363,13 +2384,7 @@ impl Table {
         block_handle: &BlockHandle,
     ) -> crate::Result<(Vec<u8>, Vec<u8>, usize)> {
         use crate::table::block::ParsedItem as _;
-        let block = self.load_block(
-            block_handle,
-            BlockType::Data,
-            self.metadata.data_block_compression,
-            #[cfg(zstd_any)]
-            self.zstd_dictionary.as_deref(),
-        )?;
+        let block = self.load_block_from_disk(block_handle, BlockType::Data)?;
         let data_block = DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())?;
         let entries: Vec<_> = data_block
             .try_iter(self.comparator.clone())?
@@ -2478,44 +2493,62 @@ impl Table {
         Ok(())
     }
 
-    /// Confirms every decoded key is RETRIEVABLE through the full point-read
-    /// path. A data block's embedded HASH INDEX (and binary index) is
-    /// checksum-clean to the out-of-band walk even when a bucket was
-    /// re-stamped to `MARKER_FREE` (or a binary-index offset misdirected):
-    /// the sequential decode gates still see every entry, but `point_read`
-    /// trusts the index and returns `None` for the affected keys. Probe each
-    /// key's NEWEST version (the first occurrence in block-index order, since
-    /// blocks are sorted by key then descending seqno) with `point_read` at
-    /// `MAX_SEQNO` and require a hit; a miss means the in-block indexes
-    /// disagree with the decoded entries. Covers hash + binary index and
-    /// filter / locator misdirection in one end-to-end check.
+    /// Confirms every decoded key is RETRIEVABLE through its own block's
+    /// in-block indexes, judged on the DISK-FRESH bytes. A data block's
+    /// embedded HASH INDEX is checksum-clean to the out-of-band walk even
+    /// when a bucket was re-stamped to `MARKER_FREE`: the sequential decode
+    /// gates still see every entry, but `point_read` trusts the index and
+    /// returns `None` for the affected keys. Each block is re-read from the
+    /// file and probed through ITS OWN `point_read` — the table-level probe
+    /// this replaces went through the recovery-time in-memory index and the
+    /// block cache, so a pristine cached copy masked the on-disk forge.
+    /// Filter, locator, and TLI misdirection have their own disk-fresh
+    /// gates (`verify_filter`, `verify_locator`, `verify_tli_mirrors`).
+    /// Columnar blocks carry no in-block key index (rows are reconstructed
+    /// on load), so they have nothing to probe.
     ///
     /// # Errors
     ///
-    /// [`crate::Error::InvalidHeader`] when a decoded key is not retrievable;
-    /// any I/O / decode error from the full scan.
+    /// [`crate::Error::InvalidHeader`] when a decoded key is not retrievable
+    /// from its block; any I/O / decode error from the full scan.
     #[cfg(feature = "std")]
     pub(crate) fn verify_point_read_reachability(&self) -> crate::Result<()> {
-        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        use crate::table::block::ParsedItem as _;
+        #[cfg(feature = "columnar")]
+        if self.metadata.columnar {
+            return Ok(());
+        }
         for handle in self.block_index.iter() {
             let handle = handle?;
             let block_handle = BlockHandle::new(handle.offset(), handle.size());
-            let entries = self.decode_block_entries(&block_handle)?;
+            let block = self.load_block_from_disk(&block_handle, BlockType::Data)?;
+            let data_block =
+                DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())?;
+            let entries: Vec<InternalValue> = data_block
+                .try_iter(self.comparator.clone())?
+                .map(|p| p.materialize(data_block.as_slice()))
+                .collect();
+            // A key's versions are adjacent within the block (sorted by key
+            // then descending seqno), so one probe per distinct key.
+            let mut prev_key: Option<UserKey> = None;
             for entry in entries {
-                let user_key = entry.key.user_key.to_vec();
-                if !seen.insert(user_key.clone()) {
+                if prev_key.as_ref() == Some(&entry.key.user_key) {
                     continue;
                 }
-                let key_hash = crate::hash::hash64(&user_key);
-                if self
-                    .point_read(&user_key, crate::seqno::MAX_SEQNO, key_hash)?
+                if data_block
+                    .point_read(
+                        entry.key.user_key.as_ref(),
+                        crate::seqno::MAX_SEQNO,
+                        &self.comparator,
+                    )?
                     .is_none()
                 {
                     return Err(crate::Error::InvalidHeader(
-                        "a decoded key is not retrievable via point_read (an in-block \
-                         index disagrees with the entries)",
+                        "a decoded key is not retrievable via its block's point_read \
+                         (an in-block index disagrees with the entries)",
                     ));
                 }
+                prev_key = Some(entry.key.user_key);
             }
         }
         Ok(())
@@ -3033,7 +3066,10 @@ impl Table {
     }
 
     /// Decodes one data block's entries (row or columnar) into
-    /// [`InternalValue`]s, for the semantic cross-check gates.
+    /// [`InternalValue`]s, for the semantic cross-check gates. Reads the
+    /// block DISK-FRESH ([`Self::load_block_from_disk`]): the gates judge
+    /// the file being reconciled, and a pristine copy cached before an
+    /// on-disk alteration must not stand in for the altered bytes.
     #[cfg(feature = "std")]
     fn decode_block_entries(
         &self,
@@ -3042,23 +3078,11 @@ impl Table {
         use crate::table::block::ParsedItem as _;
         #[cfg(feature = "columnar")]
         if self.metadata.columnar {
-            let block = self.load_block(
-                block_handle,
-                BlockType::Columnar,
-                self.metadata.data_block_compression,
-                #[cfg(zstd_any)]
-                self.zstd_dictionary.as_deref(),
-            )?;
+            let block = self.load_block_from_disk(block_handle, BlockType::Columnar)?;
             let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
             return crate::table::columnar::column_batch_to_entries(&batch);
         }
-        let block = self.load_block(
-            block_handle,
-            BlockType::Data,
-            self.metadata.data_block_compression,
-            #[cfg(zstd_any)]
-            self.zstd_dictionary.as_deref(),
-        )?;
+        let block = self.load_block_from_disk(block_handle, BlockType::Data)?;
         let data_block = DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())?;
         Ok(data_block
             .try_iter(self.comparator.clone())?
