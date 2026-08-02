@@ -400,9 +400,16 @@ pub(crate) fn salvage_with_context(
             // mutation, so without its own sync a power loss can leave the
             // manifest referencing a `dest` that reappears only under the
             // temporary name. Same mode-aware publish discipline as the
-            // writer's own finish.
-            if let Some(parent) = dest.parent() {
-                fs.sync_directory_with(parent, options.sync_mode)?;
+            // writer's own finish. A sync failure here has already populated
+            // `dest` (the rename succeeded): remove the owned copy before
+            // returning the durability error, like every other salvage
+            // failure path, so a standalone retry's `create_new` open and the
+            // repair caller both see the destination free.
+            if let Some(parent) = dest.parent()
+                && let Err(e) = fs.sync_directory_with(parent, options.sync_mode)
+            {
+                discard_partial(fs, &dest);
+                return Err(e.into());
             }
             rep.salvaged_path = Some(dest);
         }
