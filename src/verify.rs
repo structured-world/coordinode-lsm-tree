@@ -1200,7 +1200,30 @@ fn scan_sst_blocks(
     // present (their findings are still valid).
     {
         let mut expected_pos: u64 = 0;
+        // A re-stamped TOC can also DUPLICATE a recognized name: renaming
+        // `range_tombstones` to a second `data` entry (and re-stamping its
+        // block header's role) preserves the tiling AND passes the
+        // recognized-role walk, yet `Toc::section(b"data")` returns the
+        // FIRST match and `ParsedRegions` sees no range-tombstone section —
+        // so the deleted range silently resurrects. Section names are unique
+        // by construction (the writer emits each at most once), so any
+        // duplicate is corruption.
+        let mut seen_names: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         for entry in toc.iter() {
+            if !seen_names.insert(entry.name().to_vec()) {
+                errors.push(BlockVerifyError::TocCorrupted {
+                    table_id,
+                    path: path.to_path_buf(),
+                    section_name: entry.name().to_vec(),
+                    section_offset: entry.pos(),
+                    reason: format!(
+                        "duplicate TOC section name {:?}; a renamed section can \
+                         shadow another and hide it from the readers that look \
+                         it up by name",
+                        alloc::string::String::from_utf8_lossy(entry.name()),
+                    ),
+                });
+            }
             if entry.pos() != expected_pos {
                 errors.push(BlockVerifyError::TocCorrupted {
                     table_id,
