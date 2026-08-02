@@ -1417,6 +1417,83 @@ pub fn forge_tli_binary_index_pointer(
     replace_section_frame(path, b"tli_tail", &forged)
 }
 
+/// Re-encodes the `zone_map` section WITHOUT its LAST block entry (fresh
+/// checksum, ZoneMap role): paired with a TLI forge hiding the same
+/// trailing block, the positioning chain over the remaining indexed
+/// blocks stays self-consistent — the omitted block is invisible to every
+/// index-driven check and only a physical data-section walk can find it.
+/// The SST must be unencrypted, non-ECC, and carry a zone map with >= 2
+/// entries.
+pub fn forge_zone_map_drop_last_entry(
+    path: &std::path::Path,
+    table_id: crate::TableId,
+) -> crate::Result<()> {
+    use crate::table::block::{Block, BlockIdentity, BlockType};
+    use crate::table::{BlockHandle, BlockOffset};
+
+    let identity = BlockIdentity {
+        table_id,
+        block_type: BlockType::ZoneMap,
+        dict_id: 0,
+        window_log: 0,
+    };
+    let transform = crate::table::block::BlockTransform::from_parts(
+        crate::CompressionType::None,
+        None,
+        #[cfg(zstd_any)]
+        None,
+    )?;
+
+    let (pos, len) = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"zone_map") else {
+            panic!("the SST must carry a zone_map section");
+        };
+        (
+            usize::try_from(entry.pos()).expect("pos fits usize"),
+            usize::try_from(entry.len()).expect("len fits usize"),
+        )
+    };
+    let blocks: Vec<(BlockOffset, Vec<crate::table::zone_map::ColumnStats>)> = {
+        let file = crate::fs::Fs::open(
+            &crate::fs::StdFs,
+            path,
+            &crate::fs::FsOpenOptions::new().read(true),
+        )?;
+        let block = Block::from_file(
+            &*file,
+            BlockHandle::new(
+                BlockOffset(u64::try_from(pos).expect("pos fits u64")),
+                u32::try_from(len).expect("section fits u32"),
+            ),
+            identity,
+            &transform,
+        )?;
+        let map = crate::table::zone_map::ZoneMap::decode(&block.data)?;
+        let entries = map.entries();
+        assert!(
+            entries.len() >= 2,
+            "dropping the last entry must leave a non-empty map",
+        );
+        entries
+            .get(..entries.len() - 1)
+            .expect("all but the last entry")
+            .iter()
+            .map(|(off, cols)| (BlockOffset(*off), cols.clone()))
+            .collect()
+    };
+
+    let mut payload = Vec::new();
+    crate::table::zone_map::encode_zone_map(&mut payload, &blocks)?;
+    let mut forged = Vec::new();
+    Block::write_into(&mut forged, &payload, identity, &transform)?;
+    replace_section_frame(path, b"zone_map", &forged)
+}
+
 /// Shared preamble of the TLI forges: the Index identity, the uncompressed
 /// (optionally ECC) transform, and the DECODED `tli_tail` mirror. Every TLI
 /// forge must agree on these — a drift between copies would silently write

@@ -253,6 +253,14 @@ impl ZoneMap {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    /// Test-only: the raw `(offset, columns)` entries, for forges that
+    /// re-encode the section with a record removed or altered.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn entries(&self) -> &[(u64, Vec<ColumnStats>)] {
+        &self.entries
+    }
 }
 
 /// Forward cursor over a [`ZoneMap`], optimized for ascending-offset block

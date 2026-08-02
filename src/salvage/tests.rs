@@ -2087,6 +2087,85 @@ fn salvage_drops_a_row_block_with_out_of_order_keys() -> crate::Result<()> {
     Ok(())
 }
 
+/// A delete-bearing columnar SST whose TLI mirrors AND zone map both omit
+/// the same TRAILING block: the positioning chain over the remaining
+/// indexed blocks stays self-consistent, so `delete_positions_verified`
+/// passes and the walk takes the masked re-emit — but the hidden block is
+/// recovered by the PHYSICAL gap walk with no verified start position,
+/// and masking it as "all rows live" would permanently resurrect the rows
+/// the delete bitmap marked there, without the explicit resurrection
+/// opt-in. The masked path must DROP an index-omitted block instead.
+#[cfg(feature = "columnar")]
+#[test]
+fn salvage_does_not_resurrect_deletes_in_an_index_omitted_block() -> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let n = 200u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_data_block_size(256)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    // Deletes land in the LAST block (the one both forges will hide).
+    let deleted = [n - 1, n - 2, n - 3];
+    for pos in deleted {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    // Row count of the block both forges hide, for the loss accounting.
+    let hidden_rows = {
+        let table = open(source.clone(), &fs)?;
+        let Some(last) = table.data_block_handles().filter_map(Result::ok).last() else {
+            panic!("source must have data blocks");
+        };
+        let Some(batch) = table.load_columnar_block_masked(last.as_ref())? else {
+            panic!("the last block holds live rows");
+        };
+        // The masked load on the INTACT source applies the bitmap, so add
+        // the deletes back for the block's physical row count.
+        u64::from(batch.row_count) + deleted.len() as u64
+    };
+
+    // Consistent forge: the zone map loses its last entry FIRST (the TLI
+    // still addresses the block for the entry lookup), then both TLI
+    // mirrors hide the same trailing block.
+    crate::test_forge::forge_zone_map_drop_last_entry(&source, 0)?;
+    crate::test_forge::forge_tli_mirrors_truncated(&source, 0, None)?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert_eq!(
+        report.dropped.len(),
+        1,
+        "the index-omitted block has no verified delete position and must \
+         drop, never re-emit live: {report:?}",
+    );
+    assert_eq!(
+        report.entries_salvaged,
+        u64::from(n) - deleted.len() as u64 - (hidden_rows - deleted.len() as u64),
+        "every indexed block's surviving rows are recovered: {report:?}",
+    );
+    for pos in deleted {
+        let key = format!("key{pos:05}");
+        assert!(
+            reopen_get(dest.clone(), &fs, key.as_bytes())?.is_none(),
+            "a positionally deleted row must not resurrect via the gap walk",
+        );
+    }
+    Ok(())
+}
+
 /// The DELETE-BEARING twin of the columnar out-of-order drop: the swapped
 /// keys keep every block's row count intact, so the delete positions still
 /// verify and the walk takes the masked re-emit — whose writer then rejects
