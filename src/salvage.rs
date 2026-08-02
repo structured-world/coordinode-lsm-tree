@@ -932,10 +932,25 @@ fn salvage_blocks(
             }
         };
         let mut cursor = section_pos;
+        // The tiling below is offset-driven, but the index yields KEY order,
+        // which a forged index can decouple from the physical order: an
+        // out-of-place handle would be covered twice (once by the gap probe,
+        // once by itself), and the duplicate emit would be rejected as an
+        // ordering violation — misreporting an intact block as dropped.
+        // Offset order equals the writer's key order for the blocks
+        // themselves, so re-sorting also keeps the emit order valid.
+        indexed.sort_unstable_by_key(|k| *k.as_ref().offset());
         for keyed in indexed {
             let off = *keyed.as_ref().offset();
             if off > cursor {
                 probe_gap(cursor, off, &mut items, &mut dropped);
+            }
+            // A handle starting inside already-covered bytes (a duplicate or
+            // overlapping forge) is skipped: its span was walked physically,
+            // and any uncovered tail is reached by the next gap probe since
+            // the cursor does not advance here.
+            if off < cursor {
+                continue;
             }
             let next = off.saturating_add(u64::from(keyed.as_ref().size()));
             items.push((*keyed.as_ref(), Some(keyed.end_key().clone())));
