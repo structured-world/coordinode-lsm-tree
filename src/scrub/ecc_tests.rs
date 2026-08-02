@@ -2225,6 +2225,55 @@ fn checksum_refresh_is_idempotent_against_a_stale_table_view() -> crate::Result<
     Ok(())
 }
 
+/// A PINNED file descriptor (a tree opened without an FD cache) cannot be
+/// retargeted at the private copy the hard-link unshare produces: after
+/// the copy + rename this Table would keep reading the DEAD inode forever
+/// — reads, scrub probes, and digest checks all resolve through the
+/// pinned handle while the manifest and live path refer to the healed
+/// copy. The heal must REFUSE the detach instead: the blocked write-backs
+/// surface as findings and every checkpoint link stays byte-identical to
+/// what its manifest describes.
+#[test]
+fn heal_in_place_refuses_to_detach_under_a_pinned_descriptor() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst(dir.path());
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
+    rebuild_manifest_over_current_bytes(dir.path())?;
+
+    // A second hard link stands in for a checkpoint's snapshot.
+    let link = dir.path().join("checkpoint-link");
+    std::fs::hard_link(&sst_path, &link)?;
+
+    // No descriptor table: every Table pins one FD at recover time.
+    let crate::AnyTree::Standard(tree) = crate::Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .page_ecc(true)
+    .ecc_scheme(EccScheme::ReedSolomon {
+        data_shards: 8,
+        parity_shards: 2,
+    })
+    .use_descriptor_table(None)
+    .open()
+    .expect("open pinned ecc tree") else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        !report.is_ok(),
+        "a refused detach must surface the blocked write-backs as findings: {report:?}",
+    );
+    assert_eq!(
+        std::fs::read(&sst_path)?,
+        std::fs::read(&link)?,
+        "the live path must stay byte-identical to its checkpoint link (no detach)",
+    );
+    Ok(())
+}
+
 /// The pre-write ATTRIBUTION probe must compare against the CURRENT
 /// manifest digest, not the caller's captured view: a reconciliation
 /// running with a view captured before the manifest was re-recorded
