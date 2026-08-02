@@ -569,6 +569,61 @@ fn verify_sst_file_flags_an_omitted_toc_section() {
     );
 }
 
+/// A TOC entry RENAMED to a duplicate recognized name — `range_tombstones`
+/// renamed to a second `data`, its block header re-stamped with the `Data`
+/// role — preserves the tiling AND passes the recognized-role walk, yet the
+/// reader's name lookup (`Toc::section`) returns the first match, hiding the
+/// renamed section so the deleted range silently resurrects. The duplicate
+/// name is the only trace; the walk must reject it.
+#[test]
+fn verify_sst_file_flags_a_duplicate_toc_section_name() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let cfg = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None));
+        let tree = cfg.open().unwrap();
+        for i in 0u64..100 {
+            let key = format!("k{i:08}");
+            tree.insert(key.as_bytes(), b"v", 1 + i);
+        }
+        tree.remove_range("k00000010", "k00000020", 200);
+        tree.flush_active_memtable(300).unwrap();
+        drop(tree);
+    }
+    let sst_path = pick_first_sst_path(dir.path());
+
+    // Sanity: intact file verifies clean.
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        report.is_ok(),
+        "intact SST must be clean: {:?}",
+        report.errors
+    );
+
+    crate::test_forge::forge_duplicate_section_name(
+        &sst_path,
+        b"range_tombstones",
+        b"data",
+        crate::table::block::BlockType::Data,
+    )
+    .unwrap();
+
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, BlockVerifyError::TocCorrupted { .. })),
+        "a duplicate recognized section name must be flagged as TocCorrupted, \
+         got {:?}",
+        report.errors,
+    );
+}
+
 /// Exercises the file-open failure branch (the only path through
 /// `verify_sst_file` that converts an underlying `io::Error` into
 /// a `BlockVerifyError::SstFileUnreadable`). A missing file is the

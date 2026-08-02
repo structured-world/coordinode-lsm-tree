@@ -37,6 +37,144 @@ pub fn forge_restamped_data_block(path: &std::path::Path) -> crate::Result<()> {
     flip_and_restamp_first_data_block(path, 1)
 }
 
+/// RENAMES a TOC section to a DUPLICATE recognized name and re-stamps the
+/// renamed section's block header ROLE plus the trailer's TOC checksum: the
+/// section entries still tile perfectly and both names pass the
+/// recognized-role walk, yet the reader's name lookup (`Toc::section`)
+/// returns the FIRST match, so the renamed section is hidden — e.g.
+/// `range_tombstones` renamed to a second `data` vanishes and its deleted
+/// range resurrects. The block header at the section's offset is re-encoded
+/// under `to_role` (a fresh header checksum; both must be SST block types so
+/// the header length is unchanged and the payload / parity stay valid), so
+/// the only remaining trace is the duplicate name. `from` and `to` may
+/// differ in length (the TOC is rebuilt). The payload is untouched, so its
+/// parity trailer still verifies.
+pub fn forge_duplicate_section_name(
+    path: &std::path::Path,
+    from: &[u8],
+    to: &[u8],
+    to_role: crate::table::block::BlockType,
+) -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::table::block::Header;
+
+    let mut bytes = std::fs::read(path)?;
+    const TRAILER_SIZE: usize = 4 + 1 + 1 + 16 + 8 + 8;
+    let trailer_start = bytes.len() - TRAILER_SIZE;
+    let read_u64 = |bytes: &[u8], at: usize| {
+        let Some(b) = bytes.get(at..at + 8) else {
+            panic!("u64 field within the trailer");
+        };
+        u64::from_le_bytes(b.try_into().expect("8 bytes"))
+    };
+    let toc_pos = usize::try_from(read_u64(&bytes, trailer_start + 4 + 1 + 1 + 16))
+        .expect("toc_pos fits usize");
+    let toc_len = usize::try_from(read_u64(&bytes, trailer_start + 4 + 1 + 1 + 16 + 8))
+        .expect("toc_len fits usize");
+
+    // Locate the section's block offset so its header role can be re-stamped.
+    let section_off = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == from) else {
+            panic!("the SST must carry the section to rename");
+        };
+        usize::try_from(entry.pos()).expect("section offset fits usize")
+    };
+    // Re-encode the block header under the new role (SST block types have no
+    // block_flags byte and equal header length, so the frame geometry and
+    // the payload / parity trailer are untouched).
+    {
+        let Some(block) = bytes.get(section_off..) else {
+            panic!("section block within the file");
+        };
+        let mut cursor = block;
+        let header = Header::decode_from(&mut cursor)?;
+        let header_len = Header::header_len(header.block_type);
+        assert_eq!(
+            header_len,
+            Header::header_len(to_role),
+            "the rerole must keep the header length so the geometry holds",
+        );
+        let new_header = Header {
+            block_type: to_role,
+            ..header
+        };
+        let mut hdr_bytes = Vec::with_capacity(header_len);
+        new_header.encode_into(&mut hdr_bytes)?;
+        let Some(dst) = bytes.get_mut(section_off..section_off + header_len) else {
+            panic!("section header within the file");
+        };
+        dst.copy_from_slice(&hdr_bytes);
+    }
+
+    // Rebuild the TOC with the renamed entry (name length may change).
+    let toc = bytes.get(toc_pos..toc_pos + toc_len).expect("TOC region");
+    assert_eq!(toc.get(..4), Some(&b"TOC!"[..]), "TOC magic");
+    let count = u32::from_le_bytes(toc.get(4..8).expect("count").try_into().expect("4 bytes"));
+    let mut new_toc = Vec::with_capacity(toc.len());
+    new_toc.extend_from_slice(toc.get(..8).expect("TOC header"));
+    let mut at = 8usize;
+    let mut renamed = false;
+    for _ in 0..count {
+        let pos = toc.get(at..at + 16).expect("pos+len");
+        at += 16;
+        let name_len = usize::from(u16::from_le_bytes(
+            toc.get(at..at + 2)
+                .expect("name_len")
+                .try_into()
+                .expect("2 bytes"),
+        ));
+        at += 2;
+        let entry_name = toc.get(at..at + name_len).expect("name");
+        at += name_len;
+        new_toc.extend_from_slice(pos);
+        if entry_name == from {
+            renamed = true;
+            new_toc.extend_from_slice(
+                &u16::try_from(to.len())
+                    .expect("name fits u16")
+                    .to_le_bytes(),
+            );
+            new_toc.extend_from_slice(to);
+        } else {
+            new_toc.extend_from_slice(&u16::try_from(name_len).expect("fits u16").to_le_bytes());
+            new_toc.extend_from_slice(entry_name);
+        }
+    }
+    assert!(renamed, "section name present in the TOC");
+
+    let fresh = {
+        let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
+        hasher.update(&new_toc);
+        hasher.digest128()
+    };
+    let mut out = Vec::with_capacity(toc_pos + new_toc.len() + TRAILER_SIZE);
+    out.extend_from_slice(bytes.get(..toc_pos).expect("pre-TOC prefix"));
+    out.extend_from_slice(&new_toc);
+    out.extend_from_slice(
+        bytes
+            .get(trailer_start..trailer_start + 4 + 1 + 1)
+            .expect("trailer head"),
+    );
+    out.extend_from_slice(&fresh.to_le_bytes());
+    out.extend_from_slice(
+        &u64::try_from(toc_pos)
+            .expect("toc_pos fits u64")
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(
+        &u64::try_from(new_toc.len())
+            .expect("TOC length fits u64")
+            .to_le_bytes(),
+    );
+    std::fs::write(path, &out)?;
+    Ok(())
+}
+
 /// RENAMES an SFA TOC section (same-length name) and re-stamps the trailer's
 /// TOC checksum: the archive stays internally consistent while a section the
 /// verifier knows disappears behind an unrecognized name — the shape only a
