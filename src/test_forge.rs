@@ -1326,6 +1326,36 @@ pub fn forge_tli_mirrors_truncated(
     replace_section_frame(path, b"tli_tail", &forged)
 }
 
+/// Re-encodes BOTH TLI mirrors (`tli`, `tli_tail`) after LOWERING the first
+/// block's separator (end) key to a truncated prefix of itself: still
+/// strictly below the next block's separator, so the handle list stays
+/// sorted, the mirrors stay equal, and the section tiling holds — but the
+/// separator no longer matches the addressed block's real last key. After
+/// reopen the index binary search routes keys in `(forged_separator,
+/// real_last_key]` to the WRONG block, so `point_read` returns `None` for
+/// existing keys. Only a cross-check of each separator against the
+/// addressed block's decoded final key can catch it. The SST must be
+/// unencrypted, its index uncompressed, and carry >= 2 data blocks.
+pub fn forge_tli_mirrors_lower_first_separator(
+    path: &std::path::Path,
+    table_id: crate::TableId,
+    ecc: Option<crate::table::block::EccParams>,
+) -> crate::Result<()> {
+    let forged = rebuilt_tli_frame(path, table_id, ecc, |handles| {
+        use crate::table::KeyedBlockHandle;
+        let first = handles.first().expect("at least two handles");
+        let key = first.end_key().as_ref();
+        assert!(key.len() >= 2, "separator key long enough to truncate");
+        // A one-byte-shorter prefix is lexicographically smaller than the
+        // original and still smaller than the next block's separator.
+        let lowered = crate::UserKey::from(&key[..key.len() - 1]);
+        let rebuilt = KeyedBlockHandle::new(lowered, first.seqno(), *first.as_ref());
+        handles[0] = rebuilt;
+    })?;
+    replace_section_frame(path, b"tli", &forged)?;
+    replace_section_frame(path, b"tli_tail", &forged)
+}
+
 /// Decodes the `tli_tail` mirror's handle list, drops the LAST handle, and
 /// returns the re-encoded Index frame (checksum-, role-, and, under `ecc`,
 /// parity-consistent). The SST must be unencrypted and its index
@@ -1334,6 +1364,21 @@ fn truncated_tli_frame(
     path: &std::path::Path,
     table_id: crate::TableId,
     ecc: Option<crate::table::block::EccParams>,
+) -> crate::Result<Vec<u8>> {
+    rebuilt_tli_frame(path, table_id, ecc, |handles| {
+        handles.pop();
+    })
+}
+
+/// Decodes the `tli_tail` mirror's handle list, applies `mutate`, and returns
+/// the re-encoded Index frame (checksum-, role-, and, under `ecc`,
+/// parity-consistent). The SST must be unencrypted and its index
+/// uncompressed, and the mutated list must stay a valid sorted index.
+fn rebuilt_tli_frame(
+    path: &std::path::Path,
+    table_id: crate::TableId,
+    ecc: Option<crate::table::block::EccParams>,
+    mutate: impl FnOnce(&mut Vec<crate::table::KeyedBlockHandle>),
 ) -> crate::Result<Vec<u8>> {
     use crate::table::block::{Block, BlockIdentity, BlockType};
     use crate::table::{BlockHandle, BlockOffset, IndexBlock, KeyedBlockHandle};
@@ -1372,7 +1417,7 @@ fn truncated_tli_frame(
             usize::try_from(entry.len()).expect("len fits usize"),
         )
     };
-    let handles: Vec<KeyedBlockHandle> = {
+    let mut handles: Vec<KeyedBlockHandle> = {
         let file = crate::fs::Fs::open(
             &crate::fs::StdFs,
             path,
@@ -1397,12 +1442,12 @@ fn truncated_tli_frame(
     };
     assert!(
         handles.len() >= 2,
-        "the forge needs at least two handles so dropping one leaves a valid index",
+        "the forge needs at least two handles so the mutation leaves a valid index",
     );
 
-    // Re-encode without the LAST handle and frame it as a fresh Index block.
-    let truncated = handles.get(..handles.len() - 1).expect("non-empty prefix");
-    let payload = IndexBlock::encode_into_vec(truncated)?;
+    mutate(&mut handles);
+
+    let payload = IndexBlock::encode_into_vec(&handles)?;
     let mut forged = Vec::new();
     Block::write_into(&mut forged, &payload, identity, &transform)?;
     Ok(forged)

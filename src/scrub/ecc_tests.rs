@@ -1505,6 +1505,45 @@ fn heal_in_place_does_not_restamp_over_a_forged_data_block_count() -> crate::Res
     Ok(())
 }
 
+/// The digest reconciliation must not restamp over a FORGED TLI SEPARATOR
+/// key: both mirrors re-encoded with the first block's separator lowered to
+/// a truncated prefix stay equal, sorted, and section-tiling — yet after
+/// reopen the index binary search routes keys in `(forged_separator,
+/// real_last_key]` to the wrong block, so `point_read` misses existing
+/// keys. The in-memory point-read reachability gate does not catch this on
+/// the heal path (the live table keeps its correct recovery-time index), so
+/// the disk-fresh separator must be cross-checked against the addressed
+/// block's decoded final key.
+#[test]
+fn heal_in_place_does_not_restamp_over_a_forged_tli_separator() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _) = write_ecc_sst_footered(dir.path());
+
+    let tree = open_ecc_tree(dir.path());
+    crate::test_forge::forge_tli_mirrors_lower_first_separator(
+        &sst_path,
+        0,
+        Some(crate::table::block::EccParams::try_new(8, 2)?),
+    )?;
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
+        "a forged TLI separator must refuse the digest refresh: {report:?}",
+    );
+
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the forged SST must keep failing verify_integrity: restamping its \
+         digest would let point reads miss keys routed to the wrong block",
+    );
+    Ok(())
+}
+
 /// A LEGITIMATE heal on a tombstone-bearing table must still reconcile the
 /// manifest digest: attribution (the pre-write digest matched the manifest,
 /// so the file now differs by exactly this pass's verified corrections)
