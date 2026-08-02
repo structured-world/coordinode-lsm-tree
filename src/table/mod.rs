@@ -2479,7 +2479,7 @@ impl Table {
         // appears is its newest version, so that block is the locator's
         // expected answer. `seen` dedups across blocks (a key's older
         // versions in later blocks must not overwrite the expectation).
-        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut seen: crate::HashSet<Vec<u8>> = crate::HashSet::default();
         for handle in self.block_index.iter() {
             let handle = handle?;
             let block_handle = BlockHandle::new(handle.offset(), handle.size());
@@ -2674,10 +2674,10 @@ impl Table {
 
         // Partition blocks are shared by many keys; memoize by file offset so
         // the probe loop reads each partition once.
-        let mut partitions: std::collections::BTreeMap<
+        let mut partitions: alloc::collections::BTreeMap<
             u64,
             crate::table::filter::block::FilterBlock,
-        > = std::collections::BTreeMap::new();
+        > = alloc::collections::BTreeMap::new();
 
         let mut prev_key: Option<Vec<u8>> = None;
         for handle in self.block_index.iter() {
@@ -2704,8 +2704,8 @@ impl Table {
                     };
                     let part_handle = part_handle.materialize(idx.as_slice()).into_inner();
                     let filter = match partitions.entry(part_handle.offset().0) {
-                        std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
-                        std::collections::btree_map::Entry::Vacant(e) => {
+                        alloc::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+                        alloc::collections::btree_map::Entry::Vacant(e) => {
                             e.insert(load_filter_block(part_handle)?)
                         }
                     };

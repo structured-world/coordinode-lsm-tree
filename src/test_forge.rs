@@ -978,9 +978,11 @@ pub fn forge_block_layout_shift_middle_end(
 /// seqno gates all pass — yet `point_read` trusts the hash index and returns
 /// `None` for every existing key. The SST must be uncompressed and
 /// unencrypted (the hash index is patched in place through the on-disk
-/// payload) and its blocks must carry a hash index (a non-zero
-/// `data_block_hash_ratio`). `shards` is the SST's descriptor scheme
-/// (`None` for a parity-less table).
+/// payload), its blocks must carry a hash index (a non-zero
+/// `data_block_hash_ratio`) AND per-KV checksum footers — the block is
+/// re-parsed with `has_kv_footer = true` unconditionally, so a footer-less
+/// block would misread its trailer. `shards` is the SST's descriptor
+/// scheme (`None` for a parity-less table).
 pub fn forge_hash_index_all_free(
     path: &std::path::Path,
     shards: Option<(u8, u8)>,

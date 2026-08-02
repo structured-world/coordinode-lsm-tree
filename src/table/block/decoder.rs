@@ -217,6 +217,9 @@ pub struct DecoderMeta {
     cached_entries_end: usize,
 }
 
+// Test-only: the binary-index forge patches pointer bytes in place and needs
+// the trailer-derived layout; production readers go through the decoder.
+#[cfg(test)]
 impl DecoderMeta {
     /// Byte offset of the binary index within the block payload.
     #[must_use]
