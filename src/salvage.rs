@@ -1042,107 +1042,108 @@ fn salvage_blocks(
                     // walking, exactly like a row-major block whose entries fail
                     // to decode. Only writer errors (I/O to the destination)
                     // stay hard errors.
-                    Ok(mut sb) => match {
+                    Ok(mut sb) => {
                         if !allow_verbatim {
                             sb.verbatim = None;
                         }
-                        crate::table::columnar::ColumnBatch::decode(&sb.block.data)
-                    }
-                    .and_then(|batch| {
-                        crate::table::columnar::column_batch_to_entries(&batch)
-                            .map(|entries| (batch, entries))
-                    }) {
-                        // A real writer never emits an empty data block, so a
-                        // checksum-clean ZERO-ROW batch is malformed input:
-                        // the writer primitives below would emit NOTHING for
-                        // it, and counting it as salvaged would misreport an
-                        // unrecovered block (an SST whose only block is empty
-                        // would even report a salvaged path that the
-                        // empty-table finish just removed).
-                        Ok((batch, _)) if batch.row_count == 0 => {
-                            dropped.push(classify_drop(
-                                &crate::Error::InvalidHeader("columnar: zero-row data block"),
-                                offset,
-                                prev_end.as_ref(),
-                                end_key.as_ref(),
-                            ));
-                        }
-                        Ok((batch, entries)) => {
-                            let rows = u64::from(batch.row_count);
-                            // Indirections BEFORE emit: an entry tagged as an
-                            // indirection whose value fails to decode is
-                            // corrupt content — drop the block rather than
-                            // laundering it into the copy.
-                            let block_links = match collect_indirections(&entries) {
-                                Ok(links) => links,
-                                Err(e) => {
-                                    dropped.push(classify_drop(
-                                        &e,
-                                        offset,
-                                        prev_end.as_ref(),
-                                        end_key.as_ref(),
-                                    ));
-                                    prev_end = end_key.or(prev_end);
-                                    continue;
-                                }
-                            };
-                            // A delete-bearing SST is never byte-copied, even
-                            // on this unmasked (resurrection opt-in) arm: the
-                            // re-encode keeps the recovered copy's layout
-                            // consistent with the degraded-bitmap path.
-                            let verbatim_source = if table.has_delete_bitmap_section() {
-                                None
-                            } else {
-                                sb.verbatim
-                            };
-                            // A writer REJECTION (ordering / framing validation)
-                            // is block-local malformed content — drop the block
-                            // and keep walking; destination I/O errors stay hard.
-                            let emitted = match verbatim_source {
-                                // Clean: copy the block's raw bytes as-is.
-                                Some((raw, header, layout)) => writer
-                                    .append_verbatim_data_block(
-                                        &raw, header, layout, &entries, comparator,
-                                    )
-                                    .map(|_| true),
-                                // ECC-recovered (or delete-bearing): re-encode the
-                                // batch so the recovered copy carries clean bytes.
-                                None => writer
-                                    .write_columnar_block_verbatim(&batch, comparator)
-                                    .map(|_| false),
-                            };
-                            match emitted {
-                                Ok(verbatim) => {
-                                    if verbatim {
-                                        blocks_copied_verbatim += 1;
+                        match crate::table::columnar::ColumnBatch::decode(&sb.block.data).and_then(
+                            |batch| {
+                                crate::table::columnar::column_batch_to_entries(&batch)
+                                    .map(|entries| (batch, entries))
+                            },
+                        ) {
+                            // A real writer never emits an empty data block, so a
+                            // checksum-clean ZERO-ROW batch is malformed input:
+                            // the writer primitives below would emit NOTHING for
+                            // it, and counting it as salvaged would misreport an
+                            // unrecovered block (an SST whose only block is empty
+                            // would even report a salvaged path that the
+                            // empty-table finish just removed).
+                            Ok((batch, _)) if batch.row_count == 0 => {
+                                dropped.push(classify_drop(
+                                    &crate::Error::InvalidHeader("columnar: zero-row data block"),
+                                    offset,
+                                    prev_end.as_ref(),
+                                    end_key.as_ref(),
+                                ));
+                            }
+                            Ok((batch, entries)) => {
+                                let rows = u64::from(batch.row_count);
+                                // Indirections BEFORE emit: an entry tagged as an
+                                // indirection whose value fails to decode is
+                                // corrupt content — drop the block rather than
+                                // laundering it into the copy.
+                                let block_links = match collect_indirections(&entries) {
+                                    Ok(links) => links,
+                                    Err(e) => {
+                                        dropped.push(classify_drop(
+                                            &e,
+                                            offset,
+                                            prev_end.as_ref(),
+                                            end_key.as_ref(),
+                                        ));
+                                        prev_end = end_key.or(prev_end);
+                                        continue;
                                     }
-                                    entries_salvaged += rows;
-                                    blocks_salvaged += 1;
-                                    fold_blob_links(&mut derived_blob_links, &block_links);
+                                };
+                                // A delete-bearing SST is never byte-copied, even
+                                // on this unmasked (resurrection opt-in) arm: the
+                                // re-encode keeps the recovered copy's layout
+                                // consistent with the degraded-bitmap path.
+                                let verbatim_source = if table.has_delete_bitmap_section() {
+                                    None
+                                } else {
+                                    sb.verbatim
+                                };
+                                // A writer REJECTION (ordering / framing validation)
+                                // is block-local malformed content — drop the block
+                                // and keep walking; destination I/O errors stay hard.
+                                let emitted = match verbatim_source {
+                                    // Clean: copy the block's raw bytes as-is.
+                                    Some((raw, header, layout)) => writer
+                                        .append_verbatim_data_block(
+                                            &raw, header, layout, &entries, comparator,
+                                        )
+                                        .map(|_| true),
+                                    // ECC-recovered (or delete-bearing): re-encode the
+                                    // batch so the recovered copy carries clean bytes.
+                                    None => writer
+                                        .write_columnar_block_verbatim(&batch, comparator)
+                                        .map(|_| false),
+                                };
+                                match emitted {
+                                    Ok(verbatim) => {
+                                        if verbatim {
+                                            blocks_copied_verbatim += 1;
+                                        }
+                                        entries_salvaged += rows;
+                                        blocks_salvaged += 1;
+                                        fold_blob_links(&mut derived_blob_links, &block_links);
+                                    }
+                                    Err(
+                                        e @ (crate::Error::InvalidHeader(_)
+                                        | crate::Error::InvalidTag(_)),
+                                    ) => {
+                                        dropped.push(classify_drop(
+                                            &e,
+                                            offset,
+                                            prev_end.as_ref(),
+                                            end_key.as_ref(),
+                                        ));
+                                    }
+                                    Err(e) => return Err(e),
                                 }
-                                Err(
-                                    e @ (crate::Error::InvalidHeader(_)
-                                    | crate::Error::InvalidTag(_)),
-                                ) => {
-                                    dropped.push(classify_drop(
-                                        &e,
-                                        offset,
-                                        prev_end.as_ref(),
-                                        end_key.as_ref(),
-                                    ));
-                                }
-                                Err(e) => return Err(e),
+                            }
+                            Err(e) => {
+                                dropped.push(classify_drop(
+                                    &e,
+                                    offset,
+                                    prev_end.as_ref(),
+                                    end_key.as_ref(),
+                                ));
                             }
                         }
-                        Err(e) => {
-                            dropped.push(classify_drop(
-                                &e,
-                                offset,
-                                prev_end.as_ref(),
-                                end_key.as_ref(),
-                            ));
-                        }
-                    },
+                    }
                     Err(e) => dropped.push(classify_drop(
                         &e,
                         offset,

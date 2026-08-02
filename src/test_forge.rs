@@ -114,6 +114,15 @@ pub fn forge_duplicate_section_name(
     // Rebuild the TOC with the renamed entry (name length may change).
     let toc = bytes.get(toc_pos..toc_pos + toc_len).expect("TOC region");
     assert_eq!(toc.get(..4), Some(&b"TOC!"[..]), "TOC magic");
+    // The splice below rebuilds the file as prefix + new TOC + trailer, so
+    // any bytes between the TOC's end and the trailer would be silently
+    // dropped; the writer emits them adjacent today — fail loudly if that
+    // layout ever changes instead of producing a truncated fixture.
+    assert_eq!(
+        toc_pos + toc_len,
+        trailer_start,
+        "the TOC must sit directly before the trailer",
+    );
     let count = u32::from_le_bytes(toc.get(4..8).expect("count").try_into().expect("4 bytes"));
     let mut new_toc = Vec::with_capacity(toc.len());
     new_toc.extend_from_slice(toc.get(..8).expect("TOC header"));
@@ -1375,6 +1384,53 @@ pub fn forge_tli_binary_index_pointer(
     table_id: crate::TableId,
     ecc: Option<crate::table::block::EccParams>,
 ) -> crate::Result<()> {
+    use crate::table::block::Block;
+
+    let (identity, transform, index) = tli_forge_frame(path, table_id, ecc)?;
+    let (mut payload, bi_offset, bi_len, step) = {
+        // Locate the binary index from the trailer metadata.
+        let meta = index.decoder_meta().expect("tli trailer parses");
+        (
+            index.as_slice().to_vec(),
+            usize::try_from(meta.binary_index_offset()).expect("offset fits usize"),
+            usize::try_from(meta.binary_index_len()).expect("len fits usize"),
+            usize::from(meta.binary_index_step_size()),
+        )
+    };
+    assert!(
+        bi_len >= 2,
+        "the forge needs at least two pointers so first != last",
+    );
+    let first: Vec<u8> = payload
+        .get(bi_offset..bi_offset + step)
+        .expect("first pointer within the payload")
+        .to_vec();
+    let last_at = bi_offset + (bi_len - 1) * step;
+    payload
+        .get_mut(last_at..last_at + step)
+        .expect("last pointer within the payload")
+        .copy_from_slice(&first);
+
+    let mut forged = Vec::new();
+    Block::write_into(&mut forged, &payload, identity, &transform)?;
+    replace_section_frame(path, b"tli", &forged)?;
+    replace_section_frame(path, b"tli_tail", &forged)
+}
+
+/// Shared preamble of the TLI forges: the Index identity, the uncompressed
+/// (optionally ECC) transform, and the DECODED `tli_tail` mirror. Every TLI
+/// forge must agree on these — a drift between copies would silently write
+/// an unreadable frame instead of the intended corruption. The SST must be
+/// unencrypted and its index uncompressed.
+fn tli_forge_frame(
+    path: &std::path::Path,
+    table_id: crate::TableId,
+    ecc: Option<crate::table::block::EccParams>,
+) -> crate::Result<(
+    crate::table::block::BlockIdentity,
+    crate::table::block::BlockTransform<'static>,
+    crate::table::IndexBlock,
+)> {
     use crate::table::block::{Block, BlockIdentity, BlockType};
     use crate::table::{BlockHandle, BlockOffset, IndexBlock};
 
@@ -1412,49 +1468,21 @@ pub fn forge_tli_binary_index_pointer(
             usize::try_from(entry.len()).expect("len fits usize"),
         )
     };
-    let (mut payload, bi_offset, bi_len, step) = {
-        let file = crate::fs::Fs::open(
-            &crate::fs::StdFs,
-            path,
-            &crate::fs::FsOpenOptions::new().read(true),
-        )?;
-        let block = Block::from_file(
-            &*file,
-            BlockHandle::new(
-                BlockOffset(u64::try_from(tail_pos).expect("pos fits u64")),
-                u32::try_from(tail_len).expect("tail section fits u32"),
-            ),
-            identity,
-            &transform,
-        )?;
-        let index = IndexBlock::new(block);
-        // Locate the binary index from the trailer metadata.
-        let meta = index.decoder_meta().expect("tli trailer parses");
-        (
-            index.as_slice().to_vec(),
-            usize::try_from(meta.binary_index_offset()).expect("offset fits usize"),
-            usize::try_from(meta.binary_index_len()).expect("len fits usize"),
-            usize::from(meta.binary_index_step_size()),
-        )
-    };
-    assert!(
-        bi_len >= 2,
-        "the forge needs at least two pointers so first != last",
-    );
-    let first: Vec<u8> = payload
-        .get(bi_offset..bi_offset + step)
-        .expect("first pointer within the payload")
-        .to_vec();
-    let last_at = bi_offset + (bi_len - 1) * step;
-    payload
-        .get_mut(last_at..last_at + step)
-        .expect("last pointer within the payload")
-        .copy_from_slice(&first);
-
-    let mut forged = Vec::new();
-    Block::write_into(&mut forged, &payload, identity, &transform)?;
-    replace_section_frame(path, b"tli", &forged)?;
-    replace_section_frame(path, b"tli_tail", &forged)
+    let file = crate::fs::Fs::open(
+        &crate::fs::StdFs,
+        path,
+        &crate::fs::FsOpenOptions::new().read(true),
+    )?;
+    let block = Block::from_file(
+        &*file,
+        BlockHandle::new(
+            BlockOffset(u64::try_from(tail_pos).expect("pos fits u64")),
+            u32::try_from(tail_len).expect("tail section fits u32"),
+        ),
+        identity,
+        &transform,
+    )?;
+    Ok((identity, transform, IndexBlock::new(block)))
 }
 
 /// Decodes the `tli_tail` mirror's handle list, drops the LAST handle, and
@@ -1481,60 +1509,12 @@ fn rebuilt_tli_frame(
     ecc: Option<crate::table::block::EccParams>,
     mutate: impl FnOnce(&mut Vec<crate::table::KeyedBlockHandle>),
 ) -> crate::Result<Vec<u8>> {
-    use crate::table::block::{Block, BlockIdentity, BlockType};
-    use crate::table::{BlockHandle, BlockOffset, IndexBlock, KeyedBlockHandle};
+    use crate::table::block::Block;
+    use crate::table::{IndexBlock, KeyedBlockHandle};
 
-    let identity = BlockIdentity {
-        table_id,
-        block_type: BlockType::Index,
-        dict_id: 0,
-        window_log: 0,
-    };
-    let transform = {
-        let t = crate::table::block::BlockTransform::from_parts(
-            crate::CompressionType::None,
-            None,
-            #[cfg(zstd_any)]
-            None,
-        )?;
-        if let Some(ecc) = ecc {
-            t.with_ecc(ecc)
-        } else {
-            t
-        }
-    };
-
-    let (tail_pos, tail_len) = {
-        let mut f = std::fs::File::open(path)?;
-        let reader = match crate::sfa::Reader::from_reader(&mut f) {
-            Ok(r) => r,
-            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
-        };
-        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"tli_tail") else {
-            panic!("the SST must carry a tli_tail mirror");
-        };
-        (
-            usize::try_from(entry.pos()).expect("pos fits usize"),
-            usize::try_from(entry.len()).expect("len fits usize"),
-        )
-    };
+    let (identity, transform, index) = tli_forge_frame(path, table_id, ecc)?;
     let mut handles: Vec<KeyedBlockHandle> = {
-        let file = crate::fs::Fs::open(
-            &crate::fs::StdFs,
-            path,
-            &crate::fs::FsOpenOptions::new().read(true),
-        )?;
-        let block = Block::from_file(
-            &*file,
-            BlockHandle::new(
-                BlockOffset(u64::try_from(tail_pos).expect("pos fits u64")),
-                u32::try_from(tail_len).expect("tail section fits u32"),
-            ),
-            identity,
-            &transform,
-        )?;
         use crate::table::block::ParsedItem as _;
-        let index = IndexBlock::new(block);
         let mut out = Vec::new();
         for item in index.iter(crate::comparator::default_comparator()) {
             out.push(item.materialize(index.as_slice()));
