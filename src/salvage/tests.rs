@@ -362,6 +362,63 @@ fn salvage_removes_the_mid_copy_when_the_publish_dir_sync_fails() -> crate::Resu
     Ok(())
 }
 
+/// A STALE arbitration temp file left by a crashed predecessor must not
+/// block the MID attempt: the temp-name sequence is process-local, so a
+/// fresh process would otherwise pick the same `.healtmp-0` name, fail its
+/// `create_new` open, and return the tail attempt's inferior (or failing)
+/// result without ever trying the recoverable MID mirror — and tree
+/// recovery only sweeps this namespace inside table folders, so a
+/// standalone salvage destination stays blocked indefinitely. The
+/// arbitration must probe forward to a free name; the foreign artifact is
+/// never reclaimed (it may belong to a concurrently running salvage).
+///
+/// `lz4`-gated: the divergent-mirror arbitration is driven by a
+/// `compression#data` forge to Lz4 (see the sibling MID-cleanup test).
+#[cfg(feature = "lz4")]
+#[test]
+fn salvage_arbitration_skips_a_stale_crash_artifact() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0u64..100 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Divergent mirrors so the MID attempt wins and publishes via rename.
+    crate::test_forge::forge_tail_meta_value(&source, b"compression#data", &[1])?;
+
+    // A crashed predecessor's artifact occupies the FIRST temp name this
+    // process would pick (the sequence is a process-local counter and
+    // nextest runs each test in its own process, so it starts at zero).
+    let stale = dest.with_extension("healtmp-0");
+    std::fs::write(&stale, b"crashed predecessor artifact")?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert_eq!(
+        report.entries_salvaged, 100,
+        "the MID attempt must pick a fresh temp name past the stale artifact: {report:?}",
+    );
+    assert!(
+        std::path::Path::new(&stale).exists(),
+        "a foreign artifact is never reclaimed",
+    );
+    assert_eq!(
+        std::fs::read(&stale)?,
+        b"crashed predecessor artifact".to_vec(),
+        "the stale artifact's bytes stay untouched",
+    );
+    Ok(())
+}
+
 /// A PRE-EXISTING destination must survive a divergent-mirror salvage: the
 /// tail attempt correctly fails its `create_new` open, but the MID attempt
 /// writes to a sibling temp path and wins the arbitration — publishing it
