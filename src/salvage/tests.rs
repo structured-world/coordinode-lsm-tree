@@ -294,9 +294,16 @@ fn salvage_removes_the_mid_copy_when_the_publish_dir_sync_fails() -> crate::Resu
     injector.arm(FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).skip(1));
 
     let result = salvage_sst(&source, dest.clone(), &fs);
+    // The error must be the INJECTED directory-sync fault: only the publish
+    // path both consumes the fault and propagates it. If a future change
+    // adds an earlier directory sync, `skip(1)` fires on the MID writer's
+    // finish instead — `mid` fails, the arbitration returns the tail
+    // attempt's (different) mis-decode error, and this assertion flags that
+    // the test no longer covers the publish-sync cleanup path.
+    let err = result.expect_err("a failed publish directory sync must fail the salvage");
     assert!(
-        result.is_err(),
-        "a failed publish directory sync must fail the salvage: {result:?}",
+        err.to_string().contains("injected fault on SyncDirectory"),
+        "the salvage error must be the injected publish-sync fault, got {err:?}",
     );
     assert!(
         !std::path::Path::new(&dest).exists(),

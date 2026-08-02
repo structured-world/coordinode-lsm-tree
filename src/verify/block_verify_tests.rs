@@ -613,11 +613,16 @@ fn verify_sst_file_flags_a_duplicate_toc_section_name() {
     .unwrap();
 
     let report = verify_sst_file(&sst_path);
+    // Match the duplicate-name finding specifically: the forge rewrites the
+    // whole TOC, so an unrelated TocCorrupted (tiling gap, seek failure,
+    // unrecognized name) would keep this green without proving the
+    // duplicate-name detection ran.
     assert!(
-        report
-            .errors
-            .iter()
-            .any(|e| matches!(e, BlockVerifyError::TocCorrupted { .. })),
+        report.errors.iter().any(|e| matches!(
+            e,
+            BlockVerifyError::TocCorrupted { section_name, reason, .. }
+                if section_name == b"data" && reason.contains("duplicate TOC section name")
+        )),
         "a duplicate recognized section name must be flagged as TocCorrupted, \
          got {:?}",
         report.errors,
