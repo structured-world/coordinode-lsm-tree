@@ -402,7 +402,7 @@ fn salvage_arbitration_skips_a_stale_crash_artifact() -> crate::Result<()> {
     let stale = dest.with_extension("healtmp-0");
     std::fs::write(&stale, b"crashed predecessor artifact")?;
 
-    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    let report = salvage_sst(&source, dest, &fs)?;
     assert_eq!(
         report.entries_salvaged, 100,
         "the MID attempt must pick a fresh temp name past the stale artifact: {report:?}",

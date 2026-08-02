@@ -905,10 +905,10 @@ fn salvage_blocks(
     };
     if let Some((section_pos, section_len)) = data_section {
         let section_end = section_pos.saturating_add(section_len);
-        let mut probe_gap = |from: u64,
-                             to: u64,
-                             items: &mut Vec<(crate::table::BlockHandle, Option<UserKey>)>,
-                             dropped: &mut Vec<DroppedBlock>| {
+        let probe_gap = |from: u64,
+                         to: u64,
+                         items: &mut Vec<(crate::table::BlockHandle, Option<UserKey>)>,
+                         dropped: &mut Vec<DroppedBlock>| {
             let mut at = from;
             while at < to {
                 match probe_block_handle_at(table, at, to) {
