@@ -1290,6 +1290,53 @@ fn heal_in_place_does_not_restamp_over_forged_meta_key_bounds() -> crate::Result
     Ok(())
 }
 
+/// The digest reconciliation must not restamp over FORGED metadata SEQUENCE
+/// bounds: on a footer-bearing table WITHOUT deletion metadata (no sentinel
+/// to complicate the bounds), both meta mirrors re-stamped with `seqno#min`
+/// raised while every data entry stays intact pass the mirror walk and all
+/// per-KV / key / count gates — yet after reopen a snapshot read whose
+/// threshold is at or below the forged minimum returns early at
+/// `Table::get`, silently missing older visible versions. The recorded
+/// bounds must be cross-checked against the decoded entries' real seqnos.
+#[test]
+fn heal_in_place_does_not_restamp_over_forged_meta_seqno_bounds() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _) = write_ecc_sst_footered(dir.path());
+
+    // Read the SST's real recorded max so the forged min stays <= max (a
+    // min > max would fail the meta load for a different reason).
+    let tree = open_ecc_tree(dir.path());
+    let recorded_max = {
+        let binding = tree.version_history.read().latest_version();
+        let table = binding.version.iter_tables().next().expect("one table");
+        table.get_highest_seqno()
+    };
+    // Raise seqno#min to the recorded max — every entry below it is now
+    // hidden from snapshots at or under the forged minimum.
+    crate::test_forge::forge_meta_value_both_mirrors(
+        &sst_path,
+        b"seqno#min",
+        &recorded_max.to_le_bytes(),
+    )?;
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
+        "forged metadata seqno bounds must refuse the digest refresh: {report:?}",
+    );
+
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the forged SST must keep failing verify_integrity: restamping its \
+         digest would let snapshot reads silently skip older visible versions",
+    );
+    Ok(())
+}
+
 /// The digest reconciliation must not restamp over a FORGED KV-footer
 /// DESCRIPTOR: both meta mirrors re-stamped with `descriptor#kv_checksum`
 /// set to off while the footer-bearing data blocks are left intact. The
