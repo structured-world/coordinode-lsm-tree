@@ -442,7 +442,24 @@ fn refresh_healed_checksum(
         Ok(raw) => crate::Checksum::from_raw(raw),
         Err(e) => return finding(e.to_string()),
     };
-    if fresh == table.checksum() {
+    // Compare against the CURRENT manifest entry, not the caller's captured
+    // view: two concurrent heal patrols capture the same version before the
+    // per-table heal lock serializes them, so by the time the loser gets
+    // here the winner may have already installed a refreshed checksum. The
+    // captured view's stale snapshot would then flag an already-reconciled
+    // file as mismatched (and, on a table the semantic gates cannot clear
+    // without heal attribution, surface a spurious ChecksumRefreshFailed).
+    let current = tree
+        .current_version()
+        .iter_tables()
+        .find(|t| t.id() == table.id())
+        .map(crate::table::Table::checksum);
+    let Some(current) = current else {
+        // Table already compacted away while the heal ran: the old file is
+        // on its way out, there is no manifest entry left to reconcile.
+        return None;
+    };
+    if fresh == current {
         // Digest already agrees with the manifest: no pending heal to
         // reconcile, no version upgrade to install.
         return None;
