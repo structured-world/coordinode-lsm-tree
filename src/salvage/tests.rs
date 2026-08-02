@@ -258,9 +258,20 @@ fn verify_tli_mirrors_rejects_a_section_spanning_handle() -> crate::Result<()> {
     crate::test_forge::forge_tli_mirrors_span_single_handle(&source, 0)?;
 
     let table = open(source, &fs)?;
+    // Match the frame-check reason specifically: the gate returns several
+    // distinct InvalidHeader reasons, and an unrelated one would keep this
+    // green without proving the per-handle physical-frame check ran.
+    let Err(err) = table.verify_tli_mirrors() else {
+        panic!("a handle spanning several physical blocks must fail the mirror gate");
+    };
     assert!(
-        table.verify_tli_mirrors().is_err(),
-        "a handle spanning several physical blocks must fail the mirror gate",
+        matches!(
+            err,
+            crate::Error::InvalidHeader(
+                "an index handle's size disagrees with its block's physical frame"
+            )
+        ),
+        "the spanning handle must be rejected by the physical-frame check, got {err:?}",
     );
     Ok(())
 }

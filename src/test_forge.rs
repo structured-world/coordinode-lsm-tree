@@ -1600,6 +1600,13 @@ pub fn forge_tli_mirrors_span_single_handle(
 ) -> crate::Result<()> {
     let forged = rebuilt_tli_frame(path, table_id, None, |handles| {
         use crate::table::{BlockHandle, KeyedBlockHandle};
+        // With a single handle the "spanning" replacement would be
+        // byte-identical to the original — a silent no-op fixture instead
+        // of the intended corruption.
+        assert!(
+            handles.len() >= 2,
+            "spanning a single handle needs at least two handles to hide",
+        );
         let total: u32 = handles.iter().map(|h| h.as_ref().size()).sum();
         let Some(first) = handles.first() else {
             panic!("the source carries data blocks");
