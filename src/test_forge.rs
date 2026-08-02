@@ -1584,6 +1584,37 @@ pub fn forge_tli_mirrors_drop_interior(
     replace_section_frame(path, b"tli_tail", &forged)
 }
 
+/// Re-encodes BOTH TLI mirrors (`tli`, `tli_tail`) as a SINGLE handle that
+/// starts at the first block and spans the ENTIRE summed size, keeping the
+/// first block's separator. Cumulative tiling accepts it (one span covers
+/// the section), the mirrors stay equal, and the separator matches the
+/// spanned frame's decoded content (only the FIRST payload decodes; the
+/// rest reads as an unrecognized trailer on a non-ECC block) — yet every
+/// later physical block is unreachable through the index. Only a
+/// per-handle comparison against the physical block frame can catch it.
+/// The SST must be unencrypted, non-ECC, its index uncompressed, and
+/// carry >= 2 data blocks.
+pub fn forge_tli_mirrors_span_single_handle(
+    path: &std::path::Path,
+    table_id: crate::TableId,
+) -> crate::Result<()> {
+    let forged = rebuilt_tli_frame(path, table_id, None, |handles| {
+        use crate::table::{BlockHandle, KeyedBlockHandle};
+        let total: u32 = handles.iter().map(|h| h.as_ref().size()).sum();
+        let Some(first) = handles.first() else {
+            panic!("the source carries data blocks");
+        };
+        let spanning = KeyedBlockHandle::new(
+            first.end_key().clone(),
+            first.seqno(),
+            BlockHandle::new(first.as_ref().offset(), total),
+        );
+        *handles = vec![spanning];
+    })?;
+    replace_section_frame(path, b"tli", &forged)?;
+    replace_section_frame(path, b"tli_tail", &forged)
+}
+
 /// Re-encodes BOTH TLI mirrors (`tli`, `tli_tail`) with the FIRST TWO
 /// handles SWAPPED: every handle is still present and intact, the mirrors
 /// stay equal, and the section is still fully covered — but the list is no

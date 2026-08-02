@@ -228,6 +228,43 @@ fn salvage_recovers_an_interior_block_hidden_by_forged_tli_mirrors() -> crate::R
     Ok(())
 }
 
+/// BOTH TLI mirrors re-encoded as a SINGLE handle spanning the whole data
+/// section pass the cumulative tiling (one span covers the section), the
+/// mirror comparison, and the separator cross-check (only the FIRST
+/// payload decodes; the tail reads as an unrecognized trailer on a
+/// non-ECC block) — yet every later physical block is unreachable through
+/// the index, so reads silently miss its keys after the table is
+/// accepted. Each handle must frame EXACTLY one physical block.
+#[test]
+fn verify_tli_mirrors_rejects_a_section_spanning_handle() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+    for i in 0u64..64 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Sanity: the intact table passes the mirror gate.
+    open(source.clone(), &fs)?.verify_tli_mirrors()?;
+
+    crate::test_forge::forge_tli_mirrors_span_single_handle(&source, 0)?;
+
+    let table = open(source.clone(), &fs)?;
+    assert!(
+        table.verify_tli_mirrors().is_err(),
+        "a handle spanning several physical blocks must fail the mirror gate",
+    );
+    Ok(())
+}
+
 /// A source whose `seqno_bounds` section is PRESENT but unreadable (the very
 /// rot salvage exists for) must still salvage into a copy WITH the section:
 /// the recover-time load degrades the in-memory map to empty best-effort, so
