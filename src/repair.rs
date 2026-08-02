@@ -442,7 +442,10 @@ fn try_salvage_table(
             // The recovered SST is persisted at the tree's configured
             // durability, matching the manifest rebuilt around it.
             sync_mode: config.sync_mode,
-            prefix_extractor: None,
+            // The extractor is configuration, not persisted state: without
+            // it the rebuilt filter loses the source's prefix hashes and
+            // prefix scans see the salvaged copy as definitely absent.
+            prefix_extractor: config.prefix_extractor.clone(),
         },
     )?;
     if report.salvaged_path.is_none() {

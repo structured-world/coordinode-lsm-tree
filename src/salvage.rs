@@ -604,6 +604,11 @@ fn salvage_attempt(
             table.has_seqno_bounds(),
         )
         .use_sync_mode(options.sync_mode)
+        // The extractor is configuration (never persisted in the SST), so
+        // the rebuilt filter only carries the source's prefix hashes when
+        // the caller supplies it — without them, prefix scans would see
+        // the recovered copy as definitely absent.
+        .use_prefix_extractor(options.prefix_extractor.clone())
         .use_encryption(options.encryption.clone());
     #[cfg(zstd_any)]
     let writer = writer.use_zstd_dictionary(options.zstd_dictionary.clone());
