@@ -1208,13 +1208,16 @@ fn scan_sst_blocks(
         // so the deleted range silently resurrects. Section names are unique
         // by construction (the writer emits each at most once), so any
         // duplicate is corruption.
-        let mut seen_names: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        // A handful of section names — a linear scan keeps this no-std-clean
+        // (no `std::collections`).
+        let mut seen_names: Vec<Vec<u8>> = Vec::new();
         for entry in toc.iter() {
-            if !seen_names.insert(entry.name().to_vec()) {
+            let name = entry.name().to_vec();
+            if seen_names.iter().any(|n| n == &name) {
                 errors.push(BlockVerifyError::TocCorrupted {
                     table_id,
                     path: path.to_path_buf(),
-                    section_name: entry.name().to_vec(),
+                    section_name: name,
                     section_offset: entry.pos(),
                     reason: format!(
                         "duplicate TOC section name {:?}; a renamed section can \
@@ -1223,6 +1226,8 @@ fn scan_sst_blocks(
                         alloc::string::String::from_utf8_lossy(entry.name()),
                     ),
                 });
+            } else {
+                seen_names.push(name);
             }
             if entry.pos() != expected_pos {
                 errors.push(BlockVerifyError::TocCorrupted {

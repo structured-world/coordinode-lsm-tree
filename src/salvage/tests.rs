@@ -255,6 +255,11 @@ fn salvage_arbitrates_divergent_meta_mirrors() -> crate::Result<()> {
 /// SST a standalone retry's `create_new` open trips over (and the repair
 /// caller's rebuilt manifest omits, leaving an orphan). Every other salvage
 /// failure path removes its owned destination; this one must too.
+///
+/// `lz4`-gated: the divergent-mirror arbitration is driven by a
+/// `compression#data` forge to Lz4, so the tail attempt only mis-decodes
+/// (and the MID attempt wins, taking the publish path) when lz4 is built.
+#[cfg(feature = "lz4")]
 #[test]
 fn salvage_removes_the_mid_copy_when_the_publish_dir_sync_fails() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
@@ -312,6 +317,10 @@ fn salvage_removes_the_mid_copy_when_the_publish_dir_sync_fails() -> crate::Resu
 /// writes to a sibling temp path and wins the arbitration — publishing it
 /// by renaming over `dest` would silently destroy an unrelated file that an
 /// API call refusing "destination occupied" is supposed to leave untouched.
+///
+/// `lz4`-gated: the divergent-mirror arbitration is driven by a
+/// `compression#data` forge to Lz4 (see the sibling MID-cleanup test).
+#[cfg(feature = "lz4")]
 #[test]
 fn salvage_refuses_to_overwrite_a_preexisting_destination() -> crate::Result<()> {
     let dir = tempdir()?;
