@@ -234,7 +234,12 @@ fn block_verify_verdict(
         // the next recovery (which prefers the tail) away from real blocks.
         // Diverging decoded mirrors are corruption; salvage walks the HEAD
         // copy, so the recovered SST is rebuilt from a single, fully
-        // re-verified handle list.
+        // re-verified handle list. BOTH mirrors forged to the SAME list that
+        // OMITS a physical block are covered too: the salvage walk
+        // cross-checks the index against the physical data-section tiling
+        // and frames the uncovered bytes from their block headers, so the
+        // hidden block is recovered (or reported dropped), never silently
+        // missing from an apparently complete copy.
         BlockVerifyVerdict::Corrupt
     } else if table.verify_seqno_bounds().is_err() {
         // The seqno_bounds block is checksum-clean to the walk even when
