@@ -2741,18 +2741,20 @@ impl Table {
             }
         };
 
-        // The per-KV footer descriptor drives how EVERY reader interprets a
-        // data block's tail bytes: `Some(algo)` strips a footer, `None`
-        // treats them as the block trailer. A disk-fresh descriptor
-        // re-stamped to `None` while the blocks keep their footers passes the
-        // mirror walk (both copies agree) and `verify_kv_checksums` (which
-        // uses the recovery-time cached descriptor), yet after reopen the
-        // forged `None` misreads footer bytes as the trailer. The
-        // recovery-time descriptor is trustworthy — the blocks decoded under
-        // it at open — so the disk-fresh copy must still match it.
-        if meta.kv_checksum_algo != self.metadata.kv_checksum_algo {
+        // Nothing on the heal path legitimately rewrites the meta sections,
+        // so the disk-fresh copy must equal the recovery-time one FIELD FOR
+        // FIELD. A single-field comparison is not enough: any descriptor
+        // re-stamped consistently in both mirrors passes the mirror walk,
+        // and fields no gate can re-derive from the entries stay
+        // authoritative-only — `descriptor#kv_checksum` flipped to `None`
+        // makes every reader misread footer bytes as the block trailer
+        // after reopen, and a back-dated `created_at` lets FIFO compaction
+        // drop the live SST as TTL-expired. The recovery-time copy is
+        // trustworthy (the blocks decoded under it at open), so any
+        // disk-fresh divergence is a post-open re-stamp.
+        if meta != self.metadata {
             return Err(crate::Error::InvalidHeader(
-                "meta kv-checksum descriptor disagrees with the recovery-time descriptor",
+                "disk-fresh meta disagrees with the recovery-time copy",
             ));
         }
 
