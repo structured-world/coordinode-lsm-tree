@@ -2225,6 +2225,75 @@ fn checksum_refresh_is_idempotent_against_a_stale_table_view() -> crate::Result<
     Ok(())
 }
 
+/// The pre-write ATTRIBUTION probe must compare against the CURRENT
+/// manifest digest, not the caller's captured view: a reconciliation
+/// running with a view captured before the manifest was re-recorded
+/// (here: a manifest rebuilt over freshly rotted bytes after an earlier
+/// heal already refreshed it) sees a stale checksum, marks a legitimate
+/// heal unattributable, and the fail-closed rule then refuses to refresh
+/// a footer-less table forever — even though the file's pre-write digest
+/// matched the manifest exactly.
+#[test]
+fn heal_attribution_compares_against_the_current_manifest_digest() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Footer-less: without attribution the fail-closed rule turns the
+    // refusal into a permanent ChecksumRefreshFailed.
+    let (sst_path, block) = write_ecc_sst(dir.path());
+
+    // Heal cycle one: rot, record the rotted digest, heal + refresh.
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
+    rebuild_manifest_over_current_bytes(dir.path())?;
+    let stale_view = {
+        let tree = open_ecc_tree(dir.path());
+        let stale = {
+            let binding = tree.version_history.read().latest_version();
+            binding
+                .version
+                .iter_tables()
+                .next()
+                .expect("one table")
+                .clone()
+        };
+        let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+        assert!(report.is_ok(), "the first heal reconciles: {report:?}");
+        stale
+    };
+
+    // Rot a SECOND fault — in a DIFFERENT block, so the rotted digest
+    // differs from the first cycle's — and re-record the manifest over the
+    // rotted bytes: the CURRENT manifest matches the file while the
+    // captured view still carries the digest recorded before the first
+    // heal.
+    let second_block = {
+        let keyed = stale_view
+            .block_index
+            .iter()
+            .nth(1)
+            .expect("the fixture writes several data blocks")
+            .expect("block index entry decodes");
+        crate::table::BlockHandle::new(keyed.offset(), keyed.size())
+    };
+    corrupt_parity_trailer_byte(&sst_path, &second_block)?;
+    rebuild_manifest_over_current_bytes(dir.path())?;
+
+    let tree = open_ecc_tree(dir.path());
+    let report = scan_and_reconcile(
+        &tree,
+        &stale_view,
+        &PatrolScrubOptions::default().heal_in_place(true),
+    );
+    assert!(
+        report.blocks_healed_in_place >= 1,
+        "the second fault is rebuilt in place: {report:?}",
+    );
+    assert!(
+        report.is_ok(),
+        "a heal whose pre-write digest matches the CURRENT manifest is \
+         attributable and must reconcile: {report:?}",
+    );
+    Ok(())
+}
+
 /// A manifest-digest refresh that FAILS after an in-place heal must surface in
 /// the scrub report, not vanish into a log line: the heal already rewrote the
 /// SST's bytes, so with the refresh lost a manifest that carried a stale
