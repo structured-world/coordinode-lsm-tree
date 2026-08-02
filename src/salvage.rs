@@ -329,8 +329,23 @@ pub(crate) fn salvage_with_context(
     // recovery-owned temp namespace: a hard crash mid-arbitration leaves an
     // artifact the next open sweeps instead of failing the id parse.
     static ARB_TMP_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-    let seq = ARB_TMP_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let mid_dest = dest.with_extension(alloc::format!("healtmp-{seq}"));
+    // The counter is PROCESS-local: a predecessor that crashed after
+    // creating its temp file leaves an artifact a fresh process's first
+    // sequence number collides with (tree recovery only sweeps this
+    // namespace inside table folders, so a standalone destination would
+    // stay blocked on the MID writer's create_new forever). Probe forward
+    // to a free name; a foreign artifact is never reclaimed — it may
+    // belong to a concurrently running salvage. Termination: every probe
+    // advances the counter and the artifacts on disk are finite.
+    let mid_dest = loop {
+        let seq = ARB_TMP_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let candidate = dest.with_extension(alloc::format!("healtmp-{seq}"));
+        match fs.exists(&candidate) {
+            Ok(false) => break candidate,
+            Ok(true) => {}
+            Err(e) => return Err(e.into()),
+        }
+    };
     let mid = salvage_attempt(
         source,
         mid_dest.clone(),
