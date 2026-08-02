@@ -1272,6 +1272,22 @@ impl Table {
                     }
                 };
                 if shared {
+                    // A pinned FD (no descriptor cache) is bound to its
+                    // inode for the table's lifetime: after the unshare's
+                    // copy + rename, every later read, scrub probe, and
+                    // digest check would keep resolving the DEAD inode
+                    // while the manifest points at the healed live path.
+                    // Refuse the detach — the blocked write-backs surface
+                    // as findings and every link stays byte-identical.
+                    if !self.file_accessor.can_retarget() {
+                        let reason = alloc::string::String::from(
+                            "the inode is multiply linked and the pinned file \
+                             descriptor cannot be retargeted at a detached copy; \
+                             refusing the in-place write",
+                        );
+                        *state = UnshareState::Failed(reason.clone());
+                        return Err(reason);
+                    }
                     match self.unshare_for_heal(file.as_ref(), sync_mode) {
                         Ok(fresh) => *file = fresh,
                         Err(reason) => {
