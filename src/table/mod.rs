@@ -2610,7 +2610,10 @@ impl Table {
     ///   tombstone sentinel is an on-disk entry counted on both sides);
     /// - the recorded `data_block_count` equals the indexed block count
     ///   ([`Table::scan`] hands it to the compaction scanner, which stops
-    ///   after that many blocks — a smaller forge drops the tail).
+    ///   after that many blocks — a smaller forge drops the tail);
+    /// - the disk-fresh per-KV footer descriptor matches the recovery-time
+    ///   one (a re-stamped `None` would misread footer bytes as the trailer
+    ///   after reopen).
     ///
     /// The seqno bounds are deliberately NOT compared: the writer excludes
     /// the tombstone sentinel's synthetic seqno from the recorded range, so
@@ -2650,6 +2653,21 @@ impl Table {
                 )?
             }
         };
+
+        // The per-KV footer descriptor drives how EVERY reader interprets a
+        // data block's tail bytes: `Some(algo)` strips a footer, `None`
+        // treats them as the block trailer. A disk-fresh descriptor
+        // re-stamped to `None` while the blocks keep their footers passes the
+        // mirror walk (both copies agree) and `verify_kv_checksums` (which
+        // uses the recovery-time cached descriptor), yet after reopen the
+        // forged `None` misreads footer bytes as the trailer. The
+        // recovery-time descriptor is trustworthy — the blocks decoded under
+        // it at open — so the disk-fresh copy must still match it.
+        if meta.kv_checksum_algo != self.metadata.kv_checksum_algo {
+            return Err(crate::Error::InvalidHeader(
+                "meta kv-checksum descriptor disagrees with the recovery-time descriptor",
+            ));
+        }
 
         let mut count: u64 = 0;
         let mut block_count: u64 = 0;
