@@ -993,6 +993,24 @@ fn salvage_blocks(
             // (`apply_delete_mask`); an unpositionable mask under the explicit
             // resurrection opt-in re-emits every row live via the unmasked arm.
             if table.has_delete_bitmap_section() && apply_delete_mask {
+                // An INDEX-OMITTED block (recovered by the physical gap walk,
+                // `end_key` unknown) has no verified delete-start position:
+                // `delete_positions_verified` walked only the indexed blocks,
+                // and the masked load would treat an unmapped batch as all
+                // rows live — permanently resurrecting the rows the bitmap
+                // marked there, without the resurrection opt-in. Fail closed
+                // per block: drop it and report the loss.
+                if end_key.is_none() {
+                    dropped.push(classify_drop(
+                        &crate::Error::InvalidHeader(
+                            "delete positions unverifiable for an index-omitted block",
+                        ),
+                        offset,
+                        prev_end.as_ref(),
+                        None,
+                    ));
+                    continue;
+                }
                 // Re-emit each block as a delete-masked batch so the recovered copy
                 // keeps any (readable) deletes applied.
                 match table.load_columnar_block_masked(&block_handle) {
