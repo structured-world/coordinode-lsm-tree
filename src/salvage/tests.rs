@@ -249,6 +249,64 @@ fn salvage_arbitrates_divergent_meta_mirrors() -> crate::Result<()> {
     Ok(())
 }
 
+/// A MID-arbitration publish whose post-rename directory sync FAILS must not
+/// leave the owned destination behind: the rename already populated `dest`,
+/// so returning the durability error without cleanup would leave a partial
+/// SST a standalone retry's `create_new` open trips over (and the repair
+/// caller's rebuilt manifest omits, leaving an orphan). Every other salvage
+/// failure path removes its owned destination; this one must too.
+#[test]
+fn salvage_removes_the_mid_copy_when_the_publish_dir_sync_fails() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0u64..100 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Divergent mirrors so the MID attempt wins and publishes via rename.
+    crate::test_forge::forge_tail_meta_value(&source, b"compression#data", &[1])?;
+
+    // Fail the publish's post-rename directory sync. The tail attempt
+    // mis-decodes under the forged codec and drops its only block, so it
+    // never finishes (no sync); the MID writer's finish syncs the parent
+    // once, and the publish after the MID rename syncs it again. Skip the
+    // MID writer's sync and fire on the publish.
+    injector.arm(FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).skip(1));
+
+    let result = salvage_sst(&source, dest.clone(), &fs);
+    assert!(
+        result.is_err(),
+        "a failed publish directory sync must fail the salvage: {result:?}",
+    );
+    assert!(
+        !std::path::Path::new(&dest).exists(),
+        "the owned MID copy must be removed when the publish sync fails",
+    );
+    for entry in std::fs::read_dir(dir.path())? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        assert!(
+            !name.contains(".healtmp-"),
+            "the MID temp copy must not survive either, found {name:?}",
+        );
+    }
+    Ok(())
+}
+
 /// A PRE-EXISTING destination must survive a divergent-mirror salvage: the
 /// tail attempt correctly fails its `create_new` open, but the MID attempt
 /// writes to a sibling temp path and wins the arbitration — publishing it
