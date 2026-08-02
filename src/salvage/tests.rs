@@ -265,6 +265,45 @@ fn verify_tli_mirrors_rejects_a_section_spanning_handle() -> crate::Result<()> {
     Ok(())
 }
 
+/// BOTH TLI mirrors re-encoded as a SINGLE handle spanning the whole data
+/// section must not blind the SALVAGE walk: advancing the physical cursor
+/// by the untrusted indexed size skips every later block, and the oversized
+/// non-ECC handle still decodes its first payload — one block "salvaged",
+/// zero drops, and repair installs a copy with the rest silently lost. The
+/// tiler must trust each handle's span only after the block's own header
+/// confirms it, falling back to the physically framed span otherwise.
+#[test]
+fn salvage_recovers_all_blocks_under_a_section_spanning_handle() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+    for i in 0u64..64 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    crate::test_forge::forge_tli_mirrors_span_single_handle(&source, 0)?;
+
+    let report = salvage_sst(&source, dest, &fs)?;
+    assert!(
+        report.dropped.is_empty(),
+        "every block is intact, nothing may drop: {report:?}",
+    );
+    assert_eq!(
+        report.entries_salvaged, 64,
+        "the blocks a spanning handle hides must still be recovered: {report:?}",
+    );
+    Ok(())
+}
+
 /// A source whose `seqno_bounds` section is PRESENT but unreadable (the very
 /// rot salvage exists for) must still salvage into a copy WITH the section:
 /// the recover-time load degrades the in-memory map to empty best-effort, so
