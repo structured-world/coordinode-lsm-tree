@@ -1417,6 +1417,48 @@ fn heal_in_place_does_not_restamp_over_forged_meta_seqno_bounds() -> crate::Resu
     Ok(())
 }
 
+/// The digest reconciliation must not restamp over a FORGED `created_at`:
+/// both meta mirrors re-stamped with an OLDER timestamp (same 16-byte
+/// length, fresh checksums and parity) pass every byte-level check, the
+/// mirror comparison, and every content-derived gate — no cross-check can
+/// re-derive a wall-clock timestamp from the entries. Yet after reopen
+/// FIFO compaction trusts the recorded `created_at` for its TTL decision
+/// and can classify the live SST as expired, permanently dropping it. The
+/// disk-fresh meta must equal the recovery-time copy field for field
+/// before the digest is trusted.
+#[test]
+fn heal_in_place_does_not_restamp_over_a_forged_created_at() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _) = write_ecc_sst_footered(dir.path());
+
+    // Open FIRST so the live table keeps its recovery-time timestamp, then
+    // back-date the on-disk copy in both mirrors (u128 LE nanoseconds; the
+    // equal value length keeps the frame geometry).
+    let tree = open_ecc_tree(dir.path());
+    crate::test_forge::forge_meta_value_both_mirrors(
+        &sst_path,
+        b"created_at",
+        &1u128.to_le_bytes(),
+    )?;
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
+        "a forged created_at must refuse the digest refresh: {report:?}",
+    );
+
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the forged SST must keep failing verify_integrity: restamping its \
+         digest would let FIFO compaction drop the live SST as TTL-expired",
+    );
+    Ok(())
+}
+
 /// The digest reconciliation must not restamp over a FORGED KV-footer
 /// DESCRIPTOR: both meta mirrors re-stamped with `descriptor#kv_checksum`
 /// set to off while the footer-bearing data blocks are left intact. The
