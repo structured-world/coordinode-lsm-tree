@@ -1290,9 +1290,10 @@ fn heal_in_place_does_not_restamp_over_forged_meta_key_bounds() -> crate::Result
     Ok(())
 }
 
-/// A footered, uncompressed ECC SST whose data blocks carry an embedded
-/// HASH INDEX (non-zero `data_block_hash_ratio`), for the hash-index forge.
-fn write_ecc_sst_footered_hashed(dir: &std::path::Path) -> std::path::PathBuf {
+/// Opens an RS(8,2) Page-ECC tree at `dir` whose data blocks are
+/// uncompressed and carry an embedded hash index — the layout
+/// `forge_hash_index_all_free` requires.
+fn open_ecc_hashed_tree(dir: &std::path::Path) -> crate::Tree {
     let crate::AnyTree::Standard(tree) = crate::Config::new(
         dir,
         SequenceNumberCounter::default(),
@@ -1311,6 +1312,13 @@ fn write_ecc_sst_footered_hashed(dir: &std::path::Path) -> std::path::PathBuf {
     .expect("open ecc hashed tree") else {
         unreachable!("standard tree configured (no kv separation)");
     };
+    tree
+}
+
+/// A footered, uncompressed ECC SST whose data blocks carry an embedded
+/// HASH INDEX (non-zero `data_block_hash_ratio`), for the hash-index forge.
+fn write_ecc_sst_footered_hashed(dir: &std::path::Path) -> std::path::PathBuf {
+    let tree = open_ecc_hashed_tree(dir);
     tree.update_runtime_config(|c| {
         c.kv_checksums = crate::runtime_config::KvChecksumPolicy::AllLevels;
     })
@@ -1341,24 +1349,7 @@ fn heal_in_place_does_not_restamp_over_a_forged_hash_index() -> crate::Result<()
     let dir = tempfile::tempdir()?;
     let sst_path = write_ecc_sst_footered_hashed(dir.path());
 
-    let crate::AnyTree::Standard(tree) = crate::Config::new(
-        dir.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .page_ecc(true)
-    .ecc_scheme(EccScheme::ReedSolomon {
-        data_shards: 8,
-        parity_shards: 2,
-    })
-    .data_block_compression_policy(crate::config::CompressionPolicy::all(
-        crate::CompressionType::None,
-    ))
-    .data_block_hash_ratio_policy(crate::config::HashRatioPolicy::all(2.0))
-    .open()
-    .expect("reopen ecc hashed tree") else {
-        unreachable!("standard tree configured (no kv separation)");
-    };
+    let tree = open_ecc_hashed_tree(dir.path());
     crate::test_forge::forge_hash_index_all_free(&sst_path, Some((8, 2)))?;
 
     let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
