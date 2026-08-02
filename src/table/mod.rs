@@ -569,6 +569,63 @@ impl Table {
         Ok(block)
     }
 
+    /// Frames the block starting at `offset` by reading its HEADER straight
+    /// from the file: the on-disk span is header + payload + parity trailer
+    /// (SST blocks carry no `block_flags` byte, so the trailer is sized from
+    /// the per-SST descriptor scheme). The writer emits blocks back-to-back,
+    /// making the physical tiling ground truth: the salvage gap walk frames
+    /// index-omitted bytes with this, and the TLI mirror gate compares each
+    /// decoded handle against the frame its header derives. A header that
+    /// fails to decode, or a span leaving `section_end`, means the bytes are
+    /// not frameable as a block.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] on an undecodable header or an
+    /// out-of-section span; any I/O error from the read.
+    #[cfg(feature = "std")]
+    pub(crate) fn probe_block_handle_at(
+        &self,
+        offset: u64,
+        section_end: u64,
+    ) -> crate::Result<BlockHandle> {
+        use crate::coding::Decode;
+        use crate::table::block::Header;
+
+        let file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
+        // Positional read of the largest possible header (block_flags-bearing
+        // types are one byte longer than the SST minimum); a short read only
+        // matters if it cuts into the bytes `decode_from` actually consumes.
+        let mut buf = [0u8; Header::MAX_LEN];
+        let got = file.read_at(&mut buf, offset)?;
+        let mut cursor = buf.get(..got).ok_or(crate::Error::InvalidHeader(
+            "block header read out of bounds",
+        ))?;
+        let header = Header::decode_from(&mut cursor)?;
+        let header_len = Header::header_len(header.block_type) as u64;
+        let parity_len = self.metadata.ecc_params.map_or(0, |scheme| {
+            u64::from(crate::table::block::expected_parity_len(
+                header.data_length,
+                scheme,
+            ))
+        });
+        let total = header_len
+            .checked_add(u64::from(header.data_length))
+            .and_then(|t| t.checked_add(parity_len))
+            .ok_or(crate::Error::InvalidHeader("block span overflows the file"))?;
+        let end = offset
+            .checked_add(total)
+            .ok_or(crate::Error::InvalidHeader("block span overflows the file"))?;
+        if end > section_end {
+            return Err(crate::Error::InvalidHeader(
+                "block extends past its section",
+            ));
+        }
+        let size = u32::try_from(total)
+            .map_err(|_| crate::Error::InvalidHeader("block span exceeds the block size limit"))?;
+        Ok(BlockHandle::new(BlockOffset(offset), size))
+    }
+
     /// Loads (and, for columnar SSTs, reconstructs + delete-masks) a data block.
     /// Returns `Ok(None)` when a columnar block is wholly deleted by the
     /// positional mask, so the caller treats it as carrying no keys.
@@ -2007,6 +2064,7 @@ impl Table {
                     "tli handles do not tile the index section",
                 ));
             }
+            self.verify_handles_frame_blocks(&handles, index_section.pos(), index_section.len())?;
             let mut data_handles = alloc::vec::Vec::new();
             for handle in &handles {
                 let part = Self::read_tli_at(
@@ -2035,12 +2093,18 @@ impl Table {
                     "index partitions' data handles do not tile the data section",
                 ));
             }
+            self.verify_handles_frame_blocks(
+                &data_handles,
+                data_section.pos(),
+                data_section.len(),
+            )?;
         } else {
             if !Self::frames_tile_section(&handles, data_section.pos(), data_section.len()) {
                 return Err(crate::Error::InvalidHeader(
                     "tli data handles do not tile the data section",
                 ));
             }
+            self.verify_handles_frame_blocks(&handles, data_section.pos(), data_section.len())?;
             for k in &keyed {
                 self.verify_separator_matches_block(k)?;
             }
@@ -2074,6 +2138,33 @@ impl Table {
             return Err(crate::Error::InvalidHeader(
                 "tli separator does not match the addressed block's decoded last key",
             ));
+        }
+        Ok(())
+    }
+
+    /// Requires every handle's SIZE to equal the physical frame its block's
+    /// on-disk header derives (header + payload + parity). The cumulative
+    /// tiling check cannot tell ONE handle spanning several back-to-back
+    /// blocks from the real per-block layout: the spanned frame still
+    /// decodes its FIRST payload (the tail reads as an unrecognized trailer
+    /// on a non-ECC block), so the separator cross-check passes too — yet
+    /// every later physical block is unreachable through the index and
+    /// reads silently miss its keys.
+    #[cfg(feature = "std")]
+    fn verify_handles_frame_blocks(
+        &self,
+        handles: &[BlockHandle],
+        pos: u64,
+        len: u64,
+    ) -> crate::Result<()> {
+        let section_end = pos.saturating_add(len);
+        for handle in handles {
+            let probed = self.probe_block_handle_at(handle.offset().0, section_end)?;
+            if probed.size() != handle.size() {
+                return Err(crate::Error::InvalidHeader(
+                    "an index handle's size disagrees with its block's physical frame",
+                ));
+            }
         }
         Ok(())
     }
