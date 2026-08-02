@@ -1423,8 +1423,12 @@ fn expected_section_roles(name: &[u8]) -> Option<&'static [crate::table::block::
     use crate::table::block::BlockType;
     Some(match name {
         b"data" => &[BlockType::Data, BlockType::Columnar],
-        b"index" | b"tli" | b"tli_tail" => &[BlockType::Index],
-        b"filter" | b"filter_tli" => &[BlockType::Filter],
+        // `filter_tli` is the top-level index OVER filter partitions — the
+        // writer emits it with the Index role (same encoding as the data
+        // TLI), so expecting Filter here would flag a healthy
+        // partitioned-filter SST as corrupt.
+        b"index" | b"tli" | b"tli_tail" | b"filter_tli" => &[BlockType::Index],
+        b"filter" => &[BlockType::Filter],
         b"range_tombstones" => &[BlockType::RangeTombstone],
         b"meta" | b"meta_mid" => &[BlockType::Meta],
         b"block_layout" => &[BlockType::BlockLayout],
