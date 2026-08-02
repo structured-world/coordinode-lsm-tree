@@ -822,6 +822,68 @@ fn salvage_recovers_a_reclaimable_weak_tombstone_pair() -> crate::Result<()> {
     Ok(())
 }
 
+/// A corrupt `filter_tli` block (rotted payload, stale checksum) must not
+/// fail a SALVAGE-mode open: the salvage walk never consults the source's
+/// filter — the destination writer rebuilds it from the recovered keys —
+/// yet the open loaded the partitioned filter's index unconditionally and
+/// propagated the error, so repair quarantined a table whose data and
+/// data index were fully intact.
+#[test]
+fn salvage_degrades_an_unreadable_filter_index() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_partitioned_filter()
+        // A tiny partition budget so several filter partitions spill and
+        // the writer emits the `filter_tli` top-level index over them.
+        .use_meta_partition_size(3);
+    for i in 0u32..64 {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Rot one payload byte of the filter_tli block WITHOUT re-stamping its
+    // checksum, so loading it fails like any bit-rotted block.
+    {
+        let pos = {
+            let mut f = std::fs::File::open(&source)?;
+            let reader = match crate::sfa::Reader::from_reader(&mut f) {
+                Ok(r) => r,
+                Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+            };
+            let Some(entry) = reader.toc().iter().find(|e| e.name() == b"filter_tli") else {
+                panic!("the source carries a filter_tli section");
+            };
+            let Ok(pos) = usize::try_from(entry.pos()) else {
+                panic!("pos fits usize");
+            };
+            pos
+        };
+        let mut bytes = std::fs::read(&source)?;
+        // Past the block header, inside the payload.
+        let at = pos + 40;
+        let Some(slot) = bytes.get_mut(at) else {
+            panic!("payload byte within the file");
+        };
+        *slot ^= 0xFF;
+        std::fs::write(&source, bytes)?;
+    }
+
+    let report = salvage_sst(&source, dest, &fs)?;
+    assert!(
+        report.dropped.is_empty(),
+        "every data block is intact, nothing may drop: {report:?}",
+    );
+    assert_eq!(
+        report.entries_salvaged, 64,
+        "a rotted filter index must not cost the recoverable data: {report:?}",
+    );
+    Ok(())
+}
+
 /// The rebuilt filter must carry the source's PREFIX hashes: the extractor
 /// is configuration (not persisted in the SST), so the salvage writer can
 /// only index prefixes when the caller threads the tree's extractor
