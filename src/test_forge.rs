@@ -1348,9 +1348,11 @@ pub fn forge_tli_mirrors_lower_first_separator(
         assert!(key.len() >= 2, "separator key long enough to truncate");
         // A one-byte-shorter prefix is lexicographically smaller than the
         // original and still smaller than the next block's separator.
-        let lowered = crate::UserKey::from(&key[..key.len() - 1]);
+        let lowered = crate::UserKey::from(key.get(..key.len() - 1).expect("prefix"));
         let rebuilt = KeyedBlockHandle::new(lowered, first.seqno(), *first.as_ref());
-        handles[0] = rebuilt;
+        if let Some(slot) = handles.get_mut(0) {
+            *slot = rebuilt;
+        }
     })?;
     replace_section_frame(path, b"tli", &forged)?;
     replace_section_frame(path, b"tli_tail", &forged)
