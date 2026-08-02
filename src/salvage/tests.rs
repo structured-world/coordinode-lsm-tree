@@ -109,6 +109,48 @@ fn salvage_recovers_all_blocks_under_a_forged_tli_tail() -> crate::Result<()> {
     Ok(())
 }
 
+/// BOTH TLI mirrors forged to the SAME truncated handle list pass every
+/// byte-level check AND the mirror comparison (two forged copies prove
+/// nothing), so the salvage open's block index simply omits the hidden
+/// block. A walk trusting that index neither recovers the block nor
+/// reports it dropped — repair then installs an apparently complete copy
+/// with the block's keys silently missing. The physical data-section
+/// tiling is the only ground truth: salvage must frame and recover the
+/// bytes the index does not cover.
+#[test]
+fn salvage_recovers_a_block_hidden_by_forged_tli_mirrors() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // Tiny block budget so the SST spills several data blocks (several TLI
+    // handles — the forge needs at least two).
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+    for i in 0u64..64 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    crate::test_forge::forge_tli_mirrors_truncated(&source, 0, None)?;
+
+    let report = salvage_sst(&source, dest, &fs)?;
+    assert!(
+        report.dropped.is_empty(),
+        "every block is intact, nothing may drop: {report:?}",
+    );
+    assert_eq!(
+        report.entries_salvaged, 64,
+        "the block both forged mirrors hide must still be recovered: {report:?}",
+    );
+    Ok(())
+}
+
 /// A source whose `seqno_bounds` section is PRESENT but unreadable (the very
 /// rot salvage exists for) must still salvage into a copy WITH the section:
 /// the recover-time load degrades the in-memory map to empty best-effort, so
