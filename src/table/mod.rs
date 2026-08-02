@@ -2438,6 +2438,49 @@ impl Table {
         Ok(())
     }
 
+    /// Confirms every decoded key is RETRIEVABLE through the full point-read
+    /// path. A data block's embedded HASH INDEX (and binary index) is
+    /// checksum-clean to the out-of-band walk even when a bucket was
+    /// re-stamped to `MARKER_FREE` (or a binary-index offset misdirected):
+    /// the sequential decode gates still see every entry, but `point_read`
+    /// trusts the index and returns `None` for the affected keys. Probe each
+    /// key's NEWEST version (the first occurrence in block-index order, since
+    /// blocks are sorted by key then descending seqno) with `point_read` at
+    /// `MAX_SEQNO` and require a hit; a miss means the in-block indexes
+    /// disagree with the decoded entries. Covers hash + binary index and
+    /// filter / locator misdirection in one end-to-end check.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when a decoded key is not retrievable;
+    /// any I/O / decode error from the full scan.
+    #[cfg(feature = "std")]
+    pub(crate) fn verify_point_read_reachability(&self) -> crate::Result<()> {
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for handle in self.block_index.iter() {
+            let handle = handle?;
+            let block_handle = BlockHandle::new(handle.offset(), handle.size());
+            let entries = self.decode_block_entries(&block_handle)?;
+            for entry in entries {
+                let user_key = entry.key.user_key.to_vec();
+                if !seen.insert(user_key.clone()) {
+                    continue;
+                }
+                let key_hash = crate::hash::hash64(&user_key);
+                if self
+                    .point_read(&user_key, crate::seqno::MAX_SEQNO, key_hash)?
+                    .is_none()
+                {
+                    return Err(crate::Error::InvalidHeader(
+                        "a decoded key is not retrievable via point_read (an in-block \
+                         index disagrees with the entries)",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Probes every decoded data key against the on-disk `filter` section:
     /// each key the table holds must be reported as POSSIBLY PRESENT. A
     /// checksum- and parity-consistent forged filter is accepted by the

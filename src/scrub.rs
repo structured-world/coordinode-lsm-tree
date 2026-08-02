@@ -580,6 +580,17 @@ fn refresh_healed_checksum(
         ));
     }
 
+    // A data block's embedded hash / binary index is checksum-clean to the
+    // walk even when a bucket was re-stamped to MARKER_FREE, yet point_read
+    // trusts it and returns None for the affected keys. Probe every decoded
+    // key through the full point-read path before trusting the digest.
+    if let Err(e) = table.verify_point_read_reachability() {
+        return finding(alloc::format!(
+            "digest mismatch with a point-read reachability failure ({e}); \
+             the manifest digest was not refreshed"
+        ));
+    }
+
     // Both meta mirrors re-stamped CONSISTENTLY pass the mirror comparison,
     // yet run selection trusts the recorded key range to route reads AROUND
     // this table — a narrowed range silently hides real keys and the range

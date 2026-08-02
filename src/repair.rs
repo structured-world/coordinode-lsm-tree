@@ -279,6 +279,13 @@ fn block_verify_verdict(
         // disagree with the frames' actual inner blocks are corruption;
         // salvage re-derives the layout when re-encoding.
         BlockVerifyVerdict::Corrupt
+    } else if table.verify_point_read_reachability().is_err() {
+        // A checksum-clean embedded hash / binary index re-stamped to hide a
+        // key (a MARKER_FREE bucket, a misdirected offset) makes point_read
+        // miss existing data. Keys the block decodes but point_read cannot
+        // retrieve are corruption; salvage re-emits the block with fresh
+        // indexes.
+        BlockVerifyVerdict::Corrupt
     } else if table.verify_metadata_bounds().is_err() {
         // Both meta mirrors re-stamped CONSISTENTLY pass the mirror
         // comparison, yet run selection trusts the recorded key range — a
