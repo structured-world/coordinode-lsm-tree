@@ -5,6 +5,16 @@
 // Format constants live in writer (the format definition site).
 // Extracting to a shared module is an upstream structural decision.
 use super::writer::{BLOB_HEADER_MAGIC, validate_header_crc};
+
+/// Safety cap on blob value size (256 MiB), matching the writer and the
+/// ordinary reader. Intentionally duplicated (see the writer's copy):
+/// blocks and blobs are independent formats that may diverge. The scanner
+/// enforces it BEFORE allocating: a CRC-valid fake header inside a damaged
+/// record's user-controlled bytes can declare a near-`u32::MAX` length,
+/// and in a sufficiently large source the declared frame still fits the
+/// data section — without the cap the salvage walk would attempt a
+/// multi-gigabyte allocation before the candidate's checksum rejection.
+const MAX_DECOMPRESSION_SIZE: usize = 256 * 1024 * 1024;
 use crate::fs::{Fs, FsFile, FsOpenOptions};
 use crate::io::BufReader;
 use crate::io::{LittleEndian, ReadBytesExt};
@@ -280,7 +290,13 @@ impl Iterator for Scanner {
                 .checked_add(header_len)
                 .and_then(|x| x.checked_add(u64::from(key_len)))
                 .and_then(|x| x.checked_add(u64::from(on_disk_val_len)));
-            if frame_end.is_none_or(|end| end > self.data_end) {
+            // Same 256 MiB value cap as the writer / ordinary reader,
+            // checked BEFORE the buffers below are allocated: no
+            // legitimate frame exceeds it, so an over-cap declared length
+            // is corruption regardless of whether it fits the section.
+            let over_cap = u64::from(real_val_len) > MAX_DECOMPRESSION_SIZE as u64
+                || u64::from(on_disk_val_len) > MAX_DECOMPRESSION_SIZE as u64;
+            if over_cap || frame_end.is_none_or(|end| end > self.data_end) {
                 if self.resynced {
                     if let Err(e) = self.resync_to_next_frame(offset) {
                         self.is_terminated = true;
