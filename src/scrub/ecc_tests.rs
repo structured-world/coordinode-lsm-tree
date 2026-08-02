@@ -2175,6 +2175,56 @@ fn heal_in_place_refreshes_the_manifest_checksum() -> crate::Result<()> {
     Ok(())
 }
 
+/// A reconciliation whose captured Table VIEW predates another patrol's
+/// successful digest refresh must treat the already-reconciled file as
+/// clean: the view's checksum snapshot is stale, but the CURRENT manifest
+/// entry and the file agree, so there is nothing left to reconcile. Two
+/// concurrent heal patrols hit exactly this interleaving — both capture
+/// the same version before the per-table heal lock serializes them — and
+/// on a footer-less table the loser has no attributable correction, so
+/// the stale comparison surfaced as a spurious `ChecksumRefreshFailed`
+/// on a healthy, already-reconciled table.
+#[test]
+fn checksum_refresh_is_idempotent_against_a_stale_table_view() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Footer-less on purpose: without heal attribution the fail-closed
+    // authoritative-content rule turns the stale mismatch into a finding.
+    let (sst_path, block) = write_ecc_sst(dir.path());
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
+    rebuild_manifest_over_current_bytes(dir.path())?;
+
+    let tree = open_ecc_tree(dir.path());
+    // Capture the table view BEFORE the heal, like a concurrently started
+    // second patrol would.
+    let stale_view = {
+        let binding = tree.version_history.read().latest_version();
+        binding
+            .version
+            .iter_tables()
+            .next()
+            .expect("one table")
+            .clone()
+    };
+
+    // First patrol: heals the trailer in place and installs the refreshed
+    // digest into the manifest.
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report.blocks_healed_in_place >= 1,
+        "the rotted trailer is rebuilt in place: {report:?}",
+    );
+    assert!(report.is_ok(), "the first patrol reconciles: {report:?}");
+
+    // Second patrol's reconcile step, still holding the pre-heal view: the
+    // current manifest and the file already agree, so it must be a no-op.
+    let finding = refresh_healed_checksum(&tree, &stale_view, false);
+    assert!(
+        finding.is_none(),
+        "an already-reconciled file must not be reported: {finding:?}",
+    );
+    Ok(())
+}
+
 /// A manifest-digest refresh that FAILS after an in-place heal must surface in
 /// the scrub report, not vanish into a log line: the heal already rewrote the
 /// SST's bytes, so with the refresh lost a manifest that carried a stale
