@@ -982,6 +982,27 @@ impl DataBlock {
         )
     }
 
+    /// Validates the binary index against the sequentially derived restart
+    /// heads (see [`Decoder::verify_binary_index`]): the sequential decode
+    /// never reads the pointers, so a forged pointer passes every
+    /// entry-level cross-check while seeks trust it and can start at the
+    /// wrong restart head.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when a pointer disagrees with its
+    /// restart head; [`crate::Error::InvalidTrailer`] on a malformed trailer.
+    #[cfg_attr(
+        not(feature = "std"),
+        allow(
+            dead_code,
+            reason = "reconcile-gate check; the verify/scrub consumers are std-gated"
+        )
+    )]
+    pub(crate) fn verify_binary_index(&self) -> crate::Result<()> {
+        Decoder::<InternalValue, DataBlockParsedItem>::verify_binary_index(&self.inner)
+    }
+
     /// Returns the binary index length (number of pointers).
     ///
     /// The number of pointers is equal to the number of restart intervals.

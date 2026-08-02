@@ -572,6 +572,59 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
         self.get_binary_index_reader()
     }
 
+    /// Validates the block's BINARY INDEX against the sequentially derived
+    /// restart heads: pointer `i` must hold the byte offset of restart head
+    /// `i`, and the pointer count must match the head count. The sequential
+    /// decode never reads the pointers, so a forged pointer is invisible to
+    /// every entry-level cross-check while the seek path trusts it and can
+    /// start at the wrong restart head, silently missing keys. A block
+    /// without a binary index has nothing to authenticate (seeks fall back
+    /// to sequential scanning).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when the pointer list disagrees with
+    /// the restart heads; [`crate::Error::InvalidTrailer`] when the trailer
+    /// is malformed.
+    #[cfg_attr(
+        not(feature = "std"),
+        allow(
+            dead_code,
+            reason = "reconcile-gate check; the verify/scrub consumers are std-gated"
+        )
+    )]
+    pub(crate) fn verify_binary_index(block: &'a Block) -> crate::Result<()> {
+        let probe = Self::try_new(block)?;
+        let Some(reader) = probe.get_binary_index_reader() else {
+            return Ok(());
+        };
+        let mut scan = Self::try_new(block)?;
+        let mut heads: Vec<usize> = Vec::new();
+        loop {
+            let is_restart = scan.lo_scanner.remaining_in_interval == 0;
+            let head = scan.lo_scanner.offset;
+            if scan.next().is_none() {
+                break;
+            }
+            if is_restart {
+                heads.push(head);
+            }
+        }
+        if reader.len() != heads.len() {
+            return Err(crate::Error::InvalidHeader(
+                "binary index pointer count disagrees with the block's restart heads",
+            ));
+        }
+        for (idx, head) in heads.iter().enumerate() {
+            if reader.get(idx) != *head {
+                return Err(crate::Error::InvalidHeader(
+                    "a binary index pointer disagrees with its restart head",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Hash index reader built from the trailer metadata cached at
     /// construction, with no re-parse of the block trailer. Returns `None`
     /// when the block carries no hash index (`hash_index_len == 0`).

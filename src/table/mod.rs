@@ -1983,6 +1983,12 @@ impl Table {
             .section(b"data")
             .ok_or(crate::Error::InvalidHeader("data section missing"))?;
         head.try_iter(self.comparator.clone())?;
+        // The sequential walk below never reads the BINARY INDEX pointers,
+        // so a pointer redirected to another restart head passes mirror
+        // equality, tiling, and every separator check — yet the seek path
+        // trusts it after reopen. Authenticate the pointers against the
+        // sequentially derived restart heads.
+        head.verify_binary_index()?;
         let keyed: alloc::vec::Vec<KeyedBlockHandle> = head
             .iter(self.comparator.clone())
             .map(|i| i.materialize(head.as_slice()))
@@ -2012,6 +2018,9 @@ impl Table {
                     self.metadata.ecc_params,
                 )?;
                 part.try_iter(self.comparator.clone())?;
+                // Same pointer authentication as the TLI above: a partition
+                // seek trusts its binary index too.
+                part.verify_binary_index()?;
                 let part_keyed: alloc::vec::Vec<KeyedBlockHandle> = part
                     .iter(self.comparator.clone())
                     .map(|i| i.materialize(part.as_slice()))
@@ -2524,6 +2533,10 @@ impl Table {
             let block = self.load_block_from_disk(&block_handle, BlockType::Data)?;
             let data_block =
                 DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())?;
+            // A block whose keys all resolve through its HASH index never
+            // exercises the binary index in the probes below, yet range
+            // seeks still trust it — authenticate the pointers directly.
+            data_block.verify_binary_index()?;
             let entries: Vec<InternalValue> = data_block
                 .try_iter(self.comparator.clone())?
                 .map(|p| p.materialize(data_block.as_slice()))
