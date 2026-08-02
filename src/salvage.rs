@@ -908,8 +908,25 @@ fn salvage_blocks(
             if off < cursor {
                 continue;
             }
-            let next = off.saturating_add(u64::from(keyed.as_ref().size()));
-            items.push((*keyed.as_ref(), Some(keyed.end_key().clone())));
+            // Trust the indexed SPAN only after the block's own header
+            // confirms it: an oversized forged handle would otherwise
+            // advance the cursor past back-to-back blocks the gap walk
+            // should discover (the oversized non-ECC frame still decodes
+            // its first payload, so nothing later would flag the loss).
+            let (handle, end_key) = match table.probe_block_handle_at(off, section_end) {
+                Ok(probed) if probed.size() == keyed.as_ref().size() => {
+                    (*keyed.as_ref(), Some(keyed.end_key().clone()))
+                }
+                // The physical frame disagrees: walk the physically framed
+                // block instead (the lying handle's separator is just as
+                // untrusted as its span).
+                Ok(probed) => (probed, None),
+                // An unframeable header cannot refute the index; keep the
+                // handle — a genuinely corrupt block drops at load.
+                Err(_) => (*keyed.as_ref(), Some(keyed.end_key().clone())),
+            };
+            let next = off.saturating_add(u64::from(handle.size()));
+            items.push((handle, end_key));
             cursor = cursor.max(next);
         }
         if cursor < section_end {
