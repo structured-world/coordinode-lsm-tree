@@ -2613,11 +2613,15 @@ impl Table {
     ///   after that many blocks — a smaller forge drops the tail);
     /// - the disk-fresh per-KV footer descriptor matches the recovery-time
     ///   one (a re-stamped `None` would misread footer bytes as the trailer
-    ///   after reopen).
-    ///
-    /// The seqno bounds are deliberately NOT compared: the writer excludes
-    /// the tombstone sentinel's synthetic seqno from the recorded range, so
-    /// the decoded range can legitimately exceed it.
+    ///   after reopen);
+    /// - for tables WITHOUT a range-tombstone sentinel, the recorded
+    ///   `seqno#min` is at or below the decoded minimum and `seqno#kv_max`
+    ///   is at or above the decoded maximum (a raised min / lowered max
+    ///   hides visible versions from snapshot reads). RT-bearing tables skip
+    ///   this: the writer records the KV range EXCLUDING the sentinel's
+    ///   synthetic RT-derived seqno, so the decoded range legitimately
+    ///   differs — and those tables are already gated by the fail-closed
+    ///   deletion-metadata attribution rule.
     ///
     /// # Errors
     ///
@@ -2673,6 +2677,8 @@ impl Table {
         let mut block_count: u64 = 0;
         let mut first_key: Option<UserKey> = None;
         let mut last_key: Option<UserKey> = None;
+        let mut seqno_lo: Option<SeqNo> = None;
+        let mut seqno_hi: Option<SeqNo> = None;
         for handle in self.block_index.iter() {
             let handle = handle?;
             let block_handle = BlockHandle::new(handle.offset(), handle.size());
@@ -2689,11 +2695,45 @@ impl Table {
             if let Some(last) = entries.last() {
                 last_key = Some(last.key.user_key.clone());
             }
+            for entry in &entries {
+                let s = entry.key.seqno;
+                seqno_lo = Some(seqno_lo.map_or(s, |lo| lo.min(s)));
+                seqno_hi = Some(seqno_hi.map_or(s, |hi| hi.max(s)));
+            }
         }
         if count != meta.item_count {
             return Err(crate::Error::InvalidHeader(
                 "meta item_count disagrees with the decoded entry count",
             ));
+        }
+
+        // Seqno bounds route snapshot visibility: `get_for_key_cmp` skips this
+        // table when the query snapshot is at or below the recorded minimum,
+        // and treats it as fully visible above the recorded maximum. Both
+        // meta mirrors re-stamped with `seqno#min` raised (or `seqno#kv_max`
+        // lowered) pass every other gate yet silently hide older / newer
+        // visible versions after reopen. Cross-check against the decoded
+        // seqnos — but ONLY for tables WITHOUT a range-tombstone sentinel:
+        // the writer emits that synthetic entry with an RT-derived seqno
+        // OUTSIDE the recorded KV range and restores the bounds around it, so
+        // the decoded min/max legitimately differ there. Deletion-metadata
+        // tables are already gated by the fail-closed attribution rule, so
+        // they need no separate seqno check. A recorded minimum ABOVE the
+        // real minimum, or a recorded KV maximum BELOW the real maximum, is
+        // corruption.
+        if regions.range_tombstones.is_none()
+            && let (Some(lo), Some(hi)) = (seqno_lo, seqno_hi)
+        {
+            if meta.seqnos.0 > lo {
+                return Err(crate::Error::InvalidHeader(
+                    "meta seqno#min is above the decoded minimum seqno",
+                ));
+            }
+            if meta.highest_kv_seqno < hi {
+                return Err(crate::Error::InvalidHeader(
+                    "meta seqno#kv_max is below the decoded maximum seqno",
+                ));
+            }
         }
         // `Table::scan` hands the recorded count to the compaction scanner,
         // which stops after that many blocks: a count re-stamped SMALLER
