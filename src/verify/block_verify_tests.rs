@@ -629,6 +629,57 @@ fn verify_sst_file_flags_a_duplicate_toc_section_name() {
     );
 }
 
+/// A healthy SST with a PARTITIONED Bloom filter must verify clean: the
+/// writer emits the `filter_tli` block with the Index role (it is a
+/// top-level index over filter partitions, same encoding as the data
+/// TLI), so a role map expecting Filter there flags a role mismatch on an
+/// intact file — and `repair_with_salvage` would grade the healthy table
+/// corrupt and quarantine or re-salvage it.
+#[test]
+fn verify_sst_file_accepts_a_partitioned_filter() {
+    use crate::InternalValue;
+    use crate::ValueType::Value;
+    use crate::table::Writer;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sst_path = dir.path().join("partitioned");
+    let mut writer = Writer::new(sst_path.clone(), 0, 0, Arc::new(crate::fs::StdFs))
+        .unwrap()
+        .use_partitioned_filter()
+        // A tiny partition budget so several filter partitions spill and
+        // the writer emits the `filter_tli` top-level index over them.
+        .use_meta_partition_size(3);
+    for i in 0u64..64 {
+        writer
+            .write(InternalValue::from_components(
+                format!("key-{i:03}").into_bytes(),
+                format!("val-{i:03}").into_bytes(),
+                i + 1,
+                Value,
+            ))
+            .unwrap();
+    }
+    assert!(writer.finish().unwrap().is_some(), "SST is non-empty");
+
+    // Sanity: the layout actually carries the partitioned filter TLI.
+    {
+        let mut f = std::fs::File::open(&sst_path).unwrap();
+        let reader = crate::sfa::Reader::from_reader(&mut f).unwrap();
+        assert!(
+            reader.toc().iter().any(|e| e.name() == b"filter_tli"),
+            "the fixture must produce a filter_tli section",
+        );
+    }
+
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        report.is_ok(),
+        "a healthy partitioned-filter SST must verify clean: {:?}",
+        report.errors,
+    );
+}
+
 /// Exercises the file-open failure branch (the only path through
 /// `verify_sst_file` that converts an underlying `io::Error` into
 /// a `BlockVerifyError::SstFileUnreadable`). A missing file is the
