@@ -151,6 +151,83 @@ fn salvage_recovers_a_block_hidden_by_forged_tli_mirrors() -> crate::Result<()> 
     Ok(())
 }
 
+/// BOTH TLI mirrors re-encoded with the first two handles SWAPPED keep
+/// every block present and the section fully covered — but the stored
+/// order is no longer the offset order the physical tiling assumes. A
+/// tiling pass trusting that order frames the out-of-place block through
+/// the gap probe AND pushes its handle again: the duplicate emit is
+/// rejected by the writer's ordering validation, so an intact block is
+/// reported dropped and the block totals are inflated. The tiling must
+/// re-sort by offset and skip spans it already covered.
+#[test]
+fn salvage_recovers_all_blocks_under_a_reordered_tli() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+    for i in 0u64..64 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    crate::test_forge::forge_tli_mirrors_swap_first_two(&source, 0, None)?;
+
+    let report = salvage_sst(&source, dest, &fs)?;
+    assert!(
+        report.dropped.is_empty(),
+        "every block is intact and covered once, nothing may drop: {report:?}",
+    );
+    assert_eq!(
+        report.entries_salvaged, 64,
+        "a reordered index must not double-walk or lose blocks: {report:?}",
+    );
+    Ok(())
+}
+
+/// An INTERIOR handle omitted from both forged mirrors leaves the hidden
+/// block between two indexed neighbours, exercising the mid-list gap
+/// probe (the truncated-mirror sibling only covers the section-tail
+/// probe). The block must be framed from the physical tiling and
+/// recovered like any indexed block.
+#[test]
+fn salvage_recovers_an_interior_block_hidden_by_forged_tli_mirrors() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+    for i in 0u64..64 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    crate::test_forge::forge_tli_mirrors_drop_interior(&source, 0, None)?;
+
+    let report = salvage_sst(&source, dest, &fs)?;
+    assert!(
+        report.dropped.is_empty(),
+        "every block is intact, nothing may drop: {report:?}",
+    );
+    assert_eq!(
+        report.entries_salvaged, 64,
+        "the interior block both forged mirrors hide must still be recovered: {report:?}",
+    );
+    Ok(())
+}
+
 /// A source whose `seqno_bounds` section is PRESENT but unreadable (the very
 /// rot salvage exists for) must still salvage into a copy WITH the section:
 /// the recover-time load degrades the in-memory map to empty best-effort, so

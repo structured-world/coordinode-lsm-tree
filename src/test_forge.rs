@@ -1485,6 +1485,48 @@ fn tli_forge_frame(
     Ok((identity, transform, IndexBlock::new(block)))
 }
 
+/// Re-encodes BOTH TLI mirrors (`tli`, `tli_tail`) with an INTERIOR handle
+/// removed (the middle of the list), so the hidden block sits between two
+/// indexed neighbours rather than at the section tail. The mirrors stay
+/// equal and every remaining handle is intact — only a physical tiling
+/// cross-check can notice the interior gap. The SST must be unencrypted,
+/// its index uncompressed, and carry >= 3 data blocks.
+pub fn forge_tli_mirrors_drop_interior(
+    path: &std::path::Path,
+    table_id: crate::TableId,
+    ecc: Option<crate::table::block::EccParams>,
+) -> crate::Result<()> {
+    let forged = rebuilt_tli_frame(path, table_id, ecc, |handles| {
+        assert!(
+            handles.len() >= 3,
+            "an interior drop needs a handle strictly between two neighbours",
+        );
+        handles.remove(handles.len() / 2);
+    })?;
+    replace_section_frame(path, b"tli", &forged)?;
+    replace_section_frame(path, b"tli_tail", &forged)
+}
+
+/// Re-encodes BOTH TLI mirrors (`tli`, `tli_tail`) with the FIRST TWO
+/// handles SWAPPED: every handle is still present and intact, the mirrors
+/// stay equal, and the section is still fully covered — but the list is no
+/// longer in offset (key) order. A physical tiling pass that trusts the
+/// stored order double-covers the out-of-place block (once via the gap
+/// probe, once via the handle) unless it re-sorts and skips covered spans.
+/// The SST must be unencrypted, its index uncompressed, and carry >= 2
+/// data blocks.
+pub fn forge_tli_mirrors_swap_first_two(
+    path: &std::path::Path,
+    table_id: crate::TableId,
+    ecc: Option<crate::table::block::EccParams>,
+) -> crate::Result<()> {
+    let forged = rebuilt_tli_frame(path, table_id, ecc, |handles| {
+        handles.swap(0, 1);
+    })?;
+    replace_section_frame(path, b"tli", &forged)?;
+    replace_section_frame(path, b"tli_tail", &forged)
+}
+
 /// Decodes the `tli_tail` mirror's handle list, drops the LAST handle, and
 /// returns the re-encoded Index frame (checksum-, role-, and, under `ecc`,
 /// parity-consistent). The SST must be unencrypted and its index
@@ -1502,7 +1544,9 @@ fn truncated_tli_frame(
 /// Decodes the `tli_tail` mirror's handle list, applies `mutate`, and returns
 /// the re-encoded Index frame (checksum-, role-, and, under `ecc`,
 /// parity-consistent). The SST must be unencrypted and its index
-/// uncompressed, and the mutated list must stay a valid sorted index.
+/// uncompressed, and the mutated list must stay DECODABLE (the delta
+/// encoding does not require sorted input — the reorder forge relies on
+/// that to model an out-of-order forged index).
 fn rebuilt_tli_frame(
     path: &std::path::Path,
     table_id: crate::TableId,
