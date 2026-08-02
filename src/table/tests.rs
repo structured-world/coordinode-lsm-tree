@@ -3105,7 +3105,8 @@ fn heal_data_blocks_in_place_restores_a_secded_block_byte_for_byte() -> crate::R
     assert_ne!(bytes, original, "the seeded fault changed the file");
 
     let table = recover_table_on(&file, checksum, Arc::clone(&fs));
-    let (report, attributable) = table.heal_data_blocks_in_place(crate::fs::SyncMode::Full);
+    let (report, attributable) =
+        table.heal_data_blocks_in_place(crate::fs::SyncMode::Full, table.checksum());
     assert_eq!(report.blocks_healed_in_place, 1, "{report:?}");
     assert_eq!(report.uncorrectable_blocks, 0, "{report:?}");
     // The manifest digest is the HEALTHY file's, but the seeded fault changed
@@ -3167,7 +3168,8 @@ fn heal_data_blocks_in_place_attributes_a_matching_pre_heal_digest() -> crate::R
     // the degraded-but-readable file as-is), so the pre-heal probe matches.
     let rotted = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &file)?);
     let table = recover_table_on(&file, rotted, Arc::clone(&fs));
-    let (report, attributable) = table.heal_data_blocks_in_place(crate::fs::SyncMode::Full);
+    let (report, attributable) =
+        table.heal_data_blocks_in_place(crate::fs::SyncMode::Full, table.checksum());
     assert_eq!(
         report.blocks_healed_in_place, 1,
         "the rotted trailer is rebuilt in place: {report:?}",
@@ -3223,7 +3225,7 @@ fn heal_data_blocks_in_place_reports_a_block_whose_write_back_fails() -> crate::
     ));
 
     let table = recover_table_on(&file, checksum, fs);
-    let (report, _) = table.heal_data_blocks_in_place(crate::fs::SyncMode::Full);
+    let (report, _) = table.heal_data_blocks_in_place(crate::fs::SyncMode::Full, table.checksum());
     assert_eq!(
         report.blocks_healed_in_place, 0,
         "a failed write-back heals nothing: {report:?}",
@@ -3266,7 +3268,7 @@ fn heal_data_blocks_in_place_is_a_noop_on_a_non_ecc_sst() -> crate::Result<()> {
     };
 
     let table = recover_table_on(&file, checksum, fs);
-    let (report, _) = table.heal_data_blocks_in_place(crate::fs::SyncMode::Full);
+    let (report, _) = table.heal_data_blocks_in_place(crate::fs::SyncMode::Full, table.checksum());
     assert!(
         report.blocks_scanned > 0,
         "the walk inspected blocks: {report:?}"
@@ -3325,7 +3327,7 @@ fn heal_data_blocks_in_place_reports_when_the_file_cannot_be_opened() -> crate::
     // the read-only fallback may reopen freely afterwards.
     injector.arm(FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other)).once());
 
-    let (report, _) = table.heal_data_blocks_in_place(crate::fs::SyncMode::Full);
+    let (report, _) = table.heal_data_blocks_in_place(crate::fs::SyncMode::Full, table.checksum());
     assert!(
         report.blocks_scanned >= 1,
         "the read-only fallback still scans the table: {report:?}",

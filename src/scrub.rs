@@ -379,7 +379,19 @@ fn scan_and_reconcile(
                 .map(|p| p.enter_mutation_window())
         })
         .flatten();
-    let (mut partial, heal_attributable) = scan_one(table, options, tree.sync_mode());
+    // The CURRENT manifest digest for this table, read under the heal lock:
+    // a concurrent patrol may have refreshed the manifest after this
+    // caller's table view was captured, and both the attribution probe and
+    // the reconciliation must judge against what the manifest says NOW.
+    // Fall back to the captured view's snapshot when the table has already
+    // been compacted away (nothing left to attribute against).
+    let manifest_checksum = tree
+        .current_version()
+        .iter_tables()
+        .find(|t| t.id() == table.id())
+        .map_or_else(|| table.checksum(), crate::table::Table::checksum);
+    let (mut partial, heal_attributable) =
+        scan_one(table, options, tree.sync_mode(), manifest_checksum);
     if heals
         && wants_checksum_refresh(&partial)
         && let Some(finding) = refresh_healed_checksum(tree, table, heal_attributable)
@@ -679,6 +691,7 @@ fn scan_one(
     table: &crate::table::Table,
     options: &PatrolScrubOptions,
     sync_mode: crate::fs::SyncMode,
+    manifest_checksum: crate::Checksum,
 ) -> (PatrolScrubReport, bool) {
     // In-place heal only applies to SSTs written with Page-ECC parity — there is
     // nothing to reconstruct without it. A table with no ECC still needs its
@@ -687,9 +700,9 @@ fn scan_one(
     // whose per-block reconstruction is a no-op there.
     #[cfg(feature = "page_ecc")]
     if options.heal_in_place && table.metadata.ecc_params.is_some() {
-        return table.heal_data_blocks_in_place(sync_mode);
+        return table.heal_data_blocks_in_place(sync_mode, manifest_checksum);
     }
-    let _ = (options, sync_mode);
+    let _ = (options, sync_mode, manifest_checksum);
     (table.scrub_data_blocks(), false)
 }
 

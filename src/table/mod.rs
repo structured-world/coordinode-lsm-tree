@@ -1432,10 +1432,15 @@ impl Table {
     /// `F_FULLFSYNC` hardware barrier per block when the caller selected
     /// [`SyncMode::Normal`](crate::fs::SyncMode::Normal).
     ///
+    /// `manifest_checksum` is the table's CURRENT manifest digest, read by
+    /// the caller under the per-table heal lock: a concurrent patrol may
+    /// have refreshed the manifest after this view was captured, and the
+    /// attribution probe must compare against what the manifest says NOW.
     #[cfg(feature = "page_ecc")]
     pub(crate) fn heal_data_blocks_in_place(
         &self,
         sync_mode: crate::fs::SyncMode,
+        manifest_checksum: Checksum,
     ) -> (crate::scrub::PatrolScrubReport, bool) {
         use crate::scrub::{PatrolScrubReport, ScrubError};
         use std::io::{Seek, SeekFrom, Write};
@@ -1657,8 +1662,9 @@ impl Table {
                         Ok(Some(fresh)) => {
                             // Still the pre-heal bytes: capture attribution
                             // before the first write lands.
-                            let _ = pre_heal_matched
-                                .get_or_insert_with(|| self.pre_heal_digest_matches());
+                            let _ = pre_heal_matched.get_or_insert_with(|| {
+                                self.pre_heal_digest_matches(manifest_checksum)
+                            });
                             // First write: make sure no checkpoint link
                             // shares the inode (lazy detach).
                             if let Err(reason) = self.ensure_unshared_for_write(
@@ -1758,7 +1764,8 @@ impl Table {
                     };
                     // Still the pre-heal bytes: capture attribution before
                     // the first write lands.
-                    let _ = pre_heal_matched.get_or_insert_with(|| self.pre_heal_digest_matches());
+                    let _ = pre_heal_matched
+                        .get_or_insert_with(|| self.pre_heal_digest_matches(manifest_checksum));
                     // First write: make sure no checkpoint link shares the
                     // inode (lazy detach).
                     if let Err(reason) =
@@ -1828,15 +1835,20 @@ impl Table {
         (report, pre_heal_matched == Some(true))
     }
 
-    /// Whether the file's CURRENT digest equals the manifest digest — the
+    /// Whether the file's CURRENT digest equals `manifest_checksum` — the
     /// attribution probe [`Self::heal_data_blocks_in_place`] takes right
-    /// before its first write-back. A failed digest read grades `false`
-    /// (unattributable), never an error: attribution only widens what the
-    /// reconciliation may refresh, so losing it fails closed.
+    /// before its first write-back. The caller supplies the CURRENT
+    /// manifest digest (read under the per-table heal lock), not this
+    /// view's snapshot: a concurrent patrol may have refreshed the manifest
+    /// after this view was captured, and comparing against the stale
+    /// snapshot would mark a legitimate heal unattributable. A failed
+    /// digest read grades `false` (unattributable), never an error:
+    /// attribution only widens what the reconciliation may refresh, so
+    /// losing it fails closed.
     #[cfg(feature = "page_ecc")]
-    fn pre_heal_digest_matches(&self) -> bool {
+    fn pre_heal_digest_matches(&self, manifest_checksum: Checksum) -> bool {
         match crate::repair::compute_table_checksum(&*self.fs, &self.path) {
-            Ok(raw) => crate::Checksum::from_raw(raw) == self.checksum(),
+            Ok(raw) => crate::Checksum::from_raw(raw) == manifest_checksum,
             Err(e) => {
                 log::warn!(
                     "pre-heal digest probe failed for table #{} at {}: {e}",
