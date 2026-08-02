@@ -1370,6 +1370,46 @@ fn heal_in_place_does_not_restamp_over_a_forged_hash_index() -> crate::Result<()
     Ok(())
 }
 
+/// The reconcile gates must judge the bytes ON DISK, not the block cache:
+/// a block read before the forge leaves its pristine copy cached, and a
+/// gate that loads through the cache validates that stale original instead
+/// of the file being reconciled. Same forge as
+/// [`heal_in_place_does_not_restamp_over_a_forged_hash_index`], but with a
+/// point read FIRST so the pristine first data block is cached when the
+/// heal scan runs — the refresh must still be refused.
+#[test]
+fn heal_in_place_does_not_trust_cached_blocks_over_the_disk_bytes() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sst_path = write_ecc_sst_footered_hashed(dir.path());
+
+    let tree = open_ecc_hashed_tree(dir.path());
+    // Warm the block cache with the PRISTINE first data block (the key lives
+    // in it), then forge the on-disk hash index; the cached copy stays good.
+    assert!(
+        tree.get("key-000000", MAX_SEQNO)?.is_some(),
+        "pre-forge read warms the cache",
+    );
+    crate::test_forge::forge_hash_index_all_free(&sst_path, Some((8, 2)))?;
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
+        "a forged hash index must refuse the digest refresh even when the \
+         pristine block is cached: {report:?}",
+    );
+
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the forged SST must keep failing verify_integrity: restamping its \
+         digest would let point reads miss existing keys after the cache cools",
+    );
+    Ok(())
+}
+
 /// The digest reconciliation must not restamp over FORGED metadata SEQUENCE
 /// bounds: on a footer-bearing table WITHOUT deletion metadata (no sentinel
 /// to complicate the bounds), both meta mirrors re-stamped with `seqno#min`
