@@ -1358,6 +1358,103 @@ pub fn forge_tli_mirrors_lower_first_separator(
     replace_section_frame(path, b"tli_tail", &forged)
 }
 
+/// Re-stamps the LAST binary-index pointer of BOTH TLI mirrors (`tli`,
+/// `tli_tail`) to the FIRST pointer's value, then re-encodes each frame
+/// (fresh checksum, role, and, under `ecc`, parity). The entry stream is
+/// untouched, so a sequential decode still yields every correct separator
+/// and handle — mirror equality, section tiling, and the separator
+/// cross-checks all pass — yet the index binary search trusts the forged
+/// pointer and can land on the wrong restart head, silently missing keys
+/// on seeks after reopen. Only a comparison of each pointer against the
+/// sequentially derived restart heads can catch it. The SST must be
+/// unencrypted, its index uncompressed, and carry >= 2 data blocks.
+pub fn forge_tli_binary_index_pointer(
+    path: &std::path::Path,
+    table_id: crate::TableId,
+    ecc: Option<crate::table::block::EccParams>,
+) -> crate::Result<()> {
+    use crate::table::block::{Block, BlockIdentity, BlockType};
+    use crate::table::{BlockHandle, BlockOffset, IndexBlock};
+
+    let identity = BlockIdentity {
+        table_id,
+        block_type: BlockType::Index,
+        dict_id: 0,
+        window_log: 0,
+    };
+    let transform = {
+        let t = crate::table::block::BlockTransform::from_parts(
+            crate::CompressionType::None,
+            None,
+            #[cfg(zstd_any)]
+            None,
+        )?;
+        if let Some(ecc) = ecc {
+            t.with_ecc(ecc)
+        } else {
+            t
+        }
+    };
+
+    let (tail_pos, tail_len) = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"tli_tail") else {
+            panic!("the SST must carry a tli_tail mirror");
+        };
+        (
+            usize::try_from(entry.pos()).expect("pos fits usize"),
+            usize::try_from(entry.len()).expect("len fits usize"),
+        )
+    };
+    let (mut payload, bi_offset, bi_len, step) = {
+        let file = crate::fs::Fs::open(
+            &crate::fs::StdFs,
+            path,
+            &crate::fs::FsOpenOptions::new().read(true),
+        )?;
+        let block = Block::from_file(
+            &*file,
+            BlockHandle::new(
+                BlockOffset(u64::try_from(tail_pos).expect("pos fits u64")),
+                u32::try_from(tail_len).expect("tail section fits u32"),
+            ),
+            identity,
+            &transform,
+        )?;
+        let index = IndexBlock::new(block);
+        // Locate the binary index from the trailer metadata.
+        let meta = index.decoder_meta().expect("tli trailer parses");
+        (
+            index.as_slice().to_vec(),
+            usize::try_from(meta.binary_index_offset()).expect("offset fits usize"),
+            usize::try_from(meta.binary_index_len()).expect("len fits usize"),
+            usize::from(meta.binary_index_step_size()),
+        )
+    };
+    assert!(
+        bi_len >= 2,
+        "the forge needs at least two pointers so first != last",
+    );
+    let first: Vec<u8> = payload
+        .get(bi_offset..bi_offset + step)
+        .expect("first pointer within the payload")
+        .to_vec();
+    let last_at = bi_offset + (bi_len - 1) * step;
+    payload
+        .get_mut(last_at..last_at + step)
+        .expect("last pointer within the payload")
+        .copy_from_slice(&first);
+
+    let mut forged = Vec::new();
+    Block::write_into(&mut forged, &payload, identity, &transform)?;
+    replace_section_frame(path, b"tli", &forged)?;
+    replace_section_frame(path, b"tli_tail", &forged)
+}
+
 /// Decodes the `tli_tail` mirror's handle list, drops the LAST handle, and
 /// returns the re-encoded Index frame (checksum-, role-, and, under `ecc`,
 /// parity-consistent). The SST must be unencrypted and its index

@@ -217,6 +217,26 @@ pub struct DecoderMeta {
     cached_entries_end: usize,
 }
 
+impl DecoderMeta {
+    /// Byte offset of the binary index within the block payload.
+    #[must_use]
+    pub(crate) fn binary_index_offset(&self) -> u32 {
+        self.binary_index_offset
+    }
+
+    /// Number of binary-index pointers (one per restart head).
+    #[must_use]
+    pub(crate) fn binary_index_len(&self) -> u32 {
+        self.binary_index_len
+    }
+
+    /// Width of one binary-index pointer in bytes (2 or 4).
+    #[must_use]
+    pub(crate) fn binary_index_step_size(&self) -> u8 {
+        self.binary_index_step_size
+    }
+}
+
 impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Parsed> {
     #[must_use]
     pub fn restart_interval(&self) -> u8 {

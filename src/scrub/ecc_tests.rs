@@ -1617,6 +1617,44 @@ fn heal_in_place_does_not_restamp_over_a_forged_tli_separator() -> crate::Result
     Ok(())
 }
 
+/// The digest reconciliation must not restamp over a FORGED TLI BINARY
+/// INDEX: both mirrors re-stamped with the last binary-index pointer
+/// redirected to the first restart head leave the sequential entry stream
+/// untouched, so mirror equality, section tiling, and every separator
+/// cross-check pass — yet after reopen the index binary search trusts the
+/// forged pointer and can start at the wrong restart head, silently
+/// missing keys on seeks. Each disk-fresh pointer must be validated
+/// against the sequentially derived restart heads.
+#[test]
+fn heal_in_place_does_not_restamp_over_a_forged_tli_binary_index() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _) = write_ecc_sst_footered(dir.path());
+
+    let tree = open_ecc_tree(dir.path());
+    crate::test_forge::forge_tli_binary_index_pointer(
+        &sst_path,
+        0,
+        Some(crate::table::block::EccParams::try_new(8, 2)?),
+    )?;
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
+        "a forged TLI binary index must refuse the digest refresh: {report:?}",
+    );
+
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the forged SST must keep failing verify_integrity: restamping its \
+         digest would let index seeks start at the wrong restart head",
+    );
+    Ok(())
+}
+
 /// A LEGITIMATE heal on a tombstone-bearing table must still reconcile the
 /// manifest digest: attribution (the pre-write digest matched the manifest,
 /// so the file now differs by exactly this pass's verified corrections)
