@@ -1016,7 +1016,12 @@ pub fn forge_hash_index_bucket(
 ) -> crate::Result<()> {
     use crate::table::block::hash_index::MARKER_CONFLICT;
     patch_first_data_block_hash_index(path, shards, |region| {
-        // One byte per bucket, so the region length is the bucket count.
+        // One byte per bucket, so the region length is the bucket count; the
+        // modulo keeps the result below it, hence within usize.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "hash % region.len() < region.len() <= usize::MAX"
+        )]
         let bucket = (crate::hash::hash64(key) % region.len() as u64) as usize;
         let Some(slot) = region.get_mut(bucket) else {
             panic!("bucket within the hash index");

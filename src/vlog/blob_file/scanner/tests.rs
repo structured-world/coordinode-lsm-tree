@@ -549,6 +549,10 @@ fn blob_scanner_resyncs_when_a_chained_frame_swallows_the_next() -> crate::Resul
     // Re-stamp frame 1's on_disk_val_len so its declared end reaches frame
     // 3, swallowing frame 2, and recompute the header CRC so the frame is
     // CRC-valid (the payload checksum then fails on the wrong-length value).
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "BLOB_HEADER_LEN is the 42-byte header constant, well within u32"
+    )]
     let header = BLOB_HEADER_LEN as u32;
     let f3_off = 113u32;
     let swallow_odl = f3_off - header - 3; // header + key + odl == f3_off
