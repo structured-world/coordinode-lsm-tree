@@ -143,6 +143,7 @@ fn quarantine_file(
     table_base_folder: &std::path::Path,
     src: &std::path::Path,
     file_name: &str,
+    sync_mode: crate::fs::SyncMode,
 ) -> crate::Result<PathBuf> {
     let quarantine_dir = table_base_folder
         .parent()
@@ -151,6 +152,7 @@ fn quarantine_file(
     fs.create_dir_all(&quarantine_dir)?;
     let dest = quarantine_dir.join(file_name);
     fs.rename(src, &dest)?;
+    let _ = sync_mode;
     Ok(dest)
 }
 
@@ -571,7 +573,13 @@ fn recover_blob_files(
             // quarantine itself fails the bad name stays in place and the tree
             // would not reopen, so fail the repair rather than report a false
             // success.
-            let dest = quarantine_file(&*config.fs, &blobs_folder, &blob_path, &file_name)?;
+            let dest = quarantine_file(
+                &*config.fs,
+                &blobs_folder,
+                &blob_path,
+                &file_name,
+                config.sync_mode,
+            )?;
             unreadable.push((
                 blob_path,
                 format!(
@@ -741,8 +749,13 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                 // `tables/` into a sibling quarantine dir; report where it went.
                 // If the quarantine itself fails the bad name stays in place, so
                 // fail the repair rather than report a false success.
-                let dest =
-                    quarantine_file(&*folder_fs, &table_base_folder, &table_path, &file_name)?;
+                let dest = quarantine_file(
+                    &*folder_fs,
+                    &table_base_folder,
+                    &table_path,
+                    &file_name,
+                    config.sync_mode,
+                )?;
                 unreadable_files.push((
                     table_path,
                     format!(
@@ -821,6 +834,7 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                                 &table_base_folder,
                                 &table_path,
                                 &file_name,
+                                config.sync_mode,
                             ) {
                                 Ok(dest) => unreadable_files.push((
                                     table_path,
@@ -847,6 +861,7 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                                 &table_base_folder,
                                 &table_path,
                                 &file_name,
+                                config.sync_mode,
                             )?;
                             match try_salvage_table(
                                 config,
@@ -889,8 +904,13 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                     // quarantine aborts the repair (the `?`): a manifest
                     // omitting a still-in-place file would let the next open's
                     // orphan cleanup delete the only copy.
-                    let quarantined =
-                        quarantine_file(&*folder_fs, &table_base_folder, &table_path, &file_name)?;
+                    let quarantined = quarantine_file(
+                        &*folder_fs,
+                        &table_base_folder,
+                        &table_path,
+                        &file_name,
+                        config.sync_mode,
+                    )?;
                     match try_salvage_table(config, &folder_fs, &quarantined, &table_path, table_id)
                     {
                         Ok(Some(table)) => {

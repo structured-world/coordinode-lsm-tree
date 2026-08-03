@@ -1,6 +1,35 @@
-use super::{compute_table_checksum, highest_existing_version_id};
+use super::{compute_table_checksum, highest_existing_version_id, quarantine_file};
 use crate::fs::StdFs;
 use test_log::test;
+
+/// `quarantine_file` must fsync BOTH affected directories (the source's parent
+/// and the `repair-quarantine/` destination) before returning success: a
+/// rename is durable only once both directory entries are on disk. Without it a
+/// power loss after repair returns can lose the destination entry or restore
+/// the source under `tables/`, and the next open's orphan cleanup then deletes
+/// the only copy meant for manual recovery. Fault-inject the
+/// destination-directory fsync: a build that never syncs the directory never
+/// triggers the fault and wrongly reports the move durable.
+#[test]
+fn quarantine_file_syncs_the_affected_directories() {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, SyncMode};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir().unwrap();
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables).unwrap();
+    let src = tables.join("junk-name");
+    std::fs::write(&src, b"orphan").unwrap();
+
+    let fs = FaultFs::new(StdFs);
+    fs.injector().arm(
+        FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+            .on_path("repair-quarantine"),
+    );
+
+    quarantine_file(&fs, &tables, &src, "junk-name", SyncMode::Full)
+        .expect_err("the destination-directory fsync fault must surface");
+}
 
 #[test]
 fn compute_table_checksum_matches_oneshot_xxh3() -> crate::Result<()> {
