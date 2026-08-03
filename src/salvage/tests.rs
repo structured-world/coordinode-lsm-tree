@@ -1,7 +1,8 @@
 use super::{BlobDropReason, DropReason, salvage_blob_file, salvage_sst};
-// The options-bearing entry is exercised only by the encrypted / dictionary /
-// delete-resurrection salvage tests, which are themselves feature-gated.
-#[cfg(any(feature = "encryption", feature = "columnar", zstd_any))]
+// The options-bearing entry is exercised on every feature set: the
+// prefix-extractor round-trip below is ungated (extractors are core
+// configuration), so the import must not hide behind the encrypted /
+// dictionary / delete-resurrection gates its other consumers carry.
 use super::{SalvageOptions, salvage_sst_with_options};
 use crate::comparator::default_comparator;
 use crate::fs::{Fs, StdFs};
