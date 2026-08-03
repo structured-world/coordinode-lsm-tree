@@ -996,8 +996,52 @@ pub fn forge_hash_index_all_free(
     path: &std::path::Path,
     shards: Option<(u8, u8)>,
 ) -> crate::Result<()> {
-    use crate::coding::{Decode, Encode};
     use crate::table::block::hash_index::MARKER_FREE;
+    patch_first_data_block_hash_index(path, shards, |region| region.fill(MARKER_FREE))
+}
+
+/// Re-stamps the FIRST data block's hash-index bucket for `key` (a
+/// CONFLICT marker for a key spanning restart intervals) to `binary_index_pos`,
+/// so `point_read` follows the forged bucket straight to that restart head
+/// instead of the sequential scan — returning an OLDER version of a
+/// multi-version key while the sequential decode still sees the newest.
+/// Every logical entry and the per-KV footer stay valid; only a
+/// newest-version cross-check of the point-read result can catch it. Same
+/// preconditions as [`forge_hash_index_all_free`].
+pub fn forge_hash_index_bucket(
+    path: &std::path::Path,
+    key: &[u8],
+    binary_index_pos: u8,
+    shards: Option<(u8, u8)>,
+) -> crate::Result<()> {
+    use crate::table::block::hash_index::MARKER_CONFLICT;
+    patch_first_data_block_hash_index(path, shards, |region| {
+        // One byte per bucket, so the region length is the bucket count.
+        let bucket = (crate::hash::hash64(key) % region.len() as u64) as usize;
+        let Some(slot) = region.get_mut(bucket) else {
+            panic!("bucket within the hash index");
+        };
+        assert_eq!(
+            *slot, MARKER_CONFLICT,
+            "the target key's bucket must be a conflict marker (spans restart intervals)",
+        );
+        *slot = binary_index_pos;
+    })
+}
+
+/// Shared machinery for the hash-index forges: locates the FIRST data
+/// block's embedded hash index, hands its on-disk bytes to `patch`, and
+/// re-stamps the block header checksum plus (for a parity-bearing SST) the
+/// block's parity trailer. The SST must be uncompressed, unencrypted, carry
+/// a hash index, and carry per-KV footers (the block is re-parsed with
+/// `has_kv_footer = true`). `shards` is the descriptor scheme (`None` when
+/// parity-less).
+fn patch_first_data_block_hash_index(
+    path: &std::path::Path,
+    shards: Option<(u8, u8)>,
+    patch: impl FnOnce(&mut [u8]),
+) -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
     use crate::table::block::{Block, Header};
     use crate::table::{DataBlock, block::BlockType};
 
@@ -1046,7 +1090,7 @@ pub fn forge_hash_index_all_free(
         let Some(region) = bytes.get_mut(start..start + hi_len) else {
             panic!("hash index within the payload");
         };
-        region.fill(MARKER_FREE);
+        patch(region);
     }
 
     // Re-stamp the block header checksum over the altered payload.

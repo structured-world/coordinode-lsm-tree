@@ -834,6 +834,76 @@ fn salvage_recovers_a_reclaimable_weak_tombstone_pair() -> crate::Result<()> {
     Ok(())
 }
 
+/// The point-read reachability gate must require the probe to return the
+/// NEWEST version of a key, not merely SOME version. A key spanning two
+/// restart intervals has a CONFLICT-marked hash bucket; redirecting that
+/// bucket to the later interval (an OLDER version) still makes
+/// `point_read(MAX_SEQNO)` return `Some`, so an `is_none` check would pass
+/// — yet reads after reopen return the stale value. The `Writer` is driven
+/// directly (two versions of one key in one block, `restart_interval = 1`,
+/// hashed, footered) because a memtable flush deduplicates shadowed
+/// versions and cannot produce this layout.
+#[test]
+fn verify_point_read_reachability_rejects_a_bucket_redirected_to_an_older_version()
+-> crate::Result<()> {
+    use crate::runtime_config::{ChecksumAlgorithm, KvChecksumPolicy};
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_data_block_hash_ratio(2.0)
+        .use_data_block_restart_interval(1)
+        .use_kv_checksums(KvChecksumPolicy::AllLevels, ChecksumAlgorithm::Xxh3_64);
+    // "key-a" twice: newest (seqno 2) then older (seqno 1), so both are
+    // restart heads in the first block and the key's bucket conflicts.
+    writer.write(InternalValue::from_components(
+        b"key-a".to_vec(),
+        b"new".to_vec(),
+        2,
+        ValueType::Value,
+    ))?;
+    writer.write(InternalValue::from_components(
+        b"key-a".to_vec(),
+        b"old".to_vec(),
+        1,
+        ValueType::Value,
+    ))?;
+    for k in [b"key-b", b"key-c"] {
+        writer.write(InternalValue::from_components(
+            k.to_vec(),
+            b"v".to_vec(),
+            1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Sanity: the intact table passes the reachability gate.
+    open(source.clone(), &fs)?.verify_point_read_reachability()?;
+
+    // Redirect the conflicting bucket to binary-index pos 1 — the second
+    // restart head, holding the OLDER (seqno 1) version.
+    crate::test_forge::forge_hash_index_bucket(&source, b"key-a", 1, None)?;
+
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_point_read_reachability() else {
+        panic!("a bucket redirected to an older version must fail the gate");
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::InvalidHeader(
+                "a decoded key's point_read does not return its newest version \
+                 (an in-block index disagrees with the entries)"
+            )
+        ),
+        "the redirect must be rejected by the newest-version check, got {err:?}",
+    );
+    Ok(())
+}
+
 /// A corrupt `filter_tli` block (rotted payload, stale checksum) must not
 /// fail a SALVAGE-mode open: the salvage walk never consults the source's
 /// filter — the destination writer rebuilds it from the recovered keys —
