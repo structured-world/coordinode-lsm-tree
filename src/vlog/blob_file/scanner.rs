@@ -273,13 +273,17 @@ impl Iterator for Scanner {
 
         // Verify the declared frame payload fits within the data section
         // before allocating buffers. For a writer-chained frame the header
-        // CRC has vouched for the lengths, so an over-long declared end means
-        // the file itself is truncated — nothing past it can be readable;
-        // terminate. For a RESYNC CANDIDATE the CRC only proves internal
-        // consistency (the magic may sit inside a damaged record's
-        // user-controlled bytes, CRC computed over fake fields), so the
-        // over-long end condemns the candidate, not the tail: resynchronize
-        // strictly past it.
+        // A declared payload that overruns the data section or the 256 MiB
+        // cap makes the span UNTRUSTWORTHY, so resynchronize at the next
+        // real frame regardless of how this position was reached. A resync
+        // candidate's magic may sit inside a damaged record's
+        // user-controlled bytes; a writer-chained frame's header CRC vouches
+        // for its lengths at parse time, but a re-stamped length that
+        // recomputes the header CRC passes that check and can declare past
+        // the section — terminating would then leave every intact later
+        // frame uninspected. Resync parks at the section end when no further
+        // magic exists, so a genuine truncation still terminates cleanly on
+        // the next call.
         {
             let header_len = super::writer::BLOB_HEADER_LEN as u64;
             // `key_len` / `on_disk_val_len` come from the on-disk frame header and
@@ -297,13 +301,9 @@ impl Iterator for Scanner {
             let over_cap = u64::from(real_val_len) > MAX_DECOMPRESSION_SIZE as u64
                 || u64::from(on_disk_val_len) > MAX_DECOMPRESSION_SIZE as u64;
             if over_cap || frame_end.is_none_or(|end| end > self.data_end) {
-                if self.resynced {
-                    if let Err(e) = self.resync_to_next_frame(offset) {
-                        self.is_terminated = true;
-                        return Some(Err(e));
-                    }
-                } else {
+                if let Err(e) = self.resync_to_next_frame(offset) {
                     self.is_terminated = true;
+                    return Some(Err(e));
                 }
                 return Some(Err(crate::Error::InvalidHeader("Blob")));
             }
