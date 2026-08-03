@@ -1682,6 +1682,78 @@ fn repair_with_salvage_quarantines_a_toc_hidden_range_tombstone_sst() -> crate::
     Ok(())
 }
 
+/// `repair_with_salvage` must QUARANTINE (not salvage) a table whose
+/// `range_tombstones` section is RENAMED to another recognized name (here
+/// `filter_tli`) with its block role re-stamped to match. The catalogue stays
+/// uniquely named and perfectly tiled, so the deletion-hiding TOC check clears
+/// it, but the relabeled section is graded corrupt (its bytes are not a filter
+/// index) and salvage would DISCARD it while re-emitting the covered keys as
+/// live, resurrecting the deletion. A corrupt REBUILDABLE side section must
+/// fail closed: it may be a relabeled deletion salvage cannot see.
+#[test]
+fn repair_with_salvage_quarantines_a_range_tombstone_renamed_to_a_rebuildable_section()
+-> crate::Result<()> {
+    use crate::range_tombstone::RangeTombstone;
+    use crate::table::Writer;
+    use crate::table::block::BlockType;
+    use crate::{Config, InternalValue, SequenceNumberCounter, UserKey, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?;
+        for i in 0..8u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        w.write_range_tombstone(RangeTombstone::new(
+            UserKey::from(b"k00002".as_slice()),
+            UserKey::from(b"k00005".as_slice()),
+            2,
+        ));
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Rename `range_tombstones` -> `filter_tli` and re-stamp its block role to
+    // Index: the parsed table now reports no tombstones, and the catalogue is
+    // uniquely named and tiled.
+    crate::test_forge::forge_duplicate_section_name(
+        &sst,
+        b"range_tombstones",
+        b"filter_tli",
+        BlockType::Index,
+    )?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair_with_salvage(true)?;
+
+    assert_eq!(
+        report.salvaged, 0,
+        "a relabeled range_tombstones must not be salvaged into a live copy: {:?}",
+        report.unreadable_files,
+    );
+    assert_eq!(report.recovered, 0, "no table joins the rebuilt manifest");
+    assert!(
+        dir.path().join("repair-quarantine").join("0").exists(),
+        "the relabeled table must be quarantined for manual recovery: {:?}",
+        report.unreadable_files,
+    );
+    Ok(())
+}
+
 /// A tail meta whose ECC descriptor is forged to a DIFFERENT recognized
 /// scheme (here: `Off`) while its table id stays valid must not dictate the
 /// walk's trailer sizing: the probe must arbitrate against the intact MID
