@@ -2602,6 +2602,24 @@ impl Table {
         for handle in self.block_index.iter() {
             let handle = handle?;
             let block_handle = BlockHandle::new(handle.offset(), handle.size());
+            // Load the disk-fresh row block once so a `Restart` / `Entry`
+            // slot hint can be probed against it below. Columnar blocks carry
+            // no in-block slot semantics (rows are reconstructed on load), so
+            // there the locator is per-block and only the block-id is checked.
+            #[cfg(feature = "columnar")]
+            let row_block = if self.metadata.columnar {
+                None
+            } else {
+                Some(DataBlock::from_loaded(
+                    self.load_block_from_disk(&block_handle, BlockType::Data)?,
+                    self.metadata.kv_checksum_algo.is_some(),
+                )?)
+            };
+            #[cfg(not(feature = "columnar"))]
+            let row_block = Some(DataBlock::from_loaded(
+                self.load_block_from_disk(&block_handle, BlockType::Data)?,
+                self.metadata.kv_checksum_algo.is_some(),
+            )?);
             let entries = self.decode_block_entries(&block_handle)?;
             for entry in entries {
                 let user_key = entry.key.user_key.to_vec();
@@ -2609,12 +2627,45 @@ impl Table {
                     continue;
                 }
                 let key_hash = crate::hash::hash64(&user_key);
-                if let Some((located, _)) = locator.locate_block(key_hash)?
-                    && located.offset() != block_handle.offset()
-                {
+                let Some((located, hint)) = locator.locate_block(key_hash)? else {
+                    continue;
+                };
+                if located.offset() != block_handle.offset() {
                     return Err(crate::Error::InvalidHeader(
                         "locator resolves a key to a block other than its newest-version block",
                     ));
+                }
+                // A `Restart` / `Entry` slot hint sends `point_read_at_slot`
+                // straight to that in-block position: a checksum-clean
+                // locator can keep the right block id yet redirect the slot
+                // to a later restart interval holding an OLDER version of a
+                // multi-version key, and the read returns the stale value
+                // without falling back to the sorted index. Probe the hint
+                // and require the NEWEST version (the first decoded entry for
+                // the key, which is `entry` here since `located` == this
+                // block). A `None` hint (per-block precision) has no slot to
+                // validate.
+                if let (Some((slot, is_entry)), Some(block)) = (hint, row_block.as_ref()) {
+                    let found = block.point_read_at_slot(
+                        slot,
+                        is_entry,
+                        user_key.as_ref(),
+                        crate::seqno::MAX_SEQNO,
+                        &self.comparator,
+                    )?;
+                    let disagrees = match &found {
+                        Some(v) => {
+                            v.key.seqno != entry.key.seqno
+                                || v.key.value_type != entry.key.value_type
+                                || v.value != entry.value
+                        }
+                        None => true,
+                    };
+                    if disagrees {
+                        return Err(crate::Error::InvalidHeader(
+                            "locator slot hint does not resolve a key's newest version",
+                        ));
+                    }
                 }
             }
         }
