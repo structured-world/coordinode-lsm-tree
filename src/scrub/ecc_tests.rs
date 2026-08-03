@@ -2262,9 +2262,19 @@ fn heal_in_place_refuses_to_detach_under_a_pinned_descriptor() -> crate::Result<
     };
 
     let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    // The refused detach specifically: an UncorrectableBlock finding whose
+    // reason names the unshare refusal, not any unrelated failure.
     assert!(
-        !report.is_ok(),
-        "a refused detach must surface the blocked write-backs as findings: {report:?}",
+        report.errors.iter().any(|e| matches!(
+            e,
+            ScrubError::UncorrectableBlock { reason, .. }
+                if reason.starts_with("unshare hard-linked SST for heal: ")
+        )),
+        "a refused detach must surface as an unshare finding: {report:?}",
+    );
+    assert_eq!(
+        report.blocks_healed_in_place, 0,
+        "no block may be healed when the detach is refused: {report:?}",
     );
     assert_eq!(
         std::fs::read(&sst_path)?,

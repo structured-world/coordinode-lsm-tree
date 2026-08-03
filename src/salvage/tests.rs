@@ -1002,14 +1002,23 @@ fn salvage_degrades_an_unreadable_filter_index() -> crate::Result<()> {
             pos
         };
         let mut bytes = std::fs::read(&source)?;
-        // Past the block header, inside the payload.
-        let at = pos + 40;
+        // First payload byte, derived from the block header length (filter_tli
+        // is an Index block) so a header-layout change cannot slide the flip
+        // into the header and leave the payload untouched.
+        let at =
+            pos + crate::table::block::Header::header_len(crate::table::block::BlockType::Index);
         let Some(slot) = bytes.get_mut(at) else {
             panic!("payload byte within the file");
         };
         *slot ^= 0xFF;
         std::fs::write(&source, bytes)?;
     }
+
+    // Provably corrupt: a LIVE open fails closed on the rotted filter index.
+    assert!(
+        open(source.clone(), &fs).is_err(),
+        "the rotted filter index must fail a live open",
+    );
 
     let report = salvage_sst(&source, dest, &fs)?;
     assert!(

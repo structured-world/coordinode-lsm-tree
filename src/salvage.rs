@@ -925,7 +925,14 @@ fn salvage_blocks(
                 // handle — a genuinely corrupt block drops at load.
                 Err(_) => (*keyed.as_ref(), Some(keyed.end_key().clone())),
             };
-            let next = off.saturating_add(u64::from(handle.size()));
+            // A confirmed / physically framed span (the Ok arms) ends within
+            // the section by construction; only the unframeable Err arm keeps
+            // an UNVERIFIED indexed size, so bound the advance to the section
+            // end — a forged oversized size must not skip past later bytes the
+            // final gap probe should re-examine.
+            let next = off
+                .saturating_add(u64::from(handle.size()))
+                .min(section_end);
             items.push((handle, end_key));
             cursor = cursor.max(next);
         }
