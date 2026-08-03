@@ -524,6 +524,62 @@ fn blob_scanner_resyncs_when_a_candidate_frame_declares_past_the_section() -> cr
     Ok(())
 }
 
+/// A CRC-VALID frame at a WRITER-CHAINED position whose length was
+/// re-stamped so the declared payload OVERRUNS the data section (a bounds
+/// rejection, not a checksum one) must resynchronize too: a bounds
+/// rejection makes the declared span untrusted regardless of how the
+/// position was reached, so terminating would leave every intact later
+/// frame uninspected while salvage reports only the one corrupt record.
+#[test]
+fn blob_scanner_resyncs_when_a_chained_frame_declares_past_the_section() -> crate::Result<()> {
+    use crate::vlog::blob_file::writer::{BLOB_HEADER_LEN, compute_header_crc};
+
+    let dir = tempdir()?;
+    let blob_file_path = dir.path().join("0");
+    {
+        let mut writer = BlobFileWriter::new(&blob_file_path, 0, 0, &StdFs)?;
+        writer.write(b"aaa", 7, b"first_value")?;
+        writer.write(b"bbb", 7, b"second_value")?;
+        writer.write(b"ccc", 7, b"third_value")?;
+        writer.finish()?;
+    }
+
+    // Re-stamp frame 1's on_disk_val_len so its declared end overruns the
+    // whole data section, and recompute the header CRC so the frame is
+    // CRC-valid (the bounds check then rejects it before any allocation).
+    {
+        let mut bytes = std::fs::read(&blob_file_path)?;
+        let huge = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+        bytes[34..38].copy_from_slice(&huge.to_le_bytes());
+        let crc = compute_header_crc(7, 3, 11, huge);
+        bytes[38..42].copy_from_slice(&crc.to_le_bytes());
+        let _ = BLOB_HEADER_LEN;
+        std::fs::write(&blob_file_path, bytes)?;
+    }
+
+    let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
+    let first = scanner.next().unwrap();
+    assert!(
+        matches!(first, Err(crate::Error::InvalidHeader("Blob"))),
+        "the over-section frame is bounds-rejected: {first:?}",
+    );
+    let Some(second) = scanner.next() else {
+        panic!("the intact frame 2 must survive the over-section frame");
+    };
+    let second = second?;
+    assert_eq!(
+        second.key,
+        Slice::from(&b"bbb"[..]),
+        "frame 2 is recovered, not lost to a terminated scan",
+    );
+    let Some(third) = scanner.next() else {
+        panic!("frame 3 follows");
+    };
+    assert_eq!(third?.key, Slice::from(&b"ccc"[..]));
+    assert!(scanner.next().is_none());
+    Ok(())
+}
+
 /// A CRC-VALID frame at a WRITER-CHAINED position (not a resync candidate)
 /// whose on-disk length was re-stamped to consume an intact later frame,
 /// then fails its payload checksum, must resynchronize — a checksum
