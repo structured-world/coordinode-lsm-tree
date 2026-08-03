@@ -192,6 +192,64 @@ fn salvage_recovers_all_blocks_under_a_reordered_tli() -> crate::Result<()> {
     Ok(())
 }
 
+/// A partitioned index whose MIDDLE leaf partition is corrupt yields only the
+/// earlier partitions' handles before erroring, setting `index_broken`. The
+/// physical data section is still intact, writer-ordered, and self-framing, so
+/// salvage must walk it independently and recover EVERY data block instead of
+/// re-emitting only the enumerated prefix and silently dropping the failed and
+/// later partitions' blocks.
+#[test]
+fn salvage_recovers_physical_blocks_past_a_broken_index_partition() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // Tiny data blocks + a partitioned index spread the 256 blocks across
+    // several leaf partitions (no range tombstone, so salvage re-emits rather
+    // than failing closed).
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_data_block_size(128)
+        .use_partitioned_index();
+    for i in 0u64..256 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Corrupt the middle of the `index` section (a leaf partition), desyncing
+    // the handle enumeration partway while leaving the data section intact.
+    let (index_pos, index_len) = {
+        let mut f = std::fs::File::open(&source)?;
+        let reader = crate::sfa::Reader::from_reader(&mut f)?;
+        let entry = reader
+            .toc()
+            .iter()
+            .find(|e| e.name() == b"index")
+            .map(|e| (e.pos(), e.len()))
+            .expect("a partitioned-index SST must carry an index section");
+        entry
+    };
+    let flip = usize::try_from(index_pos + index_len / 2).unwrap_or(0);
+    let mut bytes = std::fs::read(&source)?;
+    if let Some(b) = bytes.get_mut(flip) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_sst(&source, dest, &fs)?;
+    assert_eq!(
+        report.entries_salvaged, 256,
+        "every data block must be recovered via the physical walk when the \
+         index enumeration breaks: {report:?}",
+    );
+    Ok(())
+}
+
 /// An INTERIOR handle omitted from both forged mirrors leaves the hidden
 /// block between two indexed neighbours, exercising the mid-list gap
 /// probe (the truncated-mirror sibling only covers the section-tail
