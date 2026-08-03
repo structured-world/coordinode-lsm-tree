@@ -3,6 +3,17 @@ use crate::{Slice, fs::StdFs, vlog::blob_file::writer::Writer as BlobFileWriter}
 use tempfile::tempdir;
 use test_log::test;
 
+// Blob frame header field offsets, derived from the field widths (magic 4 +
+// checksum 16 + seqno 8 + key_len 2 + real_val_len 4 + on_disk_val_len 4 +
+// header_crc 4 = BLOB_HEADER_LEN), so a header-layout change moves these in
+// lockstep with the writer instead of desyncing hard-coded literals.
+const OD_LEN_OFF: usize = 4 + 16 + 8 + 2 + 4;
+const HDR_CRC_OFF: usize = OD_LEN_OFF + 4;
+const _: () = assert!(
+    HDR_CRC_OFF + 4 == crate::vlog::blob_file::writer::BLOB_HEADER_LEN,
+    "the derived header field offsets must tile the blob header",
+);
+
 #[test]
 fn blob_scanner() -> crate::Result<()> {
     let dir = tempdir()?;
@@ -323,12 +334,11 @@ fn blob_scanner_header_crc_rot_resyncs_to_next_frame() -> crate::Result<()> {
     let dir = tempdir()?;
     let blob_file_path = write_two_frames(dir.path())?;
 
-    // Inflate frame 1's on_disk_val_len field (frame offset 34..38: magic 4 +
-    // checksum 16 + seqno 8 + key_len 2 + real_val_len 4). The header CRC no
-    // longer matches, so the lengths are untrusted.
+    // Inflate frame 1's on_disk_val_len field (offset derived from the header
+    // layout). The header CRC no longer matches, so the lengths are untrusted.
     {
         let mut bytes = std::fs::read(&blob_file_path)?;
-        bytes[34..38].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[OD_LEN_OFF..OD_LEN_OFF + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         std::fs::write(&blob_file_path, bytes)?;
     }
 
@@ -532,7 +542,7 @@ fn blob_scanner_resyncs_when_a_candidate_frame_declares_past_the_section() -> cr
 /// frame uninspected while salvage reports only the one corrupt record.
 #[test]
 fn blob_scanner_resyncs_when_a_chained_frame_declares_past_the_section() -> crate::Result<()> {
-    use crate::vlog::blob_file::writer::{BLOB_HEADER_LEN, compute_header_crc};
+    use crate::vlog::blob_file::writer::compute_header_crc;
 
     let dir = tempdir()?;
     let blob_file_path = dir.path().join("0");
@@ -550,10 +560,9 @@ fn blob_scanner_resyncs_when_a_chained_frame_declares_past_the_section() -> crat
     {
         let mut bytes = std::fs::read(&blob_file_path)?;
         let huge = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-        bytes[34..38].copy_from_slice(&huge.to_le_bytes());
+        bytes[OD_LEN_OFF..OD_LEN_OFF + 4].copy_from_slice(&huge.to_le_bytes());
         let crc = compute_header_crc(7, 3, 11, huge);
-        bytes[38..42].copy_from_slice(&crc.to_le_bytes());
-        let _ = BLOB_HEADER_LEN;
+        bytes[HDR_CRC_OFF..HDR_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes());
         std::fs::write(&blob_file_path, bytes)?;
     }
 
@@ -614,11 +623,9 @@ fn blob_scanner_resyncs_when_a_chained_frame_swallows_the_next() -> crate::Resul
     let swallow_odl = f3_off - header - 3; // header + key + odl == f3_off
     {
         let mut bytes = std::fs::read(&blob_file_path)?;
-        // Header field offsets: real_val_len 30..34, on_disk_val_len 34..38,
-        // header_crc 38..42; seqno 20..28, key_len 28..30.
-        bytes[34..38].copy_from_slice(&swallow_odl.to_le_bytes());
+        bytes[OD_LEN_OFF..OD_LEN_OFF + 4].copy_from_slice(&swallow_odl.to_le_bytes());
         let crc = compute_header_crc(7, 3, 11, swallow_odl);
-        bytes[38..42].copy_from_slice(&crc.to_le_bytes());
+        bytes[HDR_CRC_OFF..HDR_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes());
         std::fs::write(&blob_file_path, bytes)?;
     }
 

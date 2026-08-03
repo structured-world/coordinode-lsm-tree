@@ -2620,7 +2620,17 @@ impl Table {
                 self.load_block_from_disk(&block_handle, BlockType::Data)?,
                 self.metadata.kv_checksum_algo.is_some(),
             )?);
-            let entries = self.decode_block_entries(&block_handle)?;
+            // Reuse the already-loaded row block for row tables (its entries
+            // are what `decode_block_entries` would re-decode); only the
+            // columnar path needs the separate reconstruction decode.
+            use crate::table::block::ParsedItem as _;
+            let entries: Vec<InternalValue> = match row_block.as_ref() {
+                Some(block) => block
+                    .try_iter(self.comparator.clone())?
+                    .map(|p| p.materialize(block.as_slice()))
+                    .collect(),
+                None => self.decode_block_entries(&block_handle)?,
+            };
             for entry in entries {
                 let user_key = entry.key.user_key.to_vec();
                 if !seen.insert(user_key.clone()) {

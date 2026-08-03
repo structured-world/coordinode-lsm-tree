@@ -1472,9 +1472,12 @@ pub fn forge_tli_binary_index_pointer(
 /// source's HONEST triples with one key's slot redirected to a later
 /// restart interval: the block id stays correct so the block-id gate
 /// passes, yet `point_read_at_slot` starts at the wrong interval and
-/// returns an older version. The SST must be unencrypted, non-ECC, and
-/// already carry a `locator` section. `table_id` is the SST's id (0 for a
-/// standalone Writer fixture).
+/// returns an older version. The SST must be unencrypted, non-ECC,
+/// already carry a `locator` section, AND have been written with
+/// `Restart` precision — the helper hardcodes `Restart` and does not read
+/// the source's precision byte, so forging an `Entry` / `Block`-precision
+/// SST would silently change its slot semantics. `table_id` is the SST's
+/// id (0 for a standalone Writer fixture).
 pub fn forge_locator_slots(
     path: &std::path::Path,
     table_id: crate::TableId,

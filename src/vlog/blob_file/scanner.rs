@@ -272,9 +272,9 @@ impl Iterator for Scanner {
         };
 
         // Verify the declared frame payload fits within the data section
-        // before allocating buffers. For a writer-chained frame the header
-        // A declared payload that overruns the data section or the 256 MiB
-        // cap makes the span UNTRUSTWORTHY, so resynchronize at the next
+        // before allocating buffers. A declared payload that overruns the
+        // data section or the 256 MiB cap makes the span UNTRUSTWORTHY, so
+        // resynchronize at the next
         // real frame regardless of how this position was reached. A resync
         // candidate's magic may sit inside a damaged record's
         // user-controlled bytes; a writer-chained frame's header CRC vouches
