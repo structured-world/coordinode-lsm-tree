@@ -1499,6 +1499,50 @@ fn heal_in_place_does_not_restamp_over_a_forged_created_at() -> crate::Result<()
     Ok(())
 }
 
+/// The digest reconciliation must not restamp over a `created_at` back-dated
+/// while the tree was CLOSED. The post-open forge above is caught by the
+/// field-for-field bounds check because the live table keeps the honest
+/// recovery-time copy; an OFFLINE restamp defeats that check by poisoning the
+/// recovery-time copy itself — recovery loads the forged `created_at`, so the
+/// disk-fresh copy equals it. The manifest's whole-file digest is then the
+/// only surviving record of the honest bytes, and the mismatch it produces is
+/// UNATTRIBUTABLE to any heal. Because no cross-check can re-derive a
+/// wall-clock timestamp, an unattributed mismatch must fail closed even on a
+/// footer-bearing table; otherwise the patrol would persist the forged digest
+/// and FIFO compaction would drop the live SST as TTL-expired.
+#[test]
+fn heal_in_place_rejects_a_created_at_restamped_before_open() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _) = write_ecc_sst_footered(dir.path());
+
+    // Back-date `created_at` in BOTH mirrors BEFORE the tree opens: recovery
+    // then loads the forgery into the live table's metadata.
+    crate::test_forge::forge_meta_value_both_mirrors(
+        &sst_path,
+        b"created_at",
+        &1u128.to_le_bytes(),
+    )?;
+
+    let tree = open_ecc_tree(dir.path());
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
+        "an unattributed mismatch on a footer-bearing table must not reconcile a \
+         pre-open created_at restamp: {report:?}",
+    );
+
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the forged SST must keep failing verify_integrity: restamping its digest \
+         would let FIFO compaction drop the live SST as TTL-expired",
+    );
+    Ok(())
+}
+
 /// The digest reconciliation must not restamp over a FORGED KV-footer
 /// DESCRIPTOR: both meta mirrors re-stamped with `descriptor#kv_checksum`
 /// set to off while the footer-bearing data blocks are left intact. The
