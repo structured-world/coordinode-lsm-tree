@@ -820,10 +820,11 @@ fn salvage_blocks(
 
     // Enumerate the index handles first. A corrupt index entry stops the
     // collection after reporting it: once the index stream desyncs, later
-    // entries are unknowable (the physical fallback below only runs for a
-    // CLEANLY enumerated index, whose omissions are forgery, not rot).
+    // entries are unknowable. This is NOT the end of recovery — the physical
+    // data section is still writer-ordered and self-framing, so the tiling
+    // walk below recovers every block the broken enumeration could not reach
+    // (a mid-partition rot must not cost the failed and later partitions).
     let mut indexed: Vec<crate::table::KeyedBlockHandle> = Vec::new();
-    let mut index_broken = false;
     for handle in table.data_block_handles() {
         match handle {
             Ok(k) => indexed.push(k),
@@ -834,24 +835,25 @@ fn salvage_blocks(
                     reason: DropReason::HeaderCorrupted(format!("{e:?}")),
                     key_range: None,
                 });
-                index_broken = true;
                 break;
             }
         }
     }
 
-    // Cross-check a cleanly enumerated index against the PHYSICAL data
-    // section: both TLI mirrors forged to the SAME handle list pass every
-    // byte-level check and the mirror comparison, so an OMITTED handle is
-    // invisible to the open — the writer emits blocks back-to-back, making
-    // the section tiling the only ground truth. Frame each uncovered byte
-    // range from its block headers and salvage those blocks too (their end
-    // key is unknown until decode); an unframeable gap is reported dropped,
-    // never silently skipped.
+    // Walk the PHYSICAL data section regardless of how the index enumeration
+    // went. Two failure modes both need it:
+    // - A CLEANLY enumerated index can still OMIT a handle (both TLI mirrors
+    //   forged to the same truncated list pass every byte-level check and the
+    //   mirror comparison), invisible to the open.
+    // - A BROKEN index (a rotted leaf partition) yields only a prefix, leaving
+    //   the failed and later partitions' blocks unreferenced.
+    // The writer emits blocks back-to-back, so the section tiling is the only
+    // ground truth: frame each uncovered byte range from its block headers and
+    // salvage those blocks too (their end key is unknown until decode); an
+    // unframeable gap is reported dropped, never silently skipped. The index
+    // handles that DID enumerate still contribute their end keys.
     let mut items: Vec<(crate::table::BlockHandle, Option<UserKey>)> = Vec::new();
-    let data_section = if index_broken {
-        None
-    } else {
+    let data_section = {
         let mut file = table
             .fs
             .open(&table.path, &crate::fs::FsOpenOptions::new().read(true))?;
@@ -940,7 +942,8 @@ fn salvage_blocks(
             probe_gap(cursor, section_end, &mut items, &mut dropped);
         }
     } else {
-        // Broken index or unreadable TOC: walk exactly what the index gave.
+        // Unreadable TOC (no physical data section to tile against): walk
+        // exactly what the index enumeration gave.
         for keyed in indexed {
             let handle = *keyed.as_ref();
             items.push((handle, Some(keyed.end_key().clone())));
