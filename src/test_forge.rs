@@ -1466,6 +1466,42 @@ pub fn forge_tli_binary_index_pointer(
     replace_section_frame(path, b"tli_tail", &forged)
 }
 
+/// Rebuilds the `locator` section from `entries` (`(key_hash, block_id,
+/// slot)` triples under `Restart` precision) and re-frames it (fresh
+/// checksum, `Locator` role, no ECC / encryption). The caller passes the
+/// source's HONEST triples with one key's slot redirected to a later
+/// restart interval: the block id stays correct so the block-id gate
+/// passes, yet `point_read_at_slot` starts at the wrong interval and
+/// returns an older version. The SST must be unencrypted, non-ECC, and
+/// already carry a `locator` section. `table_id` is the SST's id (0 for a
+/// standalone Writer fixture).
+pub fn forge_locator_slots(
+    path: &std::path::Path,
+    table_id: crate::TableId,
+    entries: &[(u64, u64, u64)],
+) -> crate::Result<()> {
+    use crate::table::block::{Block, BlockIdentity, BlockType};
+
+    let spec = crate::table::locator::LocatorSpec {
+        precision: crate::config::LocatorPrecision::Restart,
+        block_id_bits: None,
+        slot_bits: None,
+    };
+    let Some(section) = crate::table::locator::build_locator_section(entries, spec) else {
+        panic!("the forged locator entries must build a section");
+    };
+    let identity = BlockIdentity {
+        table_id,
+        block_type: BlockType::Locator,
+        dict_id: 0,
+        window_log: 0,
+    };
+    let transform = crate::table::block::BlockTransform::PLAIN;
+    let mut forged = Vec::new();
+    Block::write_into(&mut forged, &section, identity, &transform)?;
+    replace_section_frame(path, b"locator", &forged)
+}
+
 /// Re-encodes the `zone_map` section WITHOUT its LAST block entry (fresh
 /// checksum, `ZoneMap` role): paired with a TLI forge hiding the same
 /// trailing block, the positioning chain over the remaining indexed

@@ -834,6 +834,92 @@ fn salvage_recovers_a_reclaimable_weak_tombstone_pair() -> crate::Result<()> {
     Ok(())
 }
 
+/// `verify_locator` must validate the SLOT hint, not only the block id: a
+/// `Restart`-precision locator can keep the correct block id yet redirect
+/// a key's slot to a later restart interval holding an older version, so
+/// `point_read_at_slot` returns the stale value without falling back to
+/// the sorted index. The `Writer` is driven directly (two versions of one
+/// key in one block, `restart_interval = 1`, locator enabled) and the
+/// locator section is rebuilt with that key's slot pushed from the newest
+/// head (0) to the older head (1).
+#[test]
+fn verify_locator_rejects_a_slot_hint_pointing_at_an_older_version() -> crate::Result<()> {
+    use crate::config::{LocatorPolicyEntry, LocatorPrecision};
+    use crate::runtime_config::{ChecksumAlgorithm, KvChecksumPolicy};
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_data_block_restart_interval(1)
+        .use_kv_checksums(KvChecksumPolicy::AllLevels, ChecksumAlgorithm::Xxh3_64)
+        .use_locator(LocatorPolicyEntry::Enabled {
+            precision: LocatorPrecision::Restart,
+            block_id_bits: None,
+            slot_bits: None,
+        });
+    // Restart heads (restart_interval = 1) in one block: key-a@2 (head 0),
+    // key-a@1 (head 1), key-b (head 2), key-c (head 3).
+    writer.write(InternalValue::from_components(
+        b"key-a".to_vec(),
+        b"new".to_vec(),
+        2,
+        ValueType::Value,
+    ))?;
+    writer.write(InternalValue::from_components(
+        b"key-a".to_vec(),
+        b"old".to_vec(),
+        1,
+        ValueType::Value,
+    ))?;
+    writer.write(InternalValue::from_components(
+        b"key-b".to_vec(),
+        b"vb".to_vec(),
+        1,
+        ValueType::Value,
+    ))?;
+    writer.write(InternalValue::from_components(
+        b"key-c".to_vec(),
+        b"vc".to_vec(),
+        1,
+        ValueType::Value,
+    ))?;
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Sanity: the honest locator passes the gate.
+    open(source.clone(), &fs)?.verify_locator()?;
+
+    // Rebuild the locator with key-a's slot pushed to head 1 (the older
+    // version); key-b / key-c keep their honest heads (2 / 3). block_id 0
+    // for the single block.
+    let h = |k: &[u8]| crate::hash::hash64(k);
+    crate::test_forge::forge_locator_slots(
+        &source,
+        0,
+        &[
+            (h(b"key-a"), 0, 1),
+            (h(b"key-b"), 0, 2),
+            (h(b"key-c"), 0, 3),
+        ],
+    )?;
+
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_locator() else {
+        panic!("a slot hint pointing at an older version must fail the gate");
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::InvalidHeader(
+                "locator slot hint does not resolve a key's newest version"
+            )
+        ),
+        "the redirect must be rejected by the slot-hint check, got {err:?}",
+    );
+    Ok(())
+}
+
 /// `verify_filter` must probe the extractor's PREFIX hashes, not only
 /// complete-key hashes: a full filter built WITHOUT the configured
 /// extractor (a salvage that dropped it, or a forge) still answers every
