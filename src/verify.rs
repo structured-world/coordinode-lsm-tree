@@ -1467,7 +1467,7 @@ pub(crate) fn toc_may_hide_deletion_section(toc: &crate::sfa::Toc, toc_pos: u64)
         let name = entry.name();
         // A duplicate recognized name (e.g. `range_tombstones` renamed to a
         // second `data`) shadows the original from every `Toc::section` lookup.
-        if seen.iter().any(|n| *n == name) {
+        if seen.contains(&name) {
             return true;
         }
         seen.push(name);
