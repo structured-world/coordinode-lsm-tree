@@ -589,7 +589,7 @@ fn refresh_healed_checksum(
     // to SKIP point reads — a key made into a false negative silently
     // disappears from every read. Probe every decoded key against the
     // on-disk filter (a no-op without one) before trusting the digest.
-    if let Err(e) = table.verify_filter() {
+    if let Err(e) = table.verify_filter(tree.prefix_extractor().as_ref()) {
         return finding(alloc::format!(
             "digest mismatch with a filter cross-check failure ({e}); \
              the manifest digest was not refreshed"

@@ -403,6 +403,11 @@ impl AbstractTree for BlobTree {
         self.index.sync_mode()
     }
 
+    fn prefix_extractor(&self) -> Option<alloc::sync::Arc<dyn crate::prefix::PrefixExtractor>> {
+        // The prefix filter is built over the index tree's SST keys.
+        self.index.prefix_extractor()
+    }
+
     fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
         // Forward the index tree's compaction state (the default impl would
         // always report idle), and mark value bytes as NOT user values: large

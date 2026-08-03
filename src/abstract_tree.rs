@@ -128,6 +128,13 @@ pub trait AbstractTree: sealed::Sealed {
     #[doc(hidden)]
     fn sync_mode(&self) -> crate::fs::SyncMode;
 
+    /// The tree's configured prefix extractor, or `None` when it indexes no
+    /// prefixes. The patrol scrub's filter cross-check reads it here so it
+    /// can verify a rebuilt full filter carries the source's prefix hashes,
+    /// not just its complete-key hashes.
+    #[doc(hidden)]
+    fn prefix_extractor(&self) -> Option<alloc::sync::Arc<dyn crate::prefix::PrefixExtractor>>;
+
     /// Returns a read-only snapshot of the tree's on-disk storage footprint:
     /// total used bytes, entry count, the average shape of a stored entry
     /// (average key / value bytes), and an estimate of how many more

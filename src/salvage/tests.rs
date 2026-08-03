@@ -834,6 +834,63 @@ fn salvage_recovers_a_reclaimable_weak_tombstone_pair() -> crate::Result<()> {
     Ok(())
 }
 
+/// `verify_filter` must probe the extractor's PREFIX hashes, not only
+/// complete-key hashes: a full filter built WITHOUT the configured
+/// extractor (a salvage that dropped it, or a forge) still answers every
+/// complete-key probe, yet `maybe_contains_prefix` treats the table as
+/// definitely absent and prefix scans silently omit its rows. No forge is
+/// needed — a `Writer` run without the extractor produces exactly the
+/// filter that lacks the prefix hashes.
+#[test]
+fn verify_filter_rejects_missing_prefix_hashes() -> crate::Result<()> {
+    /// First four key bytes (keys are `keyNNNNN`, so the prefix is `key0`).
+    struct FixedLengthPrefix;
+    impl crate::prefix::PrefixExtractor for FixedLengthPrefix {
+        fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+            key.get(..4).map_or_else(
+                || Box::new(std::iter::empty()) as Box<dyn Iterator<Item = &'a [u8]>>,
+                |p| Box::new(std::iter::once(p)),
+            )
+        }
+
+        fn is_valid_scan_boundary(&self, prefix: &[u8]) -> bool {
+            prefix.len() == 4
+        }
+    }
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let extractor: Arc<dyn crate::prefix::PrefixExtractor> = Arc::new(FixedLengthPrefix);
+
+    // Written WITHOUT the extractor: the full filter holds only complete-key
+    // hashes, exactly the state a salvage-without-extractor leaves behind.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0u32..100 {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    let table = open(source, &fs)?;
+    // Without an extractor the gate only probes complete keys and passes.
+    table.verify_filter(None)?;
+    // WITH the extractor it probes each key's prefix hash, which the filter
+    // never indexed — a false negative on an existing key's prefix.
+    let Err(err) = table.verify_filter(Some(&extractor)) else {
+        panic!("a filter missing the prefix hashes must fail the gate");
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::InvalidHeader(
+                "filter reports an existing key's prefix as definitely absent"
+            )
+        ),
+        "the missing prefix hash must be the rejection reason, got {err:?}",
+    );
+    Ok(())
+}
+
 /// The point-read reachability gate must require the probe to return the
 /// NEWEST version of a key, not merely SOME version. A key spanning two
 /// restart intervals has a CONFLICT-marked hash bucket; redirecting that

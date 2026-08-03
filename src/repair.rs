@@ -270,7 +270,10 @@ fn block_verify_verdict(
         // that disagrees with the decoded blocks is corruption; salvage
         // rebuilds the locator from the re-emitted entries.
         BlockVerifyVerdict::Corrupt
-    } else if table.verify_filter().is_err() {
+    } else if table
+        .verify_filter(config.prefix_extractor.as_ref())
+        .is_err()
+    {
         // A checksum-clean filter re-stamped to another parseable filter
         // makes check_bloom silently skip point reads for any key turned
         // into a false negative. An existing key the filter reports as

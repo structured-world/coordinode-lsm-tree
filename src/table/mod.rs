@@ -2715,7 +2715,10 @@ impl Table {
     /// [`crate::Error::InvalidHeader`] when the filter reports an existing
     /// key as definitely absent; any I/O / decode error from the full scan.
     #[cfg(feature = "std")]
-    pub(crate) fn verify_filter(&self) -> crate::Result<()> {
+    pub(crate) fn verify_filter(
+        &self,
+        prefix_extractor: Option<&alloc::sync::Arc<dyn crate::prefix::PrefixExtractor>>,
+    ) -> crate::Result<()> {
         // Re-read the filter FROM DISK: the open path PINS the filter (or
         // its partition index) in memory at recover time, so an on-disk
         // re-stamp after the open (the very forge this check exists for)
@@ -2852,6 +2855,26 @@ impl Table {
                     return Err(crate::Error::InvalidHeader(
                         "filter reports an existing key as definitely absent",
                     ));
+                }
+                // A full filter also indexes every PREFIX the extractor
+                // emits for a key, and `maybe_contains_prefix` trusts it to
+                // SKIP whole tables on a prefix scan. A filter rebuilt from
+                // complete-key hashes alone (a salvage without the extractor)
+                // passes the key probe above yet turns every prefix into a
+                // false negative — the table silently vanishes from prefix
+                // scans. Probe each emitted prefix hash too. Partitioned
+                // filters stay conservative (their prefix probe is
+                // deliberately best-effort), so this runs only for a full
+                // filter with a configured extractor.
+                if let (Some(filter), Some(extractor)) = (&full_filter, prefix_extractor) {
+                    for prefix in extractor.prefixes(&user_key) {
+                        let prefix_hash = crate::hash::hash64(prefix);
+                        if !filter.maybe_contains_hash(prefix_hash)? {
+                            return Err(crate::Error::InvalidHeader(
+                                "filter reports an existing key's prefix as definitely absent",
+                            ));
+                        }
+                    }
                 }
                 prev_key = Some(user_key);
             }

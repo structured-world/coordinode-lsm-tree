@@ -459,6 +459,10 @@ impl AbstractTree for Tree {
         self.config.sync_mode
     }
 
+    fn prefix_extractor(&self) -> Option<alloc::sync::Arc<dyn crate::prefix::PrefixExtractor>> {
+        self.config.prefix_extractor.clone()
+    }
+
     fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
         // One version snapshot reused for the footprint and the full-compaction
         // estimate below: a second `current_version()` could race a concurrent
