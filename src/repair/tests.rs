@@ -1569,6 +1569,87 @@ fn repair_with_salvage_quarantines_a_corrupt_delete_bitmap_sst() -> crate::Resul
     Ok(())
 }
 
+/// `repair_with_salvage` must QUARANTINE (not salvage) an SST whose TOC HIDES a
+/// deletion section: an omitted `range_tombstones` entry makes the parsed table
+/// report NO tombstones, so the positional salvage walk would re-emit the keys
+/// the tombstone covered as LIVE — resurrecting data the deletion suppressed.
+/// Unlike a corrupt-but-present deletion section (which the salvage guard
+/// catches on the parsed state), a hidden section is invisible to that guard;
+/// the catalogue tiling gap is the only trace, so the repair verdict must
+/// refuse salvage before it reopens the forged catalogue.
+#[test]
+fn repair_with_salvage_quarantines_a_toc_hidden_range_tombstone_sst() -> crate::Result<()> {
+    use crate::range_tombstone::RangeTombstone;
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, UserKey, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?;
+        for i in 0..8u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        // The range tombstone gives the SST the optional `range_tombstones`
+        // section whose hiding resurrects the keys it covers.
+        w.write_range_tombstone(RangeTombstone::new(
+            UserKey::from(b"k00002".as_slice()),
+            UserKey::from(b"k00005".as_slice()),
+            2,
+        ));
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Drop the `range_tombstones` TOC entry: the parsed table now reports no
+    // tombstones (the covered keys look live), and the only out-of-band trace
+    // is the gap the omission leaves in the section tiling.
+    crate::test_forge::forge_section_omitted(&sst, b"range_tombstones")?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair_with_salvage(true)?;
+
+    assert_eq!(
+        report.salvaged, 0,
+        "salvage must not re-emit a TOC-hidden tombstone's covered keys as \
+         live: {:?}",
+        report.unreadable_files,
+    );
+    assert_eq!(report.recovered, 0, "no table joins the rebuilt manifest");
+    assert_eq!(
+        report.unreadable_files.len(),
+        1,
+        "the hidden-deletion table is reported unreadable: {:?}",
+        report.unreadable_files,
+    );
+    // The original SST is preserved in quarantine for manual recovery, not
+    // left in `tables/` (where the next open's orphan cleanup would delete it).
+    let quarantine = dir.path().join("repair-quarantine").join("0");
+    assert!(
+        quarantine.exists(),
+        "the original SST must be quarantined, got {:?}",
+        report.unreadable_files,
+    );
+    assert!(
+        !tables.join("0").exists(),
+        "the corrupt original must not stay in tables/",
+    );
+    Ok(())
+}
+
 /// A tail meta whose ECC descriptor is forged to a DIFFERENT recognized
 /// scheme (here: `Off`) while its table id stays valid must not dictate the
 /// walk's trailer sizing: the probe must arbitrate against the intact MID
