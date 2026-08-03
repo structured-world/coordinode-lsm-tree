@@ -351,6 +351,24 @@ enum RepairKeepDecision {
     Quarantine(&'static str),
 }
 
+/// Whether the on-disk TOC catalogue could HIDE a deletion section — see
+/// [`crate::verify::toc_may_hide_deletion_section`]. A read failure grades
+/// `true` (fail closed): if the catalogue cannot be re-read to prove no section
+/// is hidden, salvage must not trust the parsed absence of deletion metadata.
+fn toc_may_hide_deletions(
+    folder_fs: &Arc<dyn crate::fs::Fs>,
+    table_path: &std::path::Path,
+) -> bool {
+    let Ok(mut file) = folder_fs.open(table_path, &crate::fs::FsOpenOptions::new().read(true))
+    else {
+        return true;
+    };
+    match crate::sfa::Reader::from_reader(&mut file) {
+        Ok(reader) => crate::verify::toc_may_hide_deletion_section(reader.toc(), reader.toc_pos()),
+        Err(_) => true,
+    }
+}
+
 /// Grades a freshly-recovered table into a [`RepairKeepDecision`].
 ///
 /// `Corrupt` always salvages. `DegradedButReadable` (payloads verified clean,
@@ -372,7 +390,28 @@ fn verify_keep_decision(
 ) -> RepairKeepDecision {
     match block_verify_verdict(config, folder_fs, table_path, table) {
         BlockVerifyVerdict::Clean => RepairKeepDecision::Keep,
-        BlockVerifyVerdict::Corrupt => RepairKeepDecision::Salvage,
+        BlockVerifyVerdict::Corrupt => {
+            // A `Corrupt` verdict from a catalogue that could HIDE a deletion
+            // section (an omitted / renamed / shadowed `range_tombstones` or
+            // `delete_bitmap`) must NOT salvage: the positional salvage walk
+            // reopens the same forged TOC, sees no deletion section in the
+            // parsed state, and re-emits the suppressed rows as LIVE —
+            // resurrecting data the deletion metadata masked. The salvage-side
+            // resurrection guard only inspects the PARSED deletion state, which
+            // the concealment defeats, so the refusal has to happen here.
+            // Quarantine for manual recovery unless the tiling proves no
+            // section is hidden.
+            if toc_may_hide_deletions(folder_fs, table_path) {
+                RepairKeepDecision::Quarantine(
+                    "TOC corruption may hide deletion metadata (range tombstones \
+                     / delete bitmap); salvage would reopen the same forged \
+                     catalogue and resurrect suppressed rows — quarantined for \
+                     manual recovery",
+                )
+            } else {
+                RepairKeepDecision::Salvage
+            }
+        }
         BlockVerifyVerdict::DegradedButReadable => {
             if table.range_tombstones().is_empty() {
                 RepairKeepDecision::Salvage

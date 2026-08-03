@@ -1440,6 +1440,58 @@ fn expected_section_roles(name: &[u8]) -> Option<&'static [crate::table::block::
     })
 }
 
+/// Whether the SST's TOC catalogue could HIDE an optional deletion section
+/// (`range_tombstones` / `delete_bitmap`) from the name-based readers. These
+/// sections are optional at parse time, so an unkeyed re-stamp that OMITS,
+/// RENAMES, or SHADOWS one leaves the parsed table reporting no deletions
+/// while every remaining block still passes its byte-level checks — a positional
+/// salvage would then re-emit the suppressed rows as live.
+///
+/// Returns `true` for the concealment classes: a duplicate/shadowing name, a
+/// gap or trailing hole in the `[0, toc_pos)` tiling, an unrecognized (renamed)
+/// name, or a length overflow. Returns `false` only when the catalogue tiles
+/// the whole data region with UNIQUE, RECOGNIZED names — then no section is
+/// hidden and the physical absence of any deletion section is established.
+///
+/// The recognized-name set mirrors the walk in [`scan_sst_blocks`] exactly
+/// (`expected_section_roles` ∪ [`RAW_FORMAT_SECTIONS`]), so a healthy table
+/// grades `false`.
+///
+/// Consumed by salvage-mode repair: a `Corrupt` verdict caused by one of these
+/// classes must be QUARANTINED, not salvaged, because the positional salvage
+/// walk reopens the same forged catalogue and resurrects the suppressed rows.
+pub(crate) fn toc_may_hide_deletion_section(toc: &crate::sfa::Toc, toc_pos: u64) -> bool {
+    let mut expected_pos: u64 = 0;
+    let mut seen: Vec<&[u8]> = Vec::new();
+    for entry in toc.iter() {
+        let name = entry.name();
+        // A duplicate recognized name (e.g. `range_tombstones` renamed to a
+        // second `data`) shadows the original from every `Toc::section` lookup.
+        if seen.iter().any(|n| *n == name) {
+            return true;
+        }
+        seen.push(name);
+        // A section that does not start where the previous one ended means an
+        // entry between them was dropped from the catalogue (its bytes remain,
+        // leaving the gap).
+        if entry.pos() != expected_pos {
+            return true;
+        }
+        // A name this build does not know is a renamed entry hiding a known
+        // section from every reader.
+        if expected_section_roles(name).is_none() && !RAW_FORMAT_SECTIONS.contains(&name) {
+            return true;
+        }
+        let Some(end) = entry.pos().checked_add(entry.len()) else {
+            return true;
+        };
+        expected_pos = end;
+    }
+    // The sections must tile exactly up to where the TOC begins; a shortfall is
+    // a trailing entry omitted or truncated.
+    expected_pos != toc_pos
+}
+
 /// Structural validation for the raw (non-block-format) sections; returns a
 /// human-readable reason when the section's payload cannot have the shape
 /// the writer emits.
