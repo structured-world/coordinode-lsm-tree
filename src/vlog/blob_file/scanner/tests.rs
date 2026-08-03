@@ -524,6 +524,68 @@ fn blob_scanner_resyncs_when_a_candidate_frame_declares_past_the_section() -> cr
     Ok(())
 }
 
+/// A CRC-VALID frame at a WRITER-CHAINED position (not a resync candidate)
+/// whose on-disk length was re-stamped to consume an intact later frame,
+/// then fails its payload checksum, must resynchronize — a checksum
+/// rejection means the declared span is untrusted regardless of how the
+/// position was reached. Otherwise the scan resumes past the swallowed
+/// frame and salvage drops it without reporting the loss.
+#[test]
+fn blob_scanner_resyncs_when_a_chained_frame_swallows_the_next() -> crate::Result<()> {
+    use crate::vlog::blob_file::writer::{BLOB_HEADER_LEN, compute_header_crc};
+
+    let dir = tempdir()?;
+    let blob_file_path = dir.path().join("0");
+    {
+        let mut writer = BlobFileWriter::new(&blob_file_path, 0, 0, &StdFs)?;
+        writer.write(b"aaa", 7, b"first_value")?; // 11-byte value
+        writer.write(b"bbb", 7, b"second_value")?;
+        writer.write(b"ccc", 7, b"third_value")?;
+        writer.finish()?;
+    }
+
+    // Frame 1 at offset 0: header 42 + key 3 + value 11 -> ends at 56.
+    // Frame 2: 42 + 3 + 12 -> ends at 113 (= frame 3's offset).
+    // Re-stamp frame 1's on_disk_val_len so its declared end reaches frame
+    // 3, swallowing frame 2, and recompute the header CRC so the frame is
+    // CRC-valid (the payload checksum then fails on the wrong-length value).
+    let header = BLOB_HEADER_LEN as u32;
+    let f3_off = 113u32;
+    let swallow_odl = f3_off - header - 3; // header + key + odl == f3_off
+    {
+        let mut bytes = std::fs::read(&blob_file_path)?;
+        // Header field offsets: real_val_len 30..34, on_disk_val_len 34..38,
+        // header_crc 38..42; seqno 20..28, key_len 28..30.
+        bytes[34..38].copy_from_slice(&swallow_odl.to_le_bytes());
+        let crc = compute_header_crc(7, 3, 11, swallow_odl);
+        bytes[38..42].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&blob_file_path, bytes)?;
+    }
+
+    let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
+    let first = scanner.next().unwrap();
+    assert!(
+        matches!(first, Err(crate::Error::ChecksumMismatch { .. })),
+        "the swallowing frame fails its payload checksum: {first:?}",
+    );
+    let Some(second) = scanner.next() else {
+        panic!("the intact frame 2 must survive the swallowing frame");
+    };
+    let second = second?;
+    assert_eq!(
+        second.key,
+        Slice::from(&b"bbb"[..]),
+        "frame 2 is recovered, not skipped by the re-stamped declared end",
+    );
+    assert_eq!(second.value, Slice::from(&b"second_value"[..]));
+    let Some(third) = scanner.next() else {
+        panic!("frame 3 follows");
+    };
+    assert_eq!(third?.key, Slice::from(&b"ccc"[..]));
+    assert!(scanner.next().is_none());
+    Ok(())
+}
+
 /// Scanner rejects frames with invalid magic (neither V3 nor V4).
 #[test]
 fn blob_scanner_rejects_invalid_magic() -> crate::Result<()> {
