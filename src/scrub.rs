@@ -633,24 +633,34 @@ fn refresh_healed_checksum(
     }
 
     // AUTHORITATIVE content has no cross-check, so an UNATTRIBUTED mismatch
-    // (the pre-heal digest was not probed equal to the manifest, proving the
-    // difference is exactly this pass's verified corrections) must not be
-    // restamped over it. Two authoritative surfaces:
-    // - range_tombstones / delete_bitmap: nothing in-file can re-derive
-    //   which rows or ranges were genuinely deleted;
-    // - VALUE bytes of a footer-less table: every gate above authenticates
-    //   keys, counts, and derived side structures, but a value changed
-    //   behind a re-stamped block checksum decodes cleanly — the manifest
-    //   digest is its only record. Footer-BEARING tables re-derive value
-    //   authentication through verify_kv_checksums above, so their
-    //   stale-digest reconcile (a refresh interrupted on an earlier pass)
-    //   stays available.
-    // Failing closed keeps the alteration visible to verify_integrity, and
-    // the finding recurs until an operator rewrites the table (compaction)
-    // or re-admits it (repair).
+    // (the pre-heal digest did NOT probe equal to the manifest, so the file's
+    // difference from the manifest is not provably this pass's verified
+    // corrections) must never be restamped over. Every table carries content
+    // no gate above can re-derive:
+    // - non-derivable meta scalars — `created_at` (a wall clock has no in-file
+    //   source; FIFO trusts it for TTL) and the per-KV footer descriptor (an
+    //   on/off flag). The field-for-field bounds check authenticates these
+    //   only against the RECOVERY-TIME copy, which an OFFLINE restamp before
+    //   open poisons, so it cannot arbitrate a re-stamp of them;
+    // - range_tombstones / delete_bitmap: nothing in-file re-derives which
+    //   rows or ranges were genuinely deleted;
+    // - VALUE bytes of a footer-less table: a value changed behind a
+    //   re-stamped block checksum decodes cleanly.
+    // The manifest's whole-file digest is the ONLY surviving record of the
+    // honest bytes for all three, so an unattributed mismatch fails closed
+    // REGARDLESS of footers (verify_kv_checksums re-derives value bytes, but
+    // not the meta scalars, so footers do not make the reconcile safe). Only
+    // the attributable path above — the pre-heal digest matched the manifest,
+    // proving the file differs solely by this pass's corrections — reconciles;
+    // a manifest left stale by an interrupted refresh now waits for a
+    // compaction / repair rewrite (which recomputes the digest legitimately)
+    // instead of auto-reconciling. Failing closed keeps the alteration visible
+    // to verify_integrity, and the finding recurs until that rewrite.
     if !heal_attributable {
+        // Name deletion metadata specifically — a reconcile that laundered a
+        // re-stamped range_tombstones / delete_bitmap would resurrect the rows
+        // it masked, the scariest of the three surfaces.
         match table.has_deletion_metadata() {
-            Ok(false) => {}
             Ok(true) => {
                 return finding(
                     "digest mismatch not attributable to this pass's heal on a \
@@ -660,19 +670,17 @@ fn refresh_healed_checksum(
                         .into(),
                 );
             }
+            Ok(false) => {}
             Err(e) => return finding(e.to_string()),
         }
-        // `kv_checksum_algo` is the per-SST footer descriptor on `ParsedMeta`
-        // (`Some(algo)` when every data block carries a per-KV footer under
-        // `algo`) — the same field the per-KV verify path reads above.
-        if table.metadata.kv_checksum_algo.is_none() {
-            return finding(
-                "digest mismatch not attributable to this pass's heal on a \
-                 footer-less table, whose value bytes have no per-entry \
-                 authentication; the manifest digest was not refreshed"
-                    .into(),
-            );
-        }
+        return finding(
+            "digest mismatch not attributable to this pass's heal; the file's \
+             non-derivable content (meta scalars such as created_at and the \
+             per-KV footer descriptor, plus any footer-less value bytes) has no \
+             cross-check to authenticate it and the recovery-time copy may \
+             itself be a pre-open restamp; the manifest digest was not refreshed"
+                .into(),
+        );
     }
 
     match tree.refresh_table_checksum(table.id(), fresh) {

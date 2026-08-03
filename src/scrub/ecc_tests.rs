@@ -2122,17 +2122,18 @@ fn heal_in_place_does_not_restamp_over_side_section_rot() -> crate::Result<()> {
 }
 
 /// A manifest-digest refresh that FAILED (or a crash after the heal's
-/// `sync_data` but before the manifest update) must be RECONCILED by the next
-/// heal-in-place scrub: that later scrub sees only clean blocks (the bytes
-/// were already healed), so a refresh gated on "this pass healed something"
-/// never fires again and the stale digest survives forever — every later
-/// `verify_integrity` keeps flagging a now-healthy SST.
+/// `sync_data` but before the manifest update) leaves a stale digest that a
+/// later clean heal-in-place scrub must NOT auto-reconcile: the later scrub
+/// sees only clean blocks, so the mismatch is unattributable to any heal, and
+/// nothing distinguishes it from an offline restamp of the non-derivable meta
+/// scalars (`created_at`, the footer descriptor) that no cross-check can
+/// authenticate. Reconciling it would launder such a restamp, so the scrub
+/// fails closed even on a footer-bearing table; the healthy SST keeps a
+/// `ChecksumRefreshFailed` finding until a compaction / repair rewrite
+/// recomputes the digest legitimately.
 #[test]
-fn heal_in_place_reconciles_a_stale_checksum_left_by_a_failed_refresh() -> crate::Result<()> {
+fn heal_in_place_refuses_to_reconcile_an_unattributable_stale_checksum() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
-    // Footered: the later clean pass has no heal attribution, and only a
-    // table whose value bytes re-derive authentication through the per-KV
-    // gate may be reconciled without it.
     let (sst_path, block) = write_ecc_sst_footered(dir.path());
 
     // Rot one parity-trailer byte, then let a manifest rebuild record the
@@ -2152,17 +2153,21 @@ fn heal_in_place_reconciles_a_stale_checksum_left_by_a_failed_refresh() -> crate
     );
 
     // SECOND heal pass, fault gone: every block reads clean (nothing left to
-    // heal), yet the manifest still carries the rotted digest — the scrub
-    // must reconcile it, not skip the refresh because it healed nothing.
+    // heal), and the manifest still carries the rotted digest. The mismatch is
+    // unattributable, so the scrub fails closed rather than restamping over an
+    // unauthenticated file.
     let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
     assert!(
-        report.is_ok(),
-        "a clean re-scan reconciles the pending refresh: {report:?}",
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
+        "an unattributable stale digest must not be reconciled: {report:?}",
     );
     let integrity = crate::verify::verify_integrity(&tree);
     assert!(
-        integrity.is_ok(),
-        "the reconciled manifest digest matches the healed file, got {:?}",
+        !integrity.is_ok(),
+        "the stale digest keeps flagging until a rewrite recomputes it, got {:?}",
         integrity.errors,
     );
     Ok(())
