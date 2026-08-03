@@ -331,17 +331,19 @@ impl Iterator for Scanner {
                     self.blob_file_id,
                 );
 
-                // For a writer-chained frame the lengths were validated by
-                // the header CRC, so the cursor already sits on the next
-                // frame boundary: payload rot costs exactly this one record,
-                // no resynchronization needed. A RESYNC CANDIDATE's lengths
-                // are untrusted (a CRC-valid fake header inside a damaged
-                // record's value can declare an end past intact records), so
-                // its rejection resumes the magic search strictly past the
-                // candidate instead of trusting where its lengths landed.
-                if self.resynced
-                    && let Err(e) = self.resync_to_next_frame(offset)
-                {
+                // A checksum rejection means the DECLARED SPAN is not
+                // trustworthy, so resume the magic search strictly past this
+                // frame's start regardless of how the position was reached.
+                // A resync candidate's magic came from user-controlled value
+                // bytes (a CRC-valid fake header can declare an end past
+                // intact records); a WRITER-CHAINED frame's header CRC
+                // vouches for its lengths at parse time, but a re-stamped
+                // length that recomputes the header CRC passes that check
+                // and can consume one or more intact later frames before the
+                // payload checksum fails — trusting its declared end would
+                // then skip those frames without reporting the loss. Both
+                // resynchronize at the next real frame instead.
+                if let Err(e) = self.resync_to_next_frame(offset) {
                     self.is_terminated = true;
                     return Some(Err(e));
                 }
