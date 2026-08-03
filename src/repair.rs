@@ -152,7 +152,15 @@ fn quarantine_file(
     fs.create_dir_all(&quarantine_dir)?;
     let dest = quarantine_dir.join(file_name);
     fs.rename(src, &dest)?;
-    let _ = sync_mode;
+    // A rename is durable only once BOTH affected directory entries are on
+    // disk: the destination gains the file and the source loses it. Without
+    // syncing both, a power loss after repair returns can drop the destination
+    // entry or restore the source under `tables/`, and the next open's orphan
+    // cleanup then deletes the only copy meant for manual recovery.
+    if let Some(src_dir) = src.parent() {
+        fs.sync_directory_with(src_dir, sync_mode)?;
+    }
+    fs.sync_directory_with(&quarantine_dir, sync_mode)?;
     Ok(dest)
 }
 
