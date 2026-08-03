@@ -2661,22 +2661,36 @@ impl Table {
                 .map(|p| p.materialize(data_block.as_slice()))
                 .collect();
             // A key's versions are adjacent within the block (sorted by key
-            // then descending seqno), so one probe per distinct key.
+            // then descending seqno), so the FIRST occurrence is the newest
+            // and one probe per distinct key suffices.
             let mut prev_key: Option<UserKey> = None;
             for entry in entries {
                 if prev_key.as_ref() == Some(&entry.key.user_key) {
                     continue;
                 }
-                if data_block
-                    .point_read(
-                        entry.key.user_key.as_ref(),
-                        crate::seqno::MAX_SEQNO,
-                        &self.comparator,
-                    )?
-                    .is_none()
-                {
+                // Require the probe to return the NEWEST version, not merely
+                // SOME version. A key spanning restart intervals has a
+                // conflict-marked hash bucket; re-stamping that bucket to a
+                // later interval holding an OLDER version still yields
+                // `Some`, so an `is_none` check would pass — yet point reads
+                // after reopen would return the stale value. Match the
+                // decoded newest entry's seqno, value type, and bytes.
+                let found = data_block.point_read(
+                    entry.key.user_key.as_ref(),
+                    crate::seqno::MAX_SEQNO,
+                    &self.comparator,
+                )?;
+                let disagrees = match &found {
+                    Some(v) => {
+                        v.key.seqno != entry.key.seqno
+                            || v.key.value_type != entry.key.value_type
+                            || v.value != entry.value
+                    }
+                    None => true,
+                };
+                if disagrees {
                     return Err(crate::Error::InvalidHeader(
-                        "a decoded key is not retrievable via its block's point_read \
+                        "a decoded key's point_read does not return its newest version \
                          (an in-block index disagrees with the entries)",
                     ));
                 }
