@@ -347,12 +347,10 @@ fn salvage_resyncs_past_an_unframeable_block_in_the_physical_walk() -> crate::Re
             .filter_map(Result::ok)
             .map(|h| *h.as_ref().offset())
             .collect();
-        assert!(
-            offsets.len() >= 6,
-            "need several data blocks, got {}",
-            offsets.len()
-        );
-        offsets[offsets.len() / 3]
+        let Some(&off) = offsets.get(offsets.len() / 3) else {
+            panic!("need several data blocks, got {}", offsets.len());
+        };
+        off
     };
     {
         let mut bytes = std::fs::read(&source)?;

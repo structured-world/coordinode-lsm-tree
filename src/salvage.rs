@@ -1641,11 +1641,11 @@ pub fn salvage_blob_file(
             // success (without it a power loss can discard the entry). A sync
             // failure removes the file and propagates, so a caller never sees a
             // salvaged_path whose directory entry is not durable.
-            if let Some(parent) = dest.parent() {
-                if let Err(e) = fs.sync_directory_with(parent, sync_mode) {
-                    discard_partial(fs, &dest);
-                    return Err(e.into());
-                }
+            if let Some(parent) = dest.parent()
+                && let Err(e) = fs.sync_directory_with(parent, sync_mode)
+            {
+                discard_partial(fs, &dest);
+                return Err(e.into());
             }
             Some(dest)
         }
