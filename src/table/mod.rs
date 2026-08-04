@@ -2775,6 +2775,22 @@ impl Table {
     ///
     /// [`crate::Error::InvalidHeader`] when the filter reports an existing
     /// key as definitely absent; any I/O / decode error from the full scan.
+    /// Whether a partitioned-filter top-level index (`filter_tli`) is declared
+    /// in the TOC but was NOT loaded — the salvage-mode open degraded it
+    /// because its block would not decode as an index.
+    ///
+    /// A re-stamped TOC that renames a `range_tombstones` / `delete_bitmap`
+    /// section to `filter_tli` and re-roles its block lands here: the section
+    /// is present and its block passes the byte-level walk, but its CONTENT is
+    /// not a filter index, so the load degrades it. This is a purely STRUCTURAL
+    /// signal (did the `filter_tli` block itself decode), independent of the
+    /// data blocks: a corrupt DATA block leaves the filter index loadable and
+    /// so does not trip it. Used by salvage to fail closed on a table whose
+    /// filter index may be a relabeled deletion it would otherwise discard.
+    pub(crate) fn filter_index_declared_but_unloaded(&self) -> bool {
+        self.regions.filter_tli.is_some() && self.pinned_filter_index.is_none()
+    }
+
     #[cfg(feature = "std")]
     pub(crate) fn verify_filter(
         &self,

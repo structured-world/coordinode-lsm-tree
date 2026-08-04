@@ -1105,14 +1105,17 @@ fn verify_point_read_reachability_rejects_a_bucket_redirected_to_an_older_versio
     Ok(())
 }
 
-/// A corrupt `filter_tli` block (rotted payload, stale checksum) must not
-/// fail a SALVAGE-mode open: the salvage walk never consults the source's
-/// filter — the destination writer rebuilds it from the recovered keys —
-/// yet the open loaded the partitioned filter's index unconditionally and
-/// propagated the error, so repair quarantined a table whose data and
-/// data index were fully intact.
+/// A `filter_tli` block that does not decode as a filter index must fail
+/// SALVAGE closed on a table that exposes NO deletion metadata: a re-stamped
+/// TOC can rename a `range_tombstones` / `delete_bitmap` section to
+/// `filter_tli` and re-role its block, leaving a uniquely named, tiled
+/// catalogue whose parsed table reports no deletion. Salvage re-derives the
+/// filter from the recovered keys, so it would discard that section and
+/// re-emit the suppressed rows as live. A genuinely rotted filter index is
+/// indistinguishable from the relabel, so both fail closed; the operator
+/// recovers the quarantined original by hand.
 #[test]
-fn salvage_degrades_an_unreadable_filter_index() -> crate::Result<()> {
+fn salvage_refuses_a_corrupt_filter_index_that_may_hide_a_deletion() -> crate::Result<()> {
     let dir = tempdir()?;
     let source = dir.path().join("source");
     let dest = dir.path().join("salvaged");
@@ -1164,14 +1167,15 @@ fn salvage_degrades_an_unreadable_filter_index() -> crate::Result<()> {
         "the rotted filter index must fail a live open",
     );
 
-    let report = salvage_sst(&source, dest, &fs)?;
+    // Salvage fails closed: the filter index did not decode and the table
+    // exposes no deletion, so it may be a relabeled deletion salvage would
+    // discard — quarantine for manual recovery instead of resurrecting rows.
+    let Err(err) = salvage_sst(&source, dest, &fs) else {
+        panic!("a corrupt filter index with no visible deletion must fail salvage");
+    };
     assert!(
-        report.dropped.is_empty(),
-        "every data block is intact, nothing may drop: {report:?}",
-    );
-    assert_eq!(
-        report.entries_salvaged, 64,
-        "a rotted filter index must not cost the recoverable data: {report:?}",
+        matches!(err, crate::Error::FeatureUnsupported(_)),
+        "the refusal names the unsupported salvage, got {err:?}",
     );
     Ok(())
 }

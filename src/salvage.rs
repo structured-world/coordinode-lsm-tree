@@ -554,6 +554,32 @@ fn salvage_attempt(
         ));
     }
 
+    // Fail closed when the source's `filter_tli` section is declared but did
+    // not decode as a filter index (the salvage open degraded it) AND the table
+    // exposes NO deletion metadata. A re-stamped TOC can rename a
+    // `range_tombstones` / `delete_bitmap` section to `filter_tli` and re-role
+    // its block: it passes the byte-level walk AND the tiling check (the
+    // catalogue stays uniquely named), and the parsed table reports no
+    // deletion, but its CONTENT is not a filter index. Salvage would DISCARD it
+    // (the recovered copy re-derives its filter from the entries) and re-emit
+    // the suppressed rows as live. A genuinely rotted filter index is
+    // indistinguishable from the relabel, so both fail closed; the operator
+    // recovers the quarantined original by hand. The check is purely STRUCTURAL
+    // (did the `filter_tli` block decode as an index), so a corrupt DATA block
+    // — which leaves the filter index loadable — still salvages. A table that
+    // DOES carry a visible deletion (a delete bitmap; range tombstones were
+    // rejected above) is exempt: its deletions are accounted for and applied.
+    #[cfg(feature = "columnar")]
+    let has_visible_deletion = table.has_delete_bitmap_section();
+    #[cfg(not(feature = "columnar"))]
+    let has_visible_deletion = false;
+    if !has_visible_deletion && table.filter_index_declared_but_unloaded() {
+        return Err(crate::Error::FeatureUnsupported(
+            "salvage of an SST whose filter index did not decode and may be a \
+             relabeled deletion",
+        ));
+    }
+
     // Fail closed when the delete mask cannot be applied FAITHFULLY: the
     // salvage-mode open degraded it (an unreadable bitmap, or a readable
     // bitmap whose zone map was unreadable), or the zone map decodes but its
