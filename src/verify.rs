@@ -1198,72 +1198,21 @@ fn scan_sst_blocks(
     // byte-level checks. The tiling gap the omission leaves is the only
     // out-of-band trace; report it and keep walking the sections that ARE
     // present (their findings are still valid).
-    {
-        let mut expected_pos: u64 = 0;
-        // A re-stamped TOC can also DUPLICATE a recognized name: renaming
-        // `range_tombstones` to a second `data` entry (and re-stamping its
-        // block header's role) preserves the tiling AND passes the
-        // recognized-role walk, yet `Toc::section(b"data")` returns the
-        // FIRST match and `ParsedRegions` sees no range-tombstone section —
-        // so the deleted range silently resurrects. Section names are unique
-        // by construction (the writer emits each at most once), so any
-        // duplicate is corruption.
-        // A handful of section names — a linear scan keeps this no-std-clean
-        // (no `std::collections`).
-        let mut seen_names: Vec<Vec<u8>> = Vec::new();
-        for entry in toc.iter() {
-            let name = entry.name().to_vec();
-            if seen_names.iter().any(|n| n == &name) {
-                errors.push(BlockVerifyError::TocCorrupted {
-                    table_id,
-                    path: path.to_path_buf(),
-                    section_name: name,
-                    section_offset: entry.pos(),
-                    reason: format!(
-                        "duplicate TOC section name {:?}; a renamed section can \
-                         shadow another and hide it from the readers that look \
-                         it up by name",
-                        alloc::string::String::from_utf8_lossy(entry.name()),
-                    ),
-                });
-            } else {
-                seen_names.push(name);
-            }
-            if entry.pos() != expected_pos {
-                errors.push(BlockVerifyError::TocCorrupted {
-                    table_id,
-                    path: path.to_path_buf(),
-                    section_name: entry.name().to_vec(),
-                    section_offset: entry.pos(),
-                    reason: format!(
-                        "section starts at {} but the previous section ended at \
-                         {expected_pos}; the gap hides an omitted TOC entry",
-                        entry.pos(),
-                    ),
-                });
-            }
-            // On overflow stop the tiling accumulation: the per-section walk
-            // below reports the same entry as TocCorrupted via its own
-            // checked_add, so no separate finding is needed here.
-            let Some(end) = entry.pos().checked_add(entry.len()) else {
-                expected_pos = u64::MAX;
-                break;
-            };
-            expected_pos = end;
-        }
-        if expected_pos != sfa_reader.toc_pos() {
-            errors.push(BlockVerifyError::TocCorrupted {
-                table_id,
-                path: path.to_path_buf(),
-                section_name: b"<tiling>".to_vec(),
-                section_offset: expected_pos,
-                reason: format!(
-                    "sections end at {expected_pos} but the TOC begins at {}; \
-                     a trailing TOC entry was omitted or truncated",
-                    sfa_reader.toc_pos(),
-                ),
-            });
-        }
+    // Classify catalogue-structure defects (duplicate / shadowing names, tiling
+    // gaps, unrecognized names, a trailing hole) through the SAME pass
+    // `toc_may_hide_deletion_section` uses, so the walk's `TocCorrupted` findings
+    // and the salvage-verdict concealment check can never diverge. A re-stamped
+    // TOC that duplicates a recognized name, or renames a section to hide it,
+    // preserves the byte-level checks yet steers `Toc::section` / `ParsedRegions`
+    // away from the real section — resurrecting the range it masked.
+    for defect in toc_catalogue_defects(toc, sfa_reader.toc_pos()) {
+        errors.push(BlockVerifyError::TocCorrupted {
+            table_id,
+            path: path.to_path_buf(),
+            section_name: defect.name,
+            section_offset: defect.offset,
+            reason: defect.reason,
+        });
     }
     // One reusable data buffer across the whole SST — sized up via
     // `resize` per block instead of a fresh `vec![0u8; N]` allocation
@@ -1337,22 +1286,12 @@ fn scan_sst_blocks(
             });
             continue;
         }
-        // Fail CLOSED on a section name this build does not know: the SFA
-        // trailer checksum is unkeyed, so a re-stamped TOC can RENAME a
-        // known section out of every reader's sight while its blocks still
-        // pass their byte-level checks. Report and skip the region — its
-        // role expectation is unknowable, so a walk would prove nothing.
+        // Skip a section name this build does not know: its role expectation is
+        // unknowable, so a walk would prove nothing. `toc_catalogue_defects`
+        // above already reported it as a `TocCorrupted` finding (a re-stamped
+        // TOC can RENAME a known section out of every reader's sight while its
+        // blocks still pass their byte-level checks).
         let Some(expected_roles) = expected_section_roles(entry.name()) else {
-            errors.push(BlockVerifyError::TocCorrupted {
-                table_id,
-                path: path.to_path_buf(),
-                section_name: entry.name().to_vec(),
-                section_offset: start,
-                reason: String::from(
-                    "unrecognized block-format section name; a renamed TOC entry \
-                     hides a known section from every reader",
-                ),
-            });
             continue;
         };
         let mut ctx = WalkCtx {
@@ -1440,6 +1379,87 @@ fn expected_section_roles(name: &[u8]) -> Option<&'static [crate::table::block::
     })
 }
 
+/// One structural defect in the SFA TOC catalogue: a section a reader could not
+/// reach or that hides another. Carries the offending entry's name, its declared
+/// offset, and a human-readable reason.
+struct TocCatalogueDefect {
+    name: Vec<u8>,
+    offset: u64,
+    reason: String,
+}
+
+/// Classifies every structural defect in the TOC catalogue in one pass: a
+/// duplicate / shadowing name, a gap in the `[0, toc_pos)` tiling, an
+/// unrecognized (renamed) name, or a trailing hole. Empty when the catalogue
+/// tiles the whole data region with unique, recognized names.
+///
+/// The single source of truth for what a valid catalogue looks like:
+/// [`scan_sst_blocks`] turns each defect into a `TocCorrupted` finding and
+/// [`toc_may_hide_deletion_section`] fails closed on any, so the two can never
+/// disagree. The recognized-name set is `expected_section_roles` ∪
+/// [`RAW_FORMAT_SECTIONS`]. A `pos + len` overflow stops the tiling scan (the
+/// per-section walk reports that entry via its own `checked_add`), so it is not
+/// duplicated here.
+fn toc_catalogue_defects(toc: &crate::sfa::Toc, toc_pos: u64) -> Vec<TocCatalogueDefect> {
+    let mut defects = Vec::new();
+    let mut expected_pos: u64 = 0;
+    // A handful of section names — a linear scan keeps this no-std-clean.
+    let mut seen: Vec<&[u8]> = Vec::new();
+    for entry in toc.iter() {
+        let name = entry.name();
+        if seen.contains(&name) {
+            defects.push(TocCatalogueDefect {
+                name: name.to_vec(),
+                offset: entry.pos(),
+                reason: format!(
+                    "duplicate TOC section name {:?}; a renamed section can shadow \
+                     another and hide it from the readers that look it up by name",
+                    alloc::string::String::from_utf8_lossy(name),
+                ),
+            });
+        } else {
+            seen.push(name);
+        }
+        if entry.pos() != expected_pos {
+            defects.push(TocCatalogueDefect {
+                name: name.to_vec(),
+                offset: entry.pos(),
+                reason: format!(
+                    "section starts at {} but the previous section ended at \
+                     {expected_pos}; the gap hides an omitted TOC entry",
+                    entry.pos(),
+                ),
+            });
+        }
+        if expected_section_roles(name).is_none() && !RAW_FORMAT_SECTIONS.contains(&name) {
+            defects.push(TocCatalogueDefect {
+                name: name.to_vec(),
+                offset: entry.pos(),
+                reason: String::from(
+                    "unrecognized block-format section name; a renamed TOC entry \
+                     hides a known section from every reader",
+                ),
+            });
+        }
+        let Some(end) = entry.pos().checked_add(entry.len()) else {
+            expected_pos = u64::MAX;
+            break;
+        };
+        expected_pos = end;
+    }
+    if expected_pos != toc_pos {
+        defects.push(TocCatalogueDefect {
+            name: b"<tiling>".to_vec(),
+            offset: expected_pos,
+            reason: format!(
+                "sections end at {expected_pos} but the TOC begins at {toc_pos}; a \
+                 trailing TOC entry was omitted or truncated",
+            ),
+        });
+    }
+    defects
+}
+
 /// Whether the SST's TOC catalogue could HIDE an optional deletion section
 /// (`range_tombstones` / `delete_bitmap`) from the name-based readers. These
 /// sections are optional at parse time, so an unkeyed re-stamp that OMITS,
@@ -1469,35 +1489,7 @@ fn expected_section_roles(name: &[u8]) -> Option<&'static [crate::table::block::
 /// rebuildable section that did not decode as its claimed type (see
 /// `Table::salvage_degraded_a_rebuildable_section`).
 pub(crate) fn toc_may_hide_deletion_section(toc: &crate::sfa::Toc, toc_pos: u64) -> bool {
-    let mut expected_pos: u64 = 0;
-    let mut seen: Vec<&[u8]> = Vec::new();
-    for entry in toc.iter() {
-        let name = entry.name();
-        // A duplicate recognized name (e.g. `range_tombstones` renamed to a
-        // second `data`) shadows the original from every `Toc::section` lookup.
-        if seen.contains(&name) {
-            return true;
-        }
-        seen.push(name);
-        // A section that does not start where the previous one ended means an
-        // entry between them was dropped from the catalogue (its bytes remain,
-        // leaving the gap).
-        if entry.pos() != expected_pos {
-            return true;
-        }
-        // A name this build does not know is a renamed entry hiding a known
-        // section from every reader.
-        if expected_section_roles(name).is_none() && !RAW_FORMAT_SECTIONS.contains(&name) {
-            return true;
-        }
-        let Some(end) = entry.pos().checked_add(entry.len()) else {
-            return true;
-        };
-        expected_pos = end;
-    }
-    // The sections must tile exactly up to where the TOC begins; a shortfall is
-    // a trailing entry omitted or truncated.
-    expected_pos != toc_pos
+    !toc_catalogue_defects(toc, toc_pos).is_empty()
 }
 
 /// Structural validation for the raw (non-block-format) sections; returns a
