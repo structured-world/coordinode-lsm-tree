@@ -1133,16 +1133,6 @@ impl Table {
         self.metadata.file_size
     }
 
-    /// Patrol-scrubs every data block of this table: a cache-bypassing read that
-    /// runs the Page-ECC verify+correct path, recording a heal hint (when
-    /// `auto_heal` is on) on a confirmed-persistent correction.
-    ///
-    /// Returns a partial [`PatrolScrubReport`](crate::scrub::PatrolScrubReport)
-    /// for this SST (`sst_files_scanned == 1`) so the caller can merge it across
-    /// the tree. Always runs to completion: an uncorrectable / unreadable block
-    /// is recorded (and logged), not silently skipped, and the next block is
-    /// still scrubbed. A block-index walk failure stops this table early (later
-    /// offsets are untrustworthy) but other tables still scrub.
     /// The on-disk ROLE of this table's data blocks: a columnar segment's
     /// writer seals them as [`BlockType::Columnar`], a row-major one as
     /// [`BlockType::Data`]. Scrub / heal walks pass this as the expected type
@@ -1157,6 +1147,16 @@ impl Table {
         }
     }
 
+    /// Patrol-scrubs every data block of this table: a cache-bypassing read that
+    /// runs the Page-ECC verify+correct path, recording a heal hint (when
+    /// `auto_heal` is on) on a confirmed-persistent correction.
+    ///
+    /// Returns a partial [`PatrolScrubReport`](crate::scrub::PatrolScrubReport)
+    /// for this SST (`sst_files_scanned == 1`) so the caller can merge it across
+    /// the tree. Always runs to completion: an uncorrectable / unreadable block
+    /// is recorded (and logged), not silently skipped, and the next block is
+    /// still scrubbed. A block-index walk failure stops this table early (later
+    /// offsets are untrustworthy) but other tables still scrub.
     #[cfg(feature = "std")]
     pub(crate) fn scrub_data_blocks(&self) -> crate::scrub::PatrolScrubReport {
         use crate::scrub::{PatrolScrubReport, ScrubError};
@@ -2761,6 +2761,19 @@ impl Table {
         Ok(())
     }
 
+    /// Whether the salvage-mode open degraded a REBUILDABLE side section
+    /// (filter / `filter_tli`, seqno bounds, zone map, locator) because its
+    /// block did not decode as the claimed type — see
+    /// [`Inner::rebuildable_section_degraded`](crate::table::inner::Inner). Used
+    /// by salvage to fail closed on a table whose degraded section may be a
+    /// relabeled deletion it would otherwise discard and resurrect.
+    ///
+    /// `std`-gated because its only consumer is the salvage path (`std`-only).
+    #[cfg(feature = "std")]
+    pub(crate) fn salvage_degraded_a_rebuildable_section(&self) -> bool {
+        self.rebuildable_section_degraded
+    }
+
     /// Probes every decoded data key against the on-disk `filter` section:
     /// each key the table holds must be reported as POSSIBLY PRESENT. A
     /// checksum- and parity-consistent forged filter is accepted by the
@@ -2775,16 +2788,6 @@ impl Table {
     ///
     /// [`crate::Error::InvalidHeader`] when the filter reports an existing
     /// key as definitely absent; any I/O / decode error from the full scan.
-    /// Whether the salvage-mode open degraded a REBUILDABLE side section
-    /// (filter / `filter_tli`, seqno bounds, zone map, locator) because its
-    /// block did not decode as the claimed type — see
-    /// [`Inner::rebuildable_section_degraded`](crate::table::inner::Inner). Used
-    /// by salvage to fail closed on a table whose degraded section may be a
-    /// relabeled deletion it would otherwise discard and resurrect.
-    pub(crate) fn salvage_degraded_a_rebuildable_section(&self) -> bool {
-        self.rebuildable_section_degraded
-    }
-
     #[cfg(feature = "std")]
     pub(crate) fn verify_filter(
         &self,
