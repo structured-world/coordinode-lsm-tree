@@ -41,15 +41,6 @@ pub struct Scanner {
 
     /// Byte offset where the "data" section ends (from the SFA TOC).
     data_end: u64,
-
-    /// Whether the CURRENT read position came from a forward magic
-    /// resynchronization rather than a writer-chained frame end. A resync
-    /// candidate's magic may sit inside a damaged record's user-controlled
-    /// value bytes, so until the candidate fully validates its declared
-    /// lengths are untrusted: a rejection (bounds or payload checksum)
-    /// resynchronizes again strictly past the candidate instead of trusting
-    /// its declared end or terminating. Cleared once a frame validates.
-    resynced: bool,
 }
 
 impl Scanner {
@@ -136,9 +127,6 @@ impl Scanner {
             inner: file_reader,
             is_terminated: false,
             data_end,
-            // The opening position is writer-chained (data start or a carried
-            // frame boundary), never a magic-scan candidate.
-            resynced: false,
         })
     }
     // No `with_reader` constructor: Scanner is crate-private (parent
@@ -177,9 +165,6 @@ impl Scanner {
                 .position(|w| w == BLOB_HEADER_MAGIC)
             {
                 self.inner.seek(SeekFrom::Start(pos + hit as u64))?;
-                // The next frame is a magic-scan CANDIDATE: its lengths stay
-                // untrusted until the frame fully validates.
-                self.resynced = true;
                 return Ok(());
             }
             if want < MAGIC_LEN {
@@ -353,9 +338,6 @@ impl Iterator for Scanner {
                 }));
             }
         }
-
-        // The frame fully validated: later positions are writer-chained again.
-        self.resynced = false;
 
         // The reader is now positioned at the next frame: capture it as the exact
         // punch / resume boundary for this frame.
