@@ -252,6 +252,65 @@ fn salvage_recovers_physical_blocks_past_a_broken_index_partition() -> crate::Re
     Ok(())
 }
 
+/// A range tombstone hidden by RENAMING its section to a recognized name whose
+/// block decodes cleanly (here an empty `filter`, since filtering is disabled)
+/// must fail salvage closed. The rename keeps the catalogue uniquely named and
+/// tiled and the block loads without degrading, so neither the TOC-concealment
+/// check nor the rebuildable-section degradation flag fires — but the persisted
+/// `range_tombstone_count` still records the tombstone, so salvage cross-checks
+/// it and refuses rather than re-emitting the covered keys as live.
+#[test]
+fn salvage_refuses_a_range_tombstone_hidden_as_a_recognized_section() -> crate::Result<()> {
+    use crate::UserKey;
+    use crate::config::BloomConstructionPolicy;
+    use crate::range_tombstone::RangeTombstone;
+    use crate::table::block::BlockType;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // Filtering disabled, so renaming range_tombstones to `filter` yields a
+    // UNIQUE recognized name (no existing filter to duplicate).
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_bloom_policy(BloomConstructionPolicy::BitsPerKey(0.0));
+    for i in 0u64..8 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    writer.write_range_tombstone(RangeTombstone::new(
+        UserKey::from(b"key-002".as_slice()),
+        UserKey::from(b"key-005".as_slice()),
+        9,
+    ));
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Rename range_tombstones -> filter and re-role its block to Filter: the
+    // block loads as a (garbage) filter WITHOUT degrading, so the
+    // rebuildable-section flag stays clear and the parsed table reports no range
+    // tombstones — but the persisted count still records them.
+    crate::test_forge::forge_duplicate_section_name(
+        &source,
+        b"range_tombstones",
+        b"filter",
+        BlockType::Filter,
+    )?;
+
+    let Err(err) = salvage_sst(&source, dest, &fs) else {
+        panic!("a hidden range tombstone must fail salvage");
+    };
+    assert!(
+        matches!(err, crate::Error::FeatureUnsupported(_)),
+        "the refusal names the unsupported salvage, got {err:?}",
+    );
+    Ok(())
+}
+
 /// When the broken-index physical walk hits an UNFRAMEABLE block header, it
 /// must RESYNCHRONIZE forward to the next parseable frame instead of abandoning
 /// the rest of the gap. Otherwise the intact, self-framed blocks after the
