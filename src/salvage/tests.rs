@@ -252,6 +252,91 @@ fn salvage_recovers_physical_blocks_past_a_broken_index_partition() -> crate::Re
     Ok(())
 }
 
+/// When the broken-index physical walk hits an UNFRAMEABLE block header, it
+/// must RESYNCHRONIZE forward to the next parseable frame instead of abandoning
+/// the rest of the gap. Otherwise the intact, self-framed blocks after the
+/// smashed one are neither recovered nor individually reported — the salvage
+/// silently finishes with only the prefix.
+#[test]
+fn salvage_resyncs_past_an_unframeable_block_in_the_physical_walk() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_data_block_size(128)
+        .use_partitioned_index();
+    for i in 0u64..256 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Smash the header of a block in the FIRST THIRD of the data section (its
+    // first byte, so `probe_block_handle_at` cannot frame it). A LATE key lives
+    // in a block AFTER it, so the physical walk must resync past the smash to
+    // recover that block.
+    let smash_offset = {
+        let table = open(source.clone(), &fs)?;
+        let offsets: Vec<u64> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|h| *h.as_ref().offset())
+            .collect();
+        assert!(
+            offsets.len() >= 6,
+            "need several data blocks, got {}",
+            offsets.len()
+        );
+        offsets[offsets.len() / 3]
+    };
+    {
+        let mut bytes = std::fs::read(&source)?;
+        if let Some(b) = bytes.get_mut(usize::try_from(smash_offset).unwrap_or(0)) {
+            *b ^= 0xFF;
+        }
+        std::fs::write(&source, &bytes)?;
+    }
+
+    // Corrupt the `index` section so enumeration breaks and the physical walk
+    // tiles the whole data section from the start.
+    let (index_pos, index_len) = {
+        let mut f = std::fs::File::open(&source)?;
+        let reader = crate::sfa::Reader::from_reader(&mut f)?;
+        let Some((pos, len)) = reader
+            .toc()
+            .iter()
+            .find(|e| e.name() == b"index")
+            .map(|e| (e.pos(), e.len()))
+        else {
+            panic!("a partitioned-index SST must carry an index section");
+        };
+        (pos, len)
+    };
+    let flip = usize::try_from(index_pos + index_len / 2).unwrap_or(0);
+    let mut bytes = std::fs::read(&source)?;
+    if let Some(b) = bytes.get_mut(flip) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+
+    // A late key (in a block after the smashed one) must still be recovered:
+    // the walk drops the unframeable block, resyncs forward, and frames the
+    // rest of the section.
+    assert!(
+        reopen_get(dest, &fs, b"key-250")?.is_some(),
+        "a block after the unframeable one must recover via resync: {report:?}",
+    );
+    Ok(())
+}
+
 /// An INTERIOR handle omitted from both forged mirrors leaves the hidden
 /// block between two indexed neighbours, exercising the mid-list gap
 /// probe (the truncated-mirror sibling only covers the section-tail
