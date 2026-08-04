@@ -49,6 +49,43 @@ fn quarantine_file_syncs_the_affected_directories() -> crate::Result<()> {
     Ok(())
 }
 
+/// A second repair of the same table must NOT overwrite an earlier quarantine
+/// copy: `rename` replaces the destination on Unix, so a fixed
+/// `repair-quarantine/{id}` name would destroy the only copy of the previous
+/// corrupt original kept for manual recovery. The move must land on a distinct,
+/// create-new name instead.
+#[test]
+fn quarantine_file_preserves_an_earlier_copy_of_the_same_table() -> crate::Result<()> {
+    use crate::fs::SyncMode;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+
+    let src1 = tables.join("7");
+    std::fs::write(&src1, b"first-copy")?;
+    let dest1 = quarantine_file(&StdFs, &tables, &src1, "7", SyncMode::Normal)?;
+    assert_eq!(std::fs::read(&dest1)?, b"first-copy");
+
+    // A later repair of the SAME table id produces a new corrupt file at the
+    // same name; quarantining it must preserve the earlier copy.
+    let src2 = tables.join("7");
+    std::fs::write(&src2, b"second-copy")?;
+    let dest2 = quarantine_file(&StdFs, &tables, &src2, "7", SyncMode::Normal)?;
+
+    assert_ne!(
+        dest1, dest2,
+        "the second quarantine must land on a distinct name",
+    );
+    assert_eq!(
+        std::fs::read(&dest1)?,
+        b"first-copy",
+        "the earlier quarantine copy must survive the second repair",
+    );
+    assert_eq!(std::fs::read(&dest2)?, b"second-copy");
+    Ok(())
+}
+
 #[test]
 fn compute_table_checksum_matches_oneshot_xxh3() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
