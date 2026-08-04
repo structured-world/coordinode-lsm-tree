@@ -1460,6 +1460,14 @@ fn expected_section_roles(name: &[u8]) -> Option<&'static [crate::table::block::
 /// Consumed by salvage-mode repair: a `Corrupt` verdict caused by one of these
 /// classes must be QUARANTINED, not salvaged, because the positional salvage
 /// walk reopens the same forged catalogue and resurrects the suppressed rows.
+///
+/// This catches only concealment that DISTURBS the catalogue (a missing,
+/// duplicated, or unrecognized name, or a tiling gap). A relabel that keeps the
+/// catalogue uniquely named and perfectly tiled — a deletion section RENAMED to
+/// an unused recognized name with its block re-roled — grades `false` here; it
+/// is caught instead inside salvage, which fails closed when the open degrades a
+/// rebuildable section that did not decode as its claimed type (see
+/// `Table::salvage_degraded_a_rebuildable_section`).
 pub(crate) fn toc_may_hide_deletion_section(toc: &crate::sfa::Toc, toc_pos: u64) -> bool {
     let mut expected_pos: u64 = 0;
     let mut seen: Vec<&[u8]> = Vec::new();
