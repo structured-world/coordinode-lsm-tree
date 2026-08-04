@@ -2161,11 +2161,15 @@ fn heal_in_place_refuses_to_reconcile_an_unattributable_stale_checksum() -> crat
     // unattributable, so the scrub fails closed rather than restamping over an
     // unauthenticated file.
     let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    // Pin the fail-closed reason, not just the variant: another gate could raise
+    // ChecksumRefreshFailed for a different cause and keep this test green while
+    // the attribution branch goes uncovered.
     assert!(
-        report
-            .errors
-            .iter()
-            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
+        report.errors.iter().any(|e| matches!(
+            e,
+            ScrubError::ChecksumRefreshFailed { reason, .. }
+                if reason.contains("not attributable to this pass's heal")
+        )),
         "an unattributable stale digest must not be reconciled: {report:?}",
     );
     let integrity = crate::verify::verify_integrity(&tree);

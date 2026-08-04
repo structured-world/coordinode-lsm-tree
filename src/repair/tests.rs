@@ -1809,6 +1809,18 @@ fn repair_with_salvage_quarantines_a_range_tombstone_renamed_to_a_rebuildable_se
         report.unreadable_files,
     );
     assert_eq!(report.recovered, 0, "no table joins the rebuilt manifest");
+    // Pin the specific gate: a generic whole-file recovery failure would
+    // quarantine with the same counts. This table carried a range tombstone, so
+    // the persisted-count cross-check refuses it (ahead of the degraded-section
+    // flag, which a delete-free relabel exercises separately).
+    assert!(
+        report
+            .unreadable_files
+            .iter()
+            .any(|(_, reason)| reason.contains("range tombstones")),
+        "the refusal must come from the range-tombstone gate: {:?}",
+        report.unreadable_files,
+    );
     assert!(
         dir.path().join("repair-quarantine").join("0").exists(),
         "the relabeled table must be quarantined for manual recovery: {:?}",

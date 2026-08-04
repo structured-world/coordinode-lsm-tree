@@ -619,8 +619,12 @@ fn blob_scanner_resyncs_when_a_chained_frame_swallows_the_next() -> crate::Resul
         reason = "BLOB_HEADER_LEN is the 42-byte header constant, well within u32"
     )]
     let header = BLOB_HEADER_LEN as u32;
-    let f3_off = 113u32;
-    let swallow_odl = f3_off - header - 3; // header + key + odl == f3_off
+    // Frame 3's offset = frame 1 + frame 2, each `header + key_len + value_len`
+    // (3-byte keys; 11- and 12-byte values), derived from the header constant so
+    // a header-layout change moves it in lockstep.
+    let key_len = 3u32;
+    let f3_off = (header + key_len + 11) + (header + key_len + 12);
+    let swallow_odl = f3_off - header - key_len; // header + key + odl == f3_off
     {
         let mut bytes = std::fs::read(&blob_file_path)?;
         bytes[OD_LEN_OFF..OD_LEN_OFF + 4].copy_from_slice(&swallow_odl.to_le_bytes());

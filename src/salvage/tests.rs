@@ -236,7 +236,9 @@ fn salvage_recovers_physical_blocks_past_a_broken_index_partition() -> crate::Re
         };
         (pos, len)
     };
-    let flip = usize::try_from(index_pos + index_len / 2).unwrap_or(0);
+    let Ok(flip) = usize::try_from(index_pos + index_len / 2) else {
+        panic!("the index-section offset fits usize");
+    };
     let mut bytes = std::fs::read(&source)?;
     if let Some(b) = bytes.get_mut(flip) {
         *b ^= 0xFF;
@@ -375,7 +377,9 @@ fn salvage_resyncs_past_an_unframeable_block_in_the_physical_walk() -> crate::Re
         };
         (pos, len)
     };
-    let flip = usize::try_from(index_pos + index_len / 2).unwrap_or(0);
+    let Ok(flip) = usize::try_from(index_pos + index_len / 2) else {
+        panic!("the index-section offset fits usize");
+    };
     let mut bytes = std::fs::read(&source)?;
     if let Some(b) = bytes.get_mut(flip) {
         *b ^= 0xFF;
