@@ -1525,11 +1525,15 @@ fn heal_in_place_rejects_a_created_at_restamped_before_open() -> crate::Result<(
 
     let tree = open_ecc_tree(dir.path());
     let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    // Pin the fail-closed reason, not just the error variant: another gate
+    // could raise ChecksumRefreshFailed for a different cause and keep this
+    // test green while the attribution gate goes uncovered.
     assert!(
-        report
-            .errors
-            .iter()
-            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
+        report.errors.iter().any(|e| matches!(
+            e,
+            ScrubError::ChecksumRefreshFailed { reason, .. }
+                if reason.contains("not attributable to this pass's heal")
+        )),
         "an unattributed mismatch on a footer-bearing table must not reconcile a \
          pre-open created_at restamp: {report:?}",
     );

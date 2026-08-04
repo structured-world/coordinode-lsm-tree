@@ -31,6 +31,21 @@ fn quarantine_file_syncs_the_affected_directories() -> crate::Result<()> {
         quarantine_file(&fs, &tables, &src, "junk-name", SyncMode::Full).is_err(),
         "the destination-directory fsync fault must surface",
     );
+
+    // The SOURCE directory entry must be synced too: a power loss can otherwise
+    // restore the file under `tables/`, where the next open's orphan cleanup
+    // deletes it. Arm the fault on the source parent so this case fails
+    // independently if the src.parent() sync is dropped.
+    let src2 = tables.join("junk-name-2");
+    std::fs::write(&src2, b"orphan")?;
+    let fs2 = FaultFs::new(StdFs);
+    fs2.injector().arm(
+        FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).on_path("tables"),
+    );
+    assert!(
+        quarantine_file(&fs2, &tables, &src2, "junk-name-2", SyncMode::Full).is_err(),
+        "the source-directory fsync fault must surface",
+    );
     Ok(())
 }
 
@@ -1665,6 +1680,17 @@ fn repair_with_salvage_quarantines_a_toc_hidden_range_tombstone_sst() -> crate::
         report.unreadable_files.len(),
         1,
         "the hidden-deletion table is reported unreadable: {:?}",
+        report.unreadable_files,
+    );
+    // Pin the specific gate: a whole-file recovery failure would quarantine
+    // with the same counts, so require the refusal to name the TOC-concealment
+    // check rather than accepting any quarantine path.
+    assert!(
+        report
+            .unreadable_files
+            .iter()
+            .any(|(_, reason)| reason.contains("may hide deletion metadata")),
+        "the refusal must come from the TOC concealment gate: {:?}",
         report.unreadable_files,
     );
     // The original SST is preserved in quarantine for manual recovery, not
