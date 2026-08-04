@@ -903,15 +903,22 @@ fn salvage_blocks(
                         at = next;
                     }
                     Err(e) => {
-                        // Unframeable bytes the index does not cover: report
-                        // the loss instead of silently skipping it.
+                        // An unframeable header must not abandon the rest of the
+                        // gap: report the loss ONCE, then RESYNCHRONIZE forward to
+                        // the next parseable frame so the intact, self-framed
+                        // blocks after it are still recovered. The header carries
+                        // its own checksum, so a resync landing on garbage fails
+                        // to frame and keeps scanning — no false frame is emitted.
                         dropped.push(DroppedBlock {
                             offset: at,
                             section: b"data".to_vec(),
                             reason: DropReason::HeaderCorrupted(format!("{e:?}")),
                             key_range: None,
                         });
-                        break;
+                        at += 1;
+                        while at < to && table.probe_block_handle_at(at, to).is_err() {
+                            at += 1;
+                        }
                     }
                 }
             }
