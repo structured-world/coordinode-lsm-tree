@@ -4437,6 +4437,41 @@ fn salvage_blob_file_recovers_every_record_of_a_healthy_file() -> crate::Result<
     Ok(())
 }
 
+/// `salvage_blob_file` must fsync the destination's PARENT DIRECTORY before
+/// returning a salvaged path: the writer syncs the blob file's bytes, but
+/// without the directory sync a power loss can discard the new directory entry
+/// even though the report says recovery succeeded (the SST salvage writer
+/// already syncs its parent directory). Fault-inject the directory fsync to
+/// prove it happens — a build that never syncs the directory never triggers the
+/// fault and wrongly reports the move durable.
+#[test]
+fn salvage_blob_file_syncs_the_destination_directory() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultInjector, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("blob_source");
+    let out = dir.path().join("blobdest");
+    std::fs::create_dir_all(&out)?;
+    let dest = out.join("blob_salvaged");
+
+    let injector = Arc::new(FaultInjector::new());
+    let fs: Arc<dyn Fs> = Arc::new(FaultFs::with_injector(StdFs, Arc::clone(&injector)));
+
+    let records: Vec<(&[u8], &[u8])> = vec![(b"k0", b"v0"), (b"k1", b"v1")];
+    build_blob(&source, &fs, &records)?;
+
+    // Arm AFTER building, so only the salvage's destination-directory sync trips.
+    injector.arm(
+        FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).on_path("blobdest"),
+    );
+
+    let Err(_err) = salvage_blob_file(&source, dest, &fs, 0) else {
+        panic!("the destination-directory fsync fault must surface");
+    };
+    Ok(())
+}
+
 /// The TOCTOU variant of the pre-existing-destination guarantee: a file that
 /// appears at `dest` AFTER any existence probe but BEFORE the writer's
 /// `create_new` open (a concurrent worker winning the destination) must also
