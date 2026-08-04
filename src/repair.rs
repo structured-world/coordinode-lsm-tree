@@ -150,7 +150,21 @@ fn quarantine_file(
         .unwrap_or(table_base_folder)
         .join("repair-quarantine");
     fs.create_dir_all(&quarantine_dir)?;
-    let dest = quarantine_dir.join(file_name);
+    // Preserve any EARLIER quarantine copy of the same table: `rename` replaces
+    // the destination on Unix, so a fixed `{file_name}` would move the new
+    // corrupt source over the only copy of a previously quarantined original
+    // kept for manual recovery. Probe for a free `{file_name}` / `{file_name}.N`
+    // name instead. (A tiny check-then-rename window is acceptable: repair runs
+    // single-process against a downed tree.)
+    let dest = {
+        let mut candidate = quarantine_dir.join(file_name);
+        let mut n: u64 = 1;
+        while fs.exists(&candidate)? {
+            candidate = quarantine_dir.join(format!("{file_name}.{n}"));
+            n = n.checked_add(1).ok_or(crate::Error::Unrecoverable)?;
+        }
+        candidate
+    };
     fs.rename(src, &dest)?;
     // A rename is durable only once BOTH affected directory entries are on
     // disk: the destination gains the file and the source loses it. Without
@@ -410,7 +424,11 @@ fn verify_keep_decision(
             // resurrection guard only inspects the PARSED deletion state, which
             // the concealment defeats, so the refusal has to happen here.
             // Quarantine for manual recovery unless the tiling proves no
-            // section is hidden.
+            // section is hidden. A relabel that keeps the tiling intact but
+            // re-roles the block is caught inside salvage itself
+            // (`salvage_with_context` fails closed on a corrupt rebuildable
+            // section when no deletion is visible), which both this path and
+            // the recovery-failure salvage path funnel through.
             if toc_may_hide_deletions(folder_fs, table_path) {
                 RepairKeepDecision::Quarantine(
                     "TOC corruption may hide deletion metadata (range tombstones \
