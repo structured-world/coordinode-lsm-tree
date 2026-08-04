@@ -384,57 +384,54 @@ pub(crate) fn salvage_with_context(
         {
             discard_partial(fs, &dest);
         }
-        // Ownership gate: only the tail attempt ever CREATES `dest`
-        // (create_new), and its output was discarded above — so a `dest`
-        // that still exists here predates this salvage (the tail attempt
-        // failed against the occupied path). Renaming the MID copy over it
-        // would silently destroy an unrelated file that the occupied-path
-        // failure is supposed to protect; surface the tail attempt's own
-        // failure instead and take the MID copy with it.
-        match fs.exists(&dest) {
-            Ok(false) => {}
-            Ok(true) => {
-                if let Ok(rep) = &mid
-                    && rep.salvaged_path.is_some()
-                {
-                    discard_partial(fs, &mid_dest);
-                }
-                return match tail {
-                    Err(e) => Err(e),
-                    Ok(_) => Err(crate::Error::Io(crate::io::Error::new(
-                        crate::io::ErrorKind::AlreadyExists,
-                        "salvage destination already exists",
-                    ))),
-                };
-            }
-            Err(e) => {
-                if let Ok(rep) = &mid
-                    && rep.salvaged_path.is_some()
-                {
-                    discard_partial(fs, &mid_dest);
-                }
-                return Err(e.into());
-            }
-        }
         let mut rep = mid?;
         if rep.salvaged_path.is_some() {
-            fs.rename(&mid_dest, &dest)?;
-            // The MID attempt's writer made the directory entry durable only
-            // under the `mid_dest` name; the rename is a fresh directory
-            // mutation, so without its own sync a power loss can leave the
-            // manifest referencing a `dest` that reappears only under the
-            // temporary name. Same mode-aware publish discipline as the
-            // writer's own finish. A sync failure here has already populated
-            // `dest` (the rename succeeded): remove the owned copy before
-            // returning the durability error, like every other salvage
-            // failure path, so a standalone retry's `create_new` open and the
-            // repair caller both see the destination free.
-            if let Some(parent) = dest.parent()
-                && let Err(e) = fs.sync_directory_with(parent, options.sync_mode)
-            {
+            // Publish atomically. A check-then-rename would race: another
+            // process could create `dest` in the window after an `exists` probe
+            // reported it free, and a plain `rename` then REPLACES that unowned
+            // file, violating the promise not to destroy a destination this
+            // salvage never created. `hard_link` claims `dest` with no-replace
+            // semantics — it fails `AlreadyExists` if anything is already there
+            // (every `Fs` backend implements it that way), so the ownership gate
+            // and the publish are one atomic step. `mid_dest` shares `dest`'s
+            // directory, so the link never crosses a filesystem.
+            match fs.hard_link(&mid_dest, &dest) {
+                Ok(()) => {}
+                Err(e) if e.kind() == crate::io::ErrorKind::AlreadyExists => {
+                    // A predecessor or racing worker owns `dest` (only the tail
+                    // attempt ever creates it here, and its copy was discarded
+                    // above). Keep the occupant, drop our copy, and surface the
+                    // tail attempt's own failure against the occupied path.
+                    discard_partial(fs, &mid_dest);
+                    return match tail {
+                        Err(e) => Err(e),
+                        Ok(_) => Err(crate::Error::Io(crate::io::Error::new(
+                            crate::io::ErrorKind::AlreadyExists,
+                            "salvage destination already exists",
+                        ))),
+                    };
+                }
+                Err(e) => {
+                    discard_partial(fs, &mid_dest);
+                    return Err(e.into());
+                }
+            }
+            // `dest` now links the MID copy, but the new directory entry is a
+            // fresh mutation: without its own sync a power loss can leave the
+            // manifest referencing a `dest` that survives only under the temp
+            // name. Make the entry durable BEFORE dropping the temp, using the
+            // same mode-aware discipline as the writer's finish. A sync failure
+            // removes the just-published copy (and the temp) and propagates, so
+            // a retry and the repair caller both see the destination free.
+            if let Err(e) = fs.sync_directory_with(entry_directory(&dest), options.sync_mode) {
                 discard_partial(fs, &dest);
+                discard_partial(fs, &mid_dest);
                 return Err(e.into());
             }
+            // The link is durable; drop the temp name (the inode lives on under
+            // `dest`). A crash before this leaves the temp in the recovery-owned
+            // `.healtmp-` namespace, which the next open sweeps.
+            discard_partial(fs, &mid_dest);
             rep.salvaged_path = Some(dest);
         }
         Ok(rep)
@@ -709,6 +706,20 @@ fn discard_partial(fs: &alloc::sync::Arc<dyn crate::fs::Fs>, dest: &std::path::P
     }
 }
 
+/// The directory to fsync so `path`'s new directory entry is durable.
+///
+/// [`std::path::Path::parent`] yields an EMPTY path for a bare relative
+/// destination (`Path::new("blob").parent() == Some("")`), which is not a
+/// syncable directory: fsyncing it fails and the caller would discard the
+/// recovered file it had just written. Map the empty (and absent) parent to the
+/// current directory so a bare relative destination still gets its entry synced.
+fn entry_directory(path: &std::path::Path) -> &std::path::Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    }
+}
+
 /// Classifies a block load / read failure into a [`DroppedBlock`], distinguishing
 /// a bit-rot checksum mismatch from a structural decode error from a raw
 /// read / decompress failure, and attaching the block's `(prev_end, end_key]`
@@ -891,17 +902,35 @@ fn salvage_blocks(
             .open(&table.path, &crate::fs::FsOpenOptions::new().read(true))?;
         crate::sfa::Reader::from_reader(&mut file)
             .ok()
-            .and_then(|t| t.toc().section(b"data").map(|s| (s.pos(), s.len())))
+            .and_then(|t| {
+                let toc_pos = t.toc_pos();
+                t.toc().section(b"data").and_then(|s| {
+                    // checked, not saturating: a re-stamped `data` length that
+                    // overflows `pos + len` must NOT saturate to a `u64::MAX`
+                    // section end — the byte-at-a-time resync loop below would then
+                    // probe every nonexistent offset up to it, hanging salvage. A
+                    // section that ends past where the TOC begins is equally corrupt
+                    // (it would overlap the index / meta / TOC), so require the end
+                    // to land at or before `toc_pos`.
+                    let end = s.pos().checked_add(s.len())?;
+                    (end <= toc_pos).then_some((s.pos(), end))
+                })
+            })
     };
-    if let Some((section_pos, section_len)) = data_section {
-        let section_end = section_pos.saturating_add(section_len);
+    if let Some((section_pos, section_end)) = data_section {
+        // One open handle for the WHOLE physical walk: the resync scan steps one
+        // byte at a time (block starts are not aligned), so opening the file per
+        // probe would make salvage O(section_len) opens instead of O(blocks).
+        let probe_file = table
+            .fs
+            .open(&table.path, &crate::fs::FsOpenOptions::new().read(true))?;
         let probe_gap = |from: u64,
                          to: u64,
                          items: &mut Vec<(crate::table::BlockHandle, Option<UserKey>)>,
                          dropped: &mut Vec<DroppedBlock>| {
             let mut at = from;
             while at < to {
-                match table.probe_block_handle_at(at, to) {
+                match table.probe_block_handle_in(&*probe_file, at, to) {
                     Ok(h) => {
                         let next = at + u64::from(h.size());
                         items.push((h, None));
@@ -921,7 +950,8 @@ fn salvage_blocks(
                             key_range: None,
                         });
                         at += 1;
-                        while at < to && table.probe_block_handle_at(at, to).is_err() {
+                        while at < to && table.probe_block_handle_in(&*probe_file, at, to).is_err()
+                        {
                             at += 1;
                         }
                     }
@@ -954,26 +984,28 @@ fn salvage_blocks(
             // advance the cursor past back-to-back blocks the gap walk
             // should discover (the oversized non-ECC frame still decodes
             // its first payload, so nothing later would flag the loss).
-            let (handle, end_key) = match table.probe_block_handle_at(off, section_end) {
-                Ok(probed) if probed.size() == keyed.as_ref().size() => {
-                    (*keyed.as_ref(), Some(keyed.end_key().clone()))
-                }
-                // The physical frame disagrees: walk the physically framed
-                // block instead (the lying handle's separator is just as
-                // untrusted as its span).
-                Ok(probed) => (probed, None),
-                // An unframeable header cannot refute the index; keep the
-                // handle — a genuinely corrupt block drops at load.
-                Err(_) => (*keyed.as_ref(), Some(keyed.end_key().clone())),
-            };
-            // A confirmed / physically framed span (the Ok arms) ends within
-            // the section by construction; only the unframeable Err arm keeps
-            // an UNVERIFIED indexed size, so bound the advance to the section
-            // end — a forged oversized size must not skip past later bytes the
-            // final gap probe should re-examine.
-            let next = off
-                .saturating_add(u64::from(handle.size()))
-                .min(section_end);
+            let (handle, end_key) =
+                match table.probe_block_handle_in(&*probe_file, off, section_end) {
+                    Ok(probed) if probed.size() == keyed.as_ref().size() => {
+                        (*keyed.as_ref(), Some(keyed.end_key().clone()))
+                    }
+                    // The physical frame disagrees: walk the physically framed
+                    // block instead (the lying handle's separator is just as
+                    // untrusted as its span).
+                    Ok(probed) => (probed, None),
+                    // The indexed block's header does not frame, so its size is
+                    // UNVERIFIED: trusting it could advance the cursor by a forged
+                    // oversized span and cover the whole rest of the section,
+                    // hiding later intact blocks from the gap walk. Leave the cursor
+                    // here (do not emit) and let the physical resync frame from this
+                    // offset — it drops the unframeable block and recovers the
+                    // blocks after it.
+                    Err(_) => continue,
+                };
+            // Both surviving arms probed the frame within `section_end`, so the
+            // block ends there by construction: `off + size <= section_end`,
+            // which cannot overflow a `u64` bounded by the validated section.
+            let next = (off + u64::from(handle.size())).min(section_end);
             items.push((handle, end_key));
             cursor = cursor.max(next);
         }
@@ -1638,12 +1670,12 @@ pub fn salvage_blob_file(
             }
             // The writer synced the file's bytes; sync the parent directory too
             // so the new directory entry is durable before the report claims
-            // success (without it a power loss can discard the entry). A sync
-            // failure removes the file and propagates, so a caller never sees a
-            // salvaged_path whose directory entry is not durable.
-            if let Some(parent) = dest.parent()
-                && let Err(e) = fs.sync_directory_with(parent, sync_mode)
-            {
+            // success (without it a power loss can discard the entry). A bare
+            // relative `dest` has an EMPTY parent, so resolve it to the current
+            // directory first — otherwise the sync fails and this discards the
+            // recovered file. A sync failure removes the file and propagates, so
+            // a caller never sees a salvaged_path whose entry is not durable.
+            if let Err(e) = fs.sync_directory_with(entry_directory(&dest), sync_mode) {
                 discard_partial(fs, &dest);
                 return Err(e.into());
             }

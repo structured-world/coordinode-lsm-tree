@@ -589,10 +589,29 @@ impl Table {
         offset: u64,
         section_end: u64,
     ) -> crate::Result<BlockHandle> {
+        let file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
+        self.probe_block_handle_in(&*file, offset, section_end)
+    }
+
+    /// As [`probe_block_handle_at`] but reads through an ALREADY-OPEN handle, so
+    /// a caller scanning many offsets (the salvage resync loop, which steps one
+    /// byte at a time because block starts are not aligned) pays a single
+    /// `open` instead of one per probed offset.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] on an undecodable header or an
+    /// out-of-section span; any I/O error from the read.
+    #[cfg(feature = "std")]
+    pub(crate) fn probe_block_handle_in(
+        &self,
+        file: &dyn crate::fs::FsFile,
+        offset: u64,
+        section_end: u64,
+    ) -> crate::Result<BlockHandle> {
         use crate::coding::Decode;
         use crate::table::block::Header;
 
-        let file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
         // Positional read of the largest possible header (block_flags-bearing
         // types are one byte longer than the SST minimum); a short read only
         // matters if it cuts into the bytes `decode_from` actually consumes.
@@ -2185,7 +2204,12 @@ impl Table {
         pos: u64,
         len: u64,
     ) -> crate::Result<()> {
-        let section_end = pos.saturating_add(len);
+        // checked, not saturating: a re-stamped TOC could overflow `pos + len`,
+        // and a saturated `u64::MAX` bound would then accept a forged oversized
+        // handle instead of rejecting the corrupt section.
+        let section_end = pos
+            .checked_add(len)
+            .ok_or(crate::Error::InvalidHeader("data section length overflows"))?;
         for handle in handles {
             let probed = self.probe_block_handle_at(handle.offset().0, section_end)?;
             if probed.size() != handle.size() {

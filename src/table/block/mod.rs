@@ -1744,6 +1744,9 @@ impl Block {
         // `from_file_with_recovery`.
         let actual_data_len = usize::try_from(header.data_length)
             .map_err(|_| crate::Error::InvalidHeader("Block"))?;
+        // Clamp-to-zero: a block truncated before its header ends has no payload,
+        // which `classify_block_trailer` then flags as a mismatch (never a silent
+        // clean read). Same convention as the read/verify trailer checks.
         classify_block_trailer(
             has_ecc,
             block_size.saturating_sub(header_len),

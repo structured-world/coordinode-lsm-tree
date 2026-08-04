@@ -149,7 +149,18 @@ fn quarantine_file(
         .parent()
         .unwrap_or(table_base_folder)
         .join("repair-quarantine");
+    // Creating the quarantine directory adds its entry to the PARENT directory.
+    // That entry is durable only once the parent is synced: the later syncs
+    // cover the source directory and the quarantine directory itself, but not
+    // the parent that now names it, so without this a power loss after repair
+    // returns can drop the whole quarantine directory (and the only preserved
+    // copy of the original). Sync only when the directory is freshly created —
+    // an existing quarantine directory left the parent entry untouched.
+    let quarantine_existed = fs.exists(&quarantine_dir)?;
     fs.create_dir_all(&quarantine_dir)?;
+    if !quarantine_existed && let Some(quarantine_parent) = quarantine_dir.parent() {
+        fs.sync_directory_with(quarantine_parent, sync_mode)?;
+    }
     // Preserve any EARLIER quarantine copy of the same table: `rename` replaces
     // the destination on Unix, so a fixed `{file_name}` would move the new
     // corrupt source over the only copy of a previously quarantined original
