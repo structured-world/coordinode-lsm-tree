@@ -226,13 +226,15 @@ fn salvage_recovers_physical_blocks_past_a_broken_index_partition() -> crate::Re
     let (index_pos, index_len) = {
         let mut f = std::fs::File::open(&source)?;
         let reader = crate::sfa::Reader::from_reader(&mut f)?;
-        let entry = reader
+        let Some((pos, len)) = reader
             .toc()
             .iter()
             .find(|e| e.name() == b"index")
             .map(|e| (e.pos(), e.len()))
-            .expect("a partitioned-index SST must carry an index section");
-        entry
+        else {
+            panic!("a partitioned-index SST must carry an index section");
+        };
+        (pos, len)
     };
     let flip = usize::try_from(index_pos + index_len / 2).unwrap_or(0);
     let mut bytes = std::fs::read(&source)?;
@@ -374,15 +376,17 @@ fn salvage_recovers_all_blocks_under_a_section_spanning_handle() -> crate::Resul
     Ok(())
 }
 
-/// A source whose `seqno_bounds` section is PRESENT but unreadable (the very
-/// rot salvage exists for) must still salvage into a copy WITH the section:
-/// the recover-time load degrades the in-memory map to empty best-effort, so
-/// mirroring from the loaded map would silently drop the section and the
-/// recovered copy would lose its seqno-scoped block-skip. Section presence,
-/// not map content, drives the mirror; the writer re-derives the ranges from
-/// the re-emitted entries.
+/// A source whose `seqno_bounds` section is PRESENT but does not decode must
+/// fail SALVAGE closed on a table that exposes NO deletion metadata: a
+/// re-stamped TOC can rename a `range_tombstones` / `delete_bitmap` section to
+/// `seqno_bounds` and re-role its block, leaving a uniquely named, tiled
+/// catalogue whose parsed table reports no deletion. Salvage re-derives the
+/// seqno bounds from the recovered entries, so it would discard that section
+/// and re-emit the suppressed rows as live. A genuinely rotted seqno-bounds
+/// section is indistinguishable from the relabel, so both fail closed; the
+/// operator recovers the quarantined original by hand.
 #[test]
-fn salvage_keeps_seqno_bounds_when_the_source_section_is_unreadable() -> crate::Result<()> {
+fn salvage_refuses_a_corrupt_seqno_bounds_that_may_hide_a_deletion() -> crate::Result<()> {
     let dir = tempdir()?;
     let source = dir.path().join("source");
     let dest = dir.path().join("salvaged");
@@ -426,34 +430,17 @@ fn salvage_keeps_seqno_bounds_when_the_source_section_is_unreadable() -> crate::
         std::fs::write(&source, bytes)?;
     }
 
-    let report = salvage_sst(&source, dest, &fs)?;
-    assert_eq!(
-        report.entries_salvaged, 50,
-        "all rows recovered: {report:?}"
-    );
-    let Some(salvaged) = report.salvaged_path else {
-        panic!("the data blocks are intact, a copy must be written");
-    };
-
-    // The recovered copy carries a fresh, readable seqno_bounds section.
-    let mut f = std::fs::File::open(&salvaged)?;
-    let reader = match crate::sfa::Reader::from_reader(&mut f) {
-        Ok(r) => r,
-        Err(e) => panic!("reading the salvaged SFA trailer failed: {e:?}"),
+    // Salvage fails closed: the seqno-bounds section did not decode and the
+    // table exposes no deletion, so it may be a relabeled deletion salvage
+    // would discard — quarantine for manual recovery instead of resurrecting
+    // rows.
+    let Err(err) = salvage_sst(&source, dest, &fs) else {
+        panic!("a corrupt seqno-bounds section with no visible deletion must fail salvage");
     };
     assert!(
-        reader.toc().iter().any(|e| e.name() == b"seqno_bounds"),
-        "the salvaged copy must keep the seqno_bounds section",
+        matches!(err, crate::Error::FeatureUnsupported(_)),
+        "the refusal names the unsupported salvage, got {err:?}",
     );
-
-    // TOC presence is only shape: a fresh-but-undecodable re-emit (the exact
-    // degradation the rotted source carries) would keep both the TOC check
-    // and `has_seqno_bounds` green, since recover silently degrades an
-    // unreadable map to empty. `verify_seqno_bounds` re-reads the section
-    // from disk, decodes it, and cross-checks every recorded range against
-    // the blocks' decoded entries.
-    let reopened = open(salvaged, &fs)?;
-    reopened.verify_seqno_bounds()?;
     Ok(())
 }
 

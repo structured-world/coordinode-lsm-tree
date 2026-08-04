@@ -170,6 +170,18 @@ pub struct Inner {
     /// instead of degrading.
     pub(crate) delete_bitmap_degraded: bool,
 
+    /// Whether a SALVAGE-MODE open degraded a REBUILDABLE side section
+    /// (filter / `filter_tli`, seqno bounds, zone map, locator) because its
+    /// block did not decode as the claimed type. Salvage re-derives every such
+    /// section from the recovered entries, so a section that is present but does
+    /// not decode may be a `range_tombstones` / `delete_bitmap` relabeled to a
+    /// rebuildable name and re-roled — which salvage would discard, resurrecting
+    /// the suppressed rows. The salvage walk consults this to fail closed when
+    /// the table exposes no deletion metadata. Purely STRUCTURAL (each decode
+    /// reads its own section's bytes, independent of the data blocks), so a
+    /// corrupt DATA block does not trip it.
+    pub(crate) rebuildable_section_degraded: bool,
+
     /// Retrieval-ribbon locator, loaded on open from the optional `locator`
     /// section. `Some` only when the table was written with a locator policy
     /// enabled; lets a point read resolve a key to its data block in O(1),

@@ -2775,20 +2775,14 @@ impl Table {
     ///
     /// [`crate::Error::InvalidHeader`] when the filter reports an existing
     /// key as definitely absent; any I/O / decode error from the full scan.
-    /// Whether a partitioned-filter top-level index (`filter_tli`) is declared
-    /// in the TOC but was NOT loaded — the salvage-mode open degraded it
-    /// because its block would not decode as an index.
-    ///
-    /// A re-stamped TOC that renames a `range_tombstones` / `delete_bitmap`
-    /// section to `filter_tli` and re-roles its block lands here: the section
-    /// is present and its block passes the byte-level walk, but its CONTENT is
-    /// not a filter index, so the load degrades it. This is a purely STRUCTURAL
-    /// signal (did the `filter_tli` block itself decode), independent of the
-    /// data blocks: a corrupt DATA block leaves the filter index loadable and
-    /// so does not trip it. Used by salvage to fail closed on a table whose
-    /// filter index may be a relabeled deletion it would otherwise discard.
-    pub(crate) fn filter_index_declared_but_unloaded(&self) -> bool {
-        self.regions.filter_tli.is_some() && self.pinned_filter_index.is_none()
+    /// Whether the salvage-mode open degraded a REBUILDABLE side section
+    /// (filter / `filter_tli`, seqno bounds, zone map, locator) because its
+    /// block did not decode as the claimed type — see
+    /// [`Inner::rebuildable_section_degraded`](crate::table::inner::Inner). Used
+    /// by salvage to fail closed on a table whose degraded section may be a
+    /// relabeled deletion it would otherwise discard and resurrect.
+    pub(crate) fn salvage_degraded_a_rebuildable_section(&self) -> bool {
+        self.rebuildable_section_degraded
     }
 
     #[cfg(feature = "std")]
@@ -5217,6 +5211,20 @@ impl Table {
             })
         };
 
+        // Set when the salvage-mode open DEGRADES a rebuildable side section
+        // (filter / filter_tli, seqno bounds, zone map, locator) because its
+        // block did not decode as the claimed type. Salvage re-derives every
+        // such section from the recovered entries, so a section that is present
+        // but does not decode may be a `range_tombstones` / `delete_bitmap`
+        // relabeled to a rebuildable name and re-roled — which salvage would
+        // discard, resurrecting the suppressed rows. This is a purely
+        // STRUCTURAL signal (each decode reads its own section's bytes,
+        // independent of the data blocks), so a corrupt DATA block does not
+        // trip it. `block_layout` is excluded: it fails the open outright, so a
+        // relabel to it is quarantined by the failed recovery rather than
+        // salvaged.
+        let mut rebuildable_section_degraded = false;
+
         let pinned_filter_index = if let Some(filter_tli_handle) = regions.filter_tli {
             let load = || -> crate::Result<IndexBlock> {
                 let block = Block::from_file(
@@ -5268,6 +5276,7 @@ impl Table {
                          without it (the recovered copy re-derives its filter)",
                         metadata.id
                     );
+                    rebuildable_section_degraded = true;
                     None
                 }
                 Err(e) => return Err(e),
@@ -5336,6 +5345,7 @@ impl Table {
                          without it (the recovered copy re-derives its filter)",
                         metadata.id
                     );
+                    rebuildable_section_degraded = true;
                     None
                 }
                 Err(e) => return Err(e),
@@ -5483,6 +5493,7 @@ impl Table {
                     "seqno-bounds section for table {:?} is unreadable ({e}); disabling seqno block-skip",
                     metadata.id
                 );
+                rebuildable_section_degraded = true;
                 crate::table::seqno_bounds::SeqnoBoundsMap::default()
             })
         } else {
@@ -5535,6 +5546,7 @@ impl Table {
                     "zone-map section for table {:?} is unreadable ({e}); disabling block-skip",
                     metadata.id
                 );
+                rebuildable_section_degraded = true;
                 crate::table::zone_map::ZoneMap::default()
             })
         } else {
@@ -5675,6 +5687,7 @@ impl Table {
             )
             .inspect_err(|e| {
                 log::warn!("retrieval-ribbon locator disabled: section load failed: {e:?}");
+                rebuildable_section_degraded = true;
             })
             .ok()?;
             if block.header.block_type != BlockType::Locator {
@@ -5682,6 +5695,7 @@ impl Table {
                     "retrieval-ribbon locator disabled: unexpected block type {:?}",
                     block.header.block_type
                 );
+                rebuildable_section_degraded = true;
                 return None;
             }
             let blocks: Vec<BlockHandle> = block_index
@@ -5747,6 +5761,7 @@ impl Table {
                 delete_bitmap,
                 delete_block_starts,
                 delete_bitmap_degraded,
+                rebuildable_section_degraded,
                 locator_index,
                 encryption,
 
