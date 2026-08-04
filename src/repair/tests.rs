@@ -49,6 +49,44 @@ fn quarantine_file_syncs_the_affected_directories() -> crate::Result<()> {
     Ok(())
 }
 
+/// Creating the `repair-quarantine/` directory adds its entry to the PARENT
+/// directory; that entry must be fsynced before the move so a power loss after
+/// repair returns cannot drop the whole quarantine directory (and the only
+/// preserved copy of the original). The parent sync runs right after the
+/// directory is created — BEFORE the rename — so faulting the first directory
+/// sync leaves the source UNMOVED. Without the parent sync the first sync is
+/// the post-rename source sync, by which point the file is already moved: the
+/// surviving-source assertion then fails, proving the fresh directory's parent
+/// entry was never made durable.
+#[test]
+fn quarantine_file_syncs_the_freshly_created_quarantine_parent() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, SyncMode};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let src = tables.join("junk-name");
+    std::fs::write(&src, b"orphan")?;
+
+    // Fail the FIRST directory sync. The quarantine directory does not exist
+    // yet, so the fix's parent sync (post-create, pre-rename) is that first
+    // sync — its failure aborts before the rename moves the source.
+    let fs = FaultFs::new(StdFs);
+    fs.injector()
+        .arm(FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).once());
+
+    assert!(
+        quarantine_file(&fs, &tables, &src, "junk-name", SyncMode::Full).is_err(),
+        "the quarantine-parent fsync fault must surface",
+    );
+    assert!(
+        std::fs::metadata(&src).is_ok(),
+        "the pre-rename parent-sync failure must leave the source in place",
+    );
+    Ok(())
+}
+
 /// A second repair of the same table must NOT overwrite an earlier quarantine
 /// copy: `rename` replaces the destination on Unix, so a fixed
 /// `repair-quarantine/{id}` name would destroy the only copy of the previous

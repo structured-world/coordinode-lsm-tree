@@ -184,6 +184,83 @@ pub fn forge_duplicate_section_name(
     Ok(())
 }
 
+/// Overwrites the on-disk `len` field of the named SFA TOC section with
+/// `new_len` and re-stamps the TOC trailer checksum. The section catalogue then
+/// advertises a bogus length (e.g. `u64::MAX`, whose `pos + len` overflows)
+/// while every other structure stays intact and every byte-level check passes.
+/// Used to prove the salvage physical walk rejects a data section whose end
+/// overflows / runs past the TOC instead of tiling to that forged upper bound
+/// (which would make the byte-at-a-time resync scan every offset to the bound).
+///
+/// A `len` change does not move the entry, so the TOC and every later section
+/// stay byte-for-byte in place; only the eight length bytes and the trailer
+/// digest change.
+pub fn forge_section_len(path: &std::path::Path, name: &[u8], new_len: u64) -> crate::Result<()> {
+    let mut bytes = std::fs::read(path)?;
+    const TRAILER_SIZE: usize = 4 + 1 + 1 + 16 + 8 + 8;
+    let trailer_start = bytes.len() - TRAILER_SIZE;
+    let read_u64 = |bytes: &[u8], at: usize| {
+        let Some(b) = bytes.get(at..at + 8) else {
+            panic!("u64 field within the trailer");
+        };
+        u64::from_le_bytes(b.try_into().expect("8 bytes"))
+    };
+    let toc_pos = usize::try_from(read_u64(&bytes, trailer_start + 4 + 1 + 1 + 16))
+        .expect("toc_pos fits usize");
+    let toc_len = usize::try_from(read_u64(&bytes, trailer_start + 4 + 1 + 1 + 16 + 8))
+        .expect("toc_len fits usize");
+
+    // Walk the TOC entries to find the target's len-field byte offset. Each
+    // entry is pos (u64 LE) + len (u64 LE) + name_len (u16 LE) + name, so the
+    // len field is the second u64 of the entry's 16-byte pos+len prefix.
+    let toc = bytes.get(toc_pos..toc_pos + toc_len).expect("TOC region");
+    assert_eq!(toc.get(..4), Some(&b"TOC!"[..]), "TOC magic");
+    let count = u32::from_le_bytes(toc.get(4..8).expect("count").try_into().expect("4 bytes"));
+    let mut at = 8usize;
+    let mut len_field_off: Option<usize> = None;
+    for _ in 0..count {
+        let entry_off = at;
+        at += 16;
+        let name_len = usize::from(u16::from_le_bytes(
+            toc.get(at..at + 2)
+                .expect("name_len")
+                .try_into()
+                .expect("2 bytes"),
+        ));
+        at += 2;
+        let entry_name = toc.get(at..at + name_len).expect("name");
+        at += name_len;
+        if entry_name == name {
+            len_field_off = Some(toc_pos + entry_off + 8);
+        }
+    }
+    let Some(len_off) = len_field_off else {
+        panic!(
+            "section {:?} present in the TOC",
+            core::str::from_utf8(name)
+        );
+    };
+    bytes
+        .get_mut(len_off..len_off + 8)
+        .expect("len field within file")
+        .copy_from_slice(&new_len.to_le_bytes());
+
+    // Re-stamp the trailer digest (xxh3-128 over the mutated TOC bytes only).
+    let fresh = {
+        let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
+        hasher.update(bytes.get(toc_pos..toc_pos + toc_len).expect("TOC region"));
+        hasher.digest128()
+    };
+    let ck_off = trailer_start + 4 + 1 + 1;
+    bytes
+        .get_mut(ck_off..ck_off + 16)
+        .expect("trailer checksum")
+        .copy_from_slice(&fresh.to_le_bytes());
+
+    std::fs::write(path, &bytes)?;
+    Ok(())
+}
+
 /// RENAMES an SFA TOC section (same-length name) and re-stamps the trailer's
 /// TOC checksum: the archive stays internally consistent while a section the
 /// verifier knows disappears behind an unrecognized name — the shape only a

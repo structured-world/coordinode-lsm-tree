@@ -306,9 +306,12 @@ fn salvage_refuses_a_range_tombstone_hidden_as_a_recognized_section() -> crate::
     let Err(err) = salvage_sst(&source, dest, &fs) else {
         panic!("a hidden range tombstone must fail salvage");
     };
+    let crate::Error::FeatureUnsupported(reason) = &err else {
+        panic!("the refusal must be FeatureUnsupported, got {err:?}");
+    };
     assert!(
-        matches!(err, crate::Error::FeatureUnsupported(_)),
-        "the refusal names the unsupported salvage, got {err:?}",
+        reason.contains("range tombstones"),
+        "the refusal must name range tombstones specifically, got {reason:?}",
     );
     Ok(())
 }
@@ -356,9 +359,13 @@ fn salvage_resyncs_past_an_unframeable_block_in_the_physical_walk() -> crate::Re
     };
     {
         let mut bytes = std::fs::read(&source)?;
-        if let Some(b) = bytes.get_mut(usize::try_from(smash_offset).unwrap_or(0)) {
-            *b ^= 0xFF;
-        }
+        let Ok(at) = usize::try_from(smash_offset) else {
+            panic!("data block offset {smash_offset} fits usize");
+        };
+        let Some(b) = bytes.get_mut(at) else {
+            panic!("the block header at {at} lies within the file");
+        };
+        *b ^= 0xFF;
         std::fs::write(&source, &bytes)?;
     }
 
@@ -518,6 +525,126 @@ fn salvage_recovers_all_blocks_under_a_section_spanning_handle() -> crate::Resul
     assert_eq!(
         report.entries_salvaged, 64,
         "the blocks a spanning handle hides must still be recovered: {report:?}",
+    );
+    Ok(())
+}
+
+/// A cleanly enumerated index handle whose block header does NOT frame and
+/// whose stored span is oversized (a spanning forge with a smashed header)
+/// must not advance the physical cursor by that UNVERIFIED size: trusting it
+/// covers the whole remaining data section, so the gap walk never discovers
+/// the later intact blocks and every one but the unframeable block is lost.
+/// The tiler must leave the cursor where it is and let the physical resync
+/// frame the blocks after the smashed one.
+#[test]
+fn salvage_recovers_blocks_after_an_unframeable_oversized_handle() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+    for i in 0u64..64 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Resolve the FIRST data block's offset (the block the spanning handle
+    // keeps) BEFORE the forge — the data section is first, so the tli rewrite
+    // that follows only shifts later sections and leaves this offset valid.
+    let first_off = {
+        let table = open(source.clone(), &fs)?;
+        let Some(off) = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|h| *h.as_ref().offset())
+            .next()
+        else {
+            panic!("the source carries data blocks");
+        };
+        off
+    };
+
+    // Collapse both TLI mirrors into ONE handle spanning the whole data section
+    // (size = sum of every block size), then smash that block's header first
+    // byte so it cannot frame: the handle enumerates cleanly through the
+    // mirror gate, but its oversized span is now UNVERIFIABLE.
+    crate::test_forge::forge_tli_mirrors_span_single_handle(&source, 0)?;
+    {
+        let mut bytes = std::fs::read(&source)?;
+        let Ok(at) = usize::try_from(first_off) else {
+            panic!("data block offset {first_off} fits usize");
+        };
+        let Some(b) = bytes.get_mut(at) else {
+            panic!("the block header lies within the file");
+        };
+        *b ^= 0xFF;
+        std::fs::write(&source, &bytes)?;
+    }
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+
+    // A late key (in a block after the smashed spanning one) must survive: the
+    // walk drops the unframeable block, then resyncs and frames the rest.
+    assert!(
+        reopen_get(dest, &fs, b"key-060")?.is_some(),
+        "blocks after the unframeable oversized handle must recover via resync: {report:?}",
+    );
+    assert!(
+        report.entries_salvaged > 1,
+        "more than the single unframeable block must be recovered: {report:?}",
+    );
+    Ok(())
+}
+
+/// A forged `data` SFA-section length whose `pos + len` OVERFLOWS `u64` must
+/// not be trusted as the physical-walk upper bound: saturating the bound to
+/// `u64::MAX` makes the byte-at-a-time resync probe every nonexistent offset
+/// up to that bound, effectively hanging standalone salvage. The walk must
+/// reject a section that ends past the SFA `toc_pos` (or overflows) and fall
+/// back to the intact index enumeration, completing promptly.
+#[test]
+fn salvage_rejects_overflowing_data_section_and_completes() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+    let n = 64u32;
+    for i in 0..u64::from(n) {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Forge the `data` section's advertised length to `u64::MAX` so its end
+    // overflows: the index stays intact, so a walk that rejects the bogus
+    // section recovers every block through the index enumeration instead of
+    // scanning to the overflowed bound.
+    crate::test_forge::forge_section_len(&source, b"data", u64::MAX)?;
+
+    // The nextest slow-timeout terminates a hang; completing at all — with the
+    // full key range recovered from the index — is the proof the bound was
+    // rejected rather than tiled to.
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert_eq!(
+        report.entries_salvaged,
+        u64::from(n),
+        "the intact index must recover every entry once the bogus section is rejected: {report:?}",
+    );
+    assert!(
+        reopen_get(dest, &fs, b"key-060")?.is_some(),
+        "a late key must survive the index-only recovery: {report:?}",
     );
     Ok(())
 }
@@ -713,6 +840,61 @@ fn salvage_removes_the_mid_copy_when_the_publish_dir_sync_fails() -> crate::Resu
         assert!(
             !name.contains(".healtmp-"),
             "the MID temp copy must not survive either, found {name:?}",
+        );
+    }
+    Ok(())
+}
+
+/// The MID publish must claim `dest` with an atomic no-replace operation, never
+/// a blind rename that clobbers an unowned file. When `dest` is already
+/// occupied, the tail attempt's `create_new` open fails against it (so the MID
+/// attempt wins and reaches the publish path), and the publish must surface an
+/// error while leaving the occupant's bytes untouched and leaking no temp copy.
+///
+/// The narrower check-then-rename TOCTOU — `dest` appearing only AFTER an
+/// existence probe reports it free — is not deterministically reachable through
+/// the current fault surface (it cannot force `Fs::exists` to report a present
+/// file absent); the no-replace `hard_link` publish closes that window
+/// structurally rather than by a racy probe.
+#[test]
+fn salvage_does_not_clobber_an_occupied_destination_when_the_mid_attempt_wins() -> crate::Result<()>
+{
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+    for i in 0u64..64 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // A racing worker already owns `dest`. The tail attempt's `create_new` open
+    // fails against it, so the tail errors and the MID attempt (writing to a
+    // temp) wins arbitration and must PUBLISH into the occupied path.
+    std::fs::write(&dest, b"racing worker's file")?;
+
+    let result = salvage_sst(&source, dest.clone(), &fs);
+    assert!(
+        result.is_err(),
+        "publishing over an occupied destination must fail, got {result:?}",
+    );
+    assert_eq!(
+        std::fs::read(&dest)?,
+        b"racing worker's file",
+        "the occupant's bytes must survive the failed publish",
+    );
+    for entry in std::fs::read_dir(dir.path())? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        assert!(
+            !name.contains(".healtmp-"),
+            "the MID temp copy must not leak, found {name:?}",
         );
     }
     Ok(())
@@ -1936,9 +2118,11 @@ fn salvage_drops_a_corrupted_block_and_keeps_the_rest() -> crate::Result<()> {
     assert!(writer.finish()?.is_some(), "source SST is non-empty");
 
     // Resolve the second data block's on-disk offset from the (intact) index,
-    // then flip a byte a little past its header so the block's data checksum
-    // fails on load. load_data_block reads the block by the index handle's size,
-    // so the corruption surfaces as that one block failing, not a desync.
+    // then flip a byte inside its PAYLOAD (past the fixed-size block header) so
+    // the header still frames but the block's data checksum fails on load.
+    // load_data_block reads the block by the index handle's size, so the
+    // corruption surfaces as that one block failing at load — kept via the
+    // index, dropped as a checksum mismatch — not as a physical-walk desync.
     let target = {
         let table = open(source.clone(), &fs)?;
         let offsets: alloc::vec::Vec<u64> = table
@@ -1951,7 +2135,13 @@ fn salvage_drops_a_corrupted_block_and_keeps_the_rest() -> crate::Result<()> {
         };
         second
     };
-    let flip = usize::try_from(target).unwrap_or(0) + 16;
+    // Land well past the fixed data-block header (magic + type + checksums +
+    // lengths) so the frame stays intact and only the payload rots.
+    let header_len = crate::table::block::Header::header_len(crate::table::block::BlockType::Data);
+    let Ok(target_usize) = usize::try_from(target) else {
+        panic!("data block offset {target} does not fit usize on this target");
+    };
+    let flip = target_usize + header_len + 8;
     let mut bytes = std::fs::read(&source)?;
     if let Some(b) = bytes.get_mut(flip) {
         *b ^= 0xFF;
@@ -2179,8 +2369,9 @@ fn salvage_drops_a_corrupted_columnar_block_and_keeps_the_rest() -> crate::Resul
         "source columnar SST is non-empty"
     );
 
-    // Corrupt the second columnar data block's bytes (offset from the intact
-    // index, a little past its header) so its reconstruction fails on load.
+    // Corrupt the second columnar data block's PAYLOAD (offset from the intact
+    // index, past the fixed block header) so the frame stays intact but its
+    // reconstruction fails on load — kept via the index, dropped at load.
     let target = {
         let table = open(source.clone(), &fs)?;
         let offsets: alloc::vec::Vec<u64> = table
@@ -2193,7 +2384,13 @@ fn salvage_drops_a_corrupted_columnar_block_and_keeps_the_rest() -> crate::Resul
         };
         second
     };
-    let flip = usize::try_from(target).unwrap_or(0) + 16;
+    // Land well past the fixed data-block header so only the payload rots and
+    // the header still frames (otherwise the physical walk resyncs past it).
+    let header_len = crate::table::block::Header::header_len(crate::table::block::BlockType::Data);
+    let Ok(target_usize) = usize::try_from(target) else {
+        panic!("data block offset {target} does not fit usize on this target");
+    };
+    let flip = target_usize + header_len + 8;
     let mut bytes = std::fs::read(&source)?;
     if let Some(b) = bytes.get_mut(flip) {
         *b ^= 0xFF;
@@ -4612,9 +4809,16 @@ fn salvage_blob_file_syncs_the_destination_directory() -> crate::Result<()> {
         FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).on_path("blobdest"),
     );
 
-    let Err(_err) = salvage_blob_file(&source, dest, &fs, 0) else {
+    let Err(err) = salvage_blob_file(&source, dest, &fs, 0) else {
         panic!("the destination-directory fsync fault must surface");
     };
+    // Assert the surfaced error is the INJECTED directory-sync fault, not some
+    // unrelated failure: a build that stopped syncing the directory would fail
+    // elsewhere (or not at all), and a loose "any error" check would not notice.
+    assert!(
+        err.to_string().contains("injected fault on SyncDirectory"),
+        "the salvage error must be the injected destination-directory sync fault, got {err:?}",
+    );
     Ok(())
 }
 
