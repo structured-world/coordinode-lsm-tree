@@ -54,6 +54,14 @@ pub struct ParsedMeta {
     pub file_size: u64,
     pub item_count: u64,
     pub tombstone_count: u64,
+
+    /// Number of RANGE tombstones the writer emitted into the
+    /// `range_tombstones` section. Distinct from `tombstone_count` (point
+    /// deletes). Salvage cross-checks it against the parsed section: a `> 0`
+    /// count with no readable section means the section was hidden (renamed /
+    /// re-roled), so salvaging would resurrect the rows it masked.
+    pub range_tombstone_count: u64,
+
     pub weak_tombstone_count: u64,
     pub weak_tombstone_reclaimable: u64,
 
@@ -312,6 +320,7 @@ impl ParsedMeta {
         }
         let item_count = read_u64!(block, b"item_count", &cmp);
         let tombstone_count = read_u64!(block, b"tombstone_count", &cmp);
+        let range_tombstone_count = read_u64!(block, b"range_tombstone_count", &cmp);
         let data_block_count = read_u64!(block, b"block_count#data", &cmp);
         let index_block_count = read_u64!(block, b"block_count#index", &cmp);
         let _filter_block_count = read_u64!(block, b"block_count#filter", &cmp);
@@ -465,6 +474,7 @@ impl ParsedMeta {
             file_size,
             item_count,
             tombstone_count,
+            range_tombstone_count,
             weak_tombstone_count,
             weak_tombstone_reclaimable,
             sum_user_key_bytes,

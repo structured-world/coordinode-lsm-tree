@@ -544,11 +544,16 @@ fn salvage_attempt(
         },
     )?;
 
-    // Fail closed on range tombstones: the positional walk re-emits only point
-    // entries, so salvaging an SST that carries range tombstones would drop them
-    // and let lower-level keys they cover reappear after repair (a merge-semantics
-    // violation). Reject until the writer path can re-emit them.
-    if !table.range_tombstones().is_empty() {
+    // Fail closed on range tombstones, present OR hidden: the positional walk
+    // re-emits only point entries, so salvaging an SST that carries range
+    // tombstones would drop them and let lower-level keys they cover reappear
+    // after repair (a merge-semantics violation). A re-stamped TOC can also
+    // RENAME the range_tombstones section to a recognized name whose block
+    // decodes cleanly (an empty `filter`), hiding it from `range_tombstones()`
+    // without tripping the degradation flag — but the persisted
+    // `range_tombstone_count` still records it, so cross-check the count too.
+    // Reject either way until the writer path can re-emit range tombstones.
+    if !table.range_tombstones().is_empty() || table.metadata.range_tombstone_count > 0 {
         return Err(crate::Error::FeatureUnsupported(
             "salvage of an SST with range tombstones",
         ));
