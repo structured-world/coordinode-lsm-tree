@@ -554,29 +554,30 @@ fn salvage_attempt(
         ));
     }
 
-    // Fail closed when the source's `filter_tli` section is declared but did
-    // not decode as a filter index (the salvage open degraded it) AND the table
+    // Fail closed when the salvage open DEGRADED a rebuildable side section
+    // (filter / filter_tli, seqno bounds, zone map, locator) AND the table
     // exposes NO deletion metadata. A re-stamped TOC can rename a
-    // `range_tombstones` / `delete_bitmap` section to `filter_tli` and re-role
-    // its block: it passes the byte-level walk AND the tiling check (the
-    // catalogue stays uniquely named), and the parsed table reports no
-    // deletion, but its CONTENT is not a filter index. Salvage would DISCARD it
-    // (the recovered copy re-derives its filter from the entries) and re-emit
-    // the suppressed rows as live. A genuinely rotted filter index is
-    // indistinguishable from the relabel, so both fail closed; the operator
-    // recovers the quarantined original by hand. The check is purely STRUCTURAL
-    // (did the `filter_tli` block decode as an index), so a corrupt DATA block
-    // — which leaves the filter index loadable — still salvages. A table that
-    // DOES carry a visible deletion (a delete bitmap; range tombstones were
-    // rejected above) is exempt: its deletions are accounted for and applied.
+    // `range_tombstones` / `delete_bitmap` section to one of those names and
+    // re-role its block: it passes the byte-level walk AND the tiling check
+    // (the catalogue stays uniquely named), and the parsed table reports no
+    // deletion, but its CONTENT is not what the name claims, so the open
+    // degrades it. Salvage re-derives every such section from the recovered
+    // entries, so it would DISCARD the relabeled deletion and re-emit the
+    // suppressed rows as live. A genuinely rotted section is indistinguishable
+    // from the relabel, so both fail closed; the operator recovers the
+    // quarantined original by hand. The signal is purely STRUCTURAL (each
+    // section decodes its own bytes, independent of the data blocks), so a
+    // corrupt DATA block still salvages. A table that DOES carry a visible
+    // deletion (a delete bitmap; range tombstones were rejected above) is
+    // exempt: its deletions are accounted for and applied.
     #[cfg(feature = "columnar")]
     let has_visible_deletion = table.has_delete_bitmap_section();
     #[cfg(not(feature = "columnar"))]
     let has_visible_deletion = false;
-    if !has_visible_deletion && table.filter_index_declared_but_unloaded() {
+    if !has_visible_deletion && table.salvage_degraded_a_rebuildable_section() {
         return Err(crate::Error::FeatureUnsupported(
-            "salvage of an SST whose filter index did not decode and may be a \
-             relabeled deletion",
+            "salvage of an SST with a degraded rebuildable section that may hide \
+             a relabeled deletion",
         ));
     }
 
@@ -1517,7 +1518,12 @@ pub fn salvage_blob_file(
     // would race a concurrent creator (TOCTOU) and delete a file this salvage
     // does not own. Later `write` / `finish` failures still clean up below:
     // by then `create_new` has proven `dest` is ours.
-    let mut writer = BlobWriter::new(&dest, blob_file_id, 0, &**fs)?;
+    // Blob salvage is a rare recovery operation, so sync at the strongest
+    // durability: the writer fsyncs the file's bytes and the parent directory is
+    // synced below, so the recovered file survives a power loss the moment the
+    // report claims success.
+    let sync_mode = crate::fs::SyncMode::Full;
+    let mut writer = BlobWriter::new(&dest, blob_file_id, 0, &**fs)?.use_sync_mode(sync_mode);
 
     let mut records_total = 0usize;
     let mut records_salvaged = 0usize;
@@ -1617,6 +1623,17 @@ pub fn salvage_blob_file(
             if let Err(e) = writer.finish() {
                 discard_partial(fs, &dest);
                 return Err(e);
+            }
+            // The writer synced the file's bytes; sync the parent directory too
+            // so the new directory entry is durable before the report claims
+            // success (without it a power loss can discard the entry). A sync
+            // failure removes the file and propagates, so a caller never sees a
+            // salvaged_path whose directory entry is not durable.
+            if let Some(parent) = dest.parent() {
+                if let Err(e) = fs.sync_directory_with(parent, sync_mode) {
+                    discard_partial(fs, &dest);
+                    return Err(e.into());
+                }
             }
             Some(dest)
         }
