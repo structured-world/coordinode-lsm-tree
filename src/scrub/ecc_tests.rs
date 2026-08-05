@@ -2125,28 +2125,33 @@ fn heal_in_place_does_not_restamp_over_side_section_rot() -> crate::Result<()> {
     Ok(())
 }
 
+/// Byte path of the heal attestation sidecar next to an SST.
+fn heal_attest_path(sst_path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = sst_path.as_os_str().to_os_string();
+    name.push(".heal-attest");
+    std::path::PathBuf::from(name)
+}
+
 /// A manifest-digest refresh that FAILED (or a crash after the heal's
-/// `sync_data` but before the manifest update) leaves a stale digest that a
-/// later clean heal-in-place scrub must NOT auto-reconcile: the later scrub
-/// sees only clean blocks, so the mismatch is unattributable to any heal, and
-/// nothing distinguishes it from an offline restamp of the non-derivable meta
-/// scalars (`created_at`, the footer descriptor) that no cross-check can
-/// authenticate. Reconciling it would launder such a restamp, so the scrub
-/// fails closed even on a footer-bearing table; the healthy SST keeps a
-/// `ChecksumRefreshFailed` finding until a compaction / repair rewrite
-/// recomputes the digest legitimately.
+/// `sync_data` but before the manifest update) leaves a stale digest. Because
+/// the heal writes a sidecar ATTESTATION before the reconciliation, a later
+/// clean heal-in-place scrub — which sees only clean blocks and cannot
+/// attribute the mismatch to any write of its own — reconciles the digest via
+/// that attestation instead of flagging the healed table as corrupt forever.
+/// (For an unencrypted table the attestation is plaintext; forging it needs the
+/// same directory write access that could re-stamp the SST directly, which is
+/// outside the on-disk-tamper model the digest gate defends.)
 #[test]
-fn heal_in_place_refuses_to_reconcile_an_unattributable_stale_checksum() -> crate::Result<()> {
+fn heal_in_place_reconciles_a_crashed_refresh_via_the_attestation() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
     let (sst_path, block) = write_ecc_sst_footered(dir.path());
 
-    // Rot one parity-trailer byte, then let a manifest rebuild record the
-    // digest of the ROTTED bytes.
     corrupt_parity_trailer_byte(&sst_path, &block)?;
     rebuild_manifest_over_current_bytes(dir.path())?;
 
-    // FIRST heal pass: the trailer is rebuilt in place, but the manifest
-    // refresh fails (injected fault on the edit-log open).
+    // FIRST heal pass: the trailer is rebuilt in place and an attestation is
+    // written, but the manifest refresh fails (injected fault on the edit-log
+    // open), leaving the stale digest AND the attestation on disk.
     let (tree, injector) = open_ecc_tree_with_failing_edit_log(dir.path());
     let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
     injector.clear();
@@ -2155,27 +2160,69 @@ fn heal_in_place_refuses_to_reconcile_an_unattributable_stale_checksum() -> crat
         !report.is_ok(),
         "the failed refresh is a finding: {report:?}"
     );
+    assert!(
+        heal_attest_path(&sst_path).exists(),
+        "the heal must leave an attestation for the crashed refresh",
+    );
 
-    // SECOND heal pass, fault gone: every block reads clean (nothing left to
-    // heal), and the manifest still carries the rotted digest. The mismatch is
-    // unattributable, so the scrub fails closed rather than restamping over an
-    // unauthenticated file.
+    // SECOND heal pass, fault gone: every block reads clean (nothing to heal),
+    // and the manifest still carries the rotted digest. The attestation proves
+    // the file is the healed version, so the mismatch is reconciled.
     let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
-    // Pin the fail-closed reason, not just the variant: another gate could raise
-    // ChecksumRefreshFailed for a different cause and keep this test green while
-    // the attribution branch goes uncovered.
+    assert!(
+        report.is_ok(),
+        "a crashed refresh must reconcile via the attestation on the next scrub: {report:?}",
+    );
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        integrity.is_ok(),
+        "the reconciled digest matches the healed file, got {:?}",
+        integrity.errors,
+    );
+    assert!(
+        !heal_attest_path(&sst_path).exists(),
+        "the attestation is consumed once its reconciliation lands",
+    );
+    Ok(())
+}
+
+/// Without a valid attestation, an unattributable stale digest STILL fails
+/// closed: the attestation is the only thing that lets a clean re-scan
+/// reconcile, so deleting it (modelling a crash before the attestation was
+/// written, or an offline restamp with no attestation at all) must restore the
+/// fail-closed behavior — nothing else distinguishes the mismatch from an
+/// offline restamp of the non-derivable meta scalars.
+#[test]
+fn heal_in_place_fails_closed_without_a_heal_attestation() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst_footered(dir.path());
+
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
+    rebuild_manifest_over_current_bytes(dir.path())?;
+
+    // First pass heals + attests, but the refresh fails.
+    let (tree, injector) = open_ecc_tree_with_failing_edit_log(dir.path());
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    injector.clear();
+    assert!(report.blocks_healed_in_place >= 1, "{report:?}");
+
+    // Remove the attestation before the retry: the mismatch is now
+    // unattributable with no evidence of a legitimate heal.
+    std::fs::remove_file(heal_attest_path(&sst_path))?;
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
     assert!(
         report.errors.iter().any(|e| matches!(
             e,
             ScrubError::ChecksumRefreshFailed { reason, .. }
                 if reason.contains("not attributable to this pass's heal")
         )),
-        "an unattributable stale digest must not be reconciled: {report:?}",
+        "without an attestation the stale digest must fail closed: {report:?}",
     );
     let integrity = crate::verify::verify_integrity(&tree);
     assert!(
         !integrity.is_ok(),
-        "the stale digest keeps flagging until a rewrite recomputes it, got {:?}",
+        "the unattested stale digest keeps flagging, got {:?}",
         integrity.errors,
     );
     Ok(())
