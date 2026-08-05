@@ -2127,10 +2127,10 @@ impl Table {
             }
             self.verify_handles_frame_blocks(&handles, index_section.pos(), index_section.len())?;
             let mut data_handles = alloc::vec::Vec::new();
-            for handle in &handles {
+            for top in &keyed {
                 let part = Self::read_tli_at(
                     &*file,
-                    *handle,
+                    *top.as_ref(),
                     self.metadata.id,
                     self.metadata.index_block_compression,
                     self.encryption.as_deref(),
@@ -2146,6 +2146,27 @@ impl Table {
                     .collect();
                 for k in &part_keyed {
                     self.verify_separator_matches_block(k)?;
+                }
+                // The TLI's top-level SEPARATOR for this partition must equal the
+                // partition's LAST data-block separator. `frames_tile_section`
+                // and the per-block separator checks ignore the top-level keys,
+                // so a re-stamped partition boundary (in both mirrors) passes
+                // them all — yet `TwoLevelBlockIndex::forward_reader` seeks by the
+                // top-level separator and would route reads to the wrong
+                // partition, skipping the keys the real partition holds.
+                let Some(part_last) = part_keyed.last() else {
+                    return Err(crate::Error::InvalidHeader(
+                        "tli addresses an index partition that decodes to zero entries",
+                    ));
+                };
+                if self
+                    .comparator
+                    .compare(top.end_key().as_ref(), part_last.end_key().as_ref())
+                    != core::cmp::Ordering::Equal
+                {
+                    return Err(crate::Error::InvalidHeader(
+                        "tli separator disagrees with its partition's last separator",
+                    ));
                 }
                 data_handles.extend(part_keyed.iter().map(|k| *k.as_ref()));
             }
@@ -3215,6 +3236,19 @@ impl Table {
             ));
         }
 
+        // The decoded tombstone count must match the recorded
+        // `range_tombstone_count`. A re-stamped RT block that decodes to a
+        // SUBSET, or a dropped section, passes the coverage check below for its
+        // surviving entries while the missing ranges no longer mask lower-level
+        // data — reads then resurrect the keys those tombstones deleted. The
+        // count lives in the meta block (already cross-checked field-for-field
+        // against the recovery-time copy above), so it is the trustworthy side.
+        let decoded_rt_count = tombstones.as_ref().map_or(0, alloc::vec::Vec::len) as u64;
+        if decoded_rt_count != meta.range_tombstone_count {
+            return Err(crate::Error::InvalidHeader(
+                "range_tombstones count disagrees with the recorded range_tombstone_count",
+            ));
+        }
         // Range tombstones mask entries in OLDER tables during reads and
         // merges, so a key range narrowed below a tombstone's extent routes
         // reads around this table and resurrects the data it deletes. Reuse the
@@ -3307,7 +3341,19 @@ impl Table {
                 }
                 crate::table::block_layout::BlockLayoutMap::decode(&block.data)?
             };
+            // The writer emits the block_layout section ONLY when it has at
+            // least one multi-inner-block frame to record, so a PRESENT-but-empty
+            // map on a table with data blocks is a forgery — e.g. a delete_bitmap
+            // renamed and re-roled to an empty block_layout, which drops the
+            // deletion metadata and resurrects positionally-deleted rows. (The
+            // per-block loop below cannot catch it: a block absent from the map
+            // is skipped, so an empty map trivially "agrees" with every block.)
             if map.is_empty() {
+                if self.block_index.iter().next().is_some() {
+                    return Err(crate::Error::InvalidHeader(
+                        "block_layout section is present but empty on a table with data blocks",
+                    ));
+                }
                 return Ok(());
             }
 

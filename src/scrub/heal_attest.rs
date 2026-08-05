@@ -135,9 +135,16 @@ pub(super) fn attests(
 }
 
 /// Removes the attestation (best-effort) once the reconciliation it authorized
-/// has installed a legitimate digest.
+/// has installed a legitimate digest, syncing the parent so the removal is
+/// durable — an un-synced unlink can resurrect the sidecar after a power loss,
+/// where it would otherwise linger in `tables/` across opens.
 pub(super) fn remove(fs: &dyn Fs, table_path: &Path) {
-    let _ = fs.remove_file(&attest_path(table_path));
+    let path = attest_path(table_path);
+    if fs.remove_file(&path).is_ok()
+        && let Some(parent) = path.parent()
+    {
+        let _ = fs.sync_directory(parent);
+    }
 }
 
 #[cfg(test)]

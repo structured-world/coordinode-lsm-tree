@@ -420,7 +420,17 @@ pub(crate) fn salvage_with_context(
                     // backends that cannot claim a destination atomically at all —
                     // every in-tree `Fs` implements `hard_link`.
                     match fs.exists(&dest) {
-                        Ok(false) => fs.rename(&mid_dest, &dest)?,
+                        Ok(false) => {
+                            // A failed rename leaves the temp copy behind (tree
+                            // recovery only sweeps the `.healtmp-` namespace
+                            // inside table folders, so a standalone dest keeps
+                            // it) — discard it before propagating, like every
+                            // other exit in this publish sequence.
+                            if let Err(e) = fs.rename(&mid_dest, &dest) {
+                                discard_partial(fs, &mid_dest);
+                                return Err(e.into());
+                            }
+                        }
                         Ok(true) => {
                             discard_partial(fs, &mid_dest);
                             return match tail {
@@ -950,37 +960,62 @@ fn salvage_blocks(
         let probe_file = table
             .fs
             .open(&table.path, &crate::fs::FsOpenOptions::new().read(true))?;
+        // The gap walk must accept a candidate only after its PAYLOAD loads, not
+        // just its header frame: a header-checksum-valid but FAKE header inside
+        // corrupt bytes can declare a forged size that spans real blocks after
+        // it. Advancing by that unvalidated size would skip the intact blocks
+        // (the later load pass drops only the fake candidate, losing the rest).
+        // So fully load each candidate here; the block type matches the SST.
+        let probe_block_type = {
+            #[cfg(feature = "columnar")]
+            {
+                if table.metadata.columnar {
+                    crate::table::block::BlockType::Columnar
+                } else {
+                    crate::table::block::BlockType::Data
+                }
+            }
+            #[cfg(not(feature = "columnar"))]
+            {
+                crate::table::block::BlockType::Data
+            }
+        };
+        // A candidate is REAL only if its header frames AND its payload loads.
+        let frames_and_loads = |at: u64, to: u64| -> Result<crate::table::BlockHandle, ()> {
+            match table.probe_block_handle_in(&*probe_file, at, to) {
+                Ok(h) if table.salvage_load_block(&h, probe_block_type).is_ok() => Ok(h),
+                _ => Err(()),
+            }
+        };
         let probe_gap = |from: u64,
                          to: u64,
                          items: &mut Vec<(crate::table::BlockHandle, Option<UserKey>)>,
                          dropped: &mut Vec<DroppedBlock>| {
             let mut at = from;
             while at < to {
-                match table.probe_block_handle_in(&*probe_file, at, to) {
-                    Ok(h) => {
-                        let next = at + u64::from(h.size());
-                        items.push((h, None));
-                        at = next;
-                    }
-                    Err(e) => {
-                        // An unframeable header must not abandon the rest of the
-                        // gap: report the loss ONCE, then RESYNCHRONIZE forward to
-                        // the next parseable frame so the intact, self-framed
-                        // blocks after it are still recovered. The header carries
-                        // its own checksum, so a resync landing on garbage fails
-                        // to frame and keeps scanning — no false frame is emitted.
-                        dropped.push(DroppedBlock {
-                            offset: at,
-                            section: b"data".to_vec(),
-                            reason: DropReason::HeaderCorrupted(format!("{e:?}")),
-                            key_range: None,
-                        });
-                        at += 1;
-                        while at < to && table.probe_block_handle_in(&*probe_file, at, to).is_err()
-                        {
-                            at += 1;
-                        }
-                    }
+                if let Ok(h) = frames_and_loads(at, to) {
+                    let next = at + u64::from(h.size());
+                    items.push((h, None));
+                    at = next;
+                    continue;
+                }
+                // Either the header did not frame, or it framed with a
+                // checksum-valid but FAKE size whose payload does not load.
+                // Report the loss ONCE, then RESYNCHRONIZE forward one byte at a
+                // time to the next candidate that BOTH frames and loads — never
+                // advancing by an unvalidated span, so intact blocks the fake
+                // would have skipped are still recovered.
+                dropped.push(DroppedBlock {
+                    offset: at,
+                    section: b"data".to_vec(),
+                    reason: DropReason::HeaderCorrupted(
+                        "no framed, loadable block at this offset".to_owned(),
+                    ),
+                    key_range: None,
+                });
+                at += 1;
+                while at < to && frames_and_loads(at, to).is_err() {
+                    at += 1;
                 }
             }
         };
