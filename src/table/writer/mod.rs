@@ -1825,8 +1825,6 @@ impl Writer {
             // Compute the coverage of all range tombstones.
             let mut min_start: Option<UserKey> = None;
             let mut max_end: Option<UserKey> = None;
-            let mut sentinel_start: Option<UserKey> = None;
-            let mut sentinel_seqno: Option<crate::SeqNo> = None;
             for rt in &self.range_tombstones {
                 match &min_start {
                     None => min_start = Some(rt.start.clone()),
@@ -1838,22 +1836,15 @@ impl Writer {
                     Some(cur_max) if rt.end > *cur_max => max_end = Some(rt.end.clone()),
                     _ => {}
                 }
-
-                match (sentinel_seqno, &sentinel_start) {
-                    (None, _) => {
-                        sentinel_seqno = Some(rt.seqno);
-                        sentinel_start = Some(rt.start.clone());
-                    }
-                    (Some(cur_seqno), Some(cur_start))
-                        if rt.seqno < cur_seqno
-                            || (rt.seqno == cur_seqno && rt.start < *cur_start) =>
-                    {
-                        sentinel_seqno = Some(rt.seqno);
-                        sentinel_start = Some(rt.start.clone());
-                    }
-                    _ => {}
-                }
             }
+            // The sentinel uses the (seqno, start)-minimal tombstone's start and
+            // seqno. Shared with the verify path so both agree on which entry is
+            // the synthetic sentinel (excluded from the recorded KV seqno range).
+            let (sentinel_start, sentinel_seqno) =
+                match crate::range_tombstone::RangeTombstone::sentinel(&self.range_tombstones) {
+                    Some((start, seqno)) => (Some(start.clone()), Some(seqno)),
+                    None => (None, None),
+                };
 
             if let (Some(start), Some(end), Some(sentinel_key), Some(sentinel_seqno)) =
                 (min_start, max_end, sentinel_start, sentinel_seqno)

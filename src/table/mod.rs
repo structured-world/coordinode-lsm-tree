@@ -1991,9 +1991,12 @@ impl Table {
         use crate::coding::Decode;
         use alloc::collections::BTreeMap;
 
-        let Some(recorded) = self.list_blob_file_references()? else {
-            return Ok(());
-        };
+        // Derive the indirection accounting FIRST, even when the section is
+        // absent: a table that still carries `ValueHandle` indirections but
+        // advertises no `linked_blob_files` section must NOT pass. Blob GC
+        // consults `list_blob_file_references()` to decide whether other tables
+        // reference a blob, so an accepted table with hidden indirections lets
+        // GC rewrite / drop a blob file this table still points into.
         // (len, bytes, on_disk_bytes) per blob id, accumulated exactly the
         // way the writer folds them from indirections.
         let mut derived: BTreeMap<crate::vlog::BlobFileId, (usize, u64, u64)> = BTreeMap::new();
@@ -2008,6 +2011,17 @@ impl Table {
                 slot.2 += u64::from(ind.vhandle.on_disk_size);
             }
         }
+        let Some(recorded) = self.list_blob_file_references()? else {
+            // No section is valid ONLY for a table with no indirections; a
+            // non-empty derived map with no recorded section is a dropped /
+            // renamed section hiding live blob references.
+            if !derived.is_empty() {
+                return Err(crate::Error::InvalidHeader(
+                    "table carries indirection entries but no linked_blob_files section",
+                ));
+            }
+            return Ok(());
+        };
         let mut recorded_map: BTreeMap<crate::vlog::BlobFileId, (usize, u64, u64)> =
             BTreeMap::new();
         for link in &recorded {
@@ -2299,9 +2313,12 @@ impl Table {
             }
             crate::table::seqno_bounds::SeqnoBoundsMap::decode(&block.data)?
         };
-        if seqno_bounds.is_empty() {
-            return Ok(());
-        }
+        // No early return on an empty map: a PRESENT-but-empty section on a
+        // table with data blocks is a forgery (every writer emits one entry per
+        // block). The per-block loop below rejects it — the first block's
+        // `bounds_for` returns `None` — while a genuinely empty table (no data
+        // blocks) still passes, since the loop runs zero times and `checked`
+        // equals the empty map's length.
         let mut checked = 0usize;
         for handle in self.block_index.iter() {
             let handle = handle?;
@@ -3058,6 +3075,55 @@ impl Table {
             ));
         }
 
+        // Load the range tombstones UP FRONT: the synthetic sentinel an RT-ONLY
+        // table records is derived from them and must be EXCLUDED from the KV
+        // seqno bounds below (its seqno is RT-derived and lies outside the
+        // recorded KV range), and the same list feeds the key-range coverage
+        // check further down.
+        let tombstones = if let Some(rt_handle) = regions.range_tombstones {
+            let block = Block::from_file(
+                &*file,
+                rt_handle,
+                crate::table::block::BlockIdentity {
+                    table_id: self.metadata.id,
+                    block_type: BlockType::RangeTombstone,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                &{
+                    let t = match self.encryption.as_deref() {
+                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                        None => crate::table::block::BlockTransform::PLAIN,
+                    };
+                    if let Some(ecc) = self.metadata.ecc_params {
+                        t.with_ecc(ecc)
+                    } else {
+                        t
+                    }
+                },
+            )?;
+            if block.header.block_type != BlockType::RangeTombstone {
+                return Err(crate::Error::InvalidTag((
+                    "BlockType",
+                    block.header.block_type.into(),
+                )));
+            }
+            Some(Self::decode_range_tombstones(
+                &block,
+                self.comparator.as_ref(),
+            )?)
+        } else {
+            None
+        };
+        // The `(start, seqno)` of the synthetic sentinel entry (a weak tombstone
+        // at the (seqno, start)-minimal tombstone), or `None` when there are no
+        // tombstones. Excluded ONCE from the decoded KV seqno bounds below.
+        let sentinel = tombstones
+            .as_deref()
+            .and_then(crate::range_tombstone::RangeTombstone::sentinel)
+            .map(|(k, s)| (k.clone(), s));
+        let mut sentinel_excluded = false;
+
         let mut count: u64 = 0;
         let mut block_count: u64 = 0;
         let mut first_key: Option<UserKey> = None;
@@ -3081,6 +3147,18 @@ impl Table {
                 last_key = Some(last.key.user_key.clone());
             }
             for entry in &entries {
+                // Exclude the synthetic RT sentinel (once): its RT-derived seqno
+                // is deliberately outside the recorded KV range, so folding it in
+                // would break the KV seqno-bound cross-check for an RT-only table.
+                if !sentinel_excluded
+                    && let Some((sentinel_key, sentinel_seqno)) = &sentinel
+                    && entry.key.seqno == *sentinel_seqno
+                    && entry.key.value_type == crate::ValueType::WeakTombstone
+                    && entry.key.user_key.as_ref() == sentinel_key.as_ref()
+                {
+                    sentinel_excluded = true;
+                    continue;
+                }
                 let s = entry.key.seqno;
                 seqno_lo = Some(seqno_lo.map_or(s, |lo| lo.min(s)));
                 seqno_hi = Some(seqno_hi.map_or(s, |hi| hi.max(s)));
@@ -3097,18 +3175,14 @@ impl Table {
         // and treats it as fully visible above the recorded maximum. Both
         // meta mirrors re-stamped with `seqno#min` raised (or `seqno#kv_max`
         // lowered) pass every other gate yet silently hide older / newer
-        // visible versions after reopen. Cross-check against the decoded
-        // seqnos — but ONLY for tables WITHOUT a range-tombstone sentinel:
-        // the writer emits that synthetic entry with an RT-derived seqno
-        // OUTSIDE the recorded KV range and restores the bounds around it, so
-        // the decoded min/max legitimately differ there. Deletion-metadata
-        // tables are already gated by the fail-closed attribution rule, so
-        // they need no separate seqno check. A recorded minimum ABOVE the
-        // real minimum, or a recorded KV maximum BELOW the real maximum, is
-        // corruption.
-        if regions.range_tombstones.is_none()
-            && let (Some(lo), Some(hi)) = (seqno_lo, seqno_hi)
-        {
+        // visible versions after reopen. Cross-check against the decoded seqnos.
+        // The synthetic RT sentinel was already excluded above (its RT-derived
+        // seqno lies outside the recorded KV range), so this runs for RT-bearing
+        // tables too: an RT-ONLY table's sole entry drops out, leaving no bounds
+        // to check, while an RT+KV table's real entries are checked. A recorded
+        // minimum ABOVE the real minimum, or a recorded KV maximum BELOW the
+        // real maximum, is corruption.
+        if let (Some(lo), Some(hi)) = (seqno_lo, seqno_hi) {
             if meta.seqnos.0 > lo {
                 return Err(crate::Error::InvalidHeader(
                     "meta seqno#min is above the decoded minimum seqno",
@@ -3143,37 +3217,11 @@ impl Table {
 
         // Range tombstones mask entries in OLDER tables during reads and
         // merges, so a key range narrowed below a tombstone's extent routes
-        // reads around this table and resurrects the data it deletes.
-        if let Some(rt_handle) = regions.range_tombstones {
-            let block = Block::from_file(
-                &*file,
-                rt_handle,
-                crate::table::block::BlockIdentity {
-                    table_id: self.metadata.id,
-                    block_type: BlockType::RangeTombstone,
-                    dict_id: 0,
-                    window_log: 0,
-                },
-                &{
-                    let t = match self.encryption.as_deref() {
-                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
-                        None => crate::table::block::BlockTransform::PLAIN,
-                    };
-                    if let Some(ecc) = self.metadata.ecc_params {
-                        t.with_ecc(ecc)
-                    } else {
-                        t
-                    }
-                },
-            )?;
-            if block.header.block_type != BlockType::RangeTombstone {
-                return Err(crate::Error::InvalidTag((
-                    "BlockType",
-                    block.header.block_type.into(),
-                )));
-            }
-            let tombstones = Self::decode_range_tombstones(&block, self.comparator.as_ref())?;
-            for rt in &tombstones {
+        // reads around this table and resurrects the data it deletes. Reuse the
+        // list loaded up front (for the sentinel derivation) rather than
+        // re-reading the block.
+        if let Some(tombstones) = &tombstones {
+            for rt in tombstones {
                 if !(covers(rt.start.as_ref()) && covers(rt.end.as_ref())) {
                     return Err(crate::Error::InvalidHeader(
                         "meta key range does not cover a recorded range tombstone",
