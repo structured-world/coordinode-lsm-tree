@@ -2943,6 +2943,22 @@ impl Table {
         } else {
             None
         };
+        // A present full filter whose payload decodes to the empty "no filter"
+        // sentinel is a forgery on a table with data blocks: the writer omits
+        // the section entirely when filtering is disabled, so it never emits a
+        // present-but-empty full filter. Left unrejected, the read-path probe
+        // below reports Ok(true) for EVERY key (the permissive empty sentinel),
+        // so a delete_bitmap renamed and re-roled to an empty filter passes the
+        // whole check, the SST is kept, and reopening resurrects the rows the
+        // hidden bitmap deleted.
+        if let Some(filter) = &full_filter
+            && filter.is_empty()
+            && self.block_index.iter().next().is_some()
+        {
+            return Err(crate::Error::InvalidHeader(
+                "filter section is present but empty on a table with data blocks",
+            ));
+        }
 
         // Partition blocks are shared by many keys; memoize by file offset so
         // the probe loop reads each partition once.
@@ -3306,14 +3322,12 @@ impl Table {
             let Some(bl_handle) = regions.block_layout else {
                 return Ok(());
             };
-            // The lazy partial-decode path never engages for an encrypted
-            // table (the plaintext frame is only available after a
-            // whole-block decrypt), so its layout is never consulted — and
-            // the raw frame needed for the cross-check is equally
-            // unreachable without decrypting whole blocks.
-            if self.encryption.is_some() {
-                return Ok(());
-            }
+            // Decode the map with an encryption-aware transform: on an encrypted
+            // table the section is AEAD-sealed, so both the emptiness check
+            // below AND catching a relabeled delete_bitmap (its AAD binds the
+            // block type, so decoding it as a BlockLayout fails the AEAD open)
+            // need the provider. This runs BEFORE the encrypted early return so
+            // the emptiness forgery is rejected for encrypted tables too.
             let map = {
                 let block = Block::from_file(
                     &*file,
@@ -3325,7 +3339,10 @@ impl Table {
                         window_log: 0,
                     },
                     &{
-                        let t = crate::table::block::BlockTransform::PLAIN;
+                        let t = match self.encryption.as_deref() {
+                            Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                            None => crate::table::block::BlockTransform::PLAIN,
+                        };
                         if let Some(ecc) = self.metadata.ecc_params {
                             t.with_ecc(ecc)
                         } else {
@@ -3354,6 +3371,14 @@ impl Table {
                         "block_layout section is present but empty on a table with data blocks",
                     ));
                 }
+                return Ok(());
+            }
+            // The per-frame cross-check below decodes whole DATA frames; for an
+            // encrypted table the plaintext frame is only available after a
+            // whole-block decrypt the lazy partial-decode path never performs,
+            // so its layout is never consulted and the raw frame is unreachable.
+            // The emptiness forgery above is already rejected — stop here.
+            if self.encryption.is_some() {
                 return Ok(());
             }
 
@@ -5407,7 +5432,17 @@ impl Table {
         };
 
         // TODO: FilterBlock newtype
-        let pinned_filter_block = if pinned_filter_index.is_none() && pin_filter {
+        //
+        // In SALVAGE mode the source filter is never PINNED (the destination
+        // rebuilds it from the recovered keys), but a present full filter must
+        // still be PROBED even when `pin_filter` is false: a delete_bitmap
+        // renamed and re-roled to a `filter` (an empty sentinel, or a
+        // checksum/parity-valid but structurally broken BuRR payload) launders
+        // the deletion metadata. Loading and parsing it here trips the
+        // rebuildable-section degradation, which the salvage guard turns into a
+        // fail-closed quarantine. A live open (pin_filter, not salvage) keeps
+        // its exact prior behaviour.
+        let pinned_filter_block = if pinned_filter_index.is_none() && (pin_filter || salvage) {
             let loaded = regions
                 .filter
                 .map(|filter_handle| {
@@ -5456,17 +5491,40 @@ impl Table {
                 })
                 .transpose();
             match loaded {
-                Ok(block) => block,
-                // Same salvage degradation as the filter index above: the
-                // walk never probes the source filter, the recovered copy
-                // re-derives its own.
+                Ok(Some(filter)) => {
+                    // A present full filter that decodes to the empty sentinel,
+                    // or whose BuRR payload does not parse, is not something the
+                    // writer ever emits (it omits the section when filtering is
+                    // disabled). In salvage mode treat it as a degraded
+                    // rebuildable section so a relabeled delete_bitmap cannot
+                    // pass as a filter-less table and resurrect deleted rows.
+                    if salvage && (filter.is_empty() || filter.maybe_contains_hash(0).is_err()) {
+                        log::warn!(
+                            "filter block for table {:?} is empty or unparsable; salvaging \
+                             as a degraded rebuildable section",
+                            metadata.id
+                        );
+                        rebuildable_section_degraded = true;
+                    }
+                    // Never PIN in salvage (the destination rebuilds the
+                    // filter); a live open with pin_filter keeps it.
+                    if pin_filter { Some(filter) } else { None }
+                }
+                Ok(None) => None,
+                // A filter block that FAILS to load (its own checksum/AEAD does
+                // not verify) is GENUINE bit-rot, not a relabel: a re-stamped
+                // relabel produces a checksum-VALID block (caught by the empty /
+                // unparsable payload arm above), whereas a byte-flip breaks the
+                // checksum. Genuine corruption is rebuilt from the recovered
+                // keys, so salvaging continues WITHOUT degrading — a delete-free
+                // table with a bit-rotted filter must auto-repair, not
+                // quarantine.
                 Err(e) if salvage => {
                     log::warn!(
                         "filter block for table {:?} is unreadable ({e}); salvaging \
                          without it (the recovered copy re-derives its filter)",
                         metadata.id
                     );
-                    rebuildable_section_degraded = true;
                     None
                 }
                 Err(e) => return Err(e),
