@@ -92,6 +92,10 @@ pub enum FaultOp {
     /// in-place mutation. Failing it exercises the fail-closed path (treat
     /// the file as shared).
     HardLinkCount,
+    /// [`Fs::hard_link`] — the destination link of a copy-style publish.
+    /// Failing it with [`io::ErrorKind::Unsupported`] models a backend that
+    /// leaves the trait default in place (no hard-link support).
+    HardLink,
 }
 
 /// What a matched [`FaultRule`] does to the operation.
@@ -394,6 +398,9 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::HardLink, Some(dst)) {
+            return Err(fault_error(kind, FaultOp::HardLink));
+        }
         self.inner.hard_link(src, dst)
     }
 

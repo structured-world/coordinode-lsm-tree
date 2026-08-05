@@ -411,6 +411,32 @@ pub(crate) fn salvage_with_context(
                         ))),
                     };
                 }
+                Err(e) if e.kind() == crate::io::ErrorKind::Unsupported => {
+                    // The `Fs` trait lets a backend leave `hard_link` unsupported.
+                    // Such a backend can still create and rename ordinary files,
+                    // so fall back to a best-effort no-replace publish (probe then
+                    // rename) rather than dropping a recoverable table. This
+                    // reopens a narrow check-then-rename window, but ONLY on
+                    // backends that cannot claim a destination atomically at all —
+                    // every in-tree `Fs` implements `hard_link`.
+                    match fs.exists(&dest) {
+                        Ok(false) => fs.rename(&mid_dest, &dest)?,
+                        Ok(true) => {
+                            discard_partial(fs, &mid_dest);
+                            return match tail {
+                                Err(e) => Err(e),
+                                Ok(_) => Err(crate::Error::Io(crate::io::Error::new(
+                                    crate::io::ErrorKind::AlreadyExists,
+                                    "salvage destination already exists",
+                                ))),
+                            };
+                        }
+                        Err(e) => {
+                            discard_partial(fs, &mid_dest);
+                            return Err(e.into());
+                        }
+                    }
+                }
                 Err(e) => {
                     discard_partial(fs, &mid_dest);
                     return Err(e.into());

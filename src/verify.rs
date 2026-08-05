@@ -1091,6 +1091,10 @@ fn read_ecc_params_out_of_band(
         // One decodable recognized copy: a lone unrecognized sibling does
         // not override it (a descriptor-only forge must not condemn a
         // healthy table whose mirror still holds the valid descriptor).
+        // A genuinely newer-scheme table with the OTHER mirror re-stamped to a
+        // recognized value would mis-size parity here; disambiguating the two by
+        // the block data (rather than trusting one descriptor) is tracked in
+        // issue #582.
         [one] => Some(*one),
         [] if unrecognized_seen => Some(ScrubEcc::Unrecognized),
         [..] => None,

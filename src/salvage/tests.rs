@@ -890,6 +890,60 @@ fn salvage_removes_the_mid_copy_when_the_publish_dir_sync_fails() -> crate::Resu
     Ok(())
 }
 
+/// The MID publish must fall back to a best-effort rename when the backend
+/// leaves `Fs::hard_link` unsupported. Such a backend can still create and
+/// rename ordinary files, so a divergent-meta salvage must still publish the
+/// recovered copy rather than drop a recoverable table.
+#[cfg(feature = "lz4")]
+#[test]
+fn salvage_publishes_the_mid_copy_when_hard_link_is_unsupported() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0u64..100 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Divergent mirrors so the MID attempt wins and reaches the publish path.
+    crate::test_forge::forge_tail_meta_value(&source, b"compression#data", &[1])?;
+
+    // The backend cannot hard-link: the publish must fall back to a rename.
+    injector.arm(FaultRule::new(
+        FaultOp::HardLink,
+        Fault::Error(ErrorKind::Unsupported),
+    ));
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert_eq!(
+        report.salvaged_path.as_deref(),
+        Some(dest.as_path()),
+        "the MID copy must be published via the rename fallback: {report:?}",
+    );
+    assert!(
+        report.entries_salvaged > 0,
+        "the recovered table must carry entries: {report:?}",
+    );
+    assert!(
+        std::path::Path::new(&dest).exists(),
+        "the recovered table must land at the destination",
+    );
+    Ok(())
+}
+
 /// The MID publish must claim `dest` with an atomic no-replace operation, never
 /// a blind rename that clobbers an unowned file. When `dest` is already
 /// occupied, the tail attempt's `create_new` open fails against it (so the MID
@@ -1785,8 +1839,13 @@ fn verify_blob_links_rejects_a_missing_section_with_live_indirections() -> crate
         panic!("a table with live indirections but no blob-link section must be rejected");
     };
     assert!(
-        matches!(err, crate::Error::InvalidHeader(_)),
-        "the rejection names an invalid header, got {err:?}",
+        matches!(
+            err,
+            crate::Error::InvalidHeader(
+                "table carries indirection entries but no linked_blob_files section"
+            )
+        ),
+        "the rejection names the missing-blob-link-section reason, got {err:?}",
     );
     Ok(())
 }
@@ -1826,8 +1885,11 @@ fn verify_seqno_bounds_rejects_a_present_empty_map_on_a_nonempty_table() -> crat
         panic!("an empty seqno_bounds on a table with data blocks must be rejected");
     };
     assert!(
-        matches!(err, crate::Error::InvalidHeader(_)),
-        "the rejection names an invalid header, got {err:?}",
+        matches!(
+            err,
+            crate::Error::InvalidHeader("seqno_bounds is missing a data block's entry")
+        ),
+        "the rejection names the missing-block-entry reason, got {err:?}",
     );
     Ok(())
 }
@@ -1875,8 +1937,11 @@ fn verify_metadata_bounds_rejects_a_raised_seqno_min_on_a_range_tombstone_table(
         panic!("a seqno#min above the real minimum must be rejected even with range tombstones");
     };
     assert!(
-        matches!(err, crate::Error::InvalidHeader(_)),
-        "the rejection names an invalid header, got {err:?}",
+        matches!(
+            err,
+            crate::Error::InvalidHeader("meta seqno#min is above the decoded minimum seqno")
+        ),
+        "the rejection names the seqno#min branch specifically, got {err:?}",
     );
     Ok(())
 }

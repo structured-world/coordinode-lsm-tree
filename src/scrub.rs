@@ -46,6 +46,8 @@ use crate::AbstractTree;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod heal_attest;
+
 /// One uncorrectable finding from a patrol scrub.
 ///
 /// Emitted when a block failed its checksum and Page-ECC parity could not
@@ -477,6 +479,39 @@ fn refresh_healed_checksum(
         return None;
     }
 
+    // A mismatch is attributable to a heal either DIRECTLY (this pass wrote the
+    // corrections and probed a matching pre-heal digest) or via a SIDECAR left
+    // by an earlier heal whose reconciliation crashed / failed: on the clean
+    // re-scan this pass writes nothing, so the attestation is the only surviving
+    // evidence that the file's difference from the manifest is a genuine heal.
+    let attributable = heal_attributable
+        || heal_attest::attests(
+            &*table.fs,
+            &table.path,
+            table.encryption.as_deref(),
+            table.id(),
+            fresh,
+            current,
+        );
+    // This pass healed: record the attestation BEFORE reconciling, so a crash
+    // during the reconciliation is recoverable by the next scrub. Best-effort —
+    // a write failure only forfeits that recovery, it never fails the heal.
+    if heal_attributable
+        && let Err(e) = heal_attest::write(
+            &*table.fs,
+            &table.path,
+            table.encryption.as_deref(),
+            table.id(),
+            current,
+            fresh,
+        )
+    {
+        log::warn!(
+            "scrub: could not write the heal attestation for #{}: {e}",
+            table.id(),
+        );
+    }
+
     // AUTHORITATIVE content has no cross-check, so an UNATTRIBUTED mismatch
     // (the pre-heal digest did NOT probe equal to the manifest, so the file's
     // difference from the manifest is not provably this pass's verified
@@ -500,7 +535,7 @@ fn refresh_healed_checksum(
     // installs a legitimized digest. The attributable path — the pre-heal
     // digest matched the manifest, proving the file differs solely by this
     // pass's corrections — falls through to the walk + gates and reconciles.
-    if !heal_attributable {
+    if !attributable {
         // Name deletion metadata specifically — a reconcile that laundered a
         // re-stamped range_tombstones / delete_bitmap would resurrect the rows
         // it masked, the scariest of the three surfaces.
@@ -683,7 +718,12 @@ fn refresh_healed_checksum(
     }
 
     match tree.refresh_table_checksum(table.id(), fresh) {
-        Ok(()) => None,
+        Ok(()) => {
+            // The manifest now holds a legitimate digest; the attestation that
+            // may have authorized this reconciliation has served its purpose.
+            heal_attest::remove(&*table.fs, &table.path);
+            None
+        }
         Err(e) => finding(e.to_string()),
     }
 }
