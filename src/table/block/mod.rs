@@ -1321,9 +1321,14 @@ impl Block {
                 0
             };
 
-            // Clamp-to-zero: a block truncated before its header ends has no
-            // payload, which `classify_block_trailer` then flags as a mismatch.
-            let actual_payload_plus_ecc = block_size.saturating_sub(header_len);
+            // The header was decoded from these `block_size` bytes above, so
+            // `block_size >= header_len` holds and this cannot underflow.
+            // `checked_sub` on this recovery path surfaces any future decode
+            // regression loudly instead of clamping to a 0-payload that a
+            // truncated block could sneak through the trailer check as clean.
+            let actual_payload_plus_ecc = block_size
+                .checked_sub(header_len)
+                .ok_or(crate::Error::InvalidHeader("Block"))?;
             let actual_data_len = parsed_header.data_length as usize;
             let ecc_status = classify_block_trailer(
                 has_ecc,
@@ -1508,9 +1513,15 @@ impl Block {
                 0
             };
 
-            // Clamp-to-zero: a buffer shorter than the header carries no payload,
-            // which the trailer classification then flags as a mismatch.
-            let actual_payload_plus_ecc = buf.len().saturating_sub(header_len);
+            // The header was decoded from `buf` above, so `buf.len() >=
+            // header_len` holds and this cannot underflow. `checked_sub` on this
+            // recovery path surfaces any future decode regression loudly instead
+            // of clamping to a 0-payload the trailer check could accept as a
+            // clean empty block.
+            let actual_payload_plus_ecc = buf
+                .len()
+                .checked_sub(header_len)
+                .ok_or(crate::Error::InvalidHeader("Block"))?;
             let actual_data_len = parsed_header.data_length as usize;
             let ecc_status = classify_block_trailer(
                 has_ecc,
@@ -1744,12 +1755,17 @@ impl Block {
         // `from_file_with_recovery`.
         let actual_data_len = usize::try_from(header.data_length)
             .map_err(|_| crate::Error::InvalidHeader("Block"))?;
-        // Clamp-to-zero: a block truncated before its header ends has no payload,
-        // which `classify_block_trailer` then flags as a mismatch (never a silent
-        // clean read). Same convention as the read/verify trailer checks.
+        // The header was decoded from these `block_size` bytes above, so
+        // `block_size >= header_len` holds and this cannot underflow.
+        // `checked_sub` on this recovery path surfaces any future decode
+        // regression loudly instead of clamping to a 0-payload that a truncated
+        // block could sneak through the trailer check as a clean read.
+        let actual_payload_plus_ecc = block_size
+            .checked_sub(header_len)
+            .ok_or(crate::Error::InvalidHeader("Block"))?;
         classify_block_trailer(
             has_ecc,
-            block_size.saturating_sub(header_len),
+            actual_payload_plus_ecc,
             actual_data_len,
             ecc_length,
             &handle,
@@ -1877,9 +1893,14 @@ impl Block {
             0
         };
 
-        // Clamp-to-zero: a buffer shorter than the header carries no payload,
-        // which the trailer classification then flags as a mismatch.
-        let actual_payload_plus_ecc = buf.len().saturating_sub(header_len);
+        // The header was decoded from `buf` above, so `buf.len() >= header_len`
+        // holds and this cannot underflow. `checked_sub` on this recovery path
+        // surfaces any future decode regression loudly instead of clamping to a
+        // 0-payload the trailer check could accept as a clean empty block.
+        let actual_payload_plus_ecc = buf
+            .len()
+            .checked_sub(header_len)
+            .ok_or(crate::Error::InvalidHeader("Block"))?;
         let actual_data_len = parsed_header.data_length as usize;
         let _ecc_status = classify_block_trailer(
             has_ecc,

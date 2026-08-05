@@ -969,6 +969,15 @@ fn salvage_blocks(
         indexed.sort_unstable_by_key(|k| *k.as_ref().offset());
         for keyed in indexed {
             let off = *keyed.as_ref().offset();
+            // A handle whose offset is at or beyond the section end points
+            // outside the data region (a checksum-repatched / forged index).
+            // Probing the gap up to it would scan past the section, potentially
+            // to an attacker-controlled u64 (an unbounded hang, and later SST
+            // sections framed as data). Skip it; the final gap probe still
+            // covers the rest of the section from the cursor.
+            if off >= section_end {
+                continue;
+            }
             if off > cursor {
                 probe_gap(cursor, off, &mut items, &mut dropped);
             }

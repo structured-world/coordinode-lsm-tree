@@ -154,11 +154,15 @@ fn quarantine_file(
     // cover the source directory and the quarantine directory itself, but not
     // the parent that now names it, so without this a power loss after repair
     // returns can drop the whole quarantine directory (and the only preserved
-    // copy of the original). Sync only when the directory is freshly created —
-    // an existing quarantine directory left the parent entry untouched.
-    let quarantine_existed = fs.exists(&quarantine_dir)?;
+    // copy of the original). Sync UNCONDITIONALLY, before the rename: a prior
+    // repair that created the directory but crashed before its own parent sync
+    // leaves the entry non-durable, so a retry that skipped the sync (seeing the
+    // directory already present) would move the source in without ever making
+    // the parent durable. A redundant fsync on an already-durable parent is
+    // cheap; skipping it risks losing the whole directory across a
+    // crashed-then-retried repair.
     fs.create_dir_all(&quarantine_dir)?;
-    if !quarantine_existed && let Some(quarantine_parent) = quarantine_dir.parent() {
+    if let Some(quarantine_parent) = quarantine_dir.parent() {
         fs.sync_directory_with(quarantine_parent, sync_mode)?;
     }
     // Preserve any EARLIER quarantine copy of the same table: `rename` replaces
