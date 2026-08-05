@@ -1430,6 +1430,32 @@ pub fn forge_seqno_bounds_zeroed_entry(
     Ok(())
 }
 
+/// REPLACES the `seqno_bounds` section with a valid, checksum-consistent block
+/// encoding an EMPTY map (a bare `count = 0`), shifting the following sections
+/// and re-stamping the TOC + trailer. Models the "rename an unused section to
+/// `seqno_bounds` and re-stamp it empty" forge: every byte-level check reads
+/// clean, yet the map records bounds for zero blocks even though the table
+/// still holds data blocks. The SST must be PLAIN (no compression / encryption
+/// / parity on the section) so the forged frame matches the reader's transform.
+pub fn forge_seqno_bounds_empty(
+    path: &std::path::Path,
+    table_id: crate::TableId,
+) -> crate::Result<()> {
+    use crate::table::block::{Block, BlockIdentity, BlockTransform, BlockType};
+
+    let mut payload = Vec::new();
+    crate::table::seqno_bounds::encode_seqno_bounds(&mut payload, &[])?;
+    let identity = BlockIdentity {
+        table_id,
+        block_type: BlockType::SeqnoBounds,
+        dict_id: 0,
+        window_log: 0,
+    };
+    let mut forged = Vec::new();
+    Block::write_into(&mut forged, &payload, identity, &BlockTransform::PLAIN)?;
+    replace_section_frame(path, b"seqno_bounds", &forged)
+}
+
 /// REPLACES the `tli_tail` mirror with a re-encoded index block whose LAST
 /// handle was dropped, shifting the following `meta` section and re-stamping
 /// the TOC + trailer: every byte-level check (checksum, parity, role) stays

@@ -1735,6 +1735,152 @@ fn salvage_preserves_the_source_linked_blob_files() -> crate::Result<()> {
     Ok(())
 }
 
+/// `verify_blob_links` must reject a table that still carries indirection
+/// entries but advertises NO `linked_blob_files` section (dropped or renamed
+/// away): returning `Ok` there lets a healed-digest refresh or salvage accept a
+/// table with `ValueHandle`s but no blob references, after which blob GC — which
+/// consults `list_blob_file_references()` for liveness — can rewrite or drop a
+/// blob file this table still points into.
+#[test]
+fn verify_blob_links_rejects_a_missing_section_with_live_indirections() -> crate::Result<()> {
+    use crate::AbstractTree;
+
+    let dir = tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let crate::AnyTree::Blob(tree) = crate::Config::new(
+        dir.path(),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+    .open()?
+    else {
+        unreachable!("kv separation configured");
+    };
+    let big = |i: u32| format!("{i:08}").repeat(512);
+    for i in 0u32..10 {
+        tree.insert(format!("key{i:05}"), big(i), u64::from(i) + 1);
+    }
+    tree.flush_active_memtable(10)?;
+    let source = {
+        let binding = tree.index.version_history.read().latest_version();
+        let Some(table) = binding.version.iter_tables().next() else {
+            panic!("flush produced one table");
+        };
+        (*table.path).clone()
+    };
+    drop(tree);
+
+    // Drop the linked_blob_files section from the TOC: the table keeps its
+    // indirection entries but now advertises no blob references.
+    crate::test_forge::forge_section_omitted(&source, b"linked_blob_files")?;
+
+    let table = open(source, &fs)?;
+    assert!(
+        table.list_blob_file_references()?.is_none(),
+        "the forge must leave the table with no blob-link section",
+    );
+    let Err(err) = table.verify_blob_links() else {
+        panic!("a table with live indirections but no blob-link section must be rejected");
+    };
+    assert!(
+        matches!(err, crate::Error::InvalidHeader(_)),
+        "the rejection names an invalid header, got {err:?}",
+    );
+    Ok(())
+}
+
+/// `verify_seqno_bounds` must reject a PRESENT `seqno_bounds` section that
+/// decodes to an EMPTY map on a table that still holds data blocks: every real
+/// writer emits one entry per block, so an empty map (a `delete_bitmap` renamed
+/// to `seqno_bounds` and re-stamped empty) means the table's real bounds/deletes
+/// metadata was laundered away. Accepting it lets a healed-digest refresh grade
+/// the table clean and reopen it without its deletion metadata, resurrecting
+/// positionally deleted rows.
+#[test]
+fn verify_seqno_bounds_rejects_a_present_empty_map_on_a_nonempty_table() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // A PLAIN table with the per-block seqno_bounds section enabled.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_seqno_in_index(true)
+        .use_data_block_size(128);
+    for i in 0u64..64 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Re-stamp the seqno_bounds section as a valid but EMPTY map.
+    crate::test_forge::forge_seqno_bounds_empty(&source, 0)?;
+
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_seqno_bounds() else {
+        panic!("an empty seqno_bounds on a table with data blocks must be rejected");
+    };
+    assert!(
+        matches!(err, crate::Error::InvalidHeader(_)),
+        "the rejection names an invalid header, got {err:?}",
+    );
+    Ok(())
+}
+
+/// `verify_metadata_bounds` must cross-check `seqno#min` against the decoded
+/// entries even on a RANGE-TOMBSTONE-bearing table. The synthetic sentinel is
+/// only written when the table has NO real KV items, so a table with both point
+/// entries AND range tombstones has no sentinel and its decoded seqnos are all
+/// real. Skipping the check for every RT-bearing table let both meta mirrors be
+/// re-stamped with `seqno#min` raised above a real KV seqno, hiding live
+/// versions from snapshots at/below the forged minimum after reopen.
+#[test]
+fn verify_metadata_bounds_rejects_a_raised_seqno_min_on_a_range_tombstone_table()
+-> crate::Result<()> {
+    use crate::UserKey;
+    use crate::range_tombstone::RangeTombstone;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // Point entries at seqnos 1..=8 PLUS a range tombstone: the table carries a
+    // range_tombstones section but, having real KV items, writes no sentinel.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0u64..8 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    writer.write_range_tombstone(RangeTombstone::new(
+        UserKey::from(b"key-002".as_slice()),
+        UserKey::from(b"key-005".as_slice()),
+        9,
+    ));
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Raise seqno#min above the real minimum KV seqno (1) in BOTH meta mirrors.
+    crate::test_forge::forge_meta_value_both_mirrors(&source, b"seqno#min", &5u64.to_le_bytes())?;
+
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_metadata_bounds() else {
+        panic!("a seqno#min above the real minimum must be rejected even with range tombstones");
+    };
+    assert!(
+        matches!(err, crate::Error::InvalidHeader(_)),
+        "the rejection names an invalid header, got {err:?}",
+    );
+    Ok(())
+}
+
 /// A `linked_blob_files` section that PARSES but under-reports its contents
 /// (count word forged to 0, record bytes left in place) must not be trusted
 /// as the sole source of the recovered copy's links: the recovered entries
