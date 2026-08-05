@@ -1804,6 +1804,34 @@ fn open_with_id(
     )
 }
 
+/// As [`open`] but threads an encryption provider so a keyed SST recovers.
+#[cfg(feature = "encryption")]
+fn open_encrypted(
+    path: std::path::PathBuf,
+    fs: &Arc<dyn Fs>,
+    encryption: Arc<dyn crate::encryption::EncryptionProvider>,
+) -> crate::Result<Table> {
+    let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&**fs, &path)?);
+    Table::recover(
+        path,
+        checksum,
+        0,
+        0,
+        0,
+        Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+        Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8))),
+        Arc::clone(fs),
+        false,
+        false,
+        Some(encryption),
+        #[cfg(zstd_any)]
+        None,
+        default_comparator(),
+        #[cfg(feature = "metrics")]
+        Arc::new(crate::Metrics::default()),
+    )
+}
+
 /// A reopen of a salvaged SST: recover it and return its live item count.
 fn reopen_item_count(path: std::path::PathBuf, fs: &Arc<dyn Fs>) -> crate::Result<u64> {
     Ok(open(path, fs)?.metadata.item_count)
@@ -2013,11 +2041,105 @@ fn verify_block_layout_rejects_a_present_empty_map_on_a_nonempty_table() -> crat
     assert!(writer.finish()?.is_some(), "source SST is non-empty");
 
     // Re-stamp the block_layout section as a valid but EMPTY map.
-    crate::test_forge::forge_block_layout_empty(&source, 0)?;
+    crate::test_forge::forge_block_layout_empty(&source, 0, None)?;
 
     let table = open(source, &fs)?;
     let Err(err) = table.verify_block_layout() else {
         panic!("an empty block_layout on a table with data blocks must be rejected");
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::InvalidHeader(
+                "block_layout section is present but empty on a table with data blocks"
+            )
+        ),
+        "the rejection names the present-empty block_layout reason, got {err:?}",
+    );
+    Ok(())
+}
+
+/// `verify_filter` must reject a PRESENT full `filter` section that decodes to
+/// the empty "no filter installed" sentinel on a table with data blocks: the
+/// writer omits the section when filtering is disabled, so a present-empty
+/// filter is a forgery (a `delete_bitmap` renamed and re-roled to an empty
+/// filter). The read-path probe treats an empty payload permissively — `Ok(true)`
+/// for every key — so without this rejection the relabel passes the whole check,
+/// a healed digest keeps the table, and reopening resurrects the deleted rows.
+#[test]
+fn verify_filter_rejects_a_present_empty_full_filter() -> crate::Result<()> {
+    use crate::config::BloomConstructionPolicy;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_bloom_policy(BloomConstructionPolicy::BitsPerKey(10.0));
+    for i in 0u32..200 {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Re-stamp the full filter section as a valid but EMPTY payload.
+    crate::test_forge::forge_filter_empty(&source, 0)?;
+
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_filter(None) else {
+        panic!("an empty full filter on a table with data blocks must be rejected");
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::InvalidHeader(
+                "filter section is present but empty on a table with data blocks"
+            )
+        ),
+        "the rejection names the present-empty filter reason, got {err:?}",
+    );
+    Ok(())
+}
+
+/// `verify_block_layout` must apply the present-empty rejection to ENCRYPTED
+/// tables too. The emptiness check used to sit AFTER the `self.encryption`
+/// early return, so an encrypted table's empty `block_layout` (a `delete_bitmap`
+/// relabeled to `block_layout`) slipped through. Decoding the section with the
+/// provider both runs the check and, for a genuine relabel, fails the AEAD open
+/// (the block-type AAD binds the real role).
+#[cfg(all(feature = "encryption", feature = "zstd"))]
+#[test]
+fn verify_block_layout_rejects_an_empty_map_on_an_encrypted_table() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let enc: Arc<dyn crate::encryption::EncryptionProvider> =
+        Arc::new(crate::encryption::Aes256GcmProvider::new(&[0x42; 32]));
+
+    // 256 KiB blocks at zstd L19 split into many inner blocks, so the writer
+    // records a real block_layout section even under encryption.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_data_block_size(256 * 1024)
+        .use_data_block_compression(crate::CompressionType::Zstd(19))
+        .use_encryption(Some(Arc::clone(&enc)));
+    for i in 0u64..20_000 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:012}").into_bytes(),
+            format!("value-{i:08}-payload").into_bytes(),
+            1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source encrypted SST is non-empty",
+    );
+
+    // Re-stamp the block_layout section as a valid but EMPTY encrypted map.
+    crate::test_forge::forge_block_layout_empty(&source, 0, Some(&*enc))?;
+
+    let table = open_encrypted(source, &fs, Arc::clone(&enc))?;
+    let Err(err) = table.verify_block_layout() else {
+        panic!("an empty block_layout on an encrypted table with data blocks must be rejected");
     };
     assert!(
         matches!(
@@ -3695,6 +3817,66 @@ fn salvage_sst_errors_and_discards_the_dest_on_a_write_failure() -> crate::Resul
     assert!(
         fs.metadata(&dest).is_err(),
         "the partial destination is removed on a write failure",
+    );
+    Ok(())
+}
+
+/// A delete-bearing columnar SST whose `delete_bitmap` section is renamed and
+/// re-roled to a full `filter` launders the deletion metadata: the TOC still
+/// tiles with unique recognized names (nothing catches the rename), no delete
+/// bitmap remains visible, and (unlike range tombstones) there is no persisted
+/// count to cross-check. The relabeled block's payload is not a real `BuRR`
+/// filter, so salvage must PROBE the full filter even though it never pins it —
+/// the unparsable payload trips the rebuildable-section degradation and the
+/// guard fails closed instead of re-emitting the deleted rows live.
+#[cfg(feature = "columnar")]
+#[test]
+fn salvage_refuses_a_delete_bitmap_relabeled_to_a_full_filter() -> crate::Result<()> {
+    use crate::config::{BloomConstructionPolicy, DeleteStrategy};
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // Filtering disabled, so renaming delete_bitmap to `filter` yields a UNIQUE
+    // recognized name (no existing filter to duplicate).
+    let n = 200u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_data_block_size(256)
+        .use_bloom_policy(BloomConstructionPolicy::BitsPerKey(0.0))
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    for pos in [5u32, 50, 150] {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    // Rename delete_bitmap -> filter and re-role its block to Filter.
+    crate::test_forge::forge_duplicate_section_name(
+        &source,
+        b"delete_bitmap",
+        b"filter",
+        crate::table::block::BlockType::Filter,
+    )?;
+
+    let Err(err) = salvage_sst(&source, dest.clone(), &fs) else {
+        panic!("a delete_bitmap relabeled to a filter must fail salvage");
+    };
+    assert!(
+        matches!(err, crate::Error::FeatureUnsupported(_)),
+        "the refusal names the unsupported salvage, got {err:?}",
+    );
+    assert!(
+        fs.metadata(&dest).is_err(),
+        "no destination file is left behind by the refused salvage",
     );
     Ok(())
 }

@@ -1460,11 +1460,14 @@ pub fn forge_seqno_bounds_empty(
 /// encoding an EMPTY map, shifting the following sections and re-stamping the
 /// TOC + trailer. Models the "rename a `delete_bitmap` to an empty `block_layout`"
 /// forge: every byte-level check reads clean, yet the map records boundaries for
-/// zero blocks even though the table carries multi-inner-block frames. The SST
-/// must be PLAIN (no compression / encryption / parity on the section block).
+/// zero blocks even though the table carries multi-inner-block frames. Pass the
+/// table's encryption provider for a keyed SST (the forged block is AEAD-sealed
+/// under the `block_layout` block type so the verifier decodes it), or `None`
+/// for a plaintext SST; the section carries no compression / parity either way.
 pub fn forge_block_layout_empty(
     path: &std::path::Path,
     table_id: crate::TableId,
+    encryption: Option<&dyn crate::encryption::EncryptionProvider>,
 ) -> crate::Result<()> {
     use crate::table::block::{Block, BlockIdentity, BlockTransform, BlockType};
 
@@ -1476,9 +1479,33 @@ pub fn forge_block_layout_empty(
         dict_id: 0,
         window_log: 0,
     };
+    let transform = match encryption {
+        Some(enc) => BlockTransform::Encrypted(enc),
+        None => BlockTransform::PLAIN,
+    };
     let mut forged = Vec::new();
-    Block::write_into(&mut forged, &payload, identity, &BlockTransform::PLAIN)?;
+    Block::write_into(&mut forged, &payload, identity, &transform)?;
     replace_section_frame(path, b"block_layout", &forged)
+}
+
+/// REPLACES the `filter` section with a valid, checksum-consistent Filter block
+/// carrying an EMPTY payload (the "no filter installed" sentinel), re-stamping
+/// the TOC + trailer. Models a `delete_bitmap` renamed and re-roled to an empty
+/// full `filter`: the read-path probe reports `Ok(true)` for every key on an
+/// empty payload, so the relabel would launder the deletion metadata unnoticed.
+/// The SST must be PLAIN (no encryption / parity on the section block).
+pub fn forge_filter_empty(path: &std::path::Path, table_id: crate::TableId) -> crate::Result<()> {
+    use crate::table::block::{Block, BlockIdentity, BlockTransform, BlockType};
+
+    let identity = BlockIdentity {
+        table_id,
+        block_type: BlockType::Filter,
+        dict_id: 0,
+        window_log: 0,
+    };
+    let mut forged = Vec::new();
+    Block::write_into(&mut forged, &[], identity, &BlockTransform::PLAIN)?;
+    replace_section_frame(path, b"filter", &forged)
 }
 
 /// Re-stamps the data block header at `block_off` so its `data_length` spans
