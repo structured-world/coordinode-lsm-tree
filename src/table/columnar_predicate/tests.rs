@@ -1,6 +1,6 @@
 use super::{
     Column, ColumnBatch, ColumnRangePredicate, ColumnStats, TypeTag, byte_eq_mask, byte_eq_scalar,
-    filter_batch,
+    filter_batch, take_rows,
 };
 use crate::table::columnar::{column_batch_to_entries, entries_to_column_batch};
 use crate::{Slice, ValueType, key::InternalKey, value::InternalValue};
@@ -209,4 +209,30 @@ fn filter_batch_compacts_fixed_data_and_validity() {
     assert_eq!(col.data, vec![10, 30], "fixed data keeps rows 0 and 2");
     // Both kept rows were valid, compacted to the low two bits.
     assert_eq!(col.validity, Some(vec![0b0000_0011]));
+}
+
+#[test]
+fn take_rows_repeats_a_bytes_value_and_keeps_offsets_monotonic() {
+    // A gather may list the same index more than once. The Bytes value must be
+    // emitted once per occurrence and the offset table stay monotonic — the
+    // accumulator adds each repeat's length (saturating, so an adversarial
+    // duplicate-heavy list can never wrap the u32 table into a desynced frame).
+    let batch = entries_to_column_batch(&[
+        entry(b"k0", 3, b"aaa"),
+        entry(b"k1", 2, b"bb"),
+        entry(b"k2", 1, b"c"),
+    ])
+    .expect("transpose");
+
+    // Gather rows [0, 0, 2]: row 0 ("aaa") twice, then row 2 ("c").
+    let taken = take_rows(&batch, &[0, 0, 2]);
+    assert_eq!(taken.row_count, 3);
+
+    let entries = column_batch_to_entries(&taken).expect("transpose back");
+    let values: Vec<&[u8]> = entries.iter().map(|e| e.value.as_ref()).collect();
+    assert_eq!(
+        values,
+        vec![&b"aaa"[..], &b"aaa"[..], &b"c"[..]],
+        "the repeated index emits its value each time, framed by a monotonic offset table",
+    );
 }

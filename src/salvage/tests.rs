@@ -529,6 +529,51 @@ fn salvage_recovers_all_blocks_under_a_section_spanning_handle() -> crate::Resul
     Ok(())
 }
 
+/// An index handle whose offset sits BEYOND the data section (a checksum-
+/// repatched / forged entry) must not set the gap-probe's upper bound: probing
+/// the range from the cursor up to that out-of-section offset would scan past
+/// the section, potentially to an attacker-controlled `u64` (an unbounded hang,
+/// and later SST sections read as candidate data frames). The tiler must skip
+/// the out-of-section handle and bound the walk by the section end.
+#[test]
+fn salvage_ignores_an_index_handle_beyond_the_data_section() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+    let n = 64u32;
+    for i in 0..u64::from(n) {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Append an index handle at u64::MAX/2 (far past the data section). The real
+    // handles stay intact, so a walk that bounds the gap probe to the section
+    // recovers every block and finishes; the pre-fix walk scans up to the bogus
+    // offset instead. The nextest slow-timeout terminates a hang, so completing
+    // at all — with the full key range recovered — is the proof.
+    crate::test_forge::forge_tli_mirrors_offset_beyond_section(&source, 0)?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert_eq!(
+        report.entries_salvaged,
+        u64::from(n),
+        "every real block is recovered once the out-of-section handle is skipped: {report:?}",
+    );
+    assert!(
+        reopen_get(dest, &fs, b"key-060")?.is_some(),
+        "a late key must survive the bounded walk: {report:?}",
+    );
+    Ok(())
+}
+
 /// A cleanly enumerated index handle whose block header does NOT frame and
 /// whose stored span is oversized (a spanning forge with a smashed header)
 /// must not advance the physical cursor by that UNVERIFIED size: trusting it
@@ -856,6 +901,12 @@ fn salvage_removes_the_mid_copy_when_the_publish_dir_sync_fails() -> crate::Resu
 /// the current fault surface (it cannot force `Fs::exists` to report a present
 /// file absent); the no-replace `hard_link` publish closes that window
 /// structurally rather than by a racy probe.
+///
+/// `lz4`-gated: the MID attempt only runs when the meta mirrors DIVERGE, driven
+/// by a `compression#data` forge to Lz4 (as in the sibling MID-arbitration
+/// tests). Without divergence `salvage_with_context` returns the tail attempt
+/// and never reaches the publish path this test targets.
+#[cfg(feature = "lz4")]
 #[test]
 fn salvage_does_not_clobber_an_occupied_destination_when_the_mid_attempt_wins() -> crate::Result<()>
 {
@@ -874,6 +925,10 @@ fn salvage_does_not_clobber_an_occupied_destination_when_the_mid_attempt_wins() 
         ))?;
     }
     assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Diverge the meta mirrors so the MID attempt actually runs (the tail
+    // attempt mis-decodes under the forged Lz4 codec and drops its block).
+    crate::test_forge::forge_tail_meta_value(&source, b"compression#data", &[1])?;
 
     // A racing worker already owns `dest`. The tail attempt's `create_new` open
     // fails against it, so the tail errors and the MID attempt (writing to a

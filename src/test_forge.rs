@@ -1787,6 +1787,36 @@ pub fn forge_tli_mirrors_span_single_handle(
     replace_section_frame(path, b"tli_tail", &forged)
 }
 
+/// Re-encodes BOTH TLI mirrors with an EXTRA handle whose offset sits far
+/// beyond any data section (as a checksum-repatched index could declare). The
+/// real handles stay intact; the appended one sorts last, so a salvage gap walk
+/// that probes up to a handle's offset without bounding it to the section end
+/// would scan the whole space between the section and that offset (an unbounded
+/// hang, and later SST sections read as candidate data frames). The SST must be
+/// unencrypted and its index uncompressed, and carry >= 2 data blocks.
+pub fn forge_tli_mirrors_offset_beyond_section(
+    path: &std::path::Path,
+    table_id: crate::TableId,
+) -> crate::Result<()> {
+    let forged = rebuilt_tli_frame(path, table_id, None, |handles| {
+        use crate::table::{BlockHandle, KeyedBlockHandle};
+        let Some(last) = handles.last().cloned() else {
+            panic!("the source carries data blocks");
+        };
+        let beyond = KeyedBlockHandle::new(
+            last.end_key().clone(),
+            last.seqno(),
+            BlockHandle::new(
+                crate::table::block::BlockOffset(u64::MAX / 2),
+                last.as_ref().size(),
+            ),
+        );
+        handles.push(beyond);
+    })?;
+    replace_section_frame(path, b"tli", &forged)?;
+    replace_section_frame(path, b"tli_tail", &forged)
+}
+
 /// Re-encodes BOTH TLI mirrors (`tli`, `tli_tail`) with the FIRST TWO
 /// handles SWAPPED: every handle is still present and intact, the mirrors
 /// stay equal, and the section is still fully covered — but the list is no

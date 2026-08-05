@@ -87,6 +87,45 @@ fn quarantine_file_syncs_the_freshly_created_quarantine_parent() -> crate::Resul
     Ok(())
 }
 
+/// The parent sync must run on EVERY quarantine, not only when the directory is
+/// freshly created. A previous repair that created `repair-quarantine` but
+/// crashed before syncing its parent leaves that directory entry non-durable; a
+/// retry that skips the sync (because the directory now exists) moves the only
+/// preserved source in without ever making the parent durable, so a power loss
+/// loses the whole quarantine directory. With an already-present quarantine
+/// directory, faulting the first sync must still abort BEFORE the rename —
+/// leaving the source in place — which proves the parent is synced every time.
+#[test]
+fn quarantine_file_syncs_the_parent_on_a_retry_with_a_preexisting_dir() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, SyncMode};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    // A prior repair already created the quarantine directory.
+    std::fs::create_dir_all(dir.path().join("repair-quarantine"))?;
+    let src = tables.join("junk-name");
+    std::fs::write(&src, b"orphan")?;
+
+    // Fail the FIRST directory sync. Because the parent sync is unconditional, it
+    // is that first sync (post-create, pre-rename) even though the directory
+    // already exists, so its failure aborts before the rename moves the source.
+    let fs = FaultFs::new(StdFs);
+    fs.injector()
+        .arm(FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).once());
+
+    assert!(
+        quarantine_file(&fs, &tables, &src, "junk-name", SyncMode::Full).is_err(),
+        "the quarantine-parent fsync fault must surface on a retry",
+    );
+    assert!(
+        std::fs::metadata(&src).is_ok(),
+        "the pre-rename parent-sync failure must leave the source in place on a retry",
+    );
+    Ok(())
+}
+
 /// A second repair of the same table must NOT overwrite an earlier quarantine
 /// copy: `rename` replaces the destination on Unix, so a fixed
 /// `repair-quarantine/{id}` name would destroy the only copy of the previous
