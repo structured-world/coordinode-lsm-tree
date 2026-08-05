@@ -1456,6 +1456,78 @@ pub fn forge_seqno_bounds_empty(
     replace_section_frame(path, b"seqno_bounds", &forged)
 }
 
+/// REPLACES the `block_layout` section with a valid, checksum-consistent block
+/// encoding an EMPTY map, shifting the following sections and re-stamping the
+/// TOC + trailer. Models the "rename a `delete_bitmap` to an empty `block_layout`"
+/// forge: every byte-level check reads clean, yet the map records boundaries for
+/// zero blocks even though the table carries multi-inner-block frames. The SST
+/// must be PLAIN (no compression / encryption / parity on the section block).
+pub fn forge_block_layout_empty(
+    path: &std::path::Path,
+    table_id: crate::TableId,
+) -> crate::Result<()> {
+    use crate::table::block::{Block, BlockIdentity, BlockTransform, BlockType};
+
+    let mut payload = Vec::new();
+    crate::table::block_layout::encode_block_layouts(&mut payload, &[]);
+    let identity = BlockIdentity {
+        table_id,
+        block_type: BlockType::BlockLayout,
+        dict_id: 0,
+        window_log: 0,
+    };
+    let mut forged = Vec::new();
+    Block::write_into(&mut forged, &payload, identity, &BlockTransform::PLAIN)?;
+    replace_section_frame(path, b"block_layout", &forged)
+}
+
+/// Re-stamps the data block header at `block_off` so its `data_length` spans
+/// all the way to `forged_end_off` (which must land on a LATER block boundary),
+/// leaving the ORIGINAL payload checksum untouched. The header's own integrity
+/// checksum is recomputed, so a header-only frame accepts the forged size — but
+/// the payload it now claims fails its checksum, so a full block LOAD rejects
+/// it. This models a checksum-valid FAKE header inside corrupt bytes whose
+/// oversized span hides the real blocks after it: a physical salvage walk that
+/// advanced by the framed size (before loading) would skip every block up to
+/// `forged_end_off`. The SST must be unencrypted with a parity-less data
+/// section (the span is computed as `header_len + data_length`).
+pub fn forge_data_block_oversized_header(
+    path: &std::path::Path,
+    block_off: u64,
+    forged_end_off: u64,
+) -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::table::block::Header;
+
+    let mut bytes = std::fs::read(path)?;
+    let at = usize::try_from(block_off).expect("block offset fits usize");
+    let end = usize::try_from(forged_end_off).expect("forged end offset fits usize");
+    let Some(block) = bytes.get(at..) else {
+        panic!("the data block header at {at} lies within the file");
+    };
+    let mut cursor = block;
+    let header = Header::decode_from(&mut cursor)?;
+    let header_len = Header::header_len(header.block_type);
+    let forged_len = end
+        .checked_sub(at + header_len)
+        .expect("forged end offset lies past the block header");
+    let forged_data_length = u32::try_from(forged_len).expect("forged data_length fits u32");
+    // Keep the original `checksum` (data checksum over the SMALL real payload)
+    // so the enlarged payload fails to load; only `data_length` grows.
+    let new_header = Header {
+        data_length: forged_data_length,
+        ..header
+    };
+    let mut hdr_bytes = Vec::with_capacity(header_len);
+    new_header.encode_into(&mut hdr_bytes)?;
+    let Some(hdr_dst) = bytes.get_mut(at..at + header_len) else {
+        panic!("the data block header at {at} lies within the file");
+    };
+    hdr_dst.copy_from_slice(&hdr_bytes);
+    std::fs::write(path, &bytes)?;
+    Ok(())
+}
+
 /// REPLACES the `tli_tail` mirror with a re-encoded index block whose LAST
 /// handle was dropped, shifting the following `meta` section and re-stamping
 /// the TOC + trailer: every byte-level check (checksum, parity, role) stays

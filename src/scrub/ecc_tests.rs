@@ -2643,3 +2643,54 @@ fn heal_in_place_leaves_a_clean_encrypted_columnar_sst_with_no_findings() -> cra
     );
     Ok(())
 }
+
+/// A `{id}.heal-attest` sidecar left in `tables/` by a crashed heal refresh
+/// must NOT break the next `Tree::open`: the table-folder scan skips it (it is
+/// never a table file) instead of parsing its name as a `TableId` and returning
+/// `Unrecoverable`. Deleting it here would forfeit the crashed-refresh recovery,
+/// so the scan leaves it for the next scrub to consume.
+#[test]
+fn tree_open_skips_a_lingering_heal_attestation() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sst_path = {
+        let crate::AnyTree::Standard(tree) = crate::Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?
+        else {
+            unreachable!("standard tree configured");
+        };
+        for i in 0u64..50 {
+            tree.insert(format!("k{i:04}"), b"v", i);
+        }
+        tree.flush_active_memtable(50)?;
+        let binding = tree.version_history.read().latest_version();
+        let Some(table) = binding.version.iter_tables().next() else {
+            panic!("flush produced one table");
+        };
+        (*table.path).clone()
+    };
+
+    // A crashed refresh leaves this sidecar next to the SST.
+    std::fs::write(heal_attest_path(&sst_path), b"pending attestation")?;
+
+    // Reopen: the sidecar must be skipped, not parsed as a table id.
+    let reopened = crate::Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open();
+    assert!(
+        reopened.is_ok(),
+        "a lingering heal-attest sidecar must not break open: {:?}",
+        reopened.err(),
+    );
+    assert!(
+        heal_attest_path(&sst_path).exists(),
+        "open must leave the pending attestation for the next scrub to consume",
+    );
+    Ok(())
+}

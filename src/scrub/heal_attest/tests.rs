@@ -48,6 +48,28 @@ fn attests_is_false_without_a_sidecar() {
 }
 
 #[test]
+fn attests_rejects_a_truncated_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("7");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    write(&*fs, &path, None, 7, ck(100), ck(200)).unwrap();
+    // Drop a trailing byte so the plaintext payload is shorter than the fixed
+    // 40-byte record: `deserialize`'s `get(..)?` bound must reject it (the
+    // encrypted tamper test never reaches this path — AEAD fails first).
+    let ap = attest_path(&path);
+    let bytes = std::fs::read(&ap).unwrap();
+    let Some(short) = bytes.get(..bytes.len() - 1) else {
+        panic!("the written sidecar is non-empty");
+    };
+    std::fs::write(&ap, short).unwrap();
+    assert!(
+        !attests(&*fs, &path, None, 7, ck(200), ck(100)),
+        "a short attestation must be rejected",
+    );
+}
+
+#[test]
 fn remove_deletes_the_sidecar() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("7");

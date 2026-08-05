@@ -405,6 +405,95 @@ fn salvage_resyncs_past_an_unframeable_block_in_the_physical_walk() -> crate::Re
     Ok(())
 }
 
+/// A header-checksum-valid FAKE header can declare an oversized `data_length`
+/// that spans the real blocks after it. A physical walk that advanced by the
+/// framed size BEFORE loading would jump past those blocks and silently drop
+/// them. The walk must instead LOAD each candidate and, on a load failure,
+/// resynchronize one byte forward — recovering the swallowed blocks.
+#[test]
+fn salvage_resyncs_past_a_fake_oversized_block_header_in_the_physical_walk() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_data_block_size(128)
+        .use_partitioned_index();
+    for i in 0u64..256 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Re-stamp a block a quarter of the way in so its header FRAMES (valid
+    // header checksum) but claims a size reaching the three-quarter mark — a
+    // fake oversized header whose enlarged payload cannot load. The blocks it
+    // swallows hold real, mid-table keys.
+    let (forge_off, forged_end) = {
+        let table = open(source.clone(), &fs)?;
+        let offsets: Vec<u64> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|h| *h.as_ref().offset())
+            .collect();
+        let n = offsets.len();
+        assert!(n >= 8, "need several data blocks, got {n}");
+        let (Some(&off), Some(&end)) = (offsets.get(n / 4), offsets.get(3 * n / 4)) else {
+            panic!("the quarter and three-quarter block boundaries exist");
+        };
+        (off, end)
+    };
+    crate::test_forge::forge_data_block_oversized_header(&source, forge_off, forged_end)?;
+
+    // Corrupt the `index` section so enumeration breaks and the physical walk
+    // tiles the whole data section, reaching the fake header.
+    let (index_pos, index_len) = {
+        let mut f = std::fs::File::open(&source)?;
+        let reader = crate::sfa::Reader::from_reader(&mut f)?;
+        let Some((pos, len)) = reader
+            .toc()
+            .iter()
+            .find(|e| e.name() == b"index")
+            .map(|e| (e.pos(), e.len()))
+        else {
+            panic!("a partitioned-index SST must carry an index section");
+        };
+        (pos, len)
+    };
+    let Ok(flip) = usize::try_from(index_pos + index_len / 2) else {
+        panic!("the index-section offset fits usize");
+    };
+    let mut bytes = std::fs::read(&source)?;
+    if let Some(b) = bytes.get_mut(flip) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+
+    // A mid-table key inside the swallowed span must still recover: the walk
+    // loads the fake candidate, rejects it, and resyncs one byte at a time to
+    // the real blocks it claimed to cover.
+    assert!(
+        reopen_get(dest, &fs, b"key-128")?.is_some(),
+        "a block swallowed by the fake header must recover via resync: {report:?}",
+    );
+    // Only the fake header's own block is lost; every other block resyncs, so
+    // the count stays near the full 256 (a walk that trusted the framed size
+    // would drop roughly the middle half).
+    assert!(
+        report.entries_salvaged >= 240,
+        "resync recovers all but the fake block, got {} of 256: {report:?}",
+        report.entries_salvaged,
+    );
+    Ok(())
+}
+
 /// An INTERIOR handle omitted from both forged mirrors leaves the hidden
 /// block between two indexed neighbours, exercising the mid-list gap
 /// probe (the truncated-mirror sibling only covers the section-tail
@@ -1894,6 +1983,54 @@ fn verify_seqno_bounds_rejects_a_present_empty_map_on_a_nonempty_table() -> crat
     Ok(())
 }
 
+/// `verify_block_layout` must reject a PRESENT `block_layout` section that
+/// decodes to an EMPTY map on a table that carries multi-inner-block frames:
+/// the writer only emits the section when it has boundaries to record, so an
+/// empty map (a `delete_bitmap` renamed and re-roled to an empty `block_layout`)
+/// means the deletion metadata was laundered away. The per-block loop cannot
+/// catch it (a block absent from the map is skipped), so accepting it lets a
+/// healed-digest refresh keep the table without its delete bitmap.
+#[cfg(feature = "zstd")]
+#[test]
+fn verify_block_layout_rejects_a_present_empty_map_on_a_nonempty_table() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // 256 KiB blocks at zstd L19 split into many inner blocks, so the writer
+    // records a real block_layout section.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_data_block_size(256 * 1024)
+        .use_data_block_compression(crate::CompressionType::Zstd(19));
+    for i in 0u64..20_000 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:012}").into_bytes(),
+            format!("value-{i:08}-payload").into_bytes(),
+            1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Re-stamp the block_layout section as a valid but EMPTY map.
+    crate::test_forge::forge_block_layout_empty(&source, 0)?;
+
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_block_layout() else {
+        panic!("an empty block_layout on a table with data blocks must be rejected");
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::InvalidHeader(
+                "block_layout section is present but empty on a table with data blocks"
+            )
+        ),
+        "the rejection names the present-empty block_layout reason, got {err:?}",
+    );
+    Ok(())
+}
+
 /// `verify_metadata_bounds` must cross-check `seqno#min` against the decoded
 /// entries even on a RANGE-TOMBSTONE-bearing table. The synthetic sentinel is
 /// only written when the table has NO real KV items, so a table with both point
@@ -1942,6 +2079,105 @@ fn verify_metadata_bounds_rejects_a_raised_seqno_min_on_a_range_tombstone_table(
             crate::Error::InvalidHeader("meta seqno#min is above the decoded minimum seqno")
         ),
         "the rejection names the seqno#min branch specifically, got {err:?}",
+    );
+    Ok(())
+}
+
+/// `verify_metadata_bounds` must reject a `range_tombstones` section whose
+/// decoded count disagrees with the recorded `range_tombstone_count`: a dropped
+/// section (or a re-stamped block decoding to a subset) passes coverage for its
+/// surviving entries, but the missing ranges no longer mask lower-level data —
+/// reads resurrect the keys those tombstones deleted. The recorded count lives
+/// in the (separately authenticated) meta block, so a mismatch is a forgery.
+#[test]
+fn verify_metadata_bounds_rejects_a_range_tombstone_count_mismatch() -> crate::Result<()> {
+    use crate::UserKey;
+    use crate::range_tombstone::RangeTombstone;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0u64..8 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    writer.write_range_tombstone(RangeTombstone::new(
+        UserKey::from(b"key-002".as_slice()),
+        UserKey::from(b"key-005".as_slice()),
+        9,
+    ));
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Drop the range_tombstones section: the meta block still records
+    // range_tombstone_count = 1, so the decoded count (0) disagrees.
+    crate::test_forge::forge_section_omitted(&source, b"range_tombstones")?;
+
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_metadata_bounds() else {
+        panic!("a range_tombstones count mismatch must be rejected");
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::InvalidHeader(
+                "range_tombstones count disagrees with the recorded range_tombstone_count"
+            )
+        ),
+        "the rejection names the RT count-mismatch reason, got {err:?}",
+    );
+    Ok(())
+}
+
+/// `verify_tli_mirrors` must cross-check each PARTITIONED top-level separator
+/// against its partition's last data-block separator. Lowering a top-level
+/// separator (in both mirrors) keeps the mirrors equal, the handles tiling, and
+/// every LEAF separator matching its block — yet `TwoLevelBlockIndex` seeks by
+/// the top-level separator and would route reads to the wrong partition,
+/// skipping the keys the real partition holds. Only comparing the top-level
+/// separator with the partition's decoded last key catches it.
+#[test]
+fn verify_tli_mirrors_rejects_a_forged_partition_boundary() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // A partitioned index with many small data blocks yields >= 2 top-level
+    // partitions, so the forge lowers a real partition BOUNDARY (not a leaf).
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_partitioned_index()
+        .use_data_block_size(128)
+        .use_meta_partition_size(2);
+    for i in 0u64..512 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:05}").into_bytes(),
+            format!("val-{i:05}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Lower the FIRST top-level separator in both TLI mirrors.
+    crate::test_forge::forge_tli_mirrors_lower_first_separator(&source, 0, None)?;
+
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_tli_mirrors() else {
+        panic!("a forged partition boundary must be rejected");
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::InvalidHeader(
+                "tli separator disagrees with its partition's last separator"
+            )
+        ),
+        "the rejection names the partition-boundary mismatch, got {err:?}",
     );
     Ok(())
 }
