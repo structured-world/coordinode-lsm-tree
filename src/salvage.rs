@@ -688,6 +688,11 @@ fn salvage_attempt(
     // UNMASKED — it never masks against unverified positions.
     #[cfg(feature = "columnar")]
     let delete_mask_unpositionable = table.delete_bitmap_degraded
+        // A PRESENT delete_bitmap section that decodes to an EMPTY bitmap is a
+        // forge: the writer only emits the section when it holds positions, so a
+        // checksum-consistent corruption to empty would otherwise pass as
+        // positionable and let the masked path re-emit every deleted row live.
+        || (table.has_delete_bitmap_section() && table.delete_bitmap().is_empty())
         || (!table.delete_bitmap().is_empty() && !table.delete_positions_verified());
     #[cfg(not(feature = "columnar"))]
     let delete_mask_unpositionable = table.delete_bitmap_degraded;
