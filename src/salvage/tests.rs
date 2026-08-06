@@ -3090,6 +3090,68 @@ fn salvage_drops_a_corrupted_block_and_keeps_the_rest() -> crate::Result<()> {
     Ok(())
 }
 
+/// A data block whose HEADER no longer frames is dropped by the physical gap
+/// walk, not the load path: the index still points at it, but `probe_gap`
+/// records the region rather than placing it in `items`. It must still count
+/// toward `blocks_total` (the walk INSPECTED it and found it unframeable), so
+/// the `blocks_total == recovered + dropped` contract holds. Previously a
+/// header-corrupt block dropped without being counted, so `blocks_total`
+/// equalled `blocks_salvaged` while a block had been lost — recovery ratios
+/// reported full coverage despite the loss.
+#[test]
+fn salvage_counts_a_header_corrupt_block_in_blocks_total() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(256);
+    let n = 200u32;
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Flip a byte INSIDE the second data block's header (its magic), so the
+    // physical frame no longer parses: the tiling walk cannot trust the index
+    // span and resyncs PAST the block, dropping it through the gap probe rather
+    // than the load path — a `dropped` entry that never enters `items`.
+    let target = {
+        let table = open(source.clone(), &fs)?;
+        let offsets: alloc::vec::Vec<u64> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|kh| *kh.as_ref().offset())
+            .collect();
+        let Some(&second) = offsets.get(1) else {
+            panic!("source SST must have at least two data blocks, got {offsets:?}");
+        };
+        second
+    };
+    let Ok(target_usize) = usize::try_from(target) else {
+        panic!("data block offset {target} does not fit usize on this target");
+    };
+    let mut bytes = std::fs::read(&source)?;
+    if let Some(b) = bytes.get_mut(target_usize) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+
+    assert!(
+        !report.dropped.is_empty(),
+        "the header-corrupt block must be reported dropped: {report:?}",
+    );
+    assert_eq!(
+        report.blocks_total,
+        report.blocks_salvaged + report.dropped.len(),
+        "every inspected block is either recovered or dropped — a header-corrupt \
+         block must count toward the total, not vanish from it: {report:?}",
+    );
+    Ok(())
+}
+
 /// A data block that needs ECC recovery to read is NOT copied verbatim — its
 /// on-disk bytes are faulty, so propagating them would carry the corruption into
 /// the recovered copy. Salvage re-encodes the healed payload instead (clean bytes
