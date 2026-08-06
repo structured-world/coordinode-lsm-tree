@@ -1583,11 +1583,17 @@ impl BlobSalvageReport {
 ///
 /// Where [`crate::repair`] rebuilds the blob-file *manifest* around whole files,
 /// this walks one blob file record by record and re-emits every record whose
-/// checksum verifies, recording the rest. A single bit-rotted record costs only
-/// itself: the record stream re-synchronizes at the next frame after a checksum
-/// mismatch, so the walk keeps recovering. A structural break (corrupt frame
-/// magic / header CRC / a frame that runs past the data section) cannot be
-/// resynced, so the walk stops there and reports it.
+/// checksum verifies, recording the rest. Corruption that leaves the frame
+/// header intact (a checksum mismatch, or a header-CRC / structural break) makes
+/// the record stream re-synchronize at the next frame magic. That magic — and
+/// every frame chained after it — has an UNPROVEN boundary (it may be nested in
+/// the damaged frame's user bytes), so the walk drops the ENTIRE tail past the
+/// first resync (fail closed): the conservative loss is more than one record —
+/// as much as everything after the first damage — because a fabricated chain of
+/// checksum-valid frames is byte-for-byte indistinguishable from genuine ones
+/// and re-emitting it would forge records. Only the records BEFORE the first
+/// resync are re-emitted; a genuine truncation (a frame running past the data
+/// section) still terminates the walk cleanly.
 ///
 /// `blob_file_id` is the source's id (its file name), recorded in the recovered
 /// file's metadata. The recovered file is written with no value compression, so
@@ -1659,14 +1665,16 @@ pub fn salvage_blob_file(
         for item in scanner {
             records_total += 1;
             match item {
-                // A frame reached by a byte-wise RESYNC after a damaged frame
-                // has an UNPROVEN boundary: its magic may be an original frame
+                // A frame the scanner reached at or after a byte-wise RESYNC has
+                // an UNPROVEN boundary: the resync magic may be an original frame
                 // boundary OR a checksum-valid `BLO4` frame nested inside the
-                // damaged frame's user-controlled value bytes — the two are
-                // byte-for-byte indistinguishable. Re-emitting it would FABRICATE
-                // a record (and a bogus `offset_remap` entry pointing inside the
-                // damaged frame), which is worse than losing the first frame
-                // after a rot, so drop it (fail closed on unprovable provenance).
+                // damaged frame's user-controlled value bytes, and every frame
+                // CHAINED past it inherits that unanchored start — the two are
+                // byte-for-byte indistinguishable. The taint is sticky, so this
+                // arm drops the ENTIRE tail after the first resync: re-emitting
+                // any of it would FABRICATE records (and bogus `offset_remap`
+                // entries pointing inside the damaged region), which is worse
+                // than losing the tail (fail closed on unprovable provenance).
                 Ok(entry) if entry.resynced => {
                     dropped.push(DroppedBlob {
                         reason: BlobDropReason::Corrupt(
@@ -1713,17 +1721,18 @@ pub fn salvage_blob_file(
                     offset_remap.push((entry.offset, salvaged_offset));
                     records_salvaged += 1;
                 }
-                // Payload rot: the frame's lengths were CRC-vouched, so the
-                // scanner already sits on the next frame boundary — a
-                // bit-rotted record costs only itself and the walk continues.
+                // Payload rot: the checksum failed, so the scanner RESYNCS at the
+                // next magic and arms the sticky taint. This record drops here;
+                // every frame after it comes back through the `resynced` arm
+                // above and drops too (the tail's provenance is now unprovable).
                 Err(crate::Error::ChecksumMismatch { .. }) => dropped.push(DroppedBlob {
                     reason: BlobDropReason::ChecksumMismatch,
                 }),
                 // Header rot (rotted magic or a length field caught by the
                 // header CRC): the scanner has RESYNCHRONIZED at the next
-                // frame magic (or terminated, when the CRC-vouched frame end
-                // overruns the data section — real truncation), so the walk
-                // safely continues either way.
+                // frame magic (arming the sticky taint, so the tail after it
+                // drops) or TERMINATED, when the CRC-vouched frame end overruns
+                // the data section — real truncation. Either way the walk is safe.
                 Err(
                     e @ (crate::Error::HeaderCrcMismatch { .. } | crate::Error::InvalidHeader(_)),
                 ) => {
