@@ -1071,6 +1071,13 @@ fn read_ecc_params_out_of_band(
         ) {
             if meta.ecc_unrecognized {
                 unrecognized_seen = true;
+                // Still compare this mirror's FULL metadata below: an unknown ECC
+                // descriptor must NOT exempt the copy from the divergence check,
+                // or a forge could change a correctness field (e.g. `created_at`)
+                // and hide it behind the unrecognized descriptor. Only the ECC
+                // arbitration (`recognized`) skips it — the field comparison does
+                // not.
+                decoded.push(meta);
                 continue;
             }
             recognized.push(if let Some(params) = meta.ecc_params {
