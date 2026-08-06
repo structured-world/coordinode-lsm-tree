@@ -35,9 +35,11 @@ impl From<u128> for Timestamp {
 }
 
 // `PartialEq`: the out-of-band verifier compares the two decoded meta
-// mirrors in FULL — a tail re-stamped to another internally-consistent
-// payload is detectable only by disagreeing with `meta_mid`.
-#[derive(Debug, PartialEq, Eq)]
+// mirrors — a tail re-stamped to another internally-consistent payload is
+// detectable only by disagreeing with `meta_mid`. `Clone` lets that verifier
+// compare an ECC-masked copy ([`Self::without_ecc`]) without consuming the
+// original.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedMeta {
     pub id: TableId,
     pub created_at: Timestamp,
