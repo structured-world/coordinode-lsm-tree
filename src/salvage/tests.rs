@@ -754,14 +754,15 @@ fn salvage_recovers_blocks_after_an_unframeable_oversized_handle() -> crate::Res
     Ok(())
 }
 
-/// A forged `data` SFA-section length whose `pos + len` OVERFLOWS `u64` must
-/// not be trusted as the physical-walk upper bound: saturating the bound to
-/// `u64::MAX` makes the byte-at-a-time resync probe every nonexistent offset
-/// up to that bound, effectively hanging standalone salvage. The walk must
-/// reject a section that ends past the SFA `toc_pos` (or overflows) and fall
-/// back to the intact index enumeration, completing promptly.
+/// A forged `data` SFA-section length whose `pos + len` OVERFLOWS `u64` breaks
+/// the TOC tiling: the catalogue can no longer prove that no deletion section is
+/// concealed, so standalone salvage fails CLOSED — the same decision repair
+/// reaches by quarantining such a table. It must reject PROMPTLY (the coverage
+/// check reads the TOC, never scans to the overflowed bound), so the hang the
+/// naive byte-at-a-time resync would suffer is avoided by refusing before the
+/// walk rather than by tiling to a rejected bound.
 #[test]
-fn salvage_rejects_overflowing_data_section_and_completes() -> crate::Result<()> {
+fn salvage_refuses_an_overflowing_data_section() -> crate::Result<()> {
     let dir = tempdir()?;
     let source = dir.path().join("source");
     let dest = dir.path().join("salvaged");
@@ -780,23 +781,23 @@ fn salvage_rejects_overflowing_data_section_and_completes() -> crate::Result<()>
     assert!(writer.finish()?.is_some(), "source SST is non-empty");
 
     // Forge the `data` section's advertised length to `u64::MAX` so its end
-    // overflows: the index stays intact, so a walk that rejects the bogus
-    // section recovers every block through the index enumeration instead of
-    // scanning to the overflowed bound.
+    // overflows: the tiling can no longer be proven, so a deletion section could
+    // be hidden behind the oversized span.
     crate::test_forge::forge_section_len(&source, b"data", u64::MAX)?;
 
-    // The nextest slow-timeout terminates a hang; completing at all — with the
-    // full key range recovered from the index — is the proof the bound was
-    // rejected rather than tiled to.
-    let report = salvage_sst(&source, dest.clone(), &fs)?;
-    assert_eq!(
-        report.entries_salvaged,
-        u64::from(n),
-        "the intact index must recover every entry once the bogus section is rejected: {report:?}",
+    // The nextest slow-timeout terminates a hang; a prompt error — before any
+    // scan to the overflowed bound — is the proof the coverage check rejected
+    // the catalogue instead of tiling to it.
+    let Err(err) = salvage_sst(&source, dest.clone(), &fs) else {
+        panic!("an overflowing data section must fail salvage closed");
+    };
+    assert!(
+        matches!(err, crate::Error::FeatureUnsupported(_)),
+        "the refusal names the unsupported salvage, got {err:?}",
     );
     assert!(
-        reopen_get(dest, &fs, b"key-060")?.is_some(),
-        "a late key must survive the index-only recovery: {report:?}",
+        !std::path::Path::new(&dest).exists(),
+        "no salvaged copy is produced when the catalogue may hide a deletion",
     );
     Ok(())
 }

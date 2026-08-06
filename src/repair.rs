@@ -394,7 +394,7 @@ enum RepairKeepDecision {
 /// [`crate::verify::toc_may_hide_deletion_section`]. A read failure grades
 /// `true` (fail closed): if the catalogue cannot be re-read to prove no section
 /// is hidden, salvage must not trust the parsed absence of deletion metadata.
-fn toc_may_hide_deletions(
+pub(crate) fn toc_may_hide_deletions(
     folder_fs: &Arc<dyn crate::fs::Fs>,
     table_path: &std::path::Path,
 ) -> bool {

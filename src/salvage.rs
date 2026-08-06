@@ -627,6 +627,24 @@ fn salvage_attempt(
         ));
     }
 
+    // Fail closed when the on-disk TOC catalogue could CONCEAL a deletion section
+    // without degrading any block: an OMITTED, RENAMED, SHADOWED, or gap-leaving
+    // `delete_bitmap` / `range_tombstones` entry (behind a re-stamped TOC
+    // checksum) leaves the parsed table reporting no deletion while every
+    // remaining block still passes its byte-level checks — the relabel guard
+    // above only catches a re-roled block whose catalogue stays perfectly tiled.
+    // Repair routes such a table to quarantine via this same check, but the
+    // standalone `salvage_sst` / CLI path never runs the repair verifier, so a
+    // positional walk here would re-emit the suppressed rows as live. A read
+    // failure grades closed (see [`crate::repair::toc_may_hide_deletions`]). A
+    // table with a VISIBLE deletion is exempt: its deletions are applied.
+    if !has_visible_deletion && crate::repair::toc_may_hide_deletions(fs, source) {
+        return Err(crate::Error::FeatureUnsupported(
+            "salvage of an SST whose TOC may hide a deletion section \
+             (an omitted, renamed, or shadowed entry)",
+        ));
+    }
+
     // Fail closed when the delete mask cannot be applied FAITHFULLY: the
     // salvage-mode open degraded it (an unreadable bitmap, or a readable
     // bitmap whose zone map was unreadable), or the zone map decodes but its
