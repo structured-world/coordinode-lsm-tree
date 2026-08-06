@@ -1488,6 +1488,28 @@ pub fn forge_block_layout_empty(
     replace_section_frame(path, b"block_layout", &forged)
 }
 
+/// REPLACES the `zone_map` section with a valid, checksum-consistent `ZoneMap`
+/// block encoding an EMPTY map (zero entries), re-stamping the TOC + trailer.
+/// Models a `delete_bitmap` relabeled and re-roled to an empty `zone_map`: every
+/// byte-level check reads clean, yet the map records stats for zero blocks even
+/// though the table carries data. The SST must be PLAIN (no compression /
+/// encryption / parity on the section block).
+pub fn forge_zone_map_empty(path: &std::path::Path, table_id: crate::TableId) -> crate::Result<()> {
+    use crate::table::block::{Block, BlockIdentity, BlockTransform, BlockType};
+
+    let mut payload = Vec::new();
+    crate::table::zone_map::encode_zone_map(&mut payload, &[])?;
+    let identity = BlockIdentity {
+        table_id,
+        block_type: BlockType::ZoneMap,
+        dict_id: 0,
+        window_log: 0,
+    };
+    let mut forged = Vec::new();
+    Block::write_into(&mut forged, &payload, identity, &BlockTransform::PLAIN)?;
+    replace_section_frame(path, b"zone_map", &forged)
+}
+
 /// REPLACES the `filter` section with a valid, checksum-consistent Filter block
 /// carrying an EMPTY payload (the "no filter installed" sentinel), re-stamping
 /// the TOC + trailer. Models a `delete_bitmap` renamed and re-roled to an empty
@@ -2225,6 +2247,11 @@ pub fn forge_rename_and_replace_section(
         .expect("toc_len fits usize");
     let toc = bytes.get(toc_pos..toc_pos + toc_len).expect("TOC region");
     assert_eq!(toc.get(..4), Some(&b"TOC!"[..]), "TOC magic");
+    assert_eq!(
+        toc_pos + toc_len,
+        trailer_start,
+        "the TOC must sit directly before the trailer; the splice above drops any gap",
+    );
     let count = u32::from_le_bytes(toc.get(4..8).expect("count").try_into().expect("4 bytes"));
     let mut new_toc = Vec::with_capacity(toc.len());
     new_toc.extend_from_slice(b"TOC!");
@@ -2291,7 +2318,11 @@ pub fn forge_rename_and_replace_section(
 /// with a valid EMPTY `BlockLayout` block. The writer only emits a real
 /// `block_layout` section for multi-inner-block (zstd) frames, so this
 /// synthesises the present-but-empty forgery on builds where it cannot occur
-/// naturally (non-zstd) to exercise the build-independent emptiness check.
+/// naturally (non-zstd) to exercise the build-independent emptiness check. The
+/// SST must be PLAIN and parity-less: the replacement block is framed with
+/// `BlockTransform::PLAIN`, so an encrypted source would fail the AEAD open and
+/// an ECC source would read as a missing parity trailer, in both cases before
+/// the emptiness check runs.
 #[cfg(not(feature = "zstd"))]
 pub fn forge_delete_bitmap_as_empty_block_layout(
     path: &std::path::Path,

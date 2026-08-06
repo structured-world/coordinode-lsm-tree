@@ -2320,6 +2320,48 @@ fn verify_filter_rejects_an_empty_partition_for_an_existing_key() -> crate::Resu
     Ok(())
 }
 
+/// `verify_zone_map` must reject a PRESENT `zone_map` section that decodes to an
+/// EMPTY map on a table with data blocks: the writer emits one entry per data
+/// block whenever the section exists, so an empty map (a `delete_bitmap`
+/// relabeled and re-roled to an empty `zone_map`) means the deletion metadata
+/// was laundered away while every semantic gate still passes.
+#[cfg(feature = "columnar")]
+#[test]
+fn verify_zone_map_rejects_a_present_empty_map_on_a_nonempty_table() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    for i in 0u32..64 {
+        writer.write(iv(i))?;
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+zonemap SST is non-empty"
+    );
+
+    // Re-stamp the zone_map section as a valid but EMPTY map.
+    crate::test_forge::forge_zone_map_empty(&source, 0)?;
+
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_zone_map() else {
+        panic!("an empty zone_map on a table with data blocks must be rejected");
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::InvalidHeader(
+                "zone_map section is present but empty on a table with data blocks"
+            )
+        ),
+        "the rejection names the present-empty zone_map reason, got {err:?}",
+    );
+    Ok(())
+}
+
 /// `verify_block_layout` must apply the present-empty rejection to ENCRYPTED
 /// tables too. The emptiness check used to sit AFTER the `self.encryption`
 /// early return, so an encrypted table's empty `block_layout` (a `delete_bitmap`
