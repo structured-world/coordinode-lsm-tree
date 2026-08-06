@@ -1038,7 +1038,7 @@ fn read_ecc_params_out_of_band(
     // payload is detectable only by disagreeing with the intact `meta_mid`. Both
     // are written from one parameter set, so any decoded difference is corruption
     // or a forge. The divergence comparison below masks the ECC descriptor ONLY
-    // when a mirror is unrecognized — see `mirrors_diverge`.
+    // when a mirror is unrecognized; see `mirrors_diverge`.
     let mut decoded: Vec<crate::table::meta::ParsedMeta> = Vec::new();
     for name in [b"meta".as_slice(), b"meta_mid".as_slice()] {
         let Some((pos, len)) = toc.section(name).map(|e| (e.pos(), e.len())) else {
@@ -1085,7 +1085,7 @@ fn read_ecc_params_out_of_band(
     }
     // Two recognized mirrors are compared in FULL: a descriptor disagreement
     // between two decodable schemes is a genuine forge. But when EITHER mirror
-    // carries an unrecognized descriptor, mask the ECC fields — the arbitration
+    // carries an unrecognized descriptor, mask the ECC fields: the arbitration
     // above tolerates a lone unrecognized sibling, so a descriptor-only forge
     // must not condemn a healthy table, while a change to a real field (e.g.
     // `created_at`) hidden behind that descriptor must still diverge.

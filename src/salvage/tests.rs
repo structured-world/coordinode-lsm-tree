@@ -18,7 +18,7 @@ use test_log::test;
 /// boundary OR a `BLO4` frame nested in the rotted frame's user bytes, and every
 /// frame CHAINED past it inherits that unproven anchor: a fabricated chain can
 /// plant one valid frame after another. There is no independent anchor
-/// mid-stream, so the taint is STICKY — the whole tail after the first resync is
+/// mid-stream, so the taint is STICKY: the whole tail after the first resync is
 /// dropped (fail closed), not just the frame reached immediately by the scan.
 #[test]
 fn salvage_blob_file_drops_the_whole_tail_after_a_resync() -> crate::Result<()> {
@@ -54,7 +54,7 @@ fn salvage_blob_file_drops_the_whole_tail_after_a_resync() -> crate::Result<()> 
     let report = salvage_blob_file(&source, dest, &fs, 0)?;
     // aaaa recovered; bbbb drops (header CRC) and arms the resync taint; cccc is
     // the frame reached immediately by the byte scan (unproven boundary) and
-    // dddd is chained from cccc's equally-unproven length — BOTH drop. Only the
+    // dddd is chained from cccc's equally-unproven length; BOTH drop. Only the
     // frame BEFORE the rot survives.
     assert_eq!(
         report.records_salvaged, 1,
@@ -756,7 +756,7 @@ fn salvage_recovers_blocks_after_an_unframeable_oversized_handle() -> crate::Res
 
 /// A forged `data` SFA-section length whose `pos + len` OVERFLOWS `u64` breaks
 /// the TOC tiling: the catalogue can no longer prove that no deletion section is
-/// concealed, so standalone salvage fails CLOSED — the same decision repair
+/// concealed, so standalone salvage fails CLOSED, the same decision repair
 /// reaches by quarantining such a table. It must reject PROMPTLY (the coverage
 /// check reads the TOC, never scans to the overflowed bound), so the hang the
 /// naive byte-at-a-time resync would suffer is avoided by refusing before the
@@ -785,8 +785,8 @@ fn salvage_refuses_an_overflowing_data_section() -> crate::Result<()> {
     // be hidden behind the oversized span.
     crate::test_forge::forge_section_len(&source, b"data", u64::MAX)?;
 
-    // The nextest slow-timeout terminates a hang; a prompt error — before any
-    // scan to the overflowed bound — is the proof the coverage check rejected
+    // The nextest slow-timeout terminates a hang; a prompt error (before any
+    // scan to the overflowed bound) is the proof the coverage check rejected
     // the catalogue instead of tiling to it.
     let Err(err) = salvage_sst(&source, dest.clone(), &fs) else {
         panic!("an overflowing data section must fail salvage closed");
@@ -1177,7 +1177,7 @@ fn salvage_arbitration_skips_a_stale_crash_artifact() -> crate::Result<()> {
 /// When two processes salvage the SAME divergent-mirror SST concurrently, the
 /// process-local temp counter can hand both the same `.healtmp-0` name if one's
 /// existence probe RACES the other's creation. The loser's `create_new` then
-/// fails `AlreadyExists`, and it must NOT discard that path — the file there is
+/// fails `AlreadyExists`, and it must NOT discard that path: the file there is
 /// the winner's in-progress output. A stale existence probe (a Metadata fault
 /// that reports the occupied name absent) plus a pre-existing foreign temp
 /// reproduces the race: the tail attempt loses, mid wins, and the foreign
@@ -1921,7 +1921,7 @@ fn salvage_preserves_prefix_filter_hashes() -> crate::Result<()> {
 /// Without a prefix extractor, salvage must NOT emit a filter at all. The
 /// extractor is not persisted in the SST and cannot be inferred, so a filter
 /// rebuilt from complete-key hashes only would answer `maybe_contains_prefix`
-/// with a DEFINITE-absent for a source that came from a prefix-indexed tree —
+/// with a DEFINITE-absent for a source that came from a prefix-indexed tree,
 /// silently dropping every recovered row from prefix scans once the copy is
 /// reinstalled. Omitting the filter answers "maybe present" (a full block read),
 /// which is always correct; the point-lookup speedup is sacrificed for
@@ -1958,7 +1958,7 @@ fn salvage_omits_the_filter_without_a_prefix_extractor() -> crate::Result<()> {
     }
     assert!(writer.finish()?.is_some(), "source SST is non-empty");
 
-    // Salvage via the default path — NO extractor threaded (the CLI / API
+    // Salvage via the default path with NO extractor threaded (the CLI / API
     // default), so the source's prefix indexing intent is unknown here.
     let report = salvage_sst(&source, dest.clone(), &fs)?;
     assert_eq!(
@@ -2246,7 +2246,7 @@ fn verify_blob_links_rejects_a_present_empty_section() -> crate::Result<()> {
 /// Standalone salvage must REFUSE a delete-bearing SST whose `delete_bitmap`
 /// entry was OMITTED from a re-stamped TOC. The parsed table then reports no
 /// deletion (the section's bytes linger unreferenced), no side section
-/// degrades, and the mask is not unpositionable — so the relabel and
+/// degrades, and the mask is not unpositionable, so the relabel and
 /// unpositionable guards both pass, and a naive walk would re-emit every
 /// physically-present row as live, resurrecting the deleted ones. The repair
 /// verifier catches the TOC tiling gap, but `salvage_sst` never runs it: the
@@ -3279,7 +3279,7 @@ fn salvage_drops_a_corrupted_block_and_keeps_the_rest() -> crate::Result<()> {
 /// toward `blocks_total` (the walk INSPECTED it and found it unframeable), so
 /// the `blocks_total == recovered + dropped` contract holds. Previously a
 /// header-corrupt block dropped without being counted, so `blocks_total`
-/// equalled `blocks_salvaged` while a block had been lost — recovery ratios
+/// equalled `blocks_salvaged` while a block had been lost: recovery ratios
 /// reported full coverage despite the loss.
 #[test]
 fn salvage_counts_a_header_corrupt_block_in_blocks_total() -> crate::Result<()> {
@@ -3298,7 +3298,7 @@ fn salvage_counts_a_header_corrupt_block_in_blocks_total() -> crate::Result<()> 
     // Flip a byte INSIDE the second data block's header (its magic), so the
     // physical frame no longer parses: the tiling walk cannot trust the index
     // span and resyncs PAST the block, dropping it through the gap probe rather
-    // than the load path — a `dropped` entry that never enters `items`.
+    // than the load path: a `dropped` entry that never enters `items`.
     let target = {
         let table = open(source.clone(), &fs)?;
         let offsets: alloc::vec::Vec<u64> = table
@@ -3329,7 +3329,7 @@ fn salvage_counts_a_header_corrupt_block_in_blocks_total() -> crate::Result<()> 
     assert_eq!(
         report.blocks_total,
         report.blocks_salvaged + report.dropped.len(),
-        "every inspected block is either recovered or dropped — a header-corrupt \
+        "every inspected block is either recovered or dropped, a header-corrupt \
          block must count toward the total, not vanish from it: {report:?}",
     );
     Ok(())
@@ -6385,8 +6385,8 @@ fn salvage_blob_file_drops_a_corrupt_record_and_keeps_the_rest() -> crate::Resul
     // next magic. k2's frame is reached by that byte scan through k1's damaged
     // bytes, so its boundary is UNPROVEN (the magic could be an original
     // boundary or a nested frame inside k1's value). k3, chained from k2's
-    // equally-unproven length, inherits the sticky taint. Both drop — fail
-    // closed — rather than re-emitting a possibly-fabricated chain. Only k0,
+    // equally-unproven length, inherits the sticky taint. Both drop, fail
+    // closed, rather than re-emitting a possibly-fabricated chain. Only k0,
     // before the corruption, is provable.
     assert_eq!(
         report.dropped.len(),
@@ -6414,7 +6414,7 @@ fn salvage_blob_file_drops_a_corrupt_record_and_keeps_the_rest() -> crate::Resul
         "only k0 is recovered; k1 (corrupt), k2 and k3 (unprovable after the resync) are not"
     );
 
-    // The salvaged file holds only k0 — k1 (corrupt) and the whole tainted tail
+    // The salvaged file holds only k0: k1 (corrupt) and the whole tainted tail
     // (k2, k3) after the resync are absent.
     let recovered = scan_blob(&dest, &fs)?;
     let keys: Vec<Vec<u8>> = recovered.iter().map(|(k, _)| k.clone()).collect();

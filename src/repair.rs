@@ -197,7 +197,7 @@ fn quarantine_file(
     // source still in quarantine lets a retry (which no longer finds it under
     // `tables/`) rebuild a manifest that omits it; a later power loss then rolls
     // the un-synced rename back, resurrecting the source as an orphan the next
-    // open deletes — losing the only recovery copy. Roll the rename back so the
+    // open deletes, losing the only recovery copy. Roll the rename back so the
     // source stays where a retry can still find and re-quarantine it durably.
     if let Err(e) = sync_result {
         // Best-effort: undo the move and re-sync. A rollback that itself fails

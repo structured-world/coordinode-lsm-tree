@@ -46,7 +46,7 @@ pub struct Scanner {
     /// magic, and STICKY thereafter: every frame read once this is set is marked
     /// `resynced`. The resync magic was found by a byte-wise search after a
     /// damaged frame, so it may be an original boundary OR a checksum-valid
-    /// `BLO4` frame nested inside the damaged frame's user-controlled bytes — the
+    /// `BLO4` frame nested inside the damaged frame's user-controlled bytes; the
     /// two are byte-for-byte indistinguishable. Crucially, a frame CHAINED past
     /// the resync inherits that unproven anchor: its start comes from the resync
     /// frame's own length, so a fabricated chain can plant one checksum-valid
@@ -219,7 +219,7 @@ pub struct ScanEntry {
     /// because it is chained from one whose length is equally unanchored. The
     /// taint is STICKY to EOF: no independent anchor exists mid-stream to
     /// re-establish trust. Salvage must NOT re-emit a resynced frame as a genuine
-    /// record — doing so would fabricate data — so it drops the whole tainted
+    /// record (doing so would fabricate data), so it drops the whole tainted
     /// tail (fail closed) rather than trust an unanchored candidate.
     pub resynced: bool,
 }
@@ -233,7 +233,7 @@ impl Iterator for Scanner {
         }
 
         // Read the sticky resync taint for THIS frame. Once any prior call ended
-        // by resyncing to a magic, this frame's boundary is unproven — either it
+        // by resyncing to a magic, this frame's boundary is unproven: either it
         // IS the resync frame or it is chained from one, and both anchors trace
         // back to the same byte-scanned magic. The taint never clears: there is
         // no independent anchor mid-stream to re-establish trust, so every frame

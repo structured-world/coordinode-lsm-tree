@@ -62,7 +62,7 @@ fn attest_path(table_path: &Path) -> PathBuf {
 
 /// The staging path the sidecar is written + synced to before an atomic rename
 /// onto [`attest_path`]. A crash between the temp write and the rename leaves
-/// this behind; tree recovery sweeps `{id}.heal-attest.tmp` (it is disposable —
+/// this behind; tree recovery sweeps `{id}.heal-attest.tmp` (it is disposable:
 /// either the live sidecar it would have replaced still bridges the crash
 /// window, or the heal is simply re-run).
 fn attest_tmp_path(table_path: &Path) -> PathBuf {
@@ -95,7 +95,7 @@ fn deserialize(plain: &[u8]) -> Option<(u8, u64, u128, u128)> {
 /// onto the live sidecar path. A mid-write or sync failure therefore leaves the
 /// partial bytes in the temp (removed best-effort) and never touches the live
 /// sidecar: an already-durable in-progress marker survives a failed completed
-/// write, instead of being truncated in place and destroyed — which would leave
+/// write, instead of being truncated in place and destroyed, which would leave
 /// a healed SST with a stale manifest digest and no valid attestation, forever
 /// unreconcilable.
 fn write_sidecar(

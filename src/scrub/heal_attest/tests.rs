@@ -87,7 +87,7 @@ fn remove_deletes_the_sidecar() {
 /// in-progress marker survives to bridge the crash window. Without this the
 /// completed write truncates the marker in place before failing, destroying it
 /// and leaving the healed SST with a stale manifest digest and no valid
-/// attestation — permanently unreconcilable.
+/// attestation, permanently unreconcilable.
 #[test]
 fn a_failed_completed_write_preserves_the_in_progress_marker() {
     use super::{attests_in_progress, write_in_progress};
@@ -116,7 +116,7 @@ fn a_failed_completed_write_preserves_the_in_progress_marker() {
         "the faulted completed-attestation write must fail",
     );
 
-    // The in-progress marker must still be intact — the failed completed write
+    // The in-progress marker must still be intact: the failed completed write
     // never truncated the live sidecar.
     assert!(
         attests_in_progress(&*fs, &path, None, 7, ck(100)),

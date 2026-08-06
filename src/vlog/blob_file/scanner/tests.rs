@@ -317,7 +317,7 @@ fn blob_scanner_rejects_oversized_on_disk_len() -> crate::Result<()> {
 /// decompression cap must be rejected by the pre-allocation cap check even when
 /// the frame still FITS the data section. Only `on_disk_val_len` feeds the
 /// frame-fit bound, so an over-cap `real_val_len` sails past the fit check and
-/// the cap check is the sole thing that can reject it — a path the
+/// the cap check is the sole thing that can reject it: a path the
 /// section-overrun test does not exercise. The header CRC is recomputed
 /// CONSISTENT with the oversized length so the declaration survives CRC
 /// validation and reaches the cap check.

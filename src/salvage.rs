@@ -372,7 +372,7 @@ pub(crate) fn salvage_with_context(
         (Ok(t), Ok(m)) => completeness(m) > completeness(t),
     };
     // Publish the winner from its temp; discard the loser's temp first so no
-    // artifact lingers outside the `.healtmp-` sweep namespace — but ONLY when
+    // artifact lingers outside the `.healtmp-` sweep namespace, but ONLY when
     // this invocation actually created that temp. An attempt whose `create_new`
     // lost a race to a concurrent salvage returns `AlreadyExists` WITHOUT
     // creating the file, so discarding its path would delete the file the race
@@ -663,7 +663,7 @@ fn salvage_attempt(
     // without degrading any block: an OMITTED, RENAMED, SHADOWED, or gap-leaving
     // `delete_bitmap` / `range_tombstones` entry (behind a re-stamped TOC
     // checksum) leaves the parsed table reporting no deletion while every
-    // remaining block still passes its byte-level checks — the relabel guard
+    // remaining block still passes its byte-level checks: the relabel guard
     // above only catches a re-roled block whose catalogue stays perfectly tiled.
     // Repair routes such a table to quarantine via this same check, but the
     // standalone `salvage_sst` / CLI path never runs the repair verifier, so a
@@ -736,7 +736,7 @@ fn salvage_attempt(
     // from complete-key hashes: the source's prefix-indexing intent is
     // unknowable (the extractor is not persisted and cannot be inferred), and a
     // complete-key-only filter answers `maybe_contains_prefix` DEFINITELY-ABSENT
-    // for a source that came from a prefix-indexed tree — silently dropping every
+    // for a source that came from a prefix-indexed tree, silently dropping every
     // recovered row from prefix scans. No filter answers "maybe present" (a full
     // block read), which is always correct; the point-lookup speedup is
     // sacrificed for correctness.
@@ -1161,9 +1161,9 @@ fn salvage_blocks(
         }
     }
 
-    // Drops recorded BEFORE the emit loop — a corrupt index entry and every
-    // `probe_gap` region (a header-corrupt block the tiling walk resynced past)
-    // — never enter `items`, so the per-item increment below would miss them.
+    // Drops recorded BEFORE the emit loop (a corrupt index entry and every
+    // `probe_gap` region: a header-corrupt block the tiling walk resynced past)
+    // never enter `items`, so the per-item increment below would miss them.
     // They were still INSPECTED and lost, so count them in the total: without
     // this a header-corrupt block yields `blocks_total == blocks_salvaged`
     // while a block was dropped, reporting full coverage despite the loss.
@@ -1655,11 +1655,11 @@ impl BlobSalvageReport {
 /// this walks one blob file record by record and re-emits every record whose
 /// checksum verifies, recording the rest. Corruption that leaves the frame
 /// header intact (a checksum mismatch, or a header-CRC / structural break) makes
-/// the record stream re-synchronize at the next frame magic. That magic — and
-/// every frame chained after it — has an UNPROVEN boundary (it may be nested in
+/// the record stream re-synchronize at the next frame magic. That magic (and
+/// every frame chained after it) has an UNPROVEN boundary (it may be nested in
 /// the damaged frame's user bytes), so the walk drops the ENTIRE tail past the
-/// first resync (fail closed): the conservative loss is more than one record —
-/// as much as everything after the first damage — because a fabricated chain of
+/// first resync (fail closed): the conservative loss is more than one record
+/// (as much as everything after the first damage), because a fabricated chain of
 /// checksum-valid frames is byte-for-byte indistinguishable from genuine ones
 /// and re-emitting it would forge records. Only the records BEFORE the first
 /// resync are re-emitted; a genuine truncation (a frame running past the data
@@ -1739,7 +1739,7 @@ pub fn salvage_blob_file(
                 // an UNPROVEN boundary: the resync magic may be an original frame
                 // boundary OR a checksum-valid `BLO4` frame nested inside the
                 // damaged frame's user-controlled value bytes, and every frame
-                // CHAINED past it inherits that unanchored start — the two are
+                // CHAINED past it inherits that unanchored start; the two are
                 // byte-for-byte indistinguishable. The taint is sticky, so this
                 // arm drops the ENTIRE tail after the first resync: re-emitting
                 // any of it would FABRICATE records (and bogus `offset_remap`
@@ -1802,7 +1802,7 @@ pub fn salvage_blob_file(
                 // header CRC): the scanner has RESYNCHRONIZED at the next
                 // frame magic (arming the sticky taint, so the tail after it
                 // drops) or TERMINATED, when the CRC-vouched frame end overruns
-                // the data section — real truncation. Either way the walk is safe.
+                // the data section (real truncation). Either way the walk is safe.
                 Err(
                     e @ (crate::Error::HeaderCrcMismatch { .. } | crate::Error::InvalidHeader(_)),
                 ) => {

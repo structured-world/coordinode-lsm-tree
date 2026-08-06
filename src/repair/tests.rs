@@ -128,7 +128,7 @@ fn quarantine_file_syncs_the_parent_on_a_retry_with_a_preexisting_dir() -> crate
 
 /// A POST-rename directory-sync failure must ROLL THE RENAME BACK: the move is
 /// not durably committed, so leaving the source in quarantine lets a retry
-/// install a manifest omitting it — after which a power loss that rolls the
+/// install a manifest omitting it; after which a power loss that rolls the
 /// un-synced rename back resurrects the source as an orphan the next open
 /// deletes, losing the only recovery copy. The source must return to `tables/`
 /// so a retry can still find and re-quarantine it durably. The quarantine-dir

@@ -35,7 +35,7 @@ impl From<u128> for Timestamp {
 }
 
 // `PartialEq`: the out-of-band verifier compares the two decoded meta
-// mirrors — a tail re-stamped to another internally-consistent payload is
+// mirrors: a tail re-stamped to another internally-consistent payload is
 // detectable only by disagreeing with `meta_mid`. `Clone` lets that verifier
 // compare an ECC-masked copy ([`Self::without_ecc`]) without consuming the
 // original.
