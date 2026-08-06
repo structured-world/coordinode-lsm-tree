@@ -569,6 +569,48 @@ fn verify_sst_file_flags_an_omitted_toc_section() {
     );
 }
 
+/// A tail meta mirror re-stamped with an UNRECOGNIZED ECC descriptor must still
+/// be compared against `meta_mid` for its non-ECC fields. Excluding it from the
+/// full mirror comparison lets a forge change a correctness field (here
+/// `created_at`) behind the unknown descriptor and evade the divergence check:
+/// a backdated `created_at`, selected by tail-first recovery, can make FIFO /
+/// TTL compaction discard live data. Both copies decode, so the comparison must
+/// see the tail's changed field even though its ECC descriptor is unknown.
+#[test]
+fn verify_sst_file_flags_diverging_mirrors_behind_an_unrecognized_ecc() {
+    let dir = tempfile::tempdir().unwrap();
+    populate_tree(dir.path(), 200);
+    let sst_path = pick_first_sst_path(dir.path());
+
+    // Sanity: intact file verifies clean.
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        report.is_ok(),
+        "intact SST must be clean: {:?}",
+        report.errors
+    );
+
+    // Forge ONLY the tail mirror: an UNRECOGNIZED ECC descriptor (`[9,_,_,_]` =
+    // unknown kind, which would exclude the mirror from the comparison) AND a
+    // changed `created_at` (the correctness field the forge hides behind it).
+    // meta_mid stays intact, so the two now decode to different metadata.
+    crate::test_forge::forge_tail_meta_value(&sst_path, b"descriptor#page_ecc", &[9, 0, 0, 0])
+        .unwrap();
+    crate::test_forge::forge_tail_meta_value(&sst_path, b"created_at", &[0xFF; 16]).unwrap();
+
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        report.errors.iter().any(|e| matches!(
+            e,
+            BlockVerifyError::TocCorrupted { reason, .. }
+                if reason.contains("mirrors decode to different metadata")
+        )),
+        "a tail mirror that changed created_at behind an unrecognized ECC \
+         descriptor must still diverge from meta_mid, got {:?}",
+        report.errors,
+    );
+}
+
 /// A TOC entry RENAMED to a duplicate recognized name — `range_tombstones`
 /// renamed to a second `data`, its block header re-stamped with the `Data`
 /// role — preserves the tiling AND passes the recognized-role walk, yet the
