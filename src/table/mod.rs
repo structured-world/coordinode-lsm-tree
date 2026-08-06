@@ -796,12 +796,27 @@ impl Table {
             return true;
         };
         let mut cumulative: u32 = 0;
+        // Anchor the walk to PHYSICAL block order. `delete_block_starts` is built
+        // by walking this same index, so a forged TLI that REORDERS the handles
+        // rebuilds the starts in that reordered sequence and self-validates
+        // against them — yet the bitmap positions were assigned in the writer's
+        // physical block order, so the salvage walk (which sorts blocks by
+        // offset) would mask against the wrong starts. Requiring strictly
+        // increasing offsets rejects the reorder: a genuine index is always in
+        // offset order (the writer emits blocks back-to-back).
+        let mut prev_offset: Option<u64> = None;
         for keyed in self.block_index.iter() {
             let Ok(keyed) = keyed else {
                 // An unreadable index makes every later position unverifiable.
                 return false;
             };
             let offset = keyed.offset().0;
+            if prev_offset.is_some_and(|prev| offset <= prev) {
+                // Out-of-order (or duplicate) offset: the index was reordered, so
+                // the physical positions cannot be trusted.
+                return false;
+            }
+            prev_offset = Some(offset);
             if starts.get(&offset) != Some(&cumulative) {
                 return false;
             }
