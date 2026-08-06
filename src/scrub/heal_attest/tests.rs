@@ -81,6 +81,49 @@ fn remove_deletes_the_sidecar() {
     assert!(!attest_path(&path).exists());
 }
 
+/// A completed-attestation write that FAILS must leave an already-durable
+/// in-progress marker intact. The completed sidecar publishes through a temp +
+/// atomic rename, so a mid-write failure never touches the live sidecar; the
+/// in-progress marker survives to bridge the crash window. Without this the
+/// completed write truncates the marker in place before failing, destroying it
+/// and leaving the healed SST with a stale manifest digest and no valid
+/// attestation — permanently unreconcilable.
+#[test]
+fn a_failed_completed_write_preserves_the_in_progress_marker() {
+    use super::{attests_in_progress, write_in_progress};
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("7");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    // A durable in-progress marker exists (file hashes to the manifest `pre`).
+    write_in_progress(&*fs, &path, None, 7, ck(100)).unwrap();
+    assert!(
+        attests_in_progress(&*fs, &path, None, 7, ck(100)),
+        "the in-progress marker is written and durable",
+    );
+
+    // Now the completed write fails mid-write (its temp sidecar write faults).
+    injector.arm(
+        FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::Other)).on_path(".heal-attest"),
+    );
+    assert!(
+        write(&*fs, &path, None, 7, ck(100), ck(200)).is_err(),
+        "the faulted completed-attestation write must fail",
+    );
+
+    // The in-progress marker must still be intact — the failed completed write
+    // never truncated the live sidecar.
+    assert!(
+        attests_in_progress(&*fs, &path, None, 7, ck(100)),
+        "a failed completed write must leave the in-progress marker intact",
+    );
+}
+
 /// The encrypted attestation is AEAD-sealed: a tampered ciphertext or a wrong
 /// key fails the open, so an offline attacker without the key cannot forge one.
 #[cfg(feature = "encryption")]
