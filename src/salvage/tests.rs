@@ -3320,7 +3320,7 @@ fn salvage_counts_a_header_corrupt_block_in_blocks_total() -> crate::Result<()> 
     }
     std::fs::write(&source, &bytes)?;
 
-    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    let report = salvage_sst(&source, dest, &fs)?;
 
     assert!(
         !report.dropped.is_empty(),
@@ -6285,8 +6285,7 @@ fn salvage_blob_file_reports_an_offset_remap_for_every_salvaged_record() -> crat
         .filter_map(Result::ok)
         .map(|e| e.offset)
         .collect();
-    let expected: Vec<(u64, u64)> = [0usize]
-        .iter()
+    let expected: Vec<(u64, u64)> = std::iter::once(&0usize)
         .zip(&dest_offsets)
         .map(|(&src_idx, &new)| {
             (
