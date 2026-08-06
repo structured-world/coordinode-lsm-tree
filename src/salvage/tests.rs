@@ -269,6 +269,13 @@ fn salvage_recovers_physical_blocks_past_a_broken_index_partition() -> crate::Re
         "every data block must be recovered via the physical walk when the \
          index enumeration breaks: {report:?}",
     );
+    // The index enumeration broke, but the physical walk recovered every data
+    // block: that structural index damage is NOT data loss, so the report must
+    // grade complete rather than counting the index error as a dropped block.
+    assert!(
+        report.is_complete(),
+        "a broken index the physical walk fully recovers around is not data loss: {report:?}",
+    );
     Ok(())
 }
 
