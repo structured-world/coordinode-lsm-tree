@@ -2519,7 +2519,18 @@ impl Table {
             }
             crate::table::zone_map::ZoneMap::decode(&block.data)?
         };
+        // The writer emits one zone-map entry per data block whenever the
+        // section exists, so a PRESENT-but-empty map on a table with data blocks
+        // is a forgery — e.g. a delete_bitmap relabeled and re-roled to an empty
+        // zone_map, which drops the deletion metadata while every semantic gate
+        // (tiling, block role, parsed deletion state) still passes. Reject it,
+        // as the other rebuildable-section checks do.
         if zone_map.is_empty() {
+            if self.block_index.iter().next().is_some() {
+                return Err(crate::Error::InvalidHeader(
+                    "zone_map section is present but empty on a table with data blocks",
+                ));
+            }
             return Ok(());
         }
         let mut checked = 0usize;
@@ -5540,20 +5551,21 @@ impl Table {
                 }
                 Ok(None) => None,
                 // An InvalidTag here is STRUCTURAL, not corruption: the block
-                // loaded and verified its own checksum, it is just the WRONG
-                // role (a delete_bitmap renamed to `filter` in the TOC WITHOUT
-                // re-roling its header). The header checksum covers the role, so
-                // a byte-flip in it fails the checksum BEFORE this role check —
-                // reaching InvalidTag means a valid block of the wrong name, the
-                // relabel signature. Degrade it like the empty / unparsable
-                // payload above so the guard fails closed.
+                // loaded and verified its own PAYLOAD checksum, it is just the
+                // WRONG role. `Header::checksum` covers the payload, not the
+                // header, so a `block_type` byte that flips to another valid SST
+                // discriminant does NOT fail that checksum — it reaches this
+                // role check exactly like a TOC rename (a delete_bitmap renamed
+                // to `filter` without re-roling its header). Both are a valid
+                // block of the wrong name (the relabel signature), so degrade
+                // like the empty / unparsable payload above and fail closed.
                 //
-                // Any OTHER load failure (checksum / AEAD) is GENUINE bit-rot: a
-                // re-stamped relabel produces a checksum-VALID block, so a
-                // broken checksum is real corruption, rebuilt from the recovered
-                // keys. A delete-free table with a bit-rotted filter must
-                // auto-repair, not quarantine, so salvaging continues without
-                // degrading.
+                // Any OTHER load failure (payload checksum / AEAD) is GENUINE
+                // bit-rot: a re-stamped relabel produces a checksum-VALID block,
+                // so a broken payload checksum is real corruption, rebuilt from
+                // the recovered keys. A delete-free table with a bit-rotted
+                // filter must auto-repair, not quarantine, so salvaging
+                // continues without degrading.
                 Err(e) if salvage => {
                     if matches!(e, crate::Error::InvalidTag(_)) {
                         log::warn!(
