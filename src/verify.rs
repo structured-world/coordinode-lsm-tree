@@ -1034,11 +1034,14 @@ fn read_ecc_params_out_of_band(
     // warning) — nothing out-of-band can tell which copy is legitimate.
     let mut unrecognized_seen = false;
     let mut recognized: Vec<ScrubEcc> = Vec::new();
-    // The FULL decoded mirrors, compared beyond the ECC state below: a tail
-    // re-stamped to another internally-consistent payload (its ECC
-    // descriptor untouched) is detectable only by disagreeing with the
-    // intact `meta_mid`. Both are written from one parameter set, so any
-    // decoded difference is corruption or a forge.
+    // The decoded mirrors, ECC-NORMALIZED for comparison: a tail re-stamped to
+    // another internally-consistent payload is detectable only by disagreeing
+    // with the intact `meta_mid`. Both are written from one parameter set, so any
+    // NON-ECC difference is corruption or a forge. The ECC descriptor itself is
+    // arbitrated separately below (a lone unrecognized sibling is tolerated), so
+    // it is masked here — otherwise a descriptor-only forge would condemn a
+    // healthy table, while a forge that changes a real field (e.g. `created_at`)
+    // and hides it behind an unrecognized descriptor must still surface.
     let mut decoded: Vec<crate::table::meta::ParsedMeta> = Vec::new();
     for name in [b"meta".as_slice(), b"meta_mid".as_slice()] {
         let Some((pos, len)) = toc.section(name).map(|e| (e.pos(), e.len())) else {
@@ -1071,21 +1074,19 @@ fn read_ecc_params_out_of_band(
         ) {
             if meta.ecc_unrecognized {
                 unrecognized_seen = true;
-                // Still compare this mirror's FULL metadata below: an unknown ECC
-                // descriptor must NOT exempt the copy from the divergence check,
-                // or a forge could change a correctness field (e.g. `created_at`)
-                // and hide it behind the unrecognized descriptor. Only the ECC
-                // arbitration (`recognized`) skips it — the field comparison does
-                // not.
-                decoded.push(meta);
-                continue;
-            }
-            recognized.push(if let Some(params) = meta.ecc_params {
-                ScrubEcc::Scheme(params)
             } else {
-                ScrubEcc::Off
-            });
-            decoded.push(meta);
+                recognized.push(if let Some(params) = meta.ecc_params {
+                    ScrubEcc::Scheme(params)
+                } else {
+                    ScrubEcc::Off
+                });
+            }
+            // Compare this mirror's NON-ECC content: an unknown ECC descriptor
+            // must NOT exempt the copy from the divergence check (a forge could
+            // change `created_at` behind it), but an ECC-descriptor-only
+            // difference must NOT diverge — the arbitration above already tolerates
+            // a lone unrecognized sibling, so mask the descriptor here.
+            decoded.push(meta.without_ecc());
         }
     }
     let mirrors_diverge = matches!(decoded.as_slice(), [a, b] if a != b);

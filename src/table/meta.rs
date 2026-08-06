@@ -207,6 +207,24 @@ fn validated_restart_interval_index(restart_interval: u8) -> crate::Result<u8> {
 }
 
 impl ParsedMeta {
+    /// Returns `self` with the ECC-descriptor fields normalized to their
+    /// "no scheme" values (`page_ecc = false`, `ecc_params = None`,
+    /// `ecc_unrecognized = false`).
+    ///
+    /// The out-of-band mirror comparison uses this so two `meta` / `meta_mid`
+    /// copies diverge only on a NON-ECC field: an ECC-descriptor-only difference
+    /// (a lone unrecognized sibling, or a descriptor-only forge) is arbitrated
+    /// separately and must not by itself condemn a healthy table, while a change
+    /// to a correctness field like `created_at` still surfaces even when it hides
+    /// behind an unrecognized descriptor.
+    #[cfg(feature = "std")]
+    pub(crate) fn without_ecc(mut self) -> Self {
+        self.page_ecc = false;
+        self.ecc_params = None;
+        self.ecc_unrecognized = false;
+        self
+    }
+
     #[expect(clippy::too_many_lines)]
     pub fn load_with_handle(
         file: &dyn FsFile,
