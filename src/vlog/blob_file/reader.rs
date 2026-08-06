@@ -216,7 +216,7 @@ impl<'a> Reader<'a> {
             CompressionType::Lz4 => {
                 let mut buf = vec![0u8; real_val_len];
 
-                let bytes_written = lz4_flex::decompress_into(&raw_data, &mut buf)
+                let bytes_written = lz4_flex::block::decompress_into(&raw_data, &mut buf)
                     .map_err(|_| crate::Error::Decompress(self.blob_file.0.meta.compression))?;
 
                 // Runtime validation: corrupted data may decompress to fewer bytes

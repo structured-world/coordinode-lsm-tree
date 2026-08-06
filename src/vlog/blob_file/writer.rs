@@ -262,7 +262,7 @@ impl Writer {
 
             #[cfg(feature = "lz4")]
             CompressionType::Lz4 => {
-                let compressed = lz4_flex::compress(value);
+                let compressed = lz4_flex::block::compress(value);
                 check_size_cap(compressed.len())?;
                 alloc::borrow::Cow::Owned(compressed)
             }

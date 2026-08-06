@@ -692,7 +692,7 @@ impl Block {
 
             #[cfg(feature = "lz4")]
             CompressionType::Lz4 => {
-                compressed_buf = Some(lz4_flex::compress(data));
+                compressed_buf = Some(lz4_flex::block::compress(data));
             }
 
             #[cfg(zstd_any)]
@@ -995,7 +995,7 @@ impl Block {
                     let mut builder =
                         unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };
 
-                    let bytes_written = lz4_flex::decompress_into(&decrypted, &mut builder)
+                    let bytes_written = lz4_flex::block::decompress_into(&decrypted, &mut builder)
                         .map_err(|_| crate::Error::Decompress(compression))?;
 
                     if bytes_written != header.uncompressed_length as usize {
@@ -1107,7 +1107,7 @@ impl Block {
                     let mut builder =
                         unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };
 
-                    let bytes_written = lz4_flex::decompress_into(&raw_data, &mut builder)
+                    let bytes_written = lz4_flex::block::decompress_into(&raw_data, &mut builder)
                         .map_err(|_| crate::Error::Decompress(compression))?;
 
                     if bytes_written != header.uncompressed_length as usize {
@@ -1434,8 +1434,9 @@ impl Block {
                         Slice::builder_unzeroed(parsed_header.uncompressed_length as usize)
                     };
 
-                    let bytes_written = lz4_flex::decompress_into(&decrypted, &mut decompressed)
-                        .map_err(|_| crate::Error::Decompress(compression))?;
+                    let bytes_written =
+                        lz4_flex::block::decompress_into(&decrypted, &mut decompressed)
+                            .map_err(|_| crate::Error::Decompress(compression))?;
 
                     if bytes_written != parsed_header.uncompressed_length as usize {
                         return Err(crate::Error::Decompress(compression));
@@ -1607,7 +1608,7 @@ impl Block {
                     };
 
                     let bytes_written =
-                        lz4_flex::decompress_into(compressed_data, &mut decompressed)
+                        lz4_flex::block::decompress_into(compressed_data, &mut decompressed)
                             .map_err(|_| crate::Error::Decompress(compression))?;
 
                     if bytes_written != parsed_header.uncompressed_length as usize {

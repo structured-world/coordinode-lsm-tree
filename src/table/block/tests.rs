@@ -440,7 +440,7 @@ fn lz4_corrupted_uncompressed_length_triggers_decompress_error() {
     let payload: &[u8] = b"hello world";
 
     // Compress with lz4 using the block format
-    let compressed = lz4_flex::compress(payload);
+    let compressed = lz4_flex::block::compress(payload);
 
     // Build a header with corrupted uncompressed_length (1 byte too large)
     let data_length = compressed.len() as u32;
