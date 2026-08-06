@@ -2110,6 +2110,56 @@ fn verify_blob_links_rejects_a_present_empty_section() -> crate::Result<()> {
     Ok(())
 }
 
+/// Standalone salvage must REFUSE a delete-bearing SST whose `delete_bitmap`
+/// entry was OMITTED from a re-stamped TOC. The parsed table then reports no
+/// deletion (the section's bytes linger unreferenced), no side section
+/// degrades, and the mask is not unpositionable — so the relabel and
+/// unpositionable guards both pass, and a naive walk would re-emit every
+/// physically-present row as live, resurrecting the deleted ones. The repair
+/// verifier catches the TOC tiling gap, but `salvage_sst` never runs it: the
+/// coverage check must live inside salvage too.
+#[cfg(feature = "columnar")]
+#[test]
+fn salvage_refuses_a_toc_that_omits_a_delete_bitmap() -> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let n = 64u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    for pos in [5u32, 20, 40] {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    // OMIT the delete_bitmap TOC entry (bytes remain, nothing references them),
+    // re-stamping the trailer so the archive stays internally consistent.
+    crate::test_forge::forge_section_omitted(&source, b"delete_bitmap")?;
+
+    let result = salvage_sst(&source, dest.clone(), &fs);
+    assert!(
+        result.is_err(),
+        "a TOC that hides a deletion section must be refused, not resurrected: {result:?}",
+    );
+    assert!(
+        !std::path::Path::new(&dest).exists(),
+        "no salvaged copy is produced when the deletion section may be hidden",
+    );
+    Ok(())
+}
+
 /// `verify_seqno_bounds` must reject a PRESENT `seqno_bounds` section that
 /// decodes to an EMPTY map on a table that still holds data blocks: every real
 /// writer emits one entry per block, so an empty map (a `delete_bitmap` renamed
