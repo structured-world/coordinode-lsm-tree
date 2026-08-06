@@ -1847,6 +1847,67 @@ fn salvage_preserves_prefix_filter_hashes() -> crate::Result<()> {
     Ok(())
 }
 
+/// Without a prefix extractor, salvage must NOT emit a filter at all. The
+/// extractor is not persisted in the SST and cannot be inferred, so a filter
+/// rebuilt from complete-key hashes only would answer `maybe_contains_prefix`
+/// with a DEFINITE-absent for a source that came from a prefix-indexed tree —
+/// silently dropping every recovered row from prefix scans once the copy is
+/// reinstalled. Omitting the filter answers "maybe present" (a full block read),
+/// which is always correct; the point-lookup speedup is sacrificed for
+/// correctness because the source's indexing intent is unknowable here.
+#[test]
+fn salvage_omits_the_filter_without_a_prefix_extractor() -> crate::Result<()> {
+    /// First four key bytes, mirroring the tree-level extractor fixtures.
+    struct FixedLengthPrefix;
+    impl crate::prefix::PrefixExtractor for FixedLengthPrefix {
+        fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+            key.get(..4).map_or_else(
+                || Box::new(std::iter::empty()) as Box<dyn Iterator<Item = &'a [u8]>>,
+                |p| Box::new(std::iter::once(p)),
+            )
+        }
+
+        fn is_valid_scan_boundary(&self, prefix: &[u8]) -> bool {
+            prefix.len() == 4
+        }
+    }
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let extractor: Arc<dyn crate::prefix::PrefixExtractor> = Arc::new(FixedLengthPrefix);
+
+    // Source built WITH a prefix extractor: its filter indexes the 4-byte
+    // prefixes (`key0` for keys `key000NN`).
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_prefix_extractor(Some(Arc::clone(&extractor)));
+    for i in 0u32..100 {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Salvage via the default path — NO extractor threaded (the CLI / API
+    // default), so the source's prefix indexing intent is unknown here.
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert_eq!(
+        report.entries_salvaged, 100,
+        "all rows recovered: {report:?}"
+    );
+
+    // The recovered copy must NOT answer a prefix probe definitely-absent: with
+    // no extractor the safe rebuilt filter is none, so `maybe_contains_prefix`
+    // falls back to "maybe present" instead of a false negative that would hide
+    // every recovered row from a prefix scan.
+    let prefix_hash = crate::hash::hash64(b"key0");
+    let table = open(dest, &fs)?;
+    assert!(
+        table.maybe_contains_prefix(prefix_hash)?,
+        "without the extractor the salvaged copy must not report a prefix as definitely absent",
+    );
+    Ok(())
+}
+
 fn iv(i: u32) -> InternalValue {
     InternalValue::from_components(
         format!("key{i:05}").into_bytes(),
