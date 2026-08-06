@@ -1221,6 +1221,15 @@ impl Table {
                 }
             };
 
+            // Tight-space restriction: skip a block whose last key is below the
+            // bound — it sits in the punched-out prefix a superseding output
+            // table now owns, so scrubbing its reclaimed bytes would report
+            // spurious corruption for a restricted view (see `Table::range`).
+            if let Some(bound) = &self.1
+                && self.comparator.compare(keyed.end_key(), bound) == core::cmp::Ordering::Less
+            {
+                continue;
+            }
             let block_offset = keyed.offset().0;
             let handle = BlockHandle::new(keyed.offset(), keyed.size());
             report.blocks_scanned += 1;
@@ -1585,6 +1594,17 @@ impl Table {
                     break;
                 }
             };
+            // Tight-space restriction: a block whose last key is below the bound
+            // sits in the punched-out (reclaimed) prefix that a superseding
+            // output table now owns. Its bytes are gone, so reading it reports a
+            // spurious uncorrectable error that would suppress the digest refresh
+            // for a real correction in the LIVE suffix. Skip it — the read path
+            // clamps scans the same way (see `Table::range`).
+            if let Some(bound) = &self.1
+                && self.comparator.compare(keyed.end_key(), bound) == core::cmp::Ordering::Less
+            {
+                continue;
+            }
             let block_offset = keyed.offset().0;
             let handle = BlockHandle::new(keyed.offset(), keyed.size());
             report.blocks_scanned += 1;
