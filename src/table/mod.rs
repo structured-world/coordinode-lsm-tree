@@ -6095,7 +6095,7 @@ impl Table {
                 heal_hints: once_cell::race::OnceBox::new(),
 
                 #[cfg(all(feature = "std", feature = "page_ecc"))]
-                heal_lock: parking_lot::Mutex::new(()),
+                heal_lock: once_cell::race::OnceBox::new(),
             }),
             None,
             None,
@@ -6179,6 +6179,17 @@ impl Table {
             #[cfg(feature = "metrics")]
             self.metrics.clone(),
         )?;
+        // The reopened `Inner` is DISTINCT from this one, so it starts without
+        // the tree-installed shared gates. Carry them forward, or the restricted
+        // view would lose them: without the checkpoint deletion pause a
+        // checkpoint could link healed bytes under a stale digest, and without
+        // the shared heal lock two patrols could heal + reconcile the same SST
+        // concurrently and leave a clean file mismatched with the manifest.
+        if let Some(pause) = self.0.deletion_pause.get() {
+            reopened.install_deletion_pause(Arc::clone(pause));
+        }
+        #[cfg(all(feature = "std", feature = "page_ecc"))]
+        reopened.install_heal_lock(self.heal_lock_arc());
         Ok(reopened.with_restriction(lower))
     }
 
@@ -6233,6 +6244,28 @@ impl Table {
     /// after recovery and after compaction registers freshly-built tables.
     pub(crate) fn install_deletion_pause(&self, pause: Arc<crate::deletion_pause::DeletionPause>) {
         let _ = self.0.deletion_pause.set(Box::new(pause));
+    }
+
+    /// The shared heal-serialization lock for this table, lazily created on
+    /// first use. Held by the patrol scrub across the whole scan-to-reconcile
+    /// span so two overlapping heals cannot race the link-count probe or the
+    /// digest reconciliation. Shared by STABLE table identity:
+    /// [`reopen_restricted`](Self::reopen_restricted) propagates it into the
+    /// distinct `Inner` it creates.
+    #[cfg(all(feature = "std", feature = "page_ecc"))]
+    pub(crate) fn heal_lock_arc(&self) -> Arc<parking_lot::Mutex<()>> {
+        Arc::clone(
+            self.0
+                .heal_lock
+                .get_or_init(|| Box::new(Arc::new(parking_lot::Mutex::new(())))),
+        )
+    }
+
+    /// Installs a shared heal lock, so a re-opened view serializes heals against
+    /// the original. Idempotent: a second call is a no-op.
+    #[cfg(all(feature = "std", feature = "page_ecc"))]
+    pub(crate) fn install_heal_lock(&self, lock: Arc<parking_lot::Mutex<()>>) {
+        let _ = self.0.heal_lock.set(Box::new(lock));
     }
 
     /// Installs the tree-wide background file deleter.

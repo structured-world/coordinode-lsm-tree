@@ -372,7 +372,9 @@ fn scan_and_reconcile(
     // then install the stale one. Also keeps the link-count probe honest
     // (the probed handle is always the current live inode).
     #[cfg(feature = "page_ecc")]
-    let _heal_exclusive = heals.then(|| table.heal_lock.lock());
+    let heal_lock = heals.then(|| table.heal_lock_arc());
+    #[cfg(feature = "page_ecc")]
+    let _heal_exclusive = heal_lock.as_ref().map(|l| l.lock());
     let _mutation_window = heals
         .then(|| {
             table

@@ -246,8 +246,15 @@ pub struct Inner {
     /// stale one).
     // std+page_ecc: only the heal-mode patrol scrub takes it; `parking_lot`
     // (not `spin`) because a heal pass is a long blocking operation.
+    //
+    // Held behind a shared `Arc` inside an `OnceBox` so it serializes by STABLE
+    // table identity, not by this replaceable `Inner`: tight-space compaction
+    // re-opens a table as a DISTINCT `Inner` (a different physical view of the
+    // same file), and `reopen_restricted` propagates this lock into it so two
+    // patrols cannot heal + reconcile the same SST concurrently. Lazily created
+    // on first heal for an ordinary table (the tree does not install it).
     #[cfg(all(feature = "std", feature = "page_ecc"))]
-    pub(crate) heal_lock: parking_lot::Mutex<()>,
+    pub(crate) heal_lock: once_cell::race::OnceBox<Arc<parking_lot::Mutex<()>>>,
 }
 
 impl Inner {
