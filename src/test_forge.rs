@@ -1510,6 +1510,31 @@ pub fn forge_zone_map_empty(path: &std::path::Path, table_id: crate::TableId) ->
     replace_section_frame(path, b"zone_map", &forged)
 }
 
+/// REPLACES the `delete_bitmap` section with a valid, checksum-consistent
+/// DeleteBitmap block that decodes to an EMPTY bitmap, re-stamping the TOC +
+/// trailer. The writer only emits the section when the bitmap is NON-empty, so
+/// a present-but-empty bitmap is a checksum-consistent corruption: it keeps the
+/// section visible (so the concealment guards stay exempt) while carrying no
+/// positions, which would let a masked salvage re-emit every deleted row live.
+/// The SST must be PLAIN (no encryption / parity on the section block).
+pub fn forge_delete_bitmap_empty(
+    path: &std::path::Path,
+    table_id: crate::TableId,
+) -> crate::Result<()> {
+    use crate::table::block::{Block, BlockIdentity, BlockTransform, BlockType};
+
+    let payload = crate::table::delete_bitmap::DeleteBitmap::new().encode();
+    let identity = BlockIdentity {
+        table_id,
+        block_type: BlockType::DeleteBitmap,
+        dict_id: 0,
+        window_log: 0,
+    };
+    let mut forged = Vec::new();
+    Block::write_into(&mut forged, &payload, identity, &BlockTransform::PLAIN)?;
+    replace_section_frame(path, b"delete_bitmap", &forged)
+}
+
 /// REPLACES the `filter` section with a valid, checksum-consistent Filter block
 /// carrying an EMPTY payload (the "no filter installed" sentinel), re-stamping
 /// the TOC + trailer. Models a `delete_bitmap` renamed and re-roled to an empty
