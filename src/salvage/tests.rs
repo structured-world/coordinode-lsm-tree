@@ -14,13 +14,14 @@ use test_log::test;
 
 /// Rot in a frame's length field is caught by the header CRC, after which the
 /// consumed lengths cannot locate the next frame: the salvage walk resyncs at
-/// the next magic instead of stopping, so one rotted header does not cost every
-/// readable record in the tail. The frame reached IMMEDIATELY by that byte scan
-/// has an UNPROVEN boundary (the magic could be nested in the rotted frame's
-/// bytes), so it is dropped — but frames chained by length AFTER it are
-/// recovered normally.
+/// the next magic instead of stopping. But the resync magic may be an original
+/// boundary OR a `BLO4` frame nested in the rotted frame's user bytes, and every
+/// frame CHAINED past it inherits that unproven anchor: a fabricated chain can
+/// plant one valid frame after another. There is no independent anchor
+/// mid-stream, so the taint is STICKY — the whole tail after the first resync is
+/// dropped (fail closed), not just the frame reached immediately by the scan.
 #[test]
-fn salvage_blob_file_resyncs_a_frame_after_a_length_rot() -> crate::Result<()> {
+fn salvage_blob_file_drops_the_whole_tail_after_a_resync() -> crate::Result<()> {
     let dir = tempdir()?;
     let source = dir.path().join("blob_rot");
     let dest = dir.path().join("blob_rot_salvaged");
@@ -51,11 +52,13 @@ fn salvage_blob_file_resyncs_a_frame_after_a_length_rot() -> crate::Result<()> {
     std::fs::write(&source, &bytes)?;
 
     let report = salvage_blob_file(&source, dest, &fs, 0)?;
-    // aaaa recovered; bbbb drops (header CRC); cccc is the UNPROVEN resync frame
-    // and drops; dddd, chained by length from cccc, is recovered.
+    // aaaa recovered; bbbb drops (header CRC) and arms the resync taint; cccc is
+    // the frame reached immediately by the byte scan (unproven boundary) and
+    // dddd is chained from cccc's equally-unproven length — BOTH drop. Only the
+    // frame BEFORE the rot survives.
     assert_eq!(
-        report.records_salvaged, 2,
-        "the frame before the rot and the one chained past the resync are recovered: {report:?}",
+        report.records_salvaged, 1,
+        "only the frame before the rot is provable; the whole tail after the resync drops: {report:?}",
     );
     assert!(
         report
@@ -64,22 +67,24 @@ fn salvage_blob_file_resyncs_a_frame_after_a_length_rot() -> crate::Result<()> {
             .any(|d| matches!(&d.reason, BlobDropReason::Corrupt(msg) if msg.contains("HeaderCrcMismatch"))),
         "the rotted frame drops as a header CRC mismatch: {report:?}",
     );
-    assert!(
+    assert_eq!(
         report
             .dropped
             .iter()
-            .any(|d| matches!(&d.reason, BlobDropReason::Corrupt(msg) if msg.contains("resync"))),
-        "the frame reached by the resync drops on its unprovable boundary: {report:?}",
+            .filter(|d| matches!(&d.reason, BlobDropReason::Corrupt(msg) if msg.contains("resync")))
+            .count(),
+        2,
+        "both post-resync frames (cccc and dddd chained from it) drop on their unprovable boundary: {report:?}",
     );
 
-    // The recovered copy carries exactly the two provable records.
+    // The recovered copy carries only the single provable record.
     let Some(salvaged) = report.salvaged_path else {
-        panic!("two records were salvaged");
+        panic!("one record was salvaged");
     };
     let keys: Vec<Vec<u8>> = BlobScanner::new(&salvaged, &*fs, 0)?
         .map(|r| r.map(|e| e.key.to_vec()))
         .collect::<crate::Result<_>>()?;
-    assert_eq!(keys, vec![b"aaaa".to_vec(), b"dddd".to_vec()]);
+    assert_eq!(keys, vec![b"aaaa".to_vec()]);
     Ok(())
 }
 
@@ -6004,8 +6009,9 @@ fn salvage_blob_file_reports_an_offset_remap_for_every_salvaged_record() -> crat
 
     // Corrupt the SECOND record's value bytes (a checksum break): the scanner
     // re-syncs at the next magic. k2, reached by that byte scan through k1's
-    // damaged bytes, has an unprovable boundary and drops too; k3, chained by
-    // length from k2, is recovered. So records 0 and 3 survive.
+    // damaged bytes, has an unprovable boundary and drops; k3, chained from
+    // k2's equally-unproven length, inherits the sticky taint and drops too. So
+    // only record 0 (before the corruption) survives.
     {
         let Some(&second) = source_offsets.get(1) else {
             panic!("second record offset");
@@ -6020,11 +6026,11 @@ fn salvage_blob_file_reports_an_offset_remap_for_every_salvaged_record() -> crat
     }
 
     let report = salvage_blob_file(&source, dest.clone(), &fs, 0)?;
-    assert_eq!(report.records_salvaged, 2, "{report:?}");
+    assert_eq!(report.records_salvaged, 1, "{report:?}");
     assert_eq!(
         report.dropped.len(),
-        2,
-        "the corrupt record + the unprovable resync frame drop: {report:?}"
+        3,
+        "the corrupt record + both unprovable post-resync frames drop: {report:?}"
     );
 
     // The remap covers exactly the salvaged records, keyed by their SOURCE
@@ -6034,7 +6040,7 @@ fn salvage_blob_file_reports_an_offset_remap_for_every_salvaged_record() -> crat
         .filter_map(Result::ok)
         .map(|e| e.offset)
         .collect();
-    let expected: Vec<(u64, u64)> = [0usize, 3]
+    let expected: Vec<(u64, u64)> = [0usize]
         .iter()
         .zip(&dest_offsets)
         .map(|(&src_idx, &new)| {
@@ -6134,13 +6140,14 @@ fn salvage_blob_file_drops_a_corrupt_record_and_keeps_the_rest() -> crate::Resul
     // The corrupt k1 drops on its checksum, and the scanner then RESYNCS to the
     // next magic. k2's frame is reached by that byte scan through k1's damaged
     // bytes, so its boundary is UNPROVEN (the magic could be an original
-    // boundary or a nested frame inside k1's value). It is dropped too — fail
-    // closed — rather than re-emitted as a possibly-fabricated record. k3, read
-    // by a chained length from k2, is recovered normally.
+    // boundary or a nested frame inside k1's value). k3, chained from k2's
+    // equally-unproven length, inherits the sticky taint. Both drop — fail
+    // closed — rather than re-emitting a possibly-fabricated chain. Only k0,
+    // before the corruption, is provable.
     assert_eq!(
         report.dropped.len(),
-        2,
-        "the corrupt record + the unprovable resync frame drop: {report:?}"
+        3,
+        "the corrupt record + both unprovable post-resync frames drop: {report:?}"
     );
     assert!(
         matches!(
@@ -6149,26 +6156,28 @@ fn salvage_blob_file_drops_a_corrupt_record_and_keeps_the_rest() -> crate::Resul
         ),
         "the corrupt record reports a checksum mismatch: {report:?}",
     );
-    assert!(
-        matches!(
-            report.dropped.get(1).map(|d| &d.reason),
-            Some(BlobDropReason::Corrupt(m)) if m.contains("resync")
-        ),
-        "the frame after the resync reports an unprovable boundary: {report:?}",
+    assert_eq!(
+        report
+            .dropped
+            .iter()
+            .filter(|d| matches!(&d.reason, BlobDropReason::Corrupt(m) if m.contains("resync")))
+            .count(),
+        2,
+        "both frames after the resync report an unprovable boundary: {report:?}",
     );
     assert_eq!(
-        report.records_salvaged, 2,
-        "k0 and k3 are recovered; k1 (corrupt) and k2 (unprovable) are not"
+        report.records_salvaged, 1,
+        "only k0 is recovered; k1 (corrupt), k2 and k3 (unprovable after the resync) are not"
     );
 
-    // The salvaged file holds k0 and k3 — k1 (corrupt) and k2 (unprovable
-    // boundary after the resync) are both absent.
+    // The salvaged file holds only k0 — k1 (corrupt) and the whole tainted tail
+    // (k2, k3) after the resync are absent.
     let recovered = scan_blob(&dest, &fs)?;
     let keys: Vec<Vec<u8>> = recovered.iter().map(|(k, _)| k.clone()).collect();
     assert_eq!(
         keys,
-        vec![b"k0".to_vec(), b"k3".to_vec()],
-        "only the provable frames survive",
+        vec![b"k0".to_vec()],
+        "only the provable frame before the corruption survives",
     );
     Ok(())
 }
