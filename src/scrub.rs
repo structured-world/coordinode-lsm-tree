@@ -523,6 +523,18 @@ fn refresh_healed_checksum(
         );
     }
 
+    // Any refusal from here on removes the heal sidecar: an attestation (or
+    // in-progress marker) whose reconciliation is refused must not survive to
+    // authorize an UNRELATED later mismatch. Its `pre == manifest` binding does
+    // not expire on its own, and a refused file needs a compaction / repair
+    // rewrite (which refreshes the digest itself), not a lingering marker. The
+    // transient install failure at the very end is the sole exception — the
+    // attestation is kept there for the next retry.
+    let refuse = |reason: String| -> Option<ScrubError> {
+        heal_attest::remove(&*table.fs, &table.path);
+        finding(reason)
+    };
+
     // AUTHORITATIVE content has no cross-check, so an UNATTRIBUTED mismatch
     // (the pre-heal digest did NOT probe equal to the manifest, so the file's
     // difference from the manifest is not provably this pass's verified
@@ -552,7 +564,7 @@ fn refresh_healed_checksum(
         // it masked, the scariest of the three surfaces.
         match table.has_deletion_metadata() {
             Ok(true) => {
-                return finding(
+                return refuse(
                     "digest mismatch not attributable to this pass's heal on a \
                      table carrying deletion metadata (range tombstones / delete \
                      bitmap), which no cross-check can authenticate; the manifest \
@@ -561,9 +573,9 @@ fn refresh_healed_checksum(
                 );
             }
             Ok(false) => {}
-            Err(e) => return finding(e.to_string()),
+            Err(e) => return refuse(e.to_string()),
         }
-        return finding(
+        return refuse(
             "digest mismatch not attributable to this pass's heal; the file's \
              non-derivable content (meta scalars such as created_at and the \
              per-KV footer descriptor, plus any footer-less value bytes) has no \
@@ -592,7 +604,7 @@ fn refresh_healed_checksum(
         Some(table.id()),
     );
     if !walk.errors.is_empty() || !walk.warnings.is_empty() {
-        return finding(
+        return refuse(
             "digest mismatch with corruption outside the scanned data blocks; \
              the manifest digest was not refreshed"
                 .into(),
@@ -605,7 +617,7 @@ fn refresh_healed_checksum(
     // verification too before the digest is trusted (a table without
     // footers makes this a no-op).
     if let Err(e) = table.verify_kv_checksums() {
-        return finding(alloc::format!(
+        return refuse(alloc::format!(
             "digest mismatch with a per-KV verification failure ({e}); the \
              manifest digest was not refreshed"
         ));
@@ -616,7 +628,7 @@ fn refresh_healed_checksum(
     // Cross-check the recorded ids against the table's own indirection
     // entries (a no-op without the section) before trusting the digest.
     if let Err(e) = table.verify_blob_links() {
-        return finding(alloc::format!(
+        return refuse(alloc::format!(
             "digest mismatch with a blob-link cross-check failure ({e}); \
              the manifest digest was not refreshed"
         ));
@@ -627,7 +639,7 @@ fn refresh_healed_checksum(
     // byte-level check — and the next recovery prefers the tail, silently
     // hiding blocks. Compare the decoded mirrors before trusting the digest.
     if let Err(e) = table.verify_tli_mirrors() {
-        return finding(alloc::format!(
+        return refuse(alloc::format!(
             "digest mismatch with a TLI mirror comparison failure ({e}); \
              the manifest digest was not refreshed"
         ));
@@ -639,7 +651,7 @@ fn refresh_healed_checksum(
     // range against the blocks' decoded entries (a no-op without the
     // section) before trusting the digest.
     if let Err(e) = table.verify_seqno_bounds() {
-        return finding(alloc::format!(
+        return refuse(alloc::format!(
             "digest mismatch with a seqno-bounds cross-check failure ({e}); \
              the manifest digest was not refreshed"
         ));
@@ -650,7 +662,7 @@ fn refresh_healed_checksum(
     // every block and confirm the counts match before trusting the digest,
     // or restamping would legitimize a silently-truncated tail.
     if let Err(e) = table.verify_block_entry_counts() {
-        return finding(alloc::format!(
+        return refuse(alloc::format!(
             "digest mismatch with a block entry-count mismatch ({e}); \
              the manifest digest was not refreshed"
         ));
@@ -662,7 +674,7 @@ fn refresh_healed_checksum(
     // against the blocks' decoded key ranges (a no-op without the section)
     // before trusting the digest.
     if let Err(e) = table.verify_zone_map() {
-        return finding(alloc::format!(
+        return refuse(alloc::format!(
             "digest mismatch with a zone-map cross-check failure ({e}); \
              the manifest digest was not refreshed"
         ));
@@ -674,7 +686,7 @@ fn refresh_healed_checksum(
     // its decoded newest-version block (a no-op without the section) before
     // trusting the digest.
     if let Err(e) = table.verify_locator() {
-        return finding(alloc::format!(
+        return refuse(alloc::format!(
             "digest mismatch with a locator cross-check failure ({e}); \
              the manifest digest was not refreshed"
         ));
@@ -686,7 +698,7 @@ fn refresh_healed_checksum(
     // disappears from every read. Probe every decoded key against the
     // on-disk filter (a no-op without one) before trusting the digest.
     if let Err(e) = table.verify_filter(tree.prefix_extractor().as_ref()) {
-        return finding(alloc::format!(
+        return refuse(alloc::format!(
             "digest mismatch with a filter cross-check failure ({e}); \
              the manifest digest was not refreshed"
         ));
@@ -699,7 +711,7 @@ fn refresh_healed_checksum(
     // boundary against the frames' actual inner blocks (a no-op without the
     // section) before trusting the digest.
     if let Err(e) = table.verify_block_layout() {
-        return finding(alloc::format!(
+        return refuse(alloc::format!(
             "digest mismatch with a block-layout cross-check failure ({e}); \
              the manifest digest was not refreshed"
         ));
@@ -710,7 +722,7 @@ fn refresh_healed_checksum(
     // trusts it and returns None for the affected keys. Probe every decoded
     // key through the full point-read path before trusting the digest.
     if let Err(e) = table.verify_point_read_reachability() {
-        return finding(alloc::format!(
+        return refuse(alloc::format!(
             "digest mismatch with a point-read reachability failure ({e}); \
              the manifest digest was not refreshed"
         ));
@@ -722,7 +734,7 @@ fn refresh_healed_checksum(
     // tombstones that mask older tables. Cross-check the recorded bounds
     // against the decoded contents before trusting the digest.
     if let Err(e) = table.verify_metadata_bounds() {
-        return finding(alloc::format!(
+        return refuse(alloc::format!(
             "digest mismatch with a metadata-bounds cross-check failure ({e}); \
              the manifest digest was not refreshed"
         ));

@@ -208,11 +208,14 @@ pub(super) fn attests(
     }
 }
 
-/// Removes the attestation (best-effort) once the reconciliation it authorized
-/// has installed a legitimate digest, syncing the parent so the removal is
+/// Removes the attestation (best-effort), syncing the parent so the removal is
 /// durable — an un-synced unlink can resurrect the sidecar after a power loss,
-/// where it would otherwise linger in `tables/` across opens.
-pub(super) fn remove(fs: &dyn Fs, table_path: &Path) {
+/// where it would otherwise linger in `tables/` across opens. Called both when a
+/// reconciliation it authorized has installed a legitimate digest AND when a
+/// marker must be invalidated (a heal that touched no block, or a refused
+/// reconciliation), so a stale marker never authorizes an unrelated later
+/// mismatch.
+pub fn remove(fs: &dyn Fs, table_path: &Path) {
     let path = attest_path(table_path);
     if fs.remove_file(&path).is_ok()
         && let Some(parent) = path.parent()

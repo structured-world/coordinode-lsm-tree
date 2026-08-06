@@ -1868,7 +1868,18 @@ impl Table {
             }
         }
 
-        (report, pre_heal_matched == Some(true))
+        // The in-progress marker is written speculatively before the first
+        // block write; if NO block was actually healed (every candidate turned
+        // out uncorrectable), the file is unchanged and the marker attests to a
+        // heal that never happened. Remove it so it cannot later authorize an
+        // unrelated digest mismatch (its `pre == manifest` binding does not
+        // expire on its own).
+        let healed = pre_heal_matched == Some(true);
+        if healed && report.blocks_healed_in_place == 0 {
+            crate::scrub::heal_attest::remove(&*self.fs, &self.path);
+        }
+
+        (report, healed)
     }
 
     /// Whether the file's CURRENT digest equals `manifest_checksum` — the
