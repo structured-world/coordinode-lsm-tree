@@ -688,6 +688,54 @@ fn heal_in_place_reports_a_failed_trailer_writeback_as_uncorrectable() -> crate:
     Ok(())
 }
 
+/// The in-progress marker is written speculatively before the first block
+/// write. If EVERY candidate then fails to write back (zero blocks healed), the
+/// file is unchanged and the marker attests to a heal that never happened — so
+/// it must be REMOVED, or its unexpiring `pre == manifest` binding could later
+/// authorize an unrelated digest mismatch.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn heal_in_place_removes_the_marker_when_no_block_heals() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst_footered(dir.path());
+
+    // Rot a parity trailer (payload checksum still verifies, so the block scrubs
+    // Clean and the trailer-rebuild heal fires) and rebuild the manifest over
+    // the rotted bytes, so the pre-heal digest matches and the marker is written.
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
+    rebuild_manifest_over_current_bytes(dir.path())?;
+
+    let fault = FaultFs::new(crate::fs::StdFs);
+    let injector = fault.injector();
+    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));
+
+    // The FIRST write to `tables/` is the marker sidecar; the SECOND is the
+    // trailer rebuild. Skip the marker write so the marker lands, then fail the
+    // trailer write so zero blocks heal.
+    injector.arm(
+        FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .skip(1)
+            .once(),
+    );
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    injector.clear();
+
+    assert_eq!(
+        report.blocks_healed_in_place, 0,
+        "a failed write-back heals no block: {report:?}",
+    );
+    assert!(
+        !heal_attest_path(&sst_path).exists(),
+        "the marker must be removed when no block healed, so it cannot authorize a \
+         later unrelated mismatch",
+    );
+    Ok(())
+}
+
 /// A corrected block whose heal RE-READ fails (transient I/O on the second,
 /// persist-side read) is a finding: the correction cannot be written back, so
 /// the block is reported uncorrectable rather than silently skipped.
@@ -2232,6 +2280,11 @@ fn heal_in_place_reconciles_via_an_in_progress_marker() -> crate::Result<()> {
     // Second pass, fault gone: every block reads clean (nothing to heal), so the
     // mismatch is attributable only via the in-progress marker.
     let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert_eq!(
+        report.blocks_healed_in_place, 0,
+        "the second pass must find every block clean, so ONLY the marker attributes the \
+         mismatch (a re-heal would make attribution direct and skip the marker path): {report:?}",
+    );
     assert!(
         report.is_ok(),
         "a crash before the completed attestation must reconcile via the in-progress \
