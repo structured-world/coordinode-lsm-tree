@@ -756,6 +756,51 @@ fn reopen_restricted_yields_a_distinct_clamped_view() -> crate::Result<()> {
     )
 }
 
+/// `reopen_restricted` creates a DISTINCT `Inner` for the same table, so it must
+/// PROPAGATE the tree-installed shared gates onto it: the checkpoint deletion
+/// pause and the heal lock. Without them a restricted view skips the checkpoint
+/// mutation window (a checkpoint could link healed bytes under a stale digest)
+/// and serializes heals against a different lock (two patrols could heal +
+/// reconcile the same SST concurrently and leave a clean file mismatched with
+/// the manifest).
+#[cfg(all(feature = "std", feature = "page_ecc"))]
+#[test]
+fn reopen_restricted_propagates_the_shared_heal_and_deletion_gates() -> crate::Result<()> {
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"c", b"v", 0, crate::ValueType::Value),
+    ];
+
+    test_with_table(
+        &items,
+        |table| {
+            let pause = crate::deletion_pause::DeletionPause::new_shared();
+            table.install_deletion_pause(std::sync::Arc::clone(&pause));
+            let lock = table.heal_lock_arc();
+
+            let restricted = table.reopen_restricted(crate::UserKey::from(&b"b"[..]))?;
+
+            let restricted_pause = restricted
+                .0
+                .deletion_pause
+                .get()
+                .expect("the deletion pause is propagated");
+            assert!(
+                std::sync::Arc::ptr_eq(restricted_pause, &pause),
+                "the restricted view shares the ORIGINAL deletion pause",
+            );
+            assert!(
+                std::sync::Arc::ptr_eq(&restricted.heal_lock_arc(), &lock),
+                "the restricted view shares the ORIGINAL heal lock",
+            );
+            Ok(())
+        },
+        None,
+        Some(|x| x),
+    )
+}
+
 /// `raw_block_parity_delta` must reject a frame whose on-disk trailer length
 /// differs from the freshly computed parity: returning `Ok(Some(fresh))` for
 /// a short trailer would make the in-place heal write MORE bytes than the
