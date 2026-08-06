@@ -1508,6 +1508,54 @@ pub fn forge_filter_empty(path: &std::path::Path, table_id: crate::TableId) -> c
     replace_section_frame(path, b"filter", &forged)
 }
 
+/// Empties the FIRST filter partition block IN PLACE: re-stamps its header to
+/// `data_length = 0` with the empty-payload checksum and a fresh header
+/// checksum, leaving the original bytes (and the block's on-disk size / the
+/// `filter_tli` handle) untouched, so the loader frames the same span but reads
+/// a zero-length ("no filter" sentinel) payload. Models a `filter_tli` that
+/// addresses an empty partition (a relabeled `delete_bitmap`): the read-path probe
+/// answers `Ok(true)` for every key it covers. The SST must be PLAIN and
+/// parity-less (the partition block carries no compression / encryption / ECC).
+pub fn forge_filter_first_partition_empty(path: &std::path::Path) -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::table::block::Header;
+
+    let mut bytes = std::fs::read(path)?;
+    let pos = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"filter") else {
+            panic!("the SST must carry a filter section");
+        };
+        entry.pos()
+    };
+    let block_off = usize::try_from(pos).expect("section offset fits usize");
+    let Some(block) = bytes.get(block_off..) else {
+        panic!("filter partition block within the file");
+    };
+    let mut cursor = block;
+    let header = Header::decode_from(&mut cursor)?;
+    let header_len = Header::header_len(header.block_type);
+    // Empty payload sentinel: zero length, checksum over no bytes.
+    let new_header = Header {
+        data_length: 0,
+        uncompressed_length: 0,
+        checksum: crate::Checksum::from_raw(crate::hash::hash128(&[])),
+        ..header
+    };
+    let mut hdr_bytes = Vec::with_capacity(header_len);
+    new_header.encode_into(&mut hdr_bytes)?;
+    let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
+        panic!("filter partition header within the file");
+    };
+    hdr_dst.copy_from_slice(&hdr_bytes);
+    std::fs::write(path, &bytes)?;
+    Ok(())
+}
+
 /// Re-stamps the data block header at `block_off` so its `data_length` spans
 /// all the way to `forged_end_off` (which must land on a LATER block boundary),
 /// leaving the ORIGINAL payload checksum untouched. The header's own integrity
@@ -2121,6 +2169,147 @@ fn replace_section_frame(
     );
     std::fs::write(path, &out)?;
     Ok(())
+}
+
+/// RENAMES the `from` section to `to` in the TOC and REPLACES its bytes with
+/// `new_payload`, shifting the trailing sections and re-stamping the TOC +
+/// trailer. Models a raw-section relabel (a `delete_bitmap` replaced by a
+/// zero-count `linked_blob_files`, or re-roled to an empty `block_layout`): the
+/// catalogue stays uniquely named and tiled, every byte-level check reads clean,
+/// yet the deletion metadata is gone. `to` may differ in length from `from`.
+pub fn forge_rename_and_replace_section(
+    path: &std::path::Path,
+    from: &[u8],
+    to: &[u8],
+    new_payload: &[u8],
+) -> crate::Result<()> {
+    let bytes = std::fs::read(path)?;
+    const TRAILER_SIZE: usize = 4 + 1 + 1 + 16 + 8 + 8;
+    let trailer_start = bytes.len() - TRAILER_SIZE;
+    let read_u64 = |bytes: &[u8], at: usize| {
+        let Some(b) = bytes.get(at..at + 8) else {
+            panic!("u64 field within the trailer");
+        };
+        u64::from_le_bytes(b.try_into().expect("8 bytes"))
+    };
+    let toc_pos = usize::try_from(read_u64(&bytes, trailer_start + 4 + 1 + 1 + 16))
+        .expect("toc_pos fits usize");
+    let (section_pos, section_len) = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == from) else {
+            panic!("the SST must carry the section to rename");
+        };
+        (
+            usize::try_from(entry.pos()).expect("pos fits usize"),
+            usize::try_from(entry.len()).expect("len fits usize"),
+        )
+    };
+
+    let delta = i64::try_from(new_payload.len()).expect("payload fits i64")
+        - i64::try_from(section_len).expect("section fits i64");
+    let mut out = Vec::with_capacity(bytes.len());
+    out.extend_from_slice(bytes.get(..section_pos).expect("pre-section prefix"));
+    out.extend_from_slice(new_payload);
+    out.extend_from_slice(
+        bytes
+            .get(section_pos + section_len..toc_pos)
+            .expect("post-section sections"),
+    );
+    let new_toc_pos = out.len();
+
+    let toc_len = usize::try_from(read_u64(&bytes, trailer_start + 4 + 1 + 1 + 16 + 8))
+        .expect("toc_len fits usize");
+    let toc = bytes.get(toc_pos..toc_pos + toc_len).expect("TOC region");
+    assert_eq!(toc.get(..4), Some(&b"TOC!"[..]), "TOC magic");
+    let count = u32::from_le_bytes(toc.get(4..8).expect("count").try_into().expect("4 bytes"));
+    let mut new_toc = Vec::with_capacity(toc.len());
+    new_toc.extend_from_slice(b"TOC!");
+    new_toc.extend_from_slice(&count.to_le_bytes());
+    let mut at = 8usize;
+    for _ in 0..count {
+        let pos = read_u64(toc, at);
+        let len = read_u64(toc, at + 8);
+        let name_len = usize::from(u16::from_le_bytes(
+            toc.get(at + 16..at + 18)
+                .expect("name_len")
+                .try_into()
+                .expect("2 bytes"),
+        ));
+        let name = toc.get(at + 18..at + 18 + name_len).expect("name");
+        if name == from {
+            new_toc.extend_from_slice(&pos.to_le_bytes());
+            new_toc.extend_from_slice(&(new_payload.len() as u64).to_le_bytes());
+            new_toc.extend_from_slice(
+                &u16::try_from(to.len())
+                    .expect("name fits u16")
+                    .to_le_bytes(),
+            );
+            new_toc.extend_from_slice(to);
+        } else {
+            let new_pos = if pos > section_pos as u64 {
+                pos.checked_add_signed(delta).expect("shifted pos fits u64")
+            } else {
+                pos
+            };
+            new_toc.extend_from_slice(&new_pos.to_le_bytes());
+            new_toc.extend_from_slice(&len.to_le_bytes());
+            new_toc.extend_from_slice(toc.get(at + 16..at + 18 + name_len).expect("name field"));
+        }
+        at += 18 + name_len;
+    }
+    let fresh = {
+        let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
+        hasher.update(&new_toc);
+        hasher.digest128()
+    };
+    out.extend_from_slice(&new_toc);
+    out.extend_from_slice(
+        bytes
+            .get(trailer_start..trailer_start + 4 + 1 + 1)
+            .expect("trailer head"),
+    );
+    out.extend_from_slice(&fresh.to_le_bytes());
+    out.extend_from_slice(
+        &u64::try_from(new_toc_pos)
+            .expect("toc_pos fits u64")
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(
+        &u64::try_from(new_toc.len())
+            .expect("TOC len fits u64")
+            .to_le_bytes(),
+    );
+    std::fs::write(path, &out)?;
+    Ok(())
+}
+
+/// Renames the `delete_bitmap` section to `block_layout` and replaces its block
+/// with a valid EMPTY `BlockLayout` block. The writer only emits a real
+/// `block_layout` section for multi-inner-block (zstd) frames, so this
+/// synthesises the present-but-empty forgery on builds where it cannot occur
+/// naturally (non-zstd) to exercise the build-independent emptiness check.
+#[cfg(not(feature = "zstd"))]
+pub fn forge_delete_bitmap_as_empty_block_layout(
+    path: &std::path::Path,
+    table_id: crate::TableId,
+) -> crate::Result<()> {
+    use crate::table::block::{Block, BlockIdentity, BlockTransform, BlockType};
+
+    let mut payload = Vec::new();
+    crate::table::block_layout::encode_block_layouts(&mut payload, &[]);
+    let identity = BlockIdentity {
+        table_id,
+        block_type: BlockType::BlockLayout,
+        dict_id: 0,
+        window_log: 0,
+    };
+    let mut frame = Vec::new();
+    Block::write_into(&mut frame, &payload, identity, &BlockTransform::PLAIN)?;
+    forge_rename_and_replace_section(path, b"delete_bitmap", b"block_layout", &frame)
 }
 
 /// Shared core: flips `payload[len - flip_from_end]` of the FIRST data

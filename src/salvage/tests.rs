@@ -1491,6 +1491,73 @@ fn verify_locator_rejects_a_slot_hint_pointing_at_an_older_version() -> crate::R
     Ok(())
 }
 
+/// `verify_locator` must reject a present locator that gives NO answer for a
+/// decoded key. The writer omits the section when it cannot build one and
+/// otherwise encodes every unique key, so a no-answer locator is a forgery (a
+/// `delete_bitmap` relabeled to a locator that resolves nothing). The read path
+/// falls back to the sorted index on a miss, but the verifier must treat the
+/// unanswered key as corrupt so the relabel cannot pass as deletion-free.
+#[test]
+fn verify_locator_rejects_a_no_answer_locator() -> crate::Result<()> {
+    use crate::config::{LocatorPolicyEntry, LocatorPrecision};
+    use crate::runtime_config::{ChecksumAlgorithm, KvChecksumPolicy};
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_data_block_restart_interval(1)
+        .use_kv_checksums(KvChecksumPolicy::AllLevels, ChecksumAlgorithm::Xxh3_64)
+        .use_locator(LocatorPolicyEntry::Enabled {
+            precision: LocatorPrecision::Restart,
+            block_id_bits: None,
+            slot_bits: None,
+        });
+    for k in [b"key-a".as_slice(), b"key-b", b"key-c"] {
+        writer.write(InternalValue::from_components(
+            k.to_vec(),
+            b"v".to_vec(),
+            1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Sanity: the honest locator passes the gate.
+    open(source.clone(), &fs)?.verify_locator()?;
+
+    // Rebuild the locator so key-c resolves to an OUT-OF-RANGE block id: the
+    // handle lookup fails and `locate_block` yields no answer for that decoded
+    // key (the read path would fall back to the sorted index; the verifier must
+    // not). key-a / key-b keep their honest block 0.
+    let h = |k: &[u8]| crate::hash::hash64(k);
+    crate::test_forge::forge_locator_slots(
+        &source,
+        0,
+        &[
+            (h(b"key-a"), 0, 0),
+            (h(b"key-b"), 0, 1),
+            (h(b"key-c"), 99, 2),
+        ],
+    )?;
+
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_locator() else {
+        panic!("a locator that gives no answer for a decoded key must fail the gate");
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::InvalidHeader(
+                "locator gives no answer for a decoded key it should resolve"
+            )
+        ),
+        "the miss must be rejected by the no-answer check, got {err:?}",
+    );
+    Ok(())
+}
+
 /// `verify_filter` must probe the extractor's PREFIX hashes, not only
 /// complete-key hashes: a full filter built WITHOUT the configured
 /// extractor (a salvage that dropped it, or a forge) still answers every
@@ -1967,6 +2034,64 @@ fn verify_blob_links_rejects_a_missing_section_with_live_indirections() -> crate
     Ok(())
 }
 
+/// `verify_blob_links` must reject a PRESENT but empty (zero-count)
+/// `linked_blob_files` section. The writer omits the section when there are no
+/// blob references, so a present-but-blobless section is a forgery: a
+/// `delete_bitmap` replaced by a four-byte zero-count `linked_blob_files` leaves
+/// both the derived and recorded maps empty, so the equality check passes and
+/// the table is kept after its deletion metadata vanished.
+#[cfg(feature = "columnar")]
+#[test]
+fn verify_blob_links_rejects_a_present_empty_section() -> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // A columnar delete-bearing SST with NO blob indirections (so no real
+    // linked_blob_files section exists to duplicate).
+    let n = 64u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    for pos in [5u32, 20, 40] {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    // Replace the delete_bitmap section with a four-byte zero-count
+    // linked_blob_files (raw shape valid, records no blob references).
+    crate::test_forge::forge_rename_and_replace_section(
+        &source,
+        b"delete_bitmap",
+        b"linked_blob_files",
+        &[0, 0, 0, 0],
+    )?;
+
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_blob_links() else {
+        panic!("a present zero-count linked_blob_files section must be rejected");
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::InvalidHeader(
+                "linked_blob_files section is present but records no blob references"
+            )
+        ),
+        "the rejection names the present-empty blob-link reason, got {err:?}",
+    );
+    Ok(())
+}
+
 /// `verify_seqno_bounds` must reject a PRESENT `seqno_bounds` section that
 /// decodes to an EMPTY map on a table that still holds data blocks: every real
 /// writer emits one entry per block, so an empty map (a `delete_bitmap` renamed
@@ -2059,6 +2184,57 @@ fn verify_block_layout_rejects_a_present_empty_map_on_a_nonempty_table() -> crat
     Ok(())
 }
 
+/// `verify_block_layout` must run the present-but-empty rejection on builds
+/// WITHOUT zstd too. The function used to return `Ok(())` for the whole
+/// non-zstd build before reading the section, so a columnar SST with positional
+/// deletes whose `delete_bitmap` was relabeled to an empty `block_layout` graded
+/// clean and reopened without its deletion metadata. The emptiness check now
+/// runs independent of the zstd frame cross-check.
+#[cfg(all(feature = "columnar", not(feature = "zstd")))]
+#[test]
+fn verify_block_layout_rejects_an_empty_map_without_zstd() -> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let n = 64u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    for pos in [5u32, 20, 40] {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    // Relabel the delete_bitmap section to an empty block_layout (the writer
+    // never emits a real one on a non-zstd build, so synthesise the forgery).
+    crate::test_forge::forge_delete_bitmap_as_empty_block_layout(&source, 0)?;
+
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_block_layout() else {
+        panic!("an empty block_layout on a non-zstd table with data blocks must be rejected");
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::InvalidHeader(
+                "block_layout section is present but empty on a table with data blocks"
+            )
+        ),
+        "the rejection names the present-empty block_layout reason, got {err:?}",
+    );
+    Ok(())
+}
+
 /// `verify_filter` must reject a PRESENT full `filter` section that decodes to
 /// the empty "no filter installed" sentinel on a table with data blocks: the
 /// writer omits the section when filtering is disabled, so a present-empty
@@ -2096,6 +2272,50 @@ fn verify_filter_rejects_a_present_empty_full_filter() -> crate::Result<()> {
             )
         ),
         "the rejection names the present-empty filter reason, got {err:?}",
+    );
+    Ok(())
+}
+
+/// `verify_filter` must reject an empty PARTITION too, not just an empty full
+/// filter. The partitioned path seeks the partition for a key and probes it; on
+/// the empty "no filter" sentinel `maybe_contains_hash` answers `Ok(true)` for
+/// every key, so a partition the writer would never leave empty (a `delete_bitmap`
+/// relabeled to an empty filter partition under a re-stamped `filter_tli`) would
+/// pass the probe and keep the table as deletion-free.
+#[test]
+fn verify_filter_rejects_an_empty_partition_for_an_existing_key() -> crate::Result<()> {
+    use crate::config::BloomConstructionPolicy;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // A partitioned filter with a tiny partition budget so several partitions
+    // spill and the writer emits the filter_tli over them.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_partitioned_filter()
+        .use_meta_partition_size(3)
+        .use_bloom_policy(BloomConstructionPolicy::BitsPerKey(10.0));
+    for i in 0u32..64 {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Empty the first partition in place (the one covering the lowest keys).
+    crate::test_forge::forge_filter_first_partition_empty(&source)?;
+
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_filter(None) else {
+        panic!("an empty filter partition covering an existing key must be rejected");
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::InvalidHeader(
+                "filter partition is present but empty for an existing key"
+            )
+        ),
+        "the rejection names the present-empty partition reason, got {err:?}",
     );
     Ok(())
 }
@@ -3870,9 +4090,73 @@ fn salvage_refuses_a_delete_bitmap_relabeled_to_a_full_filter() -> crate::Result
     let Err(err) = salvage_sst(&source, dest.clone(), &fs) else {
         panic!("a delete_bitmap relabeled to a filter must fail salvage");
     };
+    let crate::Error::FeatureUnsupported(reason) = &err else {
+        panic!("the refusal must be FeatureUnsupported, got {err:?}");
+    };
     assert!(
-        matches!(err, crate::Error::FeatureUnsupported(_)),
-        "the refusal names the unsupported salvage, got {err:?}",
+        reason.contains("rebuildable"),
+        "the refusal must name the degraded rebuildable section, got {reason:?}",
+    );
+    assert!(
+        fs.metadata(&dest).is_err(),
+        "no destination file is left behind by the refused salvage",
+    );
+    Ok(())
+}
+
+/// A `delete_bitmap` RENAMED to `filter` in the TOC WITHOUT re-roling its block
+/// header still launders the deletion: the block loads (its own checksum is
+/// valid) but its role is `DeleteBitmap`, so the filter load returns an
+/// `InvalidTag` role mismatch. Salvage must treat that STRUCTURAL failure as a
+/// degraded rebuildable section (a byte-flip would break the checksum first, so
+/// reaching `InvalidTag` means a valid block of the wrong name), not swallow it as
+/// genuine bit-rot, so the guard fails closed rather than re-emitting the rows.
+#[cfg(feature = "columnar")]
+#[test]
+fn salvage_refuses_a_delete_bitmap_renamed_to_a_filter_without_reroling() -> crate::Result<()> {
+    use crate::config::{BloomConstructionPolicy, DeleteStrategy};
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let n = 200u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_data_block_size(256)
+        .use_bloom_policy(BloomConstructionPolicy::BitsPerKey(0.0))
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    for pos in [5u32, 50, 150] {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    // Rename delete_bitmap -> filter in the TOC but KEEP its DeleteBitmap block
+    // role (to_role == the original role re-stamps the same header).
+    crate::test_forge::forge_duplicate_section_name(
+        &source,
+        b"delete_bitmap",
+        b"filter",
+        crate::table::block::BlockType::DeleteBitmap,
+    )?;
+
+    let Err(err) = salvage_sst(&source, dest.clone(), &fs) else {
+        panic!("a delete_bitmap renamed to a filter without re-roling must fail salvage");
+    };
+    let crate::Error::FeatureUnsupported(reason) = &err else {
+        panic!("the refusal must be FeatureUnsupported, got {err:?}");
+    };
+    assert!(
+        reason.contains("rebuildable"),
+        "the refusal must name the degraded rebuildable section, got {reason:?}",
     );
     assert!(
         fs.metadata(&dest).is_err(),
