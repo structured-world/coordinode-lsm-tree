@@ -41,6 +41,15 @@ pub struct Scanner {
 
     /// Byte offset where the "data" section ends (from the SFA TOC).
     data_end: u64,
+
+    /// Set when [`resync_to_next_frame`](Self::resync_to_next_frame) lands on a
+    /// magic, consumed by the NEXT frame read: that frame's boundary is
+    /// UNPROVEN. The magic was found by a byte-wise search after a damaged
+    /// frame, so it may be an original boundary OR a checksum-valid `BLO4` frame
+    /// nested inside the damaged frame's user-controlled bytes — the two are
+    /// byte-for-byte indistinguishable. Callers that must not fabricate data
+    /// (salvage) treat a `resynced` entry as untrusted.
+    just_resynced: bool,
 }
 
 impl Scanner {
@@ -127,6 +136,7 @@ impl Scanner {
             inner: file_reader,
             is_terminated: false,
             data_end,
+            just_resynced: false,
         })
     }
     // No `with_reader` constructor: Scanner is crate-private (parent
@@ -165,6 +175,10 @@ impl Scanner {
                 .position(|w| w == BLOB_HEADER_MAGIC)
             {
                 self.inner.seek(SeekFrom::Start(pos + hit as u64))?;
+                // The next frame read starts at a magic found by a byte scan,
+                // NOT at a boundary vouched for by a chained frame's length: its
+                // provenance is unproven (see the field doc).
+                self.just_resynced = true;
                 return Ok(());
             }
             if want < MAGIC_LEN {
@@ -192,6 +206,14 @@ pub struct ScanEntry {
     /// once an entry is consumed, `[data_start, frame_end)` is reclaimable and a
     /// resumed scan opens here.
     pub frame_end: u64,
+    /// Whether this frame was reached by a byte-wise RESYNC after a damaged
+    /// frame (rather than a chained length from the prior frame). A resynced
+    /// frame's boundary is UNPROVEN: the magic may be an original boundary or a
+    /// checksum-valid `BLO4` frame nested inside the damaged frame's bytes.
+    /// Salvage must NOT re-emit a resynced frame as a genuine record — doing so
+    /// would fabricate data — so it drops it (fail closed) rather than trusting
+    /// an unanchored candidate.
+    pub resynced: bool,
 }
 
 impl Iterator for Scanner {
@@ -201,6 +223,14 @@ impl Iterator for Scanner {
         if self.is_terminated {
             return None;
         }
+
+        // Consume the resync flag for THIS frame: it is set if the PREVIOUS call
+        // ended by resyncing to a magic, making this frame's boundary unproven.
+        // Reset it now so a frame reached by a chained length (a normal read
+        // below) is trusted; if this call itself resyncs, the flag is re-armed
+        // for the next frame.
+        let was_resynced = self.just_resynced;
+        self.just_resynced = false;
 
         let offset = fail_iter!(self.inner.stream_position());
 
@@ -350,6 +380,7 @@ impl Iterator for Scanner {
             offset,
             uncompressed_len: real_val_len,
             frame_end,
+            resynced: was_resynced,
         }))
     }
 }

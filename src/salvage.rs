@@ -1659,6 +1659,23 @@ pub fn salvage_blob_file(
         for item in scanner {
             records_total += 1;
             match item {
+                // A frame reached by a byte-wise RESYNC after a damaged frame
+                // has an UNPROVEN boundary: its magic may be an original frame
+                // boundary OR a checksum-valid `BLO4` frame nested inside the
+                // damaged frame's user-controlled value bytes — the two are
+                // byte-for-byte indistinguishable. Re-emitting it would FABRICATE
+                // a record (and a bogus `offset_remap` entry pointing inside the
+                // damaged frame), which is worse than losing the first frame
+                // after a rot, so drop it (fail closed on unprovable provenance).
+                Ok(entry) if entry.resynced => {
+                    dropped.push(DroppedBlob {
+                        reason: BlobDropReason::Corrupt(
+                            "frame reached by resync after a damaged frame; its boundary \
+                             cannot be proven original"
+                                .to_string(),
+                        ),
+                    });
+                }
                 // A frame whose CRCs are internally consistent but whose
                 // key_len is ZERO is malformed input (the writer's ingest
                 // never emits an empty key and asserts against one): route it

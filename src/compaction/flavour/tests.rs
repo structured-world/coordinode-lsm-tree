@@ -19,6 +19,7 @@ fn entry(
             // at the start itself, which would mislead any future test that
             // inspects the consumed-frontier argument.
             frame_end: offset + 1,
+            resynced: false,
         },
         blob_file_id,
     ))
