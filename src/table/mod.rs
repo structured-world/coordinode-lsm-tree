@@ -2022,6 +2022,17 @@ impl Table {
             }
             return Ok(());
         };
+        // The writer OMITS the linked_blob_files section when there are no blob
+        // references, so a PRESENT but empty (zero-count) section is a forgery,
+        // not a legitimate no-op: e.g. a delete_bitmap replaced by a four-byte
+        // zero-count linked_blob_files. Both `derived` and `recorded_map` would
+        // then be empty and the equality check below would pass, keeping the
+        // table after its deletion metadata vanished. Reject it here.
+        if recorded.is_empty() {
+            return Err(crate::Error::InvalidHeader(
+                "linked_blob_files section is present but records no blob references",
+            ));
+        }
         let mut recorded_map: BTreeMap<crate::vlog::BlobFileId, (usize, u64, u64)> =
             BTreeMap::new();
         for link in &recorded {
@@ -2699,8 +2710,18 @@ impl Table {
                     continue;
                 }
                 let key_hash = crate::hash::hash64(&user_key);
+                // The writer OMITS the locator section when it cannot build one
+                // and otherwise encodes EVERY unique key, so a present locator
+                // that gives NO answer for a decoded key is a forgery — e.g. a
+                // delete_bitmap relabeled/re-roled to a locator that resolves
+                // nothing. The read path falls back to the sorted index on a
+                // miss, but a verifier deciding whether to trust the bytes must
+                // treat the unanswered key as corrupt (otherwise the relabel
+                // records no degradation and the deleted rows come back live).
                 let Some((located, hint)) = locator.locate_block(key_hash)? else {
-                    continue;
+                    return Err(crate::Error::InvalidHeader(
+                        "locator gives no answer for a decoded key it should resolve",
+                    ));
                 };
                 if located.offset() != block_handle.offset() {
                     return Err(crate::Error::InvalidHeader(
@@ -2997,6 +3018,18 @@ impl Table {
                             e.insert(load_filter_block(part_handle)?)
                         }
                     };
+                    // The partition index only addresses partitions the writer
+                    // filled with keys, so a partition that decodes to the empty
+                    // "no filter" sentinel yet is sought for an existing key is a
+                    // forgery (a delete_bitmap relabeled to an empty filter
+                    // partition under a re-stamped filter_tli). Left unrejected,
+                    // the probe below reports Ok(true) permissively for every
+                    // key and the relabel passes as a filter-less table.
+                    if filter.is_empty() {
+                        return Err(crate::Error::InvalidHeader(
+                            "filter partition is present but empty for an existing key",
+                        ));
+                    }
                     filter.maybe_contains_hash(key_hash)?
                 } else if let Some(filter) = &full_filter {
                     filter.maybe_contains_hash(key_hash)?
@@ -3301,86 +3334,81 @@ impl Table {
     /// with the frames; any I/O / decode error from the frame reads.
     #[cfg(feature = "std")]
     pub(crate) fn verify_block_layout(&self) -> crate::Result<()> {
-        #[cfg(not(feature = "zstd"))]
-        {
-            // Without zstd no data block splits and the lazy path does not
-            // exist; a zstd-compressed table is unreadable on this build
-            // anyway (the decode gates fail first).
-            Ok(())
+        // The section-presence + EMPTINESS check runs on EVERY build (including
+        // non-zstd, where the per-frame cross-check below is compiled out): a
+        // relabeled delete_bitmap→empty block_layout drops the deletion metadata
+        // regardless of zstd, so the forgery must be caught either way.
+        //
+        // Re-read the section FROM DISK: the in-memory map was loaded at recover
+        // time, so an on-disk re-stamp after the open (the very forge this check
+        // exists for) would be invisible to it.
+        let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
+        let trailer = crate::sfa::Reader::from_reader(&mut file)?;
+        let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
+        let Some(bl_handle) = regions.block_layout else {
+            return Ok(());
+        };
+        // Decode the map with an encryption-aware transform: on an encrypted
+        // table the section is AEAD-sealed, so both the emptiness check below
+        // AND catching a relabeled delete_bitmap (its AAD binds the block type,
+        // so decoding it as a BlockLayout fails the AEAD open) need the provider.
+        let map = {
+            let block = Block::from_file(
+                &*file,
+                bl_handle,
+                crate::table::block::BlockIdentity {
+                    table_id: self.metadata.id,
+                    block_type: BlockType::BlockLayout,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                &{
+                    let t = match self.encryption.as_deref() {
+                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                        None => crate::table::block::BlockTransform::PLAIN,
+                    };
+                    if let Some(ecc) = self.metadata.ecc_params {
+                        t.with_ecc(ecc)
+                    } else {
+                        t
+                    }
+                },
+            )?;
+            if block.header.block_type != BlockType::BlockLayout {
+                return Err(crate::Error::InvalidTag((
+                    "BlockType",
+                    block.header.block_type.into(),
+                )));
+            }
+            crate::table::block_layout::BlockLayoutMap::decode(&block.data)?
+        };
+        // The writer emits the block_layout section ONLY when it has at least
+        // one multi-inner-block frame to record, so a PRESENT-but-empty map on a
+        // table with data blocks is a forgery — e.g. a delete_bitmap renamed and
+        // re-roled to an empty block_layout, which drops the deletion metadata
+        // and resurrects positionally-deleted rows. (The per-block loop below
+        // cannot catch it: a block absent from the map is skipped, so an empty
+        // map trivially "agrees" with every block.)
+        if map.is_empty() {
+            if self.block_index.iter().next().is_some() {
+                return Err(crate::Error::InvalidHeader(
+                    "block_layout section is present but empty on a table with data blocks",
+                ));
+            }
+            return Ok(());
         }
+        // The per-frame cross-check decodes whole zstd DATA frames: it needs
+        // zstd (the lazy partial-decode path) and cannot run on an encrypted
+        // table (the plaintext frame requires a whole-block decrypt the lazy
+        // path never performs). The emptiness forgery above is already rejected
+        // on every build, so a non-zstd / encrypted table stops here.
         #[cfg(feature = "zstd")]
         {
-            const ERR: crate::Error =
-                crate::Error::InvalidHeader("block_layout disagrees with the frames' inner blocks");
-
-            // Re-read the section FROM DISK: the in-memory map was loaded at
-            // recover time, so an on-disk re-stamp after the open (the very
-            // forge this check exists for) would be invisible to it.
-            let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
-            let trailer = crate::sfa::Reader::from_reader(&mut file)?;
-            let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
-            let Some(bl_handle) = regions.block_layout else {
-                return Ok(());
-            };
-            // Decode the map with an encryption-aware transform: on an encrypted
-            // table the section is AEAD-sealed, so both the emptiness check
-            // below AND catching a relabeled delete_bitmap (its AAD binds the
-            // block type, so decoding it as a BlockLayout fails the AEAD open)
-            // need the provider. This runs BEFORE the encrypted early return so
-            // the emptiness forgery is rejected for encrypted tables too.
-            let map = {
-                let block = Block::from_file(
-                    &*file,
-                    bl_handle,
-                    crate::table::block::BlockIdentity {
-                        table_id: self.metadata.id,
-                        block_type: BlockType::BlockLayout,
-                        dict_id: 0,
-                        window_log: 0,
-                    },
-                    &{
-                        let t = match self.encryption.as_deref() {
-                            Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
-                            None => crate::table::block::BlockTransform::PLAIN,
-                        };
-                        if let Some(ecc) = self.metadata.ecc_params {
-                            t.with_ecc(ecc)
-                        } else {
-                            t
-                        }
-                    },
-                )?;
-                if block.header.block_type != BlockType::BlockLayout {
-                    return Err(crate::Error::InvalidTag((
-                        "BlockType",
-                        block.header.block_type.into(),
-                    )));
-                }
-                crate::table::block_layout::BlockLayoutMap::decode(&block.data)?
-            };
-            // The writer emits the block_layout section ONLY when it has at
-            // least one multi-inner-block frame to record, so a PRESENT-but-empty
-            // map on a table with data blocks is a forgery — e.g. a delete_bitmap
-            // renamed and re-roled to an empty block_layout, which drops the
-            // deletion metadata and resurrects positionally-deleted rows. (The
-            // per-block loop below cannot catch it: a block absent from the map
-            // is skipped, so an empty map trivially "agrees" with every block.)
-            if map.is_empty() {
-                if self.block_index.iter().next().is_some() {
-                    return Err(crate::Error::InvalidHeader(
-                        "block_layout section is present but empty on a table with data blocks",
-                    ));
-                }
-                return Ok(());
-            }
-            // The per-frame cross-check below decodes whole DATA frames; for an
-            // encrypted table the plaintext frame is only available after a
-            // whole-block decrypt the lazy partial-decode path never performs,
-            // so its layout is never consulted and the raw frame is unreachable.
-            // The emptiness forgery above is already rejected — stop here.
             if self.encryption.is_some() {
                 return Ok(());
             }
+            const ERR: crate::Error =
+                crate::Error::InvalidHeader("block_layout disagrees with the frames' inner blocks");
 
             let transform = crate::table::util::build_block_transform(
                 self.metadata.data_block_compression,
@@ -3447,8 +3475,8 @@ impl Table {
                     "block_layout carries entries for blocks the index does not hold",
                 ));
             }
-            Ok(())
         }
+        Ok(())
     }
 
     /// Decodes one data block's entries (row or columnar) into
@@ -5511,20 +5539,36 @@ impl Table {
                     if pin_filter { Some(filter) } else { None }
                 }
                 Ok(None) => None,
-                // A filter block that FAILS to load (its own checksum/AEAD does
-                // not verify) is GENUINE bit-rot, not a relabel: a re-stamped
-                // relabel produces a checksum-VALID block (caught by the empty /
-                // unparsable payload arm above), whereas a byte-flip breaks the
-                // checksum. Genuine corruption is rebuilt from the recovered
-                // keys, so salvaging continues WITHOUT degrading — a delete-free
-                // table with a bit-rotted filter must auto-repair, not
-                // quarantine.
+                // An InvalidTag here is STRUCTURAL, not corruption: the block
+                // loaded and verified its own checksum, it is just the WRONG
+                // role (a delete_bitmap renamed to `filter` in the TOC WITHOUT
+                // re-roling its header). The header checksum covers the role, so
+                // a byte-flip in it fails the checksum BEFORE this role check —
+                // reaching InvalidTag means a valid block of the wrong name, the
+                // relabel signature. Degrade it like the empty / unparsable
+                // payload above so the guard fails closed.
+                //
+                // Any OTHER load failure (checksum / AEAD) is GENUINE bit-rot: a
+                // re-stamped relabel produces a checksum-VALID block, so a
+                // broken checksum is real corruption, rebuilt from the recovered
+                // keys. A delete-free table with a bit-rotted filter must
+                // auto-repair, not quarantine, so salvaging continues without
+                // degrading.
                 Err(e) if salvage => {
-                    log::warn!(
-                        "filter block for table {:?} is unreadable ({e}); salvaging \
-                         without it (the recovered copy re-derives its filter)",
-                        metadata.id
-                    );
+                    if matches!(e, crate::Error::InvalidTag(_)) {
+                        log::warn!(
+                            "filter block for table {:?} has the wrong role ({e}); salvaging \
+                             as a degraded rebuildable section",
+                            metadata.id
+                        );
+                        rebuildable_section_degraded = true;
+                    } else {
+                        log::warn!(
+                            "filter block for table {:?} is unreadable ({e}); salvaging \
+                             without it (the recovered copy re-derives its filter)",
+                            metadata.id
+                        );
+                    }
                     None
                 }
                 Err(e) => return Err(e),
