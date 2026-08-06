@@ -313,48 +313,34 @@ pub(crate) fn salvage_with_context(
     // the chosen meta, silently truncating the partial-decode read path's
     // synthesized blocks. Re-encoding under the chosen meta keeps the copy
     // self-consistent whichever mirror wins.
+    if !diverged {
+        // No arbitration: write directly to `dest`. There is no second attempt,
+        // so `dest` is never a live intermediate another process could replace.
+        return salvage_attempt(source, dest, fs, comparator, options, false, true);
+    }
+    // Divergent mirrors: run BOTH attempts to PRIVATE temp paths and publish
+    // only the selected winner, so `dest` is never a live intermediate a foreign
+    // process could atomically replace and this path then delete. Verbatim
+    // copy-through stays disabled — neither mirror is provably genuine.
+    let tail_dest = next_arb_temp(fs, &dest)?;
     let tail = salvage_attempt(
         source,
-        dest.clone(),
+        tail_dest.clone(),
         fs,
         comparator,
         options,
         false,
-        !diverged,
+        false,
     );
-    if !diverged {
-        return tail;
-    }
-    // A tail attempt that saw blocks and dropped nothing cannot be improved
-    // on: the tie-break prefers the tail (authoritative-by-convention) copy.
+    // A tail attempt that saw blocks and dropped nothing cannot be improved on:
+    // the tie-break prefers the tail (authoritative-by-convention) copy.
     if let Ok(r) = &tail
         && r.blocks_total > 0
         && r.dropped.is_empty()
     {
-        return tail;
+        return publish_from_temp(fs, tail, &tail_dest, &dest, options);
     }
-    // The MID attempt writes to a sibling temp path so the tail attempt's
-    // output survives until the comparison. The `.healtmp-{n}` shape is the
-    // recovery-owned temp namespace: a hard crash mid-arbitration leaves an
-    // artifact the next open sweeps instead of failing the id parse.
-    static ARB_TMP_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-    // The counter is PROCESS-local: a predecessor that crashed after
-    // creating its temp file leaves an artifact a fresh process's first
-    // sequence number collides with (tree recovery only sweeps this
-    // namespace inside table folders, so a standalone destination would
-    // stay blocked on the MID writer's create_new forever). Probe forward
-    // to a free name; a foreign artifact is never reclaimed — it may
-    // belong to a concurrently running salvage. Termination: every probe
-    // advances the counter and the artifacts on disk are finite.
-    let mid_dest = loop {
-        let seq = ARB_TMP_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let candidate = dest.with_extension(alloc::format!("healtmp-{seq}"));
-        match fs.exists(&candidate) {
-            Ok(false) => break candidate,
-            Ok(true) => {}
-            Err(e) => return Err(e.into()),
-        }
-    };
+    let mid_dest = next_arb_temp(fs, &dest)?;
     let mid = salvage_attempt(
         source,
         mid_dest.clone(),
@@ -365,120 +351,142 @@ pub(crate) fn salvage_with_context(
         false,
     );
 
-    let score = |r: &crate::Result<SalvageReport>| match r {
-        Ok(rep) => rep.blocks_salvaged,
-        Err(_) => 0,
+    // Completeness ranking of a successful attempt: more recovered blocks
+    // first, then more recovered entries (equal block counts can hold different
+    // key counts — block sizes vary), then fewer dropped blocks. Equal block
+    // counts alone do NOT imply equal recovered data, so the tail preference is
+    // the FINAL tie-break, applied only when every completeness dimension ties.
+    let completeness = |rep: &SalvageReport| {
+        (
+            rep.blocks_salvaged,
+            rep.entries_salvaged,
+            core::cmp::Reverse(rep.dropped.len()),
+        )
     };
     let mid_wins = match (&tail, &mid) {
         // An erroring attempt never beats a successful one; between two
-        // successes, strictly more recovered blocks wins (ties keep tail).
+        // successes, a strictly more complete recovery wins (exact ties keep
+        // the tail, authoritative-by-convention, copy).
         (Err(_), Ok(_)) => true,
         (_, Err(_)) => false,
-        (Ok(_), Ok(_)) => score(&mid) > score(&tail),
+        (Ok(t), Ok(m)) => completeness(m) > completeness(t),
     };
+    // Publish the winner from its temp; discard the loser's temp first so no
+    // artifact lingers outside the `.healtmp-` sweep namespace.
     if mid_wins {
-        // Discard the tail attempt's output (if any) and move the MID
-        // attempt's copy into place, fixing up the reported path.
-        if let Ok(rep) = &tail
-            && rep.salvaged_path.is_some()
-        {
-            discard_partial(fs, &dest);
+        discard_partial(fs, &tail_dest);
+        publish_from_temp(fs, mid, &mid_dest, &dest, options)
+    } else {
+        discard_partial(fs, &mid_dest);
+        publish_from_temp(fs, tail, &tail_dest, &dest, options)
+    }
+}
+
+/// Probes forward from a process-local counter to a free `.healtmp-{n}` sibling
+/// of `dest` for an arbitration attempt's PRIVATE output. The `.healtmp-`
+/// namespace is the recovery-owned temp space a hard crash leaves for the next
+/// open to sweep. A foreign artifact is never reclaimed (it may belong to a
+/// concurrent salvage); termination holds because every probe advances the
+/// counter and the on-disk artifacts are finite.
+fn next_arb_temp(
+    fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
+    dest: &std::path::Path,
+) -> crate::Result<std::path::PathBuf> {
+    static ARB_TMP_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    loop {
+        let seq = ARB_TMP_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let candidate = dest.with_extension(alloc::format!("healtmp-{seq}"));
+        match fs.exists(&candidate) {
+            Ok(false) => return Ok(candidate),
+            Ok(true) => {}
+            Err(e) => return Err(e.into()),
         }
-        let mut rep = mid?;
-        if rep.salvaged_path.is_some() {
-            // Publish atomically. A check-then-rename would race: another
-            // process could create `dest` in the window after an `exists` probe
-            // reported it free, and a plain `rename` then REPLACES that unowned
-            // file, violating the promise not to destroy a destination this
-            // salvage never created. `hard_link` claims `dest` with no-replace
-            // semantics — it fails `AlreadyExists` if anything is already there
-            // (every `Fs` backend implements it that way), so the ownership gate
-            // and the publish are one atomic step. `mid_dest` shares `dest`'s
-            // directory, so the link never crosses a filesystem.
-            match fs.hard_link(&mid_dest, &dest) {
-                Ok(()) => {}
-                Err(e) if e.kind() == crate::io::ErrorKind::AlreadyExists => {
-                    // A predecessor or racing worker owns `dest` (only the tail
-                    // attempt ever creates it here, and its copy was discarded
-                    // above). Keep the occupant, drop our copy, and surface the
-                    // tail attempt's own failure against the occupied path.
-                    discard_partial(fs, &mid_dest);
-                    return match tail {
-                        Err(e) => Err(e),
-                        Ok(_) => Err(crate::Error::Io(crate::io::Error::new(
-                            crate::io::ErrorKind::AlreadyExists,
-                            "salvage destination already exists",
-                        ))),
-                    };
-                }
-                Err(e) if e.kind() == crate::io::ErrorKind::Unsupported => {
-                    // The `Fs` trait lets a backend leave `hard_link` unsupported.
-                    // Such a backend can still create and rename ordinary files,
-                    // so fall back to a best-effort no-replace publish (probe then
-                    // rename) rather than dropping a recoverable table. This
-                    // reopens a narrow check-then-rename window, but ONLY on
-                    // backends that cannot claim a destination atomically at all —
-                    // every in-tree `Fs` implements `hard_link`.
-                    match fs.exists(&dest) {
-                        Ok(false) => {
-                            // A failed rename leaves the temp copy behind (tree
-                            // recovery only sweeps the `.healtmp-` namespace
-                            // inside table folders, so a standalone dest keeps
-                            // it) — discard it before propagating, like every
-                            // other exit in this publish sequence.
-                            if let Err(e) = fs.rename(&mid_dest, &dest) {
-                                discard_partial(fs, &mid_dest);
-                                return Err(e.into());
-                            }
-                        }
-                        Ok(true) => {
-                            discard_partial(fs, &mid_dest);
-                            return match tail {
-                                Err(e) => Err(e),
-                                Ok(_) => Err(crate::Error::Io(crate::io::Error::new(
-                                    crate::io::ErrorKind::AlreadyExists,
-                                    "salvage destination already exists",
-                                ))),
-                            };
-                        }
-                        Err(e) => {
-                            discard_partial(fs, &mid_dest);
-                            return Err(e.into());
-                        }
+    }
+}
+
+/// Publishes the winning arbitration attempt (`result`, written to `temp`) to
+/// `dest` with NO-REPLACE semantics, so a foreign file already at `dest` is
+/// never destroyed — the whole reason both attempts write to private temps.
+/// `hard_link` claims `dest` atomically (it fails `AlreadyExists` if anything is
+/// there); a backend without `hard_link` falls back to a probe-then-rename. On
+/// any failure the temp is discarded and the error propagates, so a retry and
+/// the repair caller both see `dest` as it was (free, or still owned by whoever
+/// holds it). A successful publish is made durable before the temp name drops.
+fn publish_from_temp(
+    fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
+    result: crate::Result<SalvageReport>,
+    temp: &std::path::Path,
+    dest: &std::path::Path,
+    options: &SalvageOptions,
+) -> crate::Result<SalvageReport> {
+    let already_exists = || {
+        crate::Error::Io(crate::io::Error::new(
+            crate::io::ErrorKind::AlreadyExists,
+            "salvage destination already exists",
+        ))
+    };
+    let mut rep = match result {
+        Ok(rep) => rep,
+        Err(e) => {
+            discard_partial(fs, temp);
+            return Err(e);
+        }
+    };
+    if rep.salvaged_path.is_none() {
+        // The attempt wrote nothing (an empty source, or a failure that left no
+        // file): there is nothing to publish.
+        return Ok(rep);
+    }
+    match fs.hard_link(temp, dest) {
+        Ok(()) => {}
+        Err(e) if e.kind() == crate::io::ErrorKind::AlreadyExists => {
+            discard_partial(fs, temp);
+            return Err(already_exists());
+        }
+        Err(e) if e.kind() == crate::io::ErrorKind::Unsupported => {
+            // A backend without `hard_link` can still create + rename ordinary
+            // files; fall back to a best-effort no-replace publish. This reopens
+            // a narrow check-then-rename window, but ONLY on backends that cannot
+            // claim a destination atomically at all — every in-tree `Fs`
+            // implements `hard_link`.
+            match fs.exists(dest) {
+                Ok(false) => {
+                    if let Err(e) = fs.rename(temp, dest) {
+                        discard_partial(fs, temp);
+                        return Err(e.into());
                     }
                 }
+                Ok(true) => {
+                    discard_partial(fs, temp);
+                    return Err(already_exists());
+                }
                 Err(e) => {
-                    discard_partial(fs, &mid_dest);
+                    discard_partial(fs, temp);
                     return Err(e.into());
                 }
             }
-            // `dest` now links the MID copy, but the new directory entry is a
-            // fresh mutation: without its own sync a power loss can leave the
-            // manifest referencing a `dest` that survives only under the temp
-            // name. Make the entry durable BEFORE dropping the temp, using the
-            // same mode-aware discipline as the writer's finish. A sync failure
-            // removes the just-published copy (and the temp) and propagates, so
-            // a retry and the repair caller both see the destination free.
-            if let Err(e) = fs.sync_directory_with(entry_directory(&dest), options.sync_mode) {
-                discard_partial(fs, &dest);
-                discard_partial(fs, &mid_dest);
-                return Err(e.into());
-            }
-            // The link is durable; drop the temp name (the inode lives on under
-            // `dest`). A crash before this leaves the temp in the recovery-owned
-            // `.healtmp-` namespace, which the next open sweeps.
-            discard_partial(fs, &mid_dest);
-            rep.salvaged_path = Some(dest);
         }
-        Ok(rep)
-    } else {
-        if let Ok(rep) = &mid
-            && rep.salvaged_path.is_some()
-        {
-            discard_partial(fs, &mid_dest);
+        Err(e) => {
+            discard_partial(fs, temp);
+            return Err(e.into());
         }
-        tail
     }
+    // `dest` now links the copy, but the new directory entry is a fresh
+    // mutation: without its own sync a power loss can leave the manifest
+    // referencing a `dest` that survives only under the temp name. Make the
+    // entry durable BEFORE dropping the temp. A sync failure removes the
+    // just-published copy (and the temp) and propagates, so a retry and the
+    // repair caller both see the destination free.
+    if let Err(e) = fs.sync_directory_with(entry_directory(dest), options.sync_mode) {
+        discard_partial(fs, dest);
+        discard_partial(fs, temp);
+        return Err(e.into());
+    }
+    // Durable; drop the temp name (the inode lives on under `dest`). A crash
+    // before this leaves the temp in the recovery-owned `.healtmp-` namespace.
+    discard_partial(fs, temp);
+    rep.salvaged_path = Some(dest.to_path_buf());
+    Ok(rep)
 }
 
 /// Decodes BOTH meta mirrors under the caller's id/encryption context and
