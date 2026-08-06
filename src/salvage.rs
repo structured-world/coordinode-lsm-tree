@@ -372,14 +372,37 @@ pub(crate) fn salvage_with_context(
         (Ok(t), Ok(m)) => completeness(m) > completeness(t),
     };
     // Publish the winner from its temp; discard the loser's temp first so no
-    // artifact lingers outside the `.healtmp-` sweep namespace.
+    // artifact lingers outside the `.healtmp-` sweep namespace — but ONLY when
+    // this invocation actually created that temp. An attempt whose `create_new`
+    // lost a race to a concurrent salvage returns `AlreadyExists` WITHOUT
+    // creating the file, so discarding its path would delete the file the race
+    // winner owns (see [`attempt_owns_temp`]).
     if mid_wins {
-        discard_partial(fs, &tail_dest);
+        if attempt_owns_temp(&tail) {
+            discard_partial(fs, &tail_dest);
+        }
         publish_from_temp(fs, mid, &mid_dest, &dest, options)
     } else {
-        discard_partial(fs, &mid_dest);
+        if attempt_owns_temp(&mid) {
+            discard_partial(fs, &mid_dest);
+        }
         publish_from_temp(fs, tail, &tail_dest, &dest, options)
     }
+}
+
+/// Whether a salvage attempt CREATED (and therefore owns) its destination temp.
+///
+/// Every attempt opens its temp with `create_new`, which atomically claims the
+/// path: any outcome other than `AlreadyExists` means this invocation owns the
+/// temp (a success, or a later write / finish error AFTER `create_new` proved
+/// ownership) and must clean it up. `AlreadyExists` means `create_new` lost a
+/// race to a concurrent creator and created nothing, so the path belongs to
+/// that other process and this invocation must NOT discard it.
+fn attempt_owns_temp(result: &crate::Result<SalvageReport>) -> bool {
+    !matches!(
+        result,
+        Err(crate::Error::Io(e)) if e.kind() == crate::io::ErrorKind::AlreadyExists
+    )
 }
 
 /// Probes forward from a process-local counter to a free `.healtmp-{n}` sibling
@@ -428,7 +451,16 @@ fn publish_from_temp(
     let mut rep = match result {
         Ok(rep) => rep,
         Err(e) => {
-            discard_partial(fs, temp);
+            // A `create_new` that lost a race returns `AlreadyExists` without
+            // creating `temp`; discarding it would delete the race winner's file.
+            // Any other error created `temp` (or nothing) and is safe to clean up.
+            let lost_race = matches!(
+                &e,
+                crate::Error::Io(io) if io.kind() == crate::io::ErrorKind::AlreadyExists
+            );
+            if !lost_race {
+                discard_partial(fs, temp);
+            }
             return Err(e);
         }
     };
