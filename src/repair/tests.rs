@@ -126,6 +126,49 @@ fn quarantine_file_syncs_the_parent_on_a_retry_with_a_preexisting_dir() -> crate
     Ok(())
 }
 
+/// A POST-rename directory-sync failure must ROLL THE RENAME BACK: the move is
+/// not durably committed, so leaving the source in quarantine lets a retry
+/// install a manifest omitting it — after which a power loss that rolls the
+/// un-synced rename back resurrects the source as an orphan the next open
+/// deletes, losing the only recovery copy. The source must return to `tables/`
+/// so a retry can still find and re-quarantine it durably. The quarantine-dir
+/// sync (which fires only AFTER the rename) is faulted, so the failure lands
+/// with the source already moved.
+#[test]
+fn quarantine_file_rolls_the_rename_back_on_a_post_move_sync_failure() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, SyncMode};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let src = tables.join("junk-name");
+    std::fs::write(&src, b"orphan")?;
+
+    // Fault the quarantine-directory sync only: it runs AFTER the rename (the
+    // pre-rename parent sync targets `dir.path()`, which does not contain
+    // "repair-quarantine"), so the failure lands with the source already moved.
+    let fs = FaultFs::new(StdFs);
+    fs.injector().arm(
+        FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+            .on_path("repair-quarantine"),
+    );
+
+    assert!(
+        quarantine_file(&fs, &tables, &src, "junk-name", SyncMode::Full).is_err(),
+        "the post-move directory-sync fault must surface",
+    );
+    assert!(
+        std::fs::metadata(&src).is_ok(),
+        "the rename must be rolled back so the source stays under tables/ for a retry",
+    );
+    assert!(
+        std::fs::metadata(dir.path().join("repair-quarantine").join("junk-name")).is_err(),
+        "the half-committed move must not linger in quarantine",
+    );
+    Ok(())
+}
+
 /// A second repair of the same table must NOT overwrite an earlier quarantine
 /// copy: `rename` replaces the destination on Unix, so a fixed
 /// `repair-quarantine/{id}` name would destroy the only copy of the previous
