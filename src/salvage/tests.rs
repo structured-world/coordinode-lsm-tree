@@ -2342,6 +2342,58 @@ fn salvage_refuses_a_present_but_empty_delete_bitmap() -> crate::Result<()> {
     Ok(())
 }
 
+/// A forged TLI that REORDERS columnar block handles must fail salvage closed.
+/// `delete_block_starts` is built by walking the index, so a reorder rebuilds
+/// the starts in that same reordered sequence and `delete_positions_verified`
+/// self-validates against them. But the bitmap positions were assigned in the
+/// writer's PHYSICAL block order, so the salvage walk (which sorts blocks back
+/// to physical order) would mask against the wrong starts, deleting live rows
+/// and resurrecting deleted ones without the opt-in. Anchoring the verification
+/// to monotonic physical offsets detects the reorder.
+#[cfg(feature = "columnar")]
+#[test]
+fn salvage_refuses_a_reordered_columnar_index_with_deletes() -> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // Small blocks so the SST spills several columnar data blocks; deletes land
+    // across them.
+    let n = 200u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_data_block_size(256)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    for pos in [5u32, 60, 120] {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    // Swap the first two block handles in both TLI mirrors. The index and
+    // delete_block_starts now agree with each other but not with the physical
+    // bitmap positions.
+    crate::test_forge::forge_tli_mirrors_swap_first_two(&source, 0, None)?;
+
+    let Err(err) = salvage_sst(&source, dest.clone(), &fs) else {
+        panic!("a reordered columnar index with deletes must fail salvage closed");
+    };
+    assert!(
+        matches!(err, crate::Error::InvalidHeader(msg) if msg.contains("delete bitmap cannot be applied")),
+        "the refusal must name the unpositionable delete mask, got {err:?}",
+    );
+    Ok(())
+}
+
 /// `verify_seqno_bounds` must reject a PRESENT `seqno_bounds` section that
 /// decodes to an EMPTY map on a table that still holds data blocks: every real
 /// writer emits one entry per block, so an empty map (a `delete_bitmap` renamed
