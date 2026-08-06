@@ -186,10 +186,29 @@ fn quarantine_file(
     // syncing both, a power loss after repair returns can drop the destination
     // entry or restore the source under `tables/`, and the next open's orphan
     // cleanup then deletes the only copy meant for manual recovery.
-    if let Some(src_dir) = src.parent() {
-        fs.sync_directory_with(src_dir, sync_mode)?;
+    let sync_result = (|| -> crate::Result<()> {
+        if let Some(src_dir) = src.parent() {
+            fs.sync_directory_with(src_dir, sync_mode)?;
+        }
+        fs.sync_directory_with(&quarantine_dir, sync_mode)?;
+        Ok(())
+    })();
+    // A sync failure means the move is NOT durably committed. Returning with the
+    // source still in quarantine lets a retry (which no longer finds it under
+    // `tables/`) rebuild a manifest that omits it; a later power loss then rolls
+    // the un-synced rename back, resurrecting the source as an orphan the next
+    // open deletes — losing the only recovery copy. Roll the rename back so the
+    // source stays where a retry can still find and re-quarantine it durably.
+    if let Err(e) = sync_result {
+        // Best-effort: undo the move and re-sync. A rollback that itself fails
+        // leaves nothing more we can safely do here; surface the original error.
+        let _ = fs.rename(&dest, src);
+        if let Some(src_dir) = src.parent() {
+            let _ = fs.sync_directory_with(src_dir, sync_mode);
+        }
+        let _ = fs.sync_directory_with(&quarantine_dir, sync_mode);
+        return Err(e);
     }
-    fs.sync_directory_with(&quarantine_dir, sync_mode)?;
     Ok(dest)
 }
 
