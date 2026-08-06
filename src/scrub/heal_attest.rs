@@ -35,9 +35,22 @@ use crate::fs::{Fs, FsOpenOptions};
 use alloc::vec::Vec;
 use std::path::{Path, PathBuf};
 
-/// Serialized payload length: `table_id` (u64) + pre digest (u128) + post digest
-/// (u128).
-const ATTEST_LEN: usize = 8 + 16 + 16;
+/// A COMPLETED attestation: the heal finished and its exact `(pre, post)`
+/// digests are recorded, so a reconcile only trusts the file that hashes to
+/// `post`.
+const KIND_COMPLETED: u8 = 0;
+/// An IN-PROGRESS marker: written BEFORE the first healed block lands, when the
+/// file still hashes to the manifest digest (`pre`). The post-heal digest is not
+/// yet known, so a reconcile trusts `pre == manifest` plus the full structural
+/// re-verification that follows attribution. It bridges a crash between the last
+/// healed block's sync and the completed attestation write — otherwise the next
+/// patrol finds a clean file (nothing to heal), no attribution, and the stale
+/// manifest digest is rejected forever until a full rewrite.
+const KIND_IN_PROGRESS: u8 = 1;
+
+/// Serialized payload length: `kind` (u8) + `table_id` (u64) + pre digest (u128)
+/// + post digest (u128).
+const ATTEST_LEN: usize = 1 + 8 + 16 + 16;
 
 /// The attestation sits next to the SST with a `.heal-attest` suffix APPENDED
 /// (not a replaced extension), so it never collides with the SST's own name.
@@ -47,19 +60,106 @@ fn attest_path(table_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-fn serialize(table_id: u64, pre: u128, post: u128) -> Vec<u8> {
+fn serialize(kind: u8, table_id: u64, pre: u128, post: u128) -> Vec<u8> {
     let mut out = Vec::with_capacity(ATTEST_LEN);
+    out.push(kind);
     out.extend_from_slice(&table_id.to_le_bytes());
     out.extend_from_slice(&pre.to_le_bytes());
     out.extend_from_slice(&post.to_le_bytes());
     out
 }
 
-fn deserialize(plain: &[u8]) -> Option<(u64, u128, u128)> {
-    let id = u64::from_le_bytes(plain.get(0..8)?.try_into().ok()?);
-    let pre = u128::from_le_bytes(plain.get(8..24)?.try_into().ok()?);
-    let post = u128::from_le_bytes(plain.get(24..40)?.try_into().ok()?);
-    Some((id, pre, post))
+fn deserialize(plain: &[u8]) -> Option<(u8, u64, u128, u128)> {
+    let kind = *plain.first()?;
+    let id = u64::from_le_bytes(plain.get(1..9)?.try_into().ok()?);
+    let pre = u128::from_le_bytes(plain.get(9..25)?.try_into().ok()?);
+    let post = u128::from_le_bytes(plain.get(25..41)?.try_into().ok()?);
+    Some((kind, id, pre, post))
+}
+
+/// Seals `plain` (AEAD for a keyed table, else plaintext) and writes+syncs it as
+/// the sidecar next to `table_path`.
+fn write_sidecar(
+    fs: &dyn Fs,
+    table_path: &Path,
+    encryption: Option<&dyn EncryptionProvider>,
+    plain: &[u8],
+) -> crate::Result<()> {
+    let content = match encryption {
+        Some(enc) => enc.encrypt(plain)?,
+        None => plain.to_vec(),
+    };
+    let path = attest_path(table_path);
+    let mut file = fs.open(
+        &path,
+        &FsOpenOptions::new().write(true).create(true).truncate(true),
+    )?;
+    file.write_all(&content)?;
+    file.flush()?;
+    file.sync_all()?;
+    if let Some(parent) = path.parent() {
+        fs.sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+/// Reads and opens the sidecar, returning its decoded `(kind, id, pre, post)` or
+/// `None` for a missing / unreadable / wrong-length / AEAD-rejected sidecar.
+fn read_sidecar(
+    fs: &dyn Fs,
+    table_path: &Path,
+    encryption: Option<&dyn EncryptionProvider>,
+) -> Option<(u8, u64, u128, u128)> {
+    let path = attest_path(table_path);
+    let mut file = fs.open(&path, &FsOpenOptions::new().read(true)).ok()?;
+    let mut content = Vec::new();
+    file.read_to_end(&mut content).ok()?;
+    let plain = match encryption {
+        // A tampered or wrong-key sidecar fails the AEAD open: reject it.
+        Some(enc) => enc.decrypt(&content).ok()?,
+        None => content,
+    };
+    deserialize(&plain)
+}
+
+/// Writes an IN-PROGRESS marker recording only the manifest (`pre`) digest, for
+/// the crash window before the completed attestation exists. Called BEFORE the
+/// first healed block is made durable.
+///
+/// # Errors
+///
+/// Propagates the AEAD seal error and any write / sync I/O error; the caller
+/// treats a failure as best-effort (a crashed heal is then not recoverable
+/// without a full rewrite, the pre-marker behavior).
+pub fn write_in_progress(
+    fs: &dyn Fs,
+    table_path: &Path,
+    encryption: Option<&dyn EncryptionProvider>,
+    table_id: u64,
+    pre: Checksum,
+) -> crate::Result<()> {
+    let plain = serialize(KIND_IN_PROGRESS, table_id, pre.into_u128(), 0);
+    write_sidecar(fs, table_path, encryption, &plain)
+}
+
+/// Whether an IN-PROGRESS marker proves the file differs from the manifest
+/// (`manifest`) solely because a heal started from a manifest-matching file.
+/// The reconcile still re-verifies the file structurally after attribution, so
+/// `pre == manifest` (plus the id and, for a keyed table, the AEAD open) is the
+/// only binding this marker needs.
+pub(super) fn attests_in_progress(
+    fs: &dyn Fs,
+    table_path: &Path,
+    encryption: Option<&dyn EncryptionProvider>,
+    table_id: u64,
+    manifest: Checksum,
+) -> bool {
+    match read_sidecar(fs, table_path, encryption) {
+        Some((kind, id, pre, _post)) => {
+            kind == KIND_IN_PROGRESS && id == table_id && pre == manifest.into_u128()
+        }
+        None => false,
+    }
 }
 
 /// Writes and syncs a heal attestation next to `table_path`.
@@ -78,23 +178,8 @@ pub(super) fn write(
     pre: Checksum,
     post: Checksum,
 ) -> crate::Result<()> {
-    let plain = serialize(table_id, pre.into_u128(), post.into_u128());
-    let content = match encryption {
-        Some(enc) => enc.encrypt(&plain)?,
-        None => plain,
-    };
-    let path = attest_path(table_path);
-    let mut file = fs.open(
-        &path,
-        &FsOpenOptions::new().write(true).create(true).truncate(true),
-    )?;
-    file.write_all(&content)?;
-    file.flush()?;
-    file.sync_all()?;
-    if let Some(parent) = path.parent() {
-        fs.sync_directory(parent)?;
-    }
-    Ok(())
+    let plain = serialize(KIND_COMPLETED, table_id, pre.into_u128(), post.into_u128());
+    write_sidecar(fs, table_path, encryption, &plain)
 }
 
 /// Whether a valid attestation proves the CURRENT file (hashing to `current`)
@@ -112,26 +197,15 @@ pub(super) fn attests(
     current: Checksum,
     manifest: Checksum,
 ) -> bool {
-    let path = attest_path(table_path);
-    let Ok(mut file) = fs.open(&path, &FsOpenOptions::new().read(true)) else {
-        return false;
-    };
-    let mut content = Vec::new();
-    if file.read_to_end(&mut content).is_err() {
-        return false;
+    match read_sidecar(fs, table_path, encryption) {
+        Some((kind, id, pre, post)) => {
+            kind == KIND_COMPLETED
+                && id == table_id
+                && post == current.into_u128()
+                && pre == manifest.into_u128()
+        }
+        None => false,
     }
-    let plain = match encryption {
-        // A tampered or wrong-key sidecar fails the AEAD open: reject it.
-        Some(enc) => match enc.decrypt(&content) {
-            Ok(plain) => plain,
-            Err(_) => return false,
-        },
-        None => content,
-    };
-    let Some((id, pre, post)) = deserialize(&plain) else {
-        return false;
-    };
-    id == table_id && post == current.into_u128() && pre == manifest.into_u128()
 }
 
 /// Removes the attestation (best-effort) once the reconciliation it authorized

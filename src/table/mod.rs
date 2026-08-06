@@ -1695,11 +1695,13 @@ impl Table {
                         // Trailer rot: persist the freshly computed parity at
                         // its on-disk position (header + payload unchanged).
                         Ok(Some(fresh)) => {
-                            // Still the pre-heal bytes: capture attribution
-                            // before the first write lands.
-                            let _ = pre_heal_matched.get_or_insert_with(|| {
-                                self.pre_heal_digest_matches(manifest_checksum)
-                            });
+                            // Still the pre-heal bytes: capture attribution and
+                            // write the crash-recoverable marker before the first
+                            // write lands.
+                            self.capture_pre_heal_attribution(
+                                &mut pre_heal_matched,
+                                manifest_checksum,
+                            );
                             // First write: make sure no checkpoint link
                             // shares the inode (lazy detach).
                             if let Err(reason) = self.ensure_unshared_for_write(
@@ -1797,10 +1799,9 @@ impl Table {
                             continue;
                         }
                     };
-                    // Still the pre-heal bytes: capture attribution before
-                    // the first write lands.
-                    let _ = pre_heal_matched
-                        .get_or_insert_with(|| self.pre_heal_digest_matches(manifest_checksum));
+                    // Still the pre-heal bytes: capture attribution and write
+                    // the crash-recoverable marker before the first write lands.
+                    self.capture_pre_heal_attribution(&mut pre_heal_matched, manifest_checksum);
                     // First write: make sure no checkpoint link shares the
                     // inode (lazy detach).
                     if let Err(reason) =
@@ -1892,6 +1893,43 @@ impl Table {
                 );
                 false
             }
+        }
+    }
+
+    /// Captures the pre-heal attribution the FIRST time a block needs healing:
+    /// probes whether the file still hashes to the manifest digest and, if so,
+    /// writes a crash-recoverable IN-PROGRESS marker BEFORE the first healed
+    /// block is made durable. Without it, a crash between the last healed block's
+    /// sync and the completed attestation leaves a clean file the next patrol
+    /// cannot attribute, so the stale manifest digest is rejected until a full
+    /// rewrite. Idempotent — only the first call (while `matched` is `None`) does
+    /// work; the marker write is best-effort (a failure only forfeits crash
+    /// recovery of this heal).
+    #[cfg(feature = "page_ecc")]
+    fn capture_pre_heal_attribution(
+        &self,
+        matched: &mut Option<bool>,
+        manifest_checksum: Checksum,
+    ) {
+        if matched.is_some() {
+            return;
+        }
+        let is_match = self.pre_heal_digest_matches(manifest_checksum);
+        *matched = Some(is_match);
+        if is_match
+            && let Err(e) = crate::scrub::heal_attest::write_in_progress(
+                &*self.fs,
+                &self.path,
+                self.encryption.as_deref(),
+                self.id(),
+                manifest_checksum,
+            )
+        {
+            log::warn!(
+                "scrub: could not write the in-progress heal marker for #{} at {}: {e}",
+                self.id(),
+                self.path.display(),
+            );
         }
     }
 

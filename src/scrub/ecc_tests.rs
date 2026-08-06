@@ -2186,6 +2186,70 @@ fn heal_in_place_reconciles_a_crashed_refresh_via_the_attestation() -> crate::Re
     Ok(())
 }
 
+/// The completed attestation is written only AFTER every block is healed, so a
+/// crash between the last healed block's sync and that write leaves the file
+/// healed with NO completed attestation. An IN-PROGRESS marker, written BEFORE
+/// the first healed block lands, bridges that window: it records only the
+/// pre-heal (manifest) digest, and the next clean scrub reconciles via it (the
+/// structural gates still re-verify the file). Without it the clean re-scan
+/// cannot attribute the mismatch and the stale digest is rejected forever.
+#[test]
+fn heal_in_place_reconciles_via_an_in_progress_marker() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst_footered(dir.path());
+
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
+    rebuild_manifest_over_current_bytes(dir.path())?;
+
+    // First heal pass with a failing edit-log: the blocks are healed and a
+    // COMPLETED attestation is written, but the manifest refresh fails.
+    let (tree, injector) = open_ecc_tree_with_failing_edit_log(dir.path());
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    injector.clear();
+    assert!(report.blocks_healed_in_place >= 1, "{report:?}");
+
+    // Model the earlier crash window — blocks healed, but the completed
+    // attestation never landed, leaving only the pre-heal IN-PROGRESS marker.
+    // The marker's `pre` is the current (stale) manifest digest.
+    let (table_id, manifest_digest) = {
+        let binding = tree.version_history.read().latest_version();
+        let table = binding
+            .version
+            .iter_tables()
+            .next()
+            .expect("the healed table is still in the manifest");
+        (table.id(), table.checksum())
+    };
+    std::fs::remove_file(heal_attest_path(&sst_path))?;
+    crate::scrub::heal_attest::write_in_progress(
+        &crate::fs::StdFs,
+        &sst_path,
+        None,
+        table_id,
+        manifest_digest,
+    )?;
+
+    // Second pass, fault gone: every block reads clean (nothing to heal), so the
+    // mismatch is attributable only via the in-progress marker.
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report.is_ok(),
+        "a crash before the completed attestation must reconcile via the in-progress \
+         marker on the next scrub: {report:?}",
+    );
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        integrity.is_ok(),
+        "the reconciled digest matches the healed file, got {:?}",
+        integrity.errors,
+    );
+    assert!(
+        !heal_attest_path(&sst_path).exists(),
+        "the marker is consumed once its reconciliation lands",
+    );
+    Ok(())
+}
+
 /// Without a valid attestation, an unattributable stale digest STILL fails
 /// closed: the attestation is the only thing that lets a clean re-scan
 /// reconcile, so deleting it (modelling a crash before the attestation was
