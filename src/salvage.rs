@@ -697,10 +697,22 @@ fn salvage_attempt(
         .use_sync_mode(options.sync_mode)
         // The extractor is configuration (never persisted in the SST), so
         // the rebuilt filter only carries the source's prefix hashes when
-        // the caller supplies it — without them, prefix scans would see
-        // the recovered copy as definitely absent.
+        // the caller supplies it.
         .use_prefix_extractor(options.prefix_extractor.clone())
         .use_encryption(options.encryption.clone());
+    // Without an extractor, DISABLE the filter entirely rather than rebuild one
+    // from complete-key hashes: the source's prefix-indexing intent is
+    // unknowable (the extractor is not persisted and cannot be inferred), and a
+    // complete-key-only filter answers `maybe_contains_prefix` DEFINITELY-ABSENT
+    // for a source that came from a prefix-indexed tree — silently dropping every
+    // recovered row from prefix scans. No filter answers "maybe present" (a full
+    // block read), which is always correct; the point-lookup speedup is
+    // sacrificed for correctness.
+    let writer = if options.prefix_extractor.is_none() {
+        writer.use_bloom_policy(crate::config::BloomConstructionPolicy::BitsPerKey(0.0))
+    } else {
+        writer
+    };
     #[cfg(zstd_any)]
     let writer = writer.use_zstd_dictionary(options.zstd_dictionary.clone());
 
