@@ -736,6 +736,51 @@ fn heal_in_place_removes_the_marker_when_no_block_heals() -> crate::Result<()> {
     Ok(())
 }
 
+/// A tight-space RESTRICTED table's heal walk must SKIP the punched-out prefix:
+/// a block whose last key is below the restriction bound was reclaimed by a
+/// superseding output table, so reading its frame reports a spurious
+/// uncorrectable error — which would suppress the digest refresh for a real
+/// correction in the live suffix. The walk must start at the bound.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn heal_skips_blocks_below_the_restriction_bound() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, first_block) = write_ecc_sst(dir.path());
+
+    // Wreck the FIRST data block's payload beyond RS recovery (uncorrectable):
+    // it holds the lowest keys, so a bound above them puts it in the prefix.
+    let start = first_block.offset().0 as usize + Header::MIN_LEN;
+    let mut bytes = std::fs::read(&sst_path)?;
+    for off in start..start + 256 {
+        if let Some(b) = bytes.get_mut(off) {
+            *b ^= 0xFF;
+        }
+    }
+    std::fs::write(&sst_path, &bytes)?;
+
+    // Re-open the table restricted to a bound well above the first block's keys,
+    // so the wrecked block sits in the (punched) prefix the walk must skip.
+    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(crate::fs::StdFs));
+    let binding = tree.version_history.read().latest_version();
+    let table = binding
+        .version
+        .iter_tables()
+        .next()
+        .expect("flush produced one table");
+    let restricted = table.reopen_restricted(crate::UserKey::from(b"key-001000".as_slice()))?;
+
+    let (report, _healed) =
+        restricted.heal_data_blocks_in_place(crate::fs::SyncMode::Full, restricted.checksum());
+    assert!(
+        report.errors.is_empty()
+            && report.uncorrectable_blocks == 0
+            && report.blocks_healed_in_place == 0,
+        "the wrecked block below the restriction bound must be skipped entirely, \
+         neither healed nor reported: {report:?}",
+    );
+    Ok(())
+}
+
 /// A corrected block whose heal RE-READ fails (transient I/O on the second,
 /// persist-side read) is a finding: the correction cannot be written back, so
 /// the block is reported uncorrectable rather than silently skipped.
