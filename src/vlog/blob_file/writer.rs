@@ -312,7 +312,7 @@ impl Writer {
         // NOTE:
         // BLOB HEADER LAYOUT
         //
-        // [MAGIC_BYTES; 4B]    - b"BLO4"
+        // [MAGIC_BYTES; 4B]    - BLOB_HEADER_MAGIC (b"BLO4")
         // [Checksum; 16B]      - xxh3_128(key + value + header_crc_le)
         // [Seqno; 8B]
         // [key len; 2B]

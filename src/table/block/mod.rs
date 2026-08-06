@@ -1794,6 +1794,16 @@ impl Block {
             // (`Table::heal_data_blocks_in_place`) verifies each block via the scrub
             // read path first and only uses `heal_frame` to fetch the corrected
             // bytes for a block that read path already flagged as recovered.
+            //
+            // A PARITY-ONLY fault (payload + payload checksum intact, ECC trailer
+            // rotted) is deliberately NOT this function's job: the read path reads
+            // it as clean, so `heal_frame` is never called for it. That case is
+            // repaired earlier in `heal_data_blocks_in_place` by
+            // `Table::raw_block_parity_delta`, which recomputes the parity over the
+            // verified payload and rewrites the trailer when it diverges (proven by
+            // `heal_in_place_restores_a_rotted_parity_trailer`). So a clean frame
+            // reaching here has an intact trailer already — returning `None` leaves
+            // no damaged parity on disk.
             return Ok(None);
         };
         // Recompute the parity over the corrected data so the rewritten frame is
