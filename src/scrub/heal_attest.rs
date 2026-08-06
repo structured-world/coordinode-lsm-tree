@@ -60,6 +60,17 @@ fn attest_path(table_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// The staging path the sidecar is written + synced to before an atomic rename
+/// onto [`attest_path`]. A crash between the temp write and the rename leaves
+/// this behind; tree recovery sweeps `{id}.heal-attest.tmp` (it is disposable —
+/// either the live sidecar it would have replaced still bridges the crash
+/// window, or the heal is simply re-run).
+fn attest_tmp_path(table_path: &Path) -> PathBuf {
+    let mut name = attest_path(table_path).into_os_string();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
 fn serialize(kind: u8, table_id: u64, pre: u128, post: u128) -> Vec<u8> {
     let mut out = Vec::with_capacity(ATTEST_LEN);
     out.push(kind);
@@ -77,8 +88,16 @@ fn deserialize(plain: &[u8]) -> Option<(u8, u64, u128, u128)> {
     Some((kind, id, pre, post))
 }
 
-/// Seals `plain` (AEAD for a keyed table, else plaintext) and writes+syncs it as
-/// the sidecar next to `table_path`.
+/// Seals `plain` (AEAD for a keyed table, else plaintext) and publishes it as
+/// the sidecar next to `table_path` through a synced temp + atomic rename.
+///
+/// The temp is written, flushed, and fsynced in full, THEN atomically renamed
+/// onto the live sidecar path. A mid-write or sync failure therefore leaves the
+/// partial bytes in the temp (removed best-effort) and never touches the live
+/// sidecar: an already-durable in-progress marker survives a failed completed
+/// write, instead of being truncated in place and destroyed — which would leave
+/// a healed SST with a stale manifest digest and no valid attestation, forever
+/// unreconcilable.
 fn write_sidecar(
     fs: &dyn Fs,
     table_path: &Path,
@@ -90,17 +109,30 @@ fn write_sidecar(
         None => plain.to_vec(),
     };
     let path = attest_path(table_path);
-    let mut file = fs.open(
-        &path,
-        &FsOpenOptions::new().write(true).create(true).truncate(true),
-    )?;
-    file.write_all(&content)?;
-    file.flush()?;
-    file.sync_all()?;
-    if let Some(parent) = path.parent() {
-        fs.sync_directory(parent)?;
+    let tmp = attest_tmp_path(table_path);
+    let publish = (|| -> crate::Result<()> {
+        let mut file = fs.open(
+            &tmp,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        file.write_all(&content)?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        // Atomic replace: the live sidecar is either the old marker or the fully
+        // written new one, never a truncated in-between.
+        fs.rename(&tmp, &path)?;
+        if let Some(parent) = path.parent() {
+            fs.sync_directory(parent)?;
+        }
+        Ok(())
+    })();
+    if publish.is_err() {
+        // The rename did not land, so the live sidecar is untouched; drop the
+        // partial temp (a crash that skips this is swept by tree recovery).
+        let _ = fs.remove_file(&tmp);
     }
-    Ok(())
+    publish
 }
 
 /// Reads and opens the sidecar, returning its decoded `(kind, id, pre, post)` or

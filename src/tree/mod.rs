@@ -4162,6 +4162,25 @@ impl Tree {
                     continue;
                 }
 
+                // A `{id}.heal-attest.tmp` is a crashed sidecar-publish temp: the
+                // attestation was written + synced to this temp for an atomic
+                // rename onto `{id}.heal-attest`, but the process died before the
+                // rename. It is disposable — either the live sidecar it would have
+                // replaced still bridges the crash window, or the heal is re-run —
+                // so sweep it like the healtmp copies. Checked BEFORE the
+                // `.heal-attest` skip because that suffix is a prefix of this one.
+                if table_file_name
+                    .strip_suffix(".heal-attest.tmp")
+                    .is_some_and(|id| id.parse::<TableId>().is_ok())
+                {
+                    log::warn!(
+                        "Removing abandoned heal-attest temp: {}",
+                        table_file_path.display()
+                    );
+                    folder_fs.remove_file(&table_file_path)?;
+                    continue;
+                }
+
                 // A `{id}.heal-attest` sidecar records that an in-place heal
                 // corrected `{id}` but its manifest digest refresh may not have
                 // landed; the next scrub consumes it to reconcile. It is never a
