@@ -394,6 +394,13 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn exists(&self, path: &Path) -> io::Result<bool> {
+        // A `Metadata` fault on an existence probe models a stat that RACED file
+        // creation and saw the path absent (the TOCTOU window `FaultOp::Metadata`
+        // documents): report `Ok(false)` so the caller proceeds to create/open,
+        // where a concurrent creator's file then surfaces as `AlreadyExists`.
+        if let Some(Fault::Error(_)) = self.injector.check(FaultOp::Metadata, Some(path)) {
+            return Ok(false);
+        }
         self.inner.exists(path)
     }
 

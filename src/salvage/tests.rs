@@ -1174,6 +1174,77 @@ fn salvage_arbitration_skips_a_stale_crash_artifact() -> crate::Result<()> {
     Ok(())
 }
 
+/// When two processes salvage the SAME divergent-mirror SST concurrently, the
+/// process-local temp counter can hand both the same `.healtmp-0` name if one's
+/// existence probe RACES the other's creation. The loser's `create_new` then
+/// fails `AlreadyExists`, and it must NOT discard that path — the file there is
+/// the winner's in-progress output. A stale existence probe (a Metadata fault
+/// that reports the occupied name absent) plus a pre-existing foreign temp
+/// reproduces the race: the tail attempt loses, mid wins, and the foreign
+/// `.healtmp-0` must survive the arbitration cleanup.
+///
+/// `lz4`-gated: the divergent-mirror arbitration is driven by a
+/// `compression#data` forge to Lz4.
+#[cfg(feature = "lz4")]
+#[test]
+fn salvage_arbitration_keeps_a_foreign_temp_it_did_not_create() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0u64..100 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Divergent mirrors so the arbitration runs both attempts.
+    crate::test_forge::forge_tail_meta_value(&source, b"compression#data", &[1])?;
+
+    // A concurrent process's in-progress temp already occupies the FIRST name
+    // this process would pick.
+    let foreign = dest.with_extension("healtmp-0");
+    let sentinel = b"concurrent salvage in-progress output".to_vec();
+    std::fs::write(&foreign, &sentinel)?;
+
+    // The tail attempt's existence probe RACES: a Metadata fault makes it see
+    // `.healtmp-0` as absent, so it returns that name and the tail's create_new
+    // then fails AlreadyExists against the foreign file. The mid attempt picks
+    // `.healtmp-1` and wins.
+    injector.arm(
+        FaultRule::new(FaultOp::Metadata, Fault::Error(ErrorKind::Other))
+            .on_path("healtmp-0")
+            .once(),
+    );
+
+    let report = salvage_sst(&source, dest, &fs)?;
+    assert_eq!(
+        report.entries_salvaged, 100,
+        "the mid attempt recovers every entry: {report:?}",
+    );
+    assert!(
+        std::path::Path::new(&foreign).exists(),
+        "the foreign concurrent temp must not be discarded by this salvage",
+    );
+    assert_eq!(
+        std::fs::read(&foreign)?,
+        sentinel,
+        "the foreign temp's bytes stay untouched",
+    );
+    Ok(())
+}
+
 /// A PRE-EXISTING destination must survive a divergent-mirror salvage: the
 /// tail attempt correctly fails its `create_new` open, but the MID attempt
 /// writes to a sibling temp path and wins the arbitration — publishing it
