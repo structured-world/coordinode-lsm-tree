@@ -978,17 +978,19 @@ fn salvage_blocks(
     // data section is still writer-ordered and self-framing, so the tiling
     // walk below recovers every block the broken enumeration could not reach
     // (a mid-partition rot must not cost the failed and later partitions).
+    // Capture (do NOT yet record) a broken enumeration: whether it is data loss
+    // depends on the fallback below. When the physical data section is readable,
+    // the tiling walk recovers every block INDEPENDENTLY of the index, so a
+    // corrupt index partition costs nothing and must not be reported as a
+    // dropped block; only when there is no physical fallback (unreadable TOC) is
+    // the un-enumerated remainder truly lost.
     let mut indexed: Vec<crate::table::KeyedBlockHandle> = Vec::new();
+    let mut index_enum_error: Option<String> = None;
     for handle in table.data_block_handles() {
         match handle {
             Ok(k) => indexed.push(k),
             Err(e) => {
-                dropped.push(DroppedBlock {
-                    offset: 0,
-                    section: b"index".to_vec(),
-                    reason: DropReason::HeaderCorrupted(format!("{e:?}")),
-                    key_range: None,
-                });
+                index_enum_error = Some(format!("{e:?}"));
                 break;
             }
         }
@@ -1159,7 +1161,17 @@ fn salvage_blocks(
         }
     } else {
         // Unreadable TOC (no physical data section to tile against): walk
-        // exactly what the index enumeration gave.
+        // exactly what the index enumeration gave. Here a broken enumeration IS
+        // data loss: with no physical fallback, the un-enumerated handles are
+        // unrecoverable, so record the structural index error as a drop.
+        if let Some(reason) = index_enum_error {
+            dropped.push(DroppedBlock {
+                offset: 0,
+                section: b"index".to_vec(),
+                reason: DropReason::HeaderCorrupted(reason),
+                key_range: None,
+            });
+        }
         for keyed in indexed {
             let handle = *keyed.as_ref();
             items.push((handle, Some(keyed.end_key().clone())));
