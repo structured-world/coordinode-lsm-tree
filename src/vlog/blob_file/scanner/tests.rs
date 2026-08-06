@@ -313,6 +313,55 @@ fn blob_scanner_rejects_oversized_on_disk_len() -> crate::Result<()> {
     Ok(())
 }
 
+/// A CRC-valid frame whose declared `real_val_len` exceeds the 256 MiB
+/// decompression cap must be rejected by the pre-allocation cap check even when
+/// the frame still FITS the data section. Only `on_disk_val_len` feeds the
+/// frame-fit bound, so an over-cap `real_val_len` sails past the fit check and
+/// the cap check is the sole thing that can reject it — a path the
+/// section-overrun test does not exercise. The header CRC is recomputed
+/// CONSISTENT with the oversized length so the declaration survives CRC
+/// validation and reaches the cap check.
+#[test]
+fn blob_scanner_rejects_over_cap_real_val_len() -> crate::Result<()> {
+    use crate::vlog::blob_file::writer::compute_header_crc;
+
+    let dir = tempdir()?;
+    let blob_file_path = dir.path().join("0");
+    let key = b"aaa";
+    let value = b"hi";
+    let seqno = 7u64;
+    {
+        let mut writer = BlobFileWriter::new(&blob_file_path, 0, 0, &StdFs)?;
+        writer.write(key, seqno, value)?;
+        writer.finish()?;
+    }
+
+    // 256 MiB + 1: over the cap, but the ON-DISK length stays `value.len()` so
+    // the frame still fits the tiny data section. Only `real_val_len` breaks the
+    // cap, so the reject cannot be attributed to a section overrun.
+    let over_cap: u32 = 256 * 1024 * 1024 + 1;
+    const RV_LEN_OFF: usize = 4 + 16 + 8 + 2;
+    {
+        let mut bytes = std::fs::read(&blob_file_path)?;
+        bytes[RV_LEN_OFF..RV_LEN_OFF + 4].copy_from_slice(&over_cap.to_le_bytes());
+        // Recompute the header CRC so the oversized length survives validation
+        // and reaches the cap check instead of tripping the header CRC first.
+        let key_len = u16::try_from(key.len()).unwrap();
+        let on_disk_val_len = u32::try_from(value.len()).unwrap();
+        let crc = compute_header_crc(seqno, key_len, over_cap, on_disk_val_len);
+        bytes[HDR_CRC_OFF..HDR_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&blob_file_path, bytes)?;
+    }
+
+    let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
+    let result = scanner.next().unwrap();
+    assert!(
+        matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
+        "an over-cap real_val_len must be rejected before allocation, got: {result:?}",
+    );
+    Ok(())
+}
+
 /// Writes two frames with the real writer and returns the path. Frame 1
 /// starts at data-section offset 0 (sfa has no inline section headers).
 fn write_two_frames(dir: &std::path::Path) -> crate::Result<std::path::PathBuf> {
