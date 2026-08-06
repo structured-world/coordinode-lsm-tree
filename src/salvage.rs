@@ -1099,6 +1099,14 @@ fn salvage_blocks(
         }
     }
 
+    // Drops recorded BEFORE the emit loop — a corrupt index entry and every
+    // `probe_gap` region (a header-corrupt block the tiling walk resynced past)
+    // — never enter `items`, so the per-item increment below would miss them.
+    // They were still INSPECTED and lost, so count them in the total: without
+    // this a header-corrupt block yields `blocks_total == blocks_salvaged`
+    // while a block was dropped, reporting full coverage despite the loss.
+    blocks_total += dropped.len();
+
     for (block_handle, end_key) in items {
         blocks_total += 1;
         let offset = *block_handle.offset();
