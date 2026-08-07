@@ -2440,7 +2440,10 @@ fn flip_and_restamp_first_data_block(
 /// row entry layout is `[value_type u8][seqno varint][...]`, so the seqno is the
 /// byte immediately after the header + the value-type byte. Models a
 /// checksum-restamped later block whose boundary key's seqno was raised.
-/// The SST must be uncompressed and footer-less.
+/// The SST must be uncompressed, unencrypted, footer-less, and parity-less: this
+/// helper edits the raw payload and re-stamps only the block-header checksum, so
+/// it neither decrypts/re-encrypts the payload nor regenerates any Page-ECC
+/// parity trailer.
 pub fn forge_raise_data_block_first_seqno(
     path: &std::path::Path,
     block_off: usize,
