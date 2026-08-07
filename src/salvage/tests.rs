@@ -1356,6 +1356,45 @@ fn salvage_reencodes_all_blocks_when_meta_mirrors_diverge() -> crate::Result<()>
     Ok(())
 }
 
+/// When the meta mirrors diverge ONLY in `created_at`, both salvage attempts
+/// recover identical blocks and entries, so the completeness tie-break picks the
+/// tail. That is SAFE because the recovered copy re-stamps `created_at` fresh at
+/// finish and re-derives every other authoritative field (key range, seqnos,
+/// counts) from the actual re-emitted entries — the layout is mirrored but
+/// re-encoded — so a backdated tail cannot be laundered into the copy. This
+/// regression guards that property: if a future change ever carried the source
+/// `created_at` forward, the forged backdated value would surface here.
+#[test]
+fn salvage_does_not_carry_a_forged_created_at_into_the_copy() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0u64..100 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    let backdated: u128 = 1;
+    crate::test_forge::forge_tail_meta_value(&source, b"created_at", &backdated.to_le_bytes())?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert_eq!(report.entries_salvaged, 100, "{report:?}");
+    let recovered = open(dest, &fs)?;
+    assert_ne!(
+        *recovered.metadata.created_at, backdated,
+        "the recovered copy must not carry the forged backdated created_at",
+    );
+    Ok(())
+}
+
 /// A checksum-clean row block that ITERATES to fewer entries than its
 /// trailer declares must be dropped, not marked recovered: the entry decoder
 /// turns a mid-stream parse failure into an ordinary end of iteration, so a

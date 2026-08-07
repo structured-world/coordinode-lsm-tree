@@ -367,6 +367,15 @@ pub(crate) fn salvage_with_context(
         // An erroring attempt never beats a successful one; between two
         // successes, a strictly more complete recovery wins (exact ties keep
         // the tail, authoritative-by-convention, copy).
+        //
+        // An exact tie under divergence is SAFE to resolve by convention: the
+        // recovered copy re-derives every authoritative field from the actual
+        // re-emitted entries (key range, seqnos, counts) and re-stamps
+        // `created_at` fresh, mirroring only the layout (re-encoded, never
+        // byte-copied when diverged). So the losing mirror's non-derivable
+        // metadata — a backdated `created_at`, a forged count — never reaches the
+        // copy; the tie-break chooses only which layout drives the re-encode, and
+        // both layouts produce a self-consistent copy.
         (Err(_), Ok(_)) => true,
         (_, Err(_)) => false,
         (Ok(t), Ok(m)) => completeness(m) > completeness(t),
