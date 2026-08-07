@@ -2885,6 +2885,14 @@ impl Table {
         if self.metadata.columnar {
             return Ok(());
         }
+        // The internal-key sort order (user key ASC, then seqno DESC per key) is
+        // a GLOBAL invariant across the whole table, not just within a block.
+        // Carry the last decoded internal key ACROSS block boundaries so a
+        // checksum-restamped later block cannot raise the seqno of a key that
+        // also ends the preceding block: both blocks would decode and probe
+        // cleanly on their own, yet after reopen the index seeks the first block
+        // and a later compaction could persist the stale (lower-seqno) version.
+        let mut prev_internal: Option<(UserKey, SeqNo)> = None;
         for handle in self.block_index.iter() {
             let handle = handle?;
             let block_handle = BlockHandle::new(handle.offset(), handle.size());
@@ -2904,6 +2912,25 @@ impl Table {
             // and one probe per distinct key suffices.
             let mut prev_key: Option<UserKey> = None;
             for entry in entries {
+                // Enforce the global sort order on EVERY entry (before the
+                // per-key dedup below), tracking the previous entry across block
+                // boundaries: the user key must strictly increase, or — for the
+                // same user key — the seqno must strictly decrease.
+                if let Some((pk, ps)) = &prev_internal {
+                    let out_of_order = match self.comparator.compare(&entry.key.user_key, pk) {
+                        core::cmp::Ordering::Greater => false,
+                        core::cmp::Ordering::Less => true,
+                        core::cmp::Ordering::Equal => entry.key.seqno >= *ps,
+                    };
+                    if out_of_order {
+                        return Err(crate::Error::InvalidHeader(
+                            "data-block entries are out of order (a user key decreased, or an \
+                             equal key's seqno did not strictly decrease) across the walk",
+                        ));
+                    }
+                }
+                prev_internal = Some((entry.key.user_key.clone(), entry.key.seqno));
+
                 if prev_key.as_ref() == Some(&entry.key.user_key) {
                     continue;
                 }
