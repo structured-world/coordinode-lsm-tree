@@ -799,7 +799,7 @@ impl Table {
         // Anchor the walk to PHYSICAL block order. `delete_block_starts` is built
         // by walking this same index, so a forged TLI that REORDERS the handles
         // rebuilds the starts in that reordered sequence and self-validates
-        // against them — yet the bitmap positions were assigned in the writer's
+        // against them, yet the bitmap positions were assigned in the writer's
         // physical block order, so the salvage walk (which sorts blocks by
         // offset) would mask against the wrong starts. Requiring strictly
         // increasing offsets rejects the reorder: a genuine index is always in
@@ -1222,7 +1222,7 @@ impl Table {
             };
 
             // Tight-space restriction: skip a block whose last key is below the
-            // bound — it sits in the punched-out prefix a superseding output
+            // bound: it sits in the punched-out prefix a superseding output
             // table now owns, so scrubbing its reclaimed bytes would report
             // spurious corruption for a restricted view (see `Table::range`).
             if let Some(bound) = &self.1
@@ -1598,7 +1598,7 @@ impl Table {
             // sits in the punched-out (reclaimed) prefix that a superseding
             // output table now owns. Its bytes are gone, so reading it reports a
             // spurious uncorrectable error that would suppress the digest refresh
-            // for a real correction in the LIVE suffix. Skip it — the read path
+            // for a real correction in the LIVE suffix. Skip it: the read path
             // clamps scans the same way (see `Table::range`).
             if let Some(bound) = &self.1
                 && self.comparator.compare(keyed.end_key(), bound) == core::cmp::Ordering::Less

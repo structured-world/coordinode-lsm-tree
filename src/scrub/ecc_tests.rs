@@ -728,9 +728,9 @@ fn heal_in_place_removes_the_marker_when_no_block_heals() -> crate::Result<()> {
         report.blocks_healed_in_place, 0,
         "a failed write-back heals no block: {report:?}",
     );
-    // Positive signal that the heal REACHED the trailer write-back — so the
-    // marker was written (its write precedes the trailer write) before the
-    // failure — rather than the marker never landing. Distinguishes
+    // Positive signal that the heal REACHED the trailer write-back (so the
+    // marker was written, its write preceding the trailer write, before the
+    // failure), rather than the marker never landing. Distinguishes
     // "marker removed after being written" from "marker never written".
     assert!(
         report.uncorrectable_blocks >= 1
@@ -749,7 +749,7 @@ fn heal_in_place_removes_the_marker_when_no_block_heals() -> crate::Result<()> {
 /// A tight-space RESTRICTED table's heal walk must SKIP the punched-out prefix:
 /// a block whose last key is below the restriction bound was reclaimed by a
 /// superseding output table, so reading its frame reports a spurious
-/// uncorrectable error — which would suppress the digest refresh for a real
+/// uncorrectable error that would suppress the digest refresh for a real
 /// correction in the live suffix. The walk must start at the bound.
 #[cfg(feature = "page_ecc")]
 #[test]
