@@ -2302,7 +2302,7 @@ fn salvage_refuses_a_toc_that_omits_a_delete_bitmap() -> crate::Result<()> {
     Ok(())
 }
 
-/// A PRESENT delete_bitmap section that decodes to an EMPTY bitmap must fail
+/// A PRESENT `delete_bitmap` section that decodes to an EMPTY bitmap must fail
 /// salvage closed. The writer only emits the section when the bitmap is
 /// non-empty, so a checksum-consistent corruption to empty is a forge: it keeps
 /// the section visible (exempting the concealment guards) yet carries no
@@ -2393,7 +2393,7 @@ fn salvage_refuses_a_reordered_columnar_index_with_deletes() -> crate::Result<()
     // bitmap positions.
     crate::test_forge::forge_tli_mirrors_swap_first_two(&source, 0, None)?;
 
-    let Err(err) = salvage_sst(&source, dest.clone(), &fs) else {
+    let Err(err) = salvage_sst(&source, dest, &fs) else {
         panic!("a reordered columnar index with deletes must fail salvage closed");
     };
     assert!(

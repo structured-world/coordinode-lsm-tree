@@ -1511,7 +1511,7 @@ pub fn forge_zone_map_empty(path: &std::path::Path, table_id: crate::TableId) ->
 }
 
 /// REPLACES the `delete_bitmap` section with a valid, checksum-consistent
-/// DeleteBitmap block that decodes to an EMPTY bitmap, re-stamping the TOC +
+/// `DeleteBitmap` block that decodes to an EMPTY bitmap, re-stamping the TOC +
 /// trailer. The writer only emits the section when the bitmap is NON-empty, so
 /// a present-but-empty bitmap is a checksum-consistent corruption: it keeps the
 /// section visible (so the concealment guards stay exempt) while carrying no
