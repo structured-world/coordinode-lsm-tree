@@ -2393,12 +2393,16 @@ fn salvage_refuses_a_reordered_columnar_index_with_deletes() -> crate::Result<()
     // bitmap positions.
     crate::test_forge::forge_tli_mirrors_swap_first_two(&source, 0, None)?;
 
-    let Err(err) = salvage_sst(&source, dest, &fs) else {
+    let Err(err) = salvage_sst(&source, dest.clone(), &fs) else {
         panic!("a reordered columnar index with deletes must fail salvage closed");
     };
     assert!(
         matches!(err, crate::Error::InvalidHeader(msg) if msg.contains("delete bitmap cannot be applied")),
         "the refusal must name the unpositionable delete mask, got {err:?}",
+    );
+    assert!(
+        !std::path::Path::new(&dest).exists(),
+        "no salvaged copy is produced when the delete bitmap cannot be positioned",
     );
     Ok(())
 }
