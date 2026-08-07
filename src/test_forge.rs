@@ -2433,3 +2433,53 @@ fn flip_and_restamp_first_data_block(
     std::fs::write(path, &bytes)?;
     Ok(())
 }
+
+/// Raises the seqno of the FIRST entry of the data block at `block_off` from a
+/// 1-byte varint value to `new_seqno` (also `< 128`, so the varint width is
+/// unchanged and nothing shifts), then re-stamps the block header checksum. The
+/// row entry layout is `[value_type u8][seqno varint][...]`, so the seqno is the
+/// byte immediately after the header + the value-type byte. Models a
+/// checksum-restamped later block whose boundary key's seqno was raised.
+/// The SST must be uncompressed and footer-less.
+pub fn forge_raise_data_block_first_seqno(
+    path: &std::path::Path,
+    block_off: usize,
+    new_seqno: u8,
+) -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::table::block::Header;
+
+    assert!(
+        new_seqno < 0x80,
+        "the raised seqno must stay a 1-byte varint"
+    );
+    let mut bytes = std::fs::read(path)?;
+    let mut cursor = bytes.get(block_off..).expect("block within the file");
+    let header = Header::decode_from(&mut cursor)?;
+    let header_len = Header::header_len(header.block_type);
+    let payload_range =
+        block_off + header_len..block_off + header_len + header.data_length as usize;
+    // payload[0] = value_type, payload[1] = the seqno varint (1 byte for < 128).
+    let seqno_at = block_off + header_len + 1;
+    let old = *bytes.get(seqno_at).expect("seqno byte within the payload");
+    assert!(
+        old < 0x80,
+        "the original seqno must be a 1-byte varint, got {old:#x}"
+    );
+    if let Some(slot) = bytes.get_mut(seqno_at) {
+        *slot = new_seqno;
+    }
+    let payload = bytes.get(payload_range).expect("payload within the file");
+    let new_header = Header {
+        checksum: crate::Checksum::from_raw(crate::hash::hash128(payload)),
+        ..header
+    };
+    let mut hdr_bytes = Vec::with_capacity(header_len);
+    new_header.encode_into(&mut hdr_bytes)?;
+    bytes
+        .get_mut(block_off..block_off + header_len)
+        .expect("header within the file")
+        .copy_from_slice(&hdr_bytes);
+    std::fs::write(path, &bytes)?;
+    Ok(())
+}

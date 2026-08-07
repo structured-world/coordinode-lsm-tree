@@ -1395,6 +1395,63 @@ fn salvage_does_not_carry_a_forged_created_at_into_the_copy() -> crate::Result<(
     Ok(())
 }
 
+/// The point-read reachability walk must reject a cross-block internal-key
+/// order inversion. A checksum-restamped later block that raises the seqno of a
+/// key ending the previous block leaves both blocks decoding and probing
+/// cleanly on their own, yet the global (user key ASC, seqno DESC) order is
+/// broken across the boundary: after reopen the index seeks the first block and
+/// a later compaction could persist the stale (lower-seqno) version.
+#[test]
+fn verify_point_read_reachability_rejects_a_cross_block_seqno_inversion() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // Two versions of the SAME key, one per block (a 1-byte block budget forces
+    // each entry into its own block), so the key's versions span the boundary:
+    // block 0 = kkk@2, block 1 = kkk@1 (equal key, descending seqno — valid).
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(1);
+    writer.write(InternalValue::from_components(
+        b"kkk",
+        b"v2",
+        2,
+        ValueType::Value,
+    ))?;
+    writer.write(InternalValue::from_components(
+        b"kkk",
+        b"v1",
+        1,
+        ValueType::Value,
+    ))?;
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Raise the SECOND block's first entry seqno from 1 to 3: block 0 now ends
+    // kkk@2 and block 1 starts kkk@3 (equal key, seqno RAISED across the
+    // boundary — the invalid inversion).
+    let block1_off = {
+        let table = open(source.clone(), &fs)?;
+        let offsets: alloc::vec::Vec<u64> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|kh| *kh.as_ref().offset())
+            .collect();
+        assert!(
+            offsets.len() >= 2,
+            "the key's versions must span two blocks, got {offsets:?}",
+        );
+        usize::try_from(offsets[1]).expect("offset fits usize")
+    };
+    crate::test_forge::forge_raise_data_block_first_seqno(&source, block1_off, 3)?;
+
+    let table = open(source, &fs)?;
+    let result = table.verify_point_read_reachability();
+    assert!(
+        matches!(&result, Err(crate::Error::InvalidHeader(msg)) if msg.contains("out of order")),
+        "a cross-block seqno inversion must be rejected, got {result:?}",
+    );
+    Ok(())
+}
+
 /// A checksum-clean row block that ITERATES to fewer entries than its
 /// trailer declares must be dropped, not marked recovered: the entry decoder
 /// turns a mid-stream parse failure into an ordinary end of iteration, so a
