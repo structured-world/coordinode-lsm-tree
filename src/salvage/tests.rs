@@ -1360,8 +1360,8 @@ fn salvage_reencodes_all_blocks_when_meta_mirrors_diverge() -> crate::Result<()>
 /// recover identical blocks and entries, so the completeness tie-break picks the
 /// tail. That is SAFE because the recovered copy re-stamps `created_at` fresh at
 /// finish and re-derives every other authoritative field (key range, seqnos,
-/// counts) from the actual re-emitted entries — the layout is mirrored but
-/// re-encoded — so a backdated tail cannot be laundered into the copy. This
+/// counts) from the actual re-emitted entries; the layout is mirrored but
+/// re-encoded, so a backdated tail cannot be laundered into the copy. This
 /// regression guards that property: if a future change ever carried the source
 /// `created_at` forward, the forged backdated value would surface here.
 #[test]
@@ -1409,7 +1409,7 @@ fn verify_point_read_reachability_rejects_a_cross_block_seqno_inversion() -> cra
 
     // Two versions of the SAME key, one per block (a 1-byte block budget forces
     // each entry into its own block), so the key's versions span the boundary:
-    // block 0 = kkk@2, block 1 = kkk@1 (equal key, descending seqno — valid).
+    // block 0 = kkk@2, block 1 = kkk@1 (equal key, descending seqno: valid).
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(1);
     writer.write(InternalValue::from_components(
         b"kkk",
@@ -1427,7 +1427,7 @@ fn verify_point_read_reachability_rejects_a_cross_block_seqno_inversion() -> cra
 
     // Raise the SECOND block's first entry seqno from 1 to 3: block 0 now ends
     // kkk@2 and block 1 starts kkk@3 (equal key, seqno RAISED across the
-    // boundary — the invalid inversion).
+    // boundary: the invalid inversion).
     let block1_off = {
         let table = open(source.clone(), &fs)?;
         let offsets: alloc::vec::Vec<u64> = table
@@ -1435,11 +1435,13 @@ fn verify_point_read_reachability_rejects_a_cross_block_seqno_inversion() -> cra
             .filter_map(Result::ok)
             .map(|kh| *kh.as_ref().offset())
             .collect();
-        assert!(
-            offsets.len() >= 2,
-            "the key's versions must span two blocks, got {offsets:?}",
-        );
-        usize::try_from(offsets[1]).expect("offset fits usize")
+        let Some(&second) = offsets.get(1) else {
+            panic!("the key's versions must span two blocks, got {offsets:?}");
+        };
+        let Ok(off) = usize::try_from(second) else {
+            panic!("the block offset fits usize");
+        };
+        off
     };
     crate::test_forge::forge_raise_data_block_first_seqno(&source, block1_off, 3)?;
 

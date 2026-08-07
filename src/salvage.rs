@@ -373,7 +373,7 @@ pub(crate) fn salvage_with_context(
         // re-emitted entries (key range, seqnos, counts) and re-stamps
         // `created_at` fresh, mirroring only the layout (re-encoded, never
         // byte-copied when diverged). So the losing mirror's non-derivable
-        // metadata — a backdated `created_at`, a forged count — never reaches the
+        // metadata (a backdated `created_at`, a forged count) never reaches the
         // copy; the tie-break chooses only which layout drives the re-encode, and
         // both layouts produce a self-consistent copy.
         (Err(_), Ok(_)) => true,

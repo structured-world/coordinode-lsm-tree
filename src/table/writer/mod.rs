@@ -2204,7 +2204,7 @@ impl Writer {
             use_columnar: self.use_columnar,
             range_tombstone_count,
             // Record the count that corresponds to the delete_bitmap section
-            // ACTUALLY written below — the exact `!is_empty() && writes_bitmap()`
+            // ACTUALLY written below: the exact `!is_empty() && writes_bitmap()`
             // condition. A strategy that keeps no bitmap (or a compaction that
             // applied its deletes, leaving the bitmap empty) writes no section
             // and records 0, so the reader's "count > 0 requires a section"

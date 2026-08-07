@@ -2914,8 +2914,8 @@ impl Table {
             for entry in entries {
                 // Enforce the global sort order on EVERY entry (before the
                 // per-key dedup below), tracking the previous entry across block
-                // boundaries: the user key must strictly increase, or — for the
-                // same user key — the seqno must strictly decrease.
+                // boundaries: the user key must strictly increase, or (for the
+                // same user key) the seqno must strictly decrease.
                 if let Some((pk, ps)) = &prev_internal {
                     let out_of_order = match self.comparator.compare(&entry.key.user_key, pk) {
                         core::cmp::Ordering::Greater => false,
@@ -3423,9 +3423,9 @@ impl Table {
 
         // The recorded positional-delete count must match the readable
         // delete_bitmap section. The section is OPTIONAL (omitted when empty),
-        // so a re-stamped TOC that RENAMES it away — or REPLACES it with another
+        // so a re-stamped TOC that RENAMES it away (or REPLACES it with another
         // valid optional section, e.g. a full filter over every key that passes
-        // every filter probe — leaves the parsed table reporting no deletion
+        // every filter probe) leaves the parsed table reporting no deletion
         // while every remaining check passes, resurrecting every
         // positionally-deleted row. The count lives in the meta block (already
         // cross-checked field-for-field against the recovery-time copy above and
