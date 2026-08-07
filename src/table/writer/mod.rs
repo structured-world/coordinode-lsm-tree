@@ -2203,6 +2203,19 @@ impl Writer {
             initial_level: self.initial_level,
             use_columnar: self.use_columnar,
             range_tombstone_count,
+            // Record the count that corresponds to the delete_bitmap section
+            // ACTUALLY written below — the exact `!is_empty() && writes_bitmap()`
+            // condition. A strategy that keeps no bitmap (or a compaction that
+            // applied its deletes, leaving the bitmap empty) writes no section
+            // and records 0, so the reader's "count > 0 requires a section"
+            // cross-check never fires on a legitimate table.
+            delete_bitmap_len: if !self.delete_bitmap.is_empty()
+                && self.delete_strategy.writes_bitmap()
+            {
+                self.delete_bitmap.len()
+            } else {
+                0
+            },
             created_at_nanos,
         };
 
@@ -2422,6 +2435,13 @@ struct MetaSectionParams<'a> {
     initial_level: u8,
     use_columnar: bool,
     range_tombstone_count: u64,
+    /// Number of positions in this table's delete bitmap. Recorded so a reader
+    /// can AUTHENTICATE the bitmap's presence: the section itself is optional
+    /// (omitted when empty), so without this count a re-stamped TOC could hide a
+    /// non-empty `delete_bitmap` (rename it away, or replace it with another
+    /// valid optional section) and resurrect every positionally-deleted row. A
+    /// `> 0` count with no readable delete-bitmap section is then a forgery.
+    delete_bitmap_len: u64,
     /// `created_at` snapshot taken once in `finish()`. Both MID and
     /// TAIL writes consume this same value; generating it inside
     /// `write_meta_section` per call would stamp the two copies with
@@ -2561,6 +2581,14 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
         // homogeneous SST, so the read path learns the layout from the
         // descriptor instead of inspecting a block header.
         meta("descriptor#columnar", &[u8::from(p.use_columnar)]),
+        // Authenticated positional-delete count: the `delete_bitmap` section is
+        // optional (omitted when empty), so this count lets a reader detect a
+        // re-stamped TOC that hid a non-empty bitmap. A `> 0` count with no
+        // readable bitmap section is a forgery that would resurrect deleted rows.
+        meta(
+            "descriptor#delete_bitmap_len",
+            &p.delete_bitmap_len.to_le_bytes(),
+        ),
         // Per-SST transform descriptor: per-KV-footer presence + algorithm
         // as one byte (0 = no footer, else 1 + algo wire tag). Lets the
         // reader know the whole table's footer state without inspecting any

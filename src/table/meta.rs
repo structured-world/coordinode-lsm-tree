@@ -64,6 +64,15 @@ pub struct ParsedMeta {
     /// re-roled), so salvaging would resurrect the rows it masked.
     pub range_tombstone_count: u64,
 
+    /// Number of positions in this table's `delete_bitmap` section, or `None`
+    /// for tables written before this field existed. The section is optional
+    /// (omitted when empty), so this authenticated count lets a reader detect a
+    /// re-stamped TOC that hid a non-empty bitmap (renamed it, or replaced it
+    /// with another valid optional section): a `Some(n)` with `n > 0` and no
+    /// readable delete-bitmap section is a forgery that would resurrect every
+    /// positionally-deleted row.
+    pub delete_bitmap_len: Option<u64>,
+
     pub weak_tombstone_count: u64,
     pub weak_tombstone_reclaimable: u64,
 
@@ -482,6 +491,7 @@ impl ParsedMeta {
         };
         let sum_user_key_bytes = read_opt_u64(b"key_bytes#sum")?;
         let sum_value_bytes = read_opt_u64(b"value_bytes#sum")?;
+        let delete_bitmap_len = read_opt_u64(b"descriptor#delete_bitmap_len")?;
 
         Ok(Self {
             id,
@@ -495,6 +505,7 @@ impl ParsedMeta {
             item_count,
             tombstone_count,
             range_tombstone_count,
+            delete_bitmap_len,
             weak_tombstone_count,
             weak_tombstone_reclaimable,
             sum_user_key_bytes,

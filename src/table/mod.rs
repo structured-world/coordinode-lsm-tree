@@ -3420,6 +3420,28 @@ impl Table {
                 "range_tombstones count disagrees with the recorded range_tombstone_count",
             ));
         }
+
+        // The recorded positional-delete count must match the readable
+        // delete_bitmap section. The section is OPTIONAL (omitted when empty),
+        // so a re-stamped TOC that RENAMES it away — or REPLACES it with another
+        // valid optional section, e.g. a full filter over every key that passes
+        // every filter probe — leaves the parsed table reporting no deletion
+        // while every remaining check passes, resurrecting every
+        // positionally-deleted row. The count lives in the meta block (already
+        // cross-checked field-for-field against the recovery-time copy above and
+        // against the mirror), so a `> 0` count with no matching bitmap is a
+        // forgery. `None` is an older table without the field: nothing to
+        // cross-check. Columnar-only: the bitmap is a columnar-layout section.
+        #[cfg(feature = "columnar")]
+        if let Some(recorded) = meta.delete_bitmap_len
+            && recorded > 0
+            && (!self.has_delete_bitmap_section() || self.delete_bitmap().len() != recorded)
+        {
+            return Err(crate::Error::InvalidHeader(
+                "delete_bitmap count disagrees with the recorded \
+                 descriptor#delete_bitmap_len (the section was hidden or replaced)",
+            ));
+        }
         // Range tombstones mask entries in OLDER tables during reads and
         // merges, so a key range narrowed below a tombstone's extent routes
         // reads around this table and resurrects the data it deletes. Reuse the
