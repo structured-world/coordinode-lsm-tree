@@ -2398,6 +2398,53 @@ fn salvage_refuses_a_toc_that_omits_a_delete_bitmap() -> crate::Result<()> {
     Ok(())
 }
 
+/// A delete-bearing SST whose `delete_bitmap` section is HIDDEN (renamed away or
+/// replaced by another valid optional section) must be rejected by the metadata
+/// cross-check: the authenticated `descriptor#delete_bitmap_len` still records
+/// the positions, so a `> 0` count with no readable bitmap section is a forgery
+/// that would resurrect every positionally-deleted row. Uses omission (a
+/// recognized-name rename or a valid filter replacement reaches the same state:
+/// the count disagrees with the absent section).
+#[cfg(feature = "columnar")]
+#[test]
+fn verify_metadata_bounds_rejects_a_hidden_delete_bitmap() -> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let n = 64u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    for pos in [5u32, 20, 40] {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    // Hide the delete_bitmap section while the authenticated meta count still
+    // records its 3 positions.
+    crate::test_forge::forge_section_omitted(&source, b"delete_bitmap")?;
+
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_metadata_bounds() else {
+        panic!("a hidden delete_bitmap with a recorded count > 0 must be rejected");
+    };
+    assert!(
+        matches!(err, crate::Error::InvalidHeader(msg) if msg.contains("delete_bitmap count disagrees")),
+        "the rejection must name the delete_bitmap count mismatch, got {err:?}",
+    );
+    Ok(())
+}
+
 /// A PRESENT `delete_bitmap` section that decodes to an EMPTY bitmap must fail
 /// salvage closed. The writer only emits the section when the bitmap is
 /// non-empty, so a checksum-consistent corruption to empty is a forge: it keeps
