@@ -728,6 +728,16 @@ fn heal_in_place_removes_the_marker_when_no_block_heals() -> crate::Result<()> {
         report.blocks_healed_in_place, 0,
         "a failed write-back heals no block: {report:?}",
     );
+    // Positive signal that the heal REACHED the trailer write-back — so the
+    // marker was written (its write precedes the trailer write) before the
+    // failure — rather than the marker never landing. Distinguishes
+    // "marker removed after being written" from "marker never written".
+    assert!(
+        report.uncorrectable_blocks >= 1
+            && format!("{report:?}").contains("in-place parity rebuild"),
+        "the failed trailer write-back must be recorded, proving the marker was \
+         written before it: {report:?}",
+    );
     assert!(
         !heal_attest_path(&sst_path).exists(),
         "the marker must be removed when no block healed, so it cannot authorize a \

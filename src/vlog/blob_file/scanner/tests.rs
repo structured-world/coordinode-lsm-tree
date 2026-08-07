@@ -9,8 +9,13 @@ use test_log::test;
 // lockstep with the writer instead of desyncing hard-coded literals.
 const OD_LEN_OFF: usize = 4 + 16 + 8 + 2 + 4;
 const HDR_CRC_OFF: usize = OD_LEN_OFF + 4;
+// `real_val_len` sits immediately before `on_disk_val_len`, so derive it from
+// the same chain instead of restating a literal that a header-layout change
+// could desync.
+const RV_LEN_OFF: usize = OD_LEN_OFF - core::mem::size_of::<u32>();
 const _: () = assert!(
-    HDR_CRC_OFF + 4 == crate::vlog::blob_file::writer::BLOB_HEADER_LEN,
+    HDR_CRC_OFF + 4 == crate::vlog::blob_file::writer::BLOB_HEADER_LEN
+        && RV_LEN_OFF + core::mem::size_of::<u32>() == OD_LEN_OFF,
     "the derived header field offsets must tile the blob header",
 );
 
@@ -336,11 +341,11 @@ fn blob_scanner_rejects_over_cap_real_val_len() -> crate::Result<()> {
         writer.finish()?;
     }
 
-    // 256 MiB + 1: over the cap, but the ON-DISK length stays `value.len()` so
-    // the frame still fits the tiny data section. Only `real_val_len` breaks the
-    // cap, so the reject cannot be attributed to a section overrun.
-    let over_cap: u32 = 256 * 1024 * 1024 + 1;
-    const RV_LEN_OFF: usize = 4 + 16 + 8 + 2;
+    // Over the cap by one, but the ON-DISK length stays `value.len()` so the
+    // frame still fits the tiny data section. Only `real_val_len` breaks the
+    // cap, so the reject cannot be attributed to a section overrun. Derived from
+    // the scanner's own cap so the two never desync.
+    let over_cap: u32 = u32::try_from(MAX_DECOMPRESSION_SIZE).unwrap() + 1;
     {
         let mut bytes = std::fs::read(&blob_file_path)?;
         bytes[RV_LEN_OFF..RV_LEN_OFF + 4].copy_from_slice(&over_cap.to_le_bytes());

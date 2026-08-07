@@ -799,8 +799,8 @@ fn salvage_refuses_an_overflowing_data_section() -> crate::Result<()> {
         panic!("an overflowing data section must fail salvage closed");
     };
     assert!(
-        matches!(err, crate::Error::FeatureUnsupported(_)),
-        "the refusal names the unsupported salvage, got {err:?}",
+        matches!(err, crate::Error::FeatureUnsupported(msg) if msg.contains("TOC may hide a deletion section")),
+        "the refusal must name the TOC-coverage gate, not any other refusal, got {err:?}",
     );
     assert!(
         !std::path::Path::new(&dest).exists(),
@@ -2288,10 +2288,12 @@ fn salvage_refuses_a_toc_that_omits_a_delete_bitmap() -> crate::Result<()> {
     // re-stamping the trailer so the archive stays internally consistent.
     crate::test_forge::forge_section_omitted(&source, b"delete_bitmap")?;
 
-    let result = salvage_sst(&source, dest.clone(), &fs);
+    let Err(err) = salvage_sst(&source, dest.clone(), &fs) else {
+        panic!("a TOC that hides a deletion section must be refused, not resurrected");
+    };
     assert!(
-        result.is_err(),
-        "a TOC that hides a deletion section must be refused, not resurrected: {result:?}",
+        matches!(err, crate::Error::FeatureUnsupported(msg) if msg.contains("TOC may hide a deletion section")),
+        "the refusal must name the hidden-deletion gate, not any other refusal, got {err:?}",
     );
     assert!(
         !std::path::Path::new(&dest).exists(),
