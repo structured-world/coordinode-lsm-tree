@@ -341,6 +341,83 @@ fn salvage_refuses_a_range_tombstone_hidden_as_a_recognized_section() -> crate::
     Ok(())
 }
 
+/// Even with an INTACT index, an indexed handle after a broken physical chain
+/// must be dropped, not trusted. Once a block's header is unframeable the
+/// contiguous chain breaks; a later indexed offset then has no authenticated
+/// boundary, and a forged TLI could point it at a checksum-valid frame nested
+/// in a corrupt block's value bytes. The walk must surrender every block after
+/// the first break — indexed or not — and recover only the anchored prefix.
+#[test]
+fn salvage_drops_indexed_blocks_after_a_broken_chain() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_data_block_size(128)
+        .use_partitioned_index();
+    for i in 0u64..256 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Smash the header of a middle data block, leaving the INDEX intact. Every
+    // indexed handle still enumerates, so the blocks after the smash are reached
+    // through their own (untrusted) index entries — the case the broken-index
+    // tests do not exercise.
+    let smash_offset = {
+        let table = open(source.clone(), &fs)?;
+        let offsets: Vec<u64> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|h| *h.as_ref().offset())
+            .collect();
+        let Some(&off) = offsets.get(offsets.len() / 2) else {
+            panic!("need several data blocks, got {}", offsets.len());
+        };
+        off
+    };
+    {
+        let mut bytes = std::fs::read(&source)?;
+        let Ok(at) = usize::try_from(smash_offset) else {
+            panic!("data block offset {smash_offset} fits usize");
+        };
+        let Some(b) = bytes.get_mut(at) else {
+            panic!("the block header at {at} lies within the file");
+        };
+        *b ^= 0xFF;
+        std::fs::write(&source, &bytes)?;
+    }
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+
+    // The anchored prefix before the smash recovers.
+    assert!(
+        reopen_get(dest.clone(), &fs, b"key-000")?.is_some(),
+        "the contiguous prefix before the broken chain must recover: {report:?}",
+    );
+    // A key in a block AFTER the smash is reachable only through its untrusted
+    // index entry, past a broken boundary — it must NOT be re-emitted.
+    assert!(
+        reopen_get(dest, &fs, b"key-250")?.is_none(),
+        "an indexed block after a broken chain must be dropped, not emitted: {report:?}",
+    );
+    assert!(
+        report.dropped.iter().any(|d| matches!(
+            &d.reason,
+            DropReason::HeaderCorrupted(msg) if msg.contains("broken")
+        )),
+        "the surrendered tail must be reported as a broken-chain drop: {report:?}",
+    );
+    Ok(())
+}
+
 /// When the broken-index physical walk hits an UNFRAMEABLE block header, the
 /// bytes after it are reachable only by byte-scan resync, so their block
 /// boundaries are unprovable: an uncompressed block can carry a complete
