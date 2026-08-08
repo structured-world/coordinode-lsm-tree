@@ -262,9 +262,9 @@ inspection, or rollback to a known-good point.
   opted in (`SalvageOptions::allow_delete_resurrection`, `sst-dump salvage
   --allow-delete-resurrection`).
 - **`salvage::salvage_blob_file(src, dest, &fs, id) -> BlobSalvageReport`**:
-  record-granular salvage of one blob (vlog) file. Corruption with an intact
-  frame header (a checksum mismatch, or a header-CRC / structural break) makes
-  the record stream re-sync at the next frame magic, but that magic (and every
+  record-granular salvage of one blob (vlog) file. When a frame fails checksum,
+  header-CRC, or structural validation, the record stream re-syncs at the next
+  frame magic, but that magic (and every
   frame chained after it) has an unproven boundary (it may be nested in the
   damaged frame's user bytes), so the walk **drops the entire tail past the
   first resync** (fail closed): the conservative loss is as much as everything
