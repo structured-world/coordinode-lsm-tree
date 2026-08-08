@@ -2632,6 +2632,20 @@ impl Table {
                     "zone_map block does not carry exactly one synthetic column",
                 ));
             };
+            // Authenticate the column's IDENTITY, not just its key bounds. The
+            // writer stamps a fixed whole-block column: `column_id == 0` and
+            // zero type / codec / null fields. A re-stamped map that keeps the
+            // checked min / max / row_count but changes the id to a consumer
+            // value-column id would let `ColumnRangePredicate::can_skip_block`
+            // read those key bounds as value-column statistics and skip blocks
+            // holding matching rows. Reject any deviation from the synthetic
+            // column the writer actually emits.
+            if col.column_id != 0 || col.type_tag != 0 || col.codec_id != 0 || col.null_count != 0 {
+                return Err(crate::Error::InvalidHeader(
+                    "zone_map synthetic column identity disagrees with the \
+                     writer's whole-block column (id / type / codec / null)",
+                ));
+            }
             // Derive (min_key, max_key, row_count) from the decoded block.
             let (min_key, max_key, rows) = {
                 #[cfg(feature = "columnar")]
