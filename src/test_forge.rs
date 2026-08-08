@@ -1879,8 +1879,8 @@ pub fn forge_zone_map_drop_last_entry(
     replace_section_frame(path, b"zone_map", &forged)
 }
 
-/// Re-stamps the zone_map so the FIRST data block's synthetic column carries a
-/// NON-ZERO `column_id` (a consumer value-column id) while its min / max / row
+/// Re-stamps the `zone_map` so the FIRST data block's synthetic column carries
+/// a NON-ZERO `column_id` (a consumer value-column id) while its min / max / row
 /// count stay intact. Models a checksum-restamped zone map that repurposes the
 /// whole-block key statistic as a value-column statistic: the key-bounds check
 /// still passes, but `ColumnRangePredicate::can_skip_block` would then read
