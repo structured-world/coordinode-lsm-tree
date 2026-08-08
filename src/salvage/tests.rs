@@ -341,13 +341,16 @@ fn salvage_refuses_a_range_tombstone_hidden_as_a_recognized_section() -> crate::
     Ok(())
 }
 
-/// When the broken-index physical walk hits an UNFRAMEABLE block header, it
-/// must RESYNCHRONIZE forward to the next parseable frame instead of abandoning
-/// the rest of the gap. Otherwise the intact, self-framed blocks after the
-/// smashed one are neither recovered nor individually reported — the salvage
-/// silently finishes with only the prefix.
+/// When the broken-index physical walk hits an UNFRAMEABLE block header, the
+/// bytes after it are reachable only by byte-scan resync, so their block
+/// boundaries are unprovable: an uncompressed block can carry a complete
+/// checksum-valid SST block inside a user value, and a resync would frame that
+/// NESTED forge and re-emit its interior entries as genuine data. The walk must
+/// fail closed like the blob resync path — drop the whole gap tail after the
+/// broken boundary rather than emit unanchored candidates. Only the contiguous,
+/// fully-framed prefix (anchored to the trusted section start) is recovered.
 #[test]
-fn salvage_resyncs_past_an_unframeable_block_in_the_physical_walk() -> crate::Result<()> {
+fn salvage_drops_the_gap_tail_after_an_unframeable_block() -> crate::Result<()> {
     let dir = tempdir()?;
     let source = dir.path().join("source");
     let dest = dir.path().join("salvaged");
@@ -367,9 +370,8 @@ fn salvage_resyncs_past_an_unframeable_block_in_the_physical_walk() -> crate::Re
     assert!(writer.finish()?.is_some(), "source SST is non-empty");
 
     // Smash the header of a block in the FIRST THIRD of the data section (its
-    // first byte, so `probe_block_handle_at` cannot frame it). A LATE key lives
-    // in a block AFTER it, so the physical walk must resync past the smash to
-    // recover that block.
+    // first byte, so `probe_block_handle_at` cannot frame it). The blocks after
+    // it are reachable only by resync, so they must be dropped, not emitted.
     let smash_offset = {
         let table = open(source.clone(), &fs)?;
         let offsets: Vec<u64> = table
@@ -420,12 +422,24 @@ fn salvage_resyncs_past_an_unframeable_block_in_the_physical_walk() -> crate::Re
 
     let report = salvage_sst(&source, dest.clone(), &fs)?;
 
-    // A late key (in a block after the smashed one) must still be recovered:
-    // the walk drops the unframeable block, resyncs forward, and frames the
-    // rest of the section.
+    // The anchored prefix (contiguous from the trusted section start) recovers.
     assert!(
-        reopen_get(dest, &fs, b"key-250")?.is_some(),
-        "a block after the unframeable one must recover via resync: {report:?}",
+        reopen_get(dest.clone(), &fs, b"key-000")?.is_some(),
+        "the contiguous prefix before the broken boundary must recover: {report:?}",
+    );
+    // A late key past the smashed block is reachable only by resync, so it must
+    // NOT be re-emitted — its boundary cannot be proven original.
+    assert!(
+        reopen_get(dest, &fs, b"key-250")?.is_none(),
+        "a block reached only by resync must be dropped, not emitted: {report:?}",
+    );
+    // The dropped tail is reported once with the unanchored reason.
+    assert!(
+        report.dropped.iter().any(|d| matches!(
+            &d.reason,
+            DropReason::HeaderCorrupted(msg) if msg.contains("unanchored")
+        )),
+        "the resync tail must be reported as an unanchored drop: {report:?}",
     );
     Ok(())
 }
