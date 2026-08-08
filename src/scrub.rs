@@ -525,17 +525,29 @@ fn refresh_healed_checksum(
         );
     }
 
-    // Any refusal from here on removes the heal sidecar: an attestation (or
-    // in-progress marker) whose reconciliation is refused must not survive to
-    // authorize an UNRELATED later mismatch. Its `pre == manifest` binding does
-    // not expire on its own, and a refused file needs a compaction / repair
-    // rewrite (which refreshes the digest itself), not a lingering marker. The
-    // transient install failure at the very end is the sole exception — the
-    // attestation is kept there for the next retry.
-    let refuse = |reason: String| -> Option<ScrubError> {
-        heal_attest::remove(&*table.fs, &table.path);
+    // A refusal drops the heal sidecar only when it PROVES the file is bad: an
+    // attestation refused for proven corruption must not survive to authorize an
+    // UNRELATED later mismatch (its `pre == manifest` binding does not expire on
+    // its own, and a corrupt file needs a compaction / repair rewrite, not a
+    // lingering marker). An INCONCLUSIVE refusal — a transient I/O read, or a
+    // walk that could only warn (unverifiable, not corrupt, bytes) — instead
+    // KEEPS the marker: the block was genuinely healed and the marker is its
+    // only durable attribution, so deleting it on a retryable error would strand
+    // the healed SST under the stale digest and every later clean patrol would
+    // reject the reconcile forever. The completed marker binds `post ==
+    // current`, so a kept marker can only ever re-authorize the SAME healed
+    // bytes on retry, never a new mismatch. The transient install failure at the
+    // very end keeps the marker for the same reason.
+    let refuse = |reason: String, remove_marker: bool| -> Option<ScrubError> {
+        if remove_marker {
+            heal_attest::remove(&*table.fs, &table.path);
+        }
         finding(reason)
     };
+    // A cross-check that fails with an I/O error is inconclusive (the read may
+    // succeed on retry), so it keeps the marker; every other error kind
+    // (structural / checksum / decode) proves corruption and removes it.
+    let definitive = |e: &crate::Error| !matches!(e, crate::Error::Io(_));
 
     // AUTHORITATIVE content has no cross-check, so an UNATTRIBUTED mismatch
     // (the pre-heal digest did NOT probe equal to the manifest, so the file's
@@ -564,6 +576,10 @@ fn refresh_healed_checksum(
         // Name deletion metadata specifically — a reconcile that laundered a
         // re-stamped range_tombstones / delete_bitmap would resurrect the rows
         // it masked, the scariest of the three surfaces.
+        // This branch means the mismatch is NOT attributable to a heal, so no
+        // marker of this pass attests the current bytes: any marker present is a
+        // stale one that does not attest, and clearing it is the correct
+        // hygiene (remove_marker = true throughout).
         match table.has_deletion_metadata() {
             Ok(true) => {
                 return refuse(
@@ -572,10 +588,11 @@ fn refresh_healed_checksum(
                      bitmap), which no cross-check can authenticate; the manifest \
                      digest was not refreshed"
                         .into(),
+                    true,
                 );
             }
             Ok(false) => {}
-            Err(e) => return refuse(e.to_string()),
+            Err(e) => return refuse(e.to_string(), true),
         }
         return refuse(
             "digest mismatch not attributable to this pass's heal; the file's \
@@ -584,6 +601,7 @@ fn refresh_healed_checksum(
              cross-check to authenticate it and the recovery-time copy may \
              itself be a pre-open restamp; the manifest digest was not refreshed"
                 .into(),
+            true,
         );
     }
 
@@ -606,10 +624,20 @@ fn refresh_healed_checksum(
         Some(table.id()),
     );
     if !walk.errors.is_empty() || !walk.warnings.is_empty() {
+        // A walk error is definitive only when it proves corruption. A transient
+        // read failure (`SstFileUnreadable` / `DataReadError`) may succeed on
+        // retry, and the warnings on their own (skipped, unverifiable-but-not-
+        // corrupt bytes) are inconclusive — both keep the marker so a genuine
+        // heal is not stranded by a flaky read or an unverifiable parity walk.
+        let walk_definitive = walk.errors.iter().any(|e| {
+            use crate::verify::BlockVerifyError as E;
+            !matches!(e, E::SstFileUnreadable { .. } | E::DataReadError { .. })
+        });
         return refuse(
             "digest mismatch with corruption outside the scanned data blocks; \
              the manifest digest was not refreshed"
                 .into(),
+            walk_definitive,
         );
     }
 
@@ -619,10 +647,13 @@ fn refresh_healed_checksum(
     // verification too before the digest is trusted (a table without
     // footers makes this a no-op).
     if let Err(e) = table.verify_kv_checksums() {
-        return refuse(alloc::format!(
-            "digest mismatch with a per-KV verification failure ({e}); the \
+        return refuse(
+            alloc::format!(
+                "digest mismatch with a per-KV verification failure ({e}); the \
              manifest digest was not refreshed"
-        ));
+            ),
+            definitive(&e),
+        );
     }
 
     // The `linked_blob_files` section carries no per-section checksum and
@@ -630,10 +661,13 @@ fn refresh_healed_checksum(
     // Cross-check the recorded ids against the table's own indirection
     // entries (a no-op without the section) before trusting the digest.
     if let Err(e) = table.verify_blob_links() {
-        return refuse(alloc::format!(
-            "digest mismatch with a blob-link cross-check failure ({e}); \
+        return refuse(
+            alloc::format!(
+                "digest mismatch with a blob-link cross-check failure ({e}); \
              the manifest digest was not refreshed"
-        ));
+            ),
+            definitive(&e),
+        );
     }
 
     // Each TLI mirror verified independently clean above, but a forged tail
@@ -641,10 +675,13 @@ fn refresh_healed_checksum(
     // byte-level check — and the next recovery prefers the tail, silently
     // hiding blocks. Compare the decoded mirrors before trusting the digest.
     if let Err(e) = table.verify_tli_mirrors() {
-        return refuse(alloc::format!(
-            "digest mismatch with a TLI mirror comparison failure ({e}); \
+        return refuse(
+            alloc::format!(
+                "digest mismatch with a TLI mirror comparison failure ({e}); \
              the manifest digest was not refreshed"
-        ));
+            ),
+            definitive(&e),
+        );
     }
 
     // The seqno_bounds block is checksum-clean to the walk even when its
@@ -653,10 +690,13 @@ fn refresh_healed_checksum(
     // range against the blocks' decoded entries (a no-op without the
     // section) before trusting the digest.
     if let Err(e) = table.verify_seqno_bounds() {
-        return refuse(alloc::format!(
-            "digest mismatch with a seqno-bounds cross-check failure ({e}); \
+        return refuse(
+            alloc::format!(
+                "digest mismatch with a seqno-bounds cross-check failure ({e}); \
              the manifest digest was not refreshed"
-        ));
+            ),
+            definitive(&e),
+        );
     }
 
     // The walk verifies only the outer frame, so a checksum-clean block whose
@@ -664,10 +704,13 @@ fn refresh_healed_checksum(
     // every block and confirm the counts match before trusting the digest,
     // or restamping would legitimize a silently-truncated tail.
     if let Err(e) = table.verify_block_entry_counts() {
-        return refuse(alloc::format!(
-            "digest mismatch with a block entry-count mismatch ({e}); \
+        return refuse(
+            alloc::format!(
+                "digest mismatch with a block entry-count mismatch ({e}); \
              the manifest digest was not refreshed"
-        ));
+            ),
+            definitive(&e),
+        );
     }
 
     // The zone_map block is checksum-clean to the walk even when its payload
@@ -676,10 +719,13 @@ fn refresh_healed_checksum(
     // against the blocks' decoded key ranges (a no-op without the section)
     // before trusting the digest.
     if let Err(e) = table.verify_zone_map() {
-        return refuse(alloc::format!(
-            "digest mismatch with a zone-map cross-check failure ({e}); \
+        return refuse(
+            alloc::format!(
+                "digest mismatch with a zone-map cross-check failure ({e}); \
              the manifest digest was not refreshed"
-        ));
+            ),
+            definitive(&e),
+        );
     }
 
     // The locator block is checksum-clean to the walk even when re-stamped to
@@ -688,10 +734,13 @@ fn refresh_healed_checksum(
     // its decoded newest-version block (a no-op without the section) before
     // trusting the digest.
     if let Err(e) = table.verify_locator() {
-        return refuse(alloc::format!(
-            "digest mismatch with a locator cross-check failure ({e}); \
+        return refuse(
+            alloc::format!(
+                "digest mismatch with a locator cross-check failure ({e}); \
              the manifest digest was not refreshed"
-        ));
+            ),
+            definitive(&e),
+        );
     }
 
     // The filter block is checksum-clean to the walk even when its payload
@@ -700,10 +749,13 @@ fn refresh_healed_checksum(
     // disappears from every read. Probe every decoded key against the
     // on-disk filter (a no-op without one) before trusting the digest.
     if let Err(e) = table.verify_filter(tree.prefix_extractor().as_ref()) {
-        return refuse(alloc::format!(
-            "digest mismatch with a filter cross-check failure ({e}); \
+        return refuse(
+            alloc::format!(
+                "digest mismatch with a filter cross-check failure ({e}); \
              the manifest digest was not refreshed"
-        ));
+            ),
+            definitive(&e),
+        );
     }
 
     // The block_layout block is checksum-clean to the walk even when a
@@ -713,10 +765,13 @@ fn refresh_healed_checksum(
     // boundary against the frames' actual inner blocks (a no-op without the
     // section) before trusting the digest.
     if let Err(e) = table.verify_block_layout() {
-        return refuse(alloc::format!(
-            "digest mismatch with a block-layout cross-check failure ({e}); \
+        return refuse(
+            alloc::format!(
+                "digest mismatch with a block-layout cross-check failure ({e}); \
              the manifest digest was not refreshed"
-        ));
+            ),
+            definitive(&e),
+        );
     }
 
     // A data block's embedded hash / binary index is checksum-clean to the
@@ -724,10 +779,13 @@ fn refresh_healed_checksum(
     // trusts it and returns None for the affected keys. Probe every decoded
     // key through the full point-read path before trusting the digest.
     if let Err(e) = table.verify_point_read_reachability() {
-        return refuse(alloc::format!(
-            "digest mismatch with a point-read reachability failure ({e}); \
+        return refuse(
+            alloc::format!(
+                "digest mismatch with a point-read reachability failure ({e}); \
              the manifest digest was not refreshed"
-        ));
+            ),
+            definitive(&e),
+        );
     }
 
     // Both meta mirrors re-stamped CONSISTENTLY pass the mirror comparison,
@@ -736,10 +794,13 @@ fn refresh_healed_checksum(
     // tombstones that mask older tables. Cross-check the recorded bounds
     // against the decoded contents before trusting the digest.
     if let Err(e) = table.verify_metadata_bounds() {
-        return refuse(alloc::format!(
-            "digest mismatch with a metadata-bounds cross-check failure ({e}); \
+        return refuse(
+            alloc::format!(
+                "digest mismatch with a metadata-bounds cross-check failure ({e}); \
              the manifest digest was not refreshed"
-        ));
+            ),
+            definitive(&e),
+        );
     }
 
     match tree.refresh_table_checksum(table.id(), fresh) {
