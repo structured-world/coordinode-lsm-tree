@@ -445,12 +445,15 @@ fn salvage_drops_the_gap_tail_after_an_unframeable_block() -> crate::Result<()> 
 }
 
 /// A header-checksum-valid FAKE header can declare an oversized `data_length`
-/// that spans the real blocks after it. A physical walk that advanced by the
-/// framed size BEFORE loading would jump past those blocks and silently drop
-/// them. The walk must instead LOAD each candidate and, on a load failure,
-/// resynchronize one byte forward — recovering the swallowed blocks.
+/// that spans the real blocks after it. The walk LOADS each candidate so it
+/// never advances by the unvalidated framed size, but the load failure it hits
+/// at the fake header breaks the contiguous chain: the swallowed span is then
+/// reachable only by byte-scan resync, whose boundaries are unprovable (a
+/// nested checksum-valid frame in a user value is indistinguishable from a real
+/// block). The walk must fail closed — drop the tail past the fake header
+/// rather than resync into it. The anchored prefix before the forge recovers.
 #[test]
-fn salvage_resyncs_past_a_fake_oversized_block_header_in_the_physical_walk() -> crate::Result<()> {
+fn salvage_drops_the_tail_past_a_fake_oversized_block_header() -> crate::Result<()> {
     let dir = tempdir()?;
     let source = dir.path().join("source");
     let dest = dir.path().join("salvaged");
@@ -515,20 +518,30 @@ fn salvage_resyncs_past_a_fake_oversized_block_header_in_the_physical_walk() -> 
 
     let report = salvage_sst(&source, dest.clone(), &fs)?;
 
-    // A mid-table key inside the swallowed span must still recover: the walk
-    // loads the fake candidate, rejects it, and resyncs one byte at a time to
-    // the real blocks it claimed to cover.
+    // The anchored prefix before the forge (a quarter of the way in) recovers.
     assert!(
-        reopen_get(dest, &fs, b"key-128")?.is_some(),
-        "a block swallowed by the fake header must recover via resync: {report:?}",
+        reopen_get(dest.clone(), &fs, b"key-010")?.is_some(),
+        "the contiguous prefix before the fake header must recover: {report:?}",
     );
-    // Only the fake header's own block is lost; every other block resyncs, so
-    // the count stays near the full 256 (a walk that trusted the framed size
-    // would drop roughly the middle half).
+    // A key inside the swallowed span is reachable only by resync past the fake
+    // header, so it must NOT be re-emitted.
     assert!(
-        report.entries_salvaged >= 240,
-        "resync recovers all but the fake block, got {} of 256: {report:?}",
+        reopen_get(dest, &fs, b"key-128")?.is_none(),
+        "a block reached only by resync past the fake header must drop: {report:?}",
+    );
+    // Only the anchored prefix survives, so the count reflects the first
+    // quarter, not the near-full 256 an unbounded resync would emit.
+    assert!(
+        report.entries_salvaged < 200,
+        "the resync tail must not be recovered, got {} of 256: {report:?}",
         report.entries_salvaged,
+    );
+    assert!(
+        report.dropped.iter().any(|d| matches!(
+            &d.reason,
+            DropReason::HeaderCorrupted(msg) if msg.contains("unanchored")
+        )),
+        "the swallowed tail must be reported as an unanchored drop: {report:?}",
     );
     Ok(())
 }
@@ -705,12 +718,13 @@ fn salvage_ignores_an_index_handle_beyond_the_data_section() -> crate::Result<()
 /// A cleanly enumerated index handle whose block header does NOT frame and
 /// whose stored span is oversized (a spanning forge with a smashed header)
 /// must not advance the physical cursor by that UNVERIFIED size: trusting it
-/// covers the whole remaining data section, so the gap walk never discovers
-/// the later intact blocks and every one but the unframeable block is lost.
-/// The tiler must leave the cursor where it is and let the physical resync
-/// frame the blocks after the smashed one.
+/// covers the whole remaining data section, hiding later blocks from the gap
+/// walk. The tiler leaves the cursor where it is and lets the physical walk
+/// tile the gap, but the smashed header breaks the contiguous chain at the
+/// section start, so the tail is reachable only by unprovable byte-scan resync.
+/// The walk must fail closed and drop that tail rather than emit it.
 #[test]
-fn salvage_recovers_blocks_after_an_unframeable_oversized_handle() -> crate::Result<()> {
+fn salvage_drops_the_tail_after_an_unframeable_oversized_handle() -> crate::Result<()> {
     let dir = tempdir()?;
     let source = dir.path().join("source");
     let dest = dir.path().join("salvaged");
@@ -762,15 +776,23 @@ fn salvage_recovers_blocks_after_an_unframeable_oversized_handle() -> crate::Res
 
     let report = salvage_sst(&source, dest.clone(), &fs)?;
 
-    // A late key (in a block after the smashed spanning one) must survive: the
-    // walk drops the unframeable block, then resyncs and frames the rest.
-    assert!(
-        reopen_get(dest, &fs, b"key-060")?.is_some(),
-        "blocks after the unframeable oversized handle must recover via resync: {report:?}",
+    // The smashed header is the FIRST data block, so the contiguous chain never
+    // starts: the whole section is reachable only by unprovable resync and must
+    // drop. Nothing is recovered, so no salvaged table is written.
+    assert_eq!(
+        report.entries_salvaged, 0,
+        "nothing is anchored, so no entry is recovered: {report:?}",
     );
     assert!(
-        report.entries_salvaged > 1,
-        "more than the single unframeable block must be recovered: {report:?}",
+        !dest.exists(),
+        "an all-dropped section produces no salvaged table: {report:?}",
+    );
+    assert!(
+        report.dropped.iter().any(|d| matches!(
+            &d.reason,
+            DropReason::HeaderCorrupted(msg) if msg.contains("unanchored")
+        )),
+        "the dropped section must be reported as unanchored: {report:?}",
     );
     Ok(())
 }

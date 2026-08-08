@@ -1077,6 +1077,20 @@ fn salvage_blocks(
                          to: u64,
                          items: &mut Vec<(crate::table::BlockHandle, Option<UserKey>)>,
                          dropped: &mut Vec<DroppedBlock>| {
+            // `from` is a TRUSTED boundary: the data section start, or the end
+            // of a block whose frame this walk already validated. Blocks that
+            // tile CONTIGUOUSLY from it inherit that provenance — each
+            // framed-and-loaded block's validated size anchors the next offset.
+            // The moment an offset does NOT frame a loadable block, the chain
+            // breaks: every later offset in this gap is reachable only by byte
+            // scanning, which cannot prove a boundary. An uncompressed block can
+            // carry a complete checksum-valid SST block inside a user value, so
+            // a scan that resynced past a broken header could frame that NESTED
+            // forge and re-emit its interior entries as genuine data. Fail
+            // closed exactly as the blob resync path does: drop the whole
+            // remaining gap rather than emit unanchored candidates. A contiguous
+            // intact section behind a broken index still recovers every block;
+            // only bytes after a broken boundary are surrendered.
             let mut at = from;
             while at < to {
                 if let Ok(h) = frames_and_loads(at, to) {
@@ -1085,24 +1099,23 @@ fn salvage_blocks(
                     at = next;
                     continue;
                 }
-                // Either the header did not frame, or it framed with a
-                // checksum-valid but FAKE size whose payload does not load.
-                // Report the loss ONCE, then RESYNCHRONIZE forward one byte at a
-                // time to the next candidate that BOTH frames and loads — never
-                // advancing by an unvalidated span, so intact blocks the fake
-                // would have skipped are still recovered.
+                // The contiguous chain broke here (a header that did not frame,
+                // or one that framed with a checksum-valid but FAKE size whose
+                // payload does not load). Report the unanchored remainder as one
+                // dropped region and stop — no resync-and-emit, because a byte
+                // scan past this point cannot distinguish an original block
+                // start from a nested frame inside a corrupt block's user bytes.
                 dropped.push(DroppedBlock {
                     offset: at,
                     section: b"data".to_vec(),
                     reason: DropReason::HeaderCorrupted(
-                        "no framed, loadable block at this offset".to_owned(),
+                        "unanchored bytes after a broken block boundary; the tail \
+                         cannot be proven to be original block starts"
+                            .to_owned(),
                     ),
                     key_range: None,
                 });
-                at += 1;
-                while at < to && frames_and_loads(at, to).is_err() {
-                    at += 1;
-                }
+                break;
             }
         };
         let mut cursor = section_pos;
