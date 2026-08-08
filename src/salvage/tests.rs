@@ -2876,6 +2876,46 @@ fn verify_zone_map_rejects_a_present_empty_map_on_a_nonempty_table() -> crate::R
     Ok(())
 }
 
+/// `verify_zone_map` must authenticate the synthetic column's IDENTITY, not
+/// only its min / max / row count. The writer stamps every whole-block column
+/// with `column_id == 0` and zero type / codec / null fields; a re-stamped map
+/// can change that id to a consumer value-column id while leaving the key
+/// bounds untouched. The bounds check then passes, repair keeps the table, and
+/// `ColumnRangePredicate::can_skip_block` reads those key bounds as
+/// value-column statistics and can skip blocks holding matching rows.
+#[cfg(feature = "columnar")]
+#[test]
+fn verify_zone_map_rejects_a_forged_synthetic_column_id() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    for i in 0u32..64 {
+        writer.write(iv(i))?;
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+zonemap SST is non-empty"
+    );
+
+    // Repurpose the first block's whole-block key statistic as a value-column
+    // statistic by changing its id, leaving min / max / row count intact.
+    crate::test_forge::forge_zone_map_column_id(&source, 0)?;
+
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_zone_map() else {
+        panic!("a non-zero synthetic column id must be rejected");
+    };
+    assert!(
+        matches!(err, crate::Error::InvalidHeader(msg) if msg.contains("zone_map synthetic column")),
+        "the rejection must name the synthetic column identity, got {err:?}",
+    );
+    Ok(())
+}
+
 /// `verify_block_layout` must apply the present-empty rejection to ENCRYPTED
 /// tables too. The emptiness check used to sit AFTER the `self.encryption`
 /// early return, so an encrypted table's empty `block_layout` (a `delete_bitmap`

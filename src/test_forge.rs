@@ -1879,6 +1879,87 @@ pub fn forge_zone_map_drop_last_entry(
     replace_section_frame(path, b"zone_map", &forged)
 }
 
+/// Re-stamps the zone_map so the FIRST data block's synthetic column carries a
+/// NON-ZERO `column_id` (a consumer value-column id) while its min / max / row
+/// count stay intact. Models a checksum-restamped zone map that repurposes the
+/// whole-block key statistic as a value-column statistic: the key-bounds check
+/// still passes, but `ColumnRangePredicate::can_skip_block` would then read
+/// those key bounds as value-column stats and skip blocks holding matching
+/// rows. The SST must be uncompressed and unencrypted.
+pub fn forge_zone_map_column_id(
+    path: &std::path::Path,
+    table_id: crate::TableId,
+) -> crate::Result<()> {
+    use crate::table::block::{Block, BlockIdentity, BlockType};
+    use crate::table::{BlockHandle, BlockOffset};
+
+    let identity = BlockIdentity {
+        table_id,
+        block_type: BlockType::ZoneMap,
+        dict_id: 0,
+        window_log: 0,
+    };
+    let transform = crate::table::block::BlockTransform::from_parts(
+        crate::CompressionType::None,
+        None,
+        #[cfg(zstd_any)]
+        None,
+    )?;
+
+    let (pos, len) = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"zone_map") else {
+            panic!("the SST must carry a zone_map section");
+        };
+        (
+            usize::try_from(entry.pos()).expect("pos fits usize"),
+            usize::try_from(entry.len()).expect("len fits usize"),
+        )
+    };
+    let mut blocks: Vec<(BlockOffset, Vec<crate::table::zone_map::ColumnStats>)> = {
+        let file = crate::fs::Fs::open(
+            &crate::fs::StdFs,
+            path,
+            &crate::fs::FsOpenOptions::new().read(true),
+        )?;
+        let block = Block::from_file(
+            &*file,
+            BlockHandle::new(
+                BlockOffset(u64::try_from(pos).expect("pos fits u64")),
+                u32::try_from(len).expect("section fits u32"),
+            ),
+            identity,
+            &transform,
+        )?;
+        let map = crate::table::zone_map::ZoneMap::decode(&block.data)?;
+        map.entries()
+            .iter()
+            .map(|(off, cols)| (BlockOffset(*off), cols.clone()))
+            .collect()
+    };
+    let Some((_off, cols)) = blocks.first_mut() else {
+        panic!("the zone_map carries at least one block entry");
+    };
+    let Some(col) = cols.first_mut() else {
+        panic!("the block entry carries its synthetic column");
+    };
+    assert_eq!(
+        col.column_id, 0,
+        "the writer stamps a zero synthetic column id",
+    );
+    col.column_id = 7;
+
+    let mut payload = Vec::new();
+    crate::table::zone_map::encode_zone_map(&mut payload, &blocks)?;
+    let mut forged = Vec::new();
+    Block::write_into(&mut forged, &payload, identity, &transform)?;
+    replace_section_frame(path, b"zone_map", &forged)
+}
+
 /// Shared preamble of the TLI forges: the Index identity, the uncompressed
 /// (optionally ECC) transform, and the DECODED `tli_tail` mirror. Every TLI
 /// forge must agree on these — a drift between copies would silently write
