@@ -2496,6 +2496,60 @@ fn salvage_refuses_a_present_but_empty_delete_bitmap() -> crate::Result<()> {
     Ok(())
 }
 
+/// A `delete_bitmap` section that is PRESENT and non-empty while the
+/// authenticated `descriptor#delete_bitmap_len` records ZERO must be rejected.
+/// The writer stamps the count as `0` precisely when no bitmap section is
+/// written, so a `0` count paired with a live section is a forge: a
+/// checksum-restamped TOC that grafts another table's bitmap (or relabels an
+/// optional section to `delete_bitmap`) onto a no-delete table makes reads
+/// apply that mask and silently drop live rows. The guard must compare the
+/// count and the section state in BOTH directions, not only reject `count > 0`
+/// with no section.
+#[cfg(feature = "columnar")]
+#[test]
+fn verify_metadata_bounds_rejects_a_zero_count_with_a_live_bitmap() -> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let n = 64u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    for pos in [5u32, 20, 40] {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    // Zero the authenticated count in both mirrors while the section keeps its
+    // three live positions: the state a TOC forge reaches by grafting a bitmap
+    // onto a genuinely no-delete table (recorded count 0).
+    crate::test_forge::forge_meta_value_both_mirrors(
+        &source,
+        b"descriptor#delete_bitmap_len",
+        &0u64.to_le_bytes(),
+    )?;
+
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_metadata_bounds() else {
+        panic!("a recorded count of 0 with a present non-empty bitmap must be rejected");
+    };
+    assert!(
+        matches!(err, crate::Error::InvalidHeader(msg) if msg.contains("delete_bitmap count disagrees")),
+        "the rejection must name the delete_bitmap count mismatch, got {err:?}",
+    );
+    Ok(())
+}
+
 /// A forged TLI that REORDERS columnar block handles must fail salvage closed.
 /// `delete_block_starts` is built by walking the index, so a reorder rebuilds
 /// the starts in that same reordered sequence and `delete_positions_verified`
