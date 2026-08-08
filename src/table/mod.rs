@@ -3422,25 +3422,38 @@ impl Table {
         }
 
         // The recorded positional-delete count must match the readable
-        // delete_bitmap section. The section is OPTIONAL (omitted when empty),
-        // so a re-stamped TOC that RENAMES it away (or REPLACES it with another
-        // valid optional section, e.g. a full filter over every key that passes
-        // every filter probe) leaves the parsed table reporting no deletion
-        // while every remaining check passes, resurrecting every
-        // positionally-deleted row. The count lives in the meta block (already
-        // cross-checked field-for-field against the recovery-time copy above and
-        // against the mirror), so a `> 0` count with no matching bitmap is a
-        // forgery. `None` is an older table without the field: nothing to
-        // cross-check. Columnar-only: the bitmap is a columnar-layout section.
+        // delete_bitmap section EXACTLY, in both directions. The section is
+        // OPTIONAL (the writer omits it, and records the count as 0, precisely
+        // when the bitmap is empty), so its effective length is its decoded
+        // length when present and 0 when absent. A re-stamped TOC can break the
+        // agreement either way:
+        //   - a `> 0` count with the section RENAMED away (or REPLACED by
+        //     another valid optional section, e.g. a full filter that passes
+        //     every probe) leaves the table reporting no deletion, resurrecting
+        //     every positionally-deleted row;
+        //   - a `0` count with a live non-empty section GRAFTED on (the
+        //     no-delete count is genuine, but a bitmap from another table is
+        //     spliced in) makes reads apply that mask and drop live rows.
+        // Comparing effective length to the recorded count catches both, like
+        // the range-tombstone count check above. The count lives in the meta
+        // block (already cross-checked field-for-field against the recovery-time
+        // copy above and against the mirror), so it is the trustworthy side.
+        // `None` is an older table without the field: nothing to cross-check.
+        // Columnar-only: the bitmap is a columnar-layout section.
         #[cfg(feature = "columnar")]
-        if let Some(recorded) = meta.delete_bitmap_len
-            && recorded > 0
-            && (!self.has_delete_bitmap_section() || self.delete_bitmap().len() != recorded)
-        {
-            return Err(crate::Error::InvalidHeader(
-                "delete_bitmap count disagrees with the recorded \
-                 descriptor#delete_bitmap_len (the section was hidden or replaced)",
-            ));
+        if let Some(recorded) = meta.delete_bitmap_len {
+            let effective = if self.has_delete_bitmap_section() {
+                self.delete_bitmap().len()
+            } else {
+                0
+            };
+            if effective != recorded {
+                return Err(crate::Error::InvalidHeader(
+                    "delete_bitmap count disagrees with the recorded \
+                     descriptor#delete_bitmap_len (the section was hidden, \
+                     replaced, or grafted on)",
+                ));
+            }
         }
         // Range tombstones mask entries in OLDER tables during reads and
         // merges, so a key range narrowed below a tombstone's extent routes
