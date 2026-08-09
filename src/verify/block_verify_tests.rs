@@ -804,7 +804,7 @@ fn verify_sst_file_missing_file_reports_unreadable() {
 )]
 fn walk_block_region_reports_data_read_error_on_truncated_data_segment() {
     use crate::coding::Encode;
-    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::{BlockType, Header};
 
     // Trailer layout (38 bytes at the tail of an SFA archive):
@@ -865,9 +865,11 @@ fn walk_block_region_reports_data_read_error_on_truncated_data_segment() {
     archive_bytes[csum_field_offset..csum_field_offset + 16]
         .copy_from_slice(&new_toc_checksum.to_le_bytes());
 
-    // Materialize the forged archive in MemFs and run the scanner.
-    let fs = MemFs::new();
-    let path = std::path::Path::new("/forged.sst");
+    // Materialize the forged archive on a real temp file and run the scanner.
+    let dir = tempfile::tempdir().unwrap();
+    let fs = StdFs;
+    let forged = dir.path().join("forged.sst");
+    let path = forged.as_path();
     {
         let mut f = fs
             .open(
@@ -934,7 +936,7 @@ fn walk_block_region_reports_data_read_error_on_truncated_data_segment() {
 )]
 fn walk_block_region_reports_data_read_error_on_truncated_parity_trailer() {
     use crate::coding::Encode;
-    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::{BlockType, EccParams, Header, expected_parity_len};
 
     // Trailer layout (38 bytes at the tail of an SFA archive):
@@ -985,8 +987,10 @@ fn walk_block_region_reports_data_read_error_on_truncated_parity_trailer() {
     archive_bytes[csum_field_offset..csum_field_offset + 16]
         .copy_from_slice(&new_toc_checksum.to_le_bytes());
 
-    let fs = MemFs::new();
-    let path = std::path::Path::new("/forged-parity.sst");
+    let dir = tempfile::tempdir().unwrap();
+    let fs = StdFs;
+    let forged = dir.path().join("forged-parity.sst");
+    let path = forged.as_path();
     {
         let mut f = fs
             .open(
@@ -1028,7 +1032,7 @@ fn walk_block_region_reports_data_read_error_on_truncated_parity_trailer() {
 )]
 fn walk_block_region_caps_an_absurd_parity_trailer_length() {
     use crate::coding::Encode;
-    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::{BlockType, EccParams, Header, expected_parity_len};
 
     // Trailer layout (38 bytes at the tail of an SFA archive):
@@ -1086,8 +1090,10 @@ fn walk_block_region_caps_an_absurd_parity_trailer_length() {
     archive_bytes[csum_field_offset..csum_field_offset + 16]
         .copy_from_slice(&new_toc_checksum.to_le_bytes());
 
-    let fs = MemFs::new();
-    let path = std::path::Path::new("/forged-parity-cap.sst");
+    let dir = tempfile::tempdir().unwrap();
+    let fs = StdFs;
+    let forged = dir.path().join("forged-parity-cap.sst");
+    let path = forged.as_path();
     {
         let mut f = fs
             .open(
@@ -1132,7 +1138,7 @@ fn walk_block_region_caps_an_absurd_parity_trailer_length() {
 )]
 fn walk_block_region_reports_header_crossing_section_boundary() {
     use crate::coding::Encode;
-    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::{BlockType, Header};
 
     const TRAILER_LEN: usize = 4 + 1 + 1 + 16 + 8 + 8;
@@ -1183,8 +1189,10 @@ fn walk_block_region_reports_header_crossing_section_boundary() {
     archive_bytes[csum_field_offset..csum_field_offset + 16]
         .copy_from_slice(&new_toc_checksum.to_le_bytes());
 
-    let fs = MemFs::new();
-    let path = std::path::Path::new("/forged-boundary.sst");
+    let dir = tempfile::tempdir().unwrap();
+    let fs = StdFs;
+    let forged = dir.path().join("forged-boundary.sst");
+    let path = forged.as_path();
     {
         let mut f = fs
             .open(
