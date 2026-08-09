@@ -1733,6 +1733,72 @@ fn heal_in_place_rejects_a_created_at_restamped_before_open() -> crate::Result<(
     Ok(())
 }
 
+/// A stale IN-PROGRESS heal marker must NOT authorize a reconcile. The
+/// in-progress marker binds only `pre == manifest`, not the healed bytes, so a
+/// crash after the marker was written but before any block was healed leaves it
+/// attesting a heal that never happened. If a checksum-restamped alteration to a
+/// non-authenticatable surface (here a pre-open `created_at` back-date, which
+/// poisons the recovery-time copy so no gate can catch it) then lands, the
+/// marker would legitimize it: the patrol refreshes the manifest over the forged
+/// bytes. Attribution must come only from this pass's heal or a COMPLETED marker
+/// (which binds `post == current`); a bare pre-only marker is ignored, so the
+/// mismatch stays unattributable and fails closed.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn heal_in_place_ignores_a_stale_in_progress_marker() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _) = write_ecc_sst_footered(dir.path());
+
+    // Back-date `created_at` in BOTH mirrors before open, poisoning the
+    // recovery-time copy so the field-for-field gate cannot catch it — the
+    // mismatch is unattributable unless a marker authorizes it.
+    crate::test_forge::forge_meta_value_both_mirrors(
+        &sst_path,
+        b"created_at",
+        &1u128.to_le_bytes(),
+    )?;
+
+    let tree = open_ecc_tree(dir.path());
+    // Manufacture a stale in-progress marker whose `pre` equals the manifest
+    // digest (the clean, pre-forge checksum the manifest still records), as a
+    // crash between the marker write and the first heal would leave.
+    let manifest_checksum = {
+        let binding = tree.version_history.read().latest_version();
+        binding
+            .version
+            .iter_tables()
+            .next()
+            .expect("flush produced one table")
+            .checksum()
+    };
+    crate::scrub::heal_attest::write_in_progress(
+        &crate::fs::StdFs,
+        &sst_path,
+        None,
+        0,
+        manifest_checksum,
+    )?;
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report.errors.iter().any(|e| matches!(
+            e,
+            ScrubError::ChecksumRefreshFailed { reason, .. }
+                if reason.contains("not attributable to this pass's heal")
+        )),
+        "a stale in-progress marker must not make an unattributed mismatch \
+         attributable: {report:?}",
+    );
+
+    let integrity = crate::verify::verify_integrity(&tree);
+    assert!(
+        !integrity.is_ok(),
+        "the forged SST must keep failing verify_integrity: a stale in-progress \
+         marker must not authorize restamping its digest",
+    );
+    Ok(())
+}
+
 /// The digest reconciliation must not restamp over a FORGED KV-footer
 /// DESCRIPTOR: both meta mirrors re-stamped with `descriptor#kv_checksum`
 /// set to off while the footer-bearing data blocks are left intact. The
