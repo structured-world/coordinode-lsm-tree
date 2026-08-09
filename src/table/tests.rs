@@ -960,7 +960,7 @@ fn salvage_load_block_reencodes_an_over_read_frame() -> crate::Result<()> {
 /// into the manifest when a tight-space compaction swaps the restricted view
 /// in, making later integrity scans flag the healed file as corrupt again.
 #[test]
-fn reopen_restricted_preserves_a_refreshed_checksum() -> crate::Result<()> {
+fn reopen_restricted_carries_the_live_suffix_digest() -> crate::Result<()> {
     let items = [
         crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
         crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
@@ -969,23 +969,31 @@ fn reopen_restricted_preserves_a_refreshed_checksum() -> crate::Result<()> {
     test_with_table(
         &items,
         |table| {
-            let refreshed = crate::Checksum::from_raw(0xDEAD_BEEF_u128);
-            assert_ne!(
-                table.checksum(),
-                refreshed,
-                "sentinel digest must differ from the recovery digest",
-            );
-
-            let healed = table.with_refreshed_checksum(refreshed);
-            let restricted = healed.reopen_restricted(crate::UserKey::from(&b"b"[..]))?;
-
+            // The restricted view's manifest digest must cover only its LIVE
+            // SUFFIX `[punch_offset, end)`, not the whole file: the prefix is
+            // hole-punched after install, so a whole-file digest would never
+            // match the punched file. It is computed fresh from the current
+            // bytes (so any heal is folded in).
+            let restricted = table.reopen_restricted(crate::UserKey::from(&b"b"[..]))?;
+            let punch = table.punch_offset_for(b"b")?;
+            let expected = crate::Checksum::from_raw(crate::repair::compute_table_checksum_from(
+                &crate::fs::StdFs,
+                &table.path,
+                punch,
+            )?);
             assert_eq!(
                 restricted.checksum(),
-                refreshed,
-                "the reopened restricted view must report the refreshed digest, \
-                 not the stale one captured at the original recovery",
+                expected,
+                "the restricted view reports its live-suffix digest",
             );
-
+            if punch > 0 {
+                assert_ne!(
+                    restricted.checksum(),
+                    table.checksum(),
+                    "a non-zero punch offset makes the suffix digest differ from \
+                     the whole-file digest",
+                );
+            }
             Ok(())
         },
         None,

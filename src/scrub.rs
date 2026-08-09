@@ -454,8 +454,11 @@ fn refresh_healed_checksum(
         })
     };
 
-    let fresh = match crate::repair::compute_table_checksum(&*table.fs, &table.path) {
-        Ok(raw) => crate::Checksum::from_raw(raw),
+    // Restriction-aware: a tight-space RESTRICTED view digests only its live
+    // suffix (its punched prefix reads as zeros), matching the suffix digest the
+    // manifest records for it.
+    let fresh = match table.live_region_checksum() {
+        Ok(ck) => ck,
         Err(e) => return finding(e.to_string()),
     };
     // Compare against the CURRENT manifest entry, not the caller's captured

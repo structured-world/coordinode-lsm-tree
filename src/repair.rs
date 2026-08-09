@@ -86,6 +86,37 @@ pub struct RepairReport {
     pub warnings: Vec<&'static str>,
 }
 
+/// Streams `path` from byte `start` to end through XXH3-128. `start == 0`
+/// reproduces the whole-file digest a normal write accumulates; a non-zero
+/// `start` digests only the LIVE suffix of a tight-space RESTRICTED table,
+/// whose `[0, start)` prefix was hole-punched (reads back as zeros) once a
+/// superseding output table took over those keys. The suffix bytes are
+/// untouched by the punch, so this digest is stable across it.
+pub(crate) fn compute_table_checksum_from(
+    fs: &dyn crate::fs::Fs,
+    path: &std::path::Path,
+    start: u64,
+) -> crate::Result<u128> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+    // Seek + sequential read (not positioned `read_at`), so at `start == 0` this
+    // is byte-for-byte the same read pattern as `compute_table_checksum`.
+    if start != 0 {
+        file.seek(SeekFrom::Start(start))?;
+    }
+    let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break; // EOF
+        }
+        let Some(chunk) = buf.get(..n) else { break };
+        hasher.update(chunk);
+    }
+    Ok(hasher.digest128())
+}
+
 /// Streams `path` start to end through XXH3-128, matching the digest a normal
 /// table write accumulates via `ChecksummedWriter`.
 pub(crate) fn compute_table_checksum(
@@ -118,16 +149,26 @@ pub(crate) fn compute_table_checksum(
 /// The overrides are size-preserving block frames at distinct, non-overlapping
 /// offsets (the heal rewrites each corrupt block at its existing offset and
 /// size), so splicing them is a byte-for-byte substitution that keeps the file
-/// length and every other byte unchanged.
+/// length and every other byte unchanged. `start` matches
+/// [`compute_table_checksum_from`]: a restricted view predicts only its live
+/// suffix (its corrections all lie there), so the digest starts at the punch
+/// offset.
 pub(crate) fn compute_table_checksum_with_overrides(
     fs: &dyn crate::fs::Fs,
     path: &std::path::Path,
+    start: u64,
     overrides: &[(u64, Vec<u8>)],
 ) -> crate::Result<u128> {
+    use std::io::{Seek, SeekFrom};
     let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+    // Seek + sequential read (see `compute_table_checksum_from`): keeps the
+    // `start == 0` read pattern identical to the plain digest.
+    if start != 0 {
+        file.seek(SeekFrom::Start(start))?;
+    }
     let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
     let mut buf = vec![0u8; 256 * 1024];
-    let mut chunk_start = 0u64;
+    let mut chunk_start = start;
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {

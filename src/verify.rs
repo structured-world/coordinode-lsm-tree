@@ -132,9 +132,23 @@ impl IntegrityReport {
 /// whatever bytes are on disk; per-block checksums catch the actual damage).
 #[cfg(feature = "std")]
 pub(crate) fn stream_checksum(path: &std::path::Path) -> std::io::Result<Checksum> {
-    use std::io::Read;
+    stream_checksum_from(path, 0)
+}
+
+/// As [`stream_checksum`], but digests only `[start, end)`. A tight-space
+/// RESTRICTED table's `[0, punch_offset)` prefix is hole-punched (reads as
+/// zeros) once a superseding output owns those keys, so its manifest digest
+/// covers only the live suffix; verification must digest from the same `start`.
+pub(crate) fn stream_checksum_from(
+    path: &std::path::Path,
+    start: u64,
+) -> std::io::Result<Checksum> {
+    use std::io::{Read, Seek, SeekFrom};
 
     let mut reader = std::fs::File::open(path)?;
+    if start != 0 {
+        reader.seek(SeekFrom::Start(start))?;
+    }
     let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
     let mut buf = vec![0u8; 64 * 1024];
 
@@ -183,7 +197,16 @@ pub fn verify_integrity(tree: &impl crate::AbstractTree) -> IntegrityReport {
         let path = &*table.path;
         let expected = table.checksum();
 
-        match stream_checksum(path) {
+        // A tight-space RESTRICTED view digests only its live suffix (the
+        // punched prefix reads as zeros and is not part of its identity). A
+        // block-index read failure while resolving the punch offset falls back
+        // to `0`, so the whole-file digest mismatches and the table is reported
+        // rather than silently passing.
+        let start = table
+            .restrict_lower_bound()
+            .and_then(|bound| table.punch_offset_for(bound).ok())
+            .unwrap_or(0);
+        match stream_checksum_from(path, start) {
             Ok(got) if got != expected => {
                 report.errors.push(IntegrityError::SstFileCorrupted {
                     table_id: table.id(),

@@ -1584,12 +1584,19 @@ impl Table {
         // cleanup below; the per-block correction is recomputed identically in
         // the write loop (both call `heal_correction_for_block`).
         let corrections = self.collect_heal_corrections(file.as_ref(), &transform);
+        // A restricted view predicts (and later digests) only its live suffix;
+        // its corrections all lie there, and the punched prefix is not hashed.
+        let heal_start = match self.restrict_lower_bound() {
+            Some(bound) => self.punch_offset_for(bound).unwrap_or(0),
+            None => 0,
+        };
         let pre_heal_matched: Option<bool> = if corrections.is_empty() {
             None
         } else if self.pre_heal_digest_matches(manifest_checksum) {
             if let Ok(raw) = crate::repair::compute_table_checksum_with_overrides(
                 &*self.fs,
                 &self.path,
+                heal_start,
                 &corrections,
             ) {
                 // Best-effort: a marker-write failure only forfeits crash
@@ -2066,8 +2073,10 @@ impl Table {
     /// losing it fails closed.
     #[cfg(feature = "page_ecc")]
     fn pre_heal_digest_matches(&self, manifest_checksum: Checksum) -> bool {
-        match crate::repair::compute_table_checksum(&*self.fs, &self.path) {
-            Ok(raw) => crate::Checksum::from_raw(raw) == manifest_checksum,
+        // Restriction-aware: a restricted view's manifest digest covers only its
+        // live suffix, so probe the same region.
+        match self.live_region_checksum() {
+            Ok(ck) => ck == manifest_checksum,
             Err(e) => {
                 log::warn!(
                     "pre-heal digest probe failed for table #{} at {}: {e}",
@@ -6361,13 +6370,21 @@ impl Table {
         )
     )]
     pub(crate) fn reopen_restricted(&self, lower: UserKey) -> crate::Result<Self> {
+        // The restricted view's digest is the LIVE SUFFIX only: its
+        // `[0, punch_offset)` prefix is hole-punched right after this view is
+        // installed, so a whole-file digest (what `self.checksum()` holds) would
+        // never match the punched file. Compute the suffix digest over the
+        // CURRENT bytes NOW, while the file is still whole — the suffix is
+        // untouched by the punch, and reading it fresh also folds in any in-place
+        // heal that refreshed this table (so a tight-space swap installs the
+        // healed suffix digest, never a stale pre-heal one).
+        let punch_offset = self.punch_offset_for(&lower)?;
+        let restricted_checksum = crate::Checksum::from_raw(
+            crate::repair::compute_table_checksum_from(&*self.fs, &self.path, punch_offset)?,
+        );
         let reopened = Self::recover(
             (*self.path).clone(),
-            // The override-aware accessor, NOT the inner recovery-time field:
-            // an in-place heal may have refreshed this table's digest, and the
-            // reopened view must carry that forward or a tight-space swap
-            // would reinstall the stale pre-heal digest into the manifest.
-            self.checksum(),
+            restricted_checksum,
             self.global_seqno,
             self.tree_id,
             self.metadata.id,
@@ -6440,6 +6457,24 @@ impl Table {
             data_end = handle.offset().0 + u64::from(handle.size());
         }
         Ok(data_end)
+    }
+
+    /// The whole-file digest for a normal table, or the LIVE-SUFFIX digest for a
+    /// tight-space RESTRICTED view: its `[0, punch_offset)` prefix is hole-
+    /// punched once a superseding output table owns those keys, so hashing the
+    /// whole physical file would fold the punched (zeroed) prefix into the
+    /// digest and never match the manifest. Digesting only `[punch_offset, end)`
+    /// keeps the checksum stable across the punch, and it is what
+    /// [`reopen_restricted`](Self::reopen_restricted) records and what
+    /// verification / heal reconciliation must recompute for a restricted view.
+    #[cfg(feature = "std")]
+    pub(crate) fn live_region_checksum(&self) -> crate::Result<Checksum> {
+        let start = match self.restrict_lower_bound() {
+            Some(bound) => self.punch_offset_for(bound)?,
+            None => 0,
+        };
+        crate::repair::compute_table_checksum_from(&*self.fs, &self.path, start)
+            .map(Checksum::from_raw)
     }
 
     /// Installs the tree-wide deletion pause used by checkpoints.
