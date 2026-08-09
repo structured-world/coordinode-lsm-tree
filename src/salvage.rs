@@ -129,7 +129,12 @@ pub struct SalvageReport {
     /// Path of the freshly written salvaged SST, or `None` when no block was
     /// recoverable and nothing was written.
     pub salvaged_path: Option<PathBuf>,
-    /// Total data blocks the walk inspected (recovered plus dropped).
+    /// Total data blocks the walk INSPECTED. This is not partitioned by
+    /// `blocks_salvaged + dropped.len()`: a columnar block whose rows were all
+    /// positionally deleted is inspected and counted here, yet re-emits nothing
+    /// (not in `blocks_salvaged`) and loses nothing (not in `dropped`). Derive
+    /// completeness from [`is_complete`](Self::is_complete) (`dropped.is_empty()`),
+    /// never from `blocks_salvaged == blocks_total`.
     pub blocks_total: usize,
     /// Data blocks successfully re-emitted into the salvaged SST.
     pub blocks_salvaged: usize,
