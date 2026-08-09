@@ -6362,13 +6362,9 @@ impl Table {
     /// # Errors
     ///
     /// Propagates any error from re-opening the SST file.
-    #[cfg_attr(
-        not(feature = "std"),
-        allow(
-            dead_code,
-            reason = "tight-space relocation view; its compaction consumer is std-gated, so unused under no_std"
-        )
-    )]
+    // std-only: computes the suffix digest via `crate::repair` (file I/O) and is
+    // reached only from tight-space compaction, which is itself std-gated.
+    #[cfg(feature = "std")]
     pub(crate) fn reopen_restricted(&self, lower: UserKey) -> crate::Result<Self> {
         // The restricted view's digest is the LIVE SUFFIX only: its
         // `[0, punch_offset)` prefix is hole-punched right after this view is

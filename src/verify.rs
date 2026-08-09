@@ -139,6 +139,7 @@ pub(crate) fn stream_checksum(path: &std::path::Path) -> std::io::Result<Checksu
 /// RESTRICTED table's `[0, punch_offset)` prefix is hole-punched (reads as
 /// zeros) once a superseding output owns those keys, so its manifest digest
 /// covers only the live suffix; verification must digest from the same `start`.
+#[cfg(feature = "std")]
 pub(crate) fn stream_checksum_from(
     path: &std::path::Path,
     start: u64,
