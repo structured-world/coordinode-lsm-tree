@@ -1073,24 +1073,28 @@ fn salvage_blocks(
                 _ => Err(()),
             }
         };
+        // Returns `true` when the gap `[from, to)` tiled CONTIGUOUSLY to `to`
+        // (so `to` is a proven boundary), `false` when the chain broke before
+        // reaching it.
         let probe_gap = |from: u64,
                          to: u64,
                          items: &mut Vec<(crate::table::BlockHandle, Option<UserKey>)>,
-                         dropped: &mut Vec<DroppedBlock>| {
+                         dropped: &mut Vec<DroppedBlock>|
+         -> bool {
             // `from` is a TRUSTED boundary: the data section start, or the end
             // of a block whose frame this walk already validated. Blocks that
             // tile CONTIGUOUSLY from it inherit that provenance — each
             // framed-and-loaded block's validated size anchors the next offset.
             // The moment an offset does NOT frame a loadable block, the chain
-            // breaks: every later offset in this gap is reachable only by byte
-            // scanning, which cannot prove a boundary. An uncompressed block can
-            // carry a complete checksum-valid SST block inside a user value, so
-            // a scan that resynced past a broken header could frame that NESTED
-            // forge and re-emit its interior entries as genuine data. Fail
-            // closed exactly as the blob resync path does: drop the whole
-            // remaining gap rather than emit unanchored candidates. A contiguous
-            // intact section behind a broken index still recovers every block;
-            // only bytes after a broken boundary are surrendered.
+            // breaks: every later offset is reachable only by byte scanning,
+            // which cannot prove a boundary. An uncompressed block can carry a
+            // complete checksum-valid SST block inside a user value, so a scan
+            // that resynced past a broken header could frame that NESTED forge
+            // and re-emit its interior entries as genuine data. Fail closed
+            // exactly as the blob resync path does: drop the whole remaining gap
+            // rather than emit unanchored candidates. A contiguous intact
+            // section still recovers every block; only bytes after a broken
+            // boundary are surrendered.
             let mut at = from;
             while at < to {
                 if let Ok(h) = frames_and_loads(at, to) {
@@ -1115,8 +1119,25 @@ fn salvage_blocks(
                     ),
                     key_range: None,
                 });
-                break;
+                return false;
             }
+            true
+        };
+        // Records an indexed handle the walk surrenders because the physical
+        // chain broke below its offset: with no proven boundary, a forged index
+        // could point it at a checksum-valid frame nested in a corrupt block's
+        // value bytes, so its own claimed key range is untrusted too (`None`).
+        let drop_unanchored_handle = |off: u64, dropped: &mut Vec<DroppedBlock>| {
+            dropped.push(DroppedBlock {
+                offset: off,
+                section: b"data".to_vec(),
+                reason: DropReason::HeaderCorrupted(
+                    "indexed block after a broken physical chain has no \
+                         authenticated boundary"
+                        .to_owned(),
+                ),
+                key_range: None,
+            });
         };
         let mut cursor = section_pos;
         // The tiling below is offset-driven, but the index yields KEY order,
@@ -1127,6 +1148,24 @@ fn salvage_blocks(
         // Offset order equals the writer's key order for the blocks
         // themselves, so re-sorting also keeps the emit order valid.
         indexed.sort_unstable_by_key(|k| *k.as_ref().offset());
+        // Whether the index (TLI + its mirror) is TRUSTWORTHY: the mirrors agree,
+        // the binary-index pointers authenticate, and the decoded handles TILE
+        // their section. A checksum-restamped index that points a handle at a
+        // frame nested inside another block's value bytes fails the tiling check
+        // (the nested offset overlaps its host block), so a passing verification
+        // proves every indexed offset is an ORIGINAL block boundary. With that
+        // proof, each indexed offset is its own provenance: a block whose header
+        // is corrupt costs only its own keys and the walk recovers the rest by
+        // their trusted offsets (block-granular salvage). WITHOUT it, an indexed
+        // offset is no more trustworthy than a byte-scanned one — a forged index
+        // could point it at a nested frame — so the physical chain is the only
+        // provenance and the walk fails closed past the first break.
+        let tli_trusted = table.tli_structure_authenticated();
+        // Tracks the contiguous physical chain from `section_pos`, consulted only
+        // when the index is NOT trusted. Once a boundary breaks there, every
+        // later offset is reachable only past unprovable bytes, so it is
+        // surrendered rather than trusted.
+        let mut chain_anchored = true;
         for keyed in indexed {
             let off = *keyed.as_ref().offset();
             // A handle whose offset is at or beyond the section end points
@@ -1138,15 +1177,32 @@ fn salvage_blocks(
             if off >= section_end {
                 continue;
             }
-            if off > cursor {
-                probe_gap(cursor, off, &mut items, &mut dropped);
-            }
             // A handle starting inside already-covered bytes (a duplicate or
-            // overlapping forge) is skipped: its span was walked physically,
-            // and any uncovered tail is reached by the next gap probe since
-            // the cursor does not advance here.
+            // overlapping forge) is skipped: its span was walked physically as
+            // part of the anchored prefix.
             if off < cursor {
                 continue;
+            }
+            // Untrusted index only: the chain already broke below this offset,
+            // so it has no proven boundary — surrender it (and every one after).
+            if !chain_anchored {
+                drop_unanchored_handle(off, &mut dropped);
+                continue;
+            }
+            if off > cursor {
+                let reached = probe_gap(cursor, off, &mut items, &mut dropped);
+                if !reached && !tli_trusted {
+                    // Untrusted index: the gap up to this handle broke, so `off`
+                    // sits past the last proven boundary and is unanchored too.
+                    // Surrender it and arm the flag for the rest of the walk.
+                    chain_anchored = false;
+                    drop_unanchored_handle(off, &mut dropped);
+                    continue;
+                }
+                // The gap tiled cleanly, OR the trusted index proves `off` is an
+                // original boundary regardless of the intervening (now dropped)
+                // index-omitted bytes. Either way `off` is a boundary.
+                cursor = off;
             }
             // Trust the indexed SPAN only after the block's own header
             // confirms it: an oversized forged handle would otherwise
@@ -1163,13 +1219,22 @@ fn salvage_blocks(
                     // untrusted as its span).
                     Ok(probed) => (probed, None),
                     // The indexed block's header does not frame, so its size is
-                    // UNVERIFIED: trusting it could advance the cursor by a forged
-                    // oversized span and cover the whole rest of the section,
-                    // hiding later intact blocks from the gap walk. Leave the cursor
-                    // here (do not emit) and let the physical resync frame from this
-                    // offset — it drops the unframeable block and recovers the
-                    // blocks after it.
-                    Err(_) => continue,
+                    // UNVERIFIED. With a TRUSTED index the block's offset is still
+                    // an original boundary, so leave the cursor here and let the
+                    // next handle's gap probe frame from it — it records the
+                    // corrupt block as a drop and recovers the intact blocks after
+                    // it by their trusted offsets (block-granular). With an
+                    // UNTRUSTED index the byte range past this unframeable header
+                    // cannot be proven to be original block starts (a nested forge
+                    // would frame just as well), so surrender this block and every
+                    // offset after it.
+                    Err(_) => {
+                        if !tli_trusted {
+                            chain_anchored = false;
+                            drop_unanchored_handle(off, &mut dropped);
+                        }
+                        continue;
+                    }
                 };
             // Both surviving arms probed the frame within `section_end`, so the
             // block ends there by construction: `off + size <= section_end`,
@@ -1178,7 +1243,9 @@ fn salvage_blocks(
             items.push((handle, end_key));
             cursor = cursor.max(next);
         }
-        if cursor < section_end {
+        // The trailing gap is probed only while the chain is still anchored:
+        // once it broke, the remaining bytes were already surrendered above.
+        if chain_anchored && cursor < section_end {
             probe_gap(cursor, section_end, &mut items, &mut dropped);
         }
     } else {

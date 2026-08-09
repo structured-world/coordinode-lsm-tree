@@ -2161,6 +2161,27 @@ impl Table {
     /// untrustworthy for the callers' restamp / keep decisions).
     #[cfg(feature = "std")]
     pub(crate) fn verify_tli_mirrors(&self) -> crate::Result<()> {
+        self.verify_tli_mirrors_inner(true)
+    }
+
+    /// Whether the index STRUCTURE alone authenticates its offsets as original
+    /// block boundaries: the mirrors agree, the binary-index pointers verify,
+    /// the partition separators are consistent, and the handles TILE their
+    /// section. This is the block-boundary provenance the salvage walk needs to
+    /// trust an indexed offset without re-reading each (possibly corrupt) data
+    /// block — [`verify_tli_mirrors`](Self::verify_tli_mirrors) additionally
+    /// frames and decodes every data block, which a bit-rotted-but-index-intact
+    /// table (the salvage case) would fail spuriously.
+    #[cfg(feature = "std")]
+    pub(crate) fn tli_structure_authenticated(&self) -> bool {
+        self.verify_tli_mirrors_inner(false).is_ok()
+    }
+
+    /// Shared body. `frame_blocks` additionally frames and decodes each
+    /// addressed DATA block (the full integrity check the scrub reconcile
+    /// wants); with it `false` only the index structure is authenticated, for
+    /// the salvage walk that runs over corrupt data blocks by design.
+    fn verify_tli_mirrors_inner(&self, frame_blocks: bool) -> crate::Result<()> {
         use crate::table::block::ParsedItem as _;
 
         let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
@@ -2239,8 +2260,10 @@ impl Table {
                     .iter(self.comparator.clone())
                     .map(|i| i.materialize(part.as_slice()))
                     .collect();
-                for k in &part_keyed {
-                    self.verify_separator_matches_block(k)?;
+                if frame_blocks {
+                    for k in &part_keyed {
+                        self.verify_separator_matches_block(k)?;
+                    }
                 }
                 // The TLI's top-level SEPARATOR for this partition must equal the
                 // partition's LAST data-block separator. `frames_tile_section`
@@ -2270,20 +2293,24 @@ impl Table {
                     "index partitions' data handles do not tile the data section",
                 ));
             }
-            self.verify_handles_frame_blocks(
-                &data_handles,
-                data_section.pos(),
-                data_section.len(),
-            )?;
+            if frame_blocks {
+                self.verify_handles_frame_blocks(
+                    &data_handles,
+                    data_section.pos(),
+                    data_section.len(),
+                )?;
+            }
         } else {
             if !Self::frames_tile_section(&handles, data_section.pos(), data_section.len()) {
                 return Err(crate::Error::InvalidHeader(
                     "tli data handles do not tile the data section",
                 ));
             }
-            self.verify_handles_frame_blocks(&handles, data_section.pos(), data_section.len())?;
-            for k in &keyed {
-                self.verify_separator_matches_block(k)?;
+            if frame_blocks {
+                self.verify_handles_frame_blocks(&handles, data_section.pos(), data_section.len())?;
+                for k in &keyed {
+                    self.verify_separator_matches_block(k)?;
+                }
             }
         }
         Ok(())
