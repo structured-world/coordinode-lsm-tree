@@ -266,10 +266,12 @@ fn restricted_view_passes_every_reconcile_gate() -> crate::Result<()> {
     // Locate the restricted table and drive every heal-reconcile gate directly:
     // each must accept the healthy suffix without decoding the punched prefix.
     let version = reopened.current_version();
-    let restricted = version
+    let Some(restricted) = version
         .iter_tables()
         .find(|t| t.restrict_lower_bound().is_some())
-        .expect("the punched input must reopen as a restricted table");
+    else {
+        panic!("the punched input must reopen as a restricted table");
+    };
 
     restricted.verify_kv_checksums()?;
     restricted.verify_blob_links()?;
