@@ -482,14 +482,17 @@ fn refresh_healed_checksum(
     }
 
     // A mismatch is attributable to a heal either DIRECTLY (this pass wrote the
-    // corrections and probed a matching pre-heal digest), via a COMPLETED
-    // attestation left by an earlier heal whose reconciliation crashed / failed
-    // (its `post` binds the exact healed file), or via an IN-PROGRESS marker left
-    // by a heal that crashed after its blocks landed but before it recorded the
-    // completed attestation — there the healed file is now clean, so this pass
-    // writes nothing and only the marker (pre == manifest) survives as evidence
-    // that the difference is a genuine heal. Every path still re-verifies the
-    // file structurally below before the digest is reconciled.
+    // corrections and probed a matching pre-heal digest) or via a COMPLETED
+    // attestation left by an earlier heal whose reconciliation crashed / failed.
+    // That attestation binds `post == current`, so it can ONLY re-authorize the
+    // exact bytes the heal produced — never an unrelated later forge. A marker
+    // that bound merely `pre == manifest` (the former in-progress marker) would
+    // authorize ANY structurally valid current bytes, so a crash after the
+    // marker but before any heal, followed by a checksum-restamped alteration to
+    // a non-authenticatable surface, could be legitimized; the heal now writes a
+    // post-bound completed marker UP FRONT instead, and a bare pre-only marker
+    // is ignored here. Every path still re-verifies the file structurally below
+    // before the digest is reconciled.
     let attributable = heal_attributable
         || heal_attest::attests(
             &*table.fs,
@@ -497,13 +500,6 @@ fn refresh_healed_checksum(
             table.encryption.as_deref(),
             table.id(),
             fresh,
-            current,
-        )
-        || heal_attest::attests_in_progress(
-            &*table.fs,
-            &table.path,
-            table.encryption.as_deref(),
-            table.id(),
             current,
         );
     // This pass healed: record the attestation BEFORE reconciling, so a crash

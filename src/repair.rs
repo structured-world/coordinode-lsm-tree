@@ -109,6 +109,52 @@ pub(crate) fn compute_table_checksum(
     Ok(hasher.digest128())
 }
 
+/// As [`compute_table_checksum`], but streams the file with `overrides` spliced
+/// in: each `(offset, bytes)` replaces the on-disk bytes at `[offset,
+/// offset + bytes.len())`. Used to predict the digest an in-place heal WILL
+/// produce, from the corrected block frames it will write, before any write
+/// lands — so the heal attestation can bind that intended post-heal state.
+///
+/// The overrides are size-preserving block frames at distinct, non-overlapping
+/// offsets (the heal rewrites each corrupt block at its existing offset and
+/// size), so splicing them is a byte-for-byte substitution that keeps the file
+/// length and every other byte unchanged.
+pub(crate) fn compute_table_checksum_with_overrides(
+    fs: &dyn crate::fs::Fs,
+    path: &std::path::Path,
+    overrides: &[(u64, Vec<u8>)],
+) -> crate::Result<u128> {
+    let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+    let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut chunk_start = 0u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break; // EOF
+        }
+        let chunk_end = chunk_start + n as u64;
+        let Some(chunk) = buf.get_mut(..n) else { break };
+        // Splice every override overlapping this chunk. Overrides are few (one
+        // per corrupt block), so scanning them per chunk is negligible.
+        for (off, bytes) in overrides {
+            let ov_end = *off + bytes.len() as u64;
+            let lo = (*off).max(chunk_start);
+            let hi = ov_end.min(chunk_end);
+            if lo < hi {
+                let dst = chunk.get_mut((lo - chunk_start) as usize..(hi - chunk_start) as usize);
+                let src = bytes.get((lo - *off) as usize..(hi - *off) as usize);
+                if let (Some(dst), Some(src)) = (dst, src) {
+                    dst.copy_from_slice(src);
+                }
+            }
+        }
+        hasher.update(&*chunk);
+        chunk_start = chunk_end;
+    }
+    Ok(hasher.digest128())
+}
+
 /// Highest existing `v{N}` manifest id in `folder`, if any. The rebuilt manifest
 /// uses `max + 1` so it supersedes any stale version file and the `current`
 /// pointer never races a half-written predecessor.

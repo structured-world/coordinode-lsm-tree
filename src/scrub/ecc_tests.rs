@@ -68,6 +68,35 @@ fn write_ecc_sst(dir: &std::path::Path) -> (std::path::PathBuf, crate::table::Bl
     ((*table.path).clone(), handle)
 }
 
+/// A SINGLE-data-block ECC SST, so the heal's positioned-read sequence is
+/// predictable for fault-injection tests: the up-front correction-prediction
+/// pass reads the block twice (scrub + re-read) and the write-back pass reads it
+/// twice more, in that order.
+fn write_single_block_ecc_sst(
+    dir: &std::path::Path,
+) -> (std::path::PathBuf, crate::table::BlockHandle) {
+    let tree = open_ecc_tree(dir);
+    for i in 0u64..4 {
+        tree.insert(format!("key-{i:03}"), format!("v{i:03}"), i);
+    }
+    tree.flush_active_memtable(4).expect("flush");
+
+    let binding = tree.version_history.read().latest_version();
+    let table = binding
+        .version
+        .iter_tables()
+        .next()
+        .expect("flush produced one table");
+    let keyed = table
+        .block_index
+        .iter()
+        .next()
+        .expect("table has at least one data block")
+        .expect("block index entry decodes");
+    let handle = crate::table::BlockHandle::new(keyed.offset(), keyed.size());
+    ((*table.path).clone(), handle)
+}
+
 /// As [`write_ecc_sst`], but with per-KV checksum footers
 /// (`KvChecksumPolicy::AllLevels`). Footered tables keep the stale-digest
 /// reconcile available on a later clean pass (their value bytes re-derive
@@ -593,19 +622,20 @@ fn heal_in_place_reports_a_failed_parity_reread_as_uncorrectable() -> crate::Res
     use crate::io::ErrorKind;
 
     let dir = tempfile::tempdir()?;
-    let (_sst_path, _block) = write_ecc_sst(dir.path());
+    let (_sst_path, _block) = write_single_block_ecc_sst(dir.path());
 
     let fault = FaultFs::new(crate::fs::StdFs);
     let injector = fault.injector();
     let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));
 
-    // Within the heal pass, per block: read #1 is the verifying scrub read,
-    // read #2 is the raw frame re-read for the parity-trailer comparison.
-    // Fail exactly the FIRST block's re-read.
+    // The single block is read twice in the up-front correction-prediction pass
+    // (scrub, then the raw frame re-read for the parity-trailer comparison) and
+    // twice again in the write-back pass. Skip the two prediction reads and the
+    // write-back scrub, then fail exactly the write-back parity re-read.
     injector.arm(
         FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other))
             .on_path("tables")
-            .skip(1)
+            .skip(3)
             .once(),
     );
     let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
@@ -798,14 +828,17 @@ fn heal_in_place_keeps_the_marker_when_the_reconcile_walk_read_fails_transiently
     let injector = fault.injector();
     let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));
 
-    // Reads #1 (scrub) and #2 (heal re-read) persist the trailer rebuild; every
-    // SST read after that belongs to the reconcile walk / semantic checks. Fail
-    // them all so the reconcile hits a transient read error, which must NOT
-    // delete the just-written attestation.
+    // The heal reads the block twice in the up-front correction-prediction pass
+    // (scrub + parity re-read) and twice more in the write-back pass, so the
+    // block's trailer rebuild lands after 4 positioned reads; every read after
+    // that belongs to the reconcile walk / semantic checks (the digest passes
+    // stream sequentially, not via ReadAt). Fail them all so the reconcile hits
+    // a transient read error, which must NOT delete the just-written
+    // attestation.
     injector.arm(
         FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other))
             .on_path("tables")
-            .skip(2),
+            .skip(4),
     );
     let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
     injector.clear();
@@ -883,9 +916,9 @@ fn heal_in_place_reports_a_failed_heal_reread_as_uncorrectable() -> crate::Resul
     use crate::io::ErrorKind;
 
     let dir = tempfile::tempdir()?;
-    let (sst_path, block) = write_ecc_sst(dir.path());
+    let (sst_path, block) = write_single_block_ecc_sst(dir.path());
 
-    // Flip one payload byte of the first data block (RS-correctable).
+    // Flip one payload byte of the block (RS-correctable).
     let corrupt_pos = block.offset().0 as usize + Header::MIN_LEN + 3;
     let mut bytes = std::fs::read(&sst_path)?;
     let Some(slot) = bytes.get_mut(corrupt_pos) else {
@@ -898,12 +931,14 @@ fn heal_in_place_reports_a_failed_heal_reread_as_uncorrectable() -> crate::Resul
     let injector = fault.injector();
     let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));
 
-    // For the corrupted first block: read #1 is the scrub read (corrects in
-    // memory), read #2 is `heal_frame`'s persist-side re-read — fail that one.
+    // The corrupted first block is read twice in the up-front correction-
+    // prediction pass (scrub + `heal_frame` re-read) and twice in the write-back
+    // pass. Skip the two prediction reads and the write-back scrub, then fail the
+    // write-back `heal_frame` re-read.
     injector.arm(
         FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other))
             .on_path("tables")
-            .skip(1)
+            .skip(3)
             .once(),
     );
     let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
@@ -2438,31 +2473,30 @@ fn heal_in_place_reconciles_a_crashed_refresh_via_the_attestation() -> crate::Re
     Ok(())
 }
 
-/// The completed attestation is written only AFTER every block is healed, so a
-/// crash between the last healed block's sync and that write leaves the file
-/// healed with NO completed attestation. An IN-PROGRESS marker, written BEFORE
-/// the first healed block lands, bridges that window: it records only the
-/// pre-heal (manifest) digest, and the next clean scrub reconciles via it (the
-/// structural gates still re-verify the file). Without it the clean re-scan
-/// cannot attribute the mismatch and the stale digest is rejected forever.
+/// A heal writes the completed attestation UP FRONT — before any block is
+/// healed — binding the deterministic post-heal digest, so a crash anywhere in
+/// the heal leaves that marker on disk. The next clean scrub reconciles via it:
+/// the marker binds `post == current`, so once the file reaches the healed
+/// state the mismatch is attributable and the structural gates re-verify before
+/// the digest is trusted. Without it the clean re-scan cannot attribute the
+/// mismatch and the stale digest is rejected forever.
 #[test]
-fn heal_in_place_reconciles_via_an_in_progress_marker() -> crate::Result<()> {
+fn heal_in_place_reconciles_via_a_completed_marker() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
     let (sst_path, block) = write_ecc_sst_footered(dir.path());
 
     corrupt_parity_trailer_byte(&sst_path, &block)?;
     rebuild_manifest_over_current_bytes(dir.path())?;
 
-    // First heal pass with a failing edit-log: the blocks are healed and a
-    // COMPLETED attestation is written, but the manifest refresh fails.
+    // First heal pass with a failing edit-log: the blocks are healed and the
+    // completed attestation is written, but the manifest refresh fails.
     let (tree, injector) = open_ecc_tree_with_failing_edit_log(dir.path());
     let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
     injector.clear();
     assert!(report.blocks_healed_in_place >= 1, "{report:?}");
 
-    // Model the earlier crash window — blocks healed, but the completed
-    // attestation never landed, leaving only the pre-heal IN-PROGRESS marker.
-    // The marker's `pre` is the current (stale) manifest digest.
+    // Model the crash window explicitly: the file is healed, and the completed
+    // marker binds the manifest's (stale) `pre` to the healed file's `post`.
     let (table_id, manifest_digest) = {
         let binding = tree.version_history.read().latest_version();
         let table = binding
@@ -2472,17 +2506,22 @@ fn heal_in_place_reconciles_via_an_in_progress_marker() -> crate::Result<()> {
             .expect("the healed table is still in the manifest");
         (table.id(), table.checksum())
     };
+    let healed_digest = crate::Checksum::from_raw(crate::repair::compute_table_checksum(
+        &crate::fs::StdFs,
+        &sst_path,
+    )?);
     std::fs::remove_file(heal_attest_path(&sst_path))?;
-    crate::scrub::heal_attest::write_in_progress(
+    crate::scrub::heal_attest::write(
         &crate::fs::StdFs,
         &sst_path,
         None,
         table_id,
         manifest_digest,
+        healed_digest,
     )?;
 
     // Second pass, fault gone: every block reads clean (nothing to heal), so the
-    // mismatch is attributable only via the in-progress marker.
+    // mismatch is attributable only via the completed marker.
     let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
     assert_eq!(
         report.blocks_healed_in_place, 0,
@@ -2491,7 +2530,7 @@ fn heal_in_place_reconciles_via_an_in_progress_marker() -> crate::Result<()> {
     );
     assert!(
         report.is_ok(),
-        "a crash before the completed attestation must reconcile via the in-progress \
+        "a crash before the manifest refresh must reconcile via the completed \
          marker on the next scrub: {report:?}",
     );
     let integrity = crate::verify::verify_integrity(&tree);

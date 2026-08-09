@@ -39,13 +39,13 @@ use std::path::{Path, PathBuf};
 /// digests are recorded, so a reconcile only trusts the file that hashes to
 /// `post`.
 const KIND_COMPLETED: u8 = 0;
-/// An IN-PROGRESS marker: written BEFORE the first healed block lands, when the
-/// file still hashes to the manifest digest (`pre`). The post-heal digest is not
-/// yet known, so a reconcile trusts `pre == manifest` plus the full structural
-/// re-verification that follows attribution. It bridges a crash between the last
-/// healed block's sync and the completed attestation write — otherwise the next
-/// patrol finds a clean file (nothing to heal), no attribution, and the stale
-/// manifest digest is rejected forever until a full rewrite.
+/// An IN-PROGRESS marker: a legacy pre-only kind that bound only `pre ==
+/// manifest`, not the healed bytes. The heal now records a completed marker with
+/// the deterministic post-heal digest UP FRONT instead, so this kind is never
+/// written in production; [`attests`] rejects it (it is not [`KIND_COMPLETED`]),
+/// which is what stops a bare pre-only marker from authorizing an unrelated
+/// forge. Retained only so the tests can forge one and prove it is ignored.
+#[cfg(test)]
 const KIND_IN_PROGRESS: u8 = 1;
 
 /// Serialized payload length: `kind` (u8) + `table_id` (u64) + pre digest (u128)
@@ -154,15 +154,15 @@ fn read_sidecar(
     deserialize(&plain)
 }
 
-/// Writes an IN-PROGRESS marker recording only the manifest (`pre`) digest, for
-/// the crash window before the completed attestation exists. Called BEFORE the
-/// first healed block is made durable.
+/// Forges a legacy IN-PROGRESS marker (pre-only). Test-only: production never
+/// writes this kind — the heal records a completed marker with the post-heal
+/// digest up front. The tests use it to prove [`attests`] ignores a bare
+/// pre-only marker, so it can never authorize an unrelated forge.
 ///
 /// # Errors
 ///
-/// Propagates the AEAD seal error and any write / sync I/O error; the caller
-/// treats a failure as best-effort (a crashed heal is then not recoverable
-/// without a full rewrite, the pre-marker behavior).
+/// Propagates the AEAD seal error and any write / sync I/O error.
+#[cfg(test)]
 pub fn write_in_progress(
     fs: &dyn Fs,
     table_path: &Path,
@@ -174,11 +174,10 @@ pub fn write_in_progress(
     write_sidecar(fs, table_path, encryption, &plain)
 }
 
-/// Whether an IN-PROGRESS marker proves the file differs from the manifest
-/// (`manifest`) solely because a heal started from a manifest-matching file.
-/// The reconcile still re-verifies the file structurally after attribution, so
-/// `pre == manifest` (plus the id and, for a keyed table, the AEAD open) is the
-/// only binding this marker needs.
+/// Whether a marker is a legacy IN-PROGRESS (pre-only) attestation. Test-only:
+/// production attribution consults [`attests`] alone, which requires
+/// [`KIND_COMPLETED`], so a pre-only marker is never trusted.
+#[cfg(test)]
 pub(super) fn attests_in_progress(
     fs: &dyn Fs,
     table_path: &Path,
@@ -202,7 +201,7 @@ pub(super) fn attests_in_progress(
 /// write / sync. The caller treats a failure as best-effort — it only means a
 /// crashed refresh will not be recoverable by the next scrub (the pre-sidecar
 /// behavior), never that the heal itself failed.
-pub(super) fn write(
+pub(crate) fn write(
     fs: &dyn Fs,
     table_path: &Path,
     encryption: Option<&dyn EncryptionProvider>,

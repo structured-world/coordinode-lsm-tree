@@ -136,6 +136,29 @@ enum UnshareState {
     Failed(alloc::string::String),
 }
 
+/// What the in-place heal would do to one data block, decided WITHOUT writing.
+/// [`Table::heal_correction_for_block`] produces it so the pre-heal digest pass
+/// and the write loop share one correction decision.
+#[cfg(feature = "page_ecc")]
+enum HealDecision {
+    /// The block verifies clean; nothing to persist.
+    Clean,
+    /// A correction was computed but the confirming re-read came back clean (a
+    /// transient fault): there is nothing durable to write.
+    Transient,
+    /// The block is corrupt beyond recovery (or unreadable); reported, not
+    /// written. Carries the finding text.
+    Uncorrectable(alloc::string::String),
+    /// Persist `bytes` at `write_offset` (size-preserving). `is_frame` marks a
+    /// full RS-recovered frame (a payload correction) apart from a parity-only
+    /// trailer rebuild.
+    Correction {
+        write_offset: u64,
+        bytes: alloc::vec::Vec<u8>,
+        is_frame: bool,
+    },
+}
+
 /// A disk segment (a.k.a. `Table`, `SSTable`, `SST`, `sorted string table`) that is located on disk
 ///
 /// A table is an immutable list of key-value pairs, split into compressed blocks.
@@ -1555,13 +1578,6 @@ impl Table {
         // cannot link this SST anywhere inside the scan-to-write span.
         let mut unshare_state = UnshareState::Unprobed;
 
-        // Attribution for the digest reconciliation: computed LAZILY right
-        // before the first write-back (same discipline as the unshare probe,
-        // so a clean scan pays nothing), while the file still holds its
-        // pre-heal bytes. A match against the manifest digest proves every
-        // later difference is one of this pass's verified corrections.
-        let mut pre_heal_matched: Option<bool> = None;
-
         let transform = match crate::table::util::build_block_transform(
             self.metadata.data_block_compression,
             self.encryption.as_deref(),
@@ -1578,6 +1594,49 @@ impl Table {
                 });
                 return (report, false);
             }
+        };
+
+        // Attribution + crash-recovery marker, computed UP FRONT while the file
+        // still holds its pre-heal bytes. The heal is deterministic, so the
+        // digest of the file with every correction applied is known before any
+        // write lands: bind THAT into the attestation (not just `pre ==
+        // manifest`), so a marker a crash leaves behind can only ever
+        // re-authorize the exact healed bytes, never an unrelated later forge.
+        // A clean scan (no corrections) writes nothing. `pre_heal_matched`
+        // still drives the returned attribution flag and the zero-heal marker
+        // cleanup below; the per-block correction is recomputed identically in
+        // the write loop (both call `heal_correction_for_block`).
+        let corrections = self.collect_heal_corrections(file.as_ref(), &transform);
+        let pre_heal_matched: Option<bool> = if corrections.is_empty() {
+            None
+        } else if self.pre_heal_digest_matches(manifest_checksum) {
+            if let Ok(raw) = crate::repair::compute_table_checksum_with_overrides(
+                &*self.fs,
+                &self.path,
+                &corrections,
+            ) {
+                // Best-effort: a marker-write failure only forfeits crash
+                // recovery of this heal, never the heal itself.
+                if let Err(e) = crate::scrub::heal_attest::write(
+                    &*self.fs,
+                    &self.path,
+                    self.encryption.as_deref(),
+                    self.id(),
+                    manifest_checksum,
+                    Checksum::from_raw(raw),
+                ) {
+                    log::warn!(
+                        "scrub: could not write the heal attestation for #{}: {e}",
+                        self.id(),
+                    );
+                }
+            }
+            // Attributable either way: on a non-crash run the reconcile
+            // attributes this pass's heal directly; the marker only adds crash
+            // recovery, so failing to predict the digest is not fatal.
+            Some(true)
+        } else {
+            Some(false)
         };
 
         for entry in self.block_index.iter() {
@@ -1730,14 +1789,9 @@ impl Table {
                         // Trailer rot: persist the freshly computed parity at
                         // its on-disk position (header + payload unchanged).
                         Ok(Some(fresh)) => {
-                            // Still the pre-heal bytes: capture attribution and
-                            // write the crash-recoverable marker before the first
-                            // write lands.
-                            self.capture_pre_heal_attribution(
-                                &mut pre_heal_matched,
-                                manifest_checksum,
-                            );
-                            // First write: make sure no checkpoint link
+                            // Attribution + the crash-recovery marker were
+                            // captured UP FRONT (before this loop), so nothing is
+                            // done here. First write: make sure no checkpoint link
                             // shares the inode (lazy detach).
                             if let Err(reason) = self.ensure_unshared_for_write(
                                 &mut file,
@@ -1834,11 +1888,9 @@ impl Table {
                             continue;
                         }
                     };
-                    // Still the pre-heal bytes: capture attribution and write
-                    // the crash-recoverable marker before the first write lands.
-                    self.capture_pre_heal_attribution(&mut pre_heal_matched, manifest_checksum);
-                    // First write: make sure no checkpoint link shares the
-                    // inode (lazy detach).
+                    // Attribution + the crash-recovery marker were captured UP
+                    // FRONT (before this loop). First write: make sure no
+                    // checkpoint link shares the inode (lazy detach).
                     if let Err(reason) =
                         self.ensure_unshared_for_write(&mut file, &mut unshare_state, sync_mode)
                     {
@@ -1917,6 +1969,142 @@ impl Table {
         (report, healed)
     }
 
+    /// The correction the in-place heal would apply to one data block, computed
+    /// WITHOUT writing. [`Self::collect_heal_corrections`] calls this to PREDICT
+    /// the post-heal bytes for the attestation; the write loop in
+    /// [`Self::heal_data_blocks_in_place`] performs the same decision inline and
+    /// applies it. The heal is deterministic (RS recovery / parity rebuild over
+    /// the same pre-heal bytes), so the prediction and the later application
+    /// are byte-identical. This MIRRORS the write loop's arms; a drift only
+    /// weakens crash recovery (a predicted digest that no longer matches the
+    /// applied bytes fails the marker CLOSED, never authorizing wrong bytes),
+    /// it is never a correctness hazard.
+    #[cfg(feature = "page_ecc")]
+    fn heal_correction_for_block(
+        &self,
+        file: &dyn crate::fs::FsFile,
+        keyed: &KeyedBlockHandle,
+        transform: &crate::table::block::BlockTransform<'_>,
+    ) -> HealDecision {
+        use crate::coding::Decode;
+        let block_offset = keyed.offset().0;
+        let handle = BlockHandle::new(keyed.offset(), keyed.size());
+        let outcome = crate::table::util::scrub_block(
+            self.global_id(),
+            &self.path,
+            &self.file_accessor,
+            &handle,
+            self.data_block_role(),
+            self.metadata.data_block_compression,
+            self.encryption.as_deref(),
+            self.metadata.ecc_params,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+            None,
+            #[cfg(feature = "metrics")]
+            &self.metrics,
+        );
+        match outcome {
+            Ok(crate::table::util::BlockScrubOutcome::Clean) => {
+                let raw = match crate::file::read_exact(file, block_offset, keyed.size() as usize) {
+                    Ok(raw) => raw,
+                    Err(e) => {
+                        return HealDecision::Uncorrectable(alloc::format!(
+                            "in-place heal: parity re-read failed: {e:?}"
+                        ));
+                    }
+                };
+                let Ok(raw_header) = crate::table::block::Header::decode_from(&mut &raw[..]) else {
+                    return HealDecision::Uncorrectable(alloc::string::String::from(
+                        "in-place heal: block scrubbed clean but its header no longer decodes",
+                    ));
+                };
+                if raw_header.block_type != self.data_block_role() {
+                    return HealDecision::Uncorrectable(alloc::string::String::from(
+                        "in-place heal: block scrubbed clean but its re-read header carries a \
+                         different block role",
+                    ));
+                }
+                let header_len = crate::table::block::Header::header_len(raw_header.block_type);
+                let payload_ok = header_len
+                    .checked_add(raw_header.data_length as usize)
+                    .and_then(|payload_end| raw.get(header_len..payload_end))
+                    .is_some_and(|payload| {
+                        crate::hash::hash128(payload) == raw_header.checksum.into_u128()
+                    });
+                if !payload_ok {
+                    return HealDecision::Uncorrectable(alloc::string::String::from(
+                        "in-place heal: block scrubbed clean but its re-read payload does not \
+                         match its checksum",
+                    ));
+                }
+                match self.raw_block_parity_delta(&raw, &raw_header) {
+                    Ok(None) => HealDecision::Clean,
+                    Ok(Some(fresh)) => {
+                        let trailer_offset = block_offset
+                            + crate::table::block::Header::header_len(raw_header.block_type) as u64
+                            + u64::from(raw_header.data_length);
+                        HealDecision::Correction {
+                            write_offset: trailer_offset,
+                            bytes: fresh,
+                            is_frame: false,
+                        }
+                    }
+                    Err(()) => HealDecision::Uncorrectable(alloc::string::String::from(
+                        "in-place heal: parity trailer unverifiable on a checksum-clean block",
+                    )),
+                }
+            }
+            Ok(crate::table::util::BlockScrubOutcome::Corrected { .. }) => {
+                match crate::table::block::Block::heal_frame(file, handle, transform) {
+                    Ok(Some((frame, _kind))) => HealDecision::Correction {
+                        write_offset: block_offset,
+                        bytes: frame,
+                        is_frame: true,
+                    },
+                    Ok(None) => HealDecision::Transient,
+                    Err(e) => HealDecision::Uncorrectable(alloc::format!(
+                        "in-place heal: block scrubbed as corrected but the heal re-read failed: \
+                         {e:?}"
+                    )),
+                }
+            }
+            Err(e) => HealDecision::Uncorrectable(alloc::format!("{e:?}")),
+        }
+    }
+
+    /// Read-only pass predicting every in-place correction (see
+    /// [`Self::heal_correction_for_block`]) as `(write_offset, bytes)`, so the
+    /// caller can compute the post-heal digest before any write lands. Skips a
+    /// restricted view's punched prefix exactly as the write loop does.
+    #[cfg(feature = "page_ecc")]
+    fn collect_heal_corrections(
+        &self,
+        file: &dyn crate::fs::FsFile,
+        transform: &crate::table::block::BlockTransform<'_>,
+    ) -> alloc::vec::Vec<(u64, alloc::vec::Vec<u8>)> {
+        let mut out = alloc::vec::Vec::new();
+        for entry in self.block_index.iter() {
+            let Ok(keyed) = entry else {
+                break;
+            };
+            if let Some(bound) = &self.1
+                && self.comparator.compare(keyed.end_key(), bound) == core::cmp::Ordering::Less
+            {
+                continue;
+            }
+            if let HealDecision::Correction {
+                write_offset,
+                bytes,
+                ..
+            } = self.heal_correction_for_block(file, &keyed, transform)
+            {
+                out.push((write_offset, bytes));
+            }
+        }
+        out
+    }
+
     /// Whether the file's CURRENT digest equals `manifest_checksum` — the
     /// attribution probe [`Self::heal_data_blocks_in_place`] takes right
     /// before its first write-back. The caller supplies the CURRENT
@@ -1939,43 +2127,6 @@ impl Table {
                 );
                 false
             }
-        }
-    }
-
-    /// Captures the pre-heal attribution the FIRST time a block needs healing:
-    /// probes whether the file still hashes to the manifest digest and, if so,
-    /// writes a crash-recoverable IN-PROGRESS marker BEFORE the first healed
-    /// block is made durable. Without it, a crash between the last healed block's
-    /// sync and the completed attestation leaves a clean file the next patrol
-    /// cannot attribute, so the stale manifest digest is rejected until a full
-    /// rewrite. Idempotent — only the first call (while `matched` is `None`) does
-    /// work; the marker write is best-effort (a failure only forfeits crash
-    /// recovery of this heal).
-    #[cfg(feature = "page_ecc")]
-    fn capture_pre_heal_attribution(
-        &self,
-        matched: &mut Option<bool>,
-        manifest_checksum: Checksum,
-    ) {
-        if matched.is_some() {
-            return;
-        }
-        let is_match = self.pre_heal_digest_matches(manifest_checksum);
-        *matched = Some(is_match);
-        if is_match
-            && let Err(e) = crate::scrub::heal_attest::write_in_progress(
-                &*self.fs,
-                &self.path,
-                self.encryption.as_deref(),
-                self.id(),
-                manifest_checksum,
-            )
-        {
-            log::warn!(
-                "scrub: could not write the in-progress heal marker for #{} at {}: {e}",
-                self.id(),
-                self.path.display(),
-            );
         }
     }
 
