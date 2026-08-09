@@ -341,14 +341,15 @@ fn salvage_refuses_a_range_tombstone_hidden_as_a_recognized_section() -> crate::
     Ok(())
 }
 
-/// Even with an INTACT index, an indexed handle after a broken physical chain
-/// must be dropped, not trusted. Once a block's header is unframeable the
-/// contiguous chain breaks; a later indexed offset then has no authenticated
-/// boundary, and a forged TLI could point it at a checksum-valid frame nested
-/// in a corrupt block's value bytes. The walk must surrender every block after
-/// the first break — indexed or not — and recover only the anchored prefix.
+/// When the index is UNTRUSTED (its mirror comparison, binary-index
+/// authentication, or section tiling fails), an indexed offset is no more
+/// provable than a byte-scanned one: a checksum-restamped TLI could point a
+/// handle at a frame nested inside a corrupt block's value bytes. So once the
+/// physical chain breaks, later indexed handles must be dropped too — the walk
+/// recovers only the anchored prefix. (With a TRUSTED index the same corruption
+/// stays block-granular; that path is covered by the recovery tests.)
 #[test]
-fn salvage_drops_indexed_blocks_after_a_broken_chain() -> crate::Result<()> {
+fn salvage_drops_indexed_blocks_after_a_break_when_the_index_is_untrusted() -> crate::Result<()> {
     let dir = tempdir()?;
     let source = dir.path().join("source");
     let dest = dir.path().join("salvaged");
@@ -367,10 +368,8 @@ fn salvage_drops_indexed_blocks_after_a_broken_chain() -> crate::Result<()> {
     }
     assert!(writer.finish()?.is_some(), "source SST is non-empty");
 
-    // Smash the header of a middle data block, leaving the INDEX intact. Every
-    // indexed handle still enumerates, so the blocks after the smash are reached
-    // through their own (untrusted) index entries — the case the broken-index
-    // tests do not exercise.
+    // Resolve a middle block offset BEFORE forging (data blocks precede the TLI,
+    // so the TLI forge below leaves this offset valid).
     let smash_offset = {
         let table = open(source.clone(), &fs)?;
         let offsets: Vec<u64> = table
@@ -383,6 +382,14 @@ fn salvage_drops_indexed_blocks_after_a_broken_chain() -> crate::Result<()> {
         };
         off
     };
+
+    // Corrupt the tli_tail mirror so it disagrees with the head: the index
+    // structure no longer authenticates (the mirrors diverge — exactly a
+    // checksum-restamped-TLI signal), though head enumeration still yields
+    // every handle.
+    crate::test_forge::forge_flip_section_last_payload_byte(&source, b"tli_tail", None)?;
+
+    // Smash the header of the middle data block: the physical chain breaks there.
     {
         let mut bytes = std::fs::read(&source)?;
         let Ok(at) = usize::try_from(smash_offset) else {
@@ -402,11 +409,12 @@ fn salvage_drops_indexed_blocks_after_a_broken_chain() -> crate::Result<()> {
         reopen_get(dest.clone(), &fs, b"key-000")?.is_some(),
         "the contiguous prefix before the broken chain must recover: {report:?}",
     );
-    // A key in a block AFTER the smash is reachable only through its untrusted
+    // A key in a block AFTER the smash is reachable only through its UNTRUSTED
     // index entry, past a broken boundary — it must NOT be re-emitted.
     assert!(
         reopen_get(dest, &fs, b"key-250")?.is_none(),
-        "an indexed block after a broken chain must be dropped, not emitted: {report:?}",
+        "an indexed block after a broken chain, under an untrusted index, must \
+         be dropped, not emitted: {report:?}",
     );
     assert!(
         report.dropped.iter().any(|d| matches!(
@@ -867,9 +875,9 @@ fn salvage_drops_the_tail_after_an_unframeable_oversized_handle() -> crate::Resu
     assert!(
         report.dropped.iter().any(|d| matches!(
             &d.reason,
-            DropReason::HeaderCorrupted(msg) if msg.contains("unanchored")
+            DropReason::HeaderCorrupted(msg) if msg.contains("broken")
         )),
-        "the dropped section must be reported as unanchored: {report:?}",
+        "the dropped section must be reported as a broken-chain drop: {report:?}",
     );
     Ok(())
 }
