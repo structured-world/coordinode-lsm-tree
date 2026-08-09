@@ -616,11 +616,19 @@ fn refresh_healed_checksum(
     // fields diverge from meta_mid) fails the refresh too. Fail closed on
     // warnings as well: an unrecognized-ECC or parity-unverifiable walk
     // skipped bytes, so the file is not provably clean.
+    // A restricted view's punched data-block prefix reads as zeros; walk only
+    // its live suffix (a block-index read failure falls back to `0`, so a truly
+    // corrupt table still fails the walk rather than skipping everything).
+    let data_start = table
+        .restrict_lower_bound()
+        .and_then(|bound| table.punch_offset_for(bound).ok())
+        .unwrap_or(0);
     let walk = crate::verify::verify_sst_file_with_context(
         &*table.fs,
         &table.path,
         table.encryption.as_deref(),
         Some(table.id()),
+        data_start,
     );
     if !walk.errors.is_empty() || !walk.warnings.is_empty() {
         // A walk error is definitive only when it proves corruption. A transient

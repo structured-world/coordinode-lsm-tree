@@ -879,7 +879,7 @@ fn walk_block_region_reports_data_read_error_on_truncated_data_segment() {
     }
 
     let table_id: TableId = 42;
-    let scan = scan_sst_blocks(&fs, path, table_id, 0, None, false)
+    let scan = scan_sst_blocks(&fs, path, table_id, 0, None, false, 0)
         .expect("forged SFA must parse cleanly");
     // The inflated section length ALSO breaks the TOC tiling invariant
     // (the declared section end runs past where the TOC begins), so the
@@ -1000,7 +1000,7 @@ fn walk_block_region_reports_data_read_error_on_truncated_parity_trailer() {
     // Scan as an RS(4,2) table: a non-zero parity_len is drained after the
     // (clean) payload, hitting EOF in the short SFA tail.
     let table_id: TableId = 7;
-    let scan = scan_sst_blocks(&fs, path, table_id, 0, Some(EccParams::RS_4_2), false)
+    let scan = scan_sst_blocks(&fs, path, table_id, 0, Some(EccParams::RS_4_2), false, 0)
         .expect("forged SFA must parse cleanly");
     assert!(
         scan.errors.iter().any(|e| matches!(
@@ -1099,7 +1099,7 @@ fn walk_block_region_caps_an_absurd_parity_trailer_length() {
     }
 
     let table_id: TableId = 7;
-    let scan = scan_sst_blocks(&fs, path, table_id, 0, Some(params), false)
+    let scan = scan_sst_blocks(&fs, path, table_id, 0, Some(params), false, 0)
         .expect("forged SFA must parse cleanly");
     assert!(
         scan.errors.iter().any(|e| matches!(
@@ -1196,7 +1196,7 @@ fn walk_block_region_reports_header_crossing_section_boundary() {
     }
 
     let table_id: TableId = 7;
-    let scan = scan_sst_blocks(&fs, path, table_id, 0, None, false)
+    let scan = scan_sst_blocks(&fs, path, table_id, 0, None, false, 0)
         .expect("forged SFA must parse cleanly");
     // The shrunken section length ALSO breaks the TOC tiling invariant
     // (the sections no longer reach the TOC start), so the walk reports

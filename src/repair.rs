@@ -339,6 +339,8 @@ fn block_verify_verdict(
         // id check — a checksum-clean forged tail meta falls back to the
         // intact MID mirror instead of dictating a forged ECC descriptor.
         Some(table.metadata.id),
+        // Repair walks the file as-is (it has no restriction context).
+        0,
     );
     // A non-parity error is corruption regardless of any warnings.
     if !report

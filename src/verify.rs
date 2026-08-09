@@ -635,6 +635,12 @@ fn scan_one_table(table: &crate::table::Table) -> BlockVerifyReport {
     // Encryption overhead is per-table (different keys / AEAD suites can attach
     // to different SSTs), so feed each table's `max_overhead()` separately.
     let max_enc_overhead = table.encryption.as_ref().map_or(0u32, |e| e.max_overhead());
+    // A restricted view digests / walks only its live suffix: skip the punched
+    // data-block prefix (a block-index read failure falls back to `0`).
+    let data_start = table
+        .restrict_lower_bound()
+        .and_then(|bound| table.punch_offset_for(bound).ok())
+        .unwrap_or(0);
     match scan_sst_blocks(
         &*table.fs,
         path,
@@ -642,6 +648,7 @@ fn scan_one_table(table: &crate::table::Table) -> BlockVerifyReport {
         max_enc_overhead,
         table.metadata.ecc_params,
         ecc_unrecognized,
+        data_start,
     ) {
         Ok(per_file) => {
             report.blocks_scanned += per_file.blocks_scanned;
@@ -852,7 +859,7 @@ pub(crate) fn verify_sst_file_with_fs(
     fs: &dyn crate::fs::Fs,
     path: &std::path::Path,
 ) -> BlockVerifyReport {
-    verify_sst_file_with_context(fs, path, None, None)
+    verify_sst_file_with_context(fs, path, None, None, 0)
 }
 
 /// As [`verify_sst_file_with_fs`], but with an encryption context for
@@ -876,6 +883,11 @@ pub(crate) fn verify_sst_file_with_context(
     path: &std::path::Path,
     encryption: Option<&dyn crate::encryption::EncryptionProvider>,
     known_table_id: Option<crate::TableId>,
+    // Byte offset to start the DATA-section walk at: `0` for a normal table, the
+    // punch offset for a tight-space RESTRICTED view (its `[0, data_start)` data
+    // blocks were hole-punched and read as zeros). The caller supplies it because
+    // this path-based walk has no `Table` to derive the restriction from.
+    data_start: u64,
 ) -> BlockVerifyReport {
     let table_id = known_table_id.unwrap_or(0);
     let mut report = BlockVerifyReport {
@@ -985,7 +997,15 @@ pub(crate) fn verify_sst_file_with_context(
     // as HeaderCorrupted and send the whole table to quarantine/salvage.
     let max_enc_overhead =
         encryption.map_or(0u32, crate::encryption::EncryptionProvider::max_overhead);
-    match scan_sst_blocks(fs, path, table_id, max_enc_overhead, ecc, ecc_unrecognized) {
+    match scan_sst_blocks(
+        fs,
+        path,
+        table_id,
+        max_enc_overhead,
+        ecc,
+        ecc_unrecognized,
+        data_start,
+    ) {
         Ok(per_file) => {
             report.blocks_scanned = per_file.blocks_scanned;
             // extend, NOT assign: the mirror-divergence finding above must
@@ -1168,6 +1188,12 @@ fn scan_sst_blocks(
     max_enc_overhead: u32,
     ecc: Option<crate::table::block::EccParams>,
     ecc_unrecognized: bool,
+    // Byte offset to START the DATA-section walk at: `0` for a normal table, or
+    // the punch offset of a tight-space RESTRICTED view whose `[0, data_start)`
+    // data blocks were hole-punched (they read as zeros and would false-flag as
+    // corruption). All other sections (index, meta, TLI …) sit past the data
+    // region and are always walked in full.
+    data_start: u64,
 ) -> io::Result<PerFileScan> {
     use io::BufReader;
     #[cfg(not(feature = "std"))]
@@ -1286,7 +1312,16 @@ fn scan_sst_blocks(
             }
             continue;
         }
-        let start = entry.pos();
+        // A restricted view's punched data-block prefix reads as zeros; start
+        // the DATA walk at `data_start` so those blocks are not framed (only the
+        // data section is punched — every other section is walked in full). The
+        // straddling block at `data_start` is intact (the punch begins at its
+        // boundary), so `start.max(data_start)` lands on a real block header.
+        let start = if entry.name() == b"data" {
+            entry.pos().max(data_start)
+        } else {
+            entry.pos()
+        };
         // `checked_add` (not `saturating_add`) so a corrupted or
         // forged TOC length cannot silently collapse to `u64::MAX`
         // and let the walk treat the whole address space as one
@@ -1296,7 +1331,7 @@ fn scan_sst_blocks(
         // `TocCorrupted` rather than `HeaderCorrupted` because the
         // failure is at the section-catalogue layer, not inside any
         // individual block.
-        let Some(end) = start.checked_add(entry.len()) else {
+        let Some(end) = entry.pos().checked_add(entry.len()) else {
             errors.push(BlockVerifyError::TocCorrupted {
                 table_id,
                 path: path.to_path_buf(),
