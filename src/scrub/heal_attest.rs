@@ -201,7 +201,7 @@ pub(super) fn attests_in_progress(
 /// write / sync. The caller treats a failure as best-effort — it only means a
 /// crashed refresh will not be recoverable by the next scrub (the pre-sidecar
 /// behavior), never that the heal itself failed.
-pub(crate) fn write(
+pub fn write(
     fs: &dyn Fs,
     table_path: &Path,
     encryption: Option<&dyn EncryptionProvider>,

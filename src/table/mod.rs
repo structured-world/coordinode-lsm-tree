@@ -136,29 +136,6 @@ enum UnshareState {
     Failed(alloc::string::String),
 }
 
-/// What the in-place heal would do to one data block, decided WITHOUT writing.
-/// [`Table::heal_correction_for_block`] produces it so the pre-heal digest pass
-/// and the write loop share one correction decision.
-#[cfg(feature = "page_ecc")]
-enum HealDecision {
-    /// The block verifies clean; nothing to persist.
-    Clean,
-    /// A correction was computed but the confirming re-read came back clean (a
-    /// transient fault): there is nothing durable to write.
-    Transient,
-    /// The block is corrupt beyond recovery (or unreadable); reported, not
-    /// written. Carries the finding text.
-    Uncorrectable(alloc::string::String),
-    /// Persist `bytes` at `write_offset` (size-preserving). `is_frame` marks a
-    /// full RS-recovered frame (a payload correction) apart from a parity-only
-    /// trailer rebuild.
-    Correction {
-        write_offset: u64,
-        bytes: alloc::vec::Vec<u8>,
-        is_frame: bool,
-    },
-}
-
 /// A disk segment (a.k.a. `Table`, `SSTable`, `SST`, `sorted string table`) that is located on disk
 ///
 /// A table is an immutable list of key-value pairs, split into compressed blocks.
@@ -1985,7 +1962,7 @@ impl Table {
         file: &dyn crate::fs::FsFile,
         keyed: &KeyedBlockHandle,
         transform: &crate::table::block::BlockTransform<'_>,
-    ) -> HealDecision {
+    ) -> Option<(u64, alloc::vec::Vec<u8>)> {
         use crate::coding::Decode;
         let block_offset = keyed.offset().0;
         let handle = BlockHandle::new(keyed.offset(), keyed.size());
@@ -2006,24 +1983,15 @@ impl Table {
         );
         match outcome {
             Ok(crate::table::util::BlockScrubOutcome::Clean) => {
-                let raw = match crate::file::read_exact(file, block_offset, keyed.size() as usize) {
-                    Ok(raw) => raw,
-                    Err(e) => {
-                        return HealDecision::Uncorrectable(alloc::format!(
-                            "in-place heal: parity re-read failed: {e:?}"
-                        ));
-                    }
-                };
-                let Ok(raw_header) = crate::table::block::Header::decode_from(&mut &raw[..]) else {
-                    return HealDecision::Uncorrectable(alloc::string::String::from(
-                        "in-place heal: block scrubbed clean but its header no longer decodes",
-                    ));
-                };
+                // A clean-payload block still needs a parity-trailer rebuild if
+                // its trailer rotted. Any read / decode inconsistency leaves the
+                // bytes unchanged (`None`), matching the write loop's report-and-
+                // skip.
+                let raw =
+                    crate::file::read_exact(file, block_offset, keyed.size() as usize).ok()?;
+                let raw_header = crate::table::block::Header::decode_from(&mut &raw[..]).ok()?;
                 if raw_header.block_type != self.data_block_role() {
-                    return HealDecision::Uncorrectable(alloc::string::String::from(
-                        "in-place heal: block scrubbed clean but its re-read header carries a \
-                         different block role",
-                    ));
+                    return None;
                 }
                 let header_len = crate::table::block::Header::header_len(raw_header.block_type);
                 let payload_ok = header_len
@@ -2033,43 +2001,29 @@ impl Table {
                         crate::hash::hash128(payload) == raw_header.checksum.into_u128()
                     });
                 if !payload_ok {
-                    return HealDecision::Uncorrectable(alloc::string::String::from(
-                        "in-place heal: block scrubbed clean but its re-read payload does not \
-                         match its checksum",
-                    ));
+                    return None;
                 }
                 match self.raw_block_parity_delta(&raw, &raw_header) {
-                    Ok(None) => HealDecision::Clean,
                     Ok(Some(fresh)) => {
                         let trailer_offset = block_offset
                             + crate::table::block::Header::header_len(raw_header.block_type) as u64
                             + u64::from(raw_header.data_length);
-                        HealDecision::Correction {
-                            write_offset: trailer_offset,
-                            bytes: fresh,
-                            is_frame: false,
-                        }
+                        Some((trailer_offset, fresh))
                     }
-                    Err(()) => HealDecision::Uncorrectable(alloc::string::String::from(
-                        "in-place heal: parity trailer unverifiable on a checksum-clean block",
-                    )),
+                    // Trailer matches (no ECC / already fresh) or is
+                    // unverifiable: nothing to persist.
+                    Ok(None) | Err(()) => None,
                 }
             }
             Ok(crate::table::util::BlockScrubOutcome::Corrected { .. }) => {
                 match crate::table::block::Block::heal_frame(file, handle, transform) {
-                    Ok(Some((frame, _kind))) => HealDecision::Correction {
-                        write_offset: block_offset,
-                        bytes: frame,
-                        is_frame: true,
-                    },
-                    Ok(None) => HealDecision::Transient,
-                    Err(e) => HealDecision::Uncorrectable(alloc::format!(
-                        "in-place heal: block scrubbed as corrected but the heal re-read failed: \
-                         {e:?}"
-                    )),
+                    Ok(Some((frame, _kind))) => Some((block_offset, frame)),
+                    // Transient (re-read clean) or a re-read error: unchanged.
+                    Ok(None) | Err(_) => None,
                 }
             }
-            Err(e) => HealDecision::Uncorrectable(alloc::format!("{e:?}")),
+            // Uncorrectable / unreadable: the block's bytes stay as they are.
+            Err(_) => None,
         }
     }
 
@@ -2093,13 +2047,8 @@ impl Table {
             {
                 continue;
             }
-            if let HealDecision::Correction {
-                write_offset,
-                bytes,
-                ..
-            } = self.heal_correction_for_block(file, &keyed, transform)
-            {
-                out.push((write_offset, bytes));
+            if let Some(correction) = self.heal_correction_for_block(file, &keyed, transform) {
+                out.push(correction);
             }
         }
         out

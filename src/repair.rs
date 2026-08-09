@@ -141,12 +141,21 @@ pub(crate) fn compute_table_checksum_with_overrides(
             let ov_end = *off + bytes.len() as u64;
             let lo = (*off).max(chunk_start);
             let hi = ov_end.min(chunk_end);
-            if lo < hi {
-                let dst = chunk.get_mut((lo - chunk_start) as usize..(hi - chunk_start) as usize);
-                let src = bytes.get((lo - *off) as usize..(hi - *off) as usize);
-                if let (Some(dst), Some(src)) = (dst, src) {
-                    dst.copy_from_slice(src);
-                }
+            // The overlap lies inside a `<= 256 KiB` chunk, so every difference
+            // fits `usize`; `try_from` handles the 32-bit target without a cast.
+            let (Ok(dst_lo), Ok(dst_hi), Ok(src_lo), Ok(src_hi)) = (
+                usize::try_from(lo - chunk_start),
+                usize::try_from(hi - chunk_start),
+                usize::try_from(lo - *off),
+                usize::try_from(hi - *off),
+            ) else {
+                continue;
+            };
+            if lo < hi
+                && let (Some(dst), Some(src)) =
+                    (chunk.get_mut(dst_lo..dst_hi), bytes.get(src_lo..src_hi))
+            {
+                dst.copy_from_slice(src);
             }
         }
         hasher.update(&*chunk);
