@@ -164,6 +164,17 @@ impl SeqnoBoundsMap {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    /// Number of recorded entries at or above `from_offset`: the LIVE entries
+    /// of a tight-space restricted view (its `[0, from_offset)` blocks are
+    /// punched, so their entries are dead). `from_offset == 0` yields [`len`].
+    #[must_use]
+    pub fn live_len(&self, from_offset: u64) -> usize {
+        self.entries
+            .iter()
+            .filter(|(off, _)| *off >= from_offset)
+            .count()
+    }
 }
 
 #[cfg(test)]

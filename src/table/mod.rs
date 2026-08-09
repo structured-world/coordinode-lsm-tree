@@ -2145,9 +2145,15 @@ impl Table {
 
         // Descriptor declares this SST footer-bearing, and an SST is
         // homogeneous — every data block carries a footer under `expected_algo`.
+        // A restricted view's punched prefix blocks are dead and read as zeros,
+        // so skip them (only the live suffix is footer-verified).
+        let punch = self.punch_offset();
         for handle in self.block_index.iter() {
             let handle = handle?;
             let block_handle = BlockHandle::new(handle.offset(), handle.size());
+            if block_handle.offset().0 < punch {
+                continue;
+            }
             // Load the RAW block (footer intact) — do NOT route through
             // `load_data_block`, which strips the footer via `from_loaded` —
             // and DISK-FRESH: a pristine copy cached before an on-disk
@@ -2183,6 +2189,18 @@ impl Table {
     pub(crate) fn verify_blob_links(&self) -> crate::Result<()> {
         use crate::coding::Decode;
         use alloc::collections::BTreeMap;
+
+        // A restricted view cannot be blob-link-cross-checked: the recorded
+        // `linked_blob_files` section aggregates the WHOLE table's indirections
+        // (per-blob-id counts, not per-block), but its punched prefix is
+        // unscannable, so the derived accounting can only cover the live suffix
+        // and would never match. This gate exists to stop a heal from laundering
+        // a re-stamped section, but an in-place heal rewrites DATA blocks only
+        // (it never touches `linked_blob_files`), so skipping it here forfeits no
+        // heal-attribution guarantee for a restricted table.
+        if self.restrict_lower_bound().is_some() {
+            return Ok(());
+        }
 
         // Derive the indirection accounting FIRST, even when the section is
         // absent: a table that still carries `ValueHandle` indirections but
@@ -2372,6 +2390,11 @@ impl Table {
                     .collect();
                 if frame_blocks {
                     for k in &part_keyed {
+                        // Punched prefix blocks of a restricted view decode to
+                        // zeros; skip their separator cross-check (they are dead).
+                        if k.offset().0 < self.punch_offset() {
+                            continue;
+                        }
                         self.verify_separator_matches_block(k)?;
                     }
                 }
@@ -2419,6 +2442,11 @@ impl Table {
             if frame_blocks {
                 self.verify_handles_frame_blocks(&handles, data_section.pos(), data_section.len())?;
                 for k in &keyed {
+                    // Punched prefix blocks of a restricted view decode to zeros;
+                    // skip their separator cross-check (they are dead).
+                    if k.offset().0 < self.punch_offset() {
+                        continue;
+                    }
                     self.verify_separator_matches_block(k)?;
                 }
             }
@@ -2477,7 +2505,16 @@ impl Table {
         let section_end = pos
             .checked_add(len)
             .ok_or(crate::Error::InvalidHeader("data section length overflows"))?;
+        // A restricted view's punched prefix blocks read as zeros, so their
+        // physical frame can no longer be probed. They tile the section by
+        // length (punch preserves file size) but are dead, so skip framing
+        // them. Index-section handles sit above the (data-section) punch
+        // offset and are never skipped.
+        let punch = self.punch_offset();
         for handle in handles {
+            if handle.offset().0 < punch {
+                continue;
+            }
             let probed = self.probe_block_handle_at(handle.offset().0, section_end)?;
             if probed.size() != handle.size() {
                 return Err(crate::Error::InvalidHeader(
@@ -2572,10 +2609,16 @@ impl Table {
         // `bounds_for` returns `None` — while a genuinely empty table (no data
         // blocks) still passes, since the loop runs zero times and `checked`
         // equals the empty map's length.
+        // Skip a restricted view's punched (dead) prefix blocks; count only the
+        // LIVE seqno_bounds entries below so the cross-check covers the suffix.
+        let punch = self.punch_offset();
         let mut checked = 0usize;
         for handle in self.block_index.iter() {
             let handle = handle?;
             let block_handle = BlockHandle::new(handle.offset(), handle.size());
+            if block_handle.offset().0 < punch {
+                continue;
+            }
             let Some(recorded) = seqno_bounds.bounds_for(block_handle.offset().0) else {
                 return Err(crate::Error::InvalidHeader(
                     "seqno_bounds is missing a data block's entry",
@@ -2628,7 +2671,7 @@ impl Table {
         // Every recorded entry matched some walked block (offsets are unique
         // on both sides), so equal counts mean the map records EXACTLY the
         // table's blocks — a forged extra entry cannot hide among them.
-        if checked != seqno_bounds.len() {
+        if checked != seqno_bounds.live_len(punch) {
             return Err(crate::Error::InvalidHeader(
                 "seqno_bounds carries entries for blocks the index does not hold",
             ));
@@ -2653,9 +2696,15 @@ impl Table {
     /// full scan.
     #[cfg(feature = "std")]
     pub(crate) fn verify_block_entry_counts(&self) -> crate::Result<()> {
+        // A restricted view's punched prefix blocks are dead (read as zeros);
+        // only its live suffix blocks are entry-count-verified.
+        let punch = self.punch_offset();
         for handle in self.block_index.iter() {
             let handle = handle?;
             let block_handle = BlockHandle::new(handle.offset(), handle.size());
+            if block_handle.offset().0 < punch {
+                continue;
+            }
             #[cfg(feature = "columnar")]
             if self.metadata.columnar {
                 let block = self.load_block_from_disk(&block_handle, BlockType::Columnar)?;
@@ -2754,10 +2803,18 @@ impl Table {
             }
             return Ok(());
         }
+        // A restricted view's punched prefix blocks are DEAD (never read), and
+        // the zone_map still carries their entries (the file is punched, not
+        // rewritten). Skip those blocks and count only the LIVE zone_map entries
+        // below, so the cross-check authenticates exactly the suffix.
+        let punch = self.punch_offset();
         let mut checked = 0usize;
         for handle in self.block_index.iter() {
             let handle = handle?;
             let block_handle = BlockHandle::new(handle.offset(), handle.size());
+            if block_handle.offset().0 < punch {
+                continue;
+            }
             let Some(recorded) = zone_map.columns_for(block_handle.offset().0) else {
                 return Err(crate::Error::InvalidHeader(
                     "zone_map is missing a data block's entry",
@@ -2815,7 +2872,7 @@ impl Table {
                 .checked_add(1)
                 .ok_or(crate::Error::InvalidHeader("zone_map"))?;
         }
-        if checked != zone_map.len() {
+        if checked != zone_map.live_len(punch) {
             return Err(crate::Error::InvalidHeader(
                 "zone_map carries entries for blocks the index does not hold",
             ));
@@ -2918,9 +2975,16 @@ impl Table {
         // expected answer. `seen` dedups across blocks (a key's older
         // versions in later blocks must not overwrite the expectation).
         let mut seen: crate::HashSet<Vec<u8>> = crate::HashSet::default();
+        // A restricted view's punched prefix blocks are dead; skip them. Their
+        // keys are superseded, so a suffix key's newest version is in the suffix,
+        // and reads never consult the locator's prefix answers.
+        let punch = self.punch_offset();
         for handle in self.block_index.iter() {
             let handle = handle?;
             let block_handle = BlockHandle::new(handle.offset(), handle.size());
+            if block_handle.offset().0 < punch {
+                continue;
+            }
             // Load the disk-fresh row block once so a `Restart` / `Entry`
             // slot hint can be probed against it below. Columnar blocks carry
             // no in-block slot semantics (rows are reconstructed on load), so
@@ -3043,10 +3107,17 @@ impl Table {
         // also ends the preceding block: both blocks would decode and probe
         // cleanly on their own, yet after reopen the index seeks the first block
         // and a later compaction could persist the stale (lower-seqno) version.
+        // A restricted view's punched prefix blocks are dead; skip them. The
+        // global sort order still holds across the LIVE suffix, so `prev_internal`
+        // simply starts at the first live block.
+        let punch = self.punch_offset();
         let mut prev_internal: Option<(UserKey, SeqNo)> = None;
         for handle in self.block_index.iter() {
             let handle = handle?;
             let block_handle = BlockHandle::new(handle.offset(), handle.size());
+            if block_handle.offset().0 < punch {
+                continue;
+            }
             let block = self.load_block_from_disk(&block_handle, BlockType::Data)?;
             let data_block =
                 DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())?;
@@ -3261,10 +3332,17 @@ impl Table {
             crate::table::filter::block::FilterBlock,
         > = alloc::collections::BTreeMap::new();
 
+        // A restricted view's punched prefix blocks decode to zeros; skip them.
+        // Their keys are superseded, so the live filter is only obligated to
+        // report the suffix keys present.
+        let punch = self.punch_offset();
         let mut prev_key: Option<Vec<u8>> = None;
         for handle in self.block_index.iter() {
             let handle = handle?;
             let block_handle = BlockHandle::new(handle.offset(), handle.size());
+            if block_handle.offset().0 < punch {
+                continue;
+            }
             let entries = self.decode_block_entries(&block_handle)?;
             for entry in entries {
                 // Blocks are sorted by key then descending seqno, so a key's
@@ -3467,6 +3545,15 @@ impl Table {
             .map(|(k, s)| (k.clone(), s));
         let mut sentinel_excluded = false;
 
+        // A restricted (tight-space) view's `[0, punch)` prefix blocks are
+        // punched to zeros: the index still LISTS them (so counting index
+        // entries yields the whole-table block count, which `meta` records),
+        // but they no longer DECODE. Count every block toward `data_block_count`
+        // without decoding, and aggregate entries / keys / seqnos over the live
+        // suffix only. `meta.item_count` describes the whole table, so its
+        // exact-equality check relaxes to a subset check for a restricted view.
+        let punch = self.punch_offset();
+        let restricted = self.restrict_lower_bound().is_some();
         let mut count: u64 = 0;
         let mut block_count: u64 = 0;
         let mut first_key: Option<UserKey> = None;
@@ -3476,12 +3563,15 @@ impl Table {
         for handle in self.block_index.iter() {
             let handle = handle?;
             let block_handle = BlockHandle::new(handle.offset(), handle.size());
+            block_count = block_count
+                .checked_add(1)
+                .ok_or(crate::Error::InvalidHeader("meta bounds"))?;
+            if block_handle.offset().0 < punch {
+                continue;
+            }
             let entries = self.decode_block_entries(&block_handle)?;
             count = count
                 .checked_add(entries.len() as u64)
-                .ok_or(crate::Error::InvalidHeader("meta bounds"))?;
-            block_count = block_count
-                .checked_add(1)
                 .ok_or(crate::Error::InvalidHeader("meta bounds"))?;
             if first_key.is_none() {
                 first_key = entries.first().map(|e| e.key.user_key.clone());
@@ -3507,7 +3597,16 @@ impl Table {
                 seqno_hi = Some(seqno_hi.map_or(s, |hi| hi.max(s)));
             }
         }
-        if count != meta.item_count {
+        if restricted {
+            // The live suffix is a subset of the whole table `meta` describes;
+            // it must not decode to MORE entries than the recorded whole-table
+            // count (that would be a grafted-in forge, not a punched prefix).
+            if count > meta.item_count {
+                return Err(crate::Error::InvalidHeader(
+                    "restricted view decodes to more entries than meta item_count",
+                ));
+            }
+        } else if count != meta.item_count {
             return Err(crate::Error::InvalidHeader(
                 "meta item_count disagrees with the decoded entry count",
             ));
@@ -3725,10 +3824,18 @@ impl Table {
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.as_deref(),
             )?;
+            // A restricted view's punched prefix frames read as zeros and cannot
+            // be frame-decoded; the map still records them (it is not rewritten
+            // on reopen), so cross-check `recorded_seen` against the LIVE map
+            // entries (offset >= punch) below instead of the whole map length.
+            let punch = self.punch_offset();
             let mut recorded_seen = 0usize;
             for handle in self.block_index.iter() {
                 let handle = handle?;
                 let block_handle = BlockHandle::new(handle.offset(), handle.size());
+                if block_handle.offset().0 < punch {
+                    continue;
+                }
                 let Some(ends) = map.ends_for(block_handle.offset().0) else {
                     continue;
                 };
@@ -3775,10 +3882,11 @@ impl Table {
                     }
                 }
             }
-            // Every recorded entry matched a walked block (offsets are unique
-            // on both sides), so equal counts mean the map records ONLY the
-            // table's blocks.
-            if recorded_seen != map.len() {
+            // Every recorded LIVE entry matched a walked block (offsets are
+            // unique on both sides), so equal counts mean the map records ONLY
+            // the table's blocks. A restricted view compares against the live
+            // map entries; the punched prefix's entries are legitimately present.
+            if recorded_seen != map.live_len(punch) {
                 return Err(crate::Error::InvalidHeader(
                     "block_layout carries entries for blocks the index does not hold",
                 ));
@@ -6453,6 +6561,19 @@ impl Table {
             data_end = handle.offset().0 + u64::from(handle.size());
         }
         Ok(data_end)
+    }
+
+    /// Byte offset of this view's first LIVE data block: `0` for a normal table,
+    /// or the punch offset for a tight-space RESTRICTED view (its `[0, offset)`
+    /// data blocks are hole-punched and read as zeros). A data block or section
+    /// entry at a lower offset is DEAD (superseded, never read), so the
+    /// disk-fresh verification gates skip it. A block-index read failure grades
+    /// `0` (verify everything) rather than skipping, so a corrupt index cannot
+    /// silently exempt blocks from checking.
+    pub(crate) fn punch_offset(&self) -> u64 {
+        self.restrict_lower_bound()
+            .and_then(|bound| self.punch_offset_for(bound).ok())
+            .unwrap_or(0)
     }
 
     /// The whole-file digest for a normal table, or the LIVE-SUFFIX digest for a

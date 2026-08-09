@@ -145,6 +145,18 @@ impl BlockLayoutMap {
         self.entries.is_empty()
     }
 
+    /// Number of recorded entries at or above `from_offset`: the LIVE entries
+    /// of a tight-space restricted view (its `[0, from_offset)` blocks are
+    /// punched, so their layout entries describe dead frames). `from_offset ==
+    /// 0` yields [`len`](Self::len).
+    #[cfg(feature = "std")]
+    pub fn live_len(&self, from_offset: u64) -> usize {
+        self.entries
+            .iter()
+            .filter(|(off, _)| *off >= from_offset)
+            .count()
+    }
+
     /// Recorded block offsets, ascending. Test-only enumeration helper.
     /// Its sole caller is the zstd large-block roundtrip test, so it is gated
     /// to that feature to stay dead-code-clean in every other test build.

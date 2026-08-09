@@ -197,6 +197,94 @@ fn tight_space_crash_after_first_slice_recovers_all_keys_on_reopen() -> crate::R
     Ok(())
 }
 
+/// A legitimately RESTRICTED table (a tight-space compaction crashed after
+/// punching its first slice, so its `[0, punch)` data-block prefix reads as
+/// zeros) must pass every heal-reconcile security gate. Each gate walks the
+/// data blocks and would, before restriction-awareness, try to decode the
+/// punched prefix and FALSELY reject the healthy restricted view, refusing to
+/// reconcile a legitimate heal and stranding recovery. Cross-checks the suffix
+/// only; the punched prefix is dead. This is the reopen state of
+/// [`tight_space_crash_after_first_slice_recovers_all_keys_on_reopen`]. (The
+/// whole-file digest's own suffix-awareness is covered separately by
+/// `reopen_restricted_carries_the_live_suffix_digest`; `verify_integrity` reads
+/// through `std::fs`, so it cannot see this MemFs-backed table.)
+#[test]
+fn restricted_view_passes_every_reconcile_gate() -> crate::Result<()> {
+    use core::sync::atomic::Ordering;
+
+    const N: u64 = 2_000;
+    let k = |i: u64| format!("key{i:08}");
+
+    let dir = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    let config = Config::new(
+        &dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_shared_fs(Arc::new(mem.clone()));
+    let failpoint = config.fail_tight_after_first_slice.clone();
+    let tree = match config.open()? {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+
+    for i in 0..N {
+        tree.insert(k(i).as_bytes(), vec![0xCDu8; 64], i);
+    }
+    tree.flush_active_memtable(0)?;
+    let used = tree.storage_stats()?.used_bytes;
+
+    mem.set_capacity(used + used / 4);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = true;
+    })?;
+
+    failpoint.store(true, Ordering::SeqCst);
+    assert!(
+        tree.major_compact(64 * 1024 * 1024, 0).is_err(),
+        "the crash failpoint must abort the tight-space compaction",
+    );
+    assert!(
+        mem.punched_bytes() > 0,
+        "the first slice must have punched before the crash",
+    );
+
+    // Reopen so recovery rebuilds the restricted input from the persisted
+    // manifest restriction.
+    drop(tree);
+    let reopened = Config::new(
+        &dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(mem))
+    .open()?;
+
+    // Locate the restricted table and drive every heal-reconcile gate directly:
+    // each must accept the healthy suffix without decoding the punched prefix.
+    let version = reopened.current_version();
+    let restricted = version
+        .iter_tables()
+        .find(|t| t.restrict_lower_bound().is_some())
+        .expect("the punched input must reopen as a restricted table");
+
+    restricted.verify_kv_checksums()?;
+    restricted.verify_blob_links()?;
+    restricted.verify_tli_mirrors()?;
+    restricted.verify_seqno_bounds()?;
+    restricted.verify_block_entry_counts()?;
+    restricted.verify_zone_map()?;
+    restricted.verify_locator()?;
+    restricted.verify_filter(None)?;
+    restricted.verify_block_layout()?;
+    restricted.verify_point_read_reachability()?;
+    restricted.verify_metadata_bounds()?;
+    Ok(())
+}
+
 /// A KV-separated tight-space compaction that RELOCATES a fragmented blob
 /// file in slices and crashes after the first slice must reopen consistently:
 /// the relocated entries (now in fresh compact files referenced by the
