@@ -2181,6 +2181,7 @@ impl Table {
     /// addressed DATA block (the full integrity check the scrub reconcile
     /// wants); with it `false` only the index structure is authenticated, for
     /// the salvage walk that runs over corrupt data blocks by design.
+    #[cfg(feature = "std")]
     fn verify_tli_mirrors_inner(&self, frame_blocks: bool) -> crate::Result<()> {
         use crate::table::block::ParsedItem as _;
 
