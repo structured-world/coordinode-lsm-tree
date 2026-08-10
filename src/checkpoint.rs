@@ -710,7 +710,11 @@ pub fn run_checkpoint<T: AbstractTree>(
     // Linking that table would snapshot healed bytes under the stale pre-heal
     // digest with no marker copied, so abort the checkpoint instead.
     #[cfg(not(feature = "page_ecc"))]
-    crate::scrub::abort_checkpoint_if_pending_heals(tree)?;
+    crate::scrub::abort_checkpoint_if_pending_heals(
+        tree,
+        "this build is compiled without page_ecc, so it has no ECC scan machinery; \
+         run a scrub with a Page-ECC-enabled build",
+    )?;
 
     // Hold the link window for the duration too: an in-place heal that has
     // already probed an SST's link count as exclusive must not observe this
@@ -725,7 +729,11 @@ pub fn run_checkpoint<T: AbstractTree>(
     // impossible (it needs the mutation window the link window excludes), so
     // abort if any marker remains rather than snapshot a healed table under a
     // stale digest. The operator retries; the next attempt reconciles it.
-    crate::scrub::abort_checkpoint_if_pending_heals(tree)?;
+    crate::scrub::abort_checkpoint_if_pending_heals(
+        tree,
+        "a concurrent heal left a pending marker after the pre-window reconcile, \
+         and the held link window excludes the mutation window reconciliation needs",
+    )?;
 
     // Capture the seqno BEFORE the flush. Sampling later (between flush
     // and `current_version()`) is unsafe: a concurrent writer can land

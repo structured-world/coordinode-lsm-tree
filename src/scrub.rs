@@ -477,14 +477,16 @@ pub(crate) fn reconcile_pending_heals(tree: &impl AbstractTree) -> crate::Result
 /// Returns an error if any table has a pending marker, or if a marker probe
 /// itself fails (fail-closed).
 #[cfg(feature = "std")]
-pub(crate) fn abort_checkpoint_if_pending_heals(tree: &impl AbstractTree) -> crate::Result<()> {
+pub(crate) fn abort_checkpoint_if_pending_heals(
+    tree: &impl AbstractTree,
+    reason: &str,
+) -> crate::Result<()> {
     let version = tree.current_version();
     for table in version.iter_tables() {
         if heal_attest::exists(&*table.fs, &table.path).map_err(crate::Error::Io)? {
             return Err(crate::Error::from(std::io::Error::other(alloc::format!(
-                "checkpoint aborted: table #{} has a pending heal attestation that this build \
-                 (compiled without page_ecc) cannot reconcile; run a scrub with a \
-                 Page-ECC-enabled build and retry",
+                "checkpoint aborted: table #{} has a pending heal attestation that cannot be \
+                 reconciled here ({reason}); retry the checkpoint",
                 table.id(),
             ))));
         }
