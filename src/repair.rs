@@ -97,24 +97,8 @@ pub(crate) fn compute_table_checksum_from(
     path: &std::path::Path,
     start: u64,
 ) -> crate::Result<u128> {
-    use std::io::{Seek, SeekFrom};
-    let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
-    // Seek + sequential read (not positioned `read_at`), so at `start == 0` this
-    // is byte-for-byte the same read pattern as `compute_table_checksum`.
-    if start != 0 {
-        file.seek(SeekFrom::Start(start))?;
-    }
-    let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break; // EOF
-        }
-        let Some(chunk) = buf.get(..n) else { break };
-        hasher.update(chunk);
-    }
-    Ok(hasher.digest128())
+    // The offset-only case is the override-splicing digest with no overrides.
+    compute_table_checksum_with_overrides(fs, path, start, &[])
 }
 
 /// Streams `path` start to end through XXH3-128, matching the digest a normal
@@ -123,21 +107,9 @@ pub(crate) fn compute_table_checksum(
     fs: &dyn crate::fs::Fs,
     path: &std::path::Path,
 ) -> crate::Result<u128> {
-    let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
-    let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break; // EOF
-        }
-        // `get(..n)` rather than `buf[..n]` to satisfy
-        // `deny(clippy::indexing_slicing)`; `Read::read` guarantees
-        // `n <= buf.len()`, so this slice is always present.
-        let Some(chunk) = buf.get(..n) else { break };
-        hasher.update(chunk);
-    }
-    Ok(hasher.digest128())
+    // The whole-file case is the override-splicing digest from offset 0 with no
+    // overrides: one shared read loop in `compute_table_checksum_with_overrides`.
+    compute_table_checksum_with_overrides(fs, path, 0, &[])
 }
 
 /// As [`compute_table_checksum`], but streams the file with `overrides` spliced
