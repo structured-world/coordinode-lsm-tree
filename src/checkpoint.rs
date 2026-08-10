@@ -704,6 +704,13 @@ pub fn run_checkpoint<T: AbstractTree>(
     // write half) mutually excludes, so doing it after would deadlock.
     #[cfg(feature = "page_ecc")]
     crate::scrub::reconcile_pending_heals(tree)?;
+    // A build WITHOUT page_ecc cannot reconcile a pending heal (no ECC scan
+    // machinery), but a feature-enabled binary may have healed an SST and
+    // crashed before refreshing its manifest, leaving a `.heal-attest` marker.
+    // Linking that table would snapshot healed bytes under the stale pre-heal
+    // digest with no marker copied, so abort the checkpoint instead.
+    #[cfg(not(feature = "page_ecc"))]
+    crate::scrub::abort_checkpoint_if_pending_heals(tree)?;
 
     // Hold the link window for the duration too: an in-place heal that has
     // already probed an SST's link count as exclusive must not observe this
@@ -711,6 +718,14 @@ pub fn run_checkpoint<T: AbstractTree>(
     // the heal is about to change, under a digest the checkpoint manifest
     // already recorded). The heal side holds the read half per table.
     let _link_window = deletion_pause.enter_link_window();
+
+    // Residual-race guard: the pre-window reconciliation released each table's
+    // mutation window before the link window was taken, so a concurrent heal
+    // could have left a fresh pending marker in between. Reconciling now is
+    // impossible (it needs the mutation window the link window excludes), so
+    // abort if any marker remains rather than snapshot a healed table under a
+    // stale digest. The operator retries; the next attempt reconciles it.
+    crate::scrub::abort_checkpoint_if_pending_heals(tree)?;
 
     // Capture the seqno BEFORE the flush. Sampling later (between flush
     // and `current_version()`) is unsafe: a concurrent writer can land

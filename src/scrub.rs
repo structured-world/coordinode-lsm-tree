@@ -457,6 +457,41 @@ pub(crate) fn reconcile_pending_heals(tree: &impl AbstractTree) -> crate::Result
     }
 }
 
+/// Abort a checkpoint if any table still carries a pending `.heal-attest`
+/// marker, when the marker cannot be reconciled at this point:
+///
+/// - On a build WITHOUT `page_ecc` (no ECC scan machinery), used BEFORE the
+///   link window in place of reconciliation.
+/// - On ANY build, used AFTER the link window is held: reconciliation there is
+///   impossible because it needs each table's mutation window, which the link
+///   window (the write half of the same lock) mutually excludes. This closes
+///   the residual race where a concurrent heal left a fresh marker between the
+///   pre-window reconcile and the link-window acquisition.
+///
+/// Either way, snapshotting a healed table under its stale pre-heal digest with
+/// no marker copied would produce an immutable checkpoint that fails integrity
+/// verification forever. The operator retries; the next attempt reconciles it.
+///
+/// # Errors
+///
+/// Returns an error if any table has a pending marker, or if a marker probe
+/// itself fails (fail-closed).
+#[cfg(feature = "std")]
+pub(crate) fn abort_checkpoint_if_pending_heals(tree: &impl AbstractTree) -> crate::Result<()> {
+    let version = tree.current_version();
+    for table in version.iter_tables() {
+        if heal_attest::exists(&*table.fs, &table.path).map_err(crate::Error::Io)? {
+            return Err(crate::Error::from(std::io::Error::other(alloc::format!(
+                "checkpoint aborted: table #{} has a pending heal attestation that this build \
+                 (compiled without page_ecc) cannot reconcile; run a scrub with a \
+                 Page-ECC-enabled build and retry",
+                table.id(),
+            ))));
+        }
+    }
+    Ok(())
+}
+
 /// Whether a per-SST HEAL scan warrants the manifest-digest reconciliation:
 /// the scan must have left the file free of known corruption (no
 /// uncorrectable blocks, no findings). Restamping a partially-healed file
