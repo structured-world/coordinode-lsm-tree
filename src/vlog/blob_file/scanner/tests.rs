@@ -318,6 +318,62 @@ fn blob_scanner_rejects_oversized_on_disk_len() -> crate::Result<()> {
     Ok(())
 }
 
+/// A `data` section that ends fewer than `BLOB_HEADER_LEN` bytes past a frame
+/// magic (a partial tail at the section boundary) must be rejected BEFORE the
+/// fixed-header reads, so those reads never consume bytes from the following
+/// SFA section. Without the pre-read bound, the header fields are read into the
+/// adjacent `meta` section and the frame is only rejected afterward by the
+/// header-CRC / span check, having already crossed the boundary. The bound
+/// rejects the incomplete tail directly as `InvalidHeader`.
+#[test]
+fn blob_scanner_rejects_a_partial_header_at_the_section_boundary() -> crate::Result<()> {
+    use crate::io::{LittleEndian, WriteBytesExt};
+    use std::io::Write;
+
+    let dir = tempdir()?;
+    let blob_file_path = dir.path().join("0");
+
+    // A `data` section holding a frame magic plus only a few of the header's
+    // fixed bytes, then the `meta` section. `data_end` therefore falls INSIDE
+    // the header: `magic_offset + BLOB_HEADER_LEN` overruns it.
+    {
+        let file = std::fs::File::create(&blob_file_path)?;
+        let mut sfa_writer = crate::sfa::Writer::from_writer(file);
+        sfa_writer.start("data")?;
+        sfa_writer.write_all(crate::vlog::blob_file::writer::BLOB_HEADER_MAGIC)?;
+        // Only 8 of the remaining BLOB_HEADER_LEN - 4 header bytes: the section
+        // ends mid-header (well under a full BLOB_HEADER_LEN from the magic).
+        sfa_writer.write_u64::<LittleEndian>(0)?;
+
+        sfa_writer.start("meta")?;
+        let metadata = crate::vlog::blob_file::meta::Metadata {
+            id: 0,
+            version: 4,
+            created_at: 0,
+            item_count: 0,
+            total_compressed_bytes: 0,
+            total_uncompressed_bytes: 0,
+            key_range: crate::KeyRange::new((b"a"[..].into(), b"a"[..].into())),
+            compression: crate::CompressionType::None,
+        };
+        metadata.encode_into(&mut sfa_writer)?;
+        sfa_writer.into_inner()?.sync_all()?;
+    }
+
+    let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
+    let result = scanner.next().unwrap();
+    assert!(
+        matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
+        "the partial tail is rejected before the header read, not parsed into \
+         the adjacent section, got: {result:?}",
+    );
+    assert!(
+        scanner.next().is_none(),
+        "no whole frame fits in the truncated data section: the scan terminates",
+    );
+    Ok(())
+}
+
 /// A CRC-valid frame whose declared `real_val_len` exceeds the 256 MiB
 /// decompression cap must be rejected by the pre-allocation cap check even when
 /// the frame still FITS the data section. Only `on_disk_val_len` feeds the
