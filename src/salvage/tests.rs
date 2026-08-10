@@ -6550,15 +6550,16 @@ fn salvage_blob_file_drops_a_frame_whose_key_regresses() -> crate::Result<()> {
         report.records_salvaged, 2,
         "the order-regressing frame is dropped, not re-emitted: {report:?}",
     );
-    assert_eq!(
-        report.dropped.len(),
-        1,
-        "exactly the regressing frame drops"
-    );
+    let [dropped] = report.dropped.as_slice() else {
+        panic!(
+            "exactly the regressing frame drops, got {:?}",
+            report.dropped
+        );
+    };
     assert!(
-        matches!(report.dropped[0].reason, BlobDropReason::Corrupt(_)),
+        matches!(dropped.reason, BlobDropReason::Corrupt(_)),
         "the drop is recorded as corruption: {:?}",
-        report.dropped[0].reason,
+        dropped.reason,
     );
 
     // The salvaged file is sorted, so it re-opens under the writer's contract.
