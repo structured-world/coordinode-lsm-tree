@@ -1778,6 +1778,25 @@ impl BlobSalvageReport {
     }
 }
 
+/// Whether `entry`'s internal key sorts BEFORE `prev` under the blob-file order
+/// (ascending user key, ties broken by DESCENDING seqno, newest first). A `None`
+/// `prev` (the first accepted record) never regresses.
+fn blob_key_regresses(
+    prev: Option<&(crate::UserKey, crate::SeqNo)>,
+    entry: &crate::vlog::blob_file::scanner::ScanEntry,
+) -> bool {
+    let Some((prev_key, prev_seqno)) = prev else {
+        return false;
+    };
+    match entry.key.as_ref().cmp(prev_key.as_ref()) {
+        core::cmp::Ordering::Less => true,
+        // Same user key: newest-first means the higher seqno comes first, so a
+        // seqno ABOVE the previous one at an equal key is out of order.
+        core::cmp::Ordering::Equal => entry.seqno > *prev_seqno,
+        core::cmp::Ordering::Greater => false,
+    }
+}
+
 /// Salvages the readable records of the blob (vlog) file at `source` into a fresh
 /// blob file at `dest`.
 ///
@@ -1857,6 +1876,11 @@ pub fn salvage_blob_file(
     let mut records_salvaged = 0usize;
     let mut offset_remap: Vec<(u64, u64)> = Vec::new();
     let mut dropped: Vec<DroppedBlob> = Vec::new();
+    // The internal key of the last record accepted for re-emit, to enforce the
+    // `BlobWriter` sorted-input contract on the salvaged file (see the accept
+    // arm). Blob files order by user key ascending, ties broken by DESCENDING
+    // seqno (newest first).
+    let mut prev_written: Option<(crate::UserKey, crate::SeqNo)> = None;
     // Emit every recoverable record. A `write` failure here (not a per-record
     // checksum/corruption drop, which the match arms absorb) is a hard error: it
     // leaves a partial `dest`, removed on the error path below the same way the
@@ -1909,6 +1933,24 @@ pub fn salvage_blob_file(
                         ),
                     });
                 }
+                // A frame whose internal key regresses below the last accepted
+                // record: `BlobWriter` requires records in key order (ascending
+                // user key, ties by descending seqno), and re-emitting an
+                // out-of-order frame would corrupt the salvaged file's key range
+                // and break the later merge scanner's per-reader sorted-input
+                // assumption (mismatched blob relocation, or a panic in the
+                // relocating compaction). The frame's own checksum is intact, so
+                // this is not payload rot; drop it and keep the sorted prefix.
+                Ok(entry) if blob_key_regresses(prev_written.as_ref(), &entry) => {
+                    dropped.push(DroppedBlob {
+                        reason: BlobDropReason::Corrupt(
+                            "frame's internal key regresses below the previous salvaged \
+                             record; re-emitting it would violate the blob writer's \
+                             sorted-input contract"
+                                .to_string(),
+                        ),
+                    });
+                }
                 Ok(entry) => {
                     // Record the frame relocation BEFORE the write advances the
                     // writer: existing SST ValueHandles point at SOURCE frame
@@ -1919,6 +1961,7 @@ pub fn salvage_blob_file(
                     let salvaged_offset = writer.offset();
                     writer.write(&entry.key, entry.seqno, &entry.value)?;
                     offset_remap.push((entry.offset, salvaged_offset));
+                    prev_written = Some((entry.key.clone(), entry.seqno));
                     records_salvaged += 1;
                 }
                 // Payload rot: the checksum failed, so the scanner RESYNCS at the
