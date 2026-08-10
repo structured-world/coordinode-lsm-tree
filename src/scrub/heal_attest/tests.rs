@@ -1,6 +1,6 @@
 #![expect(clippy::unwrap_used, reason = "test asserts on known-present values")]
 
-use super::{AttestResult, attest_path, attests, remove, write};
+use super::{AttestResult, attest_path, attests, remove, write, write_in_progress};
 use crate::Checksum;
 use crate::fs::{Fs, StdFs};
 use std::sync::Arc;
@@ -90,6 +90,54 @@ fn attests_rejects_a_truncated_sidecar() {
             AttestResult::Inconclusive
         ),
         "a short attestation is inconclusive, not attesting",
+    );
+}
+
+#[test]
+fn attests_rejects_an_oversized_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("7");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // A valid completed marker whose prefix `deserialize` would accept, followed
+    // by a long garbage tail. Without a read bound the sidecar reader would slurp
+    // the whole attacker-controlled length and then accept the leading record,
+    // both a memory-exhaustion vector and a laundered oversized marker.
+    write(&*fs, &path, None, 7, ck(100), ck(200)).unwrap();
+    let ap = attest_path(&path);
+    let mut bytes = std::fs::read(&ap).unwrap();
+    bytes.extend(std::iter::repeat_n(0u8, 4096));
+    std::fs::write(&ap, &bytes).unwrap();
+
+    // An oversized sidecar is INCONCLUSIVE (rejected), never a trusted marker:
+    // a valid plaintext record is exactly the fixed length, so extra bytes mean
+    // the file is not a marker this build wrote.
+    assert!(
+        matches!(
+            attests(&*fs, &path, None, 7, ck(200), ck(100)),
+            AttestResult::Inconclusive
+        ),
+        "an oversized attestation is inconclusive, not attesting",
+    );
+}
+
+#[test]
+fn attests_rejects_a_legacy_in_progress_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("7");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // A pre-only (in-progress) marker with the CORRECT table id and pre-digest:
+    // only its `kind` differs from a completed marker. It must never authorize a
+    // reconcile, so `attests` rejects it through the Absent branch (a bare
+    // pre-only marker is safe to clear, it does not bind a post-heal digest).
+    write_in_progress(&*fs, &path, None, 7, ck(100)).unwrap();
+    assert!(
+        matches!(
+            attests(&*fs, &path, None, 7, ck(200), ck(100)),
+            AttestResult::Absent
+        ),
+        "a legacy in-progress marker is non-attesting (Absent)",
     );
 }
 
