@@ -589,15 +589,22 @@ fn refresh_healed_checksum(
     // post-bound completed marker UP FRONT instead, and a bare pre-only marker
     // is ignored here. Every path still re-verifies the file structurally below
     // before the digest is reconciled.
-    let attributable = heal_attributable
-        || heal_attest::attests(
-            &*table.fs,
-            &table.path,
-            table.encryption.as_deref(),
-            table.id(),
-            fresh,
-            current,
-        );
+    let attest_result = heal_attest::attests(
+        &*table.fs,
+        &table.path,
+        table.encryption.as_deref(),
+        table.id(),
+        fresh,
+        current,
+    );
+    let attributable =
+        heal_attributable || matches!(attest_result, heal_attest::AttestResult::Attests);
+    // A sidecar the probe could not read CONCLUSIVELY must never trigger marker
+    // removal in the unattributable branch below: it may be a
+    // transiently-unreadable VALID marker, and deleting it would strand the
+    // healed table under the stale digest forever. Only a conclusively absent /
+    // non-attesting marker is safe to clear.
+    let sidecar_inconclusive = matches!(attest_result, heal_attest::AttestResult::Inconclusive);
     // This pass healed: record the attestation BEFORE reconciling, so a crash
     // during the reconciliation is recoverable by the next scrub. Best-effort —
     // a write failure only forfeits that recovery, it never fails the heal.
@@ -669,9 +676,12 @@ fn refresh_healed_checksum(
         // re-stamped range_tombstones / delete_bitmap would resurrect the rows
         // it masked, the scariest of the three surfaces.
         // This branch means the mismatch is NOT attributable to a heal, so no
-        // marker of this pass attests the current bytes: any marker present is a
-        // stale one that does not attest, and clearing it is the correct
-        // hygiene (remove_marker = true throughout).
+        // marker of this pass attests the current bytes: a conclusively
+        // absent / non-attesting marker is stale and clearing it is correct
+        // hygiene. But if the sidecar read was INCONCLUSIVE (a transient I/O /
+        // AEAD / malformed read), keep the marker: it may be a valid marker that
+        // reads cleanly on retry, and deleting it would strand the healed table.
+        let remove_marker = !sidecar_inconclusive;
         match table.has_deletion_metadata() {
             Ok(true) => {
                 return refuse(
@@ -680,11 +690,11 @@ fn refresh_healed_checksum(
                      bitmap), which no cross-check can authenticate; the manifest \
                      digest was not refreshed"
                         .into(),
-                    true,
+                    remove_marker,
                 );
             }
             Ok(false) => {}
-            Err(e) => return refuse(e.to_string(), true),
+            Err(e) => return refuse(e.to_string(), remove_marker),
         }
         return refuse(
             "digest mismatch not attributable to this pass's heal; the file's \
@@ -693,7 +703,7 @@ fn refresh_healed_checksum(
              cross-check to authenticate it and the recovery-time copy may \
              itself be a pre-open restamp; the manifest digest was not refreshed"
                 .into(),
-            true,
+            remove_marker,
         );
     }
 

@@ -135,23 +135,66 @@ fn write_sidecar(
     publish
 }
 
-/// Reads and opens the sidecar, returning its decoded `(kind, id, pre, post)` or
-/// `None` for a missing / unreadable / wrong-length / AEAD-rejected sidecar.
+/// Outcome of reading the sidecar. Distinguishes a CONCLUSIVELY absent sidecar
+/// from one that could not be read: a caller deciding whether to DELETE the
+/// marker must not treat an unreadable / undecryptable / malformed sidecar as
+/// "absent", because that could be a transiently-unreadable VALID marker whose
+/// deletion would strand a healed table under a stale digest forever.
+enum SidecarRead {
+    /// Decoded `(kind, id, pre, post)`.
+    Present(u8, u64, u128, u128),
+    /// Conclusively absent (the file does not exist).
+    Missing,
+    /// Present but not conclusively readable (an open error other than
+    /// not-found, a read error, an AEAD rejection, or a malformed payload).
+    /// Retryable.
+    Inconclusive,
+}
+
+/// Reads and opens the sidecar. See [`SidecarRead`] for the missing-vs-
+/// inconclusive distinction the removal decision relies on.
 fn read_sidecar(
     fs: &dyn Fs,
     table_path: &Path,
     encryption: Option<&dyn EncryptionProvider>,
-) -> Option<(u8, u64, u128, u128)> {
+) -> SidecarRead {
     let path = attest_path(table_path);
-    let mut file = fs.open(&path, &FsOpenOptions::new().read(true)).ok()?;
+    let mut file = match fs.open(&path, &FsOpenOptions::new().read(true)) {
+        Ok(file) => file,
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return SidecarRead::Missing,
+        Err(_) => return SidecarRead::Inconclusive,
+    };
     let mut content = Vec::new();
-    file.read_to_end(&mut content).ok()?;
+    if file.read_to_end(&mut content).is_err() {
+        return SidecarRead::Inconclusive;
+    }
     let plain = match encryption {
-        // A tampered or wrong-key sidecar fails the AEAD open: reject it.
-        Some(enc) => enc.decrypt(&content).ok()?,
+        // A tampered or wrong-key sidecar fails the AEAD open: inconclusive, not
+        // absent, so never delete a marker on this basis.
+        Some(enc) => match enc.decrypt(&content) {
+            Ok(plain) => plain,
+            Err(_) => return SidecarRead::Inconclusive,
+        },
         None => content,
     };
-    deserialize(&plain)
+    match deserialize(&plain) {
+        Some((kind, id, pre, post)) => SidecarRead::Present(kind, id, pre, post),
+        None => SidecarRead::Inconclusive,
+    }
+}
+
+/// Whether an attestation attests the current bytes, is absent, or could not be
+/// read. See [`attests`].
+pub(super) enum AttestResult {
+    /// A completed marker binds exactly `(pre == manifest, post == current)`
+    /// for this table: the stale manifest digest is safe to reconcile.
+    Attests,
+    /// No attesting marker: conclusively missing, or present but binding
+    /// different values / a non-completed kind. Safe to clear.
+    Absent,
+    /// The sidecar could not be read conclusively. Retryable: the caller must
+    /// NOT delete the marker on this basis (it may be a valid marker).
+    Inconclusive,
 }
 
 /// Forges a legacy IN-PROGRESS marker (pre-only). Test-only: production never
@@ -186,10 +229,10 @@ pub(super) fn attests_in_progress(
     manifest: Checksum,
 ) -> bool {
     match read_sidecar(fs, table_path, encryption) {
-        Some((kind, id, pre, _post)) => {
+        SidecarRead::Present(kind, id, pre, _post) => {
             kind == KIND_IN_PROGRESS && id == table_id && pre == manifest.into_u128()
         }
-        None => false,
+        SidecarRead::Missing | SidecarRead::Inconclusive => false,
     }
 }
 
@@ -216,10 +259,12 @@ pub fn write(
 /// Whether a valid attestation proves the CURRENT file (hashing to `current`)
 /// is the healed version recorded against the manifest's `manifest` digest.
 ///
-/// Returns `false` for a missing / unreadable sidecar, a wrong length, a
-/// `table_id` mismatch, or — for an encrypted table — a payload the AEAD open
-/// rejects (tampered or wrong key). A `true` result means the stale manifest
-/// digest is safe to reconcile to `current`.
+/// [`AttestResult::Attests`] means the stale manifest digest is safe to
+/// reconcile to `current`. [`AttestResult::Absent`] means no marker attests
+/// these values (conclusively missing, wrong id, wrong digests, or a
+/// non-completed kind), safe to clear. [`AttestResult::Inconclusive`] means
+/// the sidecar could not be read (I/O / AEAD / malformed): the caller must keep
+/// the marker, since it may be a transiently-unreadable valid one.
 pub(super) fn attests(
     fs: &dyn Fs,
     table_path: &Path,
@@ -227,15 +272,21 @@ pub(super) fn attests(
     table_id: u64,
     current: Checksum,
     manifest: Checksum,
-) -> bool {
+) -> AttestResult {
     match read_sidecar(fs, table_path, encryption) {
-        Some((kind, id, pre, post)) => {
-            kind == KIND_COMPLETED
+        SidecarRead::Present(kind, id, pre, post) => {
+            if kind == KIND_COMPLETED
                 && id == table_id
                 && post == current.into_u128()
                 && pre == manifest.into_u128()
+            {
+                AttestResult::Attests
+            } else {
+                AttestResult::Absent
+            }
         }
-        None => false,
+        SidecarRead::Missing => AttestResult::Absent,
+        SidecarRead::Inconclusive => AttestResult::Inconclusive,
     }
 }
 

@@ -1,6 +1,6 @@
 #![expect(clippy::unwrap_used, reason = "test asserts on known-present values")]
 
-use super::{attest_path, attests, remove, write};
+use super::{AttestResult, attest_path, attests, remove, write};
 use crate::Checksum;
 use crate::fs::{Fs, StdFs};
 use std::sync::Arc;
@@ -18,7 +18,10 @@ fn attests_roundtrips_a_plaintext_attestation() {
     write(&*fs, &path, None, 7, ck(100), ck(200)).unwrap();
     // Trusted only when file digest == post, manifest == pre, and the id matches.
     assert!(
-        attests(&*fs, &path, None, 7, ck(200), ck(100)),
+        matches!(
+            attests(&*fs, &path, None, 7, ck(200), ck(100)),
+            AttestResult::Attests
+        ),
         "a matching attestation is trusted",
     );
 }
@@ -30,12 +33,23 @@ fn attests_rejects_a_mismatched_digest_or_id() {
     let fs: Arc<dyn Fs> = Arc::new(StdFs);
 
     write(&*fs, &path, None, 7, ck(100), ck(200)).unwrap();
+    // A present-but-mismatched marker is conclusively non-attesting (Absent),
+    // not inconclusive: the sidecar read cleanly, its values just do not match.
     // Wrong current (file) digest: the file is not the attested healed version.
-    assert!(!attests(&*fs, &path, None, 7, ck(999), ck(100)));
+    assert!(matches!(
+        attests(&*fs, &path, None, 7, ck(999), ck(100)),
+        AttestResult::Absent
+    ));
     // Wrong manifest digest: something else moved the manifest since the heal.
-    assert!(!attests(&*fs, &path, None, 7, ck(200), ck(999)));
+    assert!(matches!(
+        attests(&*fs, &path, None, 7, ck(200), ck(999)),
+        AttestResult::Absent
+    ));
     // Wrong table id.
-    assert!(!attests(&*fs, &path, None, 8, ck(200), ck(100)));
+    assert!(matches!(
+        attests(&*fs, &path, None, 8, ck(200), ck(100)),
+        AttestResult::Absent
+    ));
 }
 
 #[test]
@@ -44,7 +58,11 @@ fn attests_is_false_without_a_sidecar() {
     let path = dir.path().join("7");
     let fs: Arc<dyn Fs> = Arc::new(StdFs);
 
-    assert!(!attests(&*fs, &path, None, 7, ck(200), ck(100)));
+    // A conclusively absent sidecar (no file) is Absent, safe to clear.
+    assert!(matches!(
+        attests(&*fs, &path, None, 7, ck(200), ck(100)),
+        AttestResult::Absent
+    ));
 }
 
 #[test]
@@ -63,9 +81,15 @@ fn attests_rejects_a_truncated_sidecar() {
         panic!("the written sidecar is non-empty");
     };
     std::fs::write(&ap, short).unwrap();
+    // A malformed (truncated) sidecar is INCONCLUSIVE, not Absent: it does not
+    // attest (so the digest is not reconciled), but it must not be treated as a
+    // clean absence that would license deleting a possibly-recoverable marker.
     assert!(
-        !attests(&*fs, &path, None, 7, ck(200), ck(100)),
-        "a short attestation must be rejected",
+        matches!(
+            attests(&*fs, &path, None, 7, ck(200), ck(100)),
+            AttestResult::Inconclusive
+        ),
+        "a short attestation is inconclusive, not attesting",
     );
 }
 
@@ -138,9 +162,13 @@ fn attests_rejects_a_tampered_or_wrong_key_encrypted_sidecar() {
 
     // A valid sealed attestation is trusted.
     write(&*fs, &path, Some(&enc), 7, ck(100), ck(200)).unwrap();
-    assert!(attests(&*fs, &path, Some(&enc), 7, ck(200), ck(100)));
+    assert!(matches!(
+        attests(&*fs, &path, Some(&enc), 7, ck(200), ck(100)),
+        AttestResult::Attests
+    ));
 
-    // A flipped ciphertext byte fails the AEAD open.
+    // A flipped ciphertext byte fails the AEAD open: inconclusive (an AEAD
+    // rejection is not treated as a clean absence that licenses deletion).
     let ap = attest_path(&path);
     let mut bytes = std::fs::read(&ap).unwrap();
     if let Some(b) = bytes.last_mut() {
@@ -148,15 +176,21 @@ fn attests_rejects_a_tampered_or_wrong_key_encrypted_sidecar() {
     }
     std::fs::write(&ap, &bytes).unwrap();
     assert!(
-        !attests(&*fs, &path, Some(&enc), 7, ck(200), ck(100)),
-        "a tampered encrypted attestation must be rejected",
+        matches!(
+            attests(&*fs, &path, Some(&enc), 7, ck(200), ck(100)),
+            AttestResult::Inconclusive
+        ),
+        "a tampered encrypted attestation is inconclusive, not attesting",
     );
 
-    // A sidecar sealed under a DIFFERENT key is rejected too.
+    // A sidecar sealed under a DIFFERENT key fails the open too: inconclusive.
     write(&*fs, &path, Some(&enc), 7, ck(100), ck(200)).unwrap();
     let wrong = Aes256GcmProvider::new(&[9u8; 32]);
     assert!(
-        !attests(&*fs, &path, Some(&wrong), 7, ck(200), ck(100)),
-        "an attestation sealed under a different key must be rejected",
+        matches!(
+            attests(&*fs, &path, Some(&wrong), 7, ck(200), ck(100)),
+            AttestResult::Inconclusive
+        ),
+        "an attestation sealed under a different key is inconclusive",
     );
 }
