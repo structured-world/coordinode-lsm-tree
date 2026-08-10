@@ -334,36 +334,7 @@ fn repair_with_salvage_reports_a_sole_corrupt_block_as_unsalvageable() -> crate:
     // byte just past its header so the block fails its checksum. The container,
     // index and meta stay intact, so whole-file recovery still opens it (data is
     // read lazily) and only verification trips.
-    let offset = {
-        let checksum = crate::Checksum::from_raw(compute_table_checksum(&*fs, &sst)?);
-        let table = crate::table::Table::recover(
-            sst.clone(),
-            checksum,
-            0,
-            0,
-            0,
-            Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
-            None,
-            Arc::clone(&fs),
-            false,
-            false,
-            None,
-            #[cfg(zstd_any)]
-            None,
-            crate::comparator::default_comparator(),
-            #[cfg(feature = "metrics")]
-            Arc::new(crate::Metrics::default()),
-        )?;
-        let offsets: alloc::vec::Vec<u64> = table
-            .data_block_handles()
-            .filter_map(Result::ok)
-            .map(|kh| *kh.as_ref().offset())
-            .collect();
-        let [only] = offsets.as_slice() else {
-            panic!("expected a single data block, got {offsets:?}");
-        };
-        *only
-    };
+    let offset = sole_data_block_offset(&recover_table(sst.clone(), &fs)?);
     let flip = usize::try_from(offset).unwrap_or(0) + 16;
     let mut bytes = std::fs::read(&sst)?;
     if let Some(b) = bytes.get_mut(flip) {
@@ -437,36 +408,7 @@ fn repair_with_salvage_reports_a_range_tombstone_sst_as_unsalvageable() -> crate
 
     // Corrupt the sole data block (offset from the intact index) so whole-file
     // recovery opens it but verification fails, driving repair into salvage.
-    let offset = {
-        let checksum = crate::Checksum::from_raw(compute_table_checksum(&*fs, &sst)?);
-        let table = crate::table::Table::recover(
-            sst.clone(),
-            checksum,
-            0,
-            0,
-            0,
-            Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
-            None,
-            Arc::clone(&fs),
-            false,
-            false,
-            None,
-            #[cfg(zstd_any)]
-            None,
-            crate::comparator::default_comparator(),
-            #[cfg(feature = "metrics")]
-            Arc::new(crate::Metrics::default()),
-        )?;
-        let offsets: alloc::vec::Vec<u64> = table
-            .data_block_handles()
-            .filter_map(Result::ok)
-            .map(|kh| *kh.as_ref().offset())
-            .collect();
-        let [only] = offsets.as_slice() else {
-            panic!("expected a single data block, got {offsets:?}");
-        };
-        *only
-    };
+    let offset = sole_data_block_offset(&recover_table(sst.clone(), &fs)?);
     let mut bytes = std::fs::read(&sst)?;
     if let Some(b) = bytes.get_mut(usize::try_from(offset).unwrap_or(0) + 16) {
         *b ^= 0xFF;
@@ -539,36 +481,7 @@ fn repair_with_salvage_reports_a_corrupt_bitmap_and_block_sst_as_unsalvageable()
 
     // Resolve the sole data block's offset from the intact index before any
     // corruption shifts nothing (the flip is in place, lengths are unchanged).
-    let block_offset = {
-        let checksum = crate::Checksum::from_raw(compute_table_checksum(&*fs, &sst)?);
-        let table = crate::table::Table::recover(
-            sst.clone(),
-            checksum,
-            0,
-            0,
-            0,
-            Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
-            None,
-            Arc::clone(&fs),
-            false,
-            false,
-            None,
-            #[cfg(zstd_any)]
-            None,
-            crate::comparator::default_comparator(),
-            #[cfg(feature = "metrics")]
-            Arc::new(crate::Metrics::default()),
-        )?;
-        let offsets: alloc::vec::Vec<u64> = table
-            .data_block_handles()
-            .filter_map(Result::ok)
-            .map(|kh| *kh.as_ref().offset())
-            .collect();
-        let [only] = offsets.as_slice() else {
-            panic!("expected a single data block, got {offsets:?}");
-        };
-        *only
-    };
+    let block_offset = sole_data_block_offset(&recover_table(sst.clone(), &fs)?);
     let bitmap = {
         let mut f = std::fs::File::open(&sst)?;
         let reader = match crate::sfa::Reader::from_reader(&mut f) {
@@ -724,6 +637,21 @@ fn recover_table(
     )
 }
 
+/// The offset of the SOLE data block in `table`, panicking if there is not
+/// exactly one. The salvage / repair tests build single-data-block SSTs, so
+/// this collapses the repeated "collect handles, assert one, take its offset".
+fn sole_data_block_offset(table: &crate::table::Table) -> u64 {
+    let offsets: alloc::vec::Vec<u64> = table
+        .data_block_handles()
+        .filter_map(Result::ok)
+        .map(|kh| *kh.as_ref().offset())
+        .collect();
+    let [only] = offsets.as_slice() else {
+        panic!("expected a single data block, got {offsets:?}");
+    };
+    *only
+}
+
 /// PARITY-ONLY rot (every payload checksum still clean) on a table salvage
 /// cannot faithfully re-emit (range tombstones) must also KEEP the table:
 /// the data is fully readable, only its recovery margin is degraded, and
@@ -767,18 +695,8 @@ fn repair_with_salvage_keeps_a_parity_rotted_range_tombstone_sst() -> crate::Res
     // Rot one byte of the sole data block's PARITY trailer: the payload
     // checksum still verifies, so the out-of-band walk reports only an
     // EccParityMismatch — the data itself is untouched.
-    let block_off = {
-        let table = recover_table(sst.clone(), &fs)?;
-        let offsets: alloc::vec::Vec<u64> = table
-            .data_block_handles()
-            .filter_map(Result::ok)
-            .map(|kh| *kh.as_ref().offset())
-            .collect();
-        let [only] = offsets.as_slice() else {
-            panic!("expected a single data block, got {offsets:?}");
-        };
-        usize::try_from(*only).unwrap_or(usize::MAX)
-    };
+    let block_off = usize::try_from(sole_data_block_offset(&recover_table(sst.clone(), &fs)?))
+        .unwrap_or(usize::MAX);
     let mut bytes = std::fs::read(&sst)?;
     let Some(mut cursor) = bytes.get(block_off..) else {
         panic!("data block within the file");
@@ -857,18 +775,8 @@ fn repair_with_salvage_rejects_a_corrupt_unrecognized_ecc_tombstone_sst() -> cra
     // Forge the unrecognized descriptor (the out-of-band walk then skips the
     // data section) AND corrupt the sole data block's payload.
     forge_unrecognized_ecc_descriptor(&sst)?;
-    let block_off = {
-        let table = recover_table(sst.clone(), &fs)?;
-        let offsets: alloc::vec::Vec<u64> = table
-            .data_block_handles()
-            .filter_map(Result::ok)
-            .map(|kh| *kh.as_ref().offset())
-            .collect();
-        let [only] = offsets.as_slice() else {
-            panic!("expected a single data block, got {offsets:?}");
-        };
-        usize::try_from(*only).unwrap_or(usize::MAX)
-    };
+    let block_off = usize::try_from(sole_data_block_offset(&recover_table(sst.clone(), &fs)?))
+        .unwrap_or(usize::MAX);
     let mut bytes = std::fs::read(&sst)?;
     if let Some(b) = bytes.get_mut(block_off + 40) {
         *b ^= 0xFF;
@@ -1304,18 +1212,8 @@ fn repair_with_salvage_rejects_a_corrupt_unrecognized_ecc_tombstone_sst_with_par
     // Corrupt the sole data block: the out-of-band walk cannot see it (the
     // data section is skipped under the unrecognized descriptor), so only
     // the handle-based fallback can catch it.
-    let block_off = {
-        let table = recover_table(sst.clone(), &fs)?;
-        let offsets: alloc::vec::Vec<u64> = table
-            .data_block_handles()
-            .filter_map(Result::ok)
-            .map(|kh| *kh.as_ref().offset())
-            .collect();
-        let [only] = offsets.as_slice() else {
-            panic!("expected a single data block, got {offsets:?}");
-        };
-        usize::try_from(*only).unwrap_or(usize::MAX)
-    };
+    let block_off = usize::try_from(sole_data_block_offset(&recover_table(sst.clone(), &fs)?))
+        .unwrap_or(usize::MAX);
     let mut bytes = std::fs::read(&sst)?;
     if let Some(b) = bytes.get_mut(block_off + 40) {
         *b ^= 0xFF;
