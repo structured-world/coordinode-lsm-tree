@@ -328,7 +328,15 @@ impl Writer {
         let mut writer = crate::sfa::Writer::from_writer(writer);
         if let Err(e) = writer.start("data") {
             drop(writer);
-            let _ = fs.remove_file(&path);
+            // Best-effort cleanup of the partial file we just created; log a
+            // failure (it can make the next create_new(true) retry fail) rather
+            // than discard it, matching the blob-file writer.
+            if let Err(remove_err) = fs.remove_file(&path) {
+                log::warn!(
+                    "failed to remove partial table file {} after a writer-init error: {remove_err}",
+                    path.display(),
+                );
+            }
             return Err(e.into());
         }
 
