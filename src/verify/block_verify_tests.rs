@@ -802,7 +802,7 @@ fn verify_sst_file_missing_file_reports_unreadable() {
               the u64 -> usize cast cannot overflow on any target \
               the test runs on (the forged archive is < 1 KiB)"
 )]
-fn walk_block_region_reports_data_read_error_on_truncated_data_segment() {
+fn walk_block_region_reports_data_read_error_on_truncated_data_segment() -> crate::Result<()> {
     use crate::coding::Encode;
     use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::{BlockType, Header};
@@ -866,23 +866,20 @@ fn walk_block_region_reports_data_read_error_on_truncated_data_segment() {
         .copy_from_slice(&new_toc_checksum.to_le_bytes());
 
     // Materialize the forged archive on a real temp file and run the scanner.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     let fs = StdFs;
     let forged = dir.path().join("forged.sst");
     let path = forged.as_path();
     {
-        let mut f = fs
-            .open(
-                path,
-                &FsOpenOptions::new().write(true).create(true).truncate(true),
-            )
-            .unwrap();
-        f.write_all(&archive_bytes).unwrap();
+        let mut f = fs.open(
+            path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        f.write_all(&archive_bytes)?;
     }
 
     let table_id: TableId = 42;
-    let scan = scan_sst_blocks(&fs, path, table_id, 0, None, false, 0)
-        .expect("forged SFA must parse cleanly");
+    let scan = scan_sst_blocks(&fs, path, table_id, 0, None, false, 0)?;
     // The inflated section length ALSO breaks the TOC tiling invariant
     // (the declared section end runs past where the TOC begins), so the
     // walk reports the tiling finding alongside the read error.
@@ -918,6 +915,7 @@ fn walk_block_region_reports_data_read_error_on_truncated_data_segment() {
         "header decoded successfully, so blocks_scanned must count this block \
          even though the data segment read failed",
     );
+    Ok(())
 }
 
 /// The parity-trailer drain reports a truncated read when an SST whose ECC
@@ -934,7 +932,7 @@ fn walk_block_region_reports_data_read_error_on_truncated_data_segment() {
     reason = "synthetic SFA forgery — offsets are in-bounds by construction (we wrote the \
               bytes ourselves) and the archive is < 8 KiB, so the casts cannot overflow"
 )]
-fn walk_block_region_reports_data_read_error_on_truncated_parity_trailer() {
+fn walk_block_region_reports_data_read_error_on_truncated_parity_trailer() -> crate::Result<()> {
     use crate::coding::Encode;
     use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::{BlockType, EccParams, Header, expected_parity_len};
@@ -987,25 +985,22 @@ fn walk_block_region_reports_data_read_error_on_truncated_parity_trailer() {
     archive_bytes[csum_field_offset..csum_field_offset + 16]
         .copy_from_slice(&new_toc_checksum.to_le_bytes());
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     let fs = StdFs;
     let forged = dir.path().join("forged-parity.sst");
     let path = forged.as_path();
     {
-        let mut f = fs
-            .open(
-                path,
-                &FsOpenOptions::new().write(true).create(true).truncate(true),
-            )
-            .unwrap();
-        f.write_all(&archive_bytes).unwrap();
+        let mut f = fs.open(
+            path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        f.write_all(&archive_bytes)?;
     }
 
     // Scan as an RS(4,2) table: a non-zero parity_len is drained after the
     // (clean) payload, hitting EOF in the short SFA tail.
     let table_id: TableId = 7;
-    let scan = scan_sst_blocks(&fs, path, table_id, 0, Some(EccParams::RS_4_2), false, 0)
-        .expect("forged SFA must parse cleanly");
+    let scan = scan_sst_blocks(&fs, path, table_id, 0, Some(EccParams::RS_4_2), false, 0)?;
     assert!(
         scan.errors.iter().any(|e| matches!(
             e,
@@ -1015,6 +1010,7 @@ fn walk_block_region_reports_data_read_error_on_truncated_parity_trailer() {
         "expected a truncated-parity DataReadError, got {:?}",
         scan.errors,
     );
+    Ok(())
 }
 
 /// A syntactically valid but absurd shard layout (RS(1,255): every payload
@@ -1030,7 +1026,7 @@ fn walk_block_region_reports_data_read_error_on_truncated_parity_trailer() {
     reason = "synthetic SFA forgery — offsets are in-bounds by construction (we wrote the \
               bytes ourselves) and the archive is small, so the casts cannot overflow"
 )]
-fn walk_block_region_caps_an_absurd_parity_trailer_length() {
+fn walk_block_region_caps_an_absurd_parity_trailer_length() -> crate::Result<()> {
     use crate::coding::Encode;
     use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::{BlockType, EccParams, Header, expected_parity_len};
@@ -1090,23 +1086,20 @@ fn walk_block_region_caps_an_absurd_parity_trailer_length() {
     archive_bytes[csum_field_offset..csum_field_offset + 16]
         .copy_from_slice(&new_toc_checksum.to_le_bytes());
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     let fs = StdFs;
     let forged = dir.path().join("forged-parity-cap.sst");
     let path = forged.as_path();
     {
-        let mut f = fs
-            .open(
-                path,
-                &FsOpenOptions::new().write(true).create(true).truncate(true),
-            )
-            .unwrap();
-        f.write_all(&archive_bytes).unwrap();
+        let mut f = fs.open(
+            path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        f.write_all(&archive_bytes)?;
     }
 
     let table_id: TableId = 7;
-    let scan = scan_sst_blocks(&fs, path, table_id, 0, Some(params), false, 0)
-        .expect("forged SFA must parse cleanly");
+    let scan = scan_sst_blocks(&fs, path, table_id, 0, Some(params), false, 0)?;
     assert!(
         scan.errors.iter().any(|e| matches!(
             e,
@@ -1117,6 +1110,7 @@ fn walk_block_region_caps_an_absurd_parity_trailer_length() {
          the buffer, got {:?}",
         scan.errors,
     );
+    Ok(())
 }
 
 /// A block header whose own bytes extend past the section boundary must be
@@ -1136,7 +1130,7 @@ fn walk_block_region_caps_an_absurd_parity_trailer_length() {
     reason = "synthetic SFA forgery — offsets are in-bounds by construction \
               and the forged archive is < 1 KiB"
 )]
-fn walk_block_region_reports_header_crossing_section_boundary() {
+fn walk_block_region_reports_header_crossing_section_boundary() -> crate::Result<()> {
     use crate::coding::Encode;
     use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::{BlockType, Header};
@@ -1189,23 +1183,20 @@ fn walk_block_region_reports_header_crossing_section_boundary() {
     archive_bytes[csum_field_offset..csum_field_offset + 16]
         .copy_from_slice(&new_toc_checksum.to_le_bytes());
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     let fs = StdFs;
     let forged = dir.path().join("forged-boundary.sst");
     let path = forged.as_path();
     {
-        let mut f = fs
-            .open(
-                path,
-                &FsOpenOptions::new().write(true).create(true).truncate(true),
-            )
-            .unwrap();
-        f.write_all(&archive_bytes).unwrap();
+        let mut f = fs.open(
+            path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        f.write_all(&archive_bytes)?;
     }
 
     let table_id: TableId = 7;
-    let scan = scan_sst_blocks(&fs, path, table_id, 0, None, false, 0)
-        .expect("forged SFA must parse cleanly");
+    let scan = scan_sst_blocks(&fs, path, table_id, 0, None, false, 0)?;
     // The shrunken section length ALSO breaks the TOC tiling invariant
     // (the sections no longer reach the TOC start), so the walk reports
     // the tiling finding alongside the boundary violation.
@@ -1231,6 +1222,7 @@ fn walk_block_region_reports_header_crossing_section_boundary() {
         "expected a section-boundary HeaderCorrupted; got {:?}",
         scan.errors,
     );
+    Ok(())
 }
 
 /// Builds a tree with `batches` separate L0 SSTs (one flush per batch) so

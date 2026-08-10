@@ -294,7 +294,6 @@ mod capfs {
         // so the restricted view is byte-faithful and the file keeps its length.
         // Count the bytes for the test's reclaim assertion.
         fn punch_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<()> {
-            self.punched.fetch_add(len, Ordering::Relaxed);
             if len == 0 {
                 return Ok(());
             }
@@ -304,6 +303,9 @@ mod capfs {
             // no indexing / cast / unwrap the crate lints forbid).
             std::io::copy(&mut std::io::repeat(0u8).take(len), &mut f)?;
             f.sync_all()?;
+            // Count the bytes only AFTER the punch durably lands, so a failed
+            // open / seek / write / sync does not inflate the reclaim counter.
+            self.punched.fetch_add(len, Ordering::Relaxed);
             Ok(())
         }
     }
@@ -360,6 +362,12 @@ fn restricted_view_passes_every_reconcile_gate() -> crate::Result<()> {
     assert!(
         tree.major_compact(64 * 1024 * 1024, 0).is_err(),
         "the crash failpoint must abort the tight-space compaction",
+    );
+    // The failpoint disarms itself when it fires: confirm the error came from
+    // the intended crash point, not an unrelated failure before the punch.
+    assert!(
+        !failpoint.load(Ordering::SeqCst),
+        "the crash failpoint must have fired and disarmed",
     );
     assert!(
         fs.punched_bytes() > 0,
