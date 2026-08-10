@@ -2588,6 +2588,47 @@ fn heal_in_place_fails_closed_without_a_heal_attestation() -> crate::Result<()> 
     Ok(())
 }
 
+/// A transiently-unreadable sidecar must NOT be treated as an absent marker on
+/// the unattributable re-scan path: deleting it on a retryable read error would
+/// strand the healed table under the stale digest forever. The read is
+/// INCONCLUSIVE, so the reconcile fails closed (no digest refresh) but KEEPS the
+/// marker for the next pass to retry.
+#[test]
+fn reconcile_keeps_the_marker_when_the_sidecar_read_is_inconclusive() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst_footered(dir.path());
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
+    rebuild_manifest_over_current_bytes(dir.path())?;
+
+    // First pass heals + writes the attestation, but the manifest refresh fails,
+    // leaving the marker on disk for a later pass to reconcile.
+    let (tree, injector) = open_ecc_tree_with_failing_edit_log(dir.path());
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    injector.clear();
+    assert!(report.blocks_healed_in_place >= 1, "{report:?}");
+    assert!(
+        heal_attest_path(&sst_path).exists(),
+        "the heal left a marker"
+    );
+
+    // Second pass: the block is clean, so the mismatch is attributable only via
+    // the marker, but its read fails transiently (an open error, not not-found).
+    // That is inconclusive, not absent, so the marker must survive.
+    injector
+        .arm(FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other)).on_path(".heal-attest"));
+    let _ = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    injector.clear();
+
+    assert!(
+        heal_attest_path(&sst_path).exists(),
+        "an inconclusive sidecar read must keep the marker, not delete it",
+    );
+    Ok(())
+}
+
 /// A `.heal-attest` sidecar whose SST is absent from the recovered manifest is
 /// an orphan: its table was retired (compacted away, its numeric file unlinked)
 /// while the attestation lingered. Recovery must SWEEP the orphan rather than
