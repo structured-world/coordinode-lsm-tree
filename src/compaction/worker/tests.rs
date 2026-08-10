@@ -129,65 +129,19 @@ fn failed_subcompaction_rolls_back_and_restores_inputs() -> crate::Result<()> {
 /// those still in the punched input's intact suffix) reads back.
 #[test]
 fn tight_space_crash_after_first_slice_recovers_all_keys_on_reopen() -> crate::Result<()> {
-    use core::sync::atomic::Ordering;
-
     const N: u64 = 2_000;
     let k = |i: u64| format!("key{i:08}");
 
     let dir = tempfile::tempdir()?;
     let mem = crate::fs::MemFs::with_capacity(u64::MAX);
-    let config = Config::new(
-        &dir,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .data_block_size_policy(BlockSizePolicy::all(512))
-    .with_shared_fs(Arc::new(mem.clone()));
-    let failpoint = config.fail_tight_after_first_slice.clone();
-    let tree = match config.open()? {
-        crate::AnyTree::Standard(t) => t,
-        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
-    };
-
-    for i in 0..N {
-        tree.insert(k(i).as_bytes(), vec![0xCDu8; 64], i);
-    }
-    tree.flush_active_memtable(0)?;
-    let used = tree.storage_stats()?.used_bytes;
-
-    // Force the single-table major compaction to be gated, and opt in to
-    // tight-space reclaim.
-    mem.set_capacity(used + used / 4);
-    tree.update_runtime_config(|c| {
-        c.storage_admission_check = true;
-        c.tight_space_compaction = true;
-    })?;
-
-    // Crash right after the first slice is durably installed + punched.
-    failpoint.store(true, Ordering::SeqCst);
-    assert!(
-        tree.major_compact(64 * 1024 * 1024, 0).is_err(),
-        "the crash failpoint must abort the tight-space compaction",
-    );
-    assert!(
-        !failpoint.load(Ordering::SeqCst),
-        "the failpoint should have fired and disarmed",
-    );
-    assert!(
-        mem.punched_bytes() > 0,
-        "the first slice must have punched before the crash",
-    );
-
-    // Reopen on the same simulated disk: recovery must rebuild the restricted
-    // input from the persisted manifest restriction.
-    drop(tree);
-    let reopened = Config::new(
-        &dir,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .with_shared_fs(Arc::new(mem))
-    .open()?;
+    // Force the single-table major compaction to be gated, opting in to
+    // tight-space reclaim by leaving only a quarter of the footprint free.
+    let reopened = tight_space_crash_and_reopen(
+        dir.path(),
+        Arc::new(mem.clone()),
+        |used| mem.set_capacity(used + used / 4),
+        || mem.punched_bytes(),
+    )?;
     for i in 0..N {
         assert!(
             reopened.get(k(i).as_bytes(), crate::MAX_SEQNO)?.is_some(),
@@ -320,6 +274,76 @@ mod capfs {
     }
 }
 
+/// The shared tight-space crash-and-reopen flow. On `shared_fs`: writes 2000
+/// keys, leaves the disk tight via `set_capacity(used)`, crashes the tight-space
+/// compaction right after its first slice is installed and punched (asserting
+/// the crash failpoint fired and `punched_bytes()` grew), then reopens so
+/// recovery rebuilds the restricted input, returning the reopened tree. Callers
+/// supply the filesystem and its capacity / reclaim accessors (a `MemFs` and a
+/// real-file `CapacityFs` configure these differently) and then run their own
+/// assertions on the returned tree.
+fn tight_space_crash_and_reopen(
+    dir: &std::path::Path,
+    shared_fs: Arc<dyn crate::fs::Fs>,
+    set_capacity: impl FnOnce(u64),
+    punched_bytes: impl Fn() -> u64,
+) -> crate::Result<crate::AnyTree> {
+    use core::sync::atomic::Ordering;
+
+    const N: u64 = 2_000;
+    let k = |i: u64| format!("key{i:08}");
+
+    let config = Config::new(
+        dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_shared_fs(Arc::clone(&shared_fs));
+    let failpoint = config.fail_tight_after_first_slice.clone();
+    let tree = match config.open()? {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+
+    for i in 0..N {
+        tree.insert(k(i).as_bytes(), vec![0xCDu8; 64], i);
+    }
+    tree.flush_active_memtable(0)?;
+    let used = tree.storage_stats()?.used_bytes;
+
+    set_capacity(used);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = true;
+    })?;
+
+    failpoint.store(true, Ordering::SeqCst);
+    assert!(
+        tree.major_compact(64 * 1024 * 1024, 0).is_err(),
+        "the crash failpoint must abort the tight-space compaction",
+    );
+    // The failpoint disarms itself when it fires: confirm the error came from the
+    // intended crash point, not an unrelated failure before the punch.
+    assert!(
+        !failpoint.load(Ordering::SeqCst),
+        "the crash failpoint must have fired and disarmed",
+    );
+    assert!(
+        punched_bytes() > 0,
+        "the first slice must have punched before the crash",
+    );
+
+    drop(tree);
+    Config::new(
+        dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(shared_fs)
+    .open()
+}
+
 /// A legitimately RESTRICTED table (a tight-space compaction crashed after
 /// punching its first slice, so its `[0, punch)` data-block prefix reads as
 /// zeros) must pass every heal-reconcile security gate AND the whole-file
@@ -333,66 +357,16 @@ mod capfs {
 /// real filesystem read / seek / EOF behavior.
 #[test]
 fn restricted_view_passes_every_reconcile_gate() -> crate::Result<()> {
-    use core::sync::atomic::Ordering;
-
-    const N: u64 = 2_000;
-    let k = |i: u64| format!("key{i:08}");
-
     let dir = tempfile::tempdir()?;
     let fs = capfs::CapacityFs::new();
-    let config = Config::new(
-        &dir,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .data_block_size_policy(BlockSizePolicy::all(512))
-    .with_shared_fs(Arc::new(fs.clone()));
-    let failpoint = config.fail_tight_after_first_slice.clone();
-    let tree = match config.open()? {
-        crate::AnyTree::Standard(t) => t,
-        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
-    };
-
-    for i in 0..N {
-        tree.insert(k(i).as_bytes(), vec![0xCDu8; 64], i);
-    }
-    tree.flush_active_memtable(0)?;
-    let used = tree.storage_stats()?.used_bytes;
-
-    // Leave only a quarter of the flushed footprint free, so a full rewrite
-    // cannot fit and the compaction takes the tight-space slice-and-punch path.
-    fs.set_available_space(used / 4);
-    tree.update_runtime_config(|c| {
-        c.storage_admission_check = true;
-        c.tight_space_compaction = true;
-    })?;
-
-    failpoint.store(true, Ordering::SeqCst);
-    assert!(
-        tree.major_compact(64 * 1024 * 1024, 0).is_err(),
-        "the crash failpoint must abort the tight-space compaction",
-    );
-    // The failpoint disarms itself when it fires: confirm the error came from
-    // the intended crash point, not an unrelated failure before the punch.
-    assert!(
-        !failpoint.load(Ordering::SeqCst),
-        "the crash failpoint must have fired and disarmed",
-    );
-    assert!(
-        fs.punched_bytes() > 0,
-        "the first slice must have punched before the crash",
-    );
-
-    // Reopen so recovery rebuilds the restricted input from the persisted
-    // manifest restriction.
-    drop(tree);
-    let reopened = Config::new(
-        &dir,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .with_shared_fs(Arc::new(fs))
-    .open()?;
+    // Leave only a quarter of the flushed footprint free so a full rewrite cannot
+    // fit and the compaction takes the tight-space slice-and-punch path.
+    let reopened = tight_space_crash_and_reopen(
+        dir.path(),
+        Arc::new(fs.clone()),
+        |used| fs.set_available_space(used / 4),
+        || fs.punched_bytes(),
+    )?;
 
     // The whole-file digest verify must pass on the restricted table: it streams
     // the SUFFIX digest for a restricted view (the punched prefix is excluded),
