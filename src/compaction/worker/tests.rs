@@ -298,14 +298,23 @@ mod capfs {
                 return Ok(());
             }
             let mut f = StdFs.open(path, &FsOpenOptions::new().write(true))?;
+            // Clamp to the bytes actually present from `offset` to EOF: a real
+            // punch (`FALLOC_FL_KEEP_SIZE`) never extends the file, so neither
+            // may this zero-fill emulation. `checked_sub` (not saturating) makes
+            // an out-of-range offset an explicit zero-length no-op.
+            let file_len = f.metadata()?.len;
+            let punch_len = len.min(file_len.checked_sub(offset).unwrap_or(0));
+            if punch_len == 0 {
+                return Ok(());
+            }
             f.seek(SeekFrom::Start(offset))?;
-            // Stream `len` zero bytes over the range (no manual chunk buffer, so
+            // Stream the zero bytes over the range (no manual chunk buffer, so
             // no indexing / cast / unwrap the crate lints forbid).
-            std::io::copy(&mut std::io::repeat(0u8).take(len), &mut f)?;
+            std::io::copy(&mut std::io::repeat(0u8).take(punch_len), &mut f)?;
             f.sync_all()?;
             // Count the bytes only AFTER the punch durably lands, so a failed
             // open / seek / write / sync does not inflate the reclaim counter.
-            self.punched.fetch_add(len, Ordering::Relaxed);
+            self.punched.fetch_add(punch_len, Ordering::Relaxed);
             Ok(())
         }
     }
