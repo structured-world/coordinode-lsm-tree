@@ -2595,7 +2595,7 @@ fn heal_in_place_fails_closed_without_a_heal_attestation() -> crate::Result<()> 
 /// marker for the next pass to retry.
 #[test]
 fn reconcile_keeps_the_marker_when_the_sidecar_read_is_inconclusive() -> crate::Result<()> {
-    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::fs::{Fault, FaultOp, FaultRule};
     use crate::io::ErrorKind;
 
     let dir = tempfile::tempdir()?;

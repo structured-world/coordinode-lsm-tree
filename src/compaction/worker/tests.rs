@@ -254,10 +254,11 @@ mod capfs {
             let mut f = StdFs.open(path, &FsOpenOptions::new().write(true))?;
             // Clamp to the bytes actually present from `offset` to EOF: a real
             // punch (`FALLOC_FL_KEEP_SIZE`) never extends the file, so neither
-            // may this zero-fill emulation. `checked_sub` (not saturating) makes
-            // an out-of-range offset an explicit zero-length no-op.
+            // may this zero-fill emulation. The min-0 clamp IS the intended
+            // semantics here (an out-of-range offset punches nothing), so a
+            // saturating subtraction is correct rather than bug-masking.
             let file_len = f.metadata()?.len;
-            let punch_len = len.min(file_len.checked_sub(offset).unwrap_or(0));
+            let punch_len = len.min(file_len.saturating_sub(offset));
             if punch_len == 0 {
                 return Ok(());
             }
