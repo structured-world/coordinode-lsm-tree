@@ -2665,6 +2665,87 @@ fn checkpoint_reconciles_a_pending_heal_before_snapshotting() -> crate::Result<(
     Ok(())
 }
 
+/// A real-on-disk [`Fs`](crate::fs::Fs) (over `StdFs`) whose `exists` probe
+/// FAILS for any `.heal-attest` sidecar, modelling a stat error on the
+/// attestation probe. Every other operation delegates to `StdFs`.
+mod exists_fail_fs {
+    use crate::fs::{Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions, StdFs};
+    use crate::io;
+    use std::path::Path;
+
+    pub(super) struct ExistsFailFs;
+
+    impl Fs for ExistsFailFs {
+        fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
+            StdFs.open(path, opts)
+        }
+        fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+            StdFs.create_dir_all(path)
+        }
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
+            StdFs.read_dir(path)
+        }
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            StdFs.remove_file(path)
+        }
+        fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+            StdFs.remove_dir_all(path)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            StdFs.rename(from, to)
+        }
+        fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
+            StdFs.metadata(path)
+        }
+        fn sync_directory(&self, path: &Path) -> io::Result<()> {
+            StdFs.sync_directory(path)
+        }
+        fn exists(&self, path: &Path) -> io::Result<bool> {
+            if path.to_string_lossy().ends_with(".heal-attest") {
+                return Err(io::Error::other("injected attestation probe failure"));
+            }
+            StdFs.exists(path)
+        }
+        fn backend_id(&self) -> Option<u64> {
+            StdFs.backend_id()
+        }
+        fn volume_id(&self, path: &Path) -> Option<u64> {
+            StdFs.volume_id(path)
+        }
+    }
+}
+
+/// The checkpoint's pending-heal reconciliation probes each ECC table for a
+/// `.heal-attest` sidecar. If that probe FAILS (an I/O error, not a clean
+/// absent), treating it as "no pending heal" would let the checkpoint snapshot
+/// the table's bytes under a possibly-stale digest with no marker to reconcile.
+/// The probe must fail CLOSED: a probe error aborts the reconciliation, which
+/// the checkpoint propagates (aborting the snapshot). Drives
+/// [`reconcile_pending_heals`] directly — the exact step the checkpoint runs
+/// before its link window — so the fault needs only the probe, not the
+/// checkpoint's full filesystem surface.
+#[test]
+fn reconcile_pending_heals_aborts_when_the_attestation_probe_fails() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    // A plain ECC table (no corruption needed): the reconcile still probes it
+    // for a pending sidecar, and that probe is what fails here.
+    let _ = write_ecc_sst_footered(dir.path());
+
+    let tree = open_ecc_tree_on(
+        dir.path(),
+        std::sync::Arc::new(exists_fail_fs::ExistsFailFs),
+    );
+
+    let result = crate::scrub::reconcile_pending_heals(&tree);
+    assert!(
+        result.is_err(),
+        "a failed attestation probe must abort the reconciliation, not silently \
+         skip the table (pre-fix the probe error was swallowed as 'no pending heal'): \
+         {result:?}",
+    );
+    Ok(())
+}
+
 /// The attributable heal path (the manifest digest matches the CURRENT pre-heal
 /// bytes) is about to change bytes the manifest still matches, so its
 /// crash-recovery attestation MUST be durable BEFORE the first block is mutated.
