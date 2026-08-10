@@ -403,18 +403,22 @@ fn run_salvage(
         );
     }
 
-    if report.is_complete() {
+    // Check the destination FIRST: `is_complete()` (nothing dropped) is true even
+    // when every block was wholly deleted, in which case no file is written and
+    // `<dest>` does not exist. Reporting "fully recovered" then would tell
+    // automation the destination is ready when the command produced none.
+    if report.salvaged_path.is_none() {
+        println!("status:          nothing recoverable");
+        ExitCode::FAILURE
+    } else if report.is_complete() {
         println!("status:          fully recovered");
         ExitCode::SUCCESS
-    } else if report.salvaged_path.is_some() {
+    } else {
         println!(
             "status:          partially recovered ({} block(s) dropped)",
             report.dropped.len(),
         );
         ExitCode::SUCCESS
-    } else {
-        println!("status:          nothing recoverable");
-        ExitCode::FAILURE
     }
 }
 
