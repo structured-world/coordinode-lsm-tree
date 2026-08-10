@@ -950,7 +950,7 @@ fn repair_with_salvage_correctable_ecc_fault_in_encrypted_filter_is_rewritten()
     // memory — but the fault persists on disk.
     let ssts = sorted_sst_paths(dir.path());
     let victim = ssts.first().expect("an SST to corrupt");
-    flip_byte_in_section(victim, b"filter", 40)?;
+    flip_byte_in_section(victim, b"filter", SectionByte::FromStart(40))?;
 
     nuke_manifest(dir.path())?;
 
@@ -1017,7 +1017,7 @@ fn repair_with_salvage_correctable_ecc_fault_in_encrypted_tli_is_rewritten() -> 
 
     let ssts = sorted_sst_paths(dir.path());
     let victim = ssts.first().expect("an SST to corrupt");
-    flip_byte_in_section(victim, b"tli", 40)?;
+    flip_byte_in_section(victim, b"tli", SectionByte::FromStart(40))?;
 
     nuke_manifest(dir.path())?;
 
@@ -1046,13 +1046,21 @@ fn repair_with_salvage_correctable_ecc_fault_in_encrypted_tli_is_rewritten() -> 
     Ok(())
 }
 
-/// Flips one byte at `offset_in_section` inside the named SFA section of an
-/// SST (locating it via the trailer TOC).
-#[cfg(all(feature = "encryption", feature = "page_ecc"))]
+/// Where in a section to flip a byte: a fixed offset from its start, or its
+/// midpoint (length-relative).
+#[cfg(feature = "encryption")]
+enum SectionByte {
+    FromStart(u64),
+    Midpoint,
+}
+
+/// Flips one byte inside the named SFA section of an SST (locating it via the
+/// trailer TOC), at a fixed offset or the section midpoint.
+#[cfg(feature = "encryption")]
 fn flip_byte_in_section(
     path: &std::path::Path,
     section: &[u8],
-    offset_in_section: u64,
+    at: SectionByte,
 ) -> lsm_tree::Result<()> {
     let pos = {
         let mut f = std::fs::File::open(path)?;
@@ -1062,7 +1070,10 @@ fn flip_byte_in_section(
             .iter()
             .find(|e| e.name() == section)
             .unwrap_or_else(|| panic!("the SST carries a {section:?} section"));
-        entry.pos() + offset_in_section
+        match at {
+            SectionByte::FromStart(offset) => entry.pos() + offset,
+            SectionByte::Midpoint => entry.pos() + entry.len() / 2,
+        }
     };
     let mut bytes = std::fs::read(path)?;
     let slot = bytes
@@ -1104,23 +1115,7 @@ fn repair_with_salvage_corrupt_filter_in_encrypted_sst_is_rewritten() -> lsm_tre
     // Corrupt the middle of the `filter` SFA section (data blocks stay intact).
     let ssts = sorted_sst_paths(dir.path());
     let victim = ssts.first().expect("an SST to corrupt");
-    {
-        let (pos, len) = {
-            let mut f = std::fs::File::open(victim)?;
-            let reader = lsm_tree::sfa::Reader::from_reader(&mut f)?;
-            let entry = reader
-                .toc()
-                .iter()
-                .find(|e| e.name() == b"filter")
-                .expect("the SST carries a filter section");
-            (entry.pos(), entry.len())
-        };
-        let flip = usize::try_from(pos + len / 2).unwrap_or(0);
-        let mut bytes = std::fs::read(victim)?;
-        let slot = bytes.get_mut(flip).expect("flip position within the SST");
-        *slot ^= 0xFF;
-        std::fs::write(victim, &bytes)?;
-    }
+    flip_byte_in_section(victim, b"filter", SectionByte::Midpoint)?;
 
     nuke_manifest(dir.path())?;
 
