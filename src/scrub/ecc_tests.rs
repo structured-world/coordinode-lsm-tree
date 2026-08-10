@@ -2621,6 +2621,40 @@ fn recovery_sweeps_an_orphaned_heal_attestation_but_keeps_a_live_one() -> crate:
     Ok(())
 }
 
+/// A prior reconciliation may have installed the refreshed checksum but crashed
+/// (or its best-effort sidecar unlink transiently failed) before removing the
+/// `.heal-attest` marker. The next reconciliation then finds the on-disk digest
+/// already matches the manifest and must RECLAIM the now-obsolete marker:
+/// leaving it makes every future checkpoint classify the table as pending and
+/// run a full heal scan before snapshotting.
+#[test]
+fn reconcile_reclaims_an_obsolete_marker_when_the_digest_already_matches() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    // A clean ECC table: its on-disk digest already matches the manifest.
+    let (sst_path, _block) = write_ecc_sst(dir.path());
+
+    // Plant a leftover sidecar, modelling a prior reconcile that installed the
+    // digest but did not manage to remove its marker.
+    let marker = heal_attest_path(&sst_path);
+    std::fs::write(&marker, b"obsolete marker")?;
+    assert!(marker.exists());
+
+    // A heal-in-place patrol scrub: the table is clean, so the reconcile takes
+    // the `fresh == current` branch, which must reclaim the obsolete marker.
+    let tree = open_ecc_tree(dir.path());
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        report.is_ok(),
+        "a clean ECC table scrubs cleanly: {report:?}"
+    );
+
+    assert!(
+        !marker.exists(),
+        "an obsolete marker must be reclaimed once the digest already matches the manifest",
+    );
+    Ok(())
+}
+
 /// A checkpoint taken while a table carries a PENDING heal attestation (healed
 /// bytes on disk, the live version still recording the pre-heal digest, and the
 /// `.heal-attest` sidecar which the checkpoint does NOT copy) must not capture
