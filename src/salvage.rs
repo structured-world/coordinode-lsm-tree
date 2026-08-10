@@ -1104,9 +1104,15 @@ fn salvage_blocks(
             while at < to {
                 if let Ok(h) = frames_and_loads(at, to) {
                     let next = at + u64::from(h.size());
-                    items.push((h, None));
-                    at = next;
-                    continue;
+                    // A zero-size frame would not advance `at` (an infinite loop)
+                    // and cannot anchor the next offset. Treat it as a broken
+                    // boundary: fall through to the drop-and-stop below rather
+                    // than spin or emit an unanchored candidate.
+                    if next > at {
+                        items.push((h, None));
+                        at = next;
+                        continue;
+                    }
                 }
                 // The contiguous chain broke here (a header that did not frame,
                 // or one that framed with a checksum-valid but FAKE size whose
