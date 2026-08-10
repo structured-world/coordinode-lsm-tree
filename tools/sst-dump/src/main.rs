@@ -250,6 +250,10 @@ enum Command {
     /// `<path>` positional is the source SST. Exits non-zero when the salvage
     /// is refused (e.g. delete semantics cannot be preserved) or fails, or
     /// when nothing was recoverable.
+    ///
+    /// Like `repair`, this uses the DEFAULT comparator, no encryption, and no
+    /// compression dictionary: a custom-comparator, encrypted, or
+    /// dictionary-compressed source is not recovered faithfully here.
     Salvage {
         /// Destination path for the recovered SST (must not already exist).
         dest: PathBuf,
