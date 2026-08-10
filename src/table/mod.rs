@@ -1600,7 +1600,7 @@ impl Table {
             // crash after a corrected block syncs but before the in-process
             // manifest refresh would leave healed bytes under the stale digest
             // with no marker, and fail-closed reconciliation rejects that
-            // mismatch forever — permanently stranding a table that was
+            // mismatch forever, permanently stranding a table that was
             // reconcilable a moment earlier. Leaving the block corrupt keeps the
             // table reconcilable; the next patrol retries once the marker can be
             // written. (A non-crash run also reconciles directly, but the marker

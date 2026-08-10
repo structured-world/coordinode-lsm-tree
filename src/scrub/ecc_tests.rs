@@ -2591,8 +2591,8 @@ fn heal_in_place_fails_closed_without_a_heal_attestation() -> crate::Result<()> 
 /// The attributable heal path (the manifest digest matches the CURRENT pre-heal
 /// bytes) is about to change bytes the manifest still matches, so its
 /// crash-recovery attestation MUST be durable BEFORE the first block is mutated.
-/// If the attestation cannot be persisted, the heal must ABORT — not proceed and
-/// only log — because a crash after a corrected block syncs but before the
+/// If the attestation cannot be persisted, the heal must ABORT (not proceed and
+/// only log), because a crash after a corrected block syncs but before the
 /// manifest refresh would leave healed bytes under the stale digest with no
 /// marker, which fail-closed reconciliation rejects forever, permanently
 /// stranding a table that was reconcilable a moment earlier. Leaving the block
