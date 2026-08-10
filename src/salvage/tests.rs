@@ -6527,6 +6527,53 @@ fn salvage_blob_file_recovers_every_record_of_a_healthy_file() -> crate::Result<
     Ok(())
 }
 
+/// A checksum-consistent frame whose key regresses below the previous salvaged
+/// record must be DROPPED, not re-emitted: `BlobWriter` requires records in
+/// key order, and a salvaged file that violates it corrupts its own key range
+/// and later breaks the merge scanner's per-reader sorted-input assumption. The
+/// source here is written physically out of order (the writer does not enforce
+/// its precondition), so every frame is individually valid but the sequence is
+/// not sorted.
+#[test]
+fn salvage_blob_file_drops_a_frame_whose_key_regresses() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("blob_source");
+    let dest = dir.path().join("blob_salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // Physically out of order: k2 precedes k1. Each frame is checksum-valid.
+    let records: Vec<(&[u8], &[u8])> = vec![(b"k0", b"v0"), (b"k2", b"v2"), (b"k1", b"v1")];
+    build_blob(&source, &fs, &records)?;
+
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0)?;
+    assert_eq!(
+        report.records_salvaged, 2,
+        "the order-regressing frame is dropped, not re-emitted: {report:?}",
+    );
+    assert_eq!(
+        report.dropped.len(),
+        1,
+        "exactly the regressing frame drops"
+    );
+    assert!(
+        matches!(report.dropped[0].reason, BlobDropReason::Corrupt(_)),
+        "the drop is recorded as corruption: {:?}",
+        report.dropped[0].reason,
+    );
+
+    // The salvaged file is sorted, so it re-opens under the writer's contract.
+    let recovered = scan_blob(&dest, &fs)?;
+    assert_eq!(
+        recovered,
+        vec![
+            (b"k0".to_vec(), b"v0".to_vec()),
+            (b"k2".to_vec(), b"v2".to_vec())
+        ],
+        "only the in-order prefix survives, still sorted",
+    );
+    Ok(())
+}
+
 /// `salvage_blob_file` must fsync the destination's PARENT DIRECTORY before
 /// returning a salvaged path: the writer syncs the blob file's bytes, but
 /// without the directory sync a power loss can discard the new directory entry
