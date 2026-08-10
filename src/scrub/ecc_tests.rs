@@ -2621,6 +2621,50 @@ fn recovery_sweeps_an_orphaned_heal_attestation_but_keeps_a_live_one() -> crate:
     Ok(())
 }
 
+/// A checkpoint taken while a table carries a PENDING heal attestation (healed
+/// bytes on disk, the live version still recording the pre-heal digest, and the
+/// `.heal-attest` sidecar which the checkpoint does NOT copy) must not capture
+/// that stale digest: the immutable checkpoint would fail integrity
+/// verification forever with no marker to reconcile. The checkpoint reconciles
+/// pending heals BEFORE snapshotting, so the captured version is self-consistent
+/// (healed bytes under a refreshed digest).
+#[test]
+fn checkpoint_reconciles_a_pending_heal_before_snapshotting() -> crate::Result<()> {
+    use crate::AbstractTree;
+
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst_footered(dir.path());
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
+    rebuild_manifest_over_current_bytes(dir.path())?;
+
+    // Heal with a failing edit-log: the blocks are healed and the attestation
+    // is written, but the manifest refresh fails, leaving a PENDING heal.
+    let (tree, injector) = open_ecc_tree_with_failing_edit_log(dir.path());
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    injector.clear();
+    assert!(report.blocks_healed_in_place >= 1, "{report:?}");
+    assert!(
+        heal_attest_path(&sst_path).exists(),
+        "the failed refresh must leave a pending attestation",
+    );
+
+    // Snapshot while the heal is still pending.
+    let dst = dir.path().join("checkpoint");
+    tree.create_checkpoint(&dst)?;
+
+    // The immutable checkpoint must verify clean: reconciling the pending heal
+    // before the snapshot means the captured digest matches the linked (healed)
+    // bytes (pre-fix it captured the stale pre-heal digest and failed forever).
+    let checkpoint = open_ecc_tree(&dst);
+    let integrity = crate::verify::verify_integrity(&checkpoint);
+    assert!(
+        integrity.is_ok(),
+        "the checkpoint must not capture a table's stale pre-heal digest, got {:?}",
+        integrity.errors,
+    );
+    Ok(())
+}
+
 /// The attributable heal path (the manifest digest matches the CURRENT pre-heal
 /// bytes) is about to change bytes the manifest still matches, so its
 /// crash-recovery attestation MUST be durable BEFORE the first block is mutated.
