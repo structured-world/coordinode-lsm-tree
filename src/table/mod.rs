@@ -1593,31 +1593,56 @@ impl Table {
         let pre_heal_matched: Option<bool> = if corrections.is_empty() {
             None
         } else if self.pre_heal_digest_matches(manifest_checksum) {
-            if let Ok(raw) = crate::repair::compute_table_checksum_with_overrides(
+            // ATTRIBUTABLE path: the heal is about to change bytes the manifest
+            // digest still matches, so the crash-recovery marker MUST be durable
+            // BEFORE the first mutation. If the post-heal digest cannot be
+            // predicted, or the attestation cannot be persisted, do NOT heal: a
+            // crash after a corrected block syncs but before the in-process
+            // manifest refresh would leave healed bytes under the stale digest
+            // with no marker, and fail-closed reconciliation rejects that
+            // mismatch forever — permanently stranding a table that was
+            // reconcilable a moment earlier. Leaving the block corrupt keeps the
+            // table reconcilable; the next patrol retries once the marker can be
+            // written. (A non-crash run also reconciles directly, but the marker
+            // is the ONLY thing that survives a crash, so its durability gates
+            // the mutation.)
+            let raw = match crate::repair::compute_table_checksum_with_overrides(
                 &*self.fs,
                 &self.path,
                 heal_start,
                 &corrections,
             ) {
-                // Best-effort: a marker-write failure only forfeits crash
-                // recovery of this heal, never the heal itself.
-                if let Err(e) = crate::scrub::heal_attest::write(
-                    &*self.fs,
-                    &self.path,
-                    self.encryption.as_deref(),
-                    self.id(),
-                    manifest_checksum,
-                    Checksum::from_raw(raw),
-                ) {
-                    log::warn!(
-                        "scrub: could not write the heal attestation for #{}: {e}",
-                        self.id(),
-                    );
+                Ok(raw) => raw,
+                Err(e) => {
+                    report.errors.push(ScrubError::ChecksumRefreshFailed {
+                        table_id: self.id(),
+                        path: self.path.to_path_buf(),
+                        reason: alloc::format!(
+                            "could not predict the post-heal digest; heal skipped to keep the \
+                             table reconcilable: {e:?}"
+                        ),
+                    });
+                    return (report, false);
                 }
+            };
+            if let Err(e) = crate::scrub::heal_attest::write(
+                &*self.fs,
+                &self.path,
+                self.encryption.as_deref(),
+                self.id(),
+                manifest_checksum,
+                Checksum::from_raw(raw),
+            ) {
+                report.errors.push(ScrubError::ChecksumRefreshFailed {
+                    table_id: self.id(),
+                    path: self.path.to_path_buf(),
+                    reason: alloc::format!(
+                        "could not persist the heal attestation; heal skipped to keep the \
+                         table reconcilable: {e}"
+                    ),
+                });
+                return (report, false);
             }
-            // Attributable either way: on a non-crash run the reconcile
-            // attributes this pass's heal directly; the marker only adds crash
-            // recovery, so failing to predict the digest is not fatal.
             Some(true)
         } else {
             Some(false)
