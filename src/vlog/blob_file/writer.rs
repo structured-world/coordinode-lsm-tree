@@ -28,10 +28,11 @@ use std::io::Write;
 /// Enforced on the write path to prevent producing blobs that are
 /// unreasonably large. The reader applies its own copy of this limit.
 ///
-/// NOTE: Intentionally duplicated in `table::block` (as `u32`) and
-/// `vlog::blob_file::reader` rather than shared, because blocks and
-/// blobs are independent storage formats that may diverge in the future.
-const MAX_DECOMPRESSION_SIZE: usize = 256 * 1024 * 1024;
+/// The blob-format definition site: `reader` and `scanner` import this rather
+/// than duplicate it. Kept SEPARATE from `table::block`'s cap (a `u32`) on
+/// purpose, since blocks and blobs are independent storage formats that may
+/// diverge.
+pub(super) const MAX_DECOMPRESSION_SIZE: usize = 256 * 1024 * 1024;
 
 /// Returns `Err(DecompressedSizeTooLarge)` if `len > MAX_DECOMPRESSION_SIZE`.
 fn check_size_cap(len: usize) -> crate::Result<()> {
@@ -172,7 +173,16 @@ impl Writer {
             crate::sfa::Writer::from_writer(ChecksummedWriter::new(BufWriter::new(file)));
         if let Err(e) = writer.start("data") {
             drop(writer);
-            let _ = fs.remove_file(path);
+            // Best-effort cleanup of the partial file we own, but do not swallow
+            // a removal failure silently: log it with context so a leaked
+            // partial blob file is diagnosable. The original start error is still
+            // what the caller sees.
+            if let Err(remove_err) = fs.remove_file(path) {
+                log::warn!(
+                    "failed to remove partial blob file {} after a writer-init error: {remove_err}",
+                    path.display(),
+                );
+            }
             return Err(e.into());
         }
 

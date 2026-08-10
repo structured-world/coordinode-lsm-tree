@@ -2,19 +2,13 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
-// Format constants live in writer (the format definition site).
-// Extracting to a shared module is an upstream structural decision.
-use super::writer::{BLOB_HEADER_MAGIC, validate_header_crc};
-
-/// Safety cap on blob value size (256 MiB), matching the writer and the
-/// ordinary reader. Intentionally duplicated (see the writer's copy):
-/// blocks and blobs are independent formats that may diverge. The scanner
-/// enforces it BEFORE allocating: a CRC-valid fake header inside a damaged
-/// record's user-controlled bytes can declare a near-`u32::MAX` length,
-/// and in a sufficiently large source the declared frame still fits the
-/// data section — without the cap the salvage walk would attempt a
-/// multi-gigabyte allocation before the candidate's checksum rejection.
-const MAX_DECOMPRESSION_SIZE: usize = 256 * 1024 * 1024;
+// Format constants live in writer (the blob-format definition site). The
+// scalar cap is shared from there; the scanner enforces it BEFORE allocating:
+// a CRC-valid fake header inside a damaged record's user-controlled bytes can
+// declare a near-`u32::MAX` length that still fits a large data section, and
+// without the cap the salvage walk would attempt a multi-gigabyte allocation
+// before the candidate's checksum rejection.
+use super::writer::{BLOB_HEADER_MAGIC, MAX_DECOMPRESSION_SIZE, validate_header_crc};
 use crate::fs::{Fs, FsFile, FsOpenOptions};
 use crate::io::BufReader;
 use crate::io::{LittleEndian, ReadBytesExt};

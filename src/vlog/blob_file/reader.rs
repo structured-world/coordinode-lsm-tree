@@ -19,17 +19,9 @@ use crate::{
 #[cfg(feature = "std")]
 use std::io::{Cursor, Read};
 
-/// Safety cap on blob value size (256 MiB).
-///
-/// Enforced on this reader and on the write path to prevent producing
-/// or accepting blobs that are unreasonably large. Other internal
-/// readers (e.g., scanner used by compaction/GC) may impose different
-/// constraints.
-///
-/// NOTE: Intentionally duplicated in `vlog::blob_file::writer` and
-/// `table::block` rather than shared, because blocks and blobs are
-/// independent storage formats that may diverge in the future.
-const MAX_DECOMPRESSION_SIZE: usize = 256 * 1024 * 1024;
+// Safety cap on blob value size (256 MiB), defined in `writer` (the blob-format
+// definition site) and shared by this reader.
+use super::writer::MAX_DECOMPRESSION_SIZE;
 
 /// Reads a single blob from a blob file
 pub struct Reader<'a> {
