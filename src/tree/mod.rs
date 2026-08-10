@@ -4164,7 +4164,7 @@ impl Tree {
                         "Removing abandoned heal copy: {}",
                         table_file_path.display()
                     );
-                    folder_fs.remove_file(&table_file_path)?;
+                    Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
                     continue;
                 }
 
@@ -4183,7 +4183,7 @@ impl Tree {
                         "Removing abandoned heal-attest temp: {}",
                         table_file_path.display()
                     );
-                    folder_fs.remove_file(&table_file_path)?;
+                    Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
                     continue;
                 }
 
@@ -4210,7 +4210,7 @@ impl Tree {
                             "Removing orphaned heal attestation (its table is gone): {}",
                             table_file_path.display()
                         );
-                        folder_fs.remove_file(&table_file_path)?;
+                        Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
                     }
                     continue;
                 }
@@ -4352,6 +4352,18 @@ impl Tree {
     /// function now fails fast on non-UTF-8 names. This is intentional: version
     /// files are always `v{u64}` — any non-UTF-8 entry indicates filesystem
     /// corruption and should surface as an error rather than be silently ignored.
+    /// Removes a recovery-swept artifact (an abandoned heal copy / temp / marker),
+    /// treating a concurrent removal (`NotFound`) as success. A benign race (a
+    /// retry, or another scanner that already swept it) must not fail recovery,
+    /// matching [`Self::cleanup_orphaned_version`].
+    fn sweep_artifact(fs: &dyn Fs, path: &Path) -> crate::Result<()> {
+        match fs.remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Removes stale manifest files left by older generations: every `v{id}`
     /// snapshot except the live one (`v{snapshot_id}`) and every `edits-{id}`
     /// log except the live snapshot's (`edits-{snapshot_id}`). A crashed
