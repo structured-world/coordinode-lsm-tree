@@ -1548,6 +1548,18 @@ impl Writer {
         // chunk is empty (the columnar-only ingest / salvage path).
         self.spill_block()?;
 
+        // Drain any blocks still being compressed on worker threads BEFORE the
+        // direct block appends its raw bytes: a direct write lands at the current
+        // file position, so a submitted-but-unwritten parallel block would
+        // otherwise be written at an overlapping offset and register a wrong
+        // handle. `spill_block` only drains down to the parallel cap, so an
+        // explicit full drain is required here (a no-op without parallel
+        // compression, mirroring the finish path).
+        #[cfg(feature = "std")]
+        while self.parallel.as_ref().map_or(0, BlockCompressor::pending) > 0 {
+            self.drain_one_parallel()?;
+        }
+
         // Per-row shape / seqno / key accounting, mirroring `write()` minus the
         // chunk push (the direct block holds all rows already). The locator
         // records each new key's position within this single block, the same as
