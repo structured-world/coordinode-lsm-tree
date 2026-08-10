@@ -1,6 +1,63 @@
-use super::{compute_table_checksum, highest_existing_version_id, quarantine_file};
+use super::{
+    compute_table_checksum, compute_table_checksum_with_overrides, highest_existing_version_id,
+    quarantine_file,
+};
 use crate::fs::StdFs;
 use test_log::test;
+
+/// `compute_table_checksum_with_overrides` splices corrections chunk by chunk
+/// (256 KiB). An override that does NOT overlap the current chunk must be
+/// skipped cleanly. Before the overlap guard was hoisted above the bound
+/// subtractions, a multi-chunk file underflowed an unsigned difference (e.g.
+/// `hi - chunk_start` for an override that ends before the chunk starts) and
+/// panicked in debug builds while predicting the post-heal digest. The result
+/// must equal a manual splice.
+#[test]
+fn checksum_with_overrides_skips_non_overlapping_overrides_across_chunks() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions};
+    use std::io::Write;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("multi-chunk.sst");
+
+    // Three 256 KiB chunks plus a tail, deterministic bytes.
+    let len: usize = 3 * 256 * 1024 + 777;
+    let mut data: Vec<u8> = (0..len)
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+
+    let fs = StdFs;
+    {
+        let mut f = fs.open(
+            &path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        f.write_all(&data)?;
+    }
+
+    // One override entirely within the FIRST chunk: chunks 1 and 2 do not
+    // overlap it, which is exactly the non-overlap path that used to underflow.
+    let ov_off: usize = 100;
+    let ov_bytes = vec![0xABu8; 4096];
+    let overrides = vec![(ov_off as u64, ov_bytes.clone())];
+
+    // Manual splice for the expected digest (mirrors the streaming hasher the
+    // implementation uses).
+    if let Some(slot) = data.get_mut(ov_off..ov_off + ov_bytes.len()) {
+        slot.copy_from_slice(&ov_bytes);
+    }
+    let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
+    hasher.update(&data);
+    let expected = hasher.digest128();
+
+    let got = compute_table_checksum_with_overrides(&fs, &path, 0, &overrides)?;
+    assert_eq!(
+        got, expected,
+        "the spliced digest must match a manual splice and must not panic on \
+         chunks the override does not overlap",
+    );
+    Ok(())
+}
 
 /// `quarantine_file` must fsync BOTH affected directories (the source's parent
 /// and the `repair-quarantine/` destination) before returning success: a
