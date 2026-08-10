@@ -2588,6 +2588,66 @@ fn heal_in_place_fails_closed_without_a_heal_attestation() -> crate::Result<()> 
     Ok(())
 }
 
+/// The attributable heal path (the manifest digest matches the CURRENT pre-heal
+/// bytes) is about to change bytes the manifest still matches, so its
+/// crash-recovery attestation MUST be durable BEFORE the first block is mutated.
+/// If the attestation cannot be persisted, the heal must ABORT — not proceed and
+/// only log — because a crash after a corrected block syncs but before the
+/// manifest refresh would leave healed bytes under the stale digest with no
+/// marker, which fail-closed reconciliation rejects forever, permanently
+/// stranding a table that was reconcilable a moment earlier. Leaving the block
+/// corrupt keeps the table reconcilable; the next patrol retries.
+#[test]
+fn heal_in_place_aborts_when_the_attestation_cannot_be_persisted() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst_footered(dir.path());
+
+    // Seed the ATTRIBUTABLE reconcile scenario: rot a parity byte, then rebuild
+    // the manifest over the rotted bytes so the manifest digest == the current
+    // (pre-heal) file. `pre_heal_digest_matches` is then true and the heal would
+    // change bytes the manifest currently matches (the only path that writes a
+    // crash-recovery marker).
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
+    rebuild_manifest_over_current_bytes(dir.path())?;
+    let before = std::fs::read(&sst_path)?;
+
+    // Fault every open of the attestation sidecar so it can never be persisted.
+    let fault = FaultFs::new(crate::fs::StdFs);
+    let injector = fault.injector();
+    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));
+    injector
+        .arm(FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other)).on_path(".heal-attest"));
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    injector.clear();
+
+    // The heal aborted: no block was mutated, so the file is byte-for-byte what
+    // it was before the pass (pre-fix the heal proceeds and rewrites the block).
+    assert_eq!(
+        report.blocks_healed_in_place, 0,
+        "the heal must not mutate any block when its attestation cannot be persisted: {report:?}",
+    );
+    let after = std::fs::read(&sst_path)?;
+    assert_eq!(
+        after, before,
+        "the corrupt block must stay untouched so the table stays reconcilable",
+    );
+    // The skipped heal is surfaced as a finding, not silently swallowed.
+    assert!(
+        !report.is_ok(),
+        "aborting the heal must surface a finding: {report:?}",
+    );
+    // A failed attestation write must not leave a partial marker behind.
+    assert!(
+        !heal_attest_path(&sst_path).exists(),
+        "no partial attestation marker after a failed write",
+    );
+    Ok(())
+}
+
 /// An in-place heal that changes the SST's bytes must REFRESH the manifest's
 /// full-file checksum. The heal itself restores the block's original bytes
 /// (whose digest usually matches the manifest), but a table admitted by a
