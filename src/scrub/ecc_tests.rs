@@ -2588,6 +2588,39 @@ fn heal_in_place_fails_closed_without_a_heal_attestation() -> crate::Result<()> 
     Ok(())
 }
 
+/// A `.heal-attest` sidecar whose SST is absent from the recovered manifest is
+/// an orphan: its table was retired (compacted away, its numeric file unlinked)
+/// while the attestation lingered. Recovery must SWEEP the orphan rather than
+/// skip it forever — an attestation can only ever reconcile a table that still
+/// exists, so a leaked sidecar is dead weight that every future recovery scan
+/// re-processes. A LIVE table's pending attestation must still be preserved.
+#[test]
+fn recovery_sweeps_an_orphaned_heal_attestation_but_keeps_a_live_one() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _block) = write_ecc_sst(dir.path());
+    let tables_dir = sst_path.parent().expect("the SST lives in a tables folder");
+
+    // An orphan sidecar for a table id that is NOT in the manifest.
+    let orphan = tables_dir.join("99999.heal-attest");
+    std::fs::write(&orphan, b"orphaned attestation")?;
+    // A pending attestation for the LIVE SST (its id IS in the manifest).
+    let live = heal_attest_path(&sst_path);
+    std::fs::write(&live, b"live attestation")?;
+
+    // Reopen: recovery scans the tables folder and reconciles sidecars.
+    let _tree = open_ecc_tree(dir.path());
+
+    assert!(
+        !orphan.exists(),
+        "recovery must sweep a sidecar whose table id is absent from the manifest",
+    );
+    assert!(
+        live.exists(),
+        "recovery must preserve a live table's pending attestation",
+    );
+    Ok(())
+}
+
 /// The attributable heal path (the manifest digest matches the CURRENT pre-heal
 /// bytes) is about to change bytes the manifest still matches, so its
 /// crash-recovery attestation MUST be durable BEFORE the first block is mutated.
