@@ -393,6 +393,16 @@ fn run_salvage(
         );
     }
 
+    // Warn ONLY when the opt-in actually resurrected positionally-deleted rows
+    // (an unappliable delete mask that the flag let through), not merely because
+    // the flag was passed.
+    if report.delete_rows_resurrected {
+        println!(
+            "warning:         --allow-delete-resurrection re-emitted positionally-deleted \
+             rows LIVE (the delete mask could not be applied faithfully)"
+        );
+    }
+
     if report.is_complete() {
         println!("status:          fully recovered");
         ExitCode::SUCCESS

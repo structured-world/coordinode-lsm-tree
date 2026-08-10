@@ -153,6 +153,14 @@ pub struct SalvageReport {
     pub entries_salvaged: u64,
     /// Blocks the walk had to drop, with their key ranges where known.
     pub dropped: Vec<DroppedBlock>,
+    /// `true` when the source carried positional deletes that could NOT be
+    /// applied faithfully and [`SalvageOptions::allow_delete_resurrection`] let
+    /// the salvage proceed anyway: the recovered copy re-emits those rows LIVE,
+    /// so positionally-deleted rows came back. Always `false` for a normal
+    /// salvage (and when the opt-in is set but no unappliable delete mask was
+    /// encountered), so a caller can warn ONLY when resurrection actually
+    /// happened.
+    pub delete_rows_resurrected: bool,
 }
 
 impl SalvageReport {
@@ -177,6 +185,7 @@ impl SalvageReport {
     ///     blocks_copied_verbatim: 4,
     ///     entries_salvaged: 100,
     ///     dropped: Vec::new(),
+    ///     delete_rows_resurrected: false,
     /// };
     /// assert!(clean.is_complete());
     /// ```
@@ -802,6 +811,10 @@ fn salvage_attempt(
         blocks_copied_verbatim: walk.blocks_copied_verbatim,
         entries_salvaged: walk.entries_salvaged,
         dropped: walk.dropped,
+        // Resurrection happened exactly when the delete mask was unappliable and
+        // the opt-in let the walk re-emit unmasked (the fail-closed branch above
+        // already returned otherwise).
+        delete_rows_resurrected: delete_mask_unpositionable && options.allow_delete_resurrection,
     })
 }
 
