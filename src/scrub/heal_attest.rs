@@ -164,6 +164,18 @@ fn read_sidecar(
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return SidecarRead::Missing,
         Err(_) => return SidecarRead::Inconclusive,
     };
+    // Bound the read: a valid sidecar is exactly `ATTEST_LEN` bytes (plaintext)
+    // or `ATTEST_LEN + max AEAD overhead` (encrypted). Reject anything larger
+    // BEFORE reading it, so a corrupt / attacker-replaced sidecar cannot force an
+    // allocation of its full (attacker-controlled) length, and a valid record
+    // padded with a long garbage tail cannot be laundered past `deserialize`.
+    let max_len =
+        ATTEST_LEN as u64 + u64::from(encryption.map_or(0, EncryptionProvider::max_overhead));
+    match file.metadata() {
+        Ok(meta) if meta.len > max_len => return SidecarRead::Inconclusive,
+        Ok(_) => {}
+        Err(_) => return SidecarRead::Inconclusive,
+    }
     let mut content = Vec::new();
     if file.read_to_end(&mut content).is_err() {
         return SidecarRead::Inconclusive;
