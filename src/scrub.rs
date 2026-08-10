@@ -426,11 +426,16 @@ fn scan_and_reconcile(
 pub(crate) fn reconcile_pending_heals(tree: &impl AbstractTree) -> crate::Result<()> {
     let options = PatrolScrubOptions::default().heal_in_place(true);
     let version = tree.current_version();
-    let pending: Vec<crate::table::Table> = version
-        .iter_tables()
-        .filter(|t| t.metadata.ecc_params.is_some() && heal_attest::exists(&*t.fs, &t.path))
-        .cloned()
-        .collect();
+    // A sidecar-probe FAILURE aborts (fail-closed): mistaking an unreadable
+    // probe for "no pending heal" would let the snapshot capture a stale digest.
+    let mut pending: Vec<crate::table::Table> = Vec::new();
+    for table in version.iter_tables() {
+        if table.metadata.ecc_params.is_some()
+            && heal_attest::exists(&*table.fs, &table.path).map_err(crate::Error::Io)?
+        {
+            pending.push(table.clone());
+        }
+    }
     if pending.is_empty() {
         return Ok(());
     }

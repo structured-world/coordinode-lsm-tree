@@ -256,9 +256,15 @@ pub fn remove(fs: &dyn Fs, table_path: &Path) {
 }
 
 /// Whether a pending attestation sidecar exists for `table_path`. A probe
-/// failure grades `false` (no pending heal to reconcile) rather than an error.
-pub fn exists(fs: &dyn Fs, table_path: &Path) -> bool {
-    fs.exists(&attest_path(table_path)).unwrap_or(false)
+/// FAILURE propagates as an error (fail-closed): a caller that reconciles
+/// pending heals before a checkpoint must abort rather than mistake an
+/// unreadable probe for "no pending heal" and snapshot a stale digest.
+///
+/// # Errors
+///
+/// Propagates the underlying [`Fs::exists`] error.
+pub fn exists(fs: &dyn Fs, table_path: &Path) -> crate::io::Result<bool> {
+    fs.exists(&attest_path(table_path))
 }
 
 #[cfg(test)]
