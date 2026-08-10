@@ -182,6 +182,15 @@ pub(crate) fn compute_table_checksum_with_overrides(
             let ov_end = *off + bytes.len() as u64;
             let lo = (*off).max(chunk_start);
             let hi = ov_end.min(chunk_end);
+            // Skip a non-overlapping override BEFORE computing relative offsets:
+            // the bound subtractions below are unsigned, and an override ending
+            // before this chunk (or starting after it) would otherwise underflow
+            // (a debug panic). Once `lo < hi` holds, `chunk_start <= lo < hi <=
+            // chunk_end` and `off <= lo < hi <= ov_end`, so all four differences
+            // are non-negative.
+            if lo >= hi {
+                continue;
+            }
             // The overlap lies inside a `<= 256 KiB` chunk, so every difference
             // fits `usize`; `try_from` handles the 32-bit target without a cast.
             let (Ok(dst_lo), Ok(dst_hi), Ok(src_lo), Ok(src_hi)) = (
@@ -192,9 +201,8 @@ pub(crate) fn compute_table_checksum_with_overrides(
             ) else {
                 continue;
             };
-            if lo < hi
-                && let (Some(dst), Some(src)) =
-                    (chunk.get_mut(dst_lo..dst_hi), bytes.get(src_lo..src_hi))
+            if let (Some(dst), Some(src)) =
+                (chunk.get_mut(dst_lo..dst_hi), bytes.get(src_lo..src_hi))
             {
                 dst.copy_from_slice(src);
             }
