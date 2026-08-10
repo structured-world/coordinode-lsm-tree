@@ -243,6 +243,21 @@ impl Iterator for Scanner {
             return None;
         }
 
+        // A frame header is a fixed BLOB_HEADER_LEN bytes. A magic found within
+        // fewer than that of the data-section end (e.g. a resync landing near
+        // EOF) would let the fixed-header reads below consume bytes from the
+        // FOLLOWING SFA section. Reject the incomplete tail here, before the
+        // first read: no whole frame can start this close to the boundary. (The
+        // span check further down still rejects a full-but-overrunning frame;
+        // this only stops the header read itself from crossing the section.)
+        if offset
+            .checked_add(super::writer::BLOB_HEADER_LEN as u64)
+            .is_none_or(|end| end > self.data_end)
+        {
+            self.is_terminated = true;
+            return Some(Err(crate::Error::InvalidHeader("Blob")));
+        }
+
         {
             let mut buf = [0; BLOB_HEADER_MAGIC.len()];
             fail_iter!(self.inner.read_exact(&mut buf));
