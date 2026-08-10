@@ -272,6 +272,14 @@ impl Drop for Inner {
         if self.is_deleted.load(core::sync::atomic::Ordering::Acquire) {
             log::trace!("Cleanup deleted table {global_id:?} at {:?}", self.path);
 
+            // Reclaim any pending `.heal-attest` sidecar: a retired table can
+            // never be reconciled, so its attestation is dead weight. Done here
+            // (before the deferred / background unlink paths return) so every
+            // deletion route reclaims it. Best-effort: a missing sidecar (the
+            // common case) is a no-op, and the recovery scan sweeps any straggler.
+            #[cfg(feature = "std")]
+            crate::scrub::heal_attest::remove(&*self.fs, &self.path);
+
             // Move the accessor and block index out so all file handles
             // (including clones held by the block index) are closed before
             // attempting deletion. On Windows, remove_file fails while any

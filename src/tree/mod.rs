@@ -4084,6 +4084,12 @@ impl Tree {
 
         let cnt = table_map.len();
 
+        // Immutable snapshot of every table id the manifest knows. `table_map`
+        // is drained as tables are recovered below, so it cannot answer "is this
+        // id live?" order-independently; this set can. Used to sweep an orphaned
+        // `.heal-attest` sidecar whose SST was retired.
+        let manifest_ids: crate::HashSet<TableId> = table_map.keys().copied().collect();
+
         log::debug!("Recovering {cnt} tables from {}", tree_path.display());
 
         let progress_mod = match cnt {
@@ -4184,16 +4190,28 @@ impl Tree {
                 // A `{id}.heal-attest` sidecar records that an in-place heal
                 // corrected `{id}` but its manifest digest refresh may not have
                 // landed; the next scrub consumes it to reconcile. It is never a
-                // table file, so SKIP it (never parse it as an id) — but, unlike
-                // the healtmp sweep, do NOT delete it: a pending attestation is
-                // still needed to reconcile a crashed refresh on the next scrub.
-                // Only the EXACT shape (numeric id + exact suffix) is owned; a
-                // foreign name merely containing `.heal-attest` falls through to
-                // the id parse and fails recovery unharmed.
-                if table_file_name
+                // table file, so never parse it as an id. Only the EXACT shape
+                // (numeric id + exact suffix) is owned; a foreign name merely
+                // containing `.heal-attest` falls through to the id parse and
+                // fails recovery unharmed.
+                if let Some(attest_id) = table_file_name
                     .strip_suffix(".heal-attest")
-                    .is_some_and(|id| id.parse::<TableId>().is_ok())
+                    .and_then(|id| id.parse::<TableId>().ok())
                 {
+                    // A LIVE table's pending attestation is preserved (the next
+                    // scrub reconciles a crashed refresh through it). But if its
+                    // SST is absent from the manifest, the table was retired
+                    // (compacted away, its file unlinked) while the sidecar
+                    // lingered: nothing can ever reconcile a table that no longer
+                    // exists, so sweep the orphan rather than leak the directory
+                    // entry and re-process it on every future recovery.
+                    if !manifest_ids.contains(&attest_id) {
+                        log::warn!(
+                            "Removing orphaned heal attestation (its table is gone): {}",
+                            table_file_path.display()
+                        );
+                        folder_fs.remove_file(&table_file_path)?;
+                    }
                     continue;
                 }
 
