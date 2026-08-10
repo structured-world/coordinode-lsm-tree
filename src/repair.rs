@@ -304,12 +304,28 @@ fn quarantine_file(
 /// bitmap, locator, meta — is then verified against its raw on-disk checksum,
 /// which flags even a persistent ECC-CORRECTABLE fault (a live read would
 /// silently heal it in memory while the corrupt bytes stay on disk).
+/// Classifies a block-verifier result for the salvage gate. A structural
+/// divergence (a checksum / decode / cross-check mismatch) is genuine
+/// corruption: `Ok(true)`, route the table through salvage. A transient
+/// [`crate::Error::Io`] is NOT corruption: the outer raw-checksum walk already
+/// proved the on-disk framing intact, so a read that fails HERE is a retryable
+/// filesystem error. Propagating it (`Err`) aborts the repair instead of
+/// dropping a healthy block and installing a partial replacement, which would
+/// turn a retryable failure into permanent missing data.
+fn is_corruption(res: crate::Result<()>) -> crate::Result<bool> {
+    match res {
+        Ok(()) => Ok(false),
+        Err(e @ crate::Error::Io(_)) => Err(e),
+        Err(_) => Ok(true),
+    }
+}
+
 fn block_verify_verdict(
     config: &Config,
     folder_fs: &Arc<dyn crate::fs::Fs>,
     table_path: &std::path::Path,
     table: &Table,
-) -> BlockVerifyVerdict {
+) -> crate::Result<BlockVerifyVerdict> {
     let report = crate::verify::verify_sst_file_with_context(
         &**folder_fs,
         table_path,
@@ -323,7 +339,7 @@ fn block_verify_verdict(
         0,
     );
     // A non-parity error is corruption regardless of any warnings.
-    if !report
+    let verdict = if !report
         .errors
         .iter()
         .all(|e| matches!(e, crate::verify::BlockVerifyError::EccParityMismatch { .. }))
@@ -342,7 +358,7 @@ fn block_verify_verdict(
         // self-describing meta blocks must not mask the skipped data /
         // index sections.
         BlockVerifyVerdict::DegradedUnscanned
-    } else if table.verify_kv_checksums().is_err() {
+    } else if is_corruption(table.verify_kv_checksums())? {
         // The walk verifies raw block checksums but never DECODES entries,
         // so a stale per-KV footer behind a re-stamped block checksum still
         // reads clean at the block level. Footer-bearing tables must pass
@@ -356,7 +372,7 @@ fn block_verify_verdict(
         // recovered descriptor, but an out-of-band unrecognized descriptor
         // already means nothing about the data was verified.)
         BlockVerifyVerdict::Corrupt
-    } else if table.verify_blob_links().is_err() {
+    } else if is_corruption(table.verify_blob_links())? {
         // Same reasoning for the blob-link list: the section carries no
         // per-section checksum, so the walk can only validate its SHAPE — a
         // flipped blob id passes it. Cross-check against the table's own
@@ -364,7 +380,7 @@ fn block_verify_verdict(
         // corruption, and salvage derives the links from the recovered
         // indirections rather than copying the forged list.
         BlockVerifyVerdict::Corrupt
-    } else if table.verify_tli_mirrors().is_err() {
+    } else if is_corruption(table.verify_tli_mirrors())? {
         // Each TLI mirror is independently checksum-clean to the walk, but a
         // forged copy that DECODES to a different handle list would steer
         // the next recovery (which prefers the tail) away from real blocks.
@@ -377,14 +393,14 @@ fn block_verify_verdict(
         // hidden block is recovered (or reported dropped), never silently
         // missing from an apparently complete copy.
         BlockVerifyVerdict::Corrupt
-    } else if table.verify_seqno_bounds().is_err() {
+    } else if is_corruption(table.verify_seqno_bounds())? {
         // The seqno_bounds block is checksum-clean to the walk even when
         // its payload was re-stamped to another structurally valid map, and
         // scan_since_seqno trusts it to SKIP blocks — keeping the table
         // would silently omit live entries from every seqno-scoped scan.
         // Salvage re-derives the bounds from the re-emitted entries.
         BlockVerifyVerdict::Corrupt
-    } else if table.verify_block_entry_counts().is_err() {
+    } else if is_corruption(table.verify_block_entry_counts())? {
         // The out-of-band walk verifies only the outer frame and the per-KV
         // gate is a no-op without footers, so a checksum-clean block whose
         // trailer declares more entries than it decodes (a valid prefix, a
@@ -392,45 +408,42 @@ fn block_verify_verdict(
         // tail. Full-decode every block; a count mismatch routes the table
         // through salvage (whose row path drops the under-decoding block).
         BlockVerifyVerdict::Corrupt
-    } else if table.verify_zone_map().is_err() {
+    } else if is_corruption(table.verify_zone_map())? {
         // A checksum-clean zone_map re-stamped to another structurally valid
         // map would let a predicate scan skip blocks its forged min/max
         // excludes, silently omitting matching rows. Diverging stats are
         // corruption; salvage re-derives the zone map from the re-emitted
         // blocks.
         BlockVerifyVerdict::Corrupt
-    } else if table.verify_locator().is_err() {
+    } else if is_corruption(table.verify_locator())? {
         // A checksum-clean locator re-stamped to resolve a key to a block
         // other than its newest-version block would make point_read return a
         // stale value without falling back to the sorted index. A mapping
         // that disagrees with the decoded blocks is corruption; salvage
         // rebuilds the locator from the re-emitted entries.
         BlockVerifyVerdict::Corrupt
-    } else if table
-        .verify_filter(config.prefix_extractor.as_ref())
-        .is_err()
-    {
+    } else if is_corruption(table.verify_filter(config.prefix_extractor.as_ref()))? {
         // A checksum-clean filter re-stamped to another parseable filter
         // makes check_bloom silently skip point reads for any key turned
         // into a false negative. An existing key the filter reports as
         // definitely absent is corruption; salvage rebuilds the filter from
         // the re-emitted keys.
         BlockVerifyVerdict::Corrupt
-    } else if table.verify_block_layout().is_err() {
+    } else if is_corruption(table.verify_block_layout())? {
         // A checksum-clean block_layout re-stamped to another structurally
         // valid boundary set mis-maps the partial range-read path's
         // decompression bounds, silently omitting keys. Boundaries that
         // disagree with the frames' actual inner blocks are corruption;
         // salvage re-derives the layout when re-encoding.
         BlockVerifyVerdict::Corrupt
-    } else if table.verify_point_read_reachability().is_err() {
+    } else if is_corruption(table.verify_point_read_reachability())? {
         // A checksum-clean embedded hash / binary index re-stamped to hide a
         // key (a MARKER_FREE bucket, a misdirected offset) makes point_read
         // miss existing data. Keys the block decodes but point_read cannot
         // retrieve are corruption; salvage re-emits the block with fresh
         // indexes.
         BlockVerifyVerdict::Corrupt
-    } else if table.verify_metadata_bounds().is_err() {
+    } else if is_corruption(table.verify_metadata_bounds())? {
         // Both meta mirrors re-stamped CONSISTENTLY pass the mirror
         // comparison, yet run selection trusts the recorded key range — a
         // narrowed range hides real keys (and the range tombstones masking
@@ -453,7 +466,8 @@ fn block_verify_verdict(
         BlockVerifyVerdict::DegradedButReadable
     } else {
         BlockVerifyVerdict::Clean
-    }
+    };
+    Ok(verdict)
 }
 
 /// Outcome of the salvage-mode block verify, from the repair gate's point of
@@ -523,63 +537,65 @@ fn verify_keep_decision(
     folder_fs: &Arc<dyn crate::fs::Fs>,
     table_path: &std::path::Path,
     table: &Table,
-) -> RepairKeepDecision {
-    match block_verify_verdict(config, folder_fs, table_path, table) {
-        BlockVerifyVerdict::Clean => RepairKeepDecision::Keep,
-        BlockVerifyVerdict::Corrupt => {
-            // A `Corrupt` verdict from a catalogue that could HIDE a deletion
-            // section (an omitted / renamed / shadowed `range_tombstones` or
-            // `delete_bitmap`) must NOT salvage: the positional salvage walk
-            // reopens the same forged TOC, sees no deletion section in the
-            // parsed state, and re-emits the suppressed rows as LIVE —
-            // resurrecting data the deletion metadata masked. The salvage-side
-            // resurrection guard only inspects the PARSED deletion state, which
-            // the concealment defeats, so the refusal has to happen here.
-            // Quarantine for manual recovery unless the tiling proves no
-            // section is hidden. A relabel that keeps the tiling intact but
-            // re-roles the block is caught inside salvage itself
-            // (`salvage_with_context` fails closed on a corrupt rebuildable
-            // section when no deletion is visible), which both this path and
-            // the recovery-failure salvage path funnel through.
-            if toc_may_hide_deletions(folder_fs, table_path) {
-                RepairKeepDecision::Quarantine(
-                    "TOC corruption may hide deletion metadata (range tombstones \
+) -> crate::Result<RepairKeepDecision> {
+    Ok(
+        match block_verify_verdict(config, folder_fs, table_path, table)? {
+            BlockVerifyVerdict::Clean => RepairKeepDecision::Keep,
+            BlockVerifyVerdict::Corrupt => {
+                // A `Corrupt` verdict from a catalogue that could HIDE a deletion
+                // section (an omitted / renamed / shadowed `range_tombstones` or
+                // `delete_bitmap`) must NOT salvage: the positional salvage walk
+                // reopens the same forged TOC, sees no deletion section in the
+                // parsed state, and re-emits the suppressed rows as LIVE —
+                // resurrecting data the deletion metadata masked. The salvage-side
+                // resurrection guard only inspects the PARSED deletion state, which
+                // the concealment defeats, so the refusal has to happen here.
+                // Quarantine for manual recovery unless the tiling proves no
+                // section is hidden. A relabel that keeps the tiling intact but
+                // re-roles the block is caught inside salvage itself
+                // (`salvage_with_context` fails closed on a corrupt rebuildable
+                // section when no deletion is visible), which both this path and
+                // the recovery-failure salvage path funnel through.
+                if toc_may_hide_deletions(folder_fs, table_path) {
+                    RepairKeepDecision::Quarantine(
+                        "TOC corruption may hide deletion metadata (range tombstones \
                      / delete bitmap); salvage would reopen the same forged \
                      catalogue and resurrect suppressed rows — quarantined for \
                      manual recovery",
-                )
-            } else {
-                RepairKeepDecision::Salvage
+                    )
+                } else {
+                    RepairKeepDecision::Salvage
+                }
             }
-        }
-        BlockVerifyVerdict::DegradedButReadable => {
-            if table.range_tombstones().is_empty() {
-                RepairKeepDecision::Salvage
-            } else {
-                log::warn!(
-                    "table {} at {}: every payload verified clean but its ECC is \
+            BlockVerifyVerdict::DegradedButReadable => {
+                if table.range_tombstones().is_empty() {
+                    RepairKeepDecision::Salvage
+                } else {
+                    log::warn!(
+                        "table {} at {}: every payload verified clean but its ECC is \
                      partially uncheckable or rotted, and salvage cannot re-emit its \
                      range tombstones — keeping the table as-is; recompact to re-stamp \
                      it under fresh, verifiable parity",
-                    table.metadata.id,
-                    table_path.display(),
-                );
-                RepairKeepDecision::Keep
+                        table.metadata.id,
+                        table_path.display(),
+                    );
+                    RepairKeepDecision::Keep
+                }
             }
-        }
-        BlockVerifyVerdict::DegradedUnscanned => {
-            if table.range_tombstones().is_empty() {
-                RepairKeepDecision::Salvage
-            } else {
-                RepairKeepDecision::Quarantine(
-                    "ECC descriptor unrecognized (the block walk cannot verify the \
+            BlockVerifyVerdict::DegradedUnscanned => {
+                if table.range_tombstones().is_empty() {
+                    RepairKeepDecision::Salvage
+                } else {
+                    RepairKeepDecision::Quarantine(
+                        "ECC descriptor unrecognized (the block walk cannot verify the \
                      table) and salvage cannot re-emit its range tombstones; \
                      quarantined for manual recovery — recompact it under a \
                      supported scheme",
-                )
+                    )
+                }
             }
-        }
-    }
+        },
+    )
 }
 
 fn try_salvage_table(
@@ -958,7 +974,7 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                 // and would misreport every healthy encrypted table as corrupt,
                 // rewriting it on every repair.
                 Ok(table) if salvage => {
-                    match verify_keep_decision(config, &folder_fs, &table_path, &table) {
+                    match verify_keep_decision(config, &folder_fs, &table_path, &table)? {
                         RepairKeepDecision::Keep => recovered_tables.push(table),
                         RepairKeepDecision::Quarantine(reason) => {
                             drop(table);
