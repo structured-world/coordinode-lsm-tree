@@ -124,6 +124,7 @@ pub enum Fault {
 pub struct FaultRule {
     op: FaultOp,
     path_substr: Option<String>,
+    offset: Option<u64>,
     skip: u64,
     count: u64,
     fault: Fault,
@@ -132,13 +133,14 @@ pub struct FaultRule {
 impl FaultRule {
     /// Creates a rule that, by default, fires `fault` on **every** matching
     /// `op` (no path filter, no skip, unlimited fires). Refine with
-    /// [`on_path`](Self::on_path), [`skip`](Self::skip),
-    /// [`times`](Self::times), or [`once`](Self::once).
+    /// [`on_path`](Self::on_path), [`at_offset`](Self::at_offset),
+    /// [`skip`](Self::skip), [`times`](Self::times), or [`once`](Self::once).
     #[must_use]
     pub const fn new(op: FaultOp, fault: Fault) -> Self {
         Self {
             op,
             path_substr: None,
+            offset: None,
             skip: 0,
             count: u64::MAX,
             fault,
@@ -151,6 +153,17 @@ impl FaultRule {
     #[must_use]
     pub fn on_path(mut self, substr: impl Into<String>) -> Self {
         self.path_substr = Some(substr.into());
+        self
+    }
+
+    /// Restricts a [`FaultOp::ReadAt`] rule to positioned reads at exactly
+    /// `offset`. Lets a test fault ONE section of a file (e.g. a single data
+    /// block) while every other positioned read on the same file proceeds, so
+    /// a fault can isolate one decode-load from the reads a recovery pass makes
+    /// on the same path. No effect on non-`ReadAt` ops (they carry no offset).
+    #[must_use]
+    pub const fn at_offset(mut self, offset: u64) -> Self {
+        self.offset = Some(offset);
         self
     }
 
@@ -177,10 +190,32 @@ impl FaultRule {
     }
 
     /// Returns `true` if this rule matches an operation of `op` at `path`.
+    ///
+    /// Offset-scoped rules ([`at_offset`](Self::at_offset)) never match here:
+    /// only the offset-aware [`FaultInjector::check_read_at`] path can fire
+    /// them, since a positioned offset is meaningful only for
+    /// [`FaultOp::ReadAt`].
     fn matches(&self, op: FaultOp, path: Option<&Path>) -> bool {
-        if self.op != op {
+        if self.op != op || self.offset.is_some() {
             return false;
         }
+        self.matches_path(path)
+    }
+
+    /// Returns `true` if this [`FaultOp::ReadAt`] rule matches a positioned read
+    /// at `offset` on `path`. An unset [`at_offset`](Self::at_offset) matches
+    /// any offset; a set one matches only that exact offset.
+    fn matches_read_at(&self, path: Option<&Path>, offset: u64) -> bool {
+        if self.op != FaultOp::ReadAt {
+            return false;
+        }
+        if self.offset.is_some_and(|want| want != offset) {
+            return false;
+        }
+        self.matches_path(path)
+    }
+
+    fn matches_path(&self, path: Option<&Path>) -> bool {
         match (&self.path_substr, path) {
             (None, _) => true,
             (Some(sub), Some(p)) => p.to_string_lossy().contains(sub.as_str()),
@@ -253,20 +288,40 @@ impl FaultInjector {
             if !rule.matches(op, path) {
                 continue;
             }
-            // First matching rule owns this occurrence.
-            if rule.skip > 0 {
-                rule.skip -= 1;
-                return None;
-            }
-            if rule.count == 0 {
-                return None;
-            }
-            if rule.count != u64::MAX {
-                rule.count -= 1;
-            }
-            return Some(rule.fault);
+            return Self::fire(rule);
         }
         None
+    }
+
+    /// Consults the rules for a positioned [`FaultOp::ReadAt`] at `offset` on
+    /// `path`, honouring an [`at_offset`](FaultRule::at_offset) scope. Advances
+    /// the matched rule's skip/fire counters exactly like [`check`](Self::check).
+    fn check_read_at(&self, path: Option<&Path>, offset: u64) -> Option<Fault> {
+        let mut rules = self.rules.lock();
+        for rule in rules.iter_mut() {
+            if !rule.matches_read_at(path, offset) {
+                continue;
+            }
+            return Self::fire(rule);
+        }
+        None
+    }
+
+    /// Advances a matched rule's skip/fire budget and returns the [`Fault`] to
+    /// apply, or `None` when the rule is still skipping or is exhausted. The
+    /// first matching rule owns the occurrence.
+    fn fire(rule: &mut FaultRule) -> Option<Fault> {
+        if rule.skip > 0 {
+            rule.skip -= 1;
+            return None;
+        }
+        if rule.count == 0 {
+            return None;
+        }
+        if rule.count != u64::MAX {
+            rule.count -= 1;
+        }
+        Some(rule.fault)
     }
 }
 
@@ -560,7 +615,7 @@ impl FsFile for FaultFile {
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::ReadAt, Some(&self.path)) {
+        if let Some(Fault::Error(kind)) = self.injector.check_read_at(Some(&self.path), offset) {
             return Err(fault_error(kind, FaultOp::ReadAt));
         }
         self.inner.read_at(buf, offset)

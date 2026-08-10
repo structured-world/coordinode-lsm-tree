@@ -652,6 +652,76 @@ fn sole_data_block_offset(table: &crate::table::Table) -> u64 {
     *only
 }
 
+/// A TRANSIENT read error while block-verifying a healthy table must abort the
+/// repair, not be laundered into a corruption verdict: routing it through
+/// salvage would drop the "unreadable" block and install a partial replacement,
+/// turning a retryable I/O failure into permanent missing data. The intact
+/// block stays on disk, so the operator retries and the next attempt reads it.
+#[test]
+fn repair_with_salvage_propagates_a_transient_verify_io_error() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    // A single-data-block SST whose bytes are entirely intact.
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?;
+        for i in 0..8u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Resolve the sole data block's offset, then fault ONLY the positioned read
+    // at that offset, exactly once. The raw-checksum verify walk streams the
+    // file (sequential `Read`), and whole-file recovery is lazy on the data
+    // section, so neither trips: the first positioned read at this offset is the
+    // block-verify DECODE-load, which then surfaces a transient `Io` error.
+    let offset = sole_data_block_offset(&recover_table(sst.clone(), &fs)?);
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    injector.arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other))
+            .at_offset(offset)
+            .once(),
+    );
+
+    let result = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(fault))
+    .repair_with_salvage(true);
+    injector.clear();
+
+    assert!(
+        result.is_err(),
+        "a transient read error during block verification must abort the repair \
+         (not salvage a healthy block into missing data), got {result:?}",
+    );
+    // The intact original is untouched: the abort happens before any quarantine
+    // move, so the operator can retry.
+    assert!(
+        fs.metadata(&sst).is_ok(),
+        "the original file stays in place after the aborted repair",
+    );
+    Ok(())
+}
+
 /// PARITY-ONLY rot (every payload checksum still clean) on a table salvage
 /// cannot faithfully re-emit (range tombstones) must also KEEP the table:
 /// the data is fully readable, only its recovery margin is degraded, and
