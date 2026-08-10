@@ -2840,6 +2840,55 @@ fn heal_in_place_aborts_when_the_attestation_cannot_be_persisted() -> crate::Res
     Ok(())
 }
 
+/// The checkpoint's pre-window reconciliation only scans ECC tables, so a
+/// pending `.heal-attest` marker it cannot consume (here: one on a non-ECC
+/// table) must still be caught by the post-link-window fail-closed guard rather
+/// than snapshot the table under a possibly-stale digest with no marker. Models
+/// the residual race where a marker survives the pre-window reconcile.
+#[test]
+fn checkpoint_aborts_when_a_pending_marker_survives_the_pre_window_reconcile() -> crate::Result<()>
+{
+    use crate::AbstractTree;
+
+    let dir = tempfile::tempdir()?;
+    // A plain (non-ECC) tree: the pre-window reconcile scans only ECC tables,
+    // so a marker planted here survives to the post-link-window guard.
+    let crate::AnyTree::Standard(tree) = crate::Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?
+    else {
+        unreachable!("standard tree configured");
+    };
+    for i in 0u64..4 {
+        tree.insert(format!("key-{i:03}"), format!("v{i:03}"), i);
+    }
+    tree.flush_active_memtable(4)?;
+    let sst_path = {
+        let binding = tree.version_history.read().latest_version();
+        let table = binding
+            .version
+            .iter_tables()
+            .next()
+            .expect("flush produced one table");
+        (*table.path).clone()
+    };
+
+    // Plant a pending marker the ECC-only pre-window reconcile will not consume.
+    std::fs::write(heal_attest_path(&sst_path), b"pending marker")?;
+
+    let dst = dir.path().join("checkpoint");
+    let result = tree.create_checkpoint(&dst);
+    assert!(
+        result.is_err(),
+        "a pending marker the pre-window reconcile cannot consume must abort the \
+         checkpoint at the post-link-window guard: {result:?}",
+    );
+    Ok(())
+}
+
 /// The pre-heal digest probe (`live_region_checksum`, a SEQUENTIAL full-file
 /// read) can fail transiently. Converting that I/O error into an ordinary
 /// "digest does not match the manifest" would let the heal proceed writing
