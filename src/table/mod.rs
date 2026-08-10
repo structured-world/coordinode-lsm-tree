@@ -1590,62 +1590,85 @@ impl Table {
             Some(bound) => self.punch_offset_for(bound).unwrap_or(0),
             None => 0,
         };
+        // The pre-heal digest probe result: `None` when there is nothing to
+        // heal; otherwise `Some(matched)` where `matched` says whether the
+        // current bytes still match the manifest (the ATTRIBUTABLE path). A
+        // probe FAILURE aborts before the first write: writing corrections with
+        // no completed marker can permanently strand a table whose manifest
+        // legitimately described the pre-heal bytes.
         let pre_heal_matched: Option<bool> = if corrections.is_empty() {
             None
-        } else if self.pre_heal_digest_matches(manifest_checksum) {
-            // ATTRIBUTABLE path: the heal is about to change bytes the manifest
-            // digest still matches, so the crash-recovery marker MUST be durable
-            // BEFORE the first mutation. If the post-heal digest cannot be
-            // predicted, or the attestation cannot be persisted, do NOT heal: a
-            // crash after a corrected block syncs but before the in-process
-            // manifest refresh would leave healed bytes under the stale digest
-            // with no marker, and fail-closed reconciliation rejects that
-            // mismatch forever, permanently stranding a table that was
-            // reconcilable a moment earlier. Leaving the block corrupt keeps the
-            // table reconcilable; the next patrol retries once the marker can be
-            // written. (A non-crash run also reconciles directly, but the marker
-            // is the ONLY thing that survives a crash, so its durability gates
-            // the mutation.)
-            let raw = match crate::repair::compute_table_checksum_with_overrides(
-                &*self.fs,
-                &self.path,
-                heal_start,
-                &corrections,
-            ) {
-                Ok(raw) => raw,
+        } else {
+            let matched = match self.pre_heal_digest_matches(manifest_checksum) {
+                Ok(matched) => matched,
                 Err(e) => {
                     report.errors.push(ScrubError::ChecksumRefreshFailed {
                         table_id: self.id(),
                         path: self.path.to_path_buf(),
                         reason: alloc::format!(
-                            "could not predict the post-heal digest; heal skipped to keep the \
+                            "pre-heal digest probe failed; heal skipped to keep the \
                              table reconcilable: {e:?}"
                         ),
                     });
                     return (report, false);
                 }
             };
-            if let Err(e) = crate::scrub::heal_attest::write(
-                &*self.fs,
-                &self.path,
-                self.encryption.as_deref(),
-                self.id(),
-                manifest_checksum,
-                Checksum::from_raw(raw),
-            ) {
-                report.errors.push(ScrubError::ChecksumRefreshFailed {
-                    table_id: self.id(),
-                    path: self.path.to_path_buf(),
-                    reason: alloc::format!(
-                        "could not persist the heal attestation; heal skipped to keep the \
-                         table reconcilable: {e}"
-                    ),
-                });
-                return (report, false);
+            if matched {
+                // ATTRIBUTABLE path: the heal is about to change bytes the
+                // manifest digest still matches, so the crash-recovery marker
+                // MUST be durable BEFORE the first mutation. If the post-heal
+                // digest cannot be predicted, or the attestation cannot be
+                // persisted, do NOT heal: a crash after a corrected block syncs
+                // but before the in-process manifest refresh would leave healed
+                // bytes under the stale digest with no marker, and fail-closed
+                // reconciliation rejects that mismatch forever, permanently
+                // stranding a table that was reconcilable a moment earlier.
+                // Leaving the block corrupt keeps the table reconcilable; the
+                // next patrol retries once the marker can be written. (A
+                // non-crash run also reconciles directly, but the marker is the
+                // ONLY thing that survives a crash, so its durability gates the
+                // mutation.)
+                let raw = match crate::repair::compute_table_checksum_with_overrides(
+                    &*self.fs,
+                    &self.path,
+                    heal_start,
+                    &corrections,
+                ) {
+                    Ok(raw) => raw,
+                    Err(e) => {
+                        report.errors.push(ScrubError::ChecksumRefreshFailed {
+                            table_id: self.id(),
+                            path: self.path.to_path_buf(),
+                            reason: alloc::format!(
+                                "could not predict the post-heal digest; heal skipped to keep the \
+                                 table reconcilable: {e:?}"
+                            ),
+                        });
+                        return (report, false);
+                    }
+                };
+                if let Err(e) = crate::scrub::heal_attest::write(
+                    &*self.fs,
+                    &self.path,
+                    self.encryption.as_deref(),
+                    self.id(),
+                    manifest_checksum,
+                    Checksum::from_raw(raw),
+                ) {
+                    report.errors.push(ScrubError::ChecksumRefreshFailed {
+                        table_id: self.id(),
+                        path: self.path.to_path_buf(),
+                        reason: alloc::format!(
+                            "could not persist the heal attestation; heal skipped to keep the \
+                             table reconcilable: {e}"
+                        ),
+                    });
+                    return (report, false);
+                }
+                Some(true)
+            } else {
+                Some(false)
             }
-            Some(true)
-        } else {
-            Some(false)
         };
 
         for entry in self.block_index.iter() {
@@ -2092,25 +2115,20 @@ impl Table {
     /// manifest digest (read under the per-table heal lock), not this
     /// view's snapshot: a concurrent patrol may have refreshed the manifest
     /// after this view was captured, and comparing against the stale
-    /// snapshot would mark a legitimate heal unattributable. A failed
-    /// digest read grades `false` (unattributable), never an error:
-    /// attribution only widens what the reconciliation may refresh, so
-    /// losing it fails closed.
+    /// snapshot would mark a legitimate heal unattributable.
+    ///
+    /// # Errors
+    ///
+    /// A failed digest read PROPAGATES rather than grading `false`: the caller
+    /// must abort the heal on a probe failure, because proceeding would write
+    /// corrections with no completed attestation, and if the manifest
+    /// legitimately described the pre-heal bytes the healed digest would then be
+    /// permanently unreconcilable.
     #[cfg(feature = "page_ecc")]
-    fn pre_heal_digest_matches(&self, manifest_checksum: Checksum) -> bool {
+    fn pre_heal_digest_matches(&self, manifest_checksum: Checksum) -> crate::Result<bool> {
         // Restriction-aware: a restricted view's manifest digest covers only its
         // live suffix, so probe the same region.
-        match self.live_region_checksum() {
-            Ok(ck) => ck == manifest_checksum,
-            Err(e) => {
-                log::warn!(
-                    "pre-heal digest probe failed for table #{} at {}: {e}",
-                    self.id(),
-                    self.path.display(),
-                );
-                false
-            }
-        }
+        Ok(self.live_region_checksum()? == manifest_checksum)
     }
 
     /// Whether the ON-DISK file carries deletion metadata the digest
