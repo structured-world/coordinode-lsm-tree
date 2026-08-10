@@ -260,6 +260,14 @@ fn verify_sst_file_detects_a_rotted_parity_trailer() {
     }
     let sst_path = pick_first_sst_path(dir.path());
 
+    // The pristine SST must verify clean BEFORE the flip, so the mismatch
+    // asserted below is provably caused by the corruption, not a pre-existing
+    // problem in the freshly written file.
+    assert!(
+        verify_sst_file(&sst_path).is_ok(),
+        "the freshly written SST must verify clean before corruption",
+    );
+
     // The first data block sits at file offset 0 (the writer opens the file
     // with the `data` section). Its parity trailer follows the payload:
     // header_len + data_length.

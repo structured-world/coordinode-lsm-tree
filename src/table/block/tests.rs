@@ -1857,7 +1857,7 @@ mod page_ecc {
     /// (extra trailing bytes) is rejected — matching the normal read path — rather
     /// than silently reported clean and left un-healed.
     #[test]
-    fn heal_frame_rejects_a_block_with_extra_trailing_bytes() -> crate::Result<()> {
+    fn heal_frame_with_extra_trailing_bytes_is_rejected() -> crate::Result<()> {
         let transform = BlockTransform::PlainEcc(EccParams::RS_4_2);
         let tmp = super::write_block_to_tempfile(
             PAYLOAD,
@@ -1874,7 +1874,9 @@ mod page_ecc {
         bytes.extend_from_slice(&[0u8; 16]);
         std::fs::write(&path, &bytes)?;
 
-        let oversized = BlockHandle::new(tmp.handle.offset(), (real_size + 16) as u32);
+        let oversized_size = u32::try_from(real_size + 16)
+            .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
+        let oversized = BlockHandle::new(tmp.handle.offset(), oversized_size);
         let file = std::fs::File::open(&path)?;
         assert!(
             Block::heal_frame(&file, oversized, &transform).is_err(),
@@ -1887,7 +1889,7 @@ mod page_ecc {
     /// reconstruct, so it returns `Ok(None)` (heal is a no-op; a checksum-only
     /// block that fails is salvage's job).
     #[test]
-    fn heal_frame_returns_none_for_a_block_without_parity() -> crate::Result<()> {
+    fn heal_frame_without_parity_returns_none() -> crate::Result<()> {
         let tmp = super::write_block_to_tempfile(
             PAYLOAD,
             BlockIdentity::for_test(0, BlockType::Data),
@@ -1903,7 +1905,7 @@ mod page_ecc {
     /// `heal_frame` rejects an absurd on-disk size (a corrupt handle) before
     /// allocating the read buffer, the same cap the read path applies.
     #[test]
-    fn heal_frame_rejects_an_oversized_handle() -> crate::Result<()> {
+    fn heal_frame_with_an_oversized_handle_is_rejected() -> crate::Result<()> {
         let transform = BlockTransform::PlainEcc(EccParams::RS_4_2);
         let tmp = super::write_block_to_tempfile(
             PAYLOAD,
@@ -1923,7 +1925,7 @@ mod page_ecc {
     /// `heal_frame` errors when the handle claims more bytes than the file holds
     /// (a truncated block), rather than acting on a short read.
     #[test]
-    fn heal_frame_errors_on_a_short_read() -> crate::Result<()> {
+    fn heal_frame_with_a_short_read_errors() -> crate::Result<()> {
         let transform = BlockTransform::PlainEcc(EccParams::RS_4_2);
         let tmp = super::write_block_to_tempfile(
             PAYLOAD,

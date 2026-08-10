@@ -244,7 +244,7 @@ fn heal_scrub_does_not_restamp_over_forged_blob_link_accounting() -> crate::Resu
         report
             .errors
             .iter()
-            .any(|e| format!("{e:?}").contains("ChecksumRefreshFailed")),
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
         "forged blob-link accounting must refuse the digest refresh: {report:?}",
     );
     let integrity = crate::verify::verify_integrity(&tree);
@@ -313,7 +313,7 @@ fn heal_scrub_does_not_reconcile_a_non_ecc_table() -> crate::Result<()> {
         !report
             .errors
             .iter()
-            .any(|e| format!("{e:?}").contains("ChecksumRefreshFailed")),
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
         "a non-ECC table must skip the digest reconciliation entirely, not \
          attempt and fail it: {report:?}",
     );
@@ -367,7 +367,7 @@ fn heal_scrub_does_not_restamp_over_a_forged_blob_link_id() -> crate::Result<()>
         report
             .errors
             .iter()
-            .any(|e| format!("{e:?}").contains("ChecksumRefreshFailed")),
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
         "the finding must be the refused digest refresh: {report:?}",
     );
 
@@ -425,7 +425,7 @@ fn heal_scrub_does_not_restamp_over_a_stale_kv_footer() -> crate::Result<()> {
         report
             .errors
             .iter()
-            .any(|e| format!("{e:?}").contains("ChecksumRefreshFailed")),
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
         "the finding must be the refused digest refresh: {report:?}",
     );
 
