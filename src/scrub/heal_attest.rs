@@ -255,5 +255,11 @@ pub fn remove(fs: &dyn Fs, table_path: &Path) {
     }
 }
 
+/// Whether a pending attestation sidecar exists for `table_path`. A probe
+/// failure grades `false` (no pending heal to reconcile) rather than an error.
+pub(crate) fn exists(fs: &dyn Fs, table_path: &Path) -> bool {
+    fs.exists(&attest_path(table_path)).unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests;

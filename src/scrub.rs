@@ -405,6 +405,53 @@ fn scan_and_reconcile(
     partial
 }
 
+/// Reconciles every table that still carries a pending `.heal-attest` sidecar,
+/// so a checkpoint about to snapshot the tree captures each table's REFRESHED
+/// digest rather than the stale pre-heal one (the sidecar is not copied into
+/// the checkpoint, so an unreconciled table would fail the immutable
+/// checkpoint's integrity check forever with no marker to reconcile).
+///
+/// Runs the same per-table scan-and-reconcile as a patrol, but only for the
+/// tables that actually have a pending attestation (the common case is none, so
+/// this is a cheap `exists` probe per table and no scan). Must be called BEFORE
+/// a checkpoint takes its link window: the reconcile acquires each table's
+/// mutation window, which the link window mutually excludes.
+///
+/// # Errors
+///
+/// Returns an error if a pending-heal table could NOT be reconciled (corruption
+/// remains, or the digest refresh failed): the caller must not snapshot a table
+/// whose on-disk bytes disagree with the digest it would record.
+#[cfg(feature = "page_ecc")]
+pub(crate) fn reconcile_pending_heals(tree: &impl AbstractTree) -> crate::Result<()> {
+    let options = PatrolScrubOptions::default().heal_in_place(true);
+    let version = tree.current_version();
+    let pending: Vec<crate::table::Table> = version
+        .iter_tables()
+        .filter(|t| t.metadata.ecc_params.is_some() && heal_attest::exists(&*t.fs, &t.path))
+        .cloned()
+        .collect();
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let mut report = PatrolScrubReport::default();
+    for table in &pending {
+        report.merge(scan_and_reconcile(tree, table, &options));
+    }
+    if report.is_ok() {
+        Ok(())
+    } else {
+        Err(crate::Error::from(std::io::Error::other(alloc::format!(
+            "checkpoint aborted: {} pending heal attestation(s) could not be reconciled \
+             ({} uncorrectable block(s), {} finding(s)); run a scrub and retry",
+            pending.len(),
+            report.uncorrectable_blocks,
+            report.errors.len(),
+        ))))
+    }
+}
+
 /// Whether a per-SST HEAL scan warrants the manifest-digest reconciliation:
 /// the scan must have left the file free of known corruption (no
 /// uncorrectable blocks, no findings). Restamping a partially-healed file

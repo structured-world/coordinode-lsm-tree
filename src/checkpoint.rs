@@ -692,6 +692,19 @@ pub fn run_checkpoint<T: AbstractTree>(
     // tables / blob files that compaction marks as deleted are held back.
     let _pause = deletion_pause.acquire();
 
+    // Reconcile any table left with a PENDING in-place-heal attestation before
+    // the snapshot: such a table has healed bytes on disk but the live version
+    // still records its pre-heal digest, and the `.heal-attest` sidecar is not
+    // copied into the checkpoint. Linking it as-is would capture a digest that
+    // never matches the linked bytes, failing the immutable checkpoint's
+    // integrity check forever with no marker to reconcile. Reconciling here
+    // refreshes the digest and consumes the sidecar so the version captured
+    // below is self-consistent. Runs BEFORE `enter_link_window` because the
+    // reconcile takes each table's mutation window, which the link window (its
+    // write half) mutually excludes, so doing it after would deadlock.
+    #[cfg(feature = "page_ecc")]
+    crate::scrub::reconcile_pending_heals(tree)?;
+
     // Hold the link window for the duration too: an in-place heal that has
     // already probed an SST's link count as exclusive must not observe this
     // checkpoint linking that SST mid-heal (the snapshot would capture bytes
