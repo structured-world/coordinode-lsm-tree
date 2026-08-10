@@ -531,8 +531,14 @@ fn refresh_healed_checksum(
         return None;
     };
     if fresh == current {
-        // Digest already agrees with the manifest: no pending heal to
-        // reconcile, no version upgrade to install.
+        // Digest already agrees with the manifest: no version upgrade to
+        // install. A `.heal-attest` sidecar here is now OBSOLETE: a prior
+        // reconcile installed this digest but crashed (or its best-effort unlink
+        // transiently failed) before removing the marker. Leaving it makes every
+        // future checkpoint classify the table as pending and run a full heal
+        // scan before snapshotting, so reclaim it now. Best-effort: a missing
+        // sidecar (the common case) is a no-op.
+        heal_attest::remove(&*table.fs, &table.path);
         return None;
     }
 
