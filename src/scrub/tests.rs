@@ -132,7 +132,7 @@ fn patrol_scrub_parallel_over_many_ssts_visits_every_file() {
 /// per-KV checksum footers. ECC because only Page-ECC tables get the
 /// heal-mode digest reconciliation these tests exercise.
 #[cfg(feature = "page_ecc")]
-fn open_kv_checked_tree(dir: &std::path::Path) -> crate::Tree {
+fn open_kv_checked_tree(dir: &std::path::Path) -> crate::Result<crate::Tree> {
     use crate::runtime_config::{EccScheme, KvChecksumPolicy};
 
     let AnyTree::Standard(tree) = Config::new(
@@ -148,13 +148,12 @@ fn open_kv_checked_tree(dir: &std::path::Path) -> crate::Tree {
         data_shards: 8,
         parity_shards: 2,
     })
-    .open()
-    .expect("open kv-checked tree") else {
+    .open()?
+    else {
         unreachable!("standard tree configured");
     };
-    tree.update_runtime_config(|c| c.kv_checksums = KvChecksumPolicy::AllLevels)
-        .expect("enable kv checksums");
-    tree
+    tree.update_runtime_config(|c| c.kv_checksums = KvChecksumPolicy::AllLevels)?;
+    Ok(tree)
 }
 
 /// Opens (or reopens) a KV-separated RS(8,2) Page-ECC tree at `dir`.
@@ -202,20 +201,20 @@ fn build_blob_ecc_sst(dir: &std::path::Path) -> crate::Result<std::path::PathBuf
 /// (the record layout after the u32 count is: `id u64 | len u64 | bytes u64
 /// | on_disk_bytes u64`).
 #[cfg(feature = "page_ecc")]
-fn linked_blob_files_offset(path: &std::path::Path) -> usize {
-    let mut f = std::fs::File::open(path).expect("open the SST");
-    let reader = match crate::sfa::Reader::from_reader(&mut f) {
-        Ok(r) => r,
-        Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
-    };
+fn linked_blob_files_offset(path: &std::path::Path) -> crate::Result<usize> {
+    let mut f = std::fs::File::open(path)?;
+    let reader = crate::sfa::Reader::from_reader(&mut f)?;
     let Some(entry) = reader
         .toc()
         .iter()
         .find(|e| e.name() == b"linked_blob_files")
     else {
-        panic!("the SST carries a linked_blob_files section");
+        return Err(crate::Error::InvalidHeader(
+            "SST is missing its linked_blob_files section",
+        ));
     };
-    usize::try_from(entry.pos()).expect("section offset fits usize")
+    usize::try_from(entry.pos())
+        .map_err(|_| crate::Error::InvalidHeader("linked_blob_files offset exceeds usize"))
 }
 
 /// The blob-link cross-check must compare the COMPLETE accounting records,
@@ -230,7 +229,7 @@ fn heal_scrub_does_not_restamp_over_forged_blob_link_accounting() -> crate::Resu
 
     // Flip one byte inside the first record's `bytes` counter: every id
     // stays intact, the shape stays valid.
-    let pos = linked_blob_files_offset(&sst_path);
+    let pos = linked_blob_files_offset(&sst_path)?;
     let mut bytes = std::fs::read(&sst_path)?;
     let Some(slot) = bytes.get_mut(pos + 4 + 16) else {
         panic!("first record's bytes counter within the file");
@@ -346,7 +345,7 @@ fn heal_scrub_does_not_restamp_over_a_forged_blob_link_id() -> crate::Result<()>
 
     // Flip one byte INSIDE the first record's blob_file_id: the count and
     // section length stay valid, so the shape check passes.
-    let pos = linked_blob_files_offset(&sst_path);
+    let pos = linked_blob_files_offset(&sst_path)?;
     let mut bytes = std::fs::read(&sst_path)?;
     let Some(slot) = bytes.get_mut(pos + 4) else {
         panic!("first blob id within the file");
@@ -392,7 +391,7 @@ fn heal_scrub_does_not_restamp_over_a_forged_blob_link_id() -> crate::Result<()>
 fn heal_scrub_does_not_restamp_over_a_stale_kv_footer() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
     let sst_path = {
-        let tree = open_kv_checked_tree(dir.path());
+        let tree = open_kv_checked_tree(dir.path())?;
         for i in 0u64..500 {
             tree.insert(format!("key-{i:06}"), format!("v{i:06}"), i);
         }
@@ -410,7 +409,7 @@ fn heal_scrub_does_not_restamp_over_a_stale_kv_footer() -> crate::Result<()> {
 
     // Heal scan: block checksums read clean (re-stamped), yet the file
     // digest disagrees with the manifest.
-    let tree = open_kv_checked_tree(dir.path());
+    let tree = open_kv_checked_tree(dir.path())?;
     assert!(
         crate::verify::verify_kv_checksums(&tree).is_err(),
         "the forged footer must be detectable by per-KV verification",
