@@ -2840,6 +2840,52 @@ fn heal_in_place_aborts_when_the_attestation_cannot_be_persisted() -> crate::Res
     Ok(())
 }
 
+/// The pre-heal digest probe (`live_region_checksum`, a SEQUENTIAL full-file
+/// read) can fail transiently. Converting that I/O error into an ordinary
+/// "digest does not match the manifest" would let the heal proceed writing
+/// corrections with NO completed attestation: if the manifest legitimately
+/// describes the degraded pre-heal bytes (a rebuild over a correctable fault),
+/// the healed digest then differs from the manifest and reconciliation rejects
+/// it forever with no marker. The probe failure must ABORT the heal before the
+/// first write, exactly like a digest-prediction / attestation-persistence
+/// failure. Faults only the sequential `Read` (the digest probe); block loads
+/// use `read_at`, so the correctable fault is still discovered.
+#[test]
+fn heal_in_place_aborts_when_the_pre_heal_digest_probe_fails() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst_footered(dir.path());
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
+    rebuild_manifest_over_current_bytes(dir.path())?;
+    let before = std::fs::read(&sst_path)?;
+
+    // Fail the sequential digest read only (block loads use read_at).
+    let fault = FaultFs::new(crate::fs::StdFs);
+    let injector = fault.injector();
+    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));
+    injector.arm(FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::Other)).on_path("tables"));
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    injector.clear();
+
+    assert_eq!(
+        report.blocks_healed_in_place, 0,
+        "a failed pre-heal digest probe must abort before any block is mutated: {report:?}",
+    );
+    let after = std::fs::read(&sst_path)?;
+    assert_eq!(
+        after, before,
+        "the corrupt block must stay untouched so the table stays reconcilable",
+    );
+    assert!(
+        !report.is_ok(),
+        "aborting the heal must surface a finding: {report:?}",
+    );
+    Ok(())
+}
+
 /// An in-place heal that changes the SST's bytes must REFRESH the manifest's
 /// full-file checksum. The heal itself restores the block's original bytes
 /// (whose digest usually matches the manifest), but a table admitted by a
