@@ -722,6 +722,56 @@ fn repair_with_salvage_propagates_a_transient_verify_io_error() -> crate::Result
     Ok(())
 }
 
+/// A pending `{id}.heal-attest` sidecar must be PRESERVED by repair, not
+/// quarantined: `Tree::open` recognizes and keeps it (the next scrub reconciles
+/// a crashed digest refresh through it). Repair quarantining it would strand the
+/// healed table under its stale pre-heal digest if the manifest rebuild later
+/// failed before committing. The sidecar must still sit next to its SST after a
+/// successful repair.
+#[test]
+fn repair_preserves_a_pending_heal_attestation_sidecar() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let sidecar = tables.join("0.heal-attest");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?;
+        for i in 0..8u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+    // A pending heal marker left next to the SST (its bytes are opaque to the
+    // repair scan; only the file name matters here).
+    std::fs::write(&sidecar, b"pending-heal-marker")?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+
+    assert_eq!(report.recovered, 1, "the table is recovered: {report:?}");
+    assert!(
+        sidecar.exists(),
+        "the heal-attest sidecar stays next to its SST (not quarantined)",
+    );
+    Ok(())
+}
+
 /// A read failure DURING the block-verify walk (not the decode-load) must abort
 /// the repair, not be graded as corruption: `verify_sst_file_with_context`
 /// reports it as `SstFileUnreadable` / `DataReadError`, and the first verdict
