@@ -862,6 +862,84 @@ fn heal_in_place_keeps_the_marker_when_the_reconcile_walk_read_fails_transiently
     Ok(())
 }
 
+/// The reconcile must ABORT if it cannot persist the crash-recovery attestation:
+/// installing the refreshed digest while that marker's write failed would leave
+/// the healed bytes with no on-disk marker for a crash mid-install, and a later
+/// patrol would then refuse to attribute the mismatch. Fault the reconcile's
+/// attestation write (the SECOND sidecar write; the up-front one during the heal
+/// succeeds) and assert the refresh is refused with the marker kept for retry.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn heal_in_place_refuses_the_refresh_when_the_reconcile_attestation_write_fails()
+-> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+
+    let (sst_path, block) = {
+        let tree = open_ecc_tree(dir.path());
+        for i in 0u64..4 {
+            tree.insert(format!("key-{i:03}"), format!("v{i:03}"), i);
+        }
+        tree.flush_active_memtable(4).expect("flush");
+        let binding = tree.version_history.read().latest_version();
+        let table = binding
+            .version
+            .iter_tables()
+            .next()
+            .expect("flush produced one table");
+        let keyed = table
+            .block_index
+            .iter()
+            .next()
+            .expect("table has at least one data block")
+            .expect("block index entry decodes");
+        (
+            (*table.path).clone(),
+            crate::table::BlockHandle::new(keyed.offset(), keyed.size()),
+        )
+    };
+
+    // Attributable trailer-rebuild heal (payload stays checksum-clean).
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
+    rebuild_manifest_over_current_bytes(dir.path())?;
+
+    let fault = FaultFs::new(crate::fs::StdFs);
+    let injector = fault.injector();
+    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));
+
+    // The heal writes the completed marker UP FRONT (first sidecar write); the
+    // reconcile re-writes it before installing (second sidecar write). Skip the
+    // first and fail the second so only the reconcile's attestation write fails.
+    injector.arm(
+        FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::Other))
+            .on_path(".heal-attest")
+            .skip(1)
+            .once(),
+    );
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    injector.clear();
+
+    assert_eq!(
+        report.blocks_healed_in_place, 1,
+        "the trailer rebuild lands before the reconcile: {report:?}",
+    );
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
+        "a failed reconcile attestation write must refuse the digest refresh, not \
+         install it without a durable marker: {report:?}",
+    );
+    assert!(
+        heal_attest_path(&sst_path).exists(),
+        "the marker is kept for the next patrol to retry the reconcile",
+    );
+    Ok(())
+}
+
 /// A tight-space RESTRICTED table's heal walk must SKIP the punched-out prefix:
 /// a block whose last key is below the restriction bound was reclaimed by a
 /// superseding output table, so reading its frame reports a spurious
