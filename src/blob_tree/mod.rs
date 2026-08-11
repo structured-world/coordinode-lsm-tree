@@ -392,10 +392,12 @@ impl AbstractTree for BlobTree {
         &self,
         table_id: crate::TableId,
         checksum: crate::checksum::Checksum,
+        expected_restriction: Option<&crate::UserKey>,
     ) -> crate::Result<()> {
         // Tables live in the index tree's version; blob files carry no
         // manifest digest.
-        self.index.refresh_table_checksum(table_id, checksum)
+        self.index
+            .refresh_table_checksum(table_id, checksum, expected_restriction)
     }
 
     fn sync_mode(&self) -> crate::fs::SyncMode {

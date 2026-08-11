@@ -102,8 +102,8 @@ pub trait AbstractTree: sealed::Sealed {
     #[doc(hidden)]
     fn current_version(&self) -> Version;
 
-    /// Records that the table with `table_id` now has the full-file digest
-    /// `checksum`, persisting it to the manifest through a version upgrade.
+    /// Records that the table with `table_id` now has the digest `checksum`,
+    /// persisting it to the manifest through a version upgrade.
     ///
     /// Called after an in-place heal rewrites a table's bytes: the healed
     /// file's digest no longer matches the one captured at recovery, and
@@ -112,12 +112,23 @@ pub trait AbstractTree: sealed::Sealed {
     /// manifest digest. A no-op when the table is no longer part of the
     /// current version (compacted away while the heal ran — the old file is
     /// on its way out).
+    ///
+    /// `expected_restriction` is the tight-space restriction bound the CALLER
+    /// computed `checksum` for (its captured view's [`restrict_lower_bound`]).
+    /// This method holds the install lock, so it re-checks it against the CURRENT
+    /// view under that lock and refuses the install (a no-op) if a compaction
+    /// swapped the view to a different restriction meanwhile: a whole-file digest
+    /// installed into a suffix-only restricted manifest (or vice versa) could
+    /// never match the punched file.
+    ///
+    /// [`restrict_lower_bound`]: crate::table::Table::restrict_lower_bound
     #[cfg(feature = "std")]
     #[doc(hidden)]
     fn refresh_table_checksum(
         &self,
         table_id: TableId,
         checksum: crate::checksum::Checksum,
+        expected_restriction: Option<&crate::UserKey>,
     ) -> crate::Result<()>;
 
     /// The tree's configured durability mode

@@ -418,20 +418,29 @@ impl AbstractTree for Tree {
         &self,
         table_id: TableId,
         checksum: crate::checksum::Checksum,
+        expected_restriction: Option<&crate::UserKey>,
     ) -> crate::Result<()> {
         // Same lock order as flush / compaction version installs: compaction
         // state first, then the version history write lock.
         let mut _compaction_state = self.compaction_state.lock();
         let mut version_lock = self.version_history.write();
 
-        // Table already compacted away while the heal ran: the old file is on
-        // its way out, there is no manifest entry left to refresh.
-        if !version_lock
+        // Under the install lock, resolve the CURRENT view of this table and
+        // reject the refresh if either it is gone (compacted away — nothing to
+        // refresh) or its restriction no longer matches the one `checksum` was
+        // computed for. A tight-space compaction can swap the captured view for a
+        // restricted same-id view (punching its prefix) between the caller's read
+        // and this lock; installing the caller's digest against a different
+        // restriction would record one the punched file can never match. Skipping
+        // leaves the current view's own (compaction-installed) digest in place for
+        // the next patrol to reconcile.
+        let restriction_matches = version_lock
             .latest_version()
             .version
             .iter_tables()
-            .any(|t| t.id() == table_id)
-        {
+            .find(|t| t.id() == table_id)
+            .is_some_and(|t| t.restrict_lower_bound() == expected_restriction);
+        if !restriction_matches {
             return Ok(());
         }
 
