@@ -789,11 +789,21 @@ impl Table {
     ///
     /// `pub(crate)` for the salvage walk ([`crate::salvage`]), which must not
     /// mask against unverified positions.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a transient [`crate::Error::Io`] from an index / block read.
+    /// `Ok(false)` is reserved for a STRUCTURAL failure (a reordered index, a
+    /// count mismatch, an undecodable or zero-row block): folding a flaky read
+    /// into `false` would classify a retryable fault as a persistent
+    /// unpositionable mask, and — with the default `allow_delete_resurrection ==
+    /// false` — abort salvage, letting `repair_with_salvage` rebuild the manifest
+    /// WITHOUT a table a retry could have recovered faithfully.
     #[cfg(feature = "columnar")]
-    pub(crate) fn delete_positions_verified(&self) -> bool {
+    pub(crate) fn delete_positions_verified(&self) -> crate::Result<bool> {
         let Some(starts) = self.delete_block_starts.as_deref() else {
             // No materialized deletes: there is nothing to position.
-            return true;
+            return Ok(true);
         };
         let mut cumulative: u32 = 0;
         // Anchor the walk to PHYSICAL block order. `delete_block_starts` is built
@@ -806,32 +816,38 @@ impl Table {
         // offset order (the writer emits blocks back-to-back).
         let mut prev_offset: Option<u64> = None;
         for keyed in self.block_index.iter() {
-            let Ok(keyed) = keyed else {
-                // An unreadable index makes every later position unverifiable.
-                return false;
+            let keyed = match keyed {
+                Ok(keyed) => keyed,
+                // A TRANSIENT read propagates (a retry could verify the mask); a
+                // STRUCTURAL index failure makes every later position unverifiable.
+                Err(e @ crate::Error::Io(_)) => return Err(e),
+                Err(_) => return Ok(false),
             };
             let offset = keyed.offset().0;
             if prev_offset.is_some_and(|prev| offset <= prev) {
                 // Out-of-order (or duplicate) offset: the index was reordered, so
                 // the physical positions cannot be trusted.
-                return false;
+                return Ok(false);
             }
             prev_offset = Some(offset);
             if starts.get(&offset) != Some(&cumulative) {
-                return false;
+                return Ok(false);
             }
             let handle = BlockHandle::new(keyed.offset(), keyed.size());
-            let Ok(block) = self.load_block(
+            let block = match self.load_block(
                 &handle,
                 BlockType::Columnar,
                 self.metadata.data_block_compression,
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.as_deref(),
-            ) else {
-                // Unreadable block: its actual count is unknowable, so every
-                // later position is unverifiable — fail closed rather than
-                // trust the (potentially tampered) zone-map claim for it.
-                return false;
+            ) {
+                Ok(block) => block,
+                // A TRANSIENT read propagates; a STRUCTURAL load failure leaves
+                // the block's actual count unknowable, so every later position is
+                // unverifiable — fail closed rather than trust the (potentially
+                // tampered) zone-map claim for it.
+                Err(e @ crate::Error::Io(_)) => return Err(e),
+                Err(_) => return Ok(false),
             };
             // FULLY decode the batch rather than trusting the leading LE u32
             // row count: a checksum-repatched tamper can keep those four bytes
@@ -842,7 +858,9 @@ impl Table {
             // positions for every later block. Fail closed on any decode
             // failure.
             let Ok(batch) = crate::table::columnar::ColumnBatch::decode(&block.data) else {
-                return false;
+                // A decode failure is STRUCTURAL (the salvage walk drops such a
+                // block), so its actual count is unknowable — fail closed.
+                return Ok(false);
             };
             // A ZERO-ROW batch is malformed input (a real writer never emits
             // an empty block) and the salvage walk DROPS it — so accepting it
@@ -851,7 +869,7 @@ impl Table {
             // bitmap was never built against for every later block. Reject
             // it like the rest of the salvage pipeline does.
             if batch.row_count == 0 {
-                return false;
+                return Ok(false);
             }
             let advance = batch.row_count;
             // `wrapping_add` matches how the open path builds the starts map,
@@ -859,7 +877,7 @@ impl Table {
             // separately rejects positions that would overflow).
             cumulative = cumulative.wrapping_add(advance);
         }
-        true
+        Ok(true)
     }
 
     /// Salvage helper: load one data block recovery-aware and, when it reads back
@@ -2479,9 +2497,23 @@ impl Table {
     /// block — [`verify_tli_mirrors`](Self::verify_tli_mirrors) additionally
     /// frames and decodes every data block, which a bit-rotted-but-index-intact
     /// table (the salvage case) would fail spuriously.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a transient [`crate::Error::Io`] from opening / reading the
+    /// index mirrors. `Ok(false)` is reserved for a STRUCTURAL authentication
+    /// failure (mirrors disagree, pointers do not verify, handles do not tile):
+    /// folding a flaky read into `false` would make the salvage walk fall back to
+    /// physical-chain provenance and surrender every block past the first header
+    /// break, dropping otherwise healthy keys the intact TLI could have anchored
+    /// on retry.
     #[cfg(feature = "std")]
-    pub(crate) fn tli_structure_authenticated(&self) -> bool {
-        self.verify_tli_mirrors_inner(false).is_ok()
+    pub(crate) fn tli_structure_authenticated(&self) -> crate::Result<bool> {
+        match self.verify_tli_mirrors_inner(false) {
+            Ok(()) => Ok(true),
+            Err(e @ crate::Error::Io(_)) => Err(e),
+            Err(_) => Ok(false),
+        }
     }
 
     /// Shared body. `frame_blocks` additionally frames and decodes each
@@ -6646,6 +6678,15 @@ impl Table {
     ///
     /// Opens with its own file handle (no shared descriptor table) so the old
     /// view's handle lifecycle stays fully separate.
+    ///
+    /// The suffix digest captured here must stay consistent with what the caller
+    /// installs in the manifest, so the caller MUST hold this table's
+    /// [`heal_lock_arc`](Self::heal_lock_arc) across BOTH this call and the
+    /// version edit that installs the returned view. Without it a concurrent
+    /// patrol heal could refresh a suffix block between the capture and the
+    /// install, binding the restricted manifest to a pre-heal digest that the
+    /// post-restriction patrol can neither match nor re-attribute (its
+    /// attestation binds whole-file, not suffix, digests).
     ///
     /// # Errors
     ///

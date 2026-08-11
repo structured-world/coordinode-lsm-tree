@@ -561,8 +561,16 @@ fn meta_mirrors_diverge(
     fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
     options: &SalvageOptions,
 ) -> crate::Result<bool> {
-    let Ok(mut file) = fs.open(source, &crate::fs::FsOpenOptions::new().read(true)) else {
-        return Ok(false);
+    // A TRANSIENT open failure must not return Ok(false) (which would skip the
+    // dual-attempt arbitration and salvage from the tail view alone): the source
+    // is being salvaged, so it EXISTS — a failure to open it is a retryable I/O
+    // fault, not a structurally-absent mirror. `Fs::open` only ever fails with an
+    // `io::Error`, so propagate it; the caller (repair) then retries instead of
+    // publishing a tail-preferred recovery that omits healthy blocks a divergent
+    // MID mirror would have kept.
+    let mut file = match fs.open(source, &crate::fs::FsOpenOptions::new().read(true)) {
+        Ok(f) => f,
+        Err(e) => return Err(crate::Error::Io(e)),
     };
     // A TRANSIENT trailer read must not return Ok(false) (which would skip the
     // dual-attempt arbitration and salvage directly from the tail view): a source
@@ -739,7 +747,12 @@ fn salvage_attempt(
         // checksum-consistent corruption to empty would otherwise pass as
         // positionable and let the masked path re-emit every deleted row live.
         || (table.has_delete_bitmap_section() && table.delete_bitmap().is_empty())
-        || (!table.delete_bitmap().is_empty() && !table.delete_positions_verified());
+        // A transient I/O fault while cross-checking the delete positions aborts
+        // salvage (propagated so repair retries) rather than being read as a
+        // persistent unpositionable mask — which under the default
+        // `allow_delete_resurrection == false` would drop the table from the
+        // rebuilt manifest a retry could have recovered.
+        || (!table.delete_bitmap().is_empty() && !table.delete_positions_verified()?);
     #[cfg(not(feature = "columnar"))]
     let delete_mask_unpositionable = table.delete_bitmap_degraded;
     if delete_mask_unpositionable && !options.allow_delete_resurrection {
@@ -1226,7 +1239,12 @@ fn salvage_blocks(
         // offset is no more trustworthy than a byte-scanned one — a forged index
         // could point it at a nested frame — so the physical chain is the only
         // provenance and the walk fails closed past the first break.
-        let tli_trusted = table.tli_structure_authenticated();
+        // A transient I/O fault while authenticating the index STRUCTURE aborts
+        // the walk (propagated up so repair retries) instead of degrading to
+        // physical-chain-only provenance: reading `false` here would surrender
+        // every indexed block past the first header break, dropping healthy keys
+        // the intact TLI could anchor on retry.
+        let tli_trusted = table.tli_structure_authenticated()?;
         // Tracks the contiguous physical chain from `section_pos`, consulted only
         // when the index is NOT trusted. Once a boundary breaks there, every
         // later offset is reachable only past unprovable bytes, so it is

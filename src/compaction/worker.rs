@@ -977,6 +977,33 @@ fn run_tight_space_compaction(
 
             let blobs_for_cleanup = new_blobs.clone();
 
+            // Serialize each surviving input's suffix-digest capture (inside
+            // `reopen_restricted` below) and this slice's manifest install
+            // against a concurrent in-place heal on the same table identity. A
+            // patrol that heals a suffix block BETWEEN the digest read and the
+            // version edit would bind the restricted manifest to a pre-heal
+            // suffix digest; the patrol then sees the restriction change and
+            // skips its whole-file refresh, and its attestation binds whole-file
+            // (not suffix) digests, so once the prefix is punched the mismatch is
+            // permanently unattributable. Hold each restricted input's heal lock
+            // across the reopen AND the `upgrade_version` below (released when
+            // these guards drop at the end of this slice iteration). Only inputs
+            // that extend past the boundary (`max >= boundary`) are re-opened, so
+            // only those are locked. The patrol holds at most one table's heal
+            // lock at a time, so acquiring several here cannot deadlock it.
+            #[cfg(feature = "page_ecc")]
+            let heal_locks: Vec<Arc<parking_lot::Mutex<()>>> = current_views
+                .iter()
+                .filter(|v| {
+                    comparator.compare(v.metadata.key_range.max(), boundary)
+                        != core::cmp::Ordering::Less
+                })
+                .map(Table::heal_lock_arc)
+                .collect();
+            #[cfg(feature = "page_ecc")]
+            let _heal_guards: Vec<parking_lot::MutexGuard<'_, ()>> =
+                heal_locks.iter().map(|l| l.lock()).collect();
+
             // Classify each input at this boundary: restrict (extends past it) or
             // remove (fully consumed by this slice). Re-open restricted views as
             // distinct Inners so a prior view drops and punches independently.
