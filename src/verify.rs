@@ -1327,7 +1327,7 @@ fn scan_sst_blocks(
                         path: path.to_path_buf(),
                         offset: entry.pos(),
                         data_length: 0,
-                        error: e.into(),
+                        error: e,
                     });
                 }
             }
@@ -1607,7 +1607,7 @@ fn raw_section_shape_error(
     name: &[u8],
     pos: u64,
     len: u64,
-) -> Result<Option<String>, std::io::Error> {
+) -> Result<Option<String>, io::Error> {
     use alloc::string::ToString as _;
     #[cfg(not(feature = "std"))]
     use io::{Read as _, Seek as _, SeekFrom};
