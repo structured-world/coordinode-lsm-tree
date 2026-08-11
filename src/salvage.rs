@@ -319,7 +319,7 @@ pub(crate) fn salvage_with_context(
     // whose intact MID mirror recovers everything. Since no copy can be
     // proven authoritative, run the walk under BOTH mirror orders and keep
     // the attempt that recovers more.
-    let diverged = meta_mirrors_diverge(source, fs, options);
+    let diverged = meta_mirrors_diverge(source, fs, options)?;
     // Divergent mirrors disable the verbatim copy-through: neither copy is
     // provably genuine, and a divergence confined to a DECODE-TRANSPARENT
     // layout field (a re-stamped restart interval — full block decoding is
@@ -552,18 +552,18 @@ fn meta_mirrors_diverge(
     source: &std::path::Path,
     fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
     options: &SalvageOptions,
-) -> bool {
+) -> crate::Result<bool> {
     let Ok(mut file) = fs.open(source, &crate::fs::FsOpenOptions::new().read(true)) else {
-        return false;
+        return Ok(false);
     };
     let Ok(trailer) = crate::sfa::Reader::from_reader(&mut file) else {
-        return false;
+        return Ok(false);
     };
     let Ok(regions) = crate::table::regions::ParsedRegions::parse_from_toc(trailer.toc()) else {
-        return false;
+        return Ok(false);
     };
     let Some(mid_handle) = regions.metadata_mid else {
-        return false;
+        return Ok(false);
     };
     // Mirror recover_inner's id policy: an encrypted open always binds the
     // caller's AAD id; an unencrypted one uses the out-of-band durable id
@@ -585,7 +585,16 @@ fn meta_mirrors_diverge(
         expected_id,
         options.encryption.as_deref(),
     );
-    matches!((tail, mid), (Ok(t), Ok(m)) if t != m)
+    match (tail, mid) {
+        (Ok(t), Ok(m)) => Ok(t != m),
+        // A TRANSIENT read on either mirror must not masquerade as "mirrors agree"
+        // (which would skip the MID recovery attempt and salvage under a possibly
+        // forged tail): propagate it so the caller retries.
+        (Err(e @ crate::Error::Io(_)), _) | (_, Err(e @ crate::Error::Io(_))) => Err(e),
+        // A structurally unreadable mirror is the ordinary tail-with-MID-fallback
+        // case: arbitration is only for two valid copies that disagree.
+        _ => Ok(false),
+    }
 }
 
 /// One salvage walk of `source` into `dest` under a fixed meta-mirror order
@@ -1094,12 +1103,22 @@ fn salvage_blocks(
             }
         };
         // A candidate is REAL only if its header frames AND its payload loads.
-        let frames_and_loads = |at: u64, to: u64| -> Result<crate::table::BlockHandle, ()> {
-            match table.probe_block_handle_in(&*probe_file, at, to) {
-                Ok(h) if table.salvage_load_block(&h, probe_block_type).is_ok() => Ok(h),
-                _ => Err(()),
-            }
-        };
+        // `Ok(Some)` = a framed, loaded block; `Ok(None)` = structurally not a
+        // block (a header that did not frame, or a payload that did not decode);
+        // `Err(Io)` = a TRANSIENT read failure, propagated so a retryable fault
+        // is never mis-recorded as a permanently dropped gap.
+        let frames_and_loads =
+            |at: u64, to: u64| -> crate::Result<Option<crate::table::BlockHandle>> {
+                match table.probe_block_handle_in(&*probe_file, at, to) {
+                    Ok(h) => match table.salvage_load_block(&h, probe_block_type) {
+                        Ok(_) => Ok(Some(h)),
+                        Err(e @ crate::Error::Io(_)) => Err(e),
+                        Err(_) => Ok(None),
+                    },
+                    Err(e @ crate::Error::Io(_)) => Err(e),
+                    Err(_) => Ok(None),
+                }
+            };
         // Returns `true` when the gap `[from, to)` tiled CONTIGUOUSLY to `to`
         // (so `to` is a proven boundary), `false` when the chain broke before
         // reaching it.
@@ -1107,7 +1126,7 @@ fn salvage_blocks(
                          to: u64,
                          items: &mut Vec<(crate::table::BlockHandle, Option<UserKey>)>,
                          dropped: &mut Vec<DroppedBlock>|
-         -> bool {
+         -> crate::Result<bool> {
             // `from` is a TRUSTED boundary: the data section start, or the end
             // of a block whose frame this walk already validated. Blocks that
             // tile CONTIGUOUSLY from it inherit that provenance — each
@@ -1124,7 +1143,7 @@ fn salvage_blocks(
             // boundary are surrendered.
             let mut at = from;
             while at < to {
-                if let Ok(h) = frames_and_loads(at, to) {
+                if let Some(h) = frames_and_loads(at, to)? {
                     let next = at + u64::from(h.size());
                     // A zero-size frame would not advance `at` (an infinite loop)
                     // and cannot anchor the next offset. Treat it as a broken
@@ -1152,9 +1171,9 @@ fn salvage_blocks(
                     ),
                     key_range: None,
                 });
-                return false;
+                return Ok(false);
             }
-            true
+            Ok(true)
         };
         // Records an indexed handle the walk surrenders because the physical
         // chain broke below its offset: with no proven boundary, a forged index
@@ -1223,7 +1242,7 @@ fn salvage_blocks(
                 continue;
             }
             if off > cursor {
-                let reached = probe_gap(cursor, off, &mut items, &mut dropped);
+                let reached = probe_gap(cursor, off, &mut items, &mut dropped)?;
                 if !reached && !tli_trusted {
                     // Untrusted index: the gap up to this handle broke, so `off`
                     // sits past the last proven boundary and is unanchored too.
@@ -1251,6 +1270,10 @@ fn salvage_blocks(
                     // block instead (the lying handle's separator is just as
                     // untrusted as its span).
                     Ok(probed) => (probed, None),
+                    // A TRANSIENT read failure is retryable: propagate it rather
+                    // than surrender the block (and, when untrusted, the whole
+                    // tail) to a permanent drop over a flaky read.
+                    Err(e @ crate::Error::Io(_)) => return Err(e),
                     // The indexed block's header does not frame, so its size is
                     // UNVERIFIED. With a TRUSTED index the block's offset is still
                     // an original boundary, so leave the cursor here and let the
@@ -1279,7 +1302,7 @@ fn salvage_blocks(
         // The trailing gap is probed only while the chain is still anchored:
         // once it broke, the remaining bytes were already surrendered above.
         if chain_anchored && cursor < section_end {
-            probe_gap(cursor, section_end, &mut items, &mut dropped);
+            probe_gap(cursor, section_end, &mut items, &mut dropped)?;
         }
     } else {
         // Unreadable TOC (no physical data section to tile against): walk
@@ -1508,6 +1531,11 @@ fn salvage_blocks(
                                     Err(e) => return Err(e),
                                 }
                             }
+                            // A transient I/O read is retryable: propagate it so a
+                            // partial columnar table is not published with healthy
+                            // rows permanently lost. Drops stay for confirmed
+                            // corruption / truncation.
+                            Err(e @ crate::Error::Io(_)) => return Err(e),
                             Err(e) => {
                                 dropped.push(classify_drop(
                                     &e,
@@ -1518,6 +1546,8 @@ fn salvage_blocks(
                             }
                         }
                     }
+                    // Same transient-I/O propagation for the delete-masked arm.
+                    Err(e @ crate::Error::Io(_)) => return Err(e),
                     Err(e) => dropped.push(classify_drop(
                         &e,
                         offset,
@@ -1795,15 +1825,19 @@ impl BlobSalvageReport {
 
 /// Whether `entry`'s internal key sorts BEFORE `prev` under the blob-file order
 /// (ascending user key, ties broken by DESCENDING seqno, newest first). A `None`
-/// `prev` (the first accepted record) never regresses.
+/// `prev` (the first accepted record) never regresses. The user-key ordering uses
+/// the tree's `comparator`, not raw bytes: a KV-separated tree may be configured
+/// with a reverse or otherwise non-lexicographic comparator, and a valid blob
+/// file from such a tree must not be judged as regressing.
 fn blob_key_regresses(
+    comparator: &crate::comparator::SharedComparator,
     prev: Option<&(crate::UserKey, crate::SeqNo)>,
     entry: &crate::vlog::blob_file::scanner::ScanEntry,
 ) -> bool {
     let Some((prev_key, prev_seqno)) = prev else {
         return false;
     };
-    match entry.key.as_ref().cmp(prev_key.as_ref()) {
+    match comparator.compare(entry.key.as_ref(), prev_key.as_ref()) {
         core::cmp::Ordering::Less => true,
         // Same user key: newest-first means the higher seqno comes first, so a
         // seqno ABOVE the previous one at an equal key is out of order.
@@ -1855,6 +1889,7 @@ pub fn salvage_blob_file(
     dest: std::path::PathBuf,
     fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
     blob_file_id: crate::vlog::BlobFileId,
+    comparator: &crate::comparator::SharedComparator,
 ) -> crate::Result<BlobSalvageReport> {
     use crate::vlog::blob_file::{scanner::Scanner, writer::Writer as BlobWriter};
     use alloc::format;
@@ -1956,7 +1991,7 @@ pub fn salvage_blob_file(
                 // assumption (mismatched blob relocation, or a panic in the
                 // relocating compaction). The frame's own checksum is intact, so
                 // this is not payload rot; drop it and keep the sorted prefix.
-                Ok(entry) if blob_key_regresses(prev_written.as_ref(), &entry) => {
+                Ok(entry) if blob_key_regresses(comparator, prev_written.as_ref(), &entry) => {
                     dropped.push(DroppedBlob {
                         reason: BlobDropReason::Corrupt(
                             "frame's internal key regresses below the previous salvaged \

@@ -51,7 +51,7 @@ fn salvage_blob_file_drops_the_whole_tail_after_a_resync() -> crate::Result<()> 
     slot.copy_from_slice(&6u16.to_le_bytes());
     std::fs::write(&source, &bytes)?;
 
-    let report = salvage_blob_file(&source, dest, &fs, 0)?;
+    let report = salvage_blob_file(&source, dest, &fs, 0, &default_comparator())?;
     // aaaa recovered; bbbb drops (header CRC) and arms the resync taint; cccc is
     // the frame reached immediately by the byte scan (unproven boundary) and
     // dddd is chained from cccc's equally-unproven length; BOTH drop. Only the
@@ -6507,7 +6507,7 @@ fn salvage_blob_file_recovers_every_record_of_a_healthy_file() -> crate::Result<
     ];
     build_blob(&source, &fs, &records)?;
 
-    let report = salvage_blob_file(&source, dest.clone(), &fs, 0)?;
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator())?;
     assert!(
         report.is_complete(),
         "a healthy blob file drops nothing: {report:?}"
@@ -6545,7 +6545,7 @@ fn salvage_blob_file_drops_a_frame_whose_key_regresses() -> crate::Result<()> {
     let records: Vec<(&[u8], &[u8])> = vec![(b"k0", b"v0"), (b"k2", b"v2"), (b"k1", b"v1")];
     build_blob(&source, &fs, &records)?;
 
-    let report = salvage_blob_file(&source, dest.clone(), &fs, 0)?;
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator())?;
     assert_eq!(
         report.records_salvaged, 2,
         "the order-regressing frame is dropped, not re-emitted: {report:?}",
@@ -6571,6 +6571,46 @@ fn salvage_blob_file_drops_a_frame_whose_key_regresses() -> crate::Result<()> {
             (b"k2".to_vec(), b"v2".to_vec())
         ],
         "only the in-order prefix survives, still sorted",
+    );
+    Ok(())
+}
+
+/// The blob-order guard must use the TREE comparator, not raw bytes: a blob file
+/// written by a reverse-comparator tree is in descending key order, which is
+/// perfectly valid there. Salvaging it under that comparator must keep every
+/// record; bytewise ordering would wrongly judge each record as regressing and
+/// drop healthy data.
+#[test]
+fn salvage_blob_file_keeps_reverse_ordered_records_under_a_reverse_comparator() -> crate::Result<()>
+{
+    struct ReverseComparator;
+    impl crate::comparator::UserComparator for ReverseComparator {
+        fn name(&self) -> &'static str {
+            "reverse-lexicographic-test"
+        }
+        fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+            b.cmp(a)
+        }
+    }
+
+    let dir = tempdir()?;
+    let source = dir.path().join("blob_source");
+    let dest = dir.path().join("blob_salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // Descending key order: correct for a reverse-comparator tree.
+    let records: Vec<(&[u8], &[u8])> = vec![(b"k2", b"v2"), (b"k1", b"v1"), (b"k0", b"v0")];
+    build_blob(&source, &fs, &records)?;
+
+    let comparator: crate::comparator::SharedComparator = Arc::new(ReverseComparator);
+    let report = salvage_blob_file(&source, dest, &fs, 0, &comparator)?;
+    assert_eq!(
+        report.records_salvaged, 3,
+        "descending order is NOT regressing under a reverse comparator: {report:?}",
+    );
+    assert!(
+        report.dropped.is_empty(),
+        "no record is dropped as out-of-order: {report:?}",
     );
     Ok(())
 }
@@ -6604,7 +6644,7 @@ fn salvage_blob_file_syncs_the_destination_directory() -> crate::Result<()> {
         FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).on_path("blobdest"),
     );
 
-    let Err(err) = salvage_blob_file(&source, dest, &fs, 0) else {
+    let Err(err) = salvage_blob_file(&source, dest, &fs, 0, &default_comparator()) else {
         panic!("the destination-directory fsync fault must surface");
     };
     // Assert the surfaced error is the INJECTED directory-sync fault, not some
@@ -6645,7 +6685,7 @@ fn salvage_blob_file_keeps_a_racing_dest_created_after_the_existence_probe() -> 
     );
     let fs: Arc<dyn Fs> = Arc::new(fault);
 
-    let result = salvage_blob_file(&source, dest.clone(), &fs, 0);
+    let result = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator());
     assert!(
         result.is_err(),
         "the destination is taken, the salvage fails: {result:?}",
@@ -6733,7 +6773,7 @@ fn salvage_blob_file_keeps_a_preexisting_dest_on_open_failure() -> crate::Result
     build_blob(&source, &fs, &[(b"k0", b"v0")])?;
     std::fs::write(&dest, b"pre-existing destination bytes")?;
 
-    let result = salvage_blob_file(&source, dest.clone(), &fs, 0);
+    let result = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator());
     assert!(
         result.is_err(),
         "an already-existing destination fails the salvage: {result:?}",
@@ -6792,7 +6832,7 @@ fn salvage_blob_file_reports_an_offset_remap_for_every_salvaged_record() -> crat
         std::fs::write(&source, &bytes)?;
     }
 
-    let report = salvage_blob_file(&source, dest.clone(), &fs, 0)?;
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator())?;
     assert_eq!(report.records_salvaged, 1, "{report:?}");
     assert_eq!(
         report.dropped.len(),
@@ -6858,7 +6898,7 @@ fn salvage_blob_file_removes_the_partial_dest_when_a_write_fails() -> crate::Res
         FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::Other)).on_path("blob_salvaged"),
     );
 
-    let result = salvage_blob_file(&source, dest.clone(), &fs, 0);
+    let result = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator());
     assert!(
         result.is_err(),
         "a failed destination write must error the salvage",
@@ -6902,7 +6942,7 @@ fn salvage_blob_file_drops_a_corrupt_record_and_keeps_the_rest() -> crate::Resul
     }
     std::fs::write(&source, &bytes)?;
 
-    let report = salvage_blob_file(&source, dest.clone(), &fs, 0)?;
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator())?;
     // The corrupt k1 drops on its checksum, and the scanner then RESYNCS to the
     // next magic. k2's frame is reached by that byte scan through k1's damaged
     // bytes, so its boundary is UNPROVEN (the magic could be an original
@@ -6979,7 +7019,7 @@ fn salvage_blob_file_removes_the_empty_dest_when_nothing_is_recoverable() -> cra
     }
     std::fs::write(&source, &bytes)?;
 
-    let report = salvage_blob_file(&source, dest.clone(), &fs, 0)?;
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator())?;
     assert_eq!(report.records_salvaged, 0, "{report:?}");
     assert_eq!(report.dropped.len(), 2, "both records drop: {report:?}");
     assert_eq!(
@@ -7029,7 +7069,7 @@ fn salvage_blob_file_stops_at_a_smashed_frame_and_keeps_the_prefix() -> crate::R
     magic.copy_from_slice(b"????");
     std::fs::write(&source, &bytes)?;
 
-    let report = salvage_blob_file(&source, dest.clone(), &fs, 0)?;
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator())?;
     assert_eq!(
         report.records_salvaged, 2,
         "the records before the smashed frame are recovered: {report:?}",
@@ -7110,7 +7150,7 @@ fn salvage_blob_file_drops_an_empty_key_frame() -> crate::Result<()> {
     patch(&mut bytes, 38..42, &new_hcrc.to_le_bytes());
     std::fs::write(&source, &bytes)?;
 
-    let report = salvage_blob_file(&source, dest.clone(), &fs, 0)?;
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator())?;
     assert_eq!(
         report.dropped.len(),
         1,
@@ -7197,7 +7237,7 @@ fn salvage_blob_file_drops_a_frame_with_a_forged_value_length() -> crate::Result
     patch(&mut bytes, 38..42, &new_hcrc.to_le_bytes());
     std::fs::write(&source, &bytes)?;
 
-    let report = salvage_blob_file(&source, dest.clone(), &fs, 0)?;
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator())?;
     assert_eq!(
         report.dropped.len(),
         1,
@@ -7235,7 +7275,7 @@ fn salvage_blob_file_rejects_a_compressed_source() -> crate::Result<()> {
 
     assert!(
         matches!(
-            salvage_blob_file(&source, dest, &fs, 0),
+            salvage_blob_file(&source, dest, &fs, 0, &default_comparator()),
             Err(crate::Error::FeatureUnsupported(_)),
         ),
         "a compressed blob file must be rejected rather than mis-salvaged",
