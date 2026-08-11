@@ -159,7 +159,10 @@ impl Scanner {
         let mut pos = frame_offset + 1;
         while pos < self.data_end {
             self.inner.seek(SeekFrom::Start(pos))?;
-            #[expect(
+            // `#[allow]`, not `#[expect]`: this is a target-width-dependent lint
+            // (`u64 as usize`), so a target where Clippy proves the `min()` bound
+            // fits usize would leave an `#[expect]` unfulfilled under `-D warnings`.
+            #[allow(
                 clippy::cast_possible_truncation,
                 reason = "min() bounds the window by the buffer length, which fits usize"
             )]
