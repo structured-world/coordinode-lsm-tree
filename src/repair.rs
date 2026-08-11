@@ -490,6 +490,7 @@ enum BlockVerifyVerdict {
 
 /// What the repair should do with a freshly-recovered table, based on the
 /// salvage-mode block verify.
+#[derive(Debug)]
 enum RepairKeepDecision {
     /// The table joins the rebuilt manifest as-is.
     Keep,

@@ -1,6 +1,6 @@
 use super::{
     compute_table_checksum, compute_table_checksum_with_overrides, highest_existing_version_id,
-    quarantine_file,
+    quarantine_file, verify_keep_decision,
 };
 use crate::fs::StdFs;
 use test_log::test;
@@ -718,6 +718,66 @@ fn repair_with_salvage_propagates_a_transient_verify_io_error() -> crate::Result
     assert!(
         fs.metadata(&sst).is_ok(),
         "the original file stays in place after the aborted repair",
+    );
+    Ok(())
+}
+
+/// A read failure DURING the block-verify walk (not the decode-load) must abort
+/// the repair, not be graded as corruption: `verify_sst_file_with_context`
+/// reports it as `SstFileUnreadable` / `DataReadError`, and the first verdict
+/// branch would otherwise map it to `Corrupt` and salvage a healthy table,
+/// dropping blocks for a retryable error. The table is recovered on a clean fs,
+/// then the walk runs on a fs whose reads fault, so only the walk trips.
+#[test]
+fn verify_keep_decision_propagates_a_transient_walk_io_error() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let clean: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    // A healthy single-block SST.
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&clean))?;
+        for i in 0..8u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Recover the table on the CLEAN fs, so recovery does not trip the fault.
+    let table = recover_table(sst.clone(), &clean)?;
+
+    // Run the verdict's walk on a fs whose reads fail: the walk opens and reads
+    // through this fs, so its trailer / block reads surface a transient I/O error.
+    let fault = FaultFs::new(StdFs);
+    fault.injector().arm(FaultRule::new(
+        FaultOp::Read,
+        Fault::Error(ErrorKind::Other),
+    ));
+    let faulting: Arc<dyn crate::fs::Fs> = Arc::new(fault);
+
+    let config = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    );
+    let decision = verify_keep_decision(&config, &faulting, &sst, &table);
+    assert!(
+        decision.is_err(),
+        "a transient walk read error must abort the repair, not salvage a healthy \
+         table into missing blocks, got {decision:?}",
     );
     Ok(())
 }
