@@ -557,16 +557,26 @@ fn refresh_healed_checksum(
     // captured view's stale snapshot would then flag an already-reconciled
     // file as mismatched (and, on a table the semantic gates cannot clear
     // without heal attribution, surface a spurious ChecksumRefreshFailed).
-    let current = tree
-        .current_version()
-        .iter_tables()
-        .find(|t| t.id() == table.id())
-        .map(crate::table::Table::checksum);
-    let Some(current) = current else {
+    let binding = tree.current_version();
+    let Some(current_view) = binding.iter_tables().find(|t| t.id() == table.id()) else {
         // Table already compacted away while the heal ran: the old file is
         // on its way out, there is no manifest entry left to reconcile.
         return None;
     };
+    // A tight-space compaction can replace the captured view with a restricted
+    // same-id view (punching its prefix) while this heal runs, and it does NOT
+    // take the per-table heal lock. `fresh` was hashed over the CAPTURED view's
+    // live region, so installing it against a current view of a different
+    // restriction would record a digest the file can never match: a whole-file
+    // digest in a suffix-only manifest (or vice versa), permanently unreconcilable
+    // once the prefix is punched. If the current view's restriction no longer
+    // matches the captured one, abort: the current restricted view already carries
+    // the digest compaction installed for it, and the next patrol reconciles it
+    // under the correct restriction. Any pending marker is kept for that retry.
+    if current_view.restrict_lower_bound() != table.restrict_lower_bound() {
+        return None;
+    }
+    let current = current_view.checksum();
     if fresh == current {
         // Digest already agrees with the manifest: no version upgrade to
         // install. A `.heal-attest` sidecar here is now OBSOLETE: a prior
