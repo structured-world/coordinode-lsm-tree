@@ -1107,24 +1107,33 @@ fn read_ecc_params_out_of_band(
         } else {
             known_table_id
         };
-        if let Ok(meta) = crate::table::meta::ParsedMeta::load_with_handle(
+        match crate::table::meta::ParsedMeta::load_with_handle(
             probe.as_ref(),
             &handle,
             expected_id,
             encryption,
         ) {
-            if meta.ecc_unrecognized {
-                unrecognized_seen = true;
-            } else {
-                recognized.push(if let Some(params) = meta.ecc_params {
-                    ScrubEcc::Scheme(params)
+            Ok(meta) => {
+                if meta.ecc_unrecognized {
+                    unrecognized_seen = true;
                 } else {
-                    ScrubEcc::Off
-                });
+                    recognized.push(if let Some(params) = meta.ecc_params {
+                        ScrubEcc::Scheme(params)
+                    } else {
+                        ScrubEcc::Off
+                    });
+                }
+                // Keep the FULL decoded mirror; the divergence comparison below
+                // masks the ECC descriptor only when a mirror is unrecognized.
+                decoded.push(meta);
             }
-            // Keep the FULL decoded mirror; the divergence comparison below masks
-            // the ECC descriptor only when a mirror is unrecognized.
-            decoded.push(meta);
+            // A TRANSIENT read fault must not silently drop a mirror from
+            // arbitration: with one mirror gone the divergence check goes false
+            // and could admit an SST under the surviving (possibly forged) copy
+            // that a retry would expose. Propagate it; a STRUCTURAL decode failure
+            // keeps the existing fallback (skip this mirror).
+            Err(crate::Error::Io(e)) => return Err(e.into()),
+            Err(_) => {}
         }
     }
     // Two recognized mirrors are compared in FULL: a descriptor disagreement
@@ -1299,16 +1308,28 @@ fn scan_sst_blocks(
             // blob-link list would launder it. Rot INSIDE a structurally
             // valid payload (a flipped id byte) remains undetectable here —
             // these sections have no integrity bytes to check against.
-            if let Some(reason) =
-                raw_section_shape_error(&mut reader, entry.name(), entry.pos(), entry.len())
-            {
-                errors.push(BlockVerifyError::TocCorrupted {
-                    table_id,
-                    path: path.to_path_buf(),
-                    section_name: entry.name().to_vec(),
-                    section_offset: entry.pos(),
-                    reason,
-                });
+            match raw_section_shape_error(&mut reader, entry.name(), entry.pos(), entry.len()) {
+                Ok(Some(reason)) => {
+                    errors.push(BlockVerifyError::TocCorrupted {
+                        table_id,
+                        path: path.to_path_buf(),
+                        section_name: entry.name().to_vec(),
+                        section_offset: entry.pos(),
+                        reason,
+                    });
+                }
+                Ok(None) => {}
+                // A transient read validating a raw section is retryable I/O, not
+                // corruption: record it as a DataReadError the repair verdict aborts on.
+                Err(e) => {
+                    errors.push(BlockVerifyError::DataReadError {
+                        table_id,
+                        path: path.to_path_buf(),
+                        offset: entry.pos(),
+                        data_length: 0,
+                        error: e.into(),
+                    });
+                }
             }
             continue;
         }
@@ -1344,20 +1365,19 @@ fn scan_sst_blocks(
             });
             continue;
         };
-        // Mid-walk seek failure: don't propagate as a file-level Err
-        // (that would discard everything already scanned and report
-        // the whole SST as unreadable, which contradicts the
-        // function's contract). Surface as a `TocCorrupted` for this
-        // section and skip walking it; subsequent sections still run.
-        // Again `TocCorrupted` (not `HeaderCorrupted`): we never even
-        // reached a block to decode its header.
+        // Mid-walk seek failure: a forged offset still seeks fine, so a seek
+        // failure is a TRANSIENT I/O fault, not catalogue corruption. Record it as
+        // a `DataReadError` (which carries the I/O kind) so the repair verdict
+        // treats it as retryable and aborts, rather than routing a healthy SST
+        // through salvage over a flaky read. Keep walking other sections (the
+        // finding still surfaces; the caller decides).
         if let Err(e) = reader.seek(SeekFrom::Start(start)) {
-            errors.push(BlockVerifyError::TocCorrupted {
+            errors.push(BlockVerifyError::DataReadError {
                 table_id,
                 path: path.to_path_buf(),
-                section_name: entry.name().to_vec(),
-                section_offset: start,
-                reason: format!("seek to section start failed: {e}"),
+                offset: start,
+                data_length: 0,
+                error: e.into(),
             });
             continue;
         }
@@ -1578,12 +1598,16 @@ pub(crate) fn toc_may_hide_deletion_section(toc: &crate::sfa::Toc, toc_pos: u64)
 ///
 /// This is SHAPE validation only: these sections carry no checksum, so rot
 /// inside a structurally valid payload is undetectable out-of-band.
+///
+/// `Err` is a TRANSIENT read/seek fault (retryable I/O), kept distinct from a
+/// structural shape defect (`Ok(Some(reason))`) so the caller can route it to an
+/// I/O finding the repair verdict treats as retryable rather than as corruption.
 fn raw_section_shape_error(
     reader: &mut io::BufReader<Box<dyn crate::fs::FsFile>>,
     name: &[u8],
     pos: u64,
     len: u64,
-) -> Option<String> {
+) -> Result<Option<String>, std::io::Error> {
     use alloc::string::ToString as _;
     #[cfg(not(feature = "std"))]
     use io::{Read as _, Seek as _, SeekFrom};
@@ -1593,36 +1617,32 @@ fn raw_section_shape_error(
     match name {
         b"linked_blob_files" => {
             if len < 4 {
-                return Some(format!(
+                return Ok(Some(format!(
                     "linked_blob_files section is {len} bytes, too short for its count prefix"
-                ));
+                )));
             }
-            if let Err(e) = reader.seek(SeekFrom::Start(pos)) {
-                return Some(format!("seek to section start failed: {e}"));
-            }
+            reader.seek(SeekFrom::Start(pos))?;
             let mut count_le = [0u8; 4];
-            if let Err(e) = reader.read_exact(&mut count_le) {
-                return Some(format!("reading the blob-link count failed: {e}"));
-            }
+            reader.read_exact(&mut count_le)?;
             let count = u64::from(u32::from_le_bytes(count_le));
             // 4 fixed u64 fields per record.
             let expected = count
                 .checked_mul(32)
                 .and_then(|records| records.checked_add(4));
             if expected != Some(len) {
-                return Some(format!(
+                return Ok(Some(format!(
                     "blob-link count {count} disagrees with the section length {len} \
                      (expected {} bytes)",
                     expected.map_or_else(|| "overflowing".to_string(), |e| e.to_string()),
-                ));
+                )));
             }
-            None
+            Ok(None)
         }
         b"table_version" => {
-            (len != 1).then(|| format!("table_version section is {len} bytes, expected 1"))
+            Ok((len != 1).then(|| format!("table_version section is {len} bytes, expected 1")))
         }
         // Padding: carries no data, nothing to validate.
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -1732,6 +1752,19 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         }
         let header = match Header::decode_from(ctx.reader) {
             Ok(h) => h,
+            // A TRANSIENT read fault decoding the header is retryable, not
+            // corruption: record it as a DataReadError so the repair verdict
+            // aborts instead of salvaging a healthy table over a flaky read.
+            Err(crate::Error::Io(e)) => {
+                ctx.errors.push(BlockVerifyError::DataReadError {
+                    table_id: ctx.table_id,
+                    path: ctx.path.to_path_buf(),
+                    offset,
+                    data_length: 0,
+                    error: e.into(),
+                });
+                return;
+            }
             Err(e) => {
                 ctx.errors.push(BlockVerifyError::HeaderCorrupted {
                     table_id: ctx.table_id,
