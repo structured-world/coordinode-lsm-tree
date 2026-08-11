@@ -393,7 +393,7 @@ impl AbstractTree for BlobTree {
         table_id: crate::TableId,
         checksum: crate::checksum::Checksum,
         expected_restriction: Option<&crate::UserKey>,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<bool> {
         // Tables live in the index tree's version; blob files carry no
         // manifest digest.
         self.index

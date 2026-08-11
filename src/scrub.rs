@@ -935,12 +935,17 @@ fn refresh_healed_checksum(
     // describes the captured region and must not be recorded against a view of a
     // different restriction).
     match tree.refresh_table_checksum(table.id(), fresh, table.restrict_lower_bound()) {
-        Ok(()) => {
+        Ok(true) => {
             // The manifest now holds a legitimate digest; the attestation that
             // may have authorized this reconciliation has served its purpose.
             heal_attest::remove(&*table.fs, &table.path);
             None
         }
+        // No-op install: the table was compacted away, or a restriction swap made
+        // the digest inapplicable to the current view. The manifest digest is
+        // unchanged, so KEEP the marker — the next patrol reconciles the current
+        // view through it rather than losing the only attribution.
+        Ok(false) => None,
         Err(e) => finding(e.to_string()),
     }
 }

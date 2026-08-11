@@ -121,6 +121,12 @@ pub trait AbstractTree: sealed::Sealed {
     /// installed into a suffix-only restricted manifest (or vice versa) could
     /// never match the punched file.
     ///
+    /// Returns `Ok(true)` when the digest was installed, and `Ok(false)` when the
+    /// refresh was a no-op (the table was compacted away, or its restriction no
+    /// longer matches `expected_restriction`). The caller uses this to decide
+    /// whether to clear the heal attestation: a no-op leaves the manifest digest
+    /// unchanged, so the marker must be KEPT for the next patrol to reconcile.
+    ///
     /// [`restrict_lower_bound`]: crate::table::Table::restrict_lower_bound
     #[cfg(feature = "std")]
     #[doc(hidden)]
@@ -129,7 +135,7 @@ pub trait AbstractTree: sealed::Sealed {
         table_id: TableId,
         checksum: crate::checksum::Checksum,
         expected_restriction: Option<&crate::UserKey>,
-    ) -> crate::Result<()>;
+    ) -> crate::Result<bool>;
 
     /// The tree's configured durability mode
     /// ([`Config::sync_mode`](crate::config::Config::sync_mode)). Maintenance

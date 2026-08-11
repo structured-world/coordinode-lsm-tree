@@ -419,7 +419,7 @@ impl AbstractTree for Tree {
         table_id: TableId,
         checksum: crate::checksum::Checksum,
         expected_restriction: Option<&crate::UserKey>,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<bool> {
         // Same lock order as flush / compaction version installs: compaction
         // state first, then the version history write lock.
         let mut _compaction_state = self.compaction_state.lock();
@@ -441,27 +441,31 @@ impl AbstractTree for Tree {
             .find(|t| t.id() == table_id)
             .is_some_and(|t| t.restrict_lower_bound() == expected_restriction);
         if !restriction_matches {
-            return Ok(());
+            // No-op: the manifest digest is unchanged, so the caller must keep the
+            // attestation for the next patrol.
+            return Ok(false);
         }
 
-        version_lock.upgrade_version(
-            &self.config.path,
-            |current| {
-                let mut copy = current.clone();
-                if let Some(next) = copy
-                    .version
-                    .with_refreshed_table_checksum(table_id, checksum)
-                {
-                    copy.version = next;
-                }
-                Ok(copy)
-            },
-            &self.config.seqno,
-            &self.config.visible_seqno,
-            &*self.config.fs,
-            self.0.runtime_config.load_full(),
-            self.0.config.encryption.clone(),
-        )
+        version_lock
+            .upgrade_version(
+                &self.config.path,
+                |current| {
+                    let mut copy = current.clone();
+                    if let Some(next) = copy
+                        .version
+                        .with_refreshed_table_checksum(table_id, checksum)
+                    {
+                        copy.version = next;
+                    }
+                    Ok(copy)
+                },
+                &self.config.seqno,
+                &self.config.visible_seqno,
+                &*self.config.fs,
+                self.0.runtime_config.load_full(),
+                self.0.config.encryption.clone(),
+            )
+            .map(|()| true)
     }
 
     fn sync_mode(&self) -> crate::fs::SyncMode {
