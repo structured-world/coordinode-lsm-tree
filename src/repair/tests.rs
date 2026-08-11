@@ -742,7 +742,7 @@ fn repair_preserves_a_pending_heal_attestation_sidecar() -> crate::Result<()> {
     let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
 
     {
-        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?;
+        let mut w = Writer::new(sst, 0, 0, Arc::clone(&fs))?;
         for i in 0..8u32 {
             w.write(InternalValue::from_components(
                 format!("k{i:05}").into_bytes(),
