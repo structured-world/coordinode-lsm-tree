@@ -618,7 +618,12 @@ fn refresh_healed_checksum(
     // non-attesting marker is safe to clear.
     let sidecar_inconclusive = matches!(attest_result, heal_attest::AttestResult::Inconclusive);
     // Re-record the attestation before reconciling, binding the CURRENT manifest
-    // digest. This is the crash-recovery insurance for the install below.
+    // digest: this is the crash-recovery insurance for the install below. If it
+    // cannot be made durable, ABORT the reconcile rather than install a digest
+    // whose recovery marker did not land — a crash after the install begins would
+    // then strand the healed bytes under a mismatch a later patrol refuses to
+    // attribute. Fail closed on the durability-primitive failure; the next patrol
+    // retries once the write succeeds (any earlier up-front marker is kept for it).
     if heal_attributable
         && let Err(e) = heal_attest::write(
             &*table.fs,
@@ -629,10 +634,10 @@ fn refresh_healed_checksum(
             fresh,
         )
     {
-        log::warn!(
-            "scrub: could not write the heal attestation for #{}: {e}",
-            table.id(),
-        );
+        return finding(alloc::format!(
+            "could not persist the reconcile attestation ({e}); the manifest digest \
+             was not refreshed"
+        ));
     }
 
     // A refusal drops the heal sidecar only when it PROVES the file is bad: an
