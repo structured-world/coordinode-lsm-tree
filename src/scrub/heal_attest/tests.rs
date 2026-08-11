@@ -99,25 +99,56 @@ fn attests_rejects_an_oversized_sidecar() {
     let path = dir.path().join("7");
     let fs: Arc<dyn Fs> = Arc::new(StdFs);
 
-    // A valid completed marker whose prefix `deserialize` would accept, followed
-    // by a long garbage tail. Without a read bound the sidecar reader would slurp
-    // the whole attacker-controlled length and then accept the leading record,
-    // both a memory-exhaustion vector and a laundered oversized marker.
+    // A valid completed marker followed by a large garbage tail. This is
+    // FAIL-FIRST for the pre-read bound: `deserialize` reads its fields with
+    // `get(1..9)` / `get(9..25)` / `get(25..41)`, which accept ANY buffer of at
+    // least the record length and ignore trailing bytes, so without the bound
+    // `read_sidecar` slurps the whole (attacker-controlled) tail, `deserialize`
+    // accepts the leading record, and the padded file is trusted as a marker.
+    // The tail is sized far past `ATTEST_LEN + max overhead` to stand in for the
+    // memory-exhaustion vector the bound closes.
     write(&*fs, &path, None, 7, ck(100), ck(200)).unwrap();
     let ap = attest_path(&path);
     let mut bytes = std::fs::read(&ap).unwrap();
-    bytes.extend(std::iter::repeat_n(0u8, 4096));
+    bytes.extend(std::iter::repeat_n(0u8, 1 << 20));
     std::fs::write(&ap, &bytes).unwrap();
 
-    // An oversized sidecar is INCONCLUSIVE (rejected), never a trusted marker:
-    // a valid plaintext record is exactly the fixed length, so extra bytes mean
-    // the file is not a marker this build wrote.
+    // An oversized sidecar is INCONCLUSIVE (rejected before the read), never a
+    // trusted marker: a valid plaintext record is exactly the fixed length, so
+    // extra bytes mean the file is not a marker this build wrote.
     assert!(
         matches!(
             attests(&*fs, &path, None, 7, ck(200), ck(100)),
             AttestResult::Inconclusive
         ),
         "an oversized attestation is inconclusive, not attesting",
+    );
+}
+
+#[test]
+fn attests_is_inconclusive_when_the_sidecar_metadata_read_fails() {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("7");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    write(&*fs, &path, None, 7, ck(100), ck(200)).unwrap();
+    // Fault the sidecar's metadata probe (the size bound the read-side enforces):
+    // a metadata failure must be fail-closed INCONCLUSIVE, never a clean read
+    // that could authorize deleting a possibly-valid marker.
+    injector.arm(
+        FaultRule::new(FaultOp::Metadata, Fault::Error(ErrorKind::Other)).on_path(".heal-attest"),
+    );
+    assert!(
+        matches!(
+            attests(&*fs, &path, None, 7, ck(200), ck(100)),
+            AttestResult::Inconclusive
+        ),
+        "a metadata probe failure is inconclusive, not attesting",
     );
 }
 

@@ -160,9 +160,17 @@ impl FaultRule {
     /// `offset`. Lets a test fault ONE section of a file (e.g. a single data
     /// block) while every other positioned read on the same file proceeds, so
     /// a fault can isolate one decode-load from the reads a recovery pass makes
-    /// on the same path. No effect on non-`ReadAt` ops (they carry no offset).
+    /// on the same path. Only [`FaultOp::ReadAt`] carries an offset: setting one
+    /// on any other op makes the rule UNMATCHABLE (it never fires), so the debug
+    /// assertion below catches that mistake instead of silently disabling it.
     #[must_use]
-    pub const fn at_offset(mut self, offset: u64) -> Self {
+    pub fn at_offset(mut self, offset: u64) -> Self {
+        debug_assert!(
+            matches!(self.op, FaultOp::ReadAt),
+            "at_offset only applies to FaultOp::ReadAt; setting it on {:?} makes the rule \
+             unmatchable",
+            self.op,
+        );
         self.offset = Some(offset);
         self
     }
@@ -594,6 +602,9 @@ impl FsFile for FaultFile {
     }
 
     fn metadata(&self) -> io::Result<FsMetadata> {
+        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::Metadata, Some(&self.path)) {
+            return Err(fault_error(kind, FaultOp::Metadata));
+        }
         self.inner.metadata()
     }
 
