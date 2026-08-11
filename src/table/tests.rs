@@ -3236,6 +3236,90 @@ fn heal_data_blocks_in_place_attributes_a_matching_pre_heal_digest() -> crate::R
     Ok(())
 }
 
+/// The streaming heal-digest prediction must be byte-identical to materializing
+/// every correction and splicing it through
+/// `compute_table_checksum_with_overrides`. The streaming path exists to bound
+/// heap on broadly damaged tables (it never holds more than one corrected frame
+/// at a time); this guards that the memory win did not change the predicted
+/// digest, which the crash-recovery marker binds. The OOM failure mode itself
+/// is not directly testable (it needs a multi-gigabyte damaged table).
+#[cfg(feature = "page_ecc")]
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "in-file block offset fits usize; only narrows on 32-bit targets"
+)]
+fn predict_heal_streams_the_same_digest_as_materializing_corrections() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::table::block::{EccParams, Header};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let healthy = build_ecc_sst_for_heal(&file, Arc::clone(&fs), EccParams::RS_4_2, 200);
+    let first_off =
+        first_data_block_offset(&recover_table_on(&file, healthy, Arc::clone(&fs))) as usize;
+
+    // Rot the first block's parity trailer → exactly one correction to splice.
+    let mut bytes = std::fs::read(&file)?;
+    let Some(mut cursor) = bytes.get(first_off..) else {
+        panic!("first data block within the file");
+    };
+    let header = Header::decode_from(&mut cursor)?;
+    let trailer_pos =
+        first_off + Header::header_len(header.block_type) + header.data_length as usize;
+    let Some(slot) = bytes.get_mut(trailer_pos) else {
+        panic!("parity trailer within the file");
+    };
+    *slot ^= 0xFF;
+    std::fs::write(&file, &bytes)?;
+
+    let rotted = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &file)?);
+    let table = recover_table_on(&file, rotted, Arc::clone(&fs));
+
+    let transform = crate::table::util::build_block_transform(
+        table.metadata.data_block_compression,
+        table.encryption.as_deref(),
+        table.metadata.ecc_params,
+        #[cfg(zstd_any)]
+        table.zstd_dictionary.as_deref(),
+    )?;
+    let fh = fs.open(&file, &crate::fs::FsOpenOptions::new().read(true))?;
+
+    // Streamed prediction (one frame of heap at a time).
+    let (streamed, offsets) = table.predict_heal_digest_and_offsets(fh.as_ref(), &transform, 0)?;
+
+    // Materialized reference: gather every correction and splice them all at once.
+    let mut corrections: Vec<(u64, Vec<u8>)> = Vec::new();
+    for entry in table.block_index.iter() {
+        let keyed = entry?;
+        if let Some(c) = table.heal_correction_for_block(fh.as_ref(), &keyed, &transform) {
+            corrections.push(c);
+        }
+    }
+    let materialized =
+        crate::repair::compute_table_checksum_with_overrides(&*fs, &file, 0, &corrections)?;
+
+    assert_eq!(
+        streamed, materialized,
+        "the streamed digest must equal the materialized-overrides digest",
+    );
+    assert_eq!(
+        offsets.len(),
+        corrections.len(),
+        "one predicted offset per correction: {corrections:?}",
+    );
+    for (off, _) in &corrections {
+        assert!(
+            offsets.contains(off),
+            "every correction offset ({off}) is in the predicted set",
+        );
+    }
+    // Sanity: the rot did produce exactly the one trailer correction.
+    assert_eq!(corrections.len(), 1, "exactly one block was rotted");
+    Ok(())
+}
+
 /// When the corrected block's write-back fails (a failing `Fs`), the heal does
 /// not count it as healed and records it as an uncorrectable finding so it is
 /// left for block salvage rather than silently lost.

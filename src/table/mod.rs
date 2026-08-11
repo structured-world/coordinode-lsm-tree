@@ -1583,20 +1583,39 @@ impl Table {
         // still drives the returned attribution flag and the zero-heal marker
         // cleanup below; the per-block correction is recomputed identically in
         // the write loop (both call `heal_correction_for_block`).
-        let corrections = self.collect_heal_corrections(file.as_ref(), &transform);
         // A restricted view predicts (and later digests) only its live suffix;
         // its corrections all lie there, and the punched prefix is not hashed.
         let heal_start = match self.restrict_lower_bound() {
             Some(bound) => self.punch_offset_for(bound).unwrap_or(0),
             None => 0,
         };
+        // Predict the post-heal digest AND the exact set of offsets the heal
+        // will touch, streaming so a broadly damaged table does not materialize
+        // every corrected frame at once. The write loop below applies ONLY these
+        // offsets, so a fault appearing after this pass is never healed under a
+        // digest that did not attest it.
+        let (predicted_digest, predicted_offsets) =
+            match self.predict_heal_digest_and_offsets(file.as_ref(), &transform, heal_start) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    report.errors.push(ScrubError::ChecksumRefreshFailed {
+                        table_id: self.id(),
+                        path: self.path.to_path_buf(),
+                        reason: alloc::format!(
+                            "could not predict the post-heal digest; heal skipped to keep the \
+                             table reconcilable: {e:?}"
+                        ),
+                    });
+                    return (report, false);
+                }
+            };
         // The pre-heal digest probe result: `None` when there is nothing to
         // heal; otherwise `Some(matched)` where `matched` says whether the
         // current bytes still match the manifest (the ATTRIBUTABLE path). A
         // probe FAILURE aborts before the first write: writing corrections with
         // no completed marker can permanently strand a table whose manifest
         // legitimately described the pre-heal bytes.
-        let pre_heal_matched: Option<bool> = if corrections.is_empty() {
+        let pre_heal_matched: Option<bool> = if predicted_offsets.is_empty() {
             None
         } else {
             let matched = match self.pre_heal_digest_matches(manifest_checksum) {
@@ -1628,32 +1647,13 @@ impl Table {
                 // non-crash run also reconciles directly, but the marker is the
                 // ONLY thing that survives a crash, so its durability gates the
                 // mutation.)
-                let raw = match crate::repair::compute_table_checksum_with_overrides(
-                    &*self.fs,
-                    &self.path,
-                    heal_start,
-                    &corrections,
-                ) {
-                    Ok(raw) => raw,
-                    Err(e) => {
-                        report.errors.push(ScrubError::ChecksumRefreshFailed {
-                            table_id: self.id(),
-                            path: self.path.to_path_buf(),
-                            reason: alloc::format!(
-                                "could not predict the post-heal digest; heal skipped to keep the \
-                                 table reconcilable: {e:?}"
-                            ),
-                        });
-                        return (report, false);
-                    }
-                };
                 if let Err(e) = crate::scrub::heal_attest::write(
                     &*self.fs,
                     &self.path,
                     self.encryption.as_deref(),
                     self.id(),
                     manifest_checksum,
-                    Checksum::from_raw(raw),
+                    Checksum::from_raw(predicted_digest),
                 ) {
                     report.errors.push(ScrubError::ChecksumRefreshFailed {
                         table_id: self.id(),
@@ -1821,6 +1821,20 @@ impl Table {
                         // Trailer rot: persist the freshly computed parity at
                         // its on-disk position (header + payload unchanged).
                         Ok(Some(fresh)) => {
+                            let trailer_offset = block_offset
+                                + crate::table::block::Header::header_len(raw_header.block_type)
+                                    as u64
+                                + u64::from(raw_header.data_length);
+                            // Apply ONLY corrections the prediction pass attested.
+                            // A trailer rebuild that appears now but was not
+                            // predicted (fresh rot between the two reads) is left
+                            // as-is: healing it would put bytes on disk the
+                            // marker's digest never covered, and a later
+                            // checkpoint would snapshot them under the stale
+                            // digest. It stays RS-correctable for the next patrol.
+                            if !predicted_offsets.contains(&trailer_offset) {
+                                continue;
+                            }
                             // Attribution + the crash-recovery marker were
                             // captured UP FRONT (before this loop), so nothing is
                             // done here. First write: make sure no checkpoint link
@@ -1841,10 +1855,6 @@ impl Table {
                                 });
                                 continue;
                             }
-                            let trailer_offset = block_offset
-                                + crate::table::block::Header::header_len(raw_header.block_type)
-                                    as u64
-                                + u64::from(raw_header.data_length);
                             let write_back = file
                                 .seek(SeekFrom::Start(trailer_offset))
                                 .and_then(|_| file.write_all(&fresh));
@@ -1882,6 +1892,15 @@ impl Table {
                 }
                 // Recovered from parity: persist the corrected frame in place.
                 Ok(crate::table::util::BlockScrubOutcome::Corrected { .. }) => {
+                    // Apply ONLY corrections the prediction pass attested. A block
+                    // that recovers now but was not in the predicted set (a fault
+                    // that appeared after the prediction) is left corrupt: writing
+                    // it would heal bytes the marker's digest never covered, so a
+                    // later checkpoint could snapshot them under the stale digest.
+                    // It stays RS-correctable, so the next patrol retries.
+                    if !predicted_offsets.contains(&block_offset) {
+                        continue;
+                    }
                     let frame = match crate::table::block::Block::heal_frame(
                         file.as_ref(),
                         handle,
@@ -2002,8 +2021,8 @@ impl Table {
     }
 
     /// The correction the in-place heal would apply to one data block, computed
-    /// WITHOUT writing. [`Self::collect_heal_corrections`] calls this to PREDICT
-    /// the post-heal bytes for the attestation; the write loop in
+    /// WITHOUT writing. [`Self::predict_heal_digest_and_offsets`] calls this to
+    /// PREDICT the post-heal digest and the offsets to touch; the write loop in
     /// [`Self::heal_data_blocks_in_place`] performs the same decision inline and
     /// applies it. The heal is deterministic (RS recovery / parity rebuild over
     /// the same pre-heal bytes), so the prediction and the later application
@@ -2082,17 +2101,71 @@ impl Table {
         }
     }
 
-    /// Read-only pass predicting every in-place correction (see
-    /// [`Self::heal_correction_for_block`]) as `(write_offset, bytes)`, so the
-    /// caller can compute the post-heal digest before any write lands. Skips a
-    /// restricted view's punched prefix exactly as the write loop does.
+    /// Read-only pass predicting the post-heal whole-file digest AND the set of
+    /// write offsets the heal will touch, WITHOUT materializing every corrected
+    /// frame. The predicted digest is streamed: each correction (see
+    /// [`Self::heal_correction_for_block`]) is spliced into a running hash and
+    /// then DROPPED, so a broadly damaged multi-gigabyte table costs only one
+    /// correction frame of heap at a time instead of the whole repaired file.
+    ///
+    /// The returned offset set is what the write loop gates on: it applies ONLY
+    /// corrections whose offset was predicted here, so a fault that appears
+    /// AFTER this pass (transient rot, a byte flipped between the two reads) is
+    /// left unwritten rather than healed under a digest that never attested it.
+    ///
+    /// The streamed digest is byte-identical to
+    /// [`crate::repair::compute_table_checksum_with_overrides`] fed the same
+    /// corrections: the file is hashed from `heal_start` to EOF with each
+    /// size-preserving correction substituted at its offset. Corrections are
+    /// non-overlapping and strictly increasing (block index order; one
+    /// correction per block, within that block), so a single forward pass with a
+    /// discard-the-replaced-bytes cursor reproduces exactly that byte stream.
+    /// Skips a restricted view's punched prefix exactly as the write loop does.
+    ///
+    /// # Errors
+    ///
+    /// Any I/O error opening or streaming the file.
     #[cfg(feature = "page_ecc")]
-    fn collect_heal_corrections(
+    fn predict_heal_digest_and_offsets(
         &self,
         file: &dyn crate::fs::FsFile,
         transform: &crate::table::block::BlockTransform<'_>,
-    ) -> alloc::vec::Vec<(u64, alloc::vec::Vec<u8>)> {
-        let mut out = alloc::vec::Vec::new();
+        heal_start: u64,
+    ) -> crate::Result<(u128, crate::HashSet<u64>)> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
+        let mut offsets = crate::HashSet::default();
+        // A dedicated sequential reader for the digest stream: it walks forward
+        // from `heal_start` while `file` still serves the per-block scrub reads.
+        let mut rdr = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
+        rdr.seek(SeekFrom::Start(heal_start))?;
+        let mut buf = alloc::vec![0u8; 256 * 1024];
+        // Absolute file position the sequential reader has consumed up to.
+        let mut pos = heal_start;
+
+        // Reads exactly `count` bytes from `rdr`, hashing them when `hash` is set
+        // and discarding them (the region a correction replaces) otherwise.
+        let consume = |rdr: &mut alloc::boxed::Box<dyn crate::fs::FsFile>,
+                       hasher: &mut xxhash_rust::xxh3::Xxh3Default,
+                       buf: &mut [u8],
+                       mut count: u64,
+                       hash: bool|
+         -> crate::Result<()> {
+            while count > 0 {
+                let want = usize::try_from(count.min(buf.len() as u64)).unwrap_or(buf.len());
+                let Some(window) = buf.get_mut(..want) else {
+                    break;
+                };
+                rdr.read_exact(window)?;
+                if hash {
+                    hasher.update(window);
+                }
+                count -= want as u64;
+            }
+            Ok(())
+        };
+
         for entry in self.block_index.iter() {
             let Ok(keyed) = entry else {
                 break;
@@ -2102,11 +2175,37 @@ impl Table {
             {
                 continue;
             }
-            if let Some(correction) = self.heal_correction_for_block(file, &keyed, transform) {
-                out.push(correction);
-            }
+            let Some((write_offset, bytes)) =
+                self.heal_correction_for_block(file, &keyed, transform)
+            else {
+                continue;
+            };
+            // Corrections are strictly increasing and non-overlapping; a
+            // regression would mean overlapping splices, so bail rather than
+            // underflow the gap.
+            let Some(gap) = write_offset.checked_sub(pos) else {
+                break;
+            };
+            consume(&mut rdr, &mut hasher, &mut buf, gap, true)?;
+            hasher.update(&bytes);
+            let replaced = bytes.len() as u64;
+            consume(&mut rdr, &mut hasher, &mut buf, replaced, false)?;
+            pos = write_offset + replaced;
+            offsets.insert(write_offset);
+            // `bytes` is dropped here: only its offset is retained.
         }
-        out
+
+        // Hash the untouched tail from the last correction to EOF.
+        loop {
+            let n = rdr.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            let Some(window) = buf.get(..n) else { break };
+            hasher.update(window);
+        }
+
+        Ok((hasher.digest128(), offsets))
     }
 
     /// Whether the file's CURRENT digest equals `manifest_checksum` — the
