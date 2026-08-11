@@ -2167,9 +2167,13 @@ impl Table {
         };
 
         for entry in self.block_index.iter() {
-            let Ok(keyed) = entry else {
-                break;
-            };
+            // Propagate a transient index-read failure rather than `break`: a
+            // truncated prediction would return a digest and an offset set that
+            // omit every later block, and the write loop's `predicted_offsets`
+            // guard would then silently skip any correctable fault it finds there,
+            // reporting a clean heal while leaving known damage on disk. Aborting
+            // makes the patrol report the failed pass and retry.
+            let keyed = entry?;
             if let Some(bound) = &self.1
                 && self.comparator.compare(keyed.end_key(), bound) == core::cmp::Ordering::Less
             {
