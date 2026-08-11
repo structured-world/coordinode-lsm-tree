@@ -439,8 +439,16 @@ fn next_arb_temp(
     dest: &std::path::Path,
 ) -> crate::Result<std::path::PathBuf> {
     static ARB_TMP_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    // Fold the process id into the HIGH bits so two concurrent standalone salvage
+    // processes never select the SAME temp name: without this both process-local
+    // counters start at 0, and a loser reading a shared name could `discard_partial`
+    // the winner's in-progress output. The result stays a single u64, so recovery
+    // still parses and sweeps `{id}.healtmp-{numeric}` on a crash. Pid reuse after
+    // exit is handled by the exists-probe / AlreadyExists retry below.
+    let pid_hi = u64::from(std::process::id()) << 32;
     loop {
-        let seq = ARB_TMP_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let counter = ARB_TMP_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let seq = pid_hi | (counter & 0xFFFF_FFFF);
         let candidate = dest.with_extension(alloc::format!("healtmp-{seq}"));
         match fs.exists(&candidate) {
             Ok(false) => return Ok(candidate),
@@ -556,8 +564,14 @@ fn meta_mirrors_diverge(
     let Ok(mut file) = fs.open(source, &crate::fs::FsOpenOptions::new().read(true)) else {
         return Ok(false);
     };
-    let Ok(trailer) = crate::sfa::Reader::from_reader(&mut file) else {
-        return Ok(false);
+    // A TRANSIENT trailer read must not return Ok(false) (which would skip the
+    // dual-attempt arbitration and salvage directly from the tail view): a source
+    // with divergent mirrors could then be re-encoded under a forged layout.
+    // Propagate sfa::Error::Io; reserve Ok(false) for structural unreadability.
+    let trailer = match crate::sfa::Reader::from_reader(&mut file) {
+        Ok(t) => t,
+        Err(crate::sfa::Error::Io(e)) => return Err(crate::Error::Io(e)),
+        Err(_) => return Ok(false),
     };
     let Ok(regions) = crate::table::regions::ParsedRegions::parse_from_toc(trailer.toc()) else {
         return Ok(false);
