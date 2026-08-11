@@ -1761,7 +1761,7 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
                     path: ctx.path.to_path_buf(),
                     offset,
                     data_length: 0,
-                    error: e.into(),
+                    error: e,
                 });
                 return;
             }
