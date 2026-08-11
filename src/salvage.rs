@@ -1040,9 +1040,8 @@ fn salvage_blocks(
         let mut file = table
             .fs
             .open(&table.path, &crate::fs::FsOpenOptions::new().read(true))?;
-        crate::sfa::Reader::from_reader(&mut file)
-            .ok()
-            .and_then(|t| {
+        match crate::sfa::Reader::from_reader(&mut file) {
+            Ok(t) => {
                 let toc_pos = t.toc_pos();
                 t.toc().section(b"data").and_then(|s| {
                     // checked, not saturating: a re-stamped `data` length that
@@ -1055,7 +1054,17 @@ fn salvage_blocks(
                     let end = s.pos().checked_add(s.len())?;
                     (end <= toc_pos).then_some((s.pos(), end))
                 })
-            })
+            }
+            // A TRANSIENT I/O error re-reading the trailer would silently disable
+            // the physical walk that recovers index-omitted blocks: if the index
+            // is checksum-consistent but omits a block, salvage would then publish
+            // the indexed subset and report a COMPLETE recovery while losing the
+            // omitted keys. Abort so the caller retries. A STRUCTURAL trailer error
+            // is the genuine "no physical fallback" case (an unreadable TOC): fall
+            // back to the index enumeration alone, as before.
+            Err(crate::sfa::Error::Io(e)) => return Err(crate::Error::Io(e)),
+            Err(_) => None,
+        }
     };
     if let Some((section_pos, section_end)) = data_section {
         // One open handle for the WHOLE physical walk: the resync scan steps one
