@@ -3293,7 +3293,7 @@ fn predict_heal_streams_the_same_digest_as_materializing_corrections() -> crate:
     let mut corrections: Vec<(u64, Vec<u8>)> = Vec::new();
     for entry in table.block_index.iter() {
         let keyed = entry?;
-        if let Some(c) = table.heal_correction_for_block(fh.as_ref(), &keyed, &transform) {
+        if let Some(c) = table.heal_correction_for_block(fh.as_ref(), &keyed, &transform)? {
             corrections.push(c);
         }
     }

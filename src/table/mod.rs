@@ -1585,8 +1585,26 @@ impl Table {
         // the write loop (both call `heal_correction_for_block`).
         // A restricted view predicts (and later digests) only its live suffix;
         // its corrections all lie there, and the punched prefix is not hashed.
+        // A transient failure resolving that bound must ABORT, not fall back to
+        // offset 0: predicting (and attesting) over the WHOLE physical file while
+        // the manifest and reconciliation hash only the suffix would, after a
+        // crash mid-heal, leave a completed marker whose digest can never match
+        // the suffix — permanently stranding the healed table.
         let heal_start = match self.restrict_lower_bound() {
-            Some(bound) => self.punch_offset_for(bound).unwrap_or(0),
+            Some(bound) => match self.punch_offset_for(bound) {
+                Ok(off) => off,
+                Err(e) => {
+                    report.errors.push(ScrubError::ChecksumRefreshFailed {
+                        table_id: self.id(),
+                        path: self.path.to_path_buf(),
+                        reason: alloc::format!(
+                            "could not resolve the restricted heal start; heal skipped to \
+                             keep the table reconcilable: {e:?}"
+                        ),
+                    });
+                    return (report, false);
+                }
+            },
             None => 0,
         };
         // Predict the post-heal digest AND the exact set of offsets the heal
@@ -2030,13 +2048,20 @@ impl Table {
     /// weakens crash recovery (a predicted digest that no longer matches the
     /// applied bytes fails the marker CLOSED, never authorizing wrong bytes),
     /// it is never a correctness hazard.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a TRANSIENT read failure (the confirming block / frame re-read)
+    /// rather than mapping it to "no correction": a swallowed read would omit the
+    /// block from the prediction's offset set, and the write loop's gate would then
+    /// skip a correction it re-discovers, reporting a clean pass over known damage.
     #[cfg(feature = "page_ecc")]
     fn heal_correction_for_block(
         &self,
         file: &dyn crate::fs::FsFile,
         keyed: &KeyedBlockHandle,
         transform: &crate::table::block::BlockTransform<'_>,
-    ) -> Option<(u64, alloc::vec::Vec<u8>)> {
+    ) -> crate::Result<Option<(u64, alloc::vec::Vec<u8>)>> {
         use crate::coding::Decode;
         let block_offset = keyed.offset().0;
         let handle = BlockHandle::new(keyed.offset(), keyed.size());
@@ -2057,15 +2082,17 @@ impl Table {
         );
         match outcome {
             Ok(crate::table::util::BlockScrubOutcome::Clean) => {
-                // A clean-payload block still needs a parity-trailer rebuild if
-                // its trailer rotted. Any read / decode inconsistency leaves the
-                // bytes unchanged (`None`), matching the write loop's report-and-
-                // skip.
-                let raw =
-                    crate::file::read_exact(file, block_offset, keyed.size() as usize).ok()?;
-                let raw_header = crate::table::block::Header::decode_from(&mut &raw[..]).ok()?;
+                // A clean-payload block still needs a parity-trailer rebuild if its
+                // trailer rotted. The confirming re-read PROPAGATES on a transient
+                // failure (see the doc), but a decode / structural inconsistency
+                // leaves the bytes unchanged (`Ok(None)`), matching the write loop's
+                // report-and-skip.
+                let raw = crate::file::read_exact(file, block_offset, keyed.size() as usize)?;
+                let Ok(raw_header) = crate::table::block::Header::decode_from(&mut &raw[..]) else {
+                    return Ok(None);
+                };
                 if raw_header.block_type != self.data_block_role() {
-                    return None;
+                    return Ok(None);
                 }
                 let header_len = crate::table::block::Header::header_len(raw_header.block_type);
                 let payload_ok = header_len
@@ -2075,29 +2102,36 @@ impl Table {
                         crate::hash::hash128(payload) == raw_header.checksum.into_u128()
                     });
                 if !payload_ok {
-                    return None;
+                    return Ok(None);
                 }
                 match self.raw_block_parity_delta(&raw, &raw_header) {
                     Ok(Some(fresh)) => {
                         let trailer_offset = block_offset
                             + crate::table::block::Header::header_len(raw_header.block_type) as u64
                             + u64::from(raw_header.data_length);
-                        Some((trailer_offset, fresh))
+                        Ok(Some((trailer_offset, fresh)))
                     }
                     // Trailer matches (no ECC / already fresh) or is
                     // unverifiable: nothing to persist.
-                    Ok(None) | Err(()) => None,
+                    Ok(None) | Err(()) => Ok(None),
                 }
             }
             Ok(crate::table::util::BlockScrubOutcome::Corrected { .. }) => {
                 match crate::table::block::Block::heal_frame(file, handle, transform) {
-                    Ok(Some((frame, _kind))) => Some((block_offset, frame)),
-                    // Transient (re-read clean) or a re-read error: unchanged.
-                    Ok(None) | Err(_) => None,
+                    Ok(Some((frame, _kind))) => Ok(Some((block_offset, frame))),
+                    // A confirming re-read that is now clean: a transient fault the
+                    // first read hit and this one did not, so nothing to persist.
+                    Ok(None) => Ok(None),
+                    // A real read / decode error on the confirming read PROPAGATES:
+                    // mapping it to "no correction" would let the write loop's gate
+                    // skip a correction it re-discovers and report a clean pass.
+                    Err(e) => Err(e),
                 }
             }
-            // Uncorrectable / unreadable: the block's bytes stay as they are.
-            Err(_) => None,
+            // Uncorrectable / unreadable: the block's bytes stay as they are; the
+            // scrub already recorded the finding (and the write pass re-surfaces it),
+            // so there is no correction to predict here.
+            Err(_) => Ok(None),
         }
     }
 
@@ -2180,7 +2214,7 @@ impl Table {
                 continue;
             }
             let Some((write_offset, bytes)) =
-                self.heal_correction_for_block(file, &keyed, transform)
+                self.heal_correction_for_block(file, &keyed, transform)?
             else {
                 continue;
             };
