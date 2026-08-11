@@ -1692,6 +1692,12 @@ fn salvage_blocks(
                     }),
                 }
             }
+            // A transient I/O error on the block read is retryable, not
+            // corruption: dropping the block and finishing dest would let repair
+            // install a partial replacement missing keys a retry would recover.
+            // Abort so the caller discards the partial dest; reserve block drops
+            // for confirmed corruption / truncation.
+            Err(e @ crate::Error::Io(_)) => return Err(e),
             Err(e) => dropped.push(classify_drop(
                 &e,
                 offset,
