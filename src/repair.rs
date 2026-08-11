@@ -911,6 +911,25 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                 continue;
             }
 
+            // Heal artifacts are not table files: `Tree::open` recognizes them
+            // and PRESERVES the live `{id}.heal-attest` sidecar (the next scrub
+            // reconciles a crashed digest refresh through it). Repair must not
+            // quarantine it, or a rebuild that fails before committing the
+            // manifest would strand the healed table under its stale pre-heal
+            // digest. Match the exact shapes recovery owns (numeric id + heal
+            // suffix); a foreign name merely containing the suffix falls through
+            // to the id parse below and is quarantined as before.
+            let is_heal_artifact = file_name
+                .strip_suffix(".heal-attest")
+                .or_else(|| file_name.strip_suffix(".heal-attest.tmp"))
+                .is_some_and(|id| id.parse::<TableId>().is_ok())
+                || file_name
+                    .split_once(".healtmp-")
+                    .is_some_and(|(id, _)| id.parse::<TableId>().is_ok());
+            if is_heal_artifact {
+                continue;
+            }
+
             let Ok(table_id) = file_name.parse::<TableId>() else {
                 // A non-numeric name cannot be a table id, and `Tree::open`
                 // rejects such a file outright (recovery parses every name in
