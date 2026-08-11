@@ -772,6 +772,58 @@ fn repair_preserves_a_pending_heal_attestation_sidecar() -> crate::Result<()> {
     Ok(())
 }
 
+/// A file whose name only LOOKS like a heal-temp — `{id}.healtmp-{non-numeric}`
+/// (e.g. `5.healtmp-backup`) — must NOT be skipped as an owned artifact: recovery
+/// owns only `{id}.healtmp-{numeric}`, so leaving it in place makes the next
+/// `Tree::open` reject its non-numeric name instead of sweeping it, leaving the
+/// repaired database unopenable. Repair must quarantine it like any foreign file.
+#[test]
+fn repair_quarantines_a_foreign_healtmp_suffix() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    // Prefix parses as a table id, but the sequence does not parse as u64.
+    let foreign = tables.join("5.healtmp-backup");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    {
+        let mut w = Writer::new(sst, 0, 0, Arc::clone(&fs))?;
+        for i in 0..8u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+    std::fs::write(&foreign, b"not a real heal temp")?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+
+    assert_eq!(
+        report.recovered, 1,
+        "the real table is recovered: {report:?}"
+    );
+    assert!(
+        !foreign.exists(),
+        "the foreign .healtmp- file is quarantined out of tables/, not left to \
+         break the next open",
+    );
+    Ok(())
+}
+
 /// A read failure DURING the block-verify walk (not the decode-load) must abort
 /// the repair, not be graded as corruption: `verify_sst_file_with_context`
 /// reports it as `SstFileUnreadable` / `DataReadError`, and the first verdict
