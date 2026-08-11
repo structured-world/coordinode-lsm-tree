@@ -344,6 +344,12 @@ fn block_verify_verdict(
     // Propagate it so the repair aborts and the operator retries, mirroring the
     // decode-load gate below. A truncation (`UnexpectedEof`) IS genuine on-disk
     // damage, so it falls through to the corruption verdict.
+    //
+    // This gate depends on the walk CLASSIFYING transient faults as one of these
+    // two I/O-bearing variants: a mid-walk seek failure, a transient block-header
+    // read, and a raw-section read all surface as `DataReadError` rather than
+    // being folded into `HeaderCorrupted` / `TocCorrupted`, so a flaky read here
+    // is not mistaken for corruption and salvaged.
     for e in &report.errors {
         if let crate::verify::BlockVerifyError::SstFileUnreadable { error, .. }
         | crate::verify::BlockVerifyError::DataReadError { error, .. } = e
