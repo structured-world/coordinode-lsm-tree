@@ -1373,6 +1373,62 @@ fn salvage_arbitration_keeps_a_foreign_temp_it_did_not_create() -> crate::Result
     Ok(())
 }
 
+/// A TRANSIENT failure to open the source for the mirror-divergence probe must
+/// not be laundered into `Ok(false)`: that would skip the dual-mirror
+/// arbitration and salvage from the tail view alone, so a divergent source (a
+/// forged tail layout) could omit healthy blocks the intact MID mirror keeps.
+/// The source is being salvaged, so it EXISTS — an open failure here is
+/// retryable I/O and must propagate, aborting the salvage so repair retries.
+///
+/// A single `Open` fault on the source hits exactly the probe's open (the first
+/// source open in the flow); the later `salvage_attempt` opens then succeed, so
+/// WITHOUT the fix salvage completes on the tail alone (`Ok`). WITH the fix it
+/// returns the propagated I/O error.
+///
+/// `lz4`-gated: the divergent mirror is forged via `compression#data` → Lz4.
+#[cfg(feature = "lz4")]
+#[test]
+fn salvage_propagates_a_transient_open_failure_from_the_mirror_probe() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0u64..100 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Divergent mirrors: without the fault, the probe would return `Ok(true)`
+    // and run the arbitration. The transient open fault must abort instead.
+    crate::test_forge::forge_tail_meta_value(&source, b"compression#data", &[1])?;
+
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
+            .on_path("source")
+            .once(),
+    );
+
+    let result = salvage_sst(&source, dest, &fs);
+    assert!(
+        matches!(result, Err(crate::Error::Io(_))),
+        "a transient open failure in the mirror-divergence probe must propagate, not \
+         skip arbitration and salvage tail-only: {result:?}",
+    );
+    Ok(())
+}
+
 /// A PRE-EXISTING destination must survive a divergent-mirror salvage: the
 /// tail attempt correctly fails its `create_new` open, but the MID attempt
 /// writes to a sibling temp path and wins the arbitration — publishing it
@@ -6753,6 +6809,103 @@ fn salvage_load_block_reencodes_when_the_verbatim_reread_fails() -> crate::Resul
     assert!(
         !sb.block.data.is_empty(),
         "the verified first read's decoded payload is preserved for re-encoding",
+    );
+    Ok(())
+}
+
+/// `tli_structure_authenticated` must PROPAGATE a transient I/O fault from
+/// opening / reading the index mirrors rather than fold it into `false` (an
+/// untrusted index). The salvage walk consults this to decide whether an indexed
+/// offset is a trusted block boundary; reading a flaky open as `false` degrades
+/// to physical-chain-only provenance and surrenders every block past the first
+/// header break — dropping healthy keys the intact TLI could anchor on retry. A
+/// single `Open` fault on the dedicated authentication read reproduces the
+/// transient failure; the method must return the propagated I/O error.
+#[test]
+fn tli_structure_authenticated_propagates_a_transient_read_failure() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0..50u32 {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Open cleanly, THEN fault the dedicated open the authentication read issues.
+    let table = open(source, &fs)?;
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
+            .on_path("source")
+            .once(),
+    );
+    let result = table.tli_structure_authenticated();
+    injector.clear();
+    assert!(
+        matches!(result, Err(crate::Error::Io(_))),
+        "a transient failure authenticating the index structure must propagate, not be \
+         read as an untrusted index: {result:?}",
+    );
+    Ok(())
+}
+
+/// `delete_positions_verified` must PROPAGATE a transient I/O fault rather than
+/// fold it into `false` (an unpositionable mask). Under the default
+/// `allow_delete_resurrection == false` a `false` verdict aborts salvage, so a
+/// flaky block read during `repair_with_salvage` would drop the table from the
+/// rebuilt manifest even though a retry could recover it faithfully. A single
+/// `ReadAt` fault on the first positional read the walk issues reproduces the
+/// transient read; the method must return the propagated I/O error, not
+/// `Ok(false)`.
+#[cfg(feature = "columnar")]
+#[test]
+fn delete_positions_verified_propagates_a_transient_block_read_failure() -> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    let n = 64u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    for pos in [5u32, 20, 40] {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    // Open cleanly (footer + block-index reads happen here), THEN fault the
+    // first positional read the verification walk issues on the source.
+    let table = open(source, &fs)?;
+    injector.arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other))
+            .on_path("source")
+            .once(),
+    );
+    let result = table.delete_positions_verified();
+    injector.clear();
+    assert!(
+        matches!(result, Err(crate::Error::Io(_))),
+        "a transient read during delete-position validation must propagate, not be read \
+         as a persistent unpositionable mask: {result:?}",
     );
     Ok(())
 }
