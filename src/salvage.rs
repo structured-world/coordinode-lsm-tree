@@ -1992,11 +1992,18 @@ pub fn salvage_blob_file(
                         reason: BlobDropReason::Corrupt(format!("{e:?}")),
                     });
                 }
-                // Any other error (I/O, allocation): the scanner does not
-                // re-sync from it, and an error that leaves the read position
-                // before `data_end` without terminating would make the
-                // iterator keep yielding it. Record the corruption and stop
-                // the walk — this is the last record it can inspect.
+                // A transient I/O error is retryable and distinguishable: it may
+                // strike AFTER at least one record was emitted, so recording it as
+                // corruption and finishing `dest` would publish a lossy report
+                // whose offset map silently omits the healthy UNREAD tail.
+                // Propagate it instead so the caller retries and the partial dest
+                // is discarded (below) rather than accepting avoidable data loss.
+                Err(e @ crate::Error::Io(_)) => return Err(e),
+                // Any other error (allocation, a decode fault the scanner does not
+                // re-sync from): an error that leaves the read position before
+                // `data_end` without terminating would make the iterator keep
+                // yielding it. Record the corruption and stop the walk — this is
+                // the last record it can inspect.
                 Err(e) => {
                     dropped.push(DroppedBlob {
                         reason: BlobDropReason::Corrupt(format!("{e:?}")),
