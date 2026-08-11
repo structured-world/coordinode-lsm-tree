@@ -617,9 +617,18 @@ fn refresh_healed_checksum(
     // healed table under the stale digest forever. Only a conclusively absent /
     // non-attesting marker is safe to clear.
     let sidecar_inconclusive = matches!(attest_result, heal_attest::AttestResult::Inconclusive);
-    // This pass healed: record the attestation BEFORE reconciling, so a crash
-    // during the reconciliation is recoverable by the next scrub. Best-effort —
-    // a write failure only forfeits that recovery, it never fails the heal.
+    // Re-record the attestation before reconciling. This is REDUNDANT insurance,
+    // not the primary crash-recovery: the in-place heal already wrote a COMPLETED
+    // marker UP FRONT (before its first block mutation) and refuses to heal at all
+    // if that write fails, so whenever `heal_attributable` is true a durable marker
+    // binding `(manifest, post-heal digest)` already exists on disk. This path is
+    // reached only when `fresh != current` (checked above), i.e. blocks were
+    // actually healed, so that up-front marker was NOT removed (it is cleared only
+    // when nothing was healed). A crash between here and the install below is
+    // therefore recoverable through that up-front marker regardless of THIS write,
+    // and `fresh` equals the up-front `predicted_digest` (the write loop applies
+    // exactly the predicted corrections), so it attests the current bytes. Hence a
+    // failure here is logged and non-fatal — it never strands the table.
     if heal_attributable
         && let Err(e) = heal_attest::write(
             &*table.fs,
