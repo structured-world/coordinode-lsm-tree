@@ -923,9 +923,13 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                 .strip_suffix(".heal-attest")
                 .or_else(|| file_name.strip_suffix(".heal-attest.tmp"))
                 .is_some_and(|id| id.parse::<TableId>().is_ok())
-                || file_name
-                    .split_once(".healtmp-")
-                    .is_some_and(|(id, _)| id.parse::<TableId>().is_ok());
+                // {id}.healtmp-{n}: BOTH the id and the numeric sequence must
+                // parse, matching recovery's ownership check. A foreign name like
+                // `5.healtmp-backup` is NOT owned (recovery would fail its
+                // non-numeric name), so it must fall through to quarantine here.
+                || file_name.split_once(".healtmp-").is_some_and(|(id, seq)| {
+                    id.parse::<TableId>().is_ok() && seq.parse::<u64>().is_ok()
+                });
             if is_heal_artifact {
                 continue;
             }
