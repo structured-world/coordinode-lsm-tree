@@ -338,6 +338,21 @@ fn block_verify_verdict(
         // Repair walks the file as-is (it has no restriction context).
         0,
     );
+    // A read failure DURING the walk (the file could not be read, or a block's
+    // data-segment read errored) is transient I/O, not block corruption: routing
+    // it through salvage would re-read the same bytes and drop a healthy block.
+    // Propagate it so the repair aborts and the operator retries, mirroring the
+    // decode-load gate below. A truncation (`UnexpectedEof`) IS genuine on-disk
+    // damage, so it falls through to the corruption verdict.
+    for e in &report.errors {
+        if let crate::verify::BlockVerifyError::SstFileUnreadable { error, .. }
+        | crate::verify::BlockVerifyError::DataReadError { error, .. } = e
+            && error.kind() != crate::io::ErrorKind::UnexpectedEof
+        {
+            return Err(crate::Error::Io(crate::io::Error::other(error.to_string())));
+        }
+    }
+
     // A non-parity error is corruption regardless of any warnings.
     let verdict = if !report
         .errors
