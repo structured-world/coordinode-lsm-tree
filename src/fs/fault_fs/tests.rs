@@ -321,7 +321,7 @@ fn every_hookable_op_faults_when_armed() -> io::Result<()> {
 }
 
 #[test]
-fn hard_link_count_path_accessor_faults_when_armed() -> io::Result<()> {
+fn hard_link_count_path_accessor_faults_when_armed() {
     // The path-based `Fs::hard_link_count` accessor (used by the blob-file and
     // table reclaim probes) must consult the injector, not delegate blind, so an
     // armed `FaultOp::HardLinkCount` exercises its fail-closed path. MemFs's path
@@ -347,7 +347,6 @@ fn hard_link_count_path_accessor_faults_when_armed() -> io::Result<()> {
         ErrorKind::Other,
         "the injected fault must gate the path-based accessor, not delegate blind",
     );
-    Ok(())
 }
 
 #[test]

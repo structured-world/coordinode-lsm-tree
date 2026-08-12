@@ -2643,7 +2643,7 @@ fn repair_routes_an_under_decoding_footerless_block_through_salvage() -> crate::
 }
 
 /// `is_corruption` grades a block-verify result for the salvage gate. Only the
-/// transient allowlist ({Interrupted, WouldBlock}) aborts the repair for a
+/// transient allowlist (`Interrupted`, `WouldBlock`) aborts the repair for a
 /// retry; a PERSISTENT I/O failure — a genuine bad sector, or a structural
 /// corruption that surfaces as `Io(Other)` on some platforms (e.g. Windows
 /// negative-seek) — is not resolved by a retry, so it must be graded as

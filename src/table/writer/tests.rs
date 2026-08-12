@@ -430,10 +430,10 @@ fn write_columnar_batch_records_entry_precision_locator() -> crate::Result<()> {
         entries.len(),
         "one locator slot per distinct key",
     );
-    for row in 0..entries.len() {
+    for (row, recorded) in writer.locators.iter().enumerate() {
         let key = format!("key{row:03}");
         assert_eq!(
-            writer.locators[row],
+            *recorded,
             (crate::hash::hash64(key.as_bytes()), 0, row as u64),
             "key at row {row} maps to (hash, direct block 0, slot == row index)",
         );

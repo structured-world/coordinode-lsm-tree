@@ -220,7 +220,6 @@ fn compact_validity(bits: &[u8], mask: &[bool], kept: usize) -> Vec<u8> {
 /// newest-wins dedup. An out-of-range index contributes an empty (`Bytes`) or
 /// zero-filled (`Fixed`) cell rather than panicking, so a malformed index can
 /// never desync a column's framing from the output row count.
-#[must_use]
 pub(crate) fn take_rows(batch: &ColumnBatch, indices: &[u32]) -> crate::Result<ColumnBatch> {
     let rows = batch.row_count as usize;
     let columns = batch
@@ -282,12 +281,12 @@ fn take_column(col: &Column, rows: usize, indices: &[u32]) -> crate::Result<Colu
                         limit: u64::from(u32::MAX),
                     }
                 })?;
-                acc = acc
-                    .checked_add(len)
-                    .ok_or(crate::Error::DecompressedSizeTooLarge {
-                        declared: u64::from(acc) + u64::from(len),
-                        limit: u64::from(u32::MAX),
-                    })?;
+                acc =
+                    acc.checked_add(len)
+                        .ok_or_else(|| crate::Error::DecompressedSizeTooLarge {
+                            declared: u64::from(acc) + u64::from(len),
+                            limit: u64::from(u32::MAX),
+                        })?;
                 payload.extend_from_slice(value);
                 offsets.extend_from_slice(&acc.to_le_bytes());
             }

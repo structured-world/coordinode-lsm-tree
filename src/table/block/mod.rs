@@ -103,7 +103,7 @@ pub(crate) fn expected_parity_len(data_length: u32, params: EccParams) -> u32 {
 /// (e.g. a high-parity shard scheme with `saturating_mul` reaching gigabytes).
 /// Rejecting here, immediately after deriving the length and BEFORE any
 /// allocation or trailer read, is the read side of the writer's cap and mirrors
-/// the out-of-band verifier's DoS guard.
+/// the out-of-band verifier's `DoS` guard.
 fn checked_ecc_length(data_length: u32, params: EccParams) -> crate::Result<u32> {
     let ecc_length = expected_parity_len(data_length, params);
     if ecc_length > MAX_DECOMPRESSION_SIZE {
