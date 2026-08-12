@@ -413,6 +413,90 @@ fn repair_with_salvage_reports_a_sole_corrupt_block_as_unsalvageable() -> crate:
     Ok(())
 }
 
+/// A TRANSIENT I/O failure during block-salvage must not commit a manifest that
+/// OMITS the table: the original is already in `repair-quarantine`, so a retry
+/// (no longer finding it under `tables/`) would never rediscover it and the SST
+/// would be permanently lost. Repair must instead RESTORE the quarantined
+/// original to its path and abort, so the operator can retry. Fault the salvage's
+/// open of the quarantined source; pre-fix, repair recorded it unreadable and
+/// committed a manifest without the table.
+#[test]
+fn repair_with_salvage_restores_the_original_on_a_transient_salvage_failure() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs};
+    use crate::io::ErrorKind;
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+
+    // A single-block SST whose sole data block is corrupt: repair routes it to
+    // salvage (verdict Corrupt).
+    {
+        let build_fs: Arc<dyn Fs> = Arc::new(StdFs);
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&build_fs))?;
+        for i in 0..8u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+        let offset = sole_data_block_offset(&recover_table(sst.clone(), &build_fs)?);
+        let flip = usize::try_from(offset).unwrap_or(0) + 16;
+        let mut bytes = std::fs::read(&sst)?;
+        if let Some(b) = bytes.get_mut(flip) {
+            *b ^= 0xFF;
+        }
+        std::fs::write(&sst, &bytes)?;
+    }
+
+    // Fault the salvage's open of the quarantined source (the first open of a
+    // `repair-quarantine/` path): try_salvage_table then fails with Io.
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
+            .on_path("repair-quarantine")
+            .once(),
+    );
+
+    let result = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair_with_salvage(true);
+    injector.clear();
+
+    assert!(
+        result.is_err(),
+        "a transient salvage failure must abort the repair, not commit without the table: \
+         {result:?}",
+    );
+    assert!(
+        sst.exists(),
+        "the quarantined original must be restored to its path so a retry can recover it",
+    );
+    let quarantine = dir.path().join("repair-quarantine");
+    let stranded = quarantine.exists()
+        && std::fs::read_dir(&quarantine)?
+            .find_map(Result::ok)
+            .is_some();
+    assert!(
+        !stranded,
+        "the original must be moved OUT of quarantine, not stranded there",
+    );
+    Ok(())
+}
+
 /// `repair_with_salvage` on an SST that carries range tombstones and a corrupt
 /// data block: whole-file recovery opens it (data is read lazily) but
 /// verification trips on the corrupt block, and block-salvage refuses it because
