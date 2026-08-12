@@ -1133,21 +1133,26 @@ fn salvage_blocks(
         };
         // A candidate is REAL only if its header frames AND its payload loads.
         // `Ok(Some)` = a framed, loaded block; `Ok(None)` = structurally not a
-        // block (a header that did not frame, or a payload that did not decode);
-        // `Err(Io)` = a TRANSIENT read failure, propagated so a retryable fault
+        // block, or a PERSISTENTLY unreadable one (a header that did not frame, a
+        // payload that did not decode, or a bad-sector read a retry can't fix) —
+        // the gap walk treats it as a chain break and drops it. `Err(Io)` is
+        // reserved for a TRANSIENT read failure, propagated so a retryable fault
         // is never mis-recorded as a permanently dropped gap.
-        let frames_and_loads =
-            |at: u64, to: u64| -> crate::Result<Option<crate::table::BlockHandle>> {
-                match table.probe_block_handle_in(&*probe_file, at, to) {
-                    Ok(h) => match table.salvage_load_block(&h, probe_block_type) {
-                        Ok(_) => Ok(Some(h)),
-                        Err(e @ crate::Error::Io(_)) => Err(e),
-                        Err(_) => Ok(None),
-                    },
-                    Err(e @ crate::Error::Io(_)) => Err(e),
+        let frames_and_loads = |at: u64,
+                                to: u64|
+         -> crate::Result<Option<crate::table::BlockHandle>> {
+            match table.probe_block_handle_in(&*probe_file, at, to) {
+                Ok(h) => match table.salvage_load_block(&h, probe_block_type) {
+                    Ok(_) => Ok(Some(h)),
+                    Err(crate::Error::Io(io)) if io.kind().is_transient() => {
+                        Err(crate::Error::Io(io))
+                    }
                     Err(_) => Ok(None),
-                }
-            };
+                },
+                Err(crate::Error::Io(io)) if io.kind().is_transient() => Err(crate::Error::Io(io)),
+                Err(_) => Ok(None),
+            }
+        };
         // Returns `true` when the gap `[from, to)` tiled CONTIGUOUSLY to `to`
         // (so `to` is a proven boundary), `false` when the chain broke before
         // reaching it.
@@ -1304,10 +1309,15 @@ fn salvage_blocks(
                     // block instead (the lying handle's separator is just as
                     // untrusted as its span).
                     Ok(probed) => (probed, None),
-                    // A TRANSIENT read failure is retryable: propagate it rather
-                    // than surrender the block (and, when untrusted, the whole
-                    // tail) to a permanent drop over a flaky read.
-                    Err(e @ crate::Error::Io(_)) => return Err(e),
+                    // Only a TRANSIENT read failure is retryable: propagate it
+                    // rather than surrender the block (and, when untrusted, the
+                    // whole tail) to a permanent drop over a flaky read. A
+                    // PERSISTENT read failure is not fixed by a retry, so it falls
+                    // through to the unframeable-header arm below and drops just
+                    // this block instead of aborting the whole salvage.
+                    Err(crate::Error::Io(io)) if io.kind().is_transient() => {
+                        return Err(crate::Error::Io(io));
+                    }
                     // The indexed block's header does not frame, so its size is
                     // UNVERIFIED. With a TRUSTED index the block's offset is still
                     // an original boundary, so leave the cursor here and let the
@@ -1455,10 +1465,14 @@ fn salvage_blocks(
                     }
                     // Wholly-deleted block: nothing to recover, nothing lost.
                     Ok(None) => {}
-                    // A TRANSIENT read (a masked block re-read after cache eviction)
-                    // propagates so repair retries; a structural failure drops just
-                    // this block, mirroring the unmasked salvage_load_block arm.
-                    Err(e @ crate::Error::Io(_)) => return Err(e),
+                    // Only a TRANSIENT read (a masked block re-read after cache
+                    // eviction) propagates so repair retries; a persistent I/O
+                    // failure or a structural failure drops just this block,
+                    // mirroring the unmasked salvage_load_block arm — a truncated
+                    // or unreadable block must not sink every intact sibling.
+                    Err(crate::Error::Io(io)) if io.kind().is_transient() => {
+                        return Err(crate::Error::Io(io));
+                    }
                     Err(e) => dropped.push(classify_drop(
                         &e,
                         offset,
@@ -1569,11 +1583,14 @@ fn salvage_blocks(
                                     Err(e) => return Err(e),
                                 }
                             }
-                            // A transient I/O read is retryable: propagate it so a
-                            // partial columnar table is not published with healthy
-                            // rows permanently lost. Drops stay for confirmed
-                            // corruption / truncation.
-                            Err(e @ crate::Error::Io(_)) => return Err(e),
+                            // Only a transient I/O read is retryable and propagates,
+                            // so a partial columnar table is not published with
+                            // healthy rows permanently lost. A persistent or
+                            // structural failure drops just this block (truncation /
+                            // an unreadable block must not sink its intact siblings).
+                            Err(crate::Error::Io(io)) if io.kind().is_transient() => {
+                                return Err(crate::Error::Io(io));
+                            }
                             Err(e) => {
                                 dropped.push(classify_drop(
                                     &e,
@@ -1584,8 +1601,10 @@ fn salvage_blocks(
                             }
                         }
                     }
-                    // Same transient-I/O propagation for the delete-masked arm.
-                    Err(e @ crate::Error::Io(_)) => return Err(e),
+                    // Same transient-only I/O propagation for the delete-masked arm.
+                    Err(crate::Error::Io(io)) if io.kind().is_transient() => {
+                        return Err(crate::Error::Io(io));
+                    }
                     Err(e) => dropped.push(classify_drop(
                         &e,
                         offset,
@@ -1760,12 +1779,17 @@ fn salvage_blocks(
                     }),
                 }
             }
-            // A transient I/O error on the block read is retryable, not
-            // corruption: dropping the block and finishing dest would let repair
-            // install a partial replacement missing keys a retry would recover.
-            // Abort so the caller discards the partial dest; reserve block drops
-            // for confirmed corruption / truncation.
-            Err(e @ crate::Error::Io(_)) => return Err(e),
+            // Only a TRANSIENT I/O error on the block read is retryable: dropping
+            // the block and finishing dest would let repair install a partial
+            // replacement missing keys a retry would recover, so abort and let the
+            // caller discard the partial dest. A PERSISTENT I/O failure (a
+            // bad-sector `Other` / EIO, `PermissionDenied`) or a truncated final
+            // block (`UnexpectedEof`) is not fixed by a retry, so it drops just
+            // this block — a persistently-unreadable tail block must not prevent
+            // every intact earlier block from being recovered.
+            Err(crate::Error::Io(io)) if io.kind().is_transient() => {
+                return Err(crate::Error::Io(io));
+            }
             Err(e) => dropped.push(classify_drop(
                 &e,
                 offset,

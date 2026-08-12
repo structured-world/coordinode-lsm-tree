@@ -426,6 +426,75 @@ fn salvage_drops_indexed_blocks_after_a_break_when_the_index_is_untrusted() -> c
     Ok(())
 }
 
+/// A PERSISTENT read failure on one block (a bad-sector `Other` / EIO, or a
+/// truncated final block) must drop just that block, not abort the whole salvage
+/// — otherwise one unreadable block sinks every intact sibling. Only a TRANSIENT
+/// read aborts for a retry. The victim block's positioned read faults once with a
+/// persistent kind; the rest of the file is intact.
+#[test]
+fn salvage_drops_a_persistently_unreadable_block_and_keeps_the_rest() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let clean: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer =
+        Writer::new(source.clone(), 0, 0, Arc::clone(&clean))?.use_data_block_size(128);
+    for i in 0u64..256 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Resolve a MIDDLE data block's offset.
+    let victim_offset = {
+        let table = open(source.clone(), &clean)?;
+        let offsets: Vec<u64> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|h| *h.as_ref().offset())
+            .collect();
+        let Some(&off) = offsets.get(offsets.len() / 2) else {
+            panic!("need several data blocks, got {}", offsets.len());
+        };
+        off
+    };
+
+    // Salvage through a fs whose positioned read of that ONE block ALWAYS fails
+    // (a persistent bad sector); every read at a different offset succeeds.
+    let fault = FaultFs::new(StdFs);
+    fault.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other)).at_offset(victim_offset),
+    );
+    let faulting: Arc<dyn Fs> = Arc::new(fault);
+
+    // Before the fix this aborted (`Err`); now it recovers, dropping just the
+    // unreadable block. (The trusted index resolves the probe failure to a
+    // broken-boundary drop rather than a ReadError, but the point is that ONE
+    // unreadable block no longer sinks the salvage.)
+    let report = salvage_sst(&source, dest.clone(), &faulting)?;
+    assert!(
+        !report.dropped.is_empty(),
+        "a persistently unreadable block must be dropped, not abort the salvage: {report:?}",
+    );
+    assert!(
+        report.blocks_salvaged >= report.blocks_total - report.dropped.len(),
+        "every block except the dropped one is salvaged: {report:?}",
+    );
+    assert!(
+        reopen_get(dest, &clean, b"key-000")?.is_some(),
+        "an intact block must still be recovered past the dropped one: {report:?}",
+    );
+    Ok(())
+}
+
 /// When the broken-index physical walk hits an UNFRAMEABLE block header, the
 /// bytes after it are reachable only by byte-scan resync, so their block
 /// boundaries are unprovable: an uncompressed block can carry a complete
