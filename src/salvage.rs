@@ -609,12 +609,19 @@ fn meta_mirrors_diverge(
     );
     match (tail, mid) {
         (Ok(t), Ok(m)) => Ok(t != m),
-        // A TRANSIENT read on either mirror must not masquerade as "mirrors agree"
-        // (which would skip the MID recovery attempt and salvage under a possibly
-        // forged tail): propagate it so the caller retries.
-        (Err(e @ crate::Error::Io(_)), _) | (_, Err(e @ crate::Error::Io(_))) => Err(e),
-        // A structurally unreadable mirror is the ordinary tail-with-MID-fallback
-        // case: arbitration is only for two valid copies that disagree.
+        // Only a TRANSIENT read on either mirror must not masquerade as "mirrors
+        // agree" (which would skip the MID recovery attempt and salvage under a
+        // possibly forged tail): propagate it so the caller retries.
+        (Err(crate::Error::Io(io)), _) | (_, Err(crate::Error::Io(io)))
+            if io.kind().is_transient() =>
+        {
+            Err(crate::Error::Io(io))
+        }
+        // A structurally unreadable mirror OR a PERSISTENT I/O failure of one
+        // mirror is the ordinary tail-with-MID-fallback case (`recover_inner`
+        // recovers from the readable copy): arbitration is only for two valid
+        // copies that disagree, and a retry cannot make a persistently unreadable
+        // mirror decode.
         _ => Ok(false),
     }
 }
@@ -2095,17 +2102,22 @@ pub fn salvage_blob_file(
                         reason: BlobDropReason::Corrupt(format!("{e:?}")),
                     });
                 }
-                // A transient I/O error is retryable and distinguishable: it may
-                // strike AFTER at least one record was emitted, so recording it as
-                // corruption and finishing `dest` would publish a lossy report
-                // whose offset map silently omits the healthy UNREAD tail.
-                // Propagate it instead so the caller retries and the partial dest
-                // is discarded (below) rather than accepting avoidable data loss.
-                Err(e @ crate::Error::Io(_)) => return Err(e),
-                // Any other error (allocation, a decode fault the scanner does not
-                // re-sync from): an error that leaves the read position before
-                // `data_end` without terminating would make the iterator keep
-                // yielding it. Record the corruption and stop the walk — this is
+                // Only a TRANSIENT I/O error is retryable and distinguishable: it
+                // may strike AFTER at least one record was emitted, so recording
+                // it as corruption and finishing `dest` would publish a lossy
+                // report whose offset map silently omits the healthy UNREAD tail.
+                // Propagate it so the caller retries and the partial dest is
+                // discarded (below) rather than accepting avoidable data loss.
+                Err(crate::Error::Io(io)) if io.kind().is_transient() => {
+                    return Err(crate::Error::Io(io));
+                }
+                // Any other error — a PERSISTENT I/O failure (a bad-sector `Other`,
+                // `PermissionDenied`, or a truncated tail `UnexpectedEof`, none
+                // fixed by a retry), an allocation failure, or a decode fault the
+                // scanner does not re-sync from: an error that leaves the read
+                // position before `data_end` without terminating would make the
+                // iterator keep yielding it. Record the corrupt tail as a drop and
+                // stop the walk, keeping the valid prefix salvageable — this is
                 // the last record it can inspect.
                 Err(e) => {
                     dropped.push(DroppedBlob {
