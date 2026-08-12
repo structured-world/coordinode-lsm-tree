@@ -1878,9 +1878,11 @@ mod page_ecc {
             .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
         let oversized = BlockHandle::new(tmp.handle.offset(), oversized_size);
         let file = std::fs::File::open(&path)?;
+        let err = Block::heal_frame(&file, oversized, &transform)
+            .expect_err("an over-sized block (extra trailing bytes) must be rejected");
         assert!(
-            Block::heal_frame(&file, oversized, &transform).is_err(),
-            "an over-sized block (extra trailing bytes) is rejected, not reported clean",
+            matches!(err, crate::Error::InvalidHeader("Block")),
+            "the trailer-length check rejects the extra bytes as InvalidHeader, got {err:?}",
         );
         Ok(())
     }
@@ -1935,9 +1937,11 @@ mod page_ecc {
         // Claim 4 KiB more than the file actually contains: within the size cap,
         // but the read cannot fill the buffer.
         let short = BlockHandle::new(tmp.handle.offset(), tmp.handle.size() + 4096);
+        let err = Block::heal_frame(&tmp.file, short, &transform)
+            .expect_err("a handle past EOF must error, not act on a short read");
         assert!(
-            Block::heal_frame(&tmp.file, short, &transform).is_err(),
-            "a handle past EOF must error, not act on a short read",
+            matches!(&err, crate::Error::Io(e) if e.kind() == crate::io::ErrorKind::UnexpectedEof),
+            "a handle past EOF must surface an UnexpectedEof short-read error, got {err:?}",
         );
         Ok(())
     }
