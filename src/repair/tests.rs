@@ -565,20 +565,19 @@ fn repair_with_salvage_reports_a_range_tombstone_sst_as_unsalvageable() -> crate
     Ok(())
 }
 
-/// A TRANSIENT whole-file recovery failure (Io) on a range-tombstone SST must
-/// not be routed through salvage: salvage refuses a range-tombstone table with a
-/// deterministic `FeatureUnsupported` (a non-Io error recorded as unsalvageable),
-/// so repair would commit a manifest OMITTING the healthy table — the quarantined
-/// original is then lost. Repair must instead propagate the I/O error and abort
-/// before quarantining, so a retry re-recovers it. Fault `Table::recover`'s open
-/// (the SECOND open of the file; the first, the checksum hash, succeeds).
+/// A TRANSIENT read failure while HASHING an SST during repair must not lose the
+/// table: recording it unreadable commits a manifest that omits the still-in-
+/// place file, which the next open's orphan cleanup then deletes. Repair must
+/// propagate the transient I/O and abort so a retry re-reads the table. Fault the
+/// first open of the file (the checksum hash's open); targeting the op by path,
+/// not a per-file open COUNT, keeps the test platform-independent (the count
+/// differs across OSes).
 #[test]
-fn repair_with_salvage_aborts_on_a_transient_recovery_failure() -> crate::Result<()> {
+fn repair_aborts_on_a_transient_checksum_failure() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs};
     use crate::io::ErrorKind;
-    use crate::range_tombstone::RangeTombstone;
     use crate::table::Writer;
-    use crate::{Config, InternalValue, SequenceNumberCounter, UserKey, ValueType};
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
     use std::sync::Arc;
 
     let dir = tempfile::tempdir()?;
@@ -589,8 +588,6 @@ fn repair_with_salvage_aborts_on_a_transient_recovery_failure() -> crate::Result
     let fault = FaultFs::new(StdFs);
     let injector = fault.injector();
 
-    // A range-tombstone SST: salvage refuses it (FeatureUnsupported), so a wrong
-    // route into salvage would lose the healthy table.
     {
         let build_fs: Arc<dyn Fs> = Arc::new(StdFs);
         let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&build_fs))?;
@@ -602,21 +599,15 @@ fn repair_with_salvage_aborts_on_a_transient_recovery_failure() -> crate::Result
                 ValueType::Value,
             ))?;
         }
-        w.write_range_tombstone(RangeTombstone::new(
-            UserKey::from(b"k00002".as_slice()),
-            UserKey::from(b"k00005".as_slice()),
-            2,
-        ));
         assert!(w.finish()?.is_some(), "the SST is non-empty");
     }
 
-    // The per-table loop opens the file twice: first to hash it
-    // (compute_table_checksum), then in Table::recover. Fault the SECOND open so
-    // the hash succeeds and recovery fails with a transient Io.
+    // compute_table_checksum is the FIRST thing the per-table loop does, and it
+    // opens the file before anything else touches it — so the first open of
+    // `tables/0` is the hash's. Fault it once with a transient Io.
     injector.arm(
         FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
             .on_path("tables/0")
-            .skip(1)
             .once(),
     );
 
@@ -631,12 +622,12 @@ fn repair_with_salvage_aborts_on_a_transient_recovery_failure() -> crate::Result
 
     assert!(
         result.is_err(),
-        "a transient recovery failure must abort the repair, not route a range-tombstone \
-         table into salvage and commit without it: {result:?}",
+        "a transient checksum-hash failure must abort the repair, not record the table \
+         unreadable and commit without it: {result:?}",
     );
     assert!(
         sst.exists(),
-        "the healthy SST must be left in place (never quarantined) for a retry",
+        "the healthy SST must be left in place for a retry",
     );
     Ok(())
 }
