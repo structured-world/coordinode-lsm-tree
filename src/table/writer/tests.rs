@@ -420,6 +420,25 @@ fn write_columnar_batch_records_entry_precision_locator() -> crate::Result<()> {
         .collect();
     let batch = entries_to_column_batch(&entries)?;
     writer.write_columnar_batch(&batch, &cmp)?;
+
+    // Validate the recorded locator slots, not just that finish() succeeds. All
+    // eight keys land in the single direct block (ordinal 0), and Entry
+    // precision records each key's row index as its slot, so the accumulated
+    // triples are exactly `(hash64(key), 0, row)`.
+    assert_eq!(
+        writer.locators.len(),
+        entries.len(),
+        "one locator slot per distinct key",
+    );
+    for row in 0..entries.len() {
+        let key = format!("key{row:03}");
+        assert_eq!(
+            writer.locators[row],
+            (crate::hash::hash64(key.as_bytes()), 0, row as u64),
+            "key at row {row} maps to (hash, direct block 0, slot == row index)",
+        );
+    }
+
     assert!(
         writer.finish()?.is_some(),
         "the columnar SST with an entry-precision locator finishes",

@@ -121,14 +121,30 @@ fn refresh_table_checksum_skips_when_compaction_state_is_contended() {
     let AnyTree::Standard(tree) = standard_tree(dir.path()) else {
         unreachable!("standard tree configured");
     };
-    // The `try_lock` short-circuits before any table lookup, so a dummy id /
-    // checksum exercises exactly the contention-skip path.
+    // Flush a real table so the refresh has a genuine (id, checksum) to look
+    // up: an `Ok(false)` is then attributable specifically to the try_lock
+    // contention skip, not to a missing-table early return that also yields
+    // `Ok(false)`.
+    tree.insert("k", "v", 0);
+    tree.flush_active_memtable(1).expect("flush");
+    let (id, checksum) = {
+        let binding = tree.version_history.read().latest_version();
+        let table = binding
+            .version
+            .iter_tables()
+            .next()
+            .expect("flush produced one table");
+        (table.id(), table.checksum())
+    };
+
     let held = tree.compaction_state.lock();
-    let result = tree.refresh_table_checksum(0, crate::Checksum::from_raw(0), None);
+    let result = tree.refresh_table_checksum(id, checksum, None);
     drop(held);
     assert!(
         matches!(result, Ok(false)),
-        "refresh must skip (not block) when compaction_state is contended: {result:?}",
+        "refresh must skip (not block) when compaction_state is contended, and the \
+         table exists so the skip is attributable to the contention rather than a \
+         missing table: {result:?}",
     );
 }
 
