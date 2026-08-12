@@ -2022,8 +2022,13 @@ impl Writer {
         // Write the optional positional delete-bitmap section (only when the
         // segment has materialized deletes AND the strategy keeps a bitmap;
         // copy-on-write drops rows instead). Applied as a row mask at scan time;
-        // absent otherwise, so a read without deletes pays nothing.
-        if !self.delete_bitmap.is_empty() && self.delete_strategy.writes_bitmap() {
+        // absent otherwise, so a read without deletes pays nothing. Compute the
+        // decision ONCE: the recorded `delete_bitmap_len` below must reflect the
+        // exact same predicate as the section actually written here, or the
+        // reader's "count > 0 requires a section" cross-check would misfire.
+        let writes_delete_bitmap =
+            !self.delete_bitmap.is_empty() && self.delete_strategy.writes_bitmap();
+        if writes_delete_bitmap {
             // Co-write invariant: the positional mask resolves each block's start
             // row from the zone map, and recovery rejects a delete-bitmap SST that
             // lacks one. Fail here at the write site (a clear misconfiguration)
@@ -2224,14 +2229,12 @@ impl Writer {
             use_columnar: self.use_columnar,
             range_tombstone_count,
             // Record the count that corresponds to the delete_bitmap section
-            // ACTUALLY written below: the exact `!is_empty() && writes_bitmap()`
-            // condition. A strategy that keeps no bitmap (or a compaction that
+            // ACTUALLY written above, via the single `writes_delete_bitmap`
+            // decision. A strategy that keeps no bitmap (or a compaction that
             // applied its deletes, leaving the bitmap empty) writes no section
             // and records 0, so the reader's "count > 0 requires a section"
             // cross-check never fires on a legitimate table.
-            delete_bitmap_len: if !self.delete_bitmap.is_empty()
-                && self.delete_strategy.writes_bitmap()
-            {
+            delete_bitmap_len: if writes_delete_bitmap {
                 self.delete_bitmap.len()
             } else {
                 0
