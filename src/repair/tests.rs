@@ -2599,3 +2599,32 @@ fn repair_routes_an_under_decoding_footerless_block_through_salvage() -> crate::
     );
     Ok(())
 }
+
+/// `is_corruption` grades a block-verify result for the salvage gate. Only the
+/// transient allowlist ({Interrupted, WouldBlock}) aborts the repair for a
+/// retry; a PERSISTENT I/O failure — a genuine bad sector, or a structural
+/// corruption that surfaces as `Io(Other)` on some platforms (e.g. Windows
+/// negative-seek) — is not resolved by a retry, so it must be graded as
+/// corruption (`Ok(true)`) and routed to salvage rather than aborting the whole
+/// repair and permanently stranding every other healthy table.
+#[test]
+fn is_corruption_routes_a_persistent_io_to_salvage() {
+    let persistent = crate::Error::Io(crate::io::Error::other("bad sector"));
+    assert!(
+        matches!(super::is_corruption(Err(persistent)), Ok(true)),
+        "a persistent I/O failure must grade as corruption, not abort the repair",
+    );
+}
+
+/// The mirror of [`is_corruption_routes_a_persistent_io_to_salvage`]: a genuine
+/// transient failure still aborts the repair so the caller can retry, rather
+/// than dropping a healthy block into a partial salvaged replacement.
+#[test]
+fn is_corruption_aborts_the_repair_on_a_transient_io() {
+    let transient =
+        crate::Error::Io(crate::io::Error::from_kind(crate::io::ErrorKind::Interrupted));
+    assert!(
+        super::is_corruption(Err(transient)).is_err(),
+        "a transient I/O failure must propagate so the repair can retry",
+    );
+}
