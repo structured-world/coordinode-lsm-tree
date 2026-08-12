@@ -465,8 +465,10 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     /// too.
     ///
     /// Backends with no hard-link concept ([`MemFs`], whose
-    /// [`Fs::hard_link`] copies) override this to return 1. Backends that CAN
-    /// share inodes but cannot determine the count keep the default error, so
+    /// [`Fs::hard_link`] copies) override this to return 1. The Unix file
+    /// backends report the real count from the inode's link field (`StdFs` via
+    /// `nlink`, the raw io_uring backend via `statx` `stx_nlink`). Backends that
+    /// CAN share inodes but cannot determine the count keep the default error, so
     /// in-place mutation paths fail closed (treat the file as shared) instead
     /// of overwriting a snapshot through an unrecognized link.
     ///
