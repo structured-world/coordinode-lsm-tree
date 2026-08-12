@@ -592,6 +592,10 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
     #[cfg_attr(
         not(feature = "std"),
         allow(
+            // Deliberately `allow`, not `expect`: the delegating data/index-block
+            // callers keep this live under some alloc-only feature combinations,
+            // so an `expect(dead_code)` would be an unfulfilled-expectation
+            // warning there. `allow` is the config-agnostic suppression.
             dead_code,
             reason = "reconcile-gate check; the verify/scrub consumers are std-gated"
         )

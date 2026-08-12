@@ -54,7 +54,10 @@ fn check_size_cap(len: usize) -> crate::Result<()> {
 /// layout without a header CRC) is corruption, not a compat case.
 pub const BLOB_HEADER_MAGIC: &[u8] = b"BLO4";
 
-/// Blob frame header length (42 bytes, includes `header_crc`).
+/// Blob frame header length: 42 bytes, `header_crc` included. The sum below is
+/// `4 (magic) + 16 (u128 checksum) + 8 (seqno) + 2 (key len) + 4 (real val len)
+/// + 4 (on-disk val len) + 4 (header crc) = 42`, asserted by
+/// `blob_scanner`/reader tests (`assert_eq!(BLOB_HEADER_LEN, 42)`).
 pub const BLOB_HEADER_LEN: usize = BLOB_HEADER_MAGIC.len()
     + core::mem::size_of::<u128>() // Checksum
     + core::mem::size_of::<u64>() // SeqNo

@@ -491,6 +491,12 @@ impl ParsedMeta {
         };
         let sum_user_key_bytes = read_opt_u64(b"key_bytes#sum")?;
         let sum_value_bytes = read_opt_u64(b"value_bytes#sum")?;
+        // Intentionally OPTIONAL, not a required `read_u64!`: tables written
+        // before this field carry no key and must still decode (`None`). It also
+        // does not need to be mandatory for the forgery cross-check — the whole
+        // meta block is verified field-for-field against the recovery-time copy
+        // and the mirror, so a stripped or forged key fails meta integrity long
+        // before the `delete_bitmap_len` cross-check would run.
         let delete_bitmap_len = read_opt_u64(b"descriptor#delete_bitmap_len")?;
 
         Ok(Self {
