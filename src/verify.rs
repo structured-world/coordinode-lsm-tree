@@ -199,14 +199,31 @@ pub fn verify_integrity(tree: &impl crate::AbstractTree) -> IntegrityReport {
         let expected = table.checksum();
 
         // A tight-space RESTRICTED view digests only its live suffix (the
-        // punched prefix reads as zeros and is not part of its identity). A
-        // block-index read failure while resolving the punch offset falls back
-        // to `0`, so the whole-file digest mismatches and the table is reported
-        // rather than silently passing.
-        let start = table
-            .restrict_lower_bound()
-            .and_then(|bound| table.punch_offset_for(bound).ok())
-            .unwrap_or(0);
+        // punched prefix reads as zeros and is not part of its identity).
+        let start = match table.restrict_lower_bound() {
+            Some(bound) => match table.punch_offset_for(bound) {
+                Ok(offset) => offset,
+                // A TRANSIENT index-read failure while resolving the punch
+                // offset is retryable I/O, not corruption: falling back to `0`
+                // would digest the hole-punched prefix and report a healthy
+                // restricted table as corrupted. Mirror `scan_one_table`, which
+                // routes the same transient failure to an unreadable/IoError
+                // classification and skips the checksum comparison.
+                Err(crate::Error::Io(error)) => {
+                    report.errors.push(IntegrityError::IoError {
+                        path: (*table.path).clone(),
+                        error,
+                    });
+                    report.sst_files_checked += 1;
+                    continue;
+                }
+                // A STRUCTURAL failure still falls back to `0` (fail closed):
+                // the whole-file digest then mismatches and the table is
+                // reported rather than silently passing.
+                Err(_) => 0,
+            },
+            None => 0,
+        };
         match stream_checksum_from(path, start) {
             Ok(got) if got != expected => {
                 report.errors.push(IntegrityError::SstFileCorrupted {
