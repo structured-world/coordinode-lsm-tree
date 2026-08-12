@@ -955,6 +955,18 @@ impl Table {
                     .ok()?;
             let header = crate::table::block::Header::decode_from(&mut &raw[..]).ok()?;
             let layout = self.inner_block_layout(handle.offset().0);
+            // A recorded MULTI-INNER layout is the untrusted `block_layout`
+            // section itself: a checksum-consistent forge of it routes an
+            // otherwise-readable zstd SST through salvage, and copying the block
+            // verbatim would re-emit the same unauthenticated inner boundaries,
+            // so partial range reads keep omitting keys even though salvage
+            // reports success. Disqualify verbatim for such blocks; the re-encode
+            // path below rebuilds the frame from the verified decoded payload and
+            // records a fresh, self-consistent layout. Single-inner blocks (the
+            // common case, empty layout) are unaffected.
+            if !layout.is_empty() {
+                return None;
+            }
             // The bytes COPIED are this second read, not the verified first
             // one, so validate this exact frame before marking it
             // verbatim-safe (a transient fault or concurrent mutation between
@@ -2146,9 +2158,14 @@ impl Table {
                     Err(e) => Err(e),
                 }
             }
-            // Uncorrectable / unreadable: the block's bytes stay as they are; the
-            // scrub already recorded the finding (and the write pass re-surfaces it),
-            // so there is no correction to predict here.
+            // A TRANSIENT read (Io) during this prediction PROPAGATES: swallowing
+            // it drops the block from the predicted offset set, so the write pass
+            // would skip a correction it re-discovers on an ECC-correctable block
+            // and report a clean pass over the fault still on disk. An
+            // UNCORRECTABLE / structural failure leaves the bytes as they are (the
+            // scrub already recorded the finding and the write pass re-surfaces
+            // it), so there is no correction to predict.
+            Err(e @ crate::Error::Io(_)) => Err(e),
             Err(_) => Ok(None),
         }
     }
@@ -3749,10 +3766,21 @@ impl Table {
             None
         };
         // The `(start, seqno)` of the synthetic sentinel entry (a weak tombstone
-        // at the (seqno, start)-minimal tombstone), or `None` when there are no
-        // tombstones. Excluded ONCE from the decoded KV seqno bounds below.
+        // at the (seqno, start)-minimal tombstone), or `None` when the table is
+        // not RT-only. Excluded ONCE from the decoded KV seqno bounds below.
+        //
+        // Only an RT-ONLY table carries a synthetic sentinel: the writer emits it
+        // SOLELY to give an otherwise KV-empty range-tombstone table one index
+        // entry (see the writer's `finish`), so `meta.item_count` is exactly 1. A
+        // table with real KV entries (`item_count > 1`) never has one; deriving a
+        // sentinel there and excluding a REAL weak tombstone that merely matches
+        // the RT-minimal `(key, seqno)` would drop the true minimum from the
+        // seqno-bounds cross-check below and let a checksum-restamped `seqno#min`
+        // raised above that entry pass repair — making snapshot reads skip the
+        // table and resurrect an older value.
         let sentinel = tombstones
             .as_deref()
+            .filter(|_| meta.item_count == 1)
             .and_then(crate::range_tombstone::RangeTombstone::sentinel)
             .map(|(k, s)| (k.clone(), s));
         let mut sentinel_excluded = false;

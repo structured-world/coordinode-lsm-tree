@@ -524,20 +524,35 @@ enum RepairKeepDecision {
 }
 
 /// Whether the on-disk TOC catalogue could HIDE a deletion section — see
-/// [`crate::verify::toc_may_hide_deletion_section`]. A read failure grades
-/// `true` (fail closed): if the catalogue cannot be re-read to prove no section
-/// is hidden, salvage must not trust the parsed absence of deletion metadata.
+/// [`crate::verify::toc_may_hide_deletion_section`]. A STRUCTURAL catalogue
+/// ambiguity grades `Ok(true)` (fail closed): if the catalogue cannot be parsed
+/// to prove no section is hidden, salvage must not trust the parsed absence of
+/// deletion metadata.
+///
+/// # Errors
+///
+/// Propagates a TRANSIENT [`crate::Error::Io`] from opening or reading the
+/// trailer. Grading a retryable read as `true` would send a table
+/// [`repair_with_salvage`](Self) already found corrupt to `Quarantine` — dropping
+/// its healthy ranges from the rebuilt manifest — when a retry of the probe could
+/// have let block salvage recover them.
 pub(crate) fn toc_may_hide_deletions(
     folder_fs: &Arc<dyn crate::fs::Fs>,
     table_path: &std::path::Path,
-) -> bool {
-    let Ok(mut file) = folder_fs.open(table_path, &crate::fs::FsOpenOptions::new().read(true))
-    else {
-        return true;
+) -> crate::Result<bool> {
+    let mut file = match folder_fs.open(table_path, &crate::fs::FsOpenOptions::new().read(true)) {
+        Ok(file) => file,
+        Err(e) => return Err(crate::Error::Io(e)),
     };
     match crate::sfa::Reader::from_reader(&mut file) {
-        Ok(reader) => crate::verify::toc_may_hide_deletion_section(reader.toc(), reader.toc_pos()),
-        Err(_) => true,
+        Ok(reader) => Ok(crate::verify::toc_may_hide_deletion_section(
+            reader.toc(),
+            reader.toc_pos(),
+        )),
+        // A transient trailer read propagates (retry could prove no hidden
+        // section); a structural trailer failure is genuine catalogue ambiguity.
+        Err(crate::sfa::Error::Io(e)) => Err(crate::Error::Io(e)),
+        Err(_) => Ok(true),
     }
 }
 
@@ -578,7 +593,7 @@ fn verify_keep_decision(
                 // (`salvage_with_context` fails closed on a corrupt rebuildable
                 // section when no deletion is visible), which both this path and
                 // the recovery-failure salvage path funnel through.
-                if toc_may_hide_deletions(folder_fs, table_path) {
+                if toc_may_hide_deletions(folder_fs, table_path)? {
                     RepairKeepDecision::Quarantine(
                         "TOC corruption may hide deletion metadata (range tombstones \
                      / delete bitmap); salvage would reopen the same forged \

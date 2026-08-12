@@ -722,9 +722,11 @@ fn salvage_attempt(
     // Repair routes such a table to quarantine via this same check, but the
     // standalone `salvage_sst` / CLI path never runs the repair verifier, so a
     // positional walk here would re-emit the suppressed rows as live. A read
-    // failure grades closed (see [`crate::repair::toc_may_hide_deletions`]). A
-    // table with a VISIBLE deletion is exempt: its deletions are applied.
-    if !has_visible_deletion && crate::repair::toc_may_hide_deletions(fs, source) {
+    // structural ambiguity grades closed, a transient read PROPAGATES (see
+    // [`crate::repair::toc_may_hide_deletions`]) so a flaky probe aborts salvage
+    // for a retry rather than refusing a recoverable table. A table with a VISIBLE
+    // deletion is exempt: its deletions are applied.
+    if !has_visible_deletion && crate::repair::toc_may_hide_deletions(fs, source)? {
         return Err(crate::Error::FeatureUnsupported(
             "salvage of an SST whose TOC may hide a deletion section \
              (an omitted, renamed, or shadowed entry)",

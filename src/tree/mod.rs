@@ -421,8 +421,20 @@ impl AbstractTree for Tree {
         expected_restriction: Option<&crate::UserKey>,
     ) -> crate::Result<bool> {
         // Same lock order as flush / compaction version installs: compaction
-        // state first, then the version history write lock.
-        let mut _compaction_state = self.compaction_state.lock();
+        // state first, then the version history write lock. But the caller (the
+        // patrol reconcile) holds this table's HEAL LOCK across this call, and a
+        // concurrent tight-space compaction acquires that heal lock WHILE holding
+        // `compaction_state`. Blocking on `compaction_state` here would invert the
+        // order (heal_lock -> compaction_state on this path vs
+        // compaction_state -> heal_lock on the compaction path) and deadlock
+        // permanently. `try_lock` instead: a failed acquire means a compaction is
+        // mid-install, so skip this refresh (`Ok(false)`) — the caller keeps the
+        // attestation and the next patrol retries once the compaction releases the
+        // state. Correctness is unchanged: the manifest digest is simply left for
+        // the next pass, exactly as the restriction-mismatch no-op below does.
+        let Some(mut _compaction_state) = self.compaction_state.try_lock() else {
+            return Ok(false);
+        };
         let mut version_lock = self.version_history.write();
 
         // Under the install lock, resolve the CURRENT view of this table and
