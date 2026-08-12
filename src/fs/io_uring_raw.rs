@@ -444,6 +444,10 @@ struct Statx {
 pub struct RawMetadata {
     /// File length in bytes (`stx_size`).
     pub size: u64,
+    /// Number of hard links to the underlying inode (`stx_nlink`). A count above
+    /// 1 means another name shares the same bytes, so in-place mutation would
+    /// rewrite that snapshot too.
+    pub nlink: u64,
     /// Whether the entry is a directory (`S_IFDIR`).
     pub is_dir: bool,
     /// Whether the entry is a regular file (`S_IFREG`).
@@ -475,6 +479,7 @@ pub fn fstat_raw(fd: i32) -> Result<RawMetadata, Error> {
     let kind = buf.stx_mode & S_IFMT;
     Ok(RawMetadata {
         size: buf.stx_size,
+        nlink: u64::from(buf.stx_nlink),
         is_dir: kind == S_IFDIR,
         is_file: kind == S_IFREG,
     })
@@ -640,6 +645,7 @@ pub fn statx_path_raw(path: &core::ffi::CStr) -> Result<Option<RawMetadata>, Err
             let kind = buf.stx_mode & S_IFMT;
             Ok(Some(RawMetadata {
                 size: buf.stx_size,
+                nlink: u64::from(buf.stx_nlink),
                 is_dir: kind == S_IFDIR,
                 is_file: kind == S_IFREG,
             }))
@@ -822,6 +828,13 @@ impl FsFile for IoUringRawFile {
             is_dir: m.is_dir,
             is_file: m.is_file,
         })
+    }
+
+    fn hard_link_count(&self) -> crate::io::Result<u64> {
+        // `statx` on the open descriptor reports `stx_nlink`, so the in-place
+        // heal path gets a real count instead of the `Unsupported` default that
+        // would make it conservatively skip every reclaim.
+        Ok(fstat_raw(self.fd)?.nlink)
     }
 
     fn set_len(&self, size: u64) -> crate::io::Result<()> {
