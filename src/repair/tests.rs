@@ -1063,14 +1063,17 @@ fn repair_quarantines_a_foreign_healtmp_suffix() -> crate::Result<()> {
     Ok(())
 }
 
-/// A read failure DURING the block-verify walk (not the decode-load) must abort
-/// the repair, not be graded as corruption: `verify_sst_file_with_context`
-/// reports it as `SstFileUnreadable` / `DataReadError`, and the first verdict
-/// branch would otherwise map it to `Corrupt` and salvage a healthy table,
-/// dropping blocks for a retryable error. The table is recovered on a clean fs,
-/// then the walk runs on a fs whose reads fault, so only the walk trips.
+/// A PERSISTENT read failure DURING the block-verify walk (not the decode-load)
+/// is graded as corruption, not an abort: `verify_sst_file_with_context` reports
+/// it as `SstFileUnreadable` / `DataReadError`, and a retry can never fix a bad
+/// sector, so aborting the whole repair forever would strand every healthy
+/// sibling table. The corrupt table is routed to salvage instead. (Only the
+/// transient allowlist — `Interrupted` / `WouldBlock` — aborts for a retry, but
+/// those kinds are absorbed by the read layer's own EINTR retry before reaching
+/// this gate, so the abort arm is defensive.) The table is recovered on a clean
+/// fs, then the walk runs on a fs whose read faults once, so only the walk trips.
 #[test]
-fn verify_keep_decision_propagates_a_transient_walk_io_error() -> crate::Result<()> {
+fn verify_keep_decision_grades_a_persistent_walk_io_error_as_corruption() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
     use crate::io::ErrorKind;
     use crate::table::Writer;
@@ -1083,7 +1086,6 @@ fn verify_keep_decision_propagates_a_transient_walk_io_error() -> crate::Result<
     let sst = tables.join("0");
     let clean: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
 
-    // A healthy single-block SST.
     {
         let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&clean))?;
         for i in 0..8u32 {
@@ -1096,17 +1098,15 @@ fn verify_keep_decision_propagates_a_transient_walk_io_error() -> crate::Result<
         }
         assert!(w.finish()?.is_some(), "the SST is non-empty");
     }
-
-    // Recover the table on the CLEAN fs, so recovery does not trip the fault.
     let table = recover_table(sst.clone(), &clean)?;
 
-    // Run the verdict's walk on a fs whose reads fail: the walk opens and reads
-    // through this fs, so its trailer / block reads surface a transient I/O error.
+    // A single persistent `Other` fault on the walk read: the verdict must NOT
+    // abort (that is the transient contract), so `verify_keep_decision` returns a
+    // decision rather than propagating the error.
     let fault = FaultFs::new(StdFs);
-    fault.injector().arm(FaultRule::new(
-        FaultOp::Read,
-        Fault::Error(ErrorKind::Other),
-    ));
+    fault
+        .injector()
+        .arm(FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::Other)).once());
     let faulting: Arc<dyn crate::fs::Fs> = Arc::new(fault);
 
     let config = Config::new(
@@ -1116,9 +1116,9 @@ fn verify_keep_decision_propagates_a_transient_walk_io_error() -> crate::Result<
     );
     let decision = verify_keep_decision(&config, &faulting, &sst, &table);
     assert!(
-        decision.is_err(),
-        "a transient walk read error must abort the repair, not salvage a healthy \
-         table into missing blocks, got {decision:?}",
+        decision.is_ok(),
+        "a persistent walk read error must be graded as corruption (a decision), not \
+         abort the whole repair, got {decision:?}",
     );
     Ok(())
 }

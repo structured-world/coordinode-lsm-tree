@@ -394,12 +394,15 @@ fn block_verify_verdict(
         // Repair walks the file as-is (it has no restriction context).
         0,
     );
-    // A read failure DURING the walk (the file could not be read, or a block's
-    // data-segment read errored) is transient I/O, not block corruption: routing
-    // it through salvage would re-read the same bytes and drop a healthy block.
-    // Propagate it so the repair aborts and the operator retries, mirroring the
-    // decode-load gate below. A truncation (`UnexpectedEof`) IS genuine on-disk
-    // damage, so it falls through to the corruption verdict.
+    // A TRANSIENT read failure DURING the walk (a retryable `Interrupted` /
+    // `WouldBlock`) is not block corruption: routing it through salvage would
+    // re-read the same bytes and drop a healthy block. Propagate it so the repair
+    // aborts and the operator retries, mirroring the decode-load gate below. Any
+    // OTHER kind falls through to the corruption verdict: a truncation
+    // (`UnexpectedEof`) is genuine on-disk damage, and a PERSISTENT failure
+    // (`Other` / EIO, `PermissionDenied`) is not fixed by a retry either, so
+    // aborting forever would strand every healthy sibling table on one bad SST.
+    // This matches the `is_corruption` allowlist policy exactly.
     //
     // This gate depends on the walk CLASSIFYING transient faults as one of these
     // two I/O-bearing variants: a mid-walk seek failure, a transient block-header
@@ -409,7 +412,7 @@ fn block_verify_verdict(
     for e in &report.errors {
         if let crate::verify::BlockVerifyError::SstFileUnreadable { error, .. }
         | crate::verify::BlockVerifyError::DataReadError { error, .. } = e
-            && error.kind() != crate::io::ErrorKind::UnexpectedEof
+            && error.kind().is_transient()
         {
             return Err(crate::Error::Io(crate::io::Error::other(error.to_string())));
         }
