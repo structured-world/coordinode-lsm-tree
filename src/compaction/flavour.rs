@@ -44,7 +44,15 @@ fn drain_blobs<I: Iterator<Item = crate::Result<(ScanEntry, BlobFileId)>>>(
         let (entry, blob_file_id) = blob?;
 
         assert!(entry.key <= key, "vptr was not matched with blob");
-        record_consumed(blob_file_id, entry.frame_end);
+        // A RESYNCED entry's boundary is unproven (see `ScanEntry::resynced`):
+        // advancing the reclaim frontier to its `frame_end` could punch past —
+        // and then skip on resume — a later frame that is actually valid. Drop
+        // the tainted entry WITHOUT advancing the frontier, so a resumed scan
+        // re-reads from the last proven boundary (fail closed). The matched-vptr
+        // relocation path refuses a resynced frame outright for the same reason.
+        if !entry.resynced {
+            record_consumed(blob_file_id, entry.frame_end);
+        }
     }
 
     Ok(())
