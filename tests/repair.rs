@@ -849,19 +849,15 @@ fn repair_with_salvage_correctable_ecc_fault_in_encrypted_sst_is_rewritten() -> 
         tree.flush_active_memtable(0)?;
     }
 
-    // Flip one byte INSIDE the first data block's payload (the data region
-    // starts at file offset 0; the block header is ~33 bytes, so offset 40 is
-    // payload — NOT the parity trailer, which a clean-checksum read never
-    // validates). Within the RS(4,2) budget, so every read CORRECTS it in
-    // memory — but the fault persists on disk.
+    // Flip one byte INSIDE the first data block's payload (the block header is
+    // ~33 bytes, so offset 40 into the `data` section is payload — NOT the
+    // parity trailer, which a clean-checksum read never validates). Within the
+    // RS(4,2) budget, so every read CORRECTS it in memory while the fault
+    // persists on disk. The shared helper locates the section via the TOC and
+    // bounds-checks the offset.
     let ssts = sorted_sst_paths(dir.path());
     let victim = ssts.first().expect("an SST to corrupt");
-    {
-        let mut bytes = std::fs::read(victim)?;
-        let slot = bytes.get_mut(40).expect("offset 40 within the SST");
-        *slot ^= 0x80;
-        std::fs::write(victim, &bytes)?;
-    }
+    flip_byte_in_section(victim, b"data", SectionByte::FromStart(40))?;
 
     nuke_manifest(dir.path())?;
 
@@ -1048,9 +1044,12 @@ fn repair_with_salvage_correctable_ecc_fault_in_encrypted_tli_is_rewritten() -> 
 }
 
 /// Where in a section to flip a byte: a fixed offset from its start, or its
-/// midpoint (length-relative).
+/// midpoint (length-relative). `FromStart` is only used by the ECC-correction
+/// tests (it targets a specific payload byte), so it is gated on `page_ecc`;
+/// `Midpoint` is available under encryption alone.
 #[cfg(feature = "encryption")]
 enum SectionByte {
+    #[cfg(feature = "page_ecc")]
     FromStart(u64),
     Midpoint,
 }
@@ -1072,7 +1071,16 @@ fn flip_byte_in_section(
             .find(|e| e.name() == section)
             .unwrap_or_else(|| panic!("the SST carries a {section:?} section"));
         match at {
-            SectionByte::FromStart(offset) => entry.pos() + offset,
+            #[cfg(feature = "page_ecc")]
+            SectionByte::FromStart(offset) => {
+                assert!(
+                    offset < entry.len(),
+                    "flip offset {offset} must fall within the {section:?} section \
+                     (len {}), not spill into another section",
+                    entry.len(),
+                );
+                entry.pos() + offset
+            }
             SectionByte::Midpoint => entry.pos() + entry.len() / 2,
         }
     };
