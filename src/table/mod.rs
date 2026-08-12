@@ -2362,7 +2362,7 @@ impl Table {
         // homogeneous — every data block carries a footer under `expected_algo`.
         // A restricted view's punched prefix blocks are dead and read as zeros,
         // so skip them (only the live suffix is footer-verified).
-        let punch = self.punch_offset();
+        let punch = self.punch_offset()?;
         for handle in self.block_index.iter() {
             let handle = handle?;
             let block_handle = BlockHandle::new(handle.offset(), handle.size());
@@ -2618,10 +2618,11 @@ impl Table {
                     .map(|i| i.materialize(part.as_slice()))
                     .collect();
                 if frame_blocks {
+                    let punch = self.punch_offset()?;
                     for k in &part_keyed {
                         // Punched prefix blocks of a restricted view decode to
                         // zeros; skip their separator cross-check (they are dead).
-                        if k.offset().0 < self.punch_offset() {
+                        if k.offset().0 < punch {
                             continue;
                         }
                         self.verify_separator_matches_block(k)?;
@@ -2670,10 +2671,11 @@ impl Table {
             }
             if frame_blocks {
                 self.verify_handles_frame_blocks(&handles, data_section.pos(), data_section.len())?;
+                let punch = self.punch_offset()?;
                 for k in &keyed {
                     // Punched prefix blocks of a restricted view decode to zeros;
                     // skip their separator cross-check (they are dead).
-                    if k.offset().0 < self.punch_offset() {
+                    if k.offset().0 < punch {
                         continue;
                     }
                     self.verify_separator_matches_block(k)?;
@@ -2739,7 +2741,7 @@ impl Table {
         // length (punch preserves file size) but are dead, so skip framing
         // them. Index-section handles sit above the (data-section) punch
         // offset and are never skipped.
-        let punch = self.punch_offset();
+        let punch = self.punch_offset()?;
         for handle in handles {
             if handle.offset().0 < punch {
                 continue;
@@ -2840,7 +2842,7 @@ impl Table {
         // equals the empty map's length.
         // Skip a restricted view's punched (dead) prefix blocks; count only the
         // LIVE seqno_bounds entries below so the cross-check covers the suffix.
-        let punch = self.punch_offset();
+        let punch = self.punch_offset()?;
         let mut checked = 0usize;
         for handle in self.block_index.iter() {
             let handle = handle?;
@@ -2927,7 +2929,7 @@ impl Table {
     pub(crate) fn verify_block_entry_counts(&self) -> crate::Result<()> {
         // A restricted view's punched prefix blocks are dead (read as zeros);
         // only its live suffix blocks are entry-count-verified.
-        let punch = self.punch_offset();
+        let punch = self.punch_offset()?;
         for handle in self.block_index.iter() {
             let handle = handle?;
             let block_handle = BlockHandle::new(handle.offset(), handle.size());
@@ -3036,7 +3038,7 @@ impl Table {
         // the zone_map still carries their entries (the file is punched, not
         // rewritten). Skip those blocks and count only the LIVE zone_map entries
         // below, so the cross-check authenticates exactly the suffix.
-        let punch = self.punch_offset();
+        let punch = self.punch_offset()?;
         let mut checked = 0usize;
         for handle in self.block_index.iter() {
             let handle = handle?;
@@ -3207,7 +3209,7 @@ impl Table {
         // A restricted view's punched prefix blocks are dead; skip them. Their
         // keys are superseded, so a suffix key's newest version is in the suffix,
         // and reads never consult the locator's prefix answers.
-        let punch = self.punch_offset();
+        let punch = self.punch_offset()?;
         for handle in self.block_index.iter() {
             let handle = handle?;
             let block_handle = BlockHandle::new(handle.offset(), handle.size());
@@ -3339,7 +3341,7 @@ impl Table {
         // A restricted view's punched prefix blocks are dead; skip them. The
         // global sort order still holds across the LIVE suffix, so `prev_internal`
         // simply starts at the first live block.
-        let punch = self.punch_offset();
+        let punch = self.punch_offset()?;
         let mut prev_internal: Option<(UserKey, SeqNo)> = None;
         for handle in self.block_index.iter() {
             let handle = handle?;
@@ -3564,7 +3566,7 @@ impl Table {
         // A restricted view's punched prefix blocks decode to zeros; skip them.
         // Their keys are superseded, so the live filter is only obligated to
         // report the suffix keys present.
-        let punch = self.punch_offset();
+        let punch = self.punch_offset()?;
         let mut prev_key: Option<Vec<u8>> = None;
         for handle in self.block_index.iter() {
             let handle = handle?;
@@ -3795,7 +3797,7 @@ impl Table {
         // without decoding, and aggregate entries / keys / seqnos over the live
         // suffix only. `meta.item_count` describes the whole table, so its
         // exact-equality check relaxes to a subset check for a restricted view.
-        let punch = self.punch_offset();
+        let punch = self.punch_offset()?;
         let restricted = self.restrict_lower_bound().is_some();
         let mut count: u64 = 0;
         let mut block_count: u64 = 0;
@@ -4071,7 +4073,7 @@ impl Table {
             // be frame-decoded; the map still records them (it is not rewritten
             // on reopen), so cross-check `recorded_seen` against the LIVE map
             // entries (offset >= punch) below instead of the whole map length.
-            let punch = self.punch_offset();
+            let punch = self.punch_offset()?;
             let mut recorded_seen = 0usize;
             for handle in self.block_index.iter() {
                 let handle = handle?;
@@ -6825,13 +6827,23 @@ impl Table {
     /// or the punch offset for a tight-space RESTRICTED view (its `[0, offset)`
     /// data blocks are hole-punched and read as zeros). A data block or section
     /// entry at a lower offset is DEAD (superseded, never read), so the
-    /// disk-fresh verification gates skip it. A block-index read failure grades
-    /// `0` (verify everything) rather than skipping, so a corrupt index cannot
-    /// silently exempt blocks from checking.
-    pub(crate) fn punch_offset(&self) -> u64 {
-        self.restrict_lower_bound()
-            .and_then(|bound| self.punch_offset_for(bound).ok())
-            .unwrap_or(0)
+    /// disk-fresh verification gates skip it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a restricted view's punch-offset lookup failure instead of
+    /// grading it `0`: falling back to `0` would make the verification gates walk
+    /// the hole-punched prefix (which reads as zeros), report its blocks as
+    /// structural corruption, and — on the heal reconcile path — strip a valid
+    /// heal attestation for what is really a transient partitioned-index read.
+    /// Propagating keeps a transient failure inconclusive (the marker survives for
+    /// the next patrol). A normal (unrestricted) table never calls the fallible
+    /// lookup, so it always returns `Ok(0)`.
+    pub(crate) fn punch_offset(&self) -> crate::Result<u64> {
+        match self.restrict_lower_bound() {
+            Some(bound) => self.punch_offset_for(bound),
+            None => Ok(0),
+        }
     }
 
     /// The whole-file digest for a normal table, or the LIVE-SUFFIX digest for a
