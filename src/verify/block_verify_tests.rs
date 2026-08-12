@@ -567,12 +567,13 @@ fn verify_sst_file_flags_an_omitted_toc_section() {
 
     let report = verify_sst_file(&sst_path);
     assert!(
-        report
-            .errors
-            .iter()
-            .any(|e| matches!(e, BlockVerifyError::TocCorrupted { .. })),
-        "an omitted TOC entry leaves a tiling gap the walk must flag as \
-         TocCorrupted, got {:?}",
+        report.errors.iter().any(|e| matches!(
+            e,
+            BlockVerifyError::TocCorrupted { reason, .. }
+                if reason.contains("the gap hides an omitted TOC entry")
+        )),
+        "an omitted TOC entry leaves a tiling gap the walk must flag with the \
+         gap-specific TocCorrupted reason, got {:?}",
         report.errors,
     );
 }

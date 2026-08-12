@@ -986,17 +986,22 @@ fn reopen_restricted_carries_the_live_suffix_digest() -> crate::Result<()> {
                 expected,
                 "the restricted view reports its live-suffix digest",
             );
-            if punch > 0 {
-                assert_ne!(
-                    restricted.checksum(),
-                    table.checksum(),
-                    "a non-zero punch offset makes the suffix digest differ from \
-                     the whole-file digest",
-                );
-            }
+            // `rotate_every == Some(1)` puts "b" in a later data block, so the
+            // punch offset is strictly positive and the suffix digest is
+            // genuinely exercised (not the degenerate whole-file case).
+            assert!(
+                punch > 0,
+                "reopening at a later block punches a real prefix"
+            );
+            assert_ne!(
+                restricted.checksum(),
+                table.checksum(),
+                "a non-zero punch offset makes the suffix digest differ from \
+                 the whole-file digest",
+            );
             Ok(())
         },
-        None,
+        Some(1),
         Some(|x| x),
     )
 }
@@ -5084,7 +5089,7 @@ fn verify_locator_rejects_a_redirected_key_mapping() -> crate::Result<()> {
     let mut triples: Vec<(u64, u64, u64)> = Vec::new();
     let block_count = table.block_index.iter().count() as u64;
     assert!(block_count >= 2, "need multiple blocks to redirect between");
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = crate::HashSet::default();
     for (ordinal, handle) in table.block_index.iter().enumerate() {
         let handle = handle?;
         let block_handle = crate::table::BlockHandle::new(handle.offset(), handle.size());
