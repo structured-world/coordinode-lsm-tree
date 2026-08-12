@@ -2807,6 +2807,48 @@ fn heal_in_place_reconciles_via_a_completed_marker() -> crate::Result<()> {
     Ok(())
 }
 
+/// `attests_post` is the discriminator the heal path uses to decide a not-matched
+/// heal is NOT diverging: it matches only a COMPLETED marker recording exactly
+/// `post` for this table, regardless of the marker's `pre`. A wrong post or a
+/// wrong table id does not match, so a genuinely diverging heal is not mistaken
+/// for a safe restore-to-an-attested-digest.
+#[test]
+fn attests_post_matches_only_the_recorded_completed_post() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("t.sst");
+    std::fs::write(&path, b"x")?;
+
+    let pre = crate::Checksum::from_raw(0x1111);
+    let post = crate::Checksum::from_raw(0x2222);
+    crate::scrub::heal_attest::write(&crate::fs::StdFs, &path, None, 7, pre, post)?;
+
+    // The recorded post matches for the right table, whatever the `pre` was.
+    assert!(crate::scrub::heal_attest::attests_post(
+        &crate::fs::StdFs,
+        &path,
+        None,
+        7,
+        post,
+    ));
+    // A different post does not match.
+    assert!(!crate::scrub::heal_attest::attests_post(
+        &crate::fs::StdFs,
+        &path,
+        None,
+        7,
+        crate::Checksum::from_raw(0x3333),
+    ));
+    // A different table id does not match.
+    assert!(!crate::scrub::heal_attest::attests_post(
+        &crate::fs::StdFs,
+        &path,
+        None,
+        8,
+        post,
+    ));
+    Ok(())
+}
+
 /// Without a valid attestation, an unattributable stale digest STILL fails
 /// closed: the attestation is the only thing that lets a clean re-scan
 /// reconcile, so deleting it (modelling a crash before the attestation was

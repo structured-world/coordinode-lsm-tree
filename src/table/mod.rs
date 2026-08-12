@@ -1725,6 +1725,37 @@ impl Table {
             }
         };
 
+        // A DIVERGING heal on a stale-manifest file must NOT proceed: when the
+        // current bytes do not match the manifest AND the predicted post-heal
+        // digest would not match it either, the file is drifting away from the
+        // manifest (e.g. a prior heal crashed after writing its completed
+        // attestation but before refreshing the manifest, then a fresh fault
+        // appeared). Writing these corrections would move the bytes off any
+        // existing attestation's `post` digest with no chaining marker, so the
+        // reconcile that runs right after this returns could not attribute the
+        // result and would strip the marker — leaving future scrubs and
+        // checkpoints unable to reconcile the table. Leave it untouched (fail
+        // closed): the reconcile still reconciles an existing marker against the
+        // manifest, and a later patrol heals the fault once the bytes line up.
+        //
+        // A not-matched file whose predicted heal RESTORES the manifest digest
+        // (a plain rotted file healing back to what the manifest describes), or
+        // restores a digest an existing COMPLETED marker already attests (a fresh
+        // fault on the just-healed bytes, which that marker still reconciles), is
+        // NOT diverging, so it proceeds. `None` (nothing to heal) is unaffected.
+        if pre_heal_matched == Some(false)
+            && Checksum::from_raw(predicted_digest) != manifest_checksum
+            && !crate::scrub::heal_attest::attests_post(
+                &*self.fs,
+                &self.path,
+                self.encryption.as_deref(),
+                self.id(),
+                Checksum::from_raw(predicted_digest),
+            )
+        {
+            return (report, false);
+        }
+
         for entry in self.block_index.iter() {
             let keyed = match entry {
                 Ok(h) => h,

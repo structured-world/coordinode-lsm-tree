@@ -305,6 +305,25 @@ pub(super) fn attests(
     }
 }
 
+/// Whether a COMPLETED marker beside `table_path` already attests `post` as the
+/// healed digest for `table_id` (regardless of its recorded `pre`). Lets the
+/// heal path recognize that re-healing a not-matched file back to an
+/// already-attested `post` is safe — the existing marker still reconciles it —
+/// so such a heal need not be skipped as "diverging".
+pub fn attests_post(
+    fs: &dyn Fs,
+    table_path: &Path,
+    encryption: Option<&dyn EncryptionProvider>,
+    table_id: u64,
+    post: Checksum,
+) -> bool {
+    matches!(
+        read_sidecar(fs, table_path, encryption),
+        SidecarRead::Present(kind, id, _pre, marker_post)
+            if kind == KIND_COMPLETED && id == table_id && marker_post == post.into_u128()
+    )
+}
+
 /// Removes the attestation (best-effort), syncing the parent so the removal is
 /// durable — an un-synced unlink can resurrect the sidecar after a power loss,
 /// where it would otherwise linger in `tables/` across opens. Called both when a
