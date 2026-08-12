@@ -759,8 +759,9 @@ fn repair_with_salvage_syncs_the_recovered_sst_at_the_configured_mode() -> lsm_t
         "the salvage writer syncs the recovered SST through the injected Fs",
     );
     assert!(
-        modes.contains(&SyncMode::Full),
-        "the recovered SST must be synced at the configured Full mode, got {modes:?}",
+        modes.iter().all(|m| *m == SyncMode::Full),
+        "every sync of the recovered SST must use the configured Full mode (a single \
+         Normal sync must fail the test), got {modes:?}",
     );
     Ok(())
 }
