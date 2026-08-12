@@ -318,9 +318,17 @@ fn restore_quarantined(
 /// dangling file `NotFound` — but those are genuine, non-retryable failures that
 /// must be recorded / salvaged like any other corruption rather than aborting the
 /// repair for a retry that would fail identically. Only an ALLOWLIST of genuinely
-/// transient kinds is retryable: `Other` (the crate maps a raw `EIO`, a timeout,
-/// and an injected fault here), `Interrupted` (`EINTR`), and `WouldBlock`
-/// (`EAGAIN`).
+/// transient kinds is retryable: `Other`, `Interrupted` (`EINTR`), and
+/// `WouldBlock` (`EAGAIN`).
+///
+/// This inspects the CRATE's [`crate::io::ErrorKind`] — what a
+/// `crate::Error::Io` always carries — NOT the originating `std::io::ErrorKind`.
+/// The `From<std::io::Error>` bridge maps every std kind it does not explicitly
+/// track to `ErrorKind::Other`, and this crate's enum has no `Uncategorized` /
+/// `TimedOut` variant to leak through, so a real OS `EIO` (std `Uncategorized`)
+/// and `ETIMEDOUT` (std `TimedOut`) both arrive as `Other` and ARE treated as
+/// transient. An injected fault (`ErrorKind::Other`) lands here for the same
+/// reason.
 fn is_transient_io(e: &crate::Error) -> bool {
     matches!(
         e,

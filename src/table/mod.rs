@@ -1538,6 +1538,12 @@ impl Table {
             sst_files_scanned: 1,
             ..PatrolScrubReport::default()
         };
+        // Whether any write-back was ATTEMPTED. A write_all that errors after a
+        // partial write, or a full write whose sync then fails, may already have
+        // changed the on-disk bytes even though `blocks_healed_in_place` stays 0,
+        // so the marker (the only attribution for a later digest refresh) must be
+        // KEPT in that case; it is removed only when no mutation ever began.
+        let mut write_attempted = false;
 
         // NEITHER exclusion is taken here — both are held by the patrol
         // scrub across this scan AND the digest reconciliation that follows
@@ -1906,6 +1912,10 @@ impl Table {
                             let write_back = file
                                 .seek(SeekFrom::Start(trailer_offset))
                                 .and_then(|_| file.write_all(&fresh));
+                            // The write_all may have written some bytes even if it
+                            // then errored; mark the file as possibly mutated so a
+                            // later failure does not drop the attestation.
+                            write_attempted = true;
                             let durable = match write_back {
                                 Ok(()) => file
                                     .sync_data_with(sync_mode)
@@ -2011,6 +2021,10 @@ impl Table {
                     let write_back = file
                         .seek(SeekFrom::Start(block_offset))
                         .and_then(|_| file.write_all(&frame));
+                    // The write_all may have written some bytes even if it then
+                    // errored (a partial write); mark the file as possibly mutated
+                    // so a later failure does not drop the attestation.
+                    write_attempted = true;
                     let durable = match write_back {
                         Ok(()) => file
                             .sync_data_with(sync_mode)
@@ -2056,12 +2070,16 @@ impl Table {
 
         // The in-progress marker is written speculatively before the first
         // block write; if NO block was actually healed (every candidate turned
-        // out uncorrectable), the file is unchanged and the marker attests to a
-        // heal that never happened. Remove it so it cannot later authorize an
-        // unrelated digest mismatch (its `pre == manifest` binding does not
-        // expire on its own).
+        // out uncorrectable) AND no write was ever attempted, the file is
+        // unchanged and the marker attests to a heal that never happened. Remove
+        // it so it cannot later authorize an unrelated digest mismatch (its
+        // `pre == manifest` binding does not expire on its own). But when a
+        // write WAS attempted and then failed (a partial write, or a full write
+        // whose sync failed), the on-disk bytes may already differ from the
+        // manifest digest: KEEP the marker so a later patrol can still attribute
+        // and refresh the altered table rather than stranding it.
         let healed = pre_heal_matched == Some(true);
-        if healed && report.blocks_healed_in_place == 0 {
+        if healed && report.blocks_healed_in_place == 0 && !write_attempted {
             crate::scrub::heal_attest::remove(&*self.fs, &self.path);
         }
 
@@ -3327,8 +3345,42 @@ impl Table {
     #[cfg(feature = "std")]
     pub(crate) fn verify_point_read_reachability(&self) -> crate::Result<()> {
         use crate::table::block::ParsedItem as _;
+        // Columnar blocks carry no in-block key index to probe, but the GLOBAL
+        // internal-key sort order (user key ASC, then seqno DESC per key) is still
+        // an invariant the read path relies on: `column_batch_match_entries`
+        // binary-searches the key column assuming it is sorted, so a
+        // checksum-restamped block with reordered keys — which every other
+        // columnar check (count / zone-bound comparisons) tolerates — would make
+        // point reads miss a key or return a stale version. Enforce the order over
+        // the live suffix (the punched prefix is dead); there is no point_read to
+        // run, so this is the only order gate for a columnar table.
         #[cfg(feature = "columnar")]
         if self.metadata.columnar {
+            let punch = self.punch_offset()?;
+            let mut prev_internal: Option<(UserKey, SeqNo)> = None;
+            for handle in self.block_index.iter() {
+                let handle = handle?;
+                let block_handle = BlockHandle::new(handle.offset(), handle.size());
+                if block_handle.offset().0 < punch {
+                    continue;
+                }
+                for entry in self.decode_block_entries(&block_handle)? {
+                    if let Some((pk, ps)) = &prev_internal {
+                        let out_of_order = match self.comparator.compare(&entry.key.user_key, pk) {
+                            core::cmp::Ordering::Greater => false,
+                            core::cmp::Ordering::Less => true,
+                            core::cmp::Ordering::Equal => entry.key.seqno >= *ps,
+                        };
+                        if out_of_order {
+                            return Err(crate::Error::InvalidHeader(
+                                "columnar entries are out of order (a user key decreased, or an \
+                                 equal key's seqno did not strictly decrease) across the walk",
+                            ));
+                        }
+                    }
+                    prev_internal = Some((entry.key.user_key.clone(), entry.key.seqno));
+                }
+            }
             return Ok(());
         }
         // The internal-key sort order (user key ASC, then seqno DESC per key) is
