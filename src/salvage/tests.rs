@@ -3198,6 +3198,81 @@ fn verify_metadata_bounds_rejects_a_raised_seqno_min_on_a_range_tombstone_table(
     Ok(())
 }
 
+/// The synthetic-sentinel exclusion must NOT fire on a table with REAL KV
+/// entries. Only an RT-ONLY table (no KV items) carries a synthetic sentinel, so
+/// `meta.item_count == 1`. On an RT+KV table a real weak tombstone whose key and
+/// seqno happen to match the RT-minimal `(start, seqno)` must be counted toward
+/// the seqno bounds — excluding it as if it were the sentinel drops the true
+/// minimum, letting a `seqno#min` restamped above that entry pass and hide the
+/// live version from snapshots at/below the forged minimum.
+#[test]
+fn verify_metadata_bounds_keeps_a_real_weak_tombstone_matching_the_rt_sentinel() -> crate::Result<()>
+{
+    use crate::UserKey;
+    use crate::range_tombstone::RangeTombstone;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // key-002 is a REAL weak tombstone at seqno 3 — the TRUE minimum seqno — and
+    // its (key, seqno) equals the (seqno, start)-minimal range tombstone's, so
+    // the old code mistook it for the synthetic RT-only sentinel and excluded it.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    writer.write(InternalValue::from_components(
+        b"key-000".to_vec(),
+        b"val-000".to_vec(),
+        4,
+        ValueType::Value,
+    ))?;
+    writer.write(InternalValue::from_components(
+        b"key-001".to_vec(),
+        b"val-001".to_vec(),
+        5,
+        ValueType::Value,
+    ))?;
+    writer.write(InternalValue::new_weak_tombstone(
+        UserKey::from(b"key-002".as_slice()),
+        3,
+    ))?;
+    for i in 3u64..8 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 3,
+            ValueType::Value,
+        ))?;
+    }
+    // The (seqno, start)-minimal range tombstone is (start = key-002, seqno = 3),
+    // so the derived sentinel is exactly the real weak tombstone above. Its end
+    // stays within the table key range (max key-007) so coverage passes.
+    writer.write_range_tombstone(RangeTombstone::new(
+        UserKey::from(b"key-002".as_slice()),
+        UserKey::from(b"key-005".as_slice()),
+        3,
+    ));
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Raise seqno#min to 4 (above the real minimum 3, at the next-lowest seqno):
+    // caught only if the seqno-3 weak tombstone is counted. With the sentinel
+    // wrongly excluding it, the decoded minimum becomes 4 and 4 > 4 is false, so
+    // the forge slips through.
+    crate::test_forge::forge_meta_value_both_mirrors(&source, b"seqno#min", &4u64.to_le_bytes())?;
+
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_metadata_bounds() else {
+        panic!("a seqno#min above a real weak tombstone matching the RT sentinel must be rejected");
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::InvalidHeader("meta seqno#min is above the decoded minimum seqno")
+        ),
+        "the rejection names the seqno#min branch specifically, got {err:?}",
+    );
+    Ok(())
+}
+
 /// `verify_metadata_bounds` must reject a `range_tombstones` section whose
 /// decoded count disagrees with the recorded `range_tombstone_count`: a dropped
 /// section (or a re-stamped block decoding to a subset) passes coverage for its

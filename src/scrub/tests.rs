@@ -103,6 +103,35 @@ fn patrol_scrub_empty_tree_scans_nothing() {
     assert!(report.is_ok());
 }
 
+/// A patrol reconcile calls `refresh_table_checksum` while holding a table's
+/// heal lock; a concurrent tight-space compaction holds `compaction_state` and
+/// then acquires that heal lock. Blocking on `compaction_state` here would
+/// invert the lock order (`heal_lock` -> `compaction_state` on the patrol path
+/// vs `compaction_state` -> `heal_lock` on the compaction path) and deadlock.
+/// The refresh must instead SKIP (`Ok(false)`) when `compaction_state` is
+/// contended.
+///
+/// Deterministic without threads: `parking_lot`'s non-reentrant `try_lock` fails
+/// even for the holding thread, so the pre-fix blocking `lock()` would
+/// self-deadlock this very test (a hang), and the fixed `try_lock` returns
+/// `Ok(false)`.
+#[test]
+fn refresh_table_checksum_skips_when_compaction_state_is_contended() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let AnyTree::Standard(tree) = standard_tree(dir.path()) else {
+        unreachable!("standard tree configured");
+    };
+    // The `try_lock` short-circuits before any table lookup, so a dummy id /
+    // checksum exercises exactly the contention-skip path.
+    let held = tree.compaction_state.lock();
+    let result = tree.refresh_table_checksum(0, crate::Checksum::from_raw(0), None);
+    drop(held);
+    assert!(
+        matches!(result, Ok(false)),
+        "refresh must skip (not block) when compaction_state is contended: {result:?}",
+    );
+}
+
 #[test]
 fn patrol_scrub_parallel_over_many_ssts_visits_every_file() {
     let dir = tempfile::tempdir().expect("tempdir");

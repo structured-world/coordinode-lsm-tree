@@ -862,6 +862,75 @@ fn heal_in_place_keeps_the_marker_when_the_reconcile_walk_read_fails_transiently
     Ok(())
 }
 
+/// A TRANSIENT read during the up-front correction-PREDICTION pass must
+/// PROPAGATE, not be folded into "no correction". Swallowing it would drop the
+/// block from the predicted offset set, so the write pass — gated on that set —
+/// would skip a correction it re-discovers on the healable block and report a
+/// clean pass with the fault still on disk. Fault ONLY the first positioned read
+/// (the prediction pass's initial block scrub); the write-pass reads then
+/// succeed, so the pre-fix `Err(_) => Ok(None)` silently skips the heal while the
+/// fixed code surfaces the transient read.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn heal_in_place_propagates_a_transient_read_during_correction_prediction() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+
+    // A single-data-block ECC SST whose parity trailer is rotted (payload stays
+    // checksum-clean, so the block would heal via a trailer rebuild).
+    let (sst_path, block) = {
+        let tree = open_ecc_tree(dir.path());
+        for i in 0u64..4 {
+            tree.insert(format!("key-{i:03}"), format!("v{i:03}"), i);
+        }
+        tree.flush_active_memtable(4).expect("flush");
+        let binding = tree.version_history.read().latest_version();
+        let table = binding
+            .version
+            .iter_tables()
+            .next()
+            .expect("flush produced one table");
+        let keyed = table
+            .block_index
+            .iter()
+            .next()
+            .expect("table has at least one data block")
+            .expect("block index entry decodes");
+        (
+            (*table.path).clone(),
+            crate::table::BlockHandle::new(keyed.offset(), keyed.size()),
+        )
+    };
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
+    rebuild_manifest_over_current_bytes(dir.path())?;
+
+    let fault = FaultFs::new(crate::fs::StdFs);
+    let injector = fault.injector();
+    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));
+
+    // Fault the FIRST positioned read — the prediction pass's initial block
+    // scrub — and let every later read succeed, so the write pass would find the
+    // block healable but never see its offset in the predicted set.
+    injector.arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .once(),
+    );
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    injector.clear();
+
+    // The transient prediction read must SURFACE (an error / inconclusive pass),
+    // not vanish into a clean report that leaves the fault on disk.
+    assert!(
+        !report.is_ok(),
+        "a transient prediction read must surface as an error, not report a clean pass \
+         over the un-healed fault: {report:?}",
+    );
+    Ok(())
+}
+
 /// The reconcile must ABORT if it cannot persist the crash-recovery attestation:
 /// installing the refreshed digest while that marker's write failed would leave
 /// the healed bytes with no on-disk marker for a crash mid-install, and a later
@@ -1458,6 +1527,78 @@ fn write_ecc_zstd_multiblock_sst(dir: &std::path::Path) -> std::path::PathBuf {
         "the multi-inner-block fixture must carry a block_layout section",
     );
     (*table.path).clone()
+}
+
+/// Salvage must NOT byte-copy a MULTI-INNER block verbatim: its recorded
+/// `block_layout` is the very (checksum-consistent, unauthenticated) section a
+/// forge can corrupt to route an otherwise-readable zstd SST through salvage, so
+/// copying the block verbatim would re-emit the same untrusted inner boundaries
+/// and keep partial range reads omitting keys even though salvage reports
+/// success. The block re-encodes from the verified payload instead
+/// (`verbatim = None`); single-inner blocks (empty layout) still copy verbatim.
+#[test]
+fn salvage_load_block_re_encodes_a_multi_inner_block() -> crate::Result<()> {
+    use crate::table::BlockHandle;
+    use crate::table::block::BlockType;
+
+    let dir = tempfile::tempdir()?;
+    // Build a multi-inner-block zstd SST and keep the tree alive so its table
+    // handle stays valid for the salvage-load probe below.
+    let crate::AnyTree::Standard(tree) = crate::Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .page_ecc(true)
+    .ecc_scheme(EccScheme::ReedSolomon {
+        data_shards: 8,
+        parity_shards: 2,
+    })
+    .data_block_size_policy(crate::config::BlockSizePolicy::all(256 * 1024))
+    .data_block_compression_policy(crate::config::CompressionPolicy::all(
+        crate::CompressionType::Zstd(19),
+    ))
+    .open()
+    .expect("open ecc zstd tree") else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+    tree.update_runtime_config(|c| {
+        c.kv_checksums = crate::runtime_config::KvChecksumPolicy::AllLevels;
+    })
+    .expect("enable kv checksums");
+    for i in 0u64..20_000 {
+        tree.insert(format!("key-{i:012}"), format!("value-{i:08}-payload"), i);
+    }
+    tree.flush_active_memtable(20_000).expect("flush");
+
+    let binding = tree.version_history.read().latest_version();
+    let table = binding
+        .version
+        .iter_tables()
+        .next()
+        .expect("flush produced one table");
+    let multi_inner_offsets = table.block_layout.offsets();
+    assert!(
+        !multi_inner_offsets.is_empty(),
+        "the fixture must carry at least one multi-inner-block frame",
+    );
+
+    // The data block recorded in the block_layout is multi-inner: salvage must
+    // re-encode it, not verbatim-copy its untrusted boundaries.
+    let multi = table
+        .block_index
+        .iter()
+        .filter_map(Result::ok)
+        .find(|kh| multi_inner_offsets.contains(&kh.offset().0))
+        .map(|kh| BlockHandle::new(kh.offset(), kh.size()))
+        .expect("a block index handle for the multi-inner offset");
+    let sb = table.salvage_load_block(&multi, BlockType::Data)?;
+    assert!(
+        sb.verbatim.is_none(),
+        "a multi-inner block must re-encode from the verified payload, not byte-copy its \
+         unauthenticated recorded layout",
+    );
+    Ok(())
 }
 
 /// The digest reconciliation must not restamp over a FORGED `block_layout`:

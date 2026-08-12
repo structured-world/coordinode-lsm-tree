@@ -1,9 +1,51 @@
 use super::{
     compute_table_checksum, compute_table_checksum_with_overrides, highest_existing_version_id,
-    quarantine_file, verify_keep_decision,
+    quarantine_file, toc_may_hide_deletions, verify_keep_decision,
 };
 use crate::fs::StdFs;
 use test_log::test;
+
+/// `toc_may_hide_deletions` must PROPAGATE a transient open failure rather than
+/// grade it `true` (fail closed): on a table `repair_with_salvage` already found
+/// corrupt, a `true` verdict routes it to Quarantine — dropping the healthy
+/// ranges block salvage could recover — when a retry of the probe could have
+/// allowed that recovery. `true` is reserved for STRUCTURAL catalogue ambiguity.
+/// A single Open fault on the probe reproduces the transient failure; the pre-fix
+/// `let Ok else true` swallowed it and returned `true`.
+#[test]
+fn toc_may_hide_deletions_propagates_a_transient_open_failure() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs};
+    use crate::io::ErrorKind;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let source = dir.path().join("source");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    let mut writer = crate::table::Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    writer.write(crate::InternalValue::from_components(
+        b"k".to_vec(),
+        b"v".to_vec(),
+        1,
+        crate::ValueType::Value,
+    ))?;
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
+            .on_path("source")
+            .once(),
+    );
+    let result = toc_may_hide_deletions(&fs, &source);
+    assert!(
+        matches!(result, Err(crate::Error::Io(_))),
+        "a transient open failure must propagate, not grade the catalogue as hiding a \
+         deletion section: {result:?}",
+    );
+    Ok(())
+}
 
 /// `compute_table_checksum_with_overrides` splices corrections chunk by chunk
 /// (256 KiB). An override that does NOT overlap the current chunk must be
