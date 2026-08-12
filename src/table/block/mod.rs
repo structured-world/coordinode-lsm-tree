@@ -96,6 +96,25 @@ pub(crate) fn expected_parity_len(data_length: u32, params: EccParams) -> u32 {
     shard_bytes.saturating_mul(parity_shards)
 }
 
+/// [`expected_parity_len`], rejecting a trailer above the payload hard cap
+/// ([`MAX_DECOMPRESSION_SIZE`]). A legitimately-written block never exceeds it —
+/// the writer enforces the same bound before emitting the trailer — so a larger
+/// DERIVED length means a forged / corrupt ECC descriptor amplifying the payload
+/// (e.g. a high-parity shard scheme with `saturating_mul` reaching gigabytes).
+/// Rejecting here, immediately after deriving the length and BEFORE any
+/// allocation or trailer read, is the read side of the writer's cap and mirrors
+/// the out-of-band verifier's DoS guard.
+fn checked_ecc_length(data_length: u32, params: EccParams) -> crate::Result<u32> {
+    let ecc_length = expected_parity_len(data_length, params);
+    if ecc_length > MAX_DECOMPRESSION_SIZE {
+        return Err(crate::Error::DecompressedSizeTooLarge {
+            declared: u64::from(ecc_length),
+            limit: u64::from(MAX_DECOMPRESSION_SIZE),
+        });
+    }
+    Ok(ecc_length)
+}
+
 /// Whether the on-disk block carries a Reed-Solomon parity trailer.
 ///
 /// Source of truth depends on the block type:
@@ -933,7 +952,7 @@ impl Block {
         // is `expected_parity_len(data_length)` (the RS(4, 2) scheme is
         // deterministic), otherwise none.
         let ecc_length = if block_has_parity(&header, transform) {
-            expected_parity_len(header.data_length, block_ecc_params(&header, transform))
+            checked_ecc_length(header.data_length, block_ecc_params(&header, transform))?
         } else {
             0
         };
@@ -1313,10 +1332,10 @@ impl Block {
             // length, when recognized, is derived from `data_length` + scheme.
             let has_ecc = block_has_parity(&parsed_header, transform);
             let ecc_length = if has_ecc {
-                expected_parity_len(
+                checked_ecc_length(
                     parsed_header.data_length,
                     block_ecc_params(&parsed_header, transform),
-                )
+                )?
             } else {
                 0
             };
@@ -1506,10 +1525,10 @@ impl Block {
             // payload). See the encrypted branch + `classify_block_trailer`.
             let has_ecc = block_has_parity(&parsed_header, transform);
             let ecc_length = if has_ecc {
-                expected_parity_len(
+                checked_ecc_length(
                     parsed_header.data_length,
                     block_ecc_params(&parsed_header, transform),
-                )
+                )?
             } else {
                 0
             };
@@ -1748,7 +1767,7 @@ impl Block {
             return Ok(None);
         }
         let ecc_params = block_ecc_params(&header, transform);
-        let ecc_length = expected_parity_len(header.data_length, ecc_params);
+        let ecc_length = checked_ecc_length(header.data_length, ecc_params)?;
         // Validate the on-disk trailer the same way the read path does before ever
         // treating the block as clean: the post-header bytes must be exactly
         // `data_length + ecc_length`. Extra trailing bytes (an over-sized / malformed
@@ -1896,10 +1915,10 @@ impl Block {
 
         let has_ecc = block_has_parity(&parsed_header, transform);
         let ecc_length = if has_ecc {
-            expected_parity_len(
+            checked_ecc_length(
                 parsed_header.data_length,
                 block_ecc_params(&parsed_header, transform),
-            )
+            )?
         } else {
             0
         };
