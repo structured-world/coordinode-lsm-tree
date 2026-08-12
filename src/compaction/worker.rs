@@ -991,6 +991,14 @@ fn run_tight_space_compaction(
             // that extend past the boundary (`max >= boundary`) are re-opened, so
             // only those are locked. The patrol holds at most one table's heal
             // lock at a time, so acquiring several here cannot deadlock it.
+            //
+            // Lock-order note: this path takes `compaction_state` (held from
+            // `do_compaction`) BEFORE these heal locks, while the patrol reconcile
+            // takes a heal lock and then `compaction_state` inside
+            // `refresh_table_checksum`. To keep that inversion from deadlocking,
+            // the patrol side `try_lock`s `compaction_state` and skips its refresh
+            // on contention rather than blocking — so it never waits on
+            // `compaction_state` while holding a heal lock this loop wants.
             #[cfg(feature = "page_ecc")]
             let heal_locks: Vec<Arc<parking_lot::Mutex<()>>> = current_views
                 .iter()
