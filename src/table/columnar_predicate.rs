@@ -221,24 +221,24 @@ fn compact_validity(bits: &[u8], mask: &[bool], kept: usize) -> Vec<u8> {
 /// zero-filled (`Fixed`) cell rather than panicking, so a malformed index can
 /// never desync a column's framing from the output row count.
 #[must_use]
-pub(crate) fn take_rows(batch: &ColumnBatch, indices: &[u32]) -> ColumnBatch {
+pub(crate) fn take_rows(batch: &ColumnBatch, indices: &[u32]) -> crate::Result<ColumnBatch> {
     let rows = batch.row_count as usize;
     let columns = batch
         .columns
         .iter()
         .map(|c| take_column(c, rows, indices))
-        .collect();
+        .collect::<crate::Result<_>>()?;
     // `indices.len()` is the output row count; it fits u32 because every index
     // addresses a row of a single block, whose count is itself a u32.
     let row_count = u32::try_from(indices.len()).unwrap_or(u32::MAX);
-    ColumnBatch { row_count, columns }
+    Ok(ColumnBatch { row_count, columns })
 }
 
 /// Gathers one column to the rows listed in `indices` (in that order),
 /// rebuilding its framing (fixed chunks copied, `Bytes` offset table + payload
 /// repacked) and its validity bitmap. Sibling of [`filter_column`] for the
 /// index-driven [`take_rows`] gather.
-fn take_column(col: &Column, rows: usize, indices: &[u32]) -> Column {
+fn take_column(col: &Column, rows: usize, indices: &[u32]) -> crate::Result<Column> {
     let data = match col.type_tag {
         TypeTag::Fixed(width) => {
             let width = width as usize;
@@ -267,17 +267,28 @@ fn take_column(col: &Column, rows: usize, indices: &[u32]) -> Column {
                 // A missing cell degrades to empty (one offset still written), so
                 // the offset table stays in lockstep with the output row count.
                 let value = bytes_row(&col.data, rows, i as usize).unwrap_or(&[]);
-                payload.extend_from_slice(value);
                 // Unlike the mask-driven `filter_column`, a gather may REPEAT an
                 // index (any index list is permitted), so the emitted payload is
-                // NOT a subset of the original and `acc` can exceed the original
-                // u32 offset total. Saturate rather than wrap: this gather is
-                // infallible and contractually degrades malformed input (an
-                // out-of-range index yields an empty cell, never a panic or a
-                // desynced frame), so clamping the accumulator keeps the offset
-                // table bounded on an adversarial duplicate-heavy index list.
-                let len = u32::try_from(value.len()).unwrap_or(u32::MAX);
-                acc = acc.saturating_add(len);
+                // NOT a subset of the original and the running u32 offset can
+                // exceed the original total. A saturating accumulator would peg
+                // the last offsets at `u32::MAX` while the payload kept growing,
+                // desyncing the offset table from the payload (later rows would
+                // be mis-sliced on read). Fail loudly on overflow BEFORE
+                // appending the value, so a genuinely oversized gather is a
+                // clean error rather than a silently corrupt batch.
+                let len = u32::try_from(value.len()).map_err(|_| {
+                    crate::Error::DecompressedSizeTooLarge {
+                        declared: value.len() as u64,
+                        limit: u64::from(u32::MAX),
+                    }
+                })?;
+                acc = acc
+                    .checked_add(len)
+                    .ok_or(crate::Error::DecompressedSizeTooLarge {
+                        declared: u64::from(acc) + u64::from(len),
+                        limit: u64::from(u32::MAX),
+                    })?;
+                payload.extend_from_slice(value);
                 offsets.extend_from_slice(&acc.to_le_bytes());
             }
             offsets.extend_from_slice(&payload);
@@ -288,12 +299,12 @@ fn take_column(col: &Column, rows: usize, indices: &[u32]) -> Column {
         .validity
         .as_ref()
         .map(|bits| take_validity(bits, indices));
-    Column {
+    Ok(Column {
         column_id: col.column_id,
         type_tag: col.type_tag,
         validity,
         data,
-    }
+    })
 }
 
 /// Rebuilds a validity bitmap for the rows listed in `indices`, preserving each

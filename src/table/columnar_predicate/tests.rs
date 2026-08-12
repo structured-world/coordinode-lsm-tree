@@ -215,8 +215,9 @@ fn filter_batch_compacts_fixed_data_and_validity() {
 fn take_rows_repeats_a_bytes_value_and_keeps_offsets_monotonic() {
     // A gather may list the same index more than once. The Bytes value must be
     // emitted once per occurrence and the offset table stay monotonic — the
-    // accumulator adds each repeat's length (saturating, so an adversarial
-    // duplicate-heavy list can never wrap the u32 table into a desynced frame).
+    // accumulator adds each repeat's length (checked, so a genuinely oversized
+    // gather errors cleanly rather than wrapping the u32 table into a desynced
+    // frame; a normal gather like this one never approaches the limit).
     let batch = entries_to_column_batch(&[
         entry(b"k0", 3, b"aaa"),
         entry(b"k1", 2, b"bb"),
@@ -225,7 +226,7 @@ fn take_rows_repeats_a_bytes_value_and_keeps_offsets_monotonic() {
     .expect("transpose");
 
     // Gather rows [0, 0, 2]: row 0 ("aaa") twice, then row 2 ("c").
-    let taken = take_rows(&batch, &[0, 0, 2]);
+    let taken = take_rows(&batch, &[0, 0, 2]).expect("gather within the u32 offset limit");
     assert_eq!(taken.row_count, 3);
 
     let entries = column_batch_to_entries(&taken).expect("transpose back");

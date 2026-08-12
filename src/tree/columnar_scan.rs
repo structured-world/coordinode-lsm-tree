@@ -465,7 +465,7 @@ impl ColumnarScan {
             kept.push(i);
         }
 
-        let mut merged = take_rows(&combined, &kept);
+        let mut merged = take_rows(&combined, &kept)?;
 
         // Apply the row predicate AFTER newest-version dedup: each surviving row is
         // now the newest visible version of its key, so a key whose newest version
