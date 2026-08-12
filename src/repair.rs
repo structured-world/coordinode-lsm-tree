@@ -368,16 +368,17 @@ fn is_transient_io(e: &crate::Error) -> bool {
 /// silently heal it in memory while the corrupt bytes stay on disk).
 /// Classifies a block-verifier result for the salvage gate. A structural
 /// divergence (a checksum / decode / cross-check mismatch) is genuine
-/// corruption: `Ok(true)`, route the table through salvage. A transient
-/// [`crate::Error::Io`] is NOT corruption: the outer raw-checksum walk already
-/// proved the on-disk framing intact, so a read that fails HERE is a retryable
-/// filesystem error. Propagating it (`Err`) aborts the repair instead of
-/// dropping a healthy block and installing a partial replacement, which would
-/// turn a retryable failure into permanent missing data.
+/// corruption: `Ok(true)`, route the table through salvage. Only a TRANSIENT
+/// [`crate::Error::Io`] (the [`is_transient_io`] allowlist) aborts the repair
+/// (`Err`) for a retry, rather than dropping a healthy block into a partial
+/// replacement. A PERSISTENT I/O failure is NOT retryable — a bad sector, or a
+/// structural corruption surfacing as `Io(Other)` on some platforms — so it is
+/// graded as corruption and salvaged too, rather than aborting the whole repair
+/// and stranding every other healthy table on one unrecoverable read.
 fn is_corruption(res: crate::Result<()>) -> crate::Result<bool> {
     match res {
         Ok(()) => Ok(false),
-        Err(e @ crate::Error::Io(_)) => Err(e),
+        Err(e) if is_transient_io(&e) => Err(e),
         Err(_) => Ok(true),
     }
 }
@@ -604,7 +605,18 @@ pub(crate) fn toc_may_hide_deletions(
 ) -> crate::Result<bool> {
     let mut file = match folder_fs.open(table_path, &crate::fs::FsOpenOptions::new().read(true)) {
         Ok(file) => file,
-        Err(e) => return Err(crate::Error::Io(e)),
+        // A TRANSIENT open failure propagates (a retry could open the file and
+        // prove no hidden section); a PERSISTENT one fails closed as catalogue
+        // ambiguity — we cannot read the TOC to prove it hides no deletion
+        // section, so `true` quarantines rather than resurrecting masked rows.
+        Err(e) => {
+            let err = crate::Error::Io(e);
+            return if is_transient_io(&err) {
+                Err(err)
+            } else {
+                Ok(true)
+            };
+        }
     };
     match crate::sfa::Reader::from_reader(&mut file) {
         Ok(reader) => Ok(crate::verify::toc_may_hide_deletion_section(
@@ -612,8 +624,16 @@ pub(crate) fn toc_may_hide_deletions(
             reader.toc_pos(),
         )),
         // A transient trailer read propagates (retry could prove no hidden
-        // section); a structural trailer failure is genuine catalogue ambiguity.
-        Err(crate::sfa::Error::Io(e)) => Err(crate::Error::Io(e)),
+        // section); a persistent I/O failure or a structural trailer failure is
+        // genuine catalogue ambiguity that fails closed.
+        Err(crate::sfa::Error::Io(e)) => {
+            let err = crate::Error::Io(e);
+            if is_transient_io(&err) {
+                Err(err)
+            } else {
+                Ok(true)
+            }
+        }
         Err(_) => Ok(true),
     }
 }

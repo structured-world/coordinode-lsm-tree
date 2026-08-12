@@ -34,7 +34,7 @@ fn toc_may_hide_deletions_propagates_a_transient_open_failure() -> crate::Result
     assert!(writer.finish()?.is_some(), "source SST is non-empty");
 
     injector.arm(
-        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Interrupted))
             .on_path("source")
             .once(),
     );
@@ -43,6 +43,45 @@ fn toc_may_hide_deletions_propagates_a_transient_open_failure() -> crate::Result
         matches!(result, Err(crate::Error::Io(_))),
         "a transient open failure must propagate, not grade the catalogue as hiding a \
          deletion section: {result:?}",
+    );
+    Ok(())
+}
+
+/// The mirror of [`toc_may_hide_deletions_propagates_a_transient_open_failure`]:
+/// a PERSISTENT open failure (outside the transient allowlist) cannot be proven
+/// harmless by a retry, so it fails closed (`Ok(true)`) — the corrupt table is
+/// quarantined rather than salvaged into resurrected rows — instead of aborting
+/// the whole repair.
+#[test]
+fn toc_may_hide_deletions_fails_closed_on_a_persistent_open_failure() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs};
+    use crate::io::ErrorKind;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let source = dir.path().join("source");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    let mut writer = crate::table::Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    writer.write(crate::InternalValue::from_components(
+        b"k".to_vec(),
+        b"v".to_vec(),
+        1,
+        crate::ValueType::Value,
+    ))?;
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
+            .on_path("source")
+            .once(),
+    );
+    let result = toc_may_hide_deletions(&fs, &source);
+    assert!(
+        matches!(result, Ok(true)),
+        "a persistent open failure must fail closed (quarantine), not propagate: {result:?}",
     );
     Ok(())
 }
@@ -887,11 +926,14 @@ fn repair_with_salvage_propagates_a_transient_verify_io_error() -> crate::Result
     // file (sequential `Read`), and whole-file recovery is lazy on the data
     // section, so neither trips: the first positioned read at this offset is the
     // block-verify DECODE-load, which then surfaces a transient `Io` error.
+    // `Interrupted` is the genuine transient kind (the `is_transient_io`
+    // allowlist): a persistent `Other` would instead grade as corruption and
+    // salvage, which is the sibling `is_corruption_routes_a_persistent_io...` case.
     let offset = sole_data_block_offset(&recover_table(sst.clone(), &fs)?);
     let fault = FaultFs::new(StdFs);
     let injector = fault.injector();
     injector.arm(
-        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other))
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Interrupted))
             .at_offset(offset)
             .once(),
     );
@@ -2621,8 +2663,9 @@ fn is_corruption_routes_a_persistent_io_to_salvage() {
 /// than dropping a healthy block into a partial salvaged replacement.
 #[test]
 fn is_corruption_aborts_the_repair_on_a_transient_io() {
-    let transient =
-        crate::Error::Io(crate::io::Error::from_kind(crate::io::ErrorKind::Interrupted));
+    let transient = crate::Error::Io(crate::io::Error::from_kind(
+        crate::io::ErrorKind::Interrupted,
+    ));
     assert!(
         super::is_corruption(Err(transient)).is_err(),
         "a transient I/O failure must propagate so the repair can retry",
