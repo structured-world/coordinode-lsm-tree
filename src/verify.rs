@@ -203,13 +203,15 @@ pub fn verify_integrity(tree: &impl crate::AbstractTree) -> IntegrityReport {
         let start = match table.restrict_lower_bound() {
             Some(bound) => match table.punch_offset_for(bound) {
                 Ok(offset) => offset,
-                // A TRANSIENT index-read failure while resolving the punch
-                // offset is retryable I/O, not corruption: falling back to `0`
-                // would digest the hole-punched prefix and report a healthy
+                // A TRANSIENT index-read failure (EINTR / EAGAIN) while resolving
+                // the punch offset is retryable I/O, not corruption: falling back
+                // to `0` would digest the hole-punched prefix and report a healthy
                 // restricted table as corrupted. Mirror `scan_one_table`, which
                 // routes the same transient failure to an unreadable/IoError
                 // classification and skips the checksum comparison.
-                Err(crate::Error::Io(error)) => {
+                Err(crate::Error::Io(error))
+                    if crate::repair::is_transient_io_kind(error.kind()) =>
+                {
                     report.errors.push(IntegrityError::IoError {
                         path: (*table.path).clone(),
                         error,
@@ -217,9 +219,10 @@ pub fn verify_integrity(tree: &impl crate::AbstractTree) -> IntegrityReport {
                     report.sst_files_checked += 1;
                     continue;
                 }
-                // A STRUCTURAL failure still falls back to `0` (fail closed):
-                // the whole-file digest then mismatches and the table is
-                // reported rather than silently passing.
+                // A PERSISTENT I/O failure (`Other` / EIO) and a STRUCTURAL
+                // failure both fall back to `0` (fail closed): the whole-file
+                // digest then mismatches and the table is reported rather than
+                // silently passing.
                 Err(_) => 0,
             },
             None => 0,
@@ -654,15 +657,17 @@ fn scan_one_table(table: &crate::table::Table) -> BlockVerifyReport {
     let max_enc_overhead = table.encryption.as_ref().map_or(0u32, |e| e.max_overhead());
     // A restricted view digests / walks only its live suffix: skip the punched
     // data-block prefix. A TRANSIENT punch-offset lookup failure (a flaky
-    // partitioned-index read) is recorded as an unreadable-file I/O error and the
-    // walk is skipped — falling back to `0` would walk the hole-punched prefix and
-    // report its zeroed blocks as a false whole-file checksum mismatch on a
-    // healthy restricted table. A STRUCTURAL lookup failure still falls back to
-    // `0` (walk everything, fail closed) so a corrupt index cannot exempt blocks.
+    // partitioned-index read: EINTR / EAGAIN) is recorded as an unreadable-file
+    // I/O error and the walk is skipped — falling back to `0` would walk the
+    // hole-punched prefix and report its zeroed blocks as a false whole-file
+    // checksum mismatch on a healthy restricted table. A PERSISTENT I/O failure
+    // (`Other` / EIO, not retryable) and a STRUCTURAL lookup failure both fall
+    // back to `0` (walk everything, fail closed) so an unresolvable or corrupt
+    // index cannot exempt blocks.
     let data_start = match table.restrict_lower_bound() {
         Some(bound) => match table.punch_offset_for(bound) {
             Ok(offset) => offset,
-            Err(crate::Error::Io(error)) => {
+            Err(crate::Error::Io(error)) if crate::repair::is_transient_io_kind(error.kind()) => {
                 report.errors.push(BlockVerifyError::SstFileUnreadable {
                     table_id,
                     path: path.to_path_buf(),

@@ -340,13 +340,19 @@ fn restore_quarantined(
 /// This inspects the CRATE's [`crate::io::ErrorKind`], which is what a
 /// `crate::Error::Io` always carries.
 fn is_transient_io(e: &crate::Error) -> bool {
+    matches!(e, crate::Error::Io(io) if is_transient_io_kind(io.kind()))
+}
+
+/// The transient-I/O allowlist as a bare-[`crate::io::ErrorKind`] predicate:
+/// only `Interrupted` (EINTR) and `WouldBlock` (EAGAIN) are unambiguously
+/// retryable. Everything else — including the ambiguous `Other`, which real
+/// `EIO` and platform-specific structural errors (e.g. a Windows negative-seek
+/// on a corrupt file) both map to — is treated as persistent / structural.
+/// Shared so the integrity-verify paths classify the same way as repair.
+pub(crate) fn is_transient_io_kind(kind: crate::io::ErrorKind) -> bool {
     matches!(
-        e,
-        crate::Error::Io(io)
-            if matches!(
-                io.kind(),
-                crate::io::ErrorKind::Interrupted | crate::io::ErrorKind::WouldBlock
-            )
+        kind,
+        crate::io::ErrorKind::Interrupted | crate::io::ErrorKind::WouldBlock
     )
 }
 
