@@ -718,14 +718,16 @@ fn heal_in_place_reports_a_failed_trailer_writeback_as_uncorrectable() -> crate:
     Ok(())
 }
 
-/// The in-progress marker is written speculatively before the first block
-/// write. If EVERY candidate then fails to write back (zero blocks healed), the
-/// file is unchanged and the marker attests to a heal that never happened — so
-/// it must be REMOVED, or its unexpiring `pre == manifest` binding could later
-/// authorize an unrelated digest mismatch.
+/// A write-back that FAILS must KEEP the in-progress marker, even though zero
+/// blocks were counted as healed. `write_all` reports no byte count on error, so
+/// a failure may have PARTIALLY written the block (or a full write's later sync
+/// failed while the bytes still reach storage): the file may already differ from
+/// the manifest digest, and dropping the marker would strand it with no
+/// attribution for a later refresh. Removal is reserved for the no-mutation case
+/// (a block that was never written — see the sibling uncorrectable test).
 #[cfg(feature = "page_ecc")]
 #[test]
-fn heal_in_place_removes_the_marker_when_no_block_heals() -> crate::Result<()> {
+fn heal_in_place_keeps_the_marker_when_a_write_back_fails() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
     use crate::io::ErrorKind;
 
@@ -744,7 +746,7 @@ fn heal_in_place_removes_the_marker_when_no_block_heals() -> crate::Result<()> {
 
     // The FIRST write to `tables/` is the marker sidecar; the SECOND is the
     // trailer rebuild. Skip the marker write so the marker lands, then fail the
-    // trailer write so zero blocks heal.
+    // trailer write so zero blocks heal but a write WAS attempted.
     injector.arm(
         FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::Other))
             .on_path("tables")
@@ -758,19 +760,59 @@ fn heal_in_place_removes_the_marker_when_no_block_heals() -> crate::Result<()> {
         report.blocks_healed_in_place, 0,
         "a failed write-back heals no block: {report:?}",
     );
-    // Positive signal that the heal REACHED the trailer write-back (so the
-    // marker was written, its write preceding the trailer write, before the
-    // failure), rather than the marker never landing. Distinguishes
-    // "marker removed after being written" from "marker never written".
     assert!(
         report.uncorrectable_blocks >= 1
             && format!("{report:?}").contains("in-place parity rebuild"),
-        "the failed trailer write-back must be recorded, proving the marker was \
-         written before it: {report:?}",
+        "the failed trailer write-back must be recorded, proving the write was \
+         attempted: {report:?}",
+    );
+    assert!(
+        heal_attest_path(&sst_path).exists(),
+        "the marker must be KEPT after a failed write-back — the file may already be \
+         partially modified, so a later patrol still needs the attribution",
+    );
+    Ok(())
+}
+
+/// The marker IS removed when no write was ever attempted: every candidate block
+/// is uncorrectable, so the file is untouched and the marker attests to a heal
+/// that never happened. Removing it prevents its unexpiring `pre == manifest`
+/// binding from later authorizing an unrelated digest mismatch.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn heal_in_place_removes_the_marker_when_no_write_is_attempted() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst_footered(dir.path());
+
+    // Wreck the ENTIRE first data block (payload + parity trailer) BEYOND RS
+    // recovery so it scrubs uncorrectable and the heal reaches no write-back at
+    // all, then rebuild the manifest so the pre-heal digest matches and the
+    // marker is written up front.
+    let start = block.offset().0 as usize + Header::MIN_LEN;
+    let end = block.offset().0 as usize + block.size() as usize;
+    let mut bytes = std::fs::read(&sst_path)?;
+    for off in start..end {
+        if let Some(b) = bytes.get_mut(off) {
+            *b ^= 0xFF;
+        }
+    }
+    std::fs::write(&sst_path, &bytes)?;
+    rebuild_manifest_over_current_bytes(dir.path())?;
+
+    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(crate::fs::StdFs));
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+
+    assert_eq!(
+        report.blocks_healed_in_place, 0,
+        "an uncorrectable block heals nothing: {report:?}",
+    );
+    assert!(
+        report.uncorrectable_blocks >= 1,
+        "the uncorrectable block is recorded: {report:?}",
     );
     assert!(
         !heal_attest_path(&sst_path).exists(),
-        "the marker must be removed when no block healed, so it cannot authorize a \
+        "the marker must be removed when no write was attempted, so it cannot authorize a \
          later unrelated mismatch",
     );
     Ok(())

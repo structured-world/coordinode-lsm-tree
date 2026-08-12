@@ -4428,6 +4428,128 @@ fn salvage_drops_a_columnar_block_with_out_of_order_keys() -> crate::Result<()> 
     Ok(())
 }
 
+/// `verify_point_read_reachability` must enforce the GLOBAL internal-key order
+/// for a COLUMNAR table too: it has no in-block key index to probe, but
+/// `column_batch_match_entries` binary-searches the key column assuming it is
+/// sorted. A checksum-consistent columnar block with two swapped keys — which the
+/// other columnar gates (count / zone bounds) tolerate — would otherwise pass
+/// salvage-mode repair and be KEPT, then miss the key or return a stale version.
+#[cfg(feature = "columnar")]
+#[test]
+fn verify_point_read_reachability_rejects_a_reordered_columnar_block() -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::table::block::Header;
+    use crate::table::columnar::{CodecId, ColumnBatch};
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let n = 200u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_data_block_size(256);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar SST is non-empty"
+    );
+
+    // Swap the first two rows' user keys inside the second block's key column
+    // (equal-length keys keep the framing), re-encode, and re-stamp the header
+    // checksum: the block stays checksum-consistent and its rows materialize,
+    // only the ordering invariant is broken.
+    let (block_off, block_size) = {
+        let table = open(source.clone(), &fs)?;
+        let Some(kh) = table.data_block_handles().filter_map(Result::ok).nth(1) else {
+            panic!("source must have at least two data blocks");
+        };
+        (
+            usize::try_from(*kh.as_ref().offset()).unwrap_or(usize::MAX),
+            kh.as_ref().size() as usize,
+        )
+    };
+    let mut bytes = std::fs::read(&source)?;
+    let Some(block) = bytes.get(block_off..block_off + block_size) else {
+        panic!("block range within the file");
+    };
+    let mut cursor = block;
+    let header = Header::decode_from(&mut cursor)?;
+    let header_len = Header::header_len(header.block_type);
+    let Some(payload) = block.get(header_len..header_len + header.data_length as usize) else {
+        panic!("payload range within the block");
+    };
+    let mut batch = ColumnBatch::decode(payload)?;
+    assert!(batch.row_count >= 2, "block holds at least two rows");
+    {
+        let Some(key_col) = batch.columns.first_mut() else {
+            panic!("key column present");
+        };
+        let table_len = (batch.row_count as usize + 1) * 4;
+        let off = |data: &[u8], idx: usize| -> usize {
+            let Some(b) = data.get(idx * 4..idx * 4 + 4) else {
+                panic!("offset {idx} within the frame table");
+            };
+            u32::from_le_bytes(b.try_into().unwrap_or([0; 4])) as usize
+        };
+        let (o0, o1, o2) = (
+            off(&key_col.data, 0),
+            off(&key_col.data, 1),
+            off(&key_col.data, 2),
+        );
+        assert_eq!(o1 - o0, o2 - o1, "adjacent keys are equal-length");
+        let len = o1 - o0;
+        let Some(first) = key_col.data.get(table_len + o0..table_len + o0 + len) else {
+            panic!("first key within the column");
+        };
+        let first = first.to_vec();
+        let Some(second) = key_col.data.get(table_len + o1..table_len + o1 + len) else {
+            panic!("second key within the column");
+        };
+        let second = second.to_vec();
+        let Some(dst0) = key_col.data.get_mut(table_len + o0..table_len + o0 + len) else {
+            panic!("first key range within the column");
+        };
+        dst0.copy_from_slice(&second);
+        let Some(dst1) = key_col.data.get_mut(table_len + o1..table_len + o1 + len) else {
+            panic!("second key range within the column");
+        };
+        dst1.copy_from_slice(&first);
+    }
+    let new_payload = batch.encode(CodecId::Plain)?;
+    let new_header = Header {
+        checksum: crate::Checksum::from_raw(crate::hash::hash128(&new_payload)),
+        ..header
+    };
+    let mut new_block = Vec::with_capacity(header_len + new_payload.len());
+    new_header.encode_into(&mut new_block)?;
+    new_block.extend_from_slice(&new_payload);
+    let Some(target) = bytes.get_mut(block_off..block_off + new_block.len()) else {
+        panic!("block range within the file");
+    };
+    target.copy_from_slice(&new_block);
+    std::fs::write(&source, &bytes)?;
+
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_point_read_reachability() else {
+        panic!("a reordered columnar block must be rejected, not declared clean");
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::InvalidHeader(
+                "columnar entries are out of order (a user key decreased, or an equal key's \
+                 seqno did not strictly decrease) across the walk"
+            )
+        ),
+        "the rejection names the columnar order violation, got {err:?}",
+    );
+    Ok(())
+}
+
 /// A checksum-clean columnar block that decodes as a ZERO-ROW `ColumnBatch`
 /// is malformed input (a real writer never emits an empty block): the writer
 /// primitive emits nothing for it, so counting it as salvaged would let an
