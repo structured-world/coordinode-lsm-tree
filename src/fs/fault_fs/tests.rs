@@ -321,6 +321,36 @@ fn every_hookable_op_faults_when_armed() -> io::Result<()> {
 }
 
 #[test]
+fn hard_link_count_path_accessor_faults_when_armed() -> io::Result<()> {
+    // The path-based `Fs::hard_link_count` accessor (used by the blob-file and
+    // table reclaim probes) must consult the injector, not delegate blind, so an
+    // armed `FaultOp::HardLinkCount` exercises its fail-closed path. MemFs's path
+    // accessor is `Unsupported`; the injected fault must override it with `Other`,
+    // which a blind delegation could not do.
+    let fs = FaultFs::new(MemFs::new());
+    let inj = fs.injector();
+
+    let unarmed = fs
+        .hard_link_count(Path::new("/d/f"))
+        .expect_err("MemFs's path accessor is Unsupported");
+    assert_eq!(unarmed.kind(), ErrorKind::Unsupported);
+
+    inj.arm(FaultRule::new(
+        FaultOp::HardLinkCount,
+        Fault::Error(ErrorKind::Other),
+    ));
+    let armed = fs
+        .hard_link_count(Path::new("/d/f"))
+        .expect_err("an armed FaultOp::HardLinkCount must gate the path accessor");
+    assert_eq!(
+        armed.kind(),
+        ErrorKind::Other,
+        "the injected fault must gate the path-based accessor, not delegate blind",
+    );
+    Ok(())
+}
+
+#[test]
 fn path_filtered_rule_never_matches_a_pathless_op() {
     // A rule with a path filter matches only operations that carry a path; a
     // path-less op (none of the current hook sites produce one, but the match

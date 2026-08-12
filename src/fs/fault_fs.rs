@@ -264,9 +264,12 @@ impl FaultInjector {
         self.rules.lock().push(rule);
     }
 
-    /// Removes all armed rules.
+    /// Removes all armed rules AND the recorded sync observations, resetting the
+    /// injector so a later phase cannot see state (rules or `sync_modes_for`
+    /// entries) recorded before the `clear()`.
     pub fn clear(&self) {
         self.rules.lock().clear();
+        self.sync_log.lock().clear();
     }
 
     /// Records one file-level mode-carrying sync observation (see
@@ -503,6 +506,9 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn hard_link_count(&self, path: &Path) -> io::Result<u64> {
+        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::HardLinkCount, Some(path)) {
+            return Err(fault_error(kind, FaultOp::HardLinkCount));
+        }
         self.inner.hard_link_count(path)
     }
 
