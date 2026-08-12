@@ -209,12 +209,12 @@ impl CrashFs {
     /// The source's durable image comes from one of two places: an entry already
     /// in `durable` (synced or captured this run), or, for a source that is
     /// pre-existing and never touched this run, its on-disk baseline (the same
-    /// "current contents are initially durable" rule [`capture_first_touch`]
+    /// "current contents are initially durable" rule [`Self::capture_first_touch`]
     /// applies). A source that is touched but not durable holds un-synced bytes,
     /// so the copy correctly inherits no durable image and a crash removes it.
     ///
     /// Reads the baseline outside the state lock (mirroring
-    /// [`capture_first_touch`]) so backend I/O never runs under the mutex.
+    /// [`Self::capture_first_touch`]) so backend I/O never runs under the mutex.
     fn track_copy(&self, src: &Path, dst: &Path) -> io::Result<()> {
         let (src_durable, src_touched) = {
             let state = self.state.lock();
@@ -441,6 +441,10 @@ impl FsFile for CrashFile {
 
     fn metadata(&self) -> io::Result<FsMetadata> {
         self.inner.metadata()
+    }
+
+    fn hard_link_count(&self) -> io::Result<u64> {
+        self.inner.hard_link_count()
     }
 
     fn set_len(&self, size: u64) -> io::Result<()> {

@@ -324,6 +324,11 @@ mod run_scanner;
 #[doc(hidden)]
 pub mod sfa;
 
+// Shared on-disk forgery helpers for corruption tests (std: reads/writes
+// real files through std::fs like the tests that consume it).
+#[cfg(all(test, feature = "std"))]
+pub(crate) mod test_forge;
+
 #[doc(hidden)]
 pub mod merge;
 

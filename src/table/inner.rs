@@ -160,6 +160,28 @@ pub struct Inner {
     /// masking, instead of recomputing the cumulative row counts per read.
     pub(crate) delete_block_starts: Option<alloc::sync::Arc<crate::HashMap<u64, u32>>>,
 
+    /// Whether a SALVAGE-MODE open degraded this segment's delete masking: its
+    /// `delete_bitmap` section exists but was unreadable (so the bitmap was
+    /// reset to empty) or readable-but-unpositionable (its zone map was
+    /// unreadable, so it was ignored). Reads then show every row live,
+    /// resurrecting positionally-deleted rows — the salvage walk consults this
+    /// to fail closed unless the caller explicitly opted into that
+    /// degradation. Always `false` on a normal (non-salvage) open, which fails
+    /// instead of degrading.
+    pub(crate) delete_bitmap_degraded: bool,
+
+    /// Whether a SALVAGE-MODE open degraded a REBUILDABLE side section
+    /// (filter / `filter_tli`, seqno bounds, zone map, locator) because its
+    /// block did not decode as the claimed type. Salvage re-derives every such
+    /// section from the recovered entries, so a section that is present but does
+    /// not decode may be a `range_tombstones` / `delete_bitmap` relabeled to a
+    /// rebuildable name and re-roled — which salvage would discard, resurrecting
+    /// the suppressed rows. The salvage walk consults this to fail closed when
+    /// the table exposes no deletion metadata. Purely STRUCTURAL (each decode
+    /// reads its own section's bytes, independent of the data blocks), so a
+    /// corrupt DATA block does not trip it.
+    pub(crate) rebuildable_section_degraded: bool,
+
     /// Retrieval-ribbon locator, loaded on open from the optional `locator`
     /// section. `Some` only when the table was written with a locator policy
     /// enabled; lets a point read resolve a key to its data block in O(1),
@@ -212,6 +234,27 @@ pub struct Inner {
     // pin `Inner` to std, matching `deletion_pause`. The hint set itself is
     // `no_std` + alloc (see `crate::heal_hints`).
     pub(crate) heal_hints: once_cell::race::OnceBox<Arc<crate::heal_hints::HealHints>>,
+
+    /// Serializes concurrent in-place heal passes of THIS table, held by the
+    /// patrol scrub across the WHOLE scan-to-reconcile span. Two overlapping
+    /// heals race in two ways without it: through the link-count probe (one
+    /// detaches the live path onto a private copy, leaving the other's
+    /// already-open handle on the OLD inode — whose count then reads 1 even
+    /// though only checkpoint links remain, so that heal would write through
+    /// the snapshot), and through the digest reconciliation (A computes a
+    /// digest, B heals a fresh fault and installs its own, A installs the
+    /// stale one).
+    // std+page_ecc: only the heal-mode patrol scrub takes it; `parking_lot`
+    // (not `spin`) because a heal pass is a long blocking operation.
+    //
+    // Held behind a shared `Arc` inside an `OnceBox` so it serializes by STABLE
+    // table identity, not by this replaceable `Inner`: tight-space compaction
+    // re-opens a table as a DISTINCT `Inner` (a different physical view of the
+    // same file), and `reopen_restricted` propagates this lock into it so two
+    // patrols cannot heal + reconcile the same SST concurrently. Lazily created
+    // on first heal for an ordinary table (the tree does not install it).
+    #[cfg(all(feature = "std", feature = "page_ecc"))]
+    pub(crate) heal_lock: once_cell::race::OnceBox<Arc<parking_lot::Mutex<()>>>,
 }
 
 impl Inner {
@@ -228,6 +271,14 @@ impl Drop for Inner {
 
         if self.is_deleted.load(core::sync::atomic::Ordering::Acquire) {
             log::trace!("Cleanup deleted table {global_id:?} at {:?}", self.path);
+
+            // Reclaim any pending `.heal-attest` sidecar: a retired table can
+            // never be reconciled, so its attestation is dead weight. Done here
+            // (before the deferred / background unlink paths return) so every
+            // deletion route reclaims it. Best-effort: a missing sidecar (the
+            // common case) is a no-op, and the recovery scan sweeps any straggler.
+            #[cfg(feature = "std")]
+            crate::scrub::heal_attest::remove(&*self.fs, &self.path);
 
             // Move the accessor and block index out so all file handles
             // (including clones held by the block index) are closed before

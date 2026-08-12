@@ -541,7 +541,7 @@ fn block_layout_section_roundtrips_for_large_zstd_blocks() {
         "large multi-inner-block table must carry a block_layout section",
     );
     assert!(
-        table.block_layout.len() >= 1,
+        !table.block_layout.is_empty(),
         "at least one data block must have a recorded inner-block layout",
     );
     // Every recorded entry must have strictly increasing cumulative ends whose
@@ -749,6 +749,251 @@ fn reopen_restricted_yields_a_distinct_clamped_view() -> crate::Result<()> {
                 ],
             );
 
+            Ok(())
+        },
+        None,
+        Some(|x| x),
+    )
+}
+
+/// `reopen_restricted` creates a DISTINCT `Inner` for the same table, so it must
+/// PROPAGATE the tree-installed shared gates onto it: the checkpoint deletion
+/// pause and the heal lock. Without them a restricted view skips the checkpoint
+/// mutation window (a checkpoint could link healed bytes under a stale digest)
+/// and serializes heals against a different lock (two patrols could heal +
+/// reconcile the same SST concurrently and leave a clean file mismatched with
+/// the manifest).
+#[cfg(all(feature = "std", feature = "page_ecc"))]
+#[test]
+fn reopen_restricted_propagates_the_shared_heal_and_deletion_gates() -> crate::Result<()> {
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"c", b"v", 0, crate::ValueType::Value),
+    ];
+
+    test_with_table(
+        &items,
+        |table| {
+            let pause = crate::deletion_pause::DeletionPause::new_shared();
+            table.install_deletion_pause(std::sync::Arc::clone(&pause));
+            let lock = table.heal_lock_arc();
+
+            let restricted = table.reopen_restricted(crate::UserKey::from(&b"b"[..]))?;
+
+            let restricted_pause = restricted
+                .0
+                .deletion_pause
+                .get()
+                .expect("the deletion pause is propagated");
+            assert!(
+                std::sync::Arc::ptr_eq(restricted_pause, &pause),
+                "the restricted view shares the ORIGINAL deletion pause",
+            );
+            assert!(
+                std::sync::Arc::ptr_eq(&restricted.heal_lock_arc(), &lock),
+                "the restricted view shares the ORIGINAL heal lock",
+            );
+            Ok(())
+        },
+        None,
+        Some(|x| x),
+    )
+}
+
+/// `raw_block_parity_delta` must reject a frame whose on-disk trailer length
+/// differs from the freshly computed parity: returning `Ok(Some(fresh))` for
+/// a short trailer would make the in-place heal write MORE bytes than the
+/// frame holds at that offset — past the block's end, into the next block's
+/// bytes — violating the size-preserving heal contract. A length mismatch is
+/// an unverifiable frame, not a healable one.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn raw_block_parity_delta_rejects_a_trailer_length_mismatch() -> crate::Result<()> {
+    use crate::coding::Decode;
+
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
+    ];
+
+    test_with_table(
+        &items,
+        |table| {
+            let keyed = table
+                .data_block_handles()
+                .next()
+                .expect("a data block")
+                .expect("index entry decodes");
+            let handle = keyed.as_ref();
+            let file = std::fs::read(&*table.path)?;
+            let start = usize::try_from(handle.offset().0).unwrap_or(usize::MAX);
+            let Some(raw) = file.get(start..start + handle.size() as usize) else {
+                panic!("block frame within the file");
+            };
+            let header = crate::table::block::Header::decode_from(&mut &raw[..])?;
+
+            // Sanity: the intact frame's trailer verifies (no delta).
+            assert!(
+                matches!(table.raw_block_parity_delta(raw, &header), Ok(None)),
+                "the intact frame's parity trailer matches",
+            );
+
+            // A frame one byte SHORT of its trailer must be unverifiable —
+            // not a mismatch whose full-length rebuild the heal would write
+            // past the frame's end.
+            let Some(short) = raw.get(..raw.len() - 1) else {
+                panic!("frame is non-empty");
+            };
+            assert!(
+                table.raw_block_parity_delta(short, &header).is_err(),
+                "a trailer-length mismatch must be unverifiable, not healable",
+            );
+
+            Ok(())
+        },
+        None,
+        Some(|w: Writer| {
+            let Ok(params) = crate::table::block::EccParams::try_new(8, 2) else {
+                panic!("RS(8,2) params are valid");
+            };
+            w.use_ecc(Some(params))
+        }),
+    )
+}
+
+/// `scrub_block` must reject a block whose decoded ROLE differs from the
+/// caller's expected type, mirroring `load_block`'s swap-defence: an index
+/// entry misdirected at another (checksum-valid) block of a different role
+/// passes its payload checksum, so without the role check the scrub reports
+/// "clean" for a handle that no longer points at a data block at all.
+#[test]
+fn scrub_block_rejects_a_block_of_the_wrong_role() -> crate::Result<()> {
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
+    ];
+
+    test_with_table(
+        &items,
+        |table| {
+            // The TLI block is a valid, checksum-clean block of role Index —
+            // exactly what a misdirected data-block handle would land on.
+            let outcome = crate::table::util::scrub_block(
+                table.global_id(),
+                &table.path,
+                &table.file_accessor,
+                &table.regions.tli,
+                crate::table::block::BlockType::Data,
+                table.metadata.data_block_compression,
+                table.encryption.as_deref(),
+                table.metadata.ecc_params,
+                #[cfg(zstd_any)]
+                table.zstd_dictionary.as_deref(),
+                None,
+                #[cfg(feature = "metrics")]
+                &table.metrics,
+            );
+            assert!(
+                matches!(outcome, Err(crate::Error::InvalidTag(("BlockType", _))),),
+                "a checksum-clean block of the WRONG role must fail the \
+                 role check specifically (not scrub clean, and not fail for \
+                 an unrelated reason): {outcome:?}",
+            );
+            Ok(())
+        },
+        None,
+        Some(|x| x),
+    )
+}
+
+/// A frame read through an OVER-SIZED (forged) index handle decodes cleanly —
+/// the payload checksum covers only `data_length` bytes, and the trailing
+/// garbage classifies as an unrecognized ECC trailer (`EccStatus::Unrecognized`)
+/// — but its raw bytes must NOT be marked verbatim-copy-safe: the salvage
+/// writer rejects the overlong frame against the header's on-disk size and the
+/// walk would drop a block whose payload actually verified. The load must fall
+/// back to the re-encode path (`verbatim = None`) instead.
+#[test]
+fn salvage_load_block_reencodes_an_over_read_frame() -> crate::Result<()> {
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
+    ];
+
+    test_with_table(
+        &items,
+        |table| {
+            let keyed = table
+                .data_block_handles()
+                .next()
+                .expect("a data block")
+                .expect("index entry decodes");
+            let handle = keyed.as_ref();
+
+            // Sanity: through the TRUE handle the block is verbatim-copy-safe.
+            let clean = table.salvage_load_block(handle, crate::table::block::BlockType::Data)?;
+            assert!(clean.verbatim.is_some(), "a clean read is verbatim-safe");
+
+            // Forged handle: 8 bytes of the following section leak into the
+            // frame (the index section follows the data blocks, so the file
+            // has bytes there).
+            let over = crate::table::BlockHandle::new(handle.offset(), handle.size() + 8);
+            let sb = table.salvage_load_block(&over, crate::table::block::BlockType::Data)?;
+            assert!(
+                sb.verbatim.is_none(),
+                "an over-read frame with an opaque trailer must fall back to \
+                 the re-encode path, not offer its overlong raw bytes for a \
+                 verbatim copy",
+            );
+
+            Ok(())
+        },
+        None,
+        Some(|x| x),
+    )
+}
+
+/// `reopen_restricted` must carry a REFRESHED full-file checksum (set by an
+/// in-place heal after recovery) into the reopened view: recovering the fresh
+/// `Inner` with the stale pre-heal digest would reinstall that stale digest
+/// into the manifest when a tight-space compaction swaps the restricted view
+/// in, making later integrity scans flag the healed file as corrupt again.
+#[test]
+fn reopen_restricted_carries_the_live_suffix_digest() -> crate::Result<()> {
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
+    ];
+
+    test_with_table(
+        &items,
+        |table| {
+            // The restricted view's manifest digest must cover only its LIVE
+            // SUFFIX `[punch_offset, end)`, not the whole file: the prefix is
+            // hole-punched after install, so a whole-file digest would never
+            // match the punched file. It is computed fresh from the current
+            // bytes (so any heal is folded in).
+            let restricted = table.reopen_restricted(crate::UserKey::from(&b"b"[..]))?;
+            let punch = table.punch_offset_for(b"b")?;
+            let expected = crate::Checksum::from_raw(crate::repair::compute_table_checksum_from(
+                &crate::fs::StdFs,
+                &table.path,
+                punch,
+            )?);
+            assert_eq!(
+                restricted.checksum(),
+                expected,
+                "the restricted view reports its live-suffix digest",
+            );
+            if punch > 0 {
+                assert_ne!(
+                    restricted.checksum(),
+                    table.checksum(),
+                    "a non-zero punch offset makes the suffix digest differ from \
+                     the whole-file digest",
+                );
+            }
             Ok(())
         },
         None,
@@ -2805,6 +3050,444 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
     Ok(())
 }
 
+/// Writes a small-block ECC SST of `n` entries under `scheme` through `fs`,
+/// returning its checksum. Shared by the in-place heal tests.
+#[cfg(feature = "page_ecc")]
+fn build_ecc_sst_for_heal(
+    file: &std::path::Path,
+    fs: Arc<dyn crate::fs::Fs>,
+    scheme: crate::table::block::EccParams,
+    n: u32,
+) -> crate::Checksum {
+    #[expect(
+        clippy::expect_used,
+        reason = "test setup; a panic is the failure signal"
+    )]
+    let mut writer = Writer::new(file.to_path_buf(), 0, 0, fs)
+        .expect("open writer")
+        .use_data_block_size(256)
+        .use_ecc(Some(scheme));
+    for i in 0..n {
+        #[expect(clippy::expect_used, reason = "test setup")]
+        writer
+            .write(InternalValue::from_components(
+                format!("key{i:05}").into_bytes(),
+                b"value-payload-bytes".to_vec(),
+                u64::from(i) + 1,
+                crate::ValueType::Value,
+            ))
+            .expect("write");
+    }
+    #[expect(clippy::expect_used, reason = "finish() returns Some after writes")]
+    let (_, checksum) = writer.finish().expect("finish").expect("non-empty");
+    checksum
+}
+
+/// Recovers a `Table` for `file` through `fs` with fresh caches.
+#[cfg(feature = "page_ecc")]
+#[expect(
+    clippy::expect_used,
+    reason = "test setup; a panic is the failure signal"
+)]
+fn recover_table_on(
+    file: &std::path::Path,
+    checksum: crate::Checksum,
+    fs: Arc<dyn crate::fs::Fs>,
+) -> Table {
+    Table::recover(
+        file.to_path_buf(),
+        checksum,
+        0,
+        0,
+        0,
+        Arc::new(crate::Cache::with_capacity_bytes(10_000_000)),
+        Some(Arc::new(crate::descriptor_table::DescriptorTable::new(10))),
+        fs,
+        false,
+        false,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        crate::comparator::default_comparator(),
+        #[cfg(feature = "metrics")]
+        Arc::new(crate::metrics::Metrics::default()),
+    )
+    .expect("recover table")
+}
+
+/// The first data block's file offset in `table`.
+#[cfg(feature = "page_ecc")]
+fn first_data_block_offset(table: &Table) -> u64 {
+    use crate::table::block_index::BlockIndex as _;
+    let Some(keyed) = table.block_index.iter().find_map(Result::ok) else {
+        panic!("a non-empty SST has at least one data block");
+    };
+    keyed.offset().0
+}
+
+/// A single-bit fault in a Page-ECC data block is healed in place AND the file
+/// is restored byte-for-byte (RS / SEC-DED reconstruct the original payload, the
+/// parity is recomputed deterministically). Exercises the SEC-DED branch of the
+/// heal primitive.
+#[cfg(feature = "page_ecc")]
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "in-file block offset fits usize; only narrows on 32-bit targets"
+)]
+fn heal_data_blocks_in_place_restores_a_secded_block_byte_for_byte() -> crate::Result<()> {
+    use crate::table::block::{EccParams, Header};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(crate::fs::StdFs);
+    let checksum = build_ecc_sst_for_heal(&file, Arc::clone(&fs), EccParams::Secded, 200);
+
+    let original = std::fs::read(&file)?;
+    let first_off =
+        first_data_block_offset(&recover_table_on(&file, checksum, Arc::clone(&fs))) as usize;
+
+    // Flip a single bit in the first data block's payload — SEC-DED corrects one
+    // bit flip per word.
+    let pos = first_off + Header::MIN_LEN + 3;
+    let mut bytes = original.clone();
+    if let Some(b) = bytes.get_mut(pos) {
+        *b ^= 0x01;
+    }
+    std::fs::write(&file, &bytes)?;
+    assert_ne!(bytes, original, "the seeded fault changed the file");
+
+    let table = recover_table_on(&file, checksum, Arc::clone(&fs));
+    let (report, attributable) =
+        table.heal_data_blocks_in_place(crate::fs::SyncMode::Full, table.checksum());
+    assert_eq!(report.blocks_healed_in_place, 1, "{report:?}");
+    assert_eq!(report.uncorrectable_blocks, 0, "{report:?}");
+    // The manifest digest is the HEALTHY file's, but the seeded fault changed
+    // the bytes before the heal ran: the pre-heal digest cannot match, so the
+    // mismatch is NOT attributable to this pass's writes.
+    assert!(
+        !attributable,
+        "a pre-heal digest differing from the manifest must not attribute",
+    );
+
+    let healed = std::fs::read(&file)?;
+    assert_eq!(
+        healed, original,
+        "SEC-DED in-place heal restores the block byte-for-byte",
+    );
+    Ok(())
+}
+
+/// The heal reports ATTRIBUTION (`true`) when the file's digest right before
+/// its first write-back matches the manifest digest: parity-trailer rot with
+/// the manifest digest recomputed over the ROTTED bytes (the shape a manifest
+/// rebuild leaves behind) makes the post-heal mismatch provably the heal's
+/// own work — the flag that lets the digest reconciliation restamp tables
+/// whose authoritative content (deletion metadata, footer-less values) has
+/// no semantic cross-check.
+#[cfg(feature = "page_ecc")]
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "in-file block offset fits usize; only narrows on 32-bit targets"
+)]
+fn heal_data_blocks_in_place_attributes_a_matching_pre_heal_digest() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::table::block::{EccParams, Header};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(crate::fs::StdFs);
+    let healthy = build_ecc_sst_for_heal(&file, Arc::clone(&fs), EccParams::RS_4_2, 200);
+    let first_off =
+        first_data_block_offset(&recover_table_on(&file, healthy, Arc::clone(&fs))) as usize;
+
+    // Rot one parity-trailer byte of the first data block: the payload stays
+    // checksum-clean, only the heal's trailer verification notices.
+    let mut bytes = std::fs::read(&file)?;
+    let Some(mut cursor) = bytes.get(first_off..) else {
+        panic!("first data block within the file");
+    };
+    let header = Header::decode_from(&mut cursor)?;
+    let trailer_pos =
+        first_off + Header::header_len(header.block_type) + header.data_length as usize;
+    let Some(slot) = bytes.get_mut(trailer_pos) else {
+        panic!("parity trailer within the file");
+    };
+    *slot ^= 0xFF;
+    std::fs::write(&file, &bytes)?;
+
+    // The manifest digest covers the ROTTED bytes (a manifest rebuild admits
+    // the degraded-but-readable file as-is), so the pre-heal probe matches.
+    let rotted = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &file)?);
+    let table = recover_table_on(&file, rotted, Arc::clone(&fs));
+    let (report, attributable) =
+        table.heal_data_blocks_in_place(crate::fs::SyncMode::Full, table.checksum());
+    assert_eq!(
+        report.blocks_healed_in_place, 1,
+        "the rotted trailer is rebuilt in place: {report:?}",
+    );
+    assert_eq!(report.uncorrectable_blocks, 0, "{report:?}");
+    assert!(
+        attributable,
+        "a pre-heal digest matching the manifest attributes the mismatch to \
+         this pass's own verified corrections",
+    );
+    Ok(())
+}
+
+/// The streaming heal-digest prediction must be byte-identical to materializing
+/// every correction and splicing it through
+/// `compute_table_checksum_with_overrides`. The streaming path exists to bound
+/// heap on broadly damaged tables (it never holds more than one corrected frame
+/// at a time); this guards that the memory win did not change the predicted
+/// digest, which the crash-recovery marker binds. The OOM failure mode itself
+/// is not directly testable (it needs a multi-gigabyte damaged table).
+#[cfg(feature = "page_ecc")]
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "in-file block offset fits usize; only narrows on 32-bit targets"
+)]
+fn predict_heal_streams_the_same_digest_as_materializing_corrections() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::table::block::{EccParams, Header};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let healthy = build_ecc_sst_for_heal(&file, Arc::clone(&fs), EccParams::RS_4_2, 200);
+    let first_off =
+        first_data_block_offset(&recover_table_on(&file, healthy, Arc::clone(&fs))) as usize;
+
+    // Rot the first block's parity trailer → exactly one correction to splice.
+    let mut bytes = std::fs::read(&file)?;
+    let Some(mut cursor) = bytes.get(first_off..) else {
+        panic!("first data block within the file");
+    };
+    let header = Header::decode_from(&mut cursor)?;
+    let trailer_pos =
+        first_off + Header::header_len(header.block_type) + header.data_length as usize;
+    let Some(slot) = bytes.get_mut(trailer_pos) else {
+        panic!("parity trailer within the file");
+    };
+    *slot ^= 0xFF;
+    std::fs::write(&file, &bytes)?;
+
+    let rotted = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &file)?);
+    let table = recover_table_on(&file, rotted, Arc::clone(&fs));
+
+    let transform = crate::table::util::build_block_transform(
+        table.metadata.data_block_compression,
+        table.encryption.as_deref(),
+        table.metadata.ecc_params,
+        #[cfg(zstd_any)]
+        table.zstd_dictionary.as_deref(),
+    )?;
+    let fh = fs.open(&file, &crate::fs::FsOpenOptions::new().read(true))?;
+
+    // Streamed prediction (one frame of heap at a time).
+    let (streamed, offsets) = table.predict_heal_digest_and_offsets(fh.as_ref(), &transform, 0)?;
+
+    // Materialized reference: gather every correction and splice them all at once.
+    let mut corrections: Vec<(u64, Vec<u8>)> = Vec::new();
+    for entry in table.block_index.iter() {
+        let keyed = entry?;
+        if let Some(c) = table.heal_correction_for_block(fh.as_ref(), &keyed, &transform)? {
+            corrections.push(c);
+        }
+    }
+    let materialized =
+        crate::repair::compute_table_checksum_with_overrides(&*fs, &file, 0, &corrections)?;
+
+    assert_eq!(
+        streamed, materialized,
+        "the streamed digest must equal the materialized-overrides digest",
+    );
+    assert_eq!(
+        offsets.len(),
+        corrections.len(),
+        "one predicted offset per correction: {corrections:?}",
+    );
+    for (off, _) in &corrections {
+        assert!(
+            offsets.contains(off),
+            "every correction offset ({off}) is in the predicted set",
+        );
+    }
+    // Sanity: the rot did produce exactly the one trailer correction.
+    assert_eq!(corrections.len(), 1, "exactly one block was rotted");
+    Ok(())
+}
+
+/// When the corrected block's write-back fails (a failing `Fs`), the heal does
+/// not count it as healed and records it as an uncorrectable finding so it is
+/// left for block salvage rather than silently lost.
+#[cfg(feature = "page_ecc")]
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "in-file block offset fits usize; only narrows on 32-bit targets"
+)]
+fn heal_data_blocks_in_place_reports_a_block_whose_write_back_fails() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+    use crate::io::ErrorKind;
+    use crate::table::block::{EccParams, Header};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(fault);
+
+    let checksum = build_ecc_sst_for_heal(&file, Arc::clone(&fs), EccParams::RS_4_2, 200);
+
+    let first_off =
+        first_data_block_offset(&recover_table_on(&file, checksum, Arc::clone(&fs))) as usize;
+
+    // RS-recoverable single-byte fault: the read recovers it (so heal returns a
+    // corrected frame), then the write-back is what fails.
+    let pos = first_off + Header::MIN_LEN + 3;
+    let mut bytes = std::fs::read(&file)?;
+    if let Some(b) = bytes.get_mut(pos) {
+        *b ^= 0x80;
+    }
+    std::fs::write(&file, &bytes)?;
+
+    // Fail every write through the fs: the heal reads + recovers the block, then
+    // its write-back errors.
+    injector.arm(FaultRule::new(
+        FaultOp::Write,
+        Fault::Error(ErrorKind::Other),
+    ));
+
+    let table = recover_table_on(&file, checksum, fs);
+    let (report, _) = table.heal_data_blocks_in_place(crate::fs::SyncMode::Full, table.checksum());
+    assert_eq!(
+        report.blocks_healed_in_place, 0,
+        "a failed write-back heals nothing: {report:?}",
+    );
+    assert!(
+        report.uncorrectable_blocks >= 1,
+        "the failed write-back is reported, not silently dropped: {report:?}",
+    );
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, crate::scrub::ScrubError::UncorrectableBlock { .. })),
+        "the finding is an UncorrectableBlock: {report:?}",
+    );
+    Ok(())
+}
+
+/// A non-ECC SST carries no parity, so an in-place heal finds nothing to
+/// reconstruct: every block reads back as "no recognized parity", nothing is
+/// written, and no block is reported as healed or uncorrectable.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn heal_data_blocks_in_place_is_a_noop_on_a_non_ecc_sst() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(crate::fs::StdFs);
+    // No ECC (no `use_ecc`): blocks carry no parity trailer.
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(256);
+    for i in 0..200u32 {
+        writer.write(InternalValue::from_components(
+            format!("key{i:05}").into_bytes(),
+            b"value-payload-bytes".to_vec(),
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let Some((_, checksum)) = writer.finish()? else {
+        panic!("non-empty SST");
+    };
+
+    let table = recover_table_on(&file, checksum, fs);
+    let (report, _) = table.heal_data_blocks_in_place(crate::fs::SyncMode::Full, table.checksum());
+    assert!(
+        report.blocks_scanned > 0,
+        "the walk inspected blocks: {report:?}"
+    );
+    assert_eq!(
+        report.blocks_healed_in_place, 0,
+        "no parity means nothing to heal: {report:?}",
+    );
+    assert_eq!(report.uncorrectable_blocks, 0, "{report:?}");
+    assert!(report.errors.is_empty(), "{report:?}");
+    Ok(())
+}
+
+/// If the read+write handle for the heal cannot even be opened (a read-only
+/// replica, restrictive permissions, a failing `Fs`), the pass must NOT return
+/// a silent healthy report with zero blocks scanned: it records the failed
+/// open AND falls back to the read-only scrub, so the table's integrity is
+/// still checked and real corruption still surfaces.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn heal_data_blocks_in_place_reports_when_the_file_cannot_be_opened() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+    use crate::io::ErrorKind;
+    use crate::table::block::{EccParams, Header};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(fault);
+
+    let checksum = build_ecc_sst_for_heal(&file, Arc::clone(&fs), EccParams::RS_4_2, 200);
+    let table = recover_table_on(&file, checksum, Arc::clone(&fs));
+
+    // Wreck the first data block's whole payload (header intact, far beyond
+    // the RS(4,2) budget) so the read-only fallback has real corruption to
+    // find and report.
+    {
+        use crate::table::block_index::BlockIndex as _;
+        let Some(keyed) = table.block_index.iter().find_map(Result::ok) else {
+            panic!("the SST has at least one data block");
+        };
+        let base = usize::try_from(keyed.offset().0).unwrap_or(usize::MAX);
+        let mut bytes = std::fs::read(&file)?;
+        let Some(payload) = bytes.get_mut(base + Header::MIN_LEN..base + keyed.size() as usize)
+        else {
+            panic!("block payload range within the file");
+        };
+        for b in payload {
+            *b ^= 0xFF;
+        }
+        std::fs::write(&file, &bytes)?;
+    }
+
+    // Fail exactly the heal's read+write open (the first open after arming);
+    // the read-only fallback may reopen freely afterwards.
+    injector.arm(FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other)).once());
+
+    let (report, _) = table.heal_data_blocks_in_place(crate::fs::SyncMode::Full, table.checksum());
+    assert!(
+        report.blocks_scanned >= 1,
+        "the read-only fallback still scans the table: {report:?}",
+    );
+    assert_eq!(
+        report.blocks_healed_in_place, 0,
+        "nothing is healed without a writable file: {report:?}",
+    );
+    assert!(
+        report.uncorrectable_blocks >= 1,
+        "the fallback scrub reports the seeded corruption: {report:?}",
+    );
+    assert!(!report.is_ok(), "corruption fails the pass: {report:?}");
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, crate::scrub::ScrubError::BlockIndexUnreadable { .. })),
+        "the failed read+write open is still reported: {report:?}",
+    );
+    Ok(())
+}
+
 /// End-to-end corruption test: tamper on-disk `seqno#kv_max` so it exceeds
 /// `seqno#max`, then verify that `ParsedMeta::load_with_handle` rejects the
 /// file with an `InvalidData` error.
@@ -4357,6 +5040,79 @@ fn write_columnar_batch_accounts_tombstones_seqno_bounds_and_restart_locator() -
     assert!(
         table.get(b"k0", SeqNo::MAX, hash64(b"k0"))?.is_some(),
         "the live row reads back",
+    );
+    Ok(())
+}
+
+/// `verify_locator` must reject a locator re-stamped to resolve a key to a
+/// block OTHER than the one holding its newest version: every byte-level
+/// check reads clean, but `point_read_inner` trusts the answer and can return
+/// a stale value from the mispointed block without falling back to the index.
+/// An intact locator passes; a redirected one fails.
+#[test]
+fn verify_locator_rejects_a_redirected_key_mapping() -> crate::Result<()> {
+    use crate::config::{LocatorPolicyEntry, LocatorPrecision};
+    use crate::table::locator::{LocatorSpec, build_locator_section};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("t");
+
+    // Small blocks so several data blocks (several block_ids) exist.
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_data_block_size(128)
+        .use_locator(LocatorPolicyEntry::Enabled {
+            precision: LocatorPrecision::Block,
+            block_id_bits: None,
+            slot_bits: None,
+        });
+    for i in 0u64..200 {
+        writer.write(crate::InternalValue::from_components(
+            format!("key-{i:04}").into_bytes(),
+            format!("v{i:04}").into_bytes(),
+            i + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    // Intact locator verifies clean.
+    table.verify_locator()?;
+
+    // Rebuild the SAME ribbon (same key set, same widths → byte-identical
+    // length) but redirect the FIRST key to a DIFFERENT block ordinal.
+    let mut triples: Vec<(u64, u64, u64)> = Vec::new();
+    let block_count = table.block_index.iter().count() as u64;
+    assert!(block_count >= 2, "need multiple blocks to redirect between");
+    let mut seen = std::collections::HashSet::new();
+    for (ordinal, handle) in table.block_index.iter().enumerate() {
+        let handle = handle?;
+        let block_handle = crate::table::BlockHandle::new(handle.offset(), handle.size());
+        let entries = table.decode_block_entries(&block_handle)?;
+        for e in entries {
+            let uk = e.key.user_key.to_vec();
+            if seen.insert(uk.clone()) {
+                triples.push((crate::hash::hash64(&uk), ordinal as u64, 0));
+            }
+        }
+    }
+    // Redirect the first key to a different existing block.
+    let orig = triples[0].1;
+    triples[0].1 = if orig == 0 { block_count - 1 } else { 0 };
+    let spec = LocatorSpec {
+        precision: LocatorPrecision::Block,
+        block_id_bits: None,
+        slot_bits: None,
+    };
+    let forged = build_locator_section(&triples, spec).expect("forged section builds");
+
+    crate::test_forge::forge_replace_section_payload(&file, b"locator", &forged, None)?;
+
+    let table = recover_test_table(&file, checksum)?;
+    let result = table.verify_locator();
+    assert!(
+        matches!(result, Err(crate::Error::InvalidHeader(_))),
+        "a redirected locator must be rejected, got {result:?}",
     );
     Ok(())
 }

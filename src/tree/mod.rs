@@ -413,6 +413,81 @@ impl AbstractTree for Tree {
         self.version_history.read().latest_version().version
     }
 
+    #[cfg(feature = "std")]
+    fn refresh_table_checksum(
+        &self,
+        table_id: TableId,
+        checksum: crate::checksum::Checksum,
+        expected_restriction: Option<&crate::UserKey>,
+    ) -> crate::Result<bool> {
+        // Same lock order as flush / compaction version installs: compaction
+        // state first, then the version history write lock. But the caller (the
+        // patrol reconcile) holds this table's HEAL LOCK across this call, and a
+        // concurrent tight-space compaction acquires that heal lock WHILE holding
+        // `compaction_state`. Blocking on `compaction_state` here would invert the
+        // order (heal_lock -> compaction_state on this path vs
+        // compaction_state -> heal_lock on the compaction path) and deadlock
+        // permanently. `try_lock` instead: a failed acquire means a compaction is
+        // mid-install, so skip this refresh (`Ok(false)`) — the caller keeps the
+        // attestation and the next patrol retries once the compaction releases the
+        // state. Correctness is unchanged: the manifest digest is simply left for
+        // the next pass, exactly as the restriction-mismatch no-op below does.
+        let Some(mut _compaction_state) = self.compaction_state.try_lock() else {
+            return Ok(false);
+        };
+        let mut version_lock = self.version_history.write();
+
+        // Under the install lock, resolve the CURRENT view of this table and
+        // reject the refresh if either it is gone (compacted away — nothing to
+        // refresh) or its restriction no longer matches the one `checksum` was
+        // computed for. A tight-space compaction can swap the captured view for a
+        // restricted same-id view (punching its prefix) between the caller's read
+        // and this lock; installing the caller's digest against a different
+        // restriction would record one the punched file can never match. Skipping
+        // leaves the current view's own (compaction-installed) digest in place for
+        // the next patrol to reconcile.
+        let restriction_matches = version_lock
+            .latest_version()
+            .version
+            .iter_tables()
+            .find(|t| t.id() == table_id)
+            .is_some_and(|t| t.restrict_lower_bound() == expected_restriction);
+        if !restriction_matches {
+            // No-op: the manifest digest is unchanged, so the caller must keep the
+            // attestation for the next patrol.
+            return Ok(false);
+        }
+
+        version_lock
+            .upgrade_version(
+                &self.config.path,
+                |current| {
+                    let mut copy = current.clone();
+                    if let Some(next) = copy
+                        .version
+                        .with_refreshed_table_checksum(table_id, checksum)
+                    {
+                        copy.version = next;
+                    }
+                    Ok(copy)
+                },
+                &self.config.seqno,
+                &self.config.visible_seqno,
+                &*self.config.fs,
+                self.0.runtime_config.load_full(),
+                self.0.config.encryption.clone(),
+            )
+            .map(|()| true)
+    }
+
+    fn sync_mode(&self) -> crate::fs::SyncMode {
+        self.config.sync_mode
+    }
+
+    fn prefix_extractor(&self) -> Option<alloc::sync::Arc<dyn crate::prefix::PrefixExtractor>> {
+        self.config.prefix_extractor.clone()
+    }
+
     fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
         // One version snapshot reused for the footprint and the full-compaction
         // estimate below: a second `current_version()` could race a concurrent
@@ -3246,7 +3321,9 @@ impl Tree {
             log::error!(
                 "It looks like you are trying to open a V1 database - the database needs a manual migration, however a migration tool is not provided, as V1 is extremely outdated."
             );
-            return Err(crate::Error::InvalidVersion(FormatVersion::V1.into()));
+            // Literal discriminant: V1 is a retired format and FormatVersion
+            // carries no legacy variants (V5-only contract).
+            return Err(crate::Error::InvalidVersion(1));
         }
 
         // Decide between recovery and fresh creation atomically by attempting
@@ -3793,8 +3870,14 @@ impl Tree {
             )?;
             let manifest = Manifest::decode_from(&mut archive_reader)?;
 
-            if !matches!(manifest.version, FormatVersion::V5) {
-                return Err(crate::Error::InvalidVersion(manifest.version.into()));
+            // V5 is the only variant `FormatVersion` can decode to (the
+            // engine reads exactly one on-disk format, no legacy paths), so
+            // a pre-V5 manifest already failed decode_from with
+            // InvalidVersion. This match stays as the explicit gate the
+            // format contract documents — and as the compile-time hook that
+            // forces a review of the open path when a new variant is added.
+            match manifest.version {
+                FormatVersion::V5 => {}
             }
 
             let supplied_name = config.comparator.name();
@@ -4026,6 +4109,12 @@ impl Tree {
 
         let cnt = table_map.len();
 
+        // Immutable snapshot of every table id the manifest knows. `table_map`
+        // is drained as tables are recovered below, so it cannot answer "is this
+        // id live?" order-independently; this set can. Used to sweep an orphaned
+        // `.heal-attest` sidecar whose SST was retired.
+        let manifest_ids: crate::HashSet<TableId> = table_map.keys().copied().collect();
+
         log::debug!("Recovering {cnt} tables from {}", tree_path.display());
 
         let progress_mod = match cnt {
@@ -4079,6 +4168,75 @@ impl Tree {
                         "Skipping unexpected directory in tables folder: {}",
                         table_file_path.display()
                     );
+                    continue;
+                }
+
+                // An in-place heal detaches a hard-linked SST through a
+                // `{id}.healtmp-{n}` copy that is renamed over the live path;
+                // a hard crash between its creation and the rename leaves the
+                // artifact behind. It is never referenced by any manifest, so
+                // sweep it instead of failing the id parse below. Only the
+                // EXACT artifact shape (numeric id, numeric sequence) is owned
+                // cleanup state — a foreign name that merely contains
+                // `.healtmp` (an operator backup like `0.healtmp.backup`) must
+                // fall through to the id parse and fail recovery unharmed,
+                // never be deleted.
+                if let Some((id_part, seq_part)) = table_file_name.split_once(".healtmp-")
+                    && id_part.parse::<TableId>().is_ok()
+                    && seq_part.parse::<u64>().is_ok()
+                {
+                    log::warn!(
+                        "Removing abandoned heal copy: {}",
+                        table_file_path.display()
+                    );
+                    Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                    continue;
+                }
+
+                // A `{id}.heal-attest.tmp` is a crashed sidecar-publish temp: the
+                // attestation was written + synced to this temp for an atomic
+                // rename onto `{id}.heal-attest`, but the process died before the
+                // rename. It is disposable: either the live sidecar it would have
+                // replaced still bridges the crash window, or the heal is re-run,
+                // so sweep it like the healtmp copies. Checked BEFORE the
+                // `.heal-attest` skip because that suffix is a prefix of this one.
+                if table_file_name
+                    .strip_suffix(".heal-attest.tmp")
+                    .is_some_and(|id| id.parse::<TableId>().is_ok())
+                {
+                    log::warn!(
+                        "Removing abandoned heal-attest temp: {}",
+                        table_file_path.display()
+                    );
+                    Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                    continue;
+                }
+
+                // A `{id}.heal-attest` sidecar records that an in-place heal
+                // corrected `{id}` but its manifest digest refresh may not have
+                // landed; the next scrub consumes it to reconcile. It is never a
+                // table file, so never parse it as an id. Only the EXACT shape
+                // (numeric id + exact suffix) is owned; a foreign name merely
+                // containing `.heal-attest` falls through to the id parse and
+                // fails recovery unharmed.
+                if let Some(attest_id) = table_file_name
+                    .strip_suffix(".heal-attest")
+                    .and_then(|id| id.parse::<TableId>().ok())
+                {
+                    // A LIVE table's pending attestation is preserved (the next
+                    // scrub reconciles a crashed refresh through it). But if its
+                    // SST is absent from the manifest, the table was retired
+                    // (compacted away, its file unlinked) while the sidecar
+                    // lingered: nothing can ever reconcile a table that no longer
+                    // exists, so sweep the orphan rather than leak the directory
+                    // entry and re-process it on every future recovery.
+                    if !manifest_ids.contains(&attest_id) {
+                        log::warn!(
+                            "Removing orphaned heal attestation (its table is gone): {}",
+                            table_file_path.display()
+                        );
+                        Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                    }
                     continue;
                 }
 
@@ -4219,6 +4377,18 @@ impl Tree {
     /// function now fails fast on non-UTF-8 names. This is intentional: version
     /// files are always `v{u64}` — any non-UTF-8 entry indicates filesystem
     /// corruption and should surface as an error rather than be silently ignored.
+    /// Removes a recovery-swept artifact (an abandoned heal copy / temp / marker),
+    /// treating a concurrent removal (`NotFound`) as success. A benign race (a
+    /// retry, or another scanner that already swept it) must not fail recovery,
+    /// matching [`Self::cleanup_orphaned_version`].
+    fn sweep_artifact(fs: &dyn Fs, path: &Path) -> crate::Result<()> {
+        match fs.remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Removes stale manifest files left by older generations: every `v{id}`
     /// snapshot except the live one (`v{snapshot_id}`) and every `edits-{id}`
     /// log except the live snapshot's (`edits-{snapshot_id}`). A crashed

@@ -692,6 +692,49 @@ pub fn run_checkpoint<T: AbstractTree>(
     // tables / blob files that compaction marks as deleted are held back.
     let _pause = deletion_pause.acquire();
 
+    // Reconcile any table left with a PENDING in-place-heal attestation before
+    // the snapshot: such a table has healed bytes on disk but the live version
+    // still records its pre-heal digest, and the `.heal-attest` sidecar is not
+    // copied into the checkpoint. Linking it as-is would capture a digest that
+    // never matches the linked bytes, failing the immutable checkpoint's
+    // integrity check forever with no marker to reconcile. Reconciling here
+    // refreshes the digest and consumes the sidecar so the version captured
+    // below is self-consistent. Runs BEFORE `enter_link_window` because the
+    // reconcile takes each table's mutation window, which the link window (its
+    // write half) mutually excludes, so doing it after would deadlock.
+    #[cfg(feature = "page_ecc")]
+    crate::scrub::reconcile_pending_heals(tree)?;
+    // A build WITHOUT page_ecc cannot reconcile a pending heal (no ECC scan
+    // machinery), but a feature-enabled binary may have healed an SST and
+    // crashed before refreshing its manifest, leaving a `.heal-attest` marker.
+    // Linking that table would snapshot healed bytes under the stale pre-heal
+    // digest with no marker copied, so abort the checkpoint instead.
+    #[cfg(not(feature = "page_ecc"))]
+    crate::scrub::abort_checkpoint_if_pending_heals(
+        tree,
+        "this build is compiled without page_ecc, so it has no ECC scan machinery; \
+         run a scrub with a Page-ECC-enabled build",
+    )?;
+
+    // Hold the link window for the duration too: an in-place heal that has
+    // already probed an SST's link count as exclusive must not observe this
+    // checkpoint linking that SST mid-heal (the snapshot would capture bytes
+    // the heal is about to change, under a digest the checkpoint manifest
+    // already recorded). The heal side holds the read half per table.
+    let _link_window = deletion_pause.enter_link_window();
+
+    // Residual-race guard: the pre-window reconciliation released each table's
+    // mutation window before the link window was taken, so a concurrent heal
+    // could have left a fresh pending marker in between. Reconciling now is
+    // impossible (it needs the mutation window the link window excludes), so
+    // abort if any marker remains rather than snapshot a healed table under a
+    // stale digest. The operator retries; the next attempt reconciles it.
+    crate::scrub::abort_checkpoint_if_pending_heals(
+        tree,
+        "a concurrent heal left a pending marker after the pre-window reconcile, \
+         and the held link window excludes the mutation window reconciliation needs",
+    )?;
+
     // Capture the seqno BEFORE the flush. Sampling later (between flush
     // and `current_version()`) is unsafe: a concurrent writer can land
     // in the freshly-rotated active memtable, advance `visible_seqno`,

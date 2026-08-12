@@ -129,20 +129,178 @@ fn failed_subcompaction_rolls_back_and_restores_inputs() -> crate::Result<()> {
 /// those still in the punched input's intact suffix) reads back.
 #[test]
 fn tight_space_crash_after_first_slice_recovers_all_keys_on_reopen() -> crate::Result<()> {
-    use core::sync::atomic::Ordering;
-
     const N: u64 = 2_000;
     let k = |i: u64| format!("key{i:08}");
 
     let dir = tempfile::tempdir()?;
     let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    // Force the single-table major compaction to be gated, opting in to
+    // tight-space reclaim by leaving only a quarter of the footprint free.
+    let reopened = tight_space_crash_and_reopen(
+        dir.path(),
+        Arc::new(mem.clone()),
+        |used| mem.set_capacity(used + used / 4),
+        || mem.punched_bytes(),
+    )?;
+    for i in 0..N {
+        assert!(
+            reopened.get(k(i).as_bytes(), crate::MAX_SEQNO)?.is_some(),
+            "key {i} lost after a crash mid tight-space compaction + reopen",
+        );
+    }
+    Ok(())
+}
+
+/// A real-on-disk [`Fs`](crate::fs::Fs) wrapper (over
+/// [`StdFs`](crate::fs::StdFs)) that simulates disk pressure for the tight-space
+/// compaction test while keeping every byte in a real file under the test's
+/// `tempdir`. It reports a fixed `available_space`, advertises hole-punch
+/// support, and EMULATES `punch_hole` by zeroing the range in place (real
+/// `StdFs::punch_hole` is Linux-only, so emulation keeps the test
+/// cross-platform and locally runnable). `punched_bytes` counts the bytes
+/// punched so the test can assert the first slice reclaimed its prefix.
+mod capfs {
+    use crate::fs::{Fs, FsCapabilities, FsDirEntry, FsFile, FsMetadata, FsOpenOptions, StdFs};
+    use crate::io;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    pub(super) struct CapacityFs {
+        available: Arc<AtomicU64>,
+        punched: Arc<AtomicU64>,
+    }
+
+    impl CapacityFs {
+        pub(super) fn new() -> Self {
+            Self {
+                available: Arc::new(AtomicU64::new(u64::MAX)),
+                punched: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        /// Sets the fixed free-space figure `available_space` reports (the
+        /// simulated remaining disk).
+        pub(super) fn set_available_space(&self, bytes: u64) {
+            self.available.store(bytes, Ordering::Relaxed);
+        }
+
+        /// Total bytes passed to `punch_hole` so far.
+        pub(super) fn punched_bytes(&self) -> u64 {
+            self.punched.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Fs for CapacityFs {
+        fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
+            StdFs.open(path, opts)
+        }
+        fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+            StdFs.create_dir_all(path)
+        }
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
+            StdFs.read_dir(path)
+        }
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            StdFs.remove_file(path)
+        }
+        fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+            StdFs.remove_dir_all(path)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            StdFs.rename(from, to)
+        }
+        fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
+            StdFs.metadata(path)
+        }
+        fn sync_directory(&self, path: &Path) -> io::Result<()> {
+            StdFs.sync_directory(path)
+        }
+        fn exists(&self, path: &Path) -> io::Result<bool> {
+            StdFs.exists(path)
+        }
+        fn backend_id(&self) -> Option<u64> {
+            StdFs.backend_id()
+        }
+        fn volume_id(&self, path: &Path) -> Option<u64> {
+            StdFs.volume_id(path)
+        }
+
+        // Simulated disk pressure: the fixed free-space figure the tight-space
+        // admission check reads to decide a full rewrite will not fit.
+        fn available_space(&self, _path: &Path) -> io::Result<u64> {
+            Ok(self.available.load(Ordering::Relaxed))
+        }
+
+        // Advertise hole-punch so the compaction takes the punch-and-reclaim
+        // path even on a platform whose real StdFs reports no support.
+        fn capabilities(&self, path: &Path) -> FsCapabilities {
+            FsCapabilities {
+                punch_hole: true,
+                ..StdFs.capabilities(path)
+            }
+        }
+
+        // Emulate a hole-punch by zeroing the range in place: the prefix then
+        // reads as zeros exactly as a real punch (`FALLOC_FL_KEEP_SIZE`) would,
+        // so the restricted view is byte-faithful and the file keeps its length.
+        // Count the bytes for the test's reclaim assertion.
+        fn punch_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<()> {
+            if len == 0 {
+                return Ok(());
+            }
+            let mut f = StdFs.open(path, &FsOpenOptions::new().write(true))?;
+            // Clamp to the bytes actually present from `offset` to EOF: a real
+            // punch (`FALLOC_FL_KEEP_SIZE`) never extends the file, so neither
+            // may this zero-fill emulation. The min-0 clamp IS the intended
+            // semantics here (an out-of-range offset punches nothing), so a
+            // saturating subtraction is correct rather than bug-masking.
+            let file_len = f.metadata()?.len;
+            let punch_len = len.min(file_len.saturating_sub(offset));
+            if punch_len == 0 {
+                return Ok(());
+            }
+            f.seek(SeekFrom::Start(offset))?;
+            // Stream the zero bytes over the range (no manual chunk buffer, so
+            // no indexing / cast / unwrap the crate lints forbid).
+            std::io::copy(&mut std::io::repeat(0u8).take(punch_len), &mut f)?;
+            f.sync_all()?;
+            // Count the bytes only AFTER the punch durably lands, so a failed
+            // open / seek / write / sync does not inflate the reclaim counter.
+            self.punched.fetch_add(punch_len, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+}
+
+/// The shared tight-space crash-and-reopen flow. On `shared_fs`: writes 2000
+/// keys, leaves the disk tight via `set_capacity(used)`, crashes the tight-space
+/// compaction right after its first slice is installed and punched (asserting
+/// the crash failpoint fired and `punched_bytes()` grew), then reopens so
+/// recovery rebuilds the restricted input, returning the reopened tree. Callers
+/// supply the filesystem and its capacity / reclaim accessors (a `MemFs` and a
+/// real-file `CapacityFs` configure these differently) and then run their own
+/// assertions on the returned tree.
+fn tight_space_crash_and_reopen(
+    dir: &std::path::Path,
+    shared_fs: Arc<dyn crate::fs::Fs>,
+    set_capacity: impl FnOnce(u64),
+    punched_bytes: impl Fn() -> u64,
+) -> crate::Result<crate::AnyTree> {
+    use core::sync::atomic::Ordering;
+
+    const N: u64 = 2_000;
+    let k = |i: u64| format!("key{i:08}");
+
     let config = Config::new(
-        &dir,
+        dir,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
     .data_block_size_policy(BlockSizePolicy::all(512))
-    .with_shared_fs(Arc::new(mem.clone()));
+    .with_shared_fs(Arc::clone(&shared_fs));
     let failpoint = config.fail_tight_after_first_slice.clone();
     let tree = match config.open()? {
         crate::AnyTree::Standard(t) => t,
@@ -155,45 +313,94 @@ fn tight_space_crash_after_first_slice_recovers_all_keys_on_reopen() -> crate::R
     tree.flush_active_memtable(0)?;
     let used = tree.storage_stats()?.used_bytes;
 
-    // Force the single-table major compaction to be gated, and opt in to
-    // tight-space reclaim.
-    mem.set_capacity(used + used / 4);
+    set_capacity(used);
     tree.update_runtime_config(|c| {
         c.storage_admission_check = true;
         c.tight_space_compaction = true;
     })?;
 
-    // Crash right after the first slice is durably installed + punched.
     failpoint.store(true, Ordering::SeqCst);
     assert!(
         tree.major_compact(64 * 1024 * 1024, 0).is_err(),
         "the crash failpoint must abort the tight-space compaction",
     );
+    // The failpoint disarms itself when it fires: confirm the error came from the
+    // intended crash point, not an unrelated failure before the punch.
     assert!(
         !failpoint.load(Ordering::SeqCst),
-        "the failpoint should have fired and disarmed",
+        "the crash failpoint must have fired and disarmed",
     );
     assert!(
-        mem.punched_bytes() > 0,
+        punched_bytes() > 0,
         "the first slice must have punched before the crash",
     );
 
-    // Reopen on the same simulated disk: recovery must rebuild the restricted
-    // input from the persisted manifest restriction.
     drop(tree);
-    let reopened = Config::new(
-        &dir,
+    Config::new(
+        dir,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .with_shared_fs(Arc::new(mem))
-    .open()?;
-    for i in 0..N {
-        assert!(
-            reopened.get(k(i).as_bytes(), crate::MAX_SEQNO)?.is_some(),
-            "key {i} lost after a crash mid tight-space compaction + reopen",
-        );
-    }
+    .with_shared_fs(shared_fs)
+    .open()
+}
+
+/// A legitimately RESTRICTED table (a tight-space compaction crashed after
+/// punching its first slice, so its `[0, punch)` data-block prefix reads as
+/// zeros) must pass every heal-reconcile security gate AND the whole-file
+/// integrity verify. Each gate walks the data blocks and would, before
+/// restriction-awareness, try to decode the punched prefix and FALSELY reject
+/// the healthy restricted view, refusing to reconcile a legitimate heal and
+/// stranding recovery. Cross-checks the suffix only; the punched prefix is
+/// dead. This is the reopen state of
+/// [`tight_space_crash_after_first_slice_recovers_all_keys_on_reopen`], run on
+/// real on-disk files ([`capfs::CapacityFs`] over `StdFs`) so the scan exercises
+/// real filesystem read / seek / EOF behavior.
+#[test]
+fn restricted_view_passes_every_reconcile_gate() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fs = capfs::CapacityFs::new();
+    // Leave only a quarter of the flushed footprint free so a full rewrite cannot
+    // fit and the compaction takes the tight-space slice-and-punch path.
+    let reopened = tight_space_crash_and_reopen(
+        dir.path(),
+        Arc::new(fs.clone()),
+        |used| fs.set_available_space(used / 4),
+        || fs.punched_bytes(),
+    )?;
+
+    // The whole-file digest verify must pass on the restricted table: it streams
+    // the SUFFIX digest for a restricted view (the punched prefix is excluded),
+    // so a legitimately punched file is not flagged as corrupt. Now testable
+    // because the table lives in a real on-disk file `verify_integrity` can read.
+    let integrity = crate::verify::verify_integrity(&reopened);
+    assert!(
+        integrity.is_ok(),
+        "verify_integrity must pass on a legitimately restricted table, got {:?}",
+        integrity.errors,
+    );
+
+    // Locate the restricted table and drive every heal-reconcile gate directly:
+    // each must accept the healthy suffix without decoding the punched prefix.
+    let version = reopened.current_version();
+    let Some(restricted) = version
+        .iter_tables()
+        .find(|t| t.restrict_lower_bound().is_some())
+    else {
+        panic!("the punched input must reopen as a restricted table");
+    };
+
+    restricted.verify_kv_checksums()?;
+    restricted.verify_blob_links()?;
+    restricted.verify_tli_mirrors()?;
+    restricted.verify_seqno_bounds()?;
+    restricted.verify_block_entry_counts()?;
+    restricted.verify_zone_map()?;
+    restricted.verify_locator()?;
+    restricted.verify_filter(None)?;
+    restricted.verify_block_layout()?;
+    restricted.verify_point_read_reachability()?;
+    restricted.verify_metadata_bounds()?;
     Ok(())
 }
 

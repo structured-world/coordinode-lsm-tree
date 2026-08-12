@@ -692,7 +692,7 @@ impl Block {
 
             #[cfg(feature = "lz4")]
             CompressionType::Lz4 => {
-                compressed_buf = Some(lz4_flex::compress(data));
+                compressed_buf = Some(lz4_flex::block::compress(data));
             }
 
             #[cfg(zstd_any)]
@@ -811,6 +811,20 @@ impl Block {
         // compiler folds it out.
         #[cfg(feature = "page_ecc")]
         let parity_buf: Option<Vec<u8>> = if let Some(ecc_params) = transform.ecc_params() {
+            // Reject a trailer above the payload hard cap BEFORE encoding it:
+            // the out-of-band verifier bounds trailers at this cap (its DoS
+            // guard against forged descriptors), so emitting a larger one
+            // would create an SST the verifier falsely flags as corrupt. No
+            // sane scheme/block combination reaches this — it takes a
+            // high-amplification shard layout (e.g. RS(1,255)) on a huge
+            // block — so the write fails loudly instead of producing an
+            // unverifiable file.
+            if expected_parity_len(payload_len, ecc_params) > MAX_DECOMPRESSION_SIZE {
+                return Err(crate::Error::FeatureUnsupported(
+                    "ecc parity trailer above the verifier's hard cap: the configured shard \
+                     scheme amplifies this block's payload past 256 MiB of parity",
+                ));
+            }
             // SEC-DED emits one check byte per 8-byte word; shard schemes emit a
             // Reed-Solomon / XOR trailer. Both produce a parity buffer the
             // reader re-sizes from `data_length` via `expected_parity_len`.
@@ -981,7 +995,7 @@ impl Block {
                     let mut builder =
                         unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };
 
-                    let bytes_written = lz4_flex::decompress_into(&decrypted, &mut builder)
+                    let bytes_written = lz4_flex::block::decompress_into(&decrypted, &mut builder)
                         .map_err(|_| crate::Error::Decompress(compression))?;
 
                     if bytes_written != header.uncompressed_length as usize {
@@ -1093,7 +1107,7 @@ impl Block {
                     let mut builder =
                         unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };
 
-                    let bytes_written = lz4_flex::decompress_into(&raw_data, &mut builder)
+                    let bytes_written = lz4_flex::block::decompress_into(&raw_data, &mut builder)
                         .map_err(|_| crate::Error::Decompress(compression))?;
 
                     if bytes_written != header.uncompressed_length as usize {
@@ -1307,9 +1321,14 @@ impl Block {
                 0
             };
 
-            // Clamp-to-zero: a block truncated before its header ends has no
-            // payload, which `classify_block_trailer` then flags as a mismatch.
-            let actual_payload_plus_ecc = block_size.saturating_sub(header_len);
+            // The header was decoded from these `block_size` bytes above, so
+            // `block_size >= header_len` holds and this cannot underflow.
+            // `checked_sub` on this recovery path surfaces any future decode
+            // regression loudly instead of clamping to a 0-payload that a
+            // truncated block could sneak through the trailer check as clean.
+            let actual_payload_plus_ecc = block_size
+                .checked_sub(header_len)
+                .ok_or(crate::Error::InvalidHeader("Block"))?;
             let actual_data_len = parsed_header.data_length as usize;
             let ecc_status = classify_block_trailer(
                 has_ecc,
@@ -1415,8 +1434,9 @@ impl Block {
                         Slice::builder_unzeroed(parsed_header.uncompressed_length as usize)
                     };
 
-                    let bytes_written = lz4_flex::decompress_into(&decrypted, &mut decompressed)
-                        .map_err(|_| crate::Error::Decompress(compression))?;
+                    let bytes_written =
+                        lz4_flex::block::decompress_into(&decrypted, &mut decompressed)
+                            .map_err(|_| crate::Error::Decompress(compression))?;
 
                     if bytes_written != parsed_header.uncompressed_length as usize {
                         return Err(crate::Error::Decompress(compression));
@@ -1494,9 +1514,15 @@ impl Block {
                 0
             };
 
-            // Clamp-to-zero: a buffer shorter than the header carries no payload,
-            // which the trailer classification then flags as a mismatch.
-            let actual_payload_plus_ecc = buf.len().saturating_sub(header_len);
+            // The header was decoded from `buf` above, so `buf.len() >=
+            // header_len` holds and this cannot underflow. `checked_sub` on this
+            // recovery path surfaces any future decode regression loudly instead
+            // of clamping to a 0-payload the trailer check could accept as a
+            // clean empty block.
+            let actual_payload_plus_ecc = buf
+                .len()
+                .checked_sub(header_len)
+                .ok_or(crate::Error::InvalidHeader("Block"))?;
             let actual_data_len = parsed_header.data_length as usize;
             let ecc_status = classify_block_trailer(
                 has_ecc,
@@ -1582,7 +1608,7 @@ impl Block {
                     };
 
                     let bytes_written =
-                        lz4_flex::decompress_into(compressed_data, &mut decompressed)
+                        lz4_flex::block::decompress_into(compressed_data, &mut decompressed)
                             .map_err(|_| crate::Error::Decompress(compression))?;
 
                     if bytes_written != parsed_header.uncompressed_length as usize {
@@ -1650,6 +1676,163 @@ impl Block {
         };
 
         Ok((Self { header, data }, ecc_status, recovery))
+    }
+
+    /// In-place autoheal primitive: read this block's on-disk frame and, if its
+    /// checksum fails but Page-ECC recovers it, return the CORRECTED frame bytes
+    /// to write back at the same offset.
+    ///
+    /// The returned frame is `header ++ recovered_data ++ freshly-recomputed
+    /// parity` and is byte-length-identical to the on-disk block (RS / SEC-DED
+    /// reconstruct the original `data_length` payload, and the parity length is a
+    /// deterministic function of it), so it can be written in place without
+    /// shifting any later block. Returns `Ok(None)` when the block reads clean (no
+    /// heal needed) or carries no recognized parity (nothing to reconstruct from);
+    /// `Err` when the checksum fails and parity cannot recover it (uncorrectable)
+    /// or the block is unreadable.
+    ///
+    /// Works purely at the framed-bytes level: the checksum and parity cover the
+    /// on-disk (post-compression, post-encryption) data bytes, so no decompress /
+    /// decrypt is needed — `transform` is consulted only for the parity scheme.
+    #[cfg(feature = "page_ecc")]
+    pub(crate) fn heal_frame(
+        file: &dyn FsFile,
+        handle: BlockHandle,
+        transform: &BlockTransform<'_>,
+    ) -> crate::Result<Option<(alloc::vec::Vec<u8>, EccRecoveryKind)>> {
+        let block_size = handle.size() as usize;
+        if block_size < Header::MIN_LEN {
+            return Err(crate::Error::InvalidHeader("Block"));
+        }
+        // Pre-allocation sanity cap on `handle.size()` (mirrors
+        // `from_file_with_recovery`): reject an absurd on-disk size from a corrupt
+        // handle before allocating the read buffer. Bound = max payload
+        // (+ encryption overhead) + its parity + the largest header.
+        let enc_overhead = transform
+            .encryption()
+            .map_or(0u64, |e| u64::from(e.max_overhead()));
+        let max_payload = u64::from(MAX_DECOMPRESSION_SIZE) + enc_overhead;
+        let max_ecc_overhead = match transform.ecc_params() {
+            Some(params) => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "max_payload is MAX_DECOMPRESSION_SIZE (+ enc overhead), well below u32::MAX"
+                )]
+                let max_payload_u32 = max_payload.min(u64::from(u32::MAX)) as u32;
+                u64::from(expected_parity_len(max_payload_u32, params))
+            }
+            None => 0,
+        };
+        let max_on_disk_size = max_payload + max_ecc_overhead + Header::MAX_LEN as u64;
+        if u64::from(handle.size()) > max_on_disk_size {
+            return Err(crate::Error::DecompressedSizeTooLarge {
+                declared: u64::from(handle.size()),
+                limit: max_on_disk_size,
+            });
+        }
+        let mut buf = alloc::vec![0u8; block_size];
+        let n = file.read_at(&mut buf, *handle.offset())?;
+        if n != block_size {
+            return Err(crate::Error::Io(crate::io::Error::new(
+                crate::io::ErrorKind::UnexpectedEof,
+                "heal_frame: short block read",
+            )));
+        }
+        let header = Header::decode_from(&mut &buf[..])?;
+        let header_len = Header::header_len(header.block_type);
+        // Heal targets blocks under a recognized parity scheme; without one there
+        // is nothing to reconstruct from (a checksum-only block that fails is
+        // salvage's job, not in-place heal's).
+        let has_ecc = block_has_parity(&header, transform);
+        if !has_ecc {
+            return Ok(None);
+        }
+        let ecc_params = block_ecc_params(&header, transform);
+        let ecc_length = expected_parity_len(header.data_length, ecc_params);
+        // Validate the on-disk trailer the same way the read path does before ever
+        // treating the block as clean: the post-header bytes must be exactly
+        // `data_length + ecc_length`. Extra trailing bytes (an over-sized / malformed
+        // block) are rejected rather than silently reported clean, matching
+        // `from_file_with_recovery`.
+        let actual_data_len = usize::try_from(header.data_length)
+            .map_err(|_| crate::Error::InvalidHeader("Block"))?;
+        // The header was decoded from these `block_size` bytes above, so
+        // `block_size >= header_len` holds and this cannot underflow.
+        // `checked_sub` on this recovery path surfaces any future decode
+        // regression loudly instead of clamping to a 0-payload that a truncated
+        // block could sneak through the trailer check as a clean read.
+        let actual_payload_plus_ecc = block_size
+            .checked_sub(header_len)
+            .ok_or(crate::Error::InvalidHeader("Block"))?;
+        classify_block_trailer(
+            has_ecc,
+            actual_payload_plus_ecc,
+            actual_data_len,
+            ecc_length,
+            &handle,
+        )?;
+        // `read_payload_and_verify` consumes exactly `data_length + ecc_length`
+        // bytes from a cursor over the post-header bytes, returning the (recovered)
+        // data and whether a correction was applied.
+        let post_header = buf
+            .get(header_len..)
+            .ok_or(crate::Error::InvalidHeader("Block"))?;
+        let mut cursor = crate::io::Cursor::new(post_header);
+        let (data, recovery) = Self::read_payload_and_verify(
+            &mut cursor,
+            header.data_length,
+            ecc_length,
+            header.checksum,
+            ecc_params,
+        )?;
+        let Some(kind) = recovery else {
+            // Clean read: nothing to persist. NOTE this is a FRAME-level clean
+            // (header + payload checksum + trailer verified), not a full decode —
+            // a header-only fault such as a bad `uncompressed_length` is not caught
+            // here. A caller that needs full-integrity detection must pair this
+            // with a decoding read; the in-place heal
+            // (`Table::heal_data_blocks_in_place`) verifies each block via the scrub
+            // read path first and only uses `heal_frame` to fetch the corrected
+            // bytes for a block that read path already flagged as recovered.
+            //
+            // A PARITY-ONLY fault (payload + payload checksum intact, ECC trailer
+            // rotted) is deliberately NOT this function's job: the read path reads
+            // it as clean, so `heal_frame` is never called for it. That case is
+            // repaired earlier in `heal_data_blocks_in_place` by
+            // `Table::raw_block_parity_delta`, which recomputes the parity over the
+            // verified payload and rewrites the trailer when it diverges (proven by
+            // `heal_in_place_restores_a_rotted_parity_trailer`). So a clean frame
+            // reaching here has an intact trailer already — returning `None` leaves
+            // no damaged parity on disk.
+            return Ok(None);
+        };
+        // Recompute the parity over the corrected data so the rewritten frame is
+        // canonical regardless of whether the fault hit a data or a parity shard.
+        let parity = if matches!(ecc_params, EccParams::Secded) {
+            crate::secded::encode_block_parity(&data)
+        } else {
+            let (data_shards, parity_shards) = ecc_params.as_shards();
+            crate::ecc::encode_parity(&data, data_shards, parity_shards)?
+        };
+        let header_bytes = buf
+            .get(..header_len)
+            .ok_or(crate::Error::InvalidHeader("Block"))?;
+        let mut frame = alloc::vec::Vec::with_capacity(header_len + data.len() + parity.len());
+        frame.extend_from_slice(header_bytes);
+        frame.extend_from_slice(&data);
+        frame.extend_from_slice(&parity);
+        // An in-place heal overwrites the block at its existing offset, so the
+        // rebuilt frame MUST be byte-length-identical to the original — a shorter
+        // or longer frame would corrupt the following block. Enforce at runtime
+        // (not just `debug_assert`): the recovered payload / recomputed parity are
+        // deterministic, so a mismatch means the header disagrees with the on-disk
+        // layout; refuse rather than write a wrong-length block in release builds.
+        if frame.len() != block_size {
+            return Err(crate::Error::InvalidHeader(
+                "in-place heal: rebuilt frame length differs from the on-disk block",
+            ));
+        }
+        Ok(Some((frame, kind)))
     }
 
     /// Reads a data block's verified COMPRESSED payload (the zstd frame) WITHOUT
@@ -1721,9 +1904,14 @@ impl Block {
             0
         };
 
-        // Clamp-to-zero: a buffer shorter than the header carries no payload,
-        // which the trailer classification then flags as a mismatch.
-        let actual_payload_plus_ecc = buf.len().saturating_sub(header_len);
+        // The header was decoded from `buf` above, so `buf.len() >= header_len`
+        // holds and this cannot underflow. `checked_sub` on this recovery path
+        // surfaces any future decode regression loudly instead of clamping to a
+        // 0-payload the trailer check could accept as a clean empty block.
+        let actual_payload_plus_ecc = buf
+            .len()
+            .checked_sub(header_len)
+            .ok_or(crate::Error::InvalidHeader("Block"))?;
         let actual_data_len = parsed_header.data_length as usize;
         let _ecc_status = classify_block_trailer(
             has_ecc,

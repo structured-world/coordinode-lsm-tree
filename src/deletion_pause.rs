@@ -57,6 +57,17 @@ pub struct DeletionPause {
 
     /// Paths queued for removal while at least one pause was active.
     queue: Mutex<Vec<QueuedDeletion>>,
+
+    /// Excludes a checkpoint's hard-link window from in-place file mutation
+    /// (the ECC autoheal): a checkpoint that links an SST between the heal's
+    /// link-count probe and its write-back would capture bytes the heal is
+    /// about to change, under a digest its immutable manifest already
+    /// recorded. Mutators hold the read side (distinct tables heal in
+    /// parallel), a checkpoint holds the write side for its whole copy/link
+    /// pass. `parking_lot` (not `spin`): both windows are long-lived,
+    /// blocking operations, so spinning would burn a core.
+    #[cfg(feature = "std")]
+    link_gate: parking_lot::RwLock<()>,
 }
 
 #[cfg_attr(
@@ -76,7 +87,8 @@ impl core::fmt::Debug for DeletionPause {
         f.debug_struct("DeletionPause")
             .field("active", &self.active.load(Ordering::Relaxed))
             .field("queued", &self.queue.lock().len())
-            .finish()
+            // `link_gate` is omitted: a lock has no meaningful debug state.
+            .finish_non_exhaustive()
     }
 }
 
@@ -140,6 +152,21 @@ impl DeletionPause {
         Pause {
             inner: Arc::clone(self),
         }
+    }
+
+    /// Enters an in-place-mutation window (blocks while a checkpoint's
+    /// link window is open). Mutators of DISTINCT files may hold windows
+    /// concurrently; see the `link_gate` field docs.
+    #[cfg(feature = "std")]
+    pub(crate) fn enter_mutation_window(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
+        self.link_gate.read()
+    }
+
+    /// Enters a checkpoint link window (blocks while any in-place-mutation
+    /// window is open, and excludes new ones until dropped).
+    #[cfg(feature = "std")]
+    pub(crate) fn enter_link_window(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
+        self.link_gate.write()
     }
 }
 

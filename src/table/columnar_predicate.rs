@@ -165,11 +165,14 @@ fn filter_column(col: &Column, rows: usize, mask: &[bool], kept: usize) -> Colum
                 // leaving a missing offset and malformed framing.
                 let value = bytes_row(&col.data, rows, row).unwrap_or(&[]);
                 payload.extend_from_slice(value);
-                // The kept payload is a subset of the original, whose offsets
-                // already fit u32. The caps only guard the unreachable overflow
-                // and keep the offsets monotonically non-decreasing.
+                // `col` is an already-decoded column, so its per-row lengths and
+                // their running total both fit u32 by construction (that is how
+                // the offset table was parsed). The kept payload is a SUBSET of
+                // that original, so `acc` stays within the original total and can
+                // never exceed u32::MAX — plain arithmetic, no cap to hide a
+                // corrupt overrun and no error channel to surface one on.
                 let len = u32::try_from(value.len()).unwrap_or(u32::MAX);
-                acc = acc.saturating_add(len);
+                acc += len;
                 offsets.extend_from_slice(&acc.to_le_bytes());
             }
             offsets.extend_from_slice(&payload);
@@ -265,6 +268,14 @@ fn take_column(col: &Column, rows: usize, indices: &[u32]) -> Column {
                 // the offset table stays in lockstep with the output row count.
                 let value = bytes_row(&col.data, rows, i as usize).unwrap_or(&[]);
                 payload.extend_from_slice(value);
+                // Unlike the mask-driven `filter_column`, a gather may REPEAT an
+                // index (any index list is permitted), so the emitted payload is
+                // NOT a subset of the original and `acc` can exceed the original
+                // u32 offset total. Saturate rather than wrap: this gather is
+                // infallible and contractually degrades malformed input (an
+                // out-of-range index yields an empty cell, never a panic or a
+                // desynced frame), so clamping the accumulator keeps the offset
+                // table bounded on an adversarial duplicate-heavy index list.
                 let len = u32::try_from(value.len()).unwrap_or(u32::MAX);
                 acc = acc.saturating_add(len);
                 offsets.extend_from_slice(&acc.to_le_bytes());

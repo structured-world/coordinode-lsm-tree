@@ -456,6 +456,31 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     /// Returns an I/O error if metadata cannot be retrieved.
     fn metadata(&self) -> io::Result<FsMetadata>;
 
+    /// Returns the number of directory entries (hard links) referring to this
+    /// file's underlying object.
+    ///
+    /// In-place mutation paths consult this before writing through a path:
+    /// a count above 1 means another name (typically a checkpoint) shares the
+    /// same bytes, and writing in place would silently rewrite that snapshot
+    /// too.
+    ///
+    /// Backends with no hard-link concept ([`MemFs`], whose
+    /// [`Fs::hard_link`] copies) override this to return 1. Backends that CAN
+    /// share inodes but cannot determine the count keep the default error, so
+    /// in-place mutation paths fail closed (treat the file as shared) instead
+    /// of overwriting a snapshot through an unrecognized link.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the link count cannot be retrieved; the
+    /// default returns [`ErrorKind::Unsupported`](crate::io::ErrorKind).
+    fn hard_link_count(&self) -> io::Result<u64> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "hard-link count unavailable",
+        ))
+    }
+
     /// Truncates or extends the file to the specified length.
     ///
     /// # Errors

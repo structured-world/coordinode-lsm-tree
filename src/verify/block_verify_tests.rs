@@ -222,6 +222,84 @@ fn verify_block_checksums_clean_nondefault_ecc_tree_has_no_errors() {
     );
 }
 
+/// Rot confined to a Page-ECC parity trailer is invisible to the payload
+/// checksum (the checksum covers the payload only; parity is consulted just
+/// for recovery on a mismatch), so a walk that merely SKIPS the trailer
+/// reports the SST as healthy while its ECC is dead — a later payload fault
+/// on that block would no longer be recoverable. The out-of-band walk must
+/// compare each clean block's trailer against freshly computed parity and
+/// flag a mismatch.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn verify_sst_file_detects_a_rotted_parity_trailer() {
+    use crate::coding::Decode;
+    use crate::table::block::Header;
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let any = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+        .page_ecc(true)
+        .ecc_scheme(crate::runtime_config::EccScheme::ReedSolomon {
+            data_shards: 4,
+            parity_shards: 2,
+        })
+        .open()
+        .unwrap();
+        for i in 0u64..2_000 {
+            let key = format!("k{i:08}");
+            let val = format!("v{i:08}");
+            any.insert(key.as_bytes(), val.as_bytes(), 1 + i);
+        }
+        any.flush_active_memtable(2_001).unwrap();
+        drop(any);
+    }
+    let sst_path = pick_first_sst_path(dir.path());
+
+    // The pristine SST must verify clean BEFORE the flip, so the mismatch
+    // asserted below is provably caused by the corruption, not a pre-existing
+    // problem in the freshly written file.
+    assert!(
+        verify_sst_file(&sst_path).is_ok(),
+        "the freshly written SST must verify clean before corruption",
+    );
+
+    // The first data block sits at file offset 0 (the writer opens the file
+    // with the `data` section). Its parity trailer follows the payload:
+    // header_len + data_length.
+    let mut bytes = std::fs::read(&sst_path).unwrap();
+    let mut cursor = bytes.as_slice();
+    let header = Header::decode_from(&mut cursor).unwrap();
+    let trailer_pos = Header::header_len(header.block_type) + header.data_length as usize;
+    let slot = bytes
+        .get_mut(trailer_pos)
+        .expect("parity trailer within the file");
+    *slot ^= 0xFF;
+    std::fs::write(&sst_path, &bytes).unwrap();
+
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        !report.is_ok(),
+        "a rotted parity trailer under a clean payload checksum must be \
+         flagged (dead ECC), got {report:?}",
+    );
+    let mismatch = report
+        .errors
+        .iter()
+        .find(|e| matches!(e, BlockVerifyError::EccParityMismatch { .. }))
+        .unwrap_or_else(|| panic!("expected an EccParityMismatch error, got {report:?}"));
+    // The rendered finding names the block and the dead-ECC condition.
+    let rendered = mismatch.to_string();
+    assert!(
+        rendered.contains("parity trailer") && rendered.contains("offset 0"),
+        "display names the block and the condition: {rendered}",
+    );
+}
+
 /// Returns the on-disk path of the first SST registered with the
 /// tree's current version. Drops the tree before returning so the
 /// caller can mutate the file safely (no descriptor cache, no
@@ -447,6 +525,211 @@ fn verify_sst_file_clean_file_has_no_errors() {
     );
 }
 
+/// A re-stamped TOC that OMITS a correctness-bearing entry entirely (the SFA
+/// trailer checksum is unkeyed) must fail the walk closed: `delete_bitmap` /
+/// `range_tombstones` are optional at parse time, so a vanished section
+/// resurrects deleted rows while every remaining block still passes its
+/// byte-level checks. The writer emits sections strictly back-to-back, so the
+/// gap the omission leaves in the section tiling is the only out-of-band
+/// trace.
+#[test]
+fn verify_sst_file_flags_an_omitted_toc_section() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let cfg = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None));
+        let tree = cfg.open().unwrap();
+        for i in 0u64..100 {
+            let key = format!("k{i:08}");
+            tree.insert(key.as_bytes(), b"v", 1 + i);
+        }
+        // A range tombstone gives the SST the optional `range_tombstones`
+        // section whose omission the walk must catch.
+        tree.remove_range("k00000010", "k00000020", 200);
+        tree.flush_active_memtable(300).unwrap();
+        drop(tree);
+    }
+    let sst_path = pick_first_sst_path(dir.path());
+
+    // Sanity: intact file verifies clean.
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        report.is_ok(),
+        "intact SST must be clean: {:?}",
+        report.errors
+    );
+
+    crate::test_forge::forge_section_omitted(&sst_path, b"range_tombstones").unwrap();
+
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, BlockVerifyError::TocCorrupted { .. })),
+        "an omitted TOC entry leaves a tiling gap the walk must flag as \
+         TocCorrupted, got {:?}",
+        report.errors,
+    );
+}
+
+/// A tail meta mirror re-stamped with an UNRECOGNIZED ECC descriptor must still
+/// be compared against `meta_mid` for its non-ECC fields. Excluding it from the
+/// full mirror comparison lets a forge change a correctness field (here
+/// `created_at`) behind the unknown descriptor and evade the divergence check:
+/// a backdated `created_at`, selected by tail-first recovery, can make FIFO /
+/// TTL compaction discard live data. Both copies decode, so the comparison must
+/// see the tail's changed field even though its ECC descriptor is unknown.
+#[test]
+fn verify_sst_file_flags_diverging_mirrors_behind_an_unrecognized_ecc() {
+    let dir = tempfile::tempdir().unwrap();
+    populate_tree(dir.path(), 200);
+    let sst_path = pick_first_sst_path(dir.path());
+
+    // Sanity: intact file verifies clean.
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        report.is_ok(),
+        "intact SST must be clean: {:?}",
+        report.errors
+    );
+
+    // Forge ONLY the tail mirror: an UNRECOGNIZED ECC descriptor (`[9,_,_,_]` =
+    // unknown kind, which would exclude the mirror from the comparison) AND a
+    // changed `created_at` (the correctness field the forge hides behind it).
+    // meta_mid stays intact, so the two now decode to different metadata.
+    crate::test_forge::forge_tail_meta_value(&sst_path, b"descriptor#page_ecc", &[9, 0, 0, 0])
+        .unwrap();
+    crate::test_forge::forge_tail_meta_value(&sst_path, b"created_at", &[0xFF; 16]).unwrap();
+
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        report.errors.iter().any(|e| matches!(
+            e,
+            BlockVerifyError::TocCorrupted { reason, .. }
+                if reason.contains("mirrors decode to different metadata")
+        )),
+        "a tail mirror that changed created_at behind an unrecognized ECC \
+         descriptor must still diverge from meta_mid, got {:?}",
+        report.errors,
+    );
+}
+
+/// A TOC entry RENAMED to a duplicate recognized name — `range_tombstones`
+/// renamed to a second `data`, its block header re-stamped with the `Data`
+/// role — preserves the tiling AND passes the recognized-role walk, yet the
+/// reader's name lookup (`Toc::section`) returns the first match, hiding the
+/// renamed section so the deleted range silently resurrects. The duplicate
+/// name is the only trace; the walk must reject it.
+#[test]
+fn verify_sst_file_flags_a_duplicate_toc_section_name() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let cfg = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None));
+        let tree = cfg.open().unwrap();
+        for i in 0u64..100 {
+            let key = format!("k{i:08}");
+            tree.insert(key.as_bytes(), b"v", 1 + i);
+        }
+        tree.remove_range("k00000010", "k00000020", 200);
+        tree.flush_active_memtable(300).unwrap();
+        drop(tree);
+    }
+    let sst_path = pick_first_sst_path(dir.path());
+
+    // Sanity: intact file verifies clean.
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        report.is_ok(),
+        "intact SST must be clean: {:?}",
+        report.errors
+    );
+
+    crate::test_forge::forge_duplicate_section_name(
+        &sst_path,
+        b"range_tombstones",
+        b"data",
+        crate::table::block::BlockType::Data,
+    )
+    .unwrap();
+
+    let report = verify_sst_file(&sst_path);
+    // Match the duplicate-name finding specifically: the forge rewrites the
+    // whole TOC, so an unrelated TocCorrupted (tiling gap, seek failure,
+    // unrecognized name) would keep this green without proving the
+    // duplicate-name detection ran.
+    assert!(
+        report.errors.iter().any(|e| matches!(
+            e,
+            BlockVerifyError::TocCorrupted { section_name, reason, .. }
+                if section_name == b"data" && reason.contains("duplicate TOC section name")
+        )),
+        "a duplicate recognized section name must be flagged as TocCorrupted, \
+         got {:?}",
+        report.errors,
+    );
+}
+
+/// A healthy SST with a PARTITIONED Bloom filter must verify clean: the
+/// writer emits the `filter_tli` block with the Index role (it is a
+/// top-level index over filter partitions, same encoding as the data
+/// TLI), so a role map expecting Filter there flags a role mismatch on an
+/// intact file — and `repair_with_salvage` would grade the healthy table
+/// corrupt and quarantine or re-salvage it.
+#[test]
+fn verify_sst_file_accepts_a_partitioned_filter() {
+    use crate::InternalValue;
+    use crate::ValueType::Value;
+    use crate::table::Writer;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sst_path = dir.path().join("partitioned");
+    let mut writer = Writer::new(sst_path.clone(), 0, 0, Arc::new(crate::fs::StdFs))
+        .unwrap()
+        .use_partitioned_filter()
+        // A tiny partition budget so several filter partitions spill and
+        // the writer emits the `filter_tli` top-level index over them.
+        .use_meta_partition_size(3);
+    for i in 0u64..64 {
+        writer
+            .write(InternalValue::from_components(
+                format!("key-{i:03}").into_bytes(),
+                format!("val-{i:03}").into_bytes(),
+                i + 1,
+                Value,
+            ))
+            .unwrap();
+    }
+    assert!(writer.finish().unwrap().is_some(), "SST is non-empty");
+
+    // Sanity: the layout actually carries the partitioned filter TLI.
+    {
+        let mut f = std::fs::File::open(&sst_path).unwrap();
+        let reader = crate::sfa::Reader::from_reader(&mut f).unwrap();
+        assert!(
+            reader.toc().iter().any(|e| e.name() == b"filter_tli"),
+            "the fixture must produce a filter_tli section",
+        );
+    }
+
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        report.is_ok(),
+        "a healthy partitioned-filter SST must verify clean: {:?}",
+        report.errors,
+    );
+}
+
 /// Exercises the file-open failure branch (the only path through
 /// `verify_sst_file` that converts an underlying `io::Error` into
 /// a `BlockVerifyError::SstFileUnreadable`). A missing file is the
@@ -527,9 +810,9 @@ fn verify_sst_file_missing_file_reports_unreadable() {
               the u64 -> usize cast cannot overflow on any target \
               the test runs on (the forged archive is < 1 KiB)"
 )]
-fn walk_block_region_reports_data_read_error_on_truncated_data_segment() {
+fn walk_block_region_reports_data_read_error_on_truncated_data_segment() -> crate::Result<()> {
     use crate::coding::Encode;
-    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::{BlockType, Header};
 
     // Trailer layout (38 bytes at the tail of an SFA archive):
@@ -590,31 +873,39 @@ fn walk_block_region_reports_data_read_error_on_truncated_data_segment() {
     archive_bytes[csum_field_offset..csum_field_offset + 16]
         .copy_from_slice(&new_toc_checksum.to_le_bytes());
 
-    // Materialize the forged archive in MemFs and run the scanner.
-    let fs = MemFs::new();
-    let path = std::path::Path::new("/forged.sst");
+    // Materialize the forged archive on a real temp file and run the scanner.
+    let dir = tempfile::tempdir()?;
+    let fs = StdFs;
+    let forged = dir.path().join("forged.sst");
+    let path = forged.as_path();
     {
-        let mut f = fs
-            .open(
-                path,
-                &FsOpenOptions::new().write(true).create(true).truncate(true),
-            )
-            .unwrap();
-        f.write_all(&archive_bytes).unwrap();
+        let mut f = fs.open(
+            path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        f.write_all(&archive_bytes)?;
     }
 
     let table_id: TableId = 42;
-    let scan = scan_sst_blocks(&fs, path, table_id, 0, None, false)
-        .expect("forged SFA must parse cleanly");
+    let scan = scan_sst_blocks(&fs, path, table_id, 0, None, false, 0)?;
+    // The inflated section length ALSO breaks the TOC tiling invariant
+    // (the declared section end runs past where the TOC begins), so the
+    // walk reports the tiling finding alongside the read error.
     assert_eq!(
         scan.errors.len(),
-        1,
-        "expected exactly one error, got {:?}",
+        2,
+        "expected the tiling finding plus the read error, got {:?}",
         scan.errors,
     );
-    let err = scan.errors.first().unwrap();
     assert!(
-        matches!(
+        scan.errors
+            .iter()
+            .any(|e| matches!(e, BlockVerifyError::TocCorrupted { .. })),
+        "the inflated section length must break the TOC tiling: {:?}",
+        scan.errors,
+    );
+    assert!(
+        scan.errors.iter().any(|err| matches!(
             err,
             BlockVerifyError::DataReadError {
                 table_id: t,
@@ -622,15 +913,17 @@ fn walk_block_region_reports_data_read_error_on_truncated_data_segment() {
                 data_length: d,
                 ..
             } if *t == table_id && *d == DATA_LENGTH,
-        ),
+        )),
         "expected DataReadError {{ table_id: {table_id}, offset: 0, \
-         data_length: {DATA_LENGTH}, .. }}; got {err:?}",
+         data_length: {DATA_LENGTH}, .. }}; got {:?}",
+        scan.errors,
     );
     assert_eq!(
         scan.blocks_scanned, 1,
         "header decoded successfully, so blocks_scanned must count this block \
          even though the data segment read failed",
     );
+    Ok(())
 }
 
 /// The parity-trailer drain reports a truncated read when an SST whose ECC
@@ -647,9 +940,9 @@ fn walk_block_region_reports_data_read_error_on_truncated_data_segment() {
     reason = "synthetic SFA forgery — offsets are in-bounds by construction (we wrote the \
               bytes ourselves) and the archive is < 8 KiB, so the casts cannot overflow"
 )]
-fn walk_block_region_reports_data_read_error_on_truncated_parity_trailer() {
+fn walk_block_region_reports_data_read_error_on_truncated_parity_trailer() -> crate::Result<()> {
     use crate::coding::Encode;
-    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::{BlockType, EccParams, Header, expected_parity_len};
 
     // Trailer layout (38 bytes at the tail of an SFA archive):
@@ -700,23 +993,22 @@ fn walk_block_region_reports_data_read_error_on_truncated_parity_trailer() {
     archive_bytes[csum_field_offset..csum_field_offset + 16]
         .copy_from_slice(&new_toc_checksum.to_le_bytes());
 
-    let fs = MemFs::new();
-    let path = std::path::Path::new("/forged-parity.sst");
+    let dir = tempfile::tempdir()?;
+    let fs = StdFs;
+    let forged = dir.path().join("forged-parity.sst");
+    let path = forged.as_path();
     {
-        let mut f = fs
-            .open(
-                path,
-                &FsOpenOptions::new().write(true).create(true).truncate(true),
-            )
-            .unwrap();
-        f.write_all(&archive_bytes).unwrap();
+        let mut f = fs.open(
+            path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        f.write_all(&archive_bytes)?;
     }
 
     // Scan as an RS(4,2) table: a non-zero parity_len is drained after the
     // (clean) payload, hitting EOF in the short SFA tail.
     let table_id: TableId = 7;
-    let scan = scan_sst_blocks(&fs, path, table_id, 0, Some(EccParams::RS_4_2), false)
-        .expect("forged SFA must parse cleanly");
+    let scan = scan_sst_blocks(&fs, path, table_id, 0, Some(EccParams::RS_4_2), false, 0)?;
     assert!(
         scan.errors.iter().any(|e| matches!(
             e,
@@ -726,6 +1018,107 @@ fn walk_block_region_reports_data_read_error_on_truncated_parity_trailer() {
         "expected a truncated-parity DataReadError, got {:?}",
         scan.errors,
     );
+    Ok(())
+}
+
+/// A syntactically valid but absurd shard layout (RS(1,255): every payload
+/// byte amplified 255x into parity) drives `expected_parity_len` toward
+/// `u32::MAX`. Combined with a lying TOC length (a forged or sparse SST), the
+/// walk would reserve the whole multi-GB trailer buffer BEFORE reporting any
+/// corruption. The trailer length must be capped like `data_length` is: over
+/// the cap it is `HeaderCorrupted`, reported without reserving anything.
+#[test]
+#[expect(
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation,
+    reason = "synthetic SFA forgery — offsets are in-bounds by construction (we wrote the \
+              bytes ourselves) and the archive is small, so the casts cannot overflow"
+)]
+fn walk_block_region_caps_an_absurd_parity_trailer_length() -> crate::Result<()> {
+    use crate::coding::Encode;
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::{BlockType, EccParams, Header, expected_parity_len};
+
+    // Trailer layout (38 bytes at the tail of an SFA archive):
+    //   MAGIC(4) | version(1) | csum_type(1) | toc_checksum(16) | toc_pos(8) | toc_len(8)
+    const TRAILER_LEN: usize = 4 + 1 + 1 + 16 + 8 + 8;
+    // 2 MiB of real payload: RS(1,255) turns that into a ~510 MiB claimed
+    // parity trailer — well over the 256 MiB hard cap.
+    const DATA_LENGTH: u32 = 2 * 1024 * 1024;
+    const HEADER_LEN: u64 = Header::MIN_LEN as u64;
+
+    let params = EccParams::try_new(1, 255).expect("a 1/255 shard layout parses");
+    let parity_len = u64::from(expected_parity_len(DATA_LENGTH, params));
+    assert!(
+        parity_len > u64::from(DATA_LENGTH) * 200,
+        "the forged scheme must amplify parity far past the payload",
+    );
+
+    let data = vec![0xABu8; DATA_LENGTH as usize];
+    let header = Header {
+        checksum: Checksum::from_raw(crate::hash::hash128(&data)),
+        data_length: DATA_LENGTH,
+        uncompressed_length: DATA_LENGTH,
+        ..Header::test_dummy(BlockType::Data)
+    };
+
+    // One `data` section: header + full payload, no parity bytes on disk.
+    let mut archive_bytes: Vec<u8> = Vec::new();
+    {
+        let mut writer = crate::sfa::Writer::from_writer(std::io::Cursor::new(&mut archive_bytes));
+        writer.start("data").unwrap();
+        writer.write_all(&header.encode_into_vec()).unwrap();
+        writer.write_all(&data).unwrap();
+        writer.finish().unwrap();
+    }
+
+    // Inflate the TOC section length to cover the claimed parity so the
+    // bounds check passes (the sparse-file / forged-TOC shape), recomputing
+    // the TOC checksum so crate::sfa::Reader still accepts the file.
+    let trailer_start = archive_bytes.len() - TRAILER_LEN;
+    let toc_pos = u64::from_le_bytes(
+        archive_bytes[trailer_start + 22..trailer_start + 30]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let toc_len = u64::from_le_bytes(
+        archive_bytes[trailer_start + 30..trailer_start + 38]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let len_field_offset = toc_pos + 4 + 4 + 8;
+    let lied_len: u64 = HEADER_LEN + u64::from(DATA_LENGTH) + parity_len;
+    archive_bytes[len_field_offset..len_field_offset + 8].copy_from_slice(&lied_len.to_le_bytes());
+    let new_toc_checksum = crate::hash::hash128(&archive_bytes[toc_pos..toc_pos + toc_len]);
+    let csum_field_offset = trailer_start + 4 + 1 + 1;
+    archive_bytes[csum_field_offset..csum_field_offset + 16]
+        .copy_from_slice(&new_toc_checksum.to_le_bytes());
+
+    let dir = tempfile::tempdir()?;
+    let fs = StdFs;
+    let forged = dir.path().join("forged-parity-cap.sst");
+    let path = forged.as_path();
+    {
+        let mut f = fs.open(
+            path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        f.write_all(&archive_bytes)?;
+    }
+
+    let table_id: TableId = 7;
+    let scan = scan_sst_blocks(&fs, path, table_id, 0, Some(params), false, 0)?;
+    assert!(
+        scan.errors.iter().any(|e| matches!(
+            e,
+            BlockVerifyError::HeaderCorrupted { table_id: t, offset: 0, reason, .. }
+                if *t == table_id && reason.contains("parity trailer length")
+        )),
+        "an over-cap parity trailer must be HeaderCorrupted without reserving \
+         the buffer, got {:?}",
+        scan.errors,
+    );
+    Ok(())
 }
 
 /// A block header whose own bytes extend past the section boundary must be
@@ -745,9 +1138,9 @@ fn walk_block_region_reports_data_read_error_on_truncated_parity_trailer() {
     reason = "synthetic SFA forgery — offsets are in-bounds by construction \
               and the forged archive is < 1 KiB"
 )]
-fn walk_block_region_reports_header_crossing_section_boundary() {
+fn walk_block_region_reports_header_crossing_section_boundary() -> crate::Result<()> {
     use crate::coding::Encode;
-    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::{BlockType, Header};
 
     const TRAILER_LEN: usize = 4 + 1 + 1 + 16 + 8 + 8;
@@ -767,7 +1160,10 @@ fn walk_block_region_reports_header_crossing_section_boundary() {
     let mut archive_bytes: Vec<u8> = Vec::new();
     {
         let mut writer = crate::sfa::Writer::from_writer(std::io::Cursor::new(&mut archive_bytes));
-        writer.start("data").unwrap();
+        // "meta", not "data": the section-vs-role cross-check would report
+        // a Meta block inside a data section as a SECOND error, and this
+        // test pins down exactly one (the boundary violation).
+        writer.start("meta").unwrap();
         writer.write_all(&header.encode_into_vec()).unwrap();
         writer.finish().unwrap();
     }
@@ -795,36 +1191,46 @@ fn walk_block_region_reports_header_crossing_section_boundary() {
     archive_bytes[csum_field_offset..csum_field_offset + 16]
         .copy_from_slice(&new_toc_checksum.to_le_bytes());
 
-    let fs = MemFs::new();
-    let path = std::path::Path::new("/forged-boundary.sst");
+    let dir = tempfile::tempdir()?;
+    let fs = StdFs;
+    let forged = dir.path().join("forged-boundary.sst");
+    let path = forged.as_path();
     {
-        let mut f = fs
-            .open(
-                path,
-                &FsOpenOptions::new().write(true).create(true).truncate(true),
-            )
-            .unwrap();
-        f.write_all(&archive_bytes).unwrap();
+        let mut f = fs.open(
+            path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        f.write_all(&archive_bytes)?;
     }
 
     let table_id: TableId = 7;
-    let scan = scan_sst_blocks(&fs, path, table_id, 0, None, false)
-        .expect("forged SFA must parse cleanly");
+    let scan = scan_sst_blocks(&fs, path, table_id, 0, None, false, 0)?;
+    // The shrunken section length ALSO breaks the TOC tiling invariant
+    // (the sections no longer reach the TOC start), so the walk reports
+    // the tiling finding alongside the boundary violation.
     assert_eq!(
         scan.errors.len(),
-        1,
-        "expected exactly one error, got {:?}",
+        2,
+        "expected the tiling finding plus the boundary violation, got {:?}",
         scan.errors,
     );
-    let err = scan.errors.first().unwrap();
     assert!(
-        matches!(
+        scan.errors
+            .iter()
+            .any(|e| matches!(e, BlockVerifyError::TocCorrupted { .. })),
+        "the shrunken section length must break the TOC tiling: {:?}",
+        scan.errors,
+    );
+    assert!(
+        scan.errors.iter().any(|err| matches!(
             err,
             BlockVerifyError::HeaderCorrupted { table_id: t, offset: 0, reason, .. }
                 if *t == table_id && reason.contains("extends past the section end"),
-        ),
-        "expected a section-boundary HeaderCorrupted; got {err:?}",
+        )),
+        "expected a section-boundary HeaderCorrupted; got {:?}",
+        scan.errors,
     );
+    Ok(())
 }
 
 /// Builds a tree with `batches` separate L0 SSTs (one flush per batch) so
@@ -951,6 +1357,72 @@ fn verify_checksum_with_throttle_completes_clean() {
         "throttled scrub must still verify clean: {report:?}"
     );
     assert!(report.sst_files_scanned >= 2);
+}
+
+/// Raw sections carry NO per-section checksum (the SFA trailer checksum
+/// covers only the TOC bytes), so the walk must at least STRUCTURALLY
+/// validate `linked_blob_files`: a corrupted count prefix would otherwise
+/// pass the walk clean, and a heal-enabled scrub could restamp the manifest
+/// digest over a broken blob-link list that blob GC / relocation then
+/// misreads.
+#[test]
+fn verify_sst_file_flags_a_corrupt_blob_link_count() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // A KV-separated tree: large values go to a blob file, the SST carries
+    // a linked_blob_files section.
+    let crate::AnyTree::Blob(tree) = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+    .open()
+    .unwrap() else {
+        unreachable!("kv separation configured");
+    };
+    let big = |i: u32| format!("{i:08}").repeat(512);
+    for i in 0u32..10 {
+        tree.insert(format!("key{i:05}"), big(i), u64::from(i) + 1);
+    }
+    tree.flush_active_memtable(10).unwrap();
+    let sst_path = {
+        let binding = tree.index.version_history.read().latest_version();
+        let table = binding
+            .version
+            .iter_tables()
+            .next()
+            .expect("flush produced one table");
+        (*table.path).clone()
+    };
+    drop(tree);
+
+    // Corrupt the section's u32 count prefix: the payload length no longer
+    // matches `4 + count * 32`.
+    let pos = {
+        let mut f = std::fs::File::open(&sst_path).unwrap();
+        let reader = crate::sfa::Reader::from_reader(&mut f).expect("SFA trailer reads");
+        let entry = reader
+            .toc()
+            .iter()
+            .find(|e| e.name() == b"linked_blob_files")
+            .expect("the SST carries a linked_blob_files section");
+        usize::try_from(entry.pos()).expect("section offset fits usize")
+    };
+    let mut bytes = std::fs::read(&sst_path).unwrap();
+    *bytes.get_mut(pos).expect("count prefix within the file") ^= 0xFF;
+    std::fs::write(&sst_path, &bytes).unwrap();
+
+    let report = verify_sst_file_with_fs(&crate::fs::StdFs, &sst_path);
+    assert!(
+        report.errors.iter().any(|e| matches!(
+            e,
+            BlockVerifyError::TocCorrupted { section_name, reason, .. }
+                if section_name == b"linked_blob_files" && reason.contains("blob-link count")
+        )),
+        "a corrupt blob-link count must fail the out-of-band walk, not be \
+         skipped as an unchecked raw section: {report:?}",
+    );
 }
 
 #[test]

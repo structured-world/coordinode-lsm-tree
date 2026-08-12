@@ -34,7 +34,12 @@ impl From<u128> for Timestamp {
     }
 }
 
-#[derive(Debug)]
+// `PartialEq`: the out-of-band verifier compares the two decoded meta
+// mirrors: a tail re-stamped to another internally-consistent payload is
+// detectable only by disagreeing with `meta_mid`. `Clone` lets that verifier
+// compare an ECC-masked copy ([`Self::without_ecc`]) without consuming the
+// original.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedMeta {
     pub id: TableId,
     pub created_at: Timestamp,
@@ -51,6 +56,23 @@ pub struct ParsedMeta {
     pub file_size: u64,
     pub item_count: u64,
     pub tombstone_count: u64,
+
+    /// Number of RANGE tombstones the writer emitted into the
+    /// `range_tombstones` section. Distinct from `tombstone_count` (point
+    /// deletes). Salvage cross-checks it against the parsed section: a `> 0`
+    /// count with no readable section means the section was hidden (renamed /
+    /// re-roled), so salvaging would resurrect the rows it masked.
+    pub range_tombstone_count: u64,
+
+    /// Number of positions in this table's `delete_bitmap` section, or `None`
+    /// for tables written before this field existed. The section is optional
+    /// (omitted when empty), so this authenticated count lets a reader detect a
+    /// re-stamped TOC that hid a non-empty bitmap (renamed it, or replaced it
+    /// with another valid optional section): a `Some(n)` with `n > 0` and no
+    /// readable delete-bitmap section is a forgery that would resurrect every
+    /// positionally-deleted row.
+    pub delete_bitmap_len: Option<u64>,
+
     pub weak_tombstone_count: u64,
     pub weak_tombstone_reclaimable: u64,
 
@@ -113,6 +135,12 @@ pub struct ParsedMeta {
     /// positional restart index when partial-decoding a block on the lazy read
     /// path (the restart heads sit every `data_block_restart_interval` entries).
     pub data_block_restart_interval: u8,
+
+    /// Restart interval the index blocks were encoded with. Not consumed on
+    /// the read path (index blocks decode without it), but persisted so a
+    /// layout-mirroring rewrite (salvage) reproduces the source's index
+    /// encoding instead of the writer default.
+    pub index_block_restart_interval: u8,
 
     /// Whether this SST's data blocks are column-organized (PAX) rather than
     /// row-major. Read from the optional `descriptor#columnar` property;
@@ -190,6 +218,24 @@ fn validated_restart_interval_index(restart_interval: u8) -> crate::Result<u8> {
 }
 
 impl ParsedMeta {
+    /// Returns `self` with the ECC-descriptor fields normalized to their
+    /// "no scheme" values (`page_ecc = false`, `ecc_params = None`,
+    /// `ecc_unrecognized = false`).
+    ///
+    /// The out-of-band mirror comparison uses this so two `meta` / `meta_mid`
+    /// copies diverge only on a NON-ECC field: an ECC-descriptor-only difference
+    /// (a lone unrecognized sibling, or a descriptor-only forge) is arbitrated
+    /// separately and must not by itself condemn a healthy table, while a change
+    /// to a correctness field like `created_at` still surfaces even when it hides
+    /// behind an unrecognized descriptor.
+    #[cfg(feature = "std")]
+    pub(crate) fn without_ecc(mut self) -> Self {
+        self.page_ecc = false;
+        self.ecc_params = None;
+        self.ecc_unrecognized = false;
+        self
+    }
+
     #[expect(clippy::too_many_lines)]
     pub fn load_with_handle(
         file: &dyn FsFile,
@@ -270,7 +316,7 @@ impl ParsedMeta {
             }
         }
 
-        let _index_block_restart_interval =
+        let index_block_restart_interval =
             validated_restart_interval_index(read_u8!(block, b"restart_interval#index", &cmp))?;
         // Data-block restart interval: needed to rebuild a positional restart
         // index when partial-decoding a block (lazy read path).
@@ -303,6 +349,7 @@ impl ParsedMeta {
         }
         let item_count = read_u64!(block, b"item_count", &cmp);
         let tombstone_count = read_u64!(block, b"tombstone_count", &cmp);
+        let range_tombstone_count = read_u64!(block, b"range_tombstone_count", &cmp);
         let data_block_count = read_u64!(block, b"block_count#data", &cmp);
         let index_block_count = read_u64!(block, b"block_count#index", &cmp);
         let _filter_block_count = read_u64!(block, b"block_count#filter", &cmp);
@@ -444,6 +491,7 @@ impl ParsedMeta {
         };
         let sum_user_key_bytes = read_opt_u64(b"key_bytes#sum")?;
         let sum_value_bytes = read_opt_u64(b"value_bytes#sum")?;
+        let delete_bitmap_len = read_opt_u64(b"descriptor#delete_bitmap_len")?;
 
         Ok(Self {
             id,
@@ -456,6 +504,8 @@ impl ParsedMeta {
             file_size,
             item_count,
             tombstone_count,
+            range_tombstone_count,
+            delete_bitmap_len,
             weak_tombstone_count,
             weak_tombstone_reclaimable,
             sum_user_key_bytes,
@@ -467,6 +517,7 @@ impl ParsedMeta {
             ecc_params,
             ecc_unrecognized,
             data_block_restart_interval,
+            index_block_restart_interval,
             columnar,
         })
     }

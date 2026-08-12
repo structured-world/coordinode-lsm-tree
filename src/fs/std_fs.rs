@@ -83,6 +83,20 @@ impl FsFile for File {
         })
     }
 
+    #[cfg(unix)]
+    fn hard_link_count(&self) -> io::Result<u64> {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(Self::metadata(self)?.nlink())
+    }
+
+    // `std` exposes the NTFS link count only behind the unstable
+    // `windows_by_handle` feature, so query the Win32 API directly (same
+    // dependency-free pattern as `available_space_sys` below).
+    #[cfg(windows)]
+    fn hard_link_count(&self) -> io::Result<u64> {
+        hard_link_count_sys::hard_link_count(self).map_err(io::Error::from)
+    }
+
     fn set_len(&self, size: u64) -> io::Result<()> {
         Self::set_len(self, size).map_err(io::Error::from)
     }
@@ -756,17 +770,17 @@ mod sys {
         #[expect(unsafe_code, reason = "LockFileEx FFI call with valid handle")]
         let ret = unsafe {
             LockFileEx(
-                handle as *mut std::ffi::c_void,
+                handle,
                 LOCKFILE_EXCLUSIVE_LOCK,
                 0,
                 u32::MAX,
                 u32::MAX,
-                &mut overlapped,
+                &raw mut overlapped,
             )
         };
 
         if ret == 0 {
-            return Err(std::io::Error::last_os_error().into());
+            return Err(std::io::Error::last_os_error());
         }
         Ok(())
     }
@@ -816,12 +830,12 @@ mod sys {
         #[expect(unsafe_code, reason = "LockFileEx FFI call with valid handle")]
         let ret = unsafe {
             LockFileEx(
-                handle as *mut std::ffi::c_void,
+                handle,
                 LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
                 0,
                 u32::MAX,
                 u32::MAX,
-                &mut overlapped,
+                &raw mut overlapped,
             )
         };
 
@@ -1255,6 +1269,61 @@ mod linux_caps {
 }
 
 // ---------------------------------------------------------------------------
+// Hard-link count probe (Windows)
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+mod hard_link_count_sys {
+    use std::io;
+    use std::os::windows::io::AsRawHandle as _;
+
+    /// `BY_HANDLE_FILE_INFORMATION` (Win32): 13 little-endian `DWORD`s. The
+    /// `FILETIME` pairs are flattened to `[u32; 2]` to keep the declaration
+    /// dependency-free; the layout is identical.
+    #[repr(C)]
+    #[allow(non_snake_case, reason = "Win32 API struct")]
+    #[derive(Default)]
+    struct ByHandleFileInformation {
+        dwFileAttributes: u32,
+        ftCreationTime: [u32; 2],
+        ftLastAccessTime: [u32; 2],
+        ftLastWriteTime: [u32; 2],
+        dwVolumeSerialNumber: u32,
+        nFileSizeHigh: u32,
+        nFileSizeLow: u32,
+        nNumberOfLinks: u32,
+        nFileIndexHigh: u32,
+        nFileIndexLow: u32,
+    }
+
+    // SAFETY (ABI): the signature matches the Win32
+    // `GetFileInformationByHandle` contract — a file handle plus an out
+    // pointer, returning a non-zero `BOOL` on success.
+    #[allow(non_snake_case, reason = "Win32 API signature")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(
+            hFile: *mut core::ffi::c_void,
+            lpFileInformation: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    pub(super) fn hard_link_count(file: &std::fs::File) -> io::Result<u64> {
+        let mut info = ByHandleFileInformation::default();
+        // SAFETY: the handle comes from a live `File` borrow; `info` is a
+        // valid out pointer; fields are read only on success.
+        #[expect(
+            unsafe_code,
+            reason = "GetFileInformationByHandle for the NTFS link count"
+        )]
+        let rc = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &raw mut info) };
+        if rc == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(u64::from(info.nNumberOfLinks))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Filesystem free-space probe
 // ---------------------------------------------------------------------------
 
@@ -1302,7 +1371,7 @@ mod available_space_sys {
         let rc = unsafe {
             GetDiskFreeSpaceExW(
                 wide.as_ptr(),
-                &mut avail,
+                &raw mut avail,
                 core::ptr::null_mut(),
                 core::ptr::null_mut(),
             )

@@ -524,6 +524,19 @@ impl CompactionFlavour for RelocatingCompaction {
                     "matched blob has different offset than vptr",
                 );
 
+                // A RESYNCHRONIZED frame was reached by a byte-wise scan after
+                // damage: its boundary is unproven (the magic may sit inside a
+                // damaged record's user-controlled bytes, and every frame chained
+                // past it inherits that unanchored start). Relocating it would
+                // rewrite fabricated bytes as a genuine record. `salvage_blob_file`
+                // drops such frames; relocation must fail closed the same way.
+                if blob_entry.resynced {
+                    return Err(crate::Error::InvalidHeader(
+                        "resynchronized blob frame reached after damage; refusing to \
+                         relocate a record whose boundary cannot be proven original",
+                    ));
+                }
+
                 // Advance the consumed frontier past this relocated frame so the
                 // tight-space loop can punch / resume here once the slice installs.
                 self.record_consumed(blob_file_id, blob_entry.frame_end);

@@ -132,9 +132,24 @@ impl IntegrityReport {
 /// whatever bytes are on disk; per-block checksums catch the actual damage).
 #[cfg(feature = "std")]
 pub(crate) fn stream_checksum(path: &std::path::Path) -> std::io::Result<Checksum> {
-    use std::io::Read;
+    stream_checksum_from(path, 0)
+}
+
+/// As [`stream_checksum`], but digests only `[start, end)`. A tight-space
+/// RESTRICTED table's `[0, punch_offset)` prefix is hole-punched (reads as
+/// zeros) once a superseding output owns those keys, so its manifest digest
+/// covers only the live suffix; verification must digest from the same `start`.
+#[cfg(feature = "std")]
+pub(crate) fn stream_checksum_from(
+    path: &std::path::Path,
+    start: u64,
+) -> std::io::Result<Checksum> {
+    use std::io::{Read, Seek, SeekFrom};
 
     let mut reader = std::fs::File::open(path)?;
+    if start != 0 {
+        reader.seek(SeekFrom::Start(start))?;
+    }
     let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
     let mut buf = vec![0u8; 64 * 1024];
 
@@ -183,7 +198,16 @@ pub fn verify_integrity(tree: &impl crate::AbstractTree) -> IntegrityReport {
         let path = &*table.path;
         let expected = table.checksum();
 
-        match stream_checksum(path) {
+        // A tight-space RESTRICTED view digests only its live suffix (the
+        // punched prefix reads as zeros and is not part of its identity). A
+        // block-index read failure while resolving the punch offset falls back
+        // to `0`, so the whole-file digest mismatches and the table is reported
+        // rather than silently passing.
+        let start = table
+            .restrict_lower_bound()
+            .and_then(|bound| table.punch_offset_for(bound).ok())
+            .unwrap_or(0);
+        match stream_checksum_from(path, start) {
             Ok(got) if got != expected => {
                 report.errors.push(IntegrityError::SstFileCorrupted {
                     table_id: table.id(),
@@ -310,6 +334,23 @@ pub enum BlockVerifyError {
         error: io::Error,
     },
 
+    /// A block's Page-ECC parity trailer did not match parity freshly
+    /// computed over its (checksum-clean) payload. The payload itself is
+    /// intact — but the block's ECC is dead: a later payload fault could no
+    /// longer be recovered from this trailer. Reported only when the payload
+    /// checksum matched (a corrupt payload legitimately mismatches the
+    /// original trailer and is already reported as `DataCorrupted`).
+    EccParityMismatch {
+        /// Table ID.
+        table_id: TableId,
+        /// Path to the SST file.
+        path: PathBuf,
+        /// File offset where the block header sits.
+        offset: u64,
+        /// Length of the on-disk data segment, in bytes.
+        data_length: u32,
+    },
+
     /// SFA TOC-level corruption: a named section's length / position
     /// fields are inconsistent (overflow on addition), or seeking to
     /// its declared start offset fails before any block is read.
@@ -384,6 +425,18 @@ impl core::fmt::Display for BlockVerifyError {
                  block at offset {offset}: {error}",
                 path.display(),
             ),
+            Self::EccParityMismatch {
+                table_id,
+                path,
+                offset,
+                data_length,
+            } => write!(
+                f,
+                "SST table {table_id} at {}: block at offset {offset} ({data_length} bytes) has a \
+                 clean payload but its ECC parity trailer does not match freshly computed parity \
+                 (dead ECC — recompact or heal in place)",
+                path.display(),
+            ),
             Self::TocCorrupted {
                 table_id,
                 path,
@@ -425,6 +478,20 @@ pub enum BlockVerifyWarning {
     /// verification was skipped for this table. Recompaction re-stamps the
     /// table with a supported scheme.
     UnrecognizedEcc {
+        /// Table the warning applies to.
+        table_id: TableId,
+        /// On-disk path of the SST.
+        path: PathBuf,
+    },
+
+    /// The table carries a RECOGNIZED Page-ECC scheme, but this build was
+    /// compiled without the ECC codecs (the `page_ecc` feature), so its parity
+    /// trailers were consumed for walk alignment but could NOT be verified.
+    /// Block payloads still verify by their own checksums — parity-only rot is
+    /// what stays invisible on this build. Verify on a `page_ecc`-enabled
+    /// build, or recompact (on this build the rewrite is parity-less) to leave
+    /// only verifiable bytes.
+    ParityUnverifiable {
         /// Table the warning applies to.
         table_id: TableId,
         /// On-disk path of the SST.
@@ -551,10 +618,45 @@ fn scan_one_table(table: &crate::table::Table) -> BlockVerifyReport {
         });
     }
 
+    // A recognized scheme on a build WITHOUT the ECC codecs: trailers are
+    // consumed for alignment but cannot be verified (parity-only rot stays
+    // invisible) — surface the gap, mirroring the out-of-band walk.
+    #[cfg(not(feature = "page_ecc"))]
+    if table.metadata.ecc_params.is_some() {
+        report
+            .warnings
+            .push(BlockVerifyWarning::ParityUnverifiable {
+                table_id,
+                path: path.to_path_buf(),
+            });
+    }
+
     // Use each Table's own `Fs` handle (StdFs, MemFs, IoUring, …).
     // Encryption overhead is per-table (different keys / AEAD suites can attach
     // to different SSTs), so feed each table's `max_overhead()` separately.
     let max_enc_overhead = table.encryption.as_ref().map_or(0u32, |e| e.max_overhead());
+    // A restricted view digests / walks only its live suffix: skip the punched
+    // data-block prefix. A TRANSIENT punch-offset lookup failure (a flaky
+    // partitioned-index read) is recorded as an unreadable-file I/O error and the
+    // walk is skipped — falling back to `0` would walk the hole-punched prefix and
+    // report its zeroed blocks as a false whole-file checksum mismatch on a
+    // healthy restricted table. A STRUCTURAL lookup failure still falls back to
+    // `0` (walk everything, fail closed) so a corrupt index cannot exempt blocks.
+    let data_start = match table.restrict_lower_bound() {
+        Some(bound) => match table.punch_offset_for(bound) {
+            Ok(offset) => offset,
+            Err(crate::Error::Io(error)) => {
+                report.errors.push(BlockVerifyError::SstFileUnreadable {
+                    table_id,
+                    path: path.to_path_buf(),
+                    error,
+                });
+                return report;
+            }
+            Err(_) => 0,
+        },
+        None => 0,
+    };
     match scan_sst_blocks(
         &*table.fs,
         path,
@@ -562,6 +664,7 @@ fn scan_one_table(table: &crate::table::Table) -> BlockVerifyReport {
         max_enc_overhead,
         table.metadata.ecc_params,
         ecc_unrecognized,
+        data_start,
     ) {
         Ok(per_file) => {
             report.blocks_scanned += per_file.blocks_scanned;
@@ -584,11 +687,11 @@ fn scan_one_table(table: &crate::table::Table) -> BlockVerifyReport {
 /// Pipeline per SST:
 ///
 /// 1. Open the file and parse the SFA trailer to obtain the TOC.
-/// 2. For each TOC section, skip if its name is in `RAW_FORMAT_SECTIONS`
-///    (those payloads are not `Header`-prefixed and are covered by the
-///    SFA-trailer checksum). Otherwise seek to the section's start
-///    offset and walk it as a contiguous block region in
-///    `[start, start + length)`.
+/// 2. For each TOC section, if its name is in `RAW_FORMAT_SECTIONS` (those
+///    payloads are not `Header`-prefixed and carry no per-section checksum)
+///    validate its structural shape instead of walking blocks. Otherwise
+///    seek to the section's start offset and walk it as a contiguous block
+///    region in `[start, start + length)`.
 /// 3. Inside each block region, decode each block's `Header` (which
 ///    validates the header's own XXH3), read the data segment, and
 ///    compare a fresh XXH3 over the data against `header.checksum`.
@@ -772,6 +875,37 @@ pub(crate) fn verify_sst_file_with_fs(
     fs: &dyn crate::fs::Fs,
     path: &std::path::Path,
 ) -> BlockVerifyReport {
+    verify_sst_file_with_context(fs, path, None, None, 0)
+}
+
+/// As [`verify_sst_file_with_fs`], but with an encryption context for
+/// ENCRYPTED SSTs and an optional caller-known durable table id. Block headers
+/// and payload checksums are plaintext, so the section walk itself needs no
+/// decryption — the provider (and the AAD-bound id) are used only to decode
+/// the meta block for the per-SST ECC descriptor. This makes the full
+/// out-of-band walk (every section, raw checksums — which flag even
+/// ECC-correctable persistent faults) available for encrypted tables, applying
+/// the same verification standard as the unencrypted path.
+///
+/// `known_table_id`: `Some` when the caller knows the durable id out-of-band
+/// (repair — the SST file name), enforcing the meta payload cross-check even
+/// on UNENCRYPTED reads so a checksum-clean forged tail meta falls back to the
+/// intact MID mirror instead of dictating a forged ECC descriptor to the walk;
+/// `None` for standalone tools with no id knowledge (reports then stamp
+/// `table_id = 0`).
+#[cfg(feature = "std")]
+pub(crate) fn verify_sst_file_with_context(
+    fs: &dyn crate::fs::Fs,
+    path: &std::path::Path,
+    encryption: Option<&dyn crate::encryption::EncryptionProvider>,
+    known_table_id: Option<crate::TableId>,
+    // Byte offset to start the DATA-section walk at: `0` for a normal table, the
+    // punch offset for a tight-space RESTRICTED view (its `[0, data_start)` data
+    // blocks were hole-punched and read as zeros). The caller supplies it because
+    // this path-based walk has no `Table` to derive the restriction from.
+    data_start: u64,
+) -> BlockVerifyReport {
+    let table_id = known_table_id.unwrap_or(0);
     let mut report = BlockVerifyReport {
         sst_files_scanned: 1,
         ..BlockVerifyReport::default()
@@ -785,22 +919,54 @@ pub(crate) fn verify_sst_file_with_fs(
     // the scan and reports spurious corruption. Surface the indeterminacy and
     // skip the walk.
     let mut ecc_unrecognized = false;
-    let ecc = match read_ecc_params_out_of_band(fs, path) {
-        Ok(Some(ScrubEcc::Off)) => None,
-        Ok(Some(ScrubEcc::Scheme(params))) => Some(params),
+    let probe = match read_ecc_params_out_of_band(fs, path, encryption, known_table_id) {
+        Ok(p) => p,
+        // Real file-open / SFA-trailer failure — preserve the underlying error
+        // rather than collapsing it into the undeterminable message below.
+        Err(error) => {
+            report.errors.push(BlockVerifyError::SstFileUnreadable {
+                table_id,
+                path: path.to_path_buf(),
+                error: error.into(),
+            });
+            return report;
+        }
+    };
+    // Both mirrors decode but their FULL metadata disagrees: one is
+    // forged/rotted to another internally-consistent payload (e.g. a changed
+    // compression tag with the ECC descriptor untouched). Every byte-level
+    // check passes on both, so this comparison is the only out-of-band
+    // detector — a recovery preferring the altered tail would misread every
+    // data block. Report and keep walking (block-level findings still add
+    // signal).
+    if probe.mirrors_diverge {
+        report.errors.push(BlockVerifyError::TocCorrupted {
+            table_id,
+            path: path.to_path_buf(),
+            section_name: b"meta".to_vec(),
+            section_offset: 0,
+            reason: alloc::string::String::from(
+                "the tail meta and meta_mid mirrors decode to different metadata; \
+                 one copy is forged or rotted behind a re-stamped checksum",
+            ),
+        });
+    }
+    let ecc = match probe.ecc {
+        Some(ScrubEcc::Off) => None,
+        Some(ScrubEcc::Scheme(params)) => Some(params),
         // The descriptor decodes to a scheme this build can't apply: the
         // SST-block trailer length isn't derivable, so those sections are
         // skipped during the walk. The self-describing `meta` / `meta_mid`
         // sections still size parity from `block_flags`, so corruption there
         // is NOT downgraded. Warn + continue (don't drop the whole scrub).
-        Ok(Some(ScrubEcc::Unrecognized)) => {
+        Some(ScrubEcc::Unrecognized) => {
             log::warn!(
                 "{}: unrecognized ECC scheme — skipping the ECC-dependent block \
                  sections; recompact to re-stamp with a supported scheme",
                 path.display(),
             );
             report.warnings.push(BlockVerifyWarning::UnrecognizedEcc {
-                table_id: 0,
+                table_id,
                 path: path.to_path_buf(),
             });
             ecc_unrecognized = true;
@@ -809,9 +975,9 @@ pub(crate) fn verify_sst_file_with_fs(
         // File + trailer readable, but neither meta block decodes (corrupt
         // meta, or an encrypted SST with no key out-of-band). The ECC scheme is
         // undeterminable; skip the walk rather than mis-walk an ECC-bearing SST.
-        Ok(None) => {
+        None => {
             report.errors.push(BlockVerifyError::SstFileUnreadable {
-                table_id: 0,
+                table_id,
                 path: path.to_path_buf(),
                 error: io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -823,26 +989,48 @@ pub(crate) fn verify_sst_file_with_fs(
             });
             return report;
         }
-        // Real file-open / SFA-trailer failure — preserve the underlying error
-        // rather than collapsing it into the undeterminable message above.
-        Err(error) => {
-            report.errors.push(BlockVerifyError::SstFileUnreadable {
-                table_id: 0,
-                path: path.to_path_buf(),
-                error: error.into(),
-            });
-            return report;
-        }
     };
 
-    match scan_sst_blocks(fs, path, 0, 0, ecc, ecc_unrecognized) {
+    // A recognized scheme on a build WITHOUT the ECC codecs: the trailers are
+    // consumed for walk alignment but cannot be verified, so parity-only rot
+    // stays invisible. Surface that as a warning — the repair gate requires a
+    // warning-free report, so such a table routes to salvage (whose rewrite is
+    // parity-less on this build, leaving only verifiable bytes) instead of
+    // being stamped into a rebuilt manifest with unchecked trailer bytes.
+    #[cfg(not(feature = "page_ecc"))]
+    if ecc.is_some() {
+        report
+            .warnings
+            .push(BlockVerifyWarning::ParityUnverifiable {
+                table_id,
+                path: path.to_path_buf(),
+            });
+    }
+
+    // Encrypted blocks legitimately exceed the plaintext data_length cap by
+    // up to the provider's AEAD overhead (mirroring `Block::from_file`); a
+    // zero here would false-flag a healthy encrypted block just over the cap
+    // as HeaderCorrupted and send the whole table to quarantine/salvage.
+    let max_enc_overhead =
+        encryption.map_or(0u32, crate::encryption::EncryptionProvider::max_overhead);
+    match scan_sst_blocks(
+        fs,
+        path,
+        table_id,
+        max_enc_overhead,
+        ecc,
+        ecc_unrecognized,
+        data_start,
+    ) {
         Ok(per_file) => {
             report.blocks_scanned = per_file.blocks_scanned;
-            report.errors = per_file.errors;
+            // extend, NOT assign: the mirror-divergence finding above must
+            // survive the block walk's own error list.
+            report.errors.extend(per_file.errors);
         }
         Err(error) => {
             report.errors.push(BlockVerifyError::SstFileUnreadable {
-                table_id: 0,
+                table_id,
                 path: path.to_path_buf(),
                 error,
             });
@@ -853,6 +1041,9 @@ pub(crate) fn verify_sst_file_with_fs(
 }
 
 /// Per-SST ECC state as seen by the out-of-band scrub.
+// `PartialEq` + `Copy`: the probe compares the states decoded from the two
+// meta copies to arbitrate a forged descriptor.
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg(feature = "std")]
 enum ScrubEcc {
     /// ECC off — no parity trailer to skip.
@@ -885,13 +1076,30 @@ enum ScrubEcc {
 fn read_ecc_params_out_of_band(
     fs: &dyn crate::fs::Fs,
     path: &std::path::Path,
-) -> std::io::Result<Option<ScrubEcc>> {
+    encryption: Option<&dyn crate::encryption::EncryptionProvider>,
+    known_table_id: Option<crate::TableId>,
+) -> std::io::Result<EccProbe> {
     let mut probe = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
     let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let toc = sfa_reader.toc();
-    // Tail `meta` is authoritative; `meta_mid` is the early mirror written so a
-    // single corrupt meta block doesn't lose the per-SST descriptor.
+    // Tail `meta` is authoritative for CONTENT; for the ECC descriptor the
+    // two copies ARBITRATE each other: a single forged copy (its table id
+    // intact, so the cross-check passes) must not dictate the walk's trailer
+    // sizing, whether the forge decodes to an unrecognized value or to a
+    // DIFFERENT recognized state (a forged `Off` would make the walk read
+    // parity bytes as block headers and condemn a healthy SST). Both copies
+    // are read; when two decodable copies disagree in ANY way the probe
+    // fails safe with `Unrecognized` (skip the ECC-dependent sections with a
+    // warning) — nothing out-of-band can tell which copy is legitimate.
+    let mut unrecognized_seen = false;
+    let mut recognized: Vec<ScrubEcc> = Vec::new();
+    // The FULL decoded mirrors: a tail re-stamped to another internally-consistent
+    // payload is detectable only by disagreeing with the intact `meta_mid`. Both
+    // are written from one parameter set, so any decoded difference is corruption
+    // or a forge. The divergence comparison below masks the ECC descriptor ONLY
+    // when a mirror is unrecognized; see `mirrors_diverge`.
+    let mut decoded: Vec<crate::table::meta::ParsedMeta> = Vec::new();
     for name in [b"meta".as_slice(), b"meta_mid".as_slice()] {
         let Some((pos, len)) = toc.section(name).map(|e| (e.pos(), e.len())) else {
             continue;
@@ -900,22 +1108,90 @@ fn read_ecc_params_out_of_band(
             continue;
         };
         let handle = crate::table::BlockHandle::new(crate::table::BlockOffset(pos), size);
-        // table_id is moot here: this scrub path reads unencrypted meta
-        // (encryption = None), so the AAD identity is unused.
-        if let Ok(meta) =
-            crate::table::meta::ParsedMeta::load_with_handle(probe.as_ref(), &handle, None, None)
-        {
-            let state = if meta.ecc_unrecognized {
-                ScrubEcc::Unrecognized
-            } else if let Some(params) = meta.ecc_params {
-                ScrubEcc::Scheme(params)
-            } else {
-                ScrubEcc::Off
-            };
-            return Ok(Some(state));
+        // The meta block is the ONLY read here that needs the provider: block
+        // HEADERS and payload checksums are plaintext, so the section walk
+        // below works on encrypted files without decrypting anything — only
+        // the ECC descriptor (inside the meta payload) requires decryption.
+        // The expected-id cross-check mirrors recovery's: enforced for
+        // encrypted reads (the AAD binds the id anyway) AND for unencrypted
+        // reads with a caller-known durable id — a checksum-clean forged tail
+        // then fails the check and this loop falls back to the intact MID
+        // mirror, instead of the forged tail dictating a wrong ECC descriptor
+        // to the walk. Only a standalone id-less diagnostic read skips it.
+        let expected_id = if encryption.is_some() {
+            Some(known_table_id.unwrap_or(0))
+        } else {
+            known_table_id
+        };
+        match crate::table::meta::ParsedMeta::load_with_handle(
+            probe.as_ref(),
+            &handle,
+            expected_id,
+            encryption,
+        ) {
+            Ok(meta) => {
+                if meta.ecc_unrecognized {
+                    unrecognized_seen = true;
+                } else {
+                    recognized.push(if let Some(params) = meta.ecc_params {
+                        ScrubEcc::Scheme(params)
+                    } else {
+                        ScrubEcc::Off
+                    });
+                }
+                // Keep the FULL decoded mirror; the divergence comparison below
+                // masks the ECC descriptor only when a mirror is unrecognized.
+                decoded.push(meta);
+            }
+            // A TRANSIENT read fault must not silently drop a mirror from
+            // arbitration: with one mirror gone the divergence check goes false
+            // and could admit an SST under the surviving (possibly forged) copy
+            // that a retry would expose. Propagate it; a STRUCTURAL decode failure
+            // keeps the existing fallback (skip this mirror).
+            Err(crate::Error::Io(e)) => return Err(e.into()),
+            Err(_) => {}
         }
     }
-    Ok(None)
+    // Two recognized mirrors are compared in FULL: a descriptor disagreement
+    // between two decodable schemes is a genuine forge. But when EITHER mirror
+    // carries an unrecognized descriptor, mask the ECC fields: the arbitration
+    // above tolerates a lone unrecognized sibling, so a descriptor-only forge
+    // must not condemn a healthy table, while a change to a real field (e.g.
+    // `created_at`) hidden behind that descriptor must still diverge.
+    let mirrors_diverge = match decoded.as_slice() {
+        [a, b] if unrecognized_seen => a.clone().without_ecc() != b.clone().without_ecc(),
+        [a, b] => a != b,
+        _ => false,
+    };
+    let ecc = match recognized.as_slice() {
+        // Two decodable copies that agree: trustworthy.
+        [a, b] if a == b => Some(*a),
+        // Two decodable copies that DISAGREE: one is forged/rotted and the
+        // probe cannot tell which — fail safe.
+        [_, _] => Some(ScrubEcc::Unrecognized),
+        // One decodable recognized copy: a lone unrecognized sibling does
+        // not override it (a descriptor-only forge must not condemn a
+        // healthy table whose mirror still holds the valid descriptor).
+        // A genuinely newer-scheme table with the OTHER mirror re-stamped to a
+        // recognized value would mis-size parity here; disambiguating the two by
+        // the block data (rather than trusting one descriptor) is tracked in
+        // issue #582.
+        [one] => Some(*one),
+        [] if unrecognized_seen => Some(ScrubEcc::Unrecognized),
+        [..] => None,
+    };
+    Ok(EccProbe {
+        ecc,
+        mirrors_diverge,
+    })
+}
+
+/// Result of [`read_ecc_params_out_of_band`]: the arbitrated ECC state plus
+/// whether the two FULLY-decoded meta mirrors disagree in any field.
+#[cfg(feature = "std")]
+struct EccProbe {
+    ecc: Option<ScrubEcc>,
+    mirrors_diverge: bool,
 }
 
 struct PerFileScan {
@@ -937,6 +1213,12 @@ fn scan_sst_blocks(
     max_enc_overhead: u32,
     ecc: Option<crate::table::block::EccParams>,
     ecc_unrecognized: bool,
+    // Byte offset to START the DATA-section walk at: `0` for a normal table, or
+    // the punch offset of a tight-space RESTRICTED view whose `[0, data_start)`
+    // data blocks were hole-punched (they read as zeros and would false-flag as
+    // corruption). All other sections (index, meta, TLI …) sit past the data
+    // region and are always walked in full.
+    data_start: u64,
 ) -> io::Result<PerFileScan> {
     use io::BufReader;
     #[cfg(not(feature = "std"))]
@@ -985,28 +1267,98 @@ fn scan_sst_blocks(
     //   - `meta`              : block-format (metadata, authoritative)
     //
     // Block-format sections are walked block-by-block (each block
-    // prefixed with the standard `Header`). Raw-format sections are
-    // skipped — their integrity is covered by the SFA-trailer
-    // checksum verified at table-open time. New section names default
-    // to "walk" (must be added to `RAW_FORMAT_SECTIONS` if they're
-    // raw), so a forgotten-to-handle section fails loud rather than
-    // silently passing a corruption.
+    // prefixed with the standard `Header`). Raw-format sections carry
+    // NO per-section checksum (the SFA-trailer checksum covers only
+    // the TOC bytes), so they get structural shape validation via
+    // `raw_section_shape_error` instead of a block walk. New section
+    // names default to "walk" (must be added to `RAW_FORMAT_SECTIONS`
+    // if they're raw), so a forgotten-to-handle section fails loud
+    // rather than silently passing a corruption.
 
     let mut reader = BufReader::with_capacity(64 * 1024, file);
     let mut blocks_scanned: usize = 0;
     let mut errors: Vec<BlockVerifyError> = Vec::new();
+
+    // The writer emits sections strictly back-to-back (the first at offset 0,
+    // each next where the previous ended, the last ending where the TOC
+    // begins), so the entries must exactly tile `[0, toc_pos)`. The SFA
+    // trailer checksum is unkeyed, so a re-stamped TOC could otherwise OMIT a
+    // correctness-bearing entry entirely — `delete_bitmap` and
+    // `range_tombstones` are optional at parse time, so a vanished section
+    // resurrects deleted rows while every remaining block still passes its
+    // byte-level checks. The tiling gap the omission leaves is the only
+    // out-of-band trace; report it and keep walking the sections that ARE
+    // present (their findings are still valid).
+    // Classify catalogue-structure defects (duplicate / shadowing names, tiling
+    // gaps, unrecognized names, a trailing hole) through the SAME pass
+    // `toc_may_hide_deletion_section` uses, so the walk's `TocCorrupted` findings
+    // and the salvage-verdict concealment check can never diverge. A re-stamped
+    // TOC that duplicates a recognized name, or renames a section to hide it,
+    // preserves the byte-level checks yet steers `Toc::section` / `ParsedRegions`
+    // away from the real section — resurrecting the range it masked.
+    for defect in toc_catalogue_defects(toc, sfa_reader.toc_pos()) {
+        errors.push(BlockVerifyError::TocCorrupted {
+            table_id,
+            path: path.to_path_buf(),
+            section_name: defect.name,
+            section_offset: defect.offset,
+            reason: defect.reason,
+        });
+    }
     // One reusable data buffer across the whole SST — sized up via
     // `resize` per block instead of a fresh `vec![0u8; N]` allocation
     // each iteration. On large trees this turns thousands of malloc
     // calls into a single growing allocation that settles at the
     // largest block size seen.
     let mut data_buf: Vec<u8> = Vec::new();
+    // Same story for the Page-ECC parity trailer (read for alignment and,
+    // when the codecs are compiled in, verified against fresh parity).
+    let mut parity_buf: Vec<u8> = Vec::new();
 
     for entry in toc.iter() {
         if RAW_FORMAT_SECTIONS.contains(&entry.name()) {
+            // Raw sections carry NO per-section checksum (the SFA trailer
+            // checksum covers only the TOC bytes), so validate their SHAPE
+            // where one is defined; a heal-enabled scrub relies on this walk
+            // before restamping the manifest digest, and skipping a broken
+            // blob-link list would launder it. Rot INSIDE a structurally
+            // valid payload (a flipped id byte) remains undetectable here —
+            // these sections have no integrity bytes to check against.
+            match raw_section_shape_error(&mut reader, entry.name(), entry.pos(), entry.len()) {
+                Ok(Some(reason)) => {
+                    errors.push(BlockVerifyError::TocCorrupted {
+                        table_id,
+                        path: path.to_path_buf(),
+                        section_name: entry.name().to_vec(),
+                        section_offset: entry.pos(),
+                        reason,
+                    });
+                }
+                Ok(None) => {}
+                // A transient read validating a raw section is retryable I/O, not
+                // corruption: record it as a DataReadError the repair verdict aborts on.
+                Err(e) => {
+                    errors.push(BlockVerifyError::DataReadError {
+                        table_id,
+                        path: path.to_path_buf(),
+                        offset: entry.pos(),
+                        data_length: 0,
+                        error: e,
+                    });
+                }
+            }
             continue;
         }
-        let start = entry.pos();
+        // A restricted view's punched data-block prefix reads as zeros; start
+        // the DATA walk at `data_start` so those blocks are not framed (only the
+        // data section is punched — every other section is walked in full). The
+        // straddling block at `data_start` is intact (the punch begins at its
+        // boundary), so `start.max(data_start)` lands on a real block header.
+        let start = if entry.name() == b"data" {
+            entry.pos().max(data_start)
+        } else {
+            entry.pos()
+        };
         // `checked_add` (not `saturating_add`) so a corrupted or
         // forged TOC length cannot silently collapse to `u64::MAX`
         // and let the walk treat the whole address space as one
@@ -1016,7 +1368,7 @@ fn scan_sst_blocks(
         // `TocCorrupted` rather than `HeaderCorrupted` because the
         // failure is at the section-catalogue layer, not inside any
         // individual block.
-        let Some(end) = start.checked_add(entry.len()) else {
+        let Some(end) = entry.pos().checked_add(entry.len()) else {
             errors.push(BlockVerifyError::TocCorrupted {
                 table_id,
                 path: path.to_path_buf(),
@@ -1029,33 +1381,42 @@ fn scan_sst_blocks(
             });
             continue;
         };
-        // Mid-walk seek failure: don't propagate as a file-level Err
-        // (that would discard everything already scanned and report
-        // the whole SST as unreadable, which contradicts the
-        // function's contract). Surface as a `TocCorrupted` for this
-        // section and skip walking it; subsequent sections still run.
-        // Again `TocCorrupted` (not `HeaderCorrupted`): we never even
-        // reached a block to decode its header.
+        // Mid-walk seek failure: a forged offset still seeks fine, so a seek
+        // failure is a TRANSIENT I/O fault, not catalogue corruption. Record it as
+        // a `DataReadError` (which carries the I/O kind) so the repair verdict
+        // treats it as retryable and aborts, rather than routing a healthy SST
+        // through salvage over a flaky read. Keep walking other sections (the
+        // finding still surfaces; the caller decides).
         if let Err(e) = reader.seek(SeekFrom::Start(start)) {
-            errors.push(BlockVerifyError::TocCorrupted {
+            errors.push(BlockVerifyError::DataReadError {
                 table_id,
                 path: path.to_path_buf(),
-                section_name: entry.name().to_vec(),
-                section_offset: start,
-                reason: format!("seek to section start failed: {e}"),
+                offset: start,
+                data_length: 0,
+                error: e.into(),
             });
             continue;
         }
+        // Skip a section name this build does not know: its role expectation is
+        // unknowable, so a walk would prove nothing. `toc_catalogue_defects`
+        // above already reported it as a `TocCorrupted` finding (a re-stamped
+        // TOC can RENAME a known section out of every reader's sight while its
+        // blocks still pass their byte-level checks).
+        let Some(expected_roles) = expected_section_roles(entry.name()) else {
+            continue;
+        };
         let mut ctx = WalkCtx {
             reader: &mut reader,
             table_id,
             path,
             data_buf: &mut data_buf,
+            parity_buf: &mut parity_buf,
             blocks_scanned: &mut blocks_scanned,
             errors: &mut errors,
             max_data_length: block_data_length_cap(max_enc_overhead),
             ecc,
             ecc_unrecognized,
+            expected_roles,
         };
         walk_block_region(&mut ctx, start, end);
     }
@@ -1067,13 +1428,14 @@ fn scan_sst_blocks(
 }
 
 /// SFA TOC section names whose payload is NOT a sequence of `Block`s
-/// (i.e. NOT prefixed with the standard `Header`). The scrub skips
-/// these sections — their integrity is covered by the SFA-trailer
-/// checksum verified at table-open time. Every other section
-/// (`data` / `tli` / `tli_tail` / `index` / `filter_tli` / `filter` /
-/// `range_tombstones` / `meta` / `meta_mid`) is a `Header`-prefixed
-/// block run and gets walked. See `scan_sst_blocks` for the full
-/// section catalogue and the writer-side source of truth.
+/// (i.e. NOT prefixed with the standard `Header`). These sections carry NO
+/// per-section checksum (the SFA-trailer checksum covers only the TOC
+/// bytes), so the walk validates their SHAPE via
+/// [`raw_section_shape_error`] instead of decoding blocks. Every other
+/// section (`data` / `tli` / `tli_tail` / `index` / `filter_tli` /
+/// `filter` / `range_tombstones` / `meta` / `meta_mid`) is a
+/// `Header`-prefixed block run and gets walked. See `scan_sst_blocks` for
+/// the full section catalogue and the writer-side source of truth.
 ///
 /// `meta_separator` is the 4 KiB zero-padding section the writer
 /// emits between the MID and TAIL meta blocks so a single bad
@@ -1082,6 +1444,223 @@ fn scan_sst_blocks(
 /// to decode zeros as a `Header` and report a spurious
 /// `HeaderCorrupted` on every clean SST.
 const RAW_FORMAT_SECTIONS: &[&[u8]] = &[b"linked_blob_files", b"table_version", b"meta_separator"];
+
+/// Block ROLE(S) the writer emits into each named block-format SFA section.
+/// The walk cross-checks every decoded header against its section: a
+/// checksum-clean block whose `block_type` was re-stamped (a filter block
+/// relabeled as Data) passes every byte-level check, so this is the only
+/// out-of-band detector before the heal's digest reconciliation would
+/// launder the forge into the manifest.
+///
+/// `None` for a section name this build does not know — the CALLER fails
+/// closed on it (an error, not a skipped check): the SFA trailer checksum is
+/// unkeyed, so a re-stamped TOC can RENAME a known section (hiding it from
+/// every reader — vanished range tombstones resurrect deleted ranges) while
+/// each block inside still passes its byte-level checks. A future section
+/// name therefore requires extending this map in the same change that adds
+/// the writer section.
+///
+/// This role check is BYTE-LEVEL only. A section whose block is
+/// checksum-clean and correctly-roled but whose PAYLOAD was re-stamped to
+/// another structurally valid value (a redirected `locator`, a shrunk
+/// `zone_map` range, a widened `seqno_bounds`) passes here yet still lies to
+/// the read path. Those SEMANTIC cross-checks — comparing the section's
+/// decoded content against the blocks it summarizes — live on `Table`
+/// (`verify_locator` / `verify_zone_map` / `verify_seqno_bounds` /
+/// `verify_tli_mirrors` / `verify_block_entry_counts`) and are driven by the
+/// repair verdict and the heal digest reconciliation, not by this walk.
+fn expected_section_roles(name: &[u8]) -> Option<&'static [crate::table::block::BlockType]> {
+    use crate::table::block::BlockType;
+    Some(match name {
+        b"data" => &[BlockType::Data, BlockType::Columnar],
+        // `filter_tli` is the top-level index OVER filter partitions — the
+        // writer emits it with the Index role (same encoding as the data
+        // TLI), so expecting Filter here would flag a healthy
+        // partitioned-filter SST as corrupt.
+        b"index" | b"tli" | b"tli_tail" | b"filter_tli" => &[BlockType::Index],
+        b"filter" => &[BlockType::Filter],
+        b"range_tombstones" => &[BlockType::RangeTombstone],
+        b"meta" | b"meta_mid" => &[BlockType::Meta],
+        b"block_layout" => &[BlockType::BlockLayout],
+        b"seqno_bounds" => &[BlockType::SeqnoBounds],
+        b"zone_map" => &[BlockType::ZoneMap],
+        b"delete_bitmap" => &[BlockType::DeleteBitmap],
+        b"locator" => &[BlockType::Locator],
+        _ => return None,
+    })
+}
+
+/// One structural defect in the SFA TOC catalogue: a section a reader could not
+/// reach or that hides another. Carries the offending entry's name, its declared
+/// offset, and a human-readable reason.
+struct TocCatalogueDefect {
+    name: Vec<u8>,
+    offset: u64,
+    reason: String,
+}
+
+/// Classifies every structural defect in the TOC catalogue in one pass: a
+/// duplicate / shadowing name, a gap in the `[0, toc_pos)` tiling, an
+/// unrecognized (renamed) name, or a trailing hole. Empty when the catalogue
+/// tiles the whole data region with unique, recognized names.
+///
+/// The single source of truth for what a valid catalogue looks like:
+/// [`scan_sst_blocks`] turns each defect into a `TocCorrupted` finding and
+/// [`toc_may_hide_deletion_section`] fails closed on any, so the two can never
+/// disagree. The recognized-name set is `expected_section_roles` ∪
+/// [`RAW_FORMAT_SECTIONS`]. A `pos + len` overflow stops the tiling scan (the
+/// per-section walk reports that entry via its own `checked_add`), so it is not
+/// duplicated here.
+fn toc_catalogue_defects(toc: &crate::sfa::Toc, toc_pos: u64) -> Vec<TocCatalogueDefect> {
+    let mut defects = Vec::new();
+    let mut expected_pos: u64 = 0;
+    // A handful of section names — a linear scan keeps this no-std-clean.
+    let mut seen: Vec<&[u8]> = Vec::new();
+    for entry in toc.iter() {
+        let name = entry.name();
+        if seen.contains(&name) {
+            defects.push(TocCatalogueDefect {
+                name: name.to_vec(),
+                offset: entry.pos(),
+                reason: format!(
+                    "duplicate TOC section name {:?}; a renamed section can shadow \
+                     another and hide it from the readers that look it up by name",
+                    alloc::string::String::from_utf8_lossy(name),
+                ),
+            });
+        } else {
+            seen.push(name);
+        }
+        if entry.pos() != expected_pos {
+            defects.push(TocCatalogueDefect {
+                name: name.to_vec(),
+                offset: entry.pos(),
+                reason: format!(
+                    "section starts at {} but the previous section ended at \
+                     {expected_pos}; the gap hides an omitted TOC entry",
+                    entry.pos(),
+                ),
+            });
+        }
+        if expected_section_roles(name).is_none() && !RAW_FORMAT_SECTIONS.contains(&name) {
+            defects.push(TocCatalogueDefect {
+                name: name.to_vec(),
+                offset: entry.pos(),
+                reason: String::from(
+                    "unrecognized block-format section name; a renamed TOC entry \
+                     hides a known section from every reader",
+                ),
+            });
+        }
+        let Some(end) = entry.pos().checked_add(entry.len()) else {
+            expected_pos = u64::MAX;
+            break;
+        };
+        expected_pos = end;
+    }
+    if expected_pos != toc_pos {
+        defects.push(TocCatalogueDefect {
+            name: b"<tiling>".to_vec(),
+            offset: expected_pos,
+            reason: format!(
+                "sections end at {expected_pos} but the TOC begins at {toc_pos}; a \
+                 trailing TOC entry was omitted or truncated",
+            ),
+        });
+    }
+    defects
+}
+
+/// Whether the SST's TOC catalogue could HIDE an optional deletion section
+/// (`range_tombstones` / `delete_bitmap`) from the name-based readers. These
+/// sections are optional at parse time, so an unkeyed re-stamp that OMITS,
+/// RENAMES, or SHADOWS one leaves the parsed table reporting no deletions
+/// while every remaining block still passes its byte-level checks — a positional
+/// salvage would then re-emit the suppressed rows as live.
+///
+/// Returns `true` for the concealment classes: a duplicate/shadowing name, a
+/// gap or trailing hole in the `[0, toc_pos)` tiling, an unrecognized (renamed)
+/// name, or a length overflow. Returns `false` only when the catalogue tiles
+/// the whole data region with UNIQUE, RECOGNIZED names — then no section is
+/// hidden and the physical absence of any deletion section is established.
+///
+/// The recognized-name set mirrors the walk in [`scan_sst_blocks`] exactly
+/// (`expected_section_roles` ∪ [`RAW_FORMAT_SECTIONS`]), so a healthy table
+/// grades `false`.
+///
+/// Consumed by salvage-mode repair: a `Corrupt` verdict caused by one of these
+/// classes must be QUARANTINED, not salvaged, because the positional salvage
+/// walk reopens the same forged catalogue and resurrects the suppressed rows.
+///
+/// This catches only concealment that DISTURBS the catalogue (a missing,
+/// duplicated, or unrecognized name, or a tiling gap). A relabel that keeps the
+/// catalogue uniquely named and perfectly tiled — a deletion section RENAMED to
+/// an unused recognized name with its block re-roled — grades `false` here; it
+/// is caught instead inside salvage, which fails closed when the open degrades a
+/// rebuildable section that did not decode as its claimed type (see
+/// `Table::salvage_degraded_a_rebuildable_section`).
+pub(crate) fn toc_may_hide_deletion_section(toc: &crate::sfa::Toc, toc_pos: u64) -> bool {
+    !toc_catalogue_defects(toc, toc_pos).is_empty()
+}
+
+/// Structural validation for the raw (non-block-format) sections; returns a
+/// human-readable reason when the section's payload cannot have the shape
+/// the writer emits.
+///
+/// - `linked_blob_files`: `u32 count` followed by `count` fixed 32-byte
+///   records — the length must be exactly `4 + count * 32`.
+/// - `table_version`: exactly one byte.
+/// - `meta_separator`: pure padding, any content is acceptable.
+///
+/// This is SHAPE validation only: these sections carry no checksum, so rot
+/// inside a structurally valid payload is undetectable out-of-band.
+///
+/// `Err` is a TRANSIENT read/seek fault (retryable I/O), kept distinct from a
+/// structural shape defect (`Ok(Some(reason))`) so the caller can route it to an
+/// I/O finding the repair verdict treats as retryable rather than as corruption.
+fn raw_section_shape_error(
+    reader: &mut io::BufReader<Box<dyn crate::fs::FsFile>>,
+    name: &[u8],
+    pos: u64,
+    len: u64,
+) -> Result<Option<String>, io::Error> {
+    use alloc::string::ToString as _;
+    #[cfg(not(feature = "std"))]
+    use io::{Read as _, Seek as _, SeekFrom};
+    #[cfg(feature = "std")]
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    match name {
+        b"linked_blob_files" => {
+            if len < 4 {
+                return Ok(Some(format!(
+                    "linked_blob_files section is {len} bytes, too short for its count prefix"
+                )));
+            }
+            reader.seek(SeekFrom::Start(pos))?;
+            let mut count_le = [0u8; 4];
+            reader.read_exact(&mut count_le)?;
+            let count = u64::from(u32::from_le_bytes(count_le));
+            // 4 fixed u64 fields per record.
+            let expected = count
+                .checked_mul(32)
+                .and_then(|records| records.checked_add(4));
+            if expected != Some(len) {
+                return Ok(Some(format!(
+                    "blob-link count {count} disagrees with the section length {len} \
+                     (expected {} bytes)",
+                    expected.map_or_else(|| "overflowing".to_string(), |e| e.to_string()),
+                )));
+            }
+            Ok(None)
+        }
+        b"table_version" => {
+            Ok((len != 1).then(|| format!("table_version section is {len} bytes, expected 1")))
+        }
+        // Padding: carries no data, nothing to validate.
+        _ => Ok(None),
+    }
+}
 
 /// Plaintext upper bound on a single block's on-disk data segment
 /// length, mirroring `table::block::MAX_DECOMPRESSION_SIZE` (256 MiB).
@@ -1116,6 +1695,10 @@ struct WalkCtx<'a> {
     table_id: TableId,
     path: &'a Path,
     data_buf: &'a mut Vec<u8>,
+    /// Reused buffer for each block's Page-ECC parity trailer: consumed for
+    /// walk alignment and, on a build with the ECC codecs, verified against
+    /// parity freshly recomputed over the payload.
+    parity_buf: &'a mut Vec<u8>,
     blocks_scanned: &'a mut usize,
     errors: &'a mut Vec<BlockVerifyError>,
     /// Effective `data_length` cap (plaintext limit + AEAD overhead).
@@ -1139,6 +1722,12 @@ struct WalkCtx<'a> {
     /// skipped (the caller warns once). Self-describing sections (`meta` /
     /// `meta_mid`) still size parity from `block_flags` and ARE walked.
     ecc_unrecognized: bool,
+    /// Roles the current section's blocks may legitimately carry (from
+    /// [`expected_section_roles`]; the caller fails closed on an unknown
+    /// name before building this context). A decoded header whose
+    /// `block_type` is not in the list is reported — see the helper's docs
+    /// for why this check is load-bearing.
+    expected_roles: &'static [crate::table::block::BlockType],
 }
 
 fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) {
@@ -1179,6 +1768,19 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         }
         let header = match Header::decode_from(ctx.reader) {
             Ok(h) => h,
+            // A TRANSIENT read fault decoding the header is retryable, not
+            // corruption: record it as a DataReadError so the repair verdict
+            // aborts instead of salvaging a healthy table over a flaky read.
+            Err(crate::Error::Io(e)) => {
+                ctx.errors.push(BlockVerifyError::DataReadError {
+                    table_id: ctx.table_id,
+                    path: ctx.path.to_path_buf(),
+                    offset,
+                    data_length: 0,
+                    error: e,
+                });
+                return;
+            }
             Err(e) => {
                 ctx.errors.push(BlockVerifyError::HeaderCorrupted {
                     table_id: ctx.table_id,
@@ -1200,6 +1802,23 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         // decides the whole section.
         if ctx.ecc_unrecognized && !Header::has_block_flags(header.block_type) {
             return;
+        }
+
+        // Role cross-check: a checksum-clean block whose `block_type` was
+        // re-stamped (a filter block relabeled as Data) passes every
+        // byte-level check below, so the section-vs-role comparison is the
+        // only out-of-band detector. Reported and then walked normally —
+        // the header is internally valid, so the offsets stay trustworthy.
+        if !ctx.expected_roles.contains(&header.block_type) {
+            ctx.errors.push(BlockVerifyError::HeaderCorrupted {
+                table_id: ctx.table_id,
+                path: ctx.path.to_path_buf(),
+                offset,
+                reason: format!(
+                    "block role {:?} does not belong to this section (expected one of {:?})",
+                    header.block_type, ctx.expected_roles,
+                ),
+            });
         }
 
         // Count the block as "header-read" immediately on successful
@@ -1241,6 +1860,25 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
                 scheme,
             ))
         });
+        // Hard cap on the parity trailer, mirroring the data_length cap
+        // below: a syntactically valid but absurd shard layout (e.g.
+        // RS(1,255), every payload byte amplified 255x into parity) drives
+        // `expected_parity_len` toward its u32::MAX saturation point, and a
+        // lying TOC length (forged, or a sparse file) would let the buffered
+        // verify reserve that whole multi-GB trailer before any corruption
+        // is reported. No real configuration produces a trailer above the
+        // payload cap itself.
+        if parity_len > MAX_BLOCK_DATA_LENGTH {
+            ctx.errors.push(BlockVerifyError::HeaderCorrupted {
+                table_id: ctx.table_id,
+                path: ctx.path.to_path_buf(),
+                offset,
+                reason: format!(
+                    "parity trailer length {parity_len} exceeds hard cap {MAX_BLOCK_DATA_LENGTH}",
+                ),
+            });
+            return;
+        }
 
         // Validate data_length against TWO bounds before allocating
         // / reading:
@@ -1335,7 +1973,8 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         }
 
         let computed = Checksum::from_raw(crate::hash::hash128(ctx.data_buf));
-        if computed != header.checksum {
+        let payload_clean = computed == header.checksum;
+        if !payload_clean {
             ctx.errors.push(BlockVerifyError::DataCorrupted {
                 table_id: ctx.table_id,
                 path: ctx.path.to_path_buf(),
@@ -1347,58 +1986,57 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         }
 
         // Consume the parity trailer (if any) so the reader cursor lands on
-        // the next block's header. The payload checksum above already covers
-        // correctness; parity is only consulted for ECC recovery on the live
-        // read path, so the scrub discards it — but it MUST still skip exactly
-        // `parity_len` bytes or the next iteration mis-reads parity as a header.
+        // the next block's header — it MUST advance exactly `parity_len` bytes
+        // or the next iteration mis-reads parity as a header. The trailer is
+        // read into a buffer (not drained) so a build with the ECC codecs can
+        // also VERIFY it: the payload checksum never covers the trailer, so
+        // rot confined to parity reads as a clean block while its ECC is dead.
         if parity_len > 0 {
-            // Discard the parity trailer so the cursor lands on the next block's
-            // header. `crate::io` has no `copy`/`sink`, so drain exactly
-            // `parity_len` bytes through a small scratch buffer.
-            let mut scratch = [0u8; 512];
-            let mut remaining = parity_len;
-            // A short read (EOF before `parity_len`) and an underlying read error
-            // are the same outcome for the scrub: the trailer cannot be skipped,
-            // so collapse both into one `Err` and report a single DataReadError.
-            let drain: io::Result<()> = loop {
-                if remaining == 0 {
-                    break Ok(());
-                }
-                let want =
-                    usize::try_from(remaining.min(scratch.len() as u64)).unwrap_or(scratch.len());
-                let (head, _) = scratch.split_at_mut(want);
-                match ctx.reader.read(head) {
-                    Ok(0) => {
-                        break Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            alloc::format!(
-                                "parity trailer truncated: read {} of {parity_len} bytes",
-                                parity_len - remaining
-                            ),
-                        ));
-                    }
-                    Ok(n) => remaining -= n as u64,
-                    Err(e) => {
-                        // EINTR is transient: retry the read rather than aborting
-                        // the parity skip with a spurious DataReadError (matches
-                        // the Interrupted handling in read_exact above). Convert
-                        // first so the kind check is uniform across std/no_std.
-                        let e: io::Error = e.into();
-                        if e.kind() != io::ErrorKind::Interrupted {
-                            break Err(e);
-                        }
-                    }
-                }
-            };
-            if let Err(error) = drain {
+            let parity_usize = usize::try_from(parity_len).unwrap_or(usize::MAX);
+            ctx.parity_buf.resize(parity_usize, 0);
+            // A short read (EOF before `parity_len`) and an underlying read
+            // error are the same outcome for the scrub: the trailer cannot be
+            // consumed, so report a single DataReadError. (`read_exact`
+            // retries `Interrupted` internally.)
+            if let Err(e) = ctx.reader.read_exact(ctx.parity_buf.as_mut_slice()) {
                 ctx.errors.push(BlockVerifyError::DataReadError {
                     table_id: ctx.table_id,
                     path: ctx.path.to_path_buf(),
                     offset,
                     data_length: header.data_length,
-                    error,
+                    error: e.into(),
                 });
                 return;
+            }
+            // Compare the stored trailer against parity freshly computed over
+            // the payload — only when the payload itself is checksum-clean (a
+            // corrupt payload legitimately mismatches its original trailer and
+            // is already reported as DataCorrupted above). Only a build with
+            // the ECC codecs can recompute parity; without `page_ecc` the
+            // trailer is consumed for alignment but stays unverified (that
+            // build cannot consume it on the read path either).
+            #[cfg(feature = "page_ecc")]
+            if payload_clean && let Some(scheme) = block_ecc {
+                let fresh = match scheme {
+                    crate::table::block::EccParams::Secded => {
+                        Some(crate::secded::encode_block_parity(ctx.data_buf))
+                    }
+                    crate::table::block::EccParams::Shard { .. } => {
+                        let (ds, ps) = scheme.as_shards();
+                        crate::ecc::encode_parity(ctx.data_buf, ds, ps).ok()
+                    }
+                };
+                // An encoder that rejects a shape the writer accepted, or a
+                // trailer that differs from the recomputed parity, both mean
+                // the block's ECC cannot be trusted — fail loud either way.
+                if fresh.as_deref() != Some(ctx.parity_buf.as_slice()) {
+                    ctx.errors.push(BlockVerifyError::EccParityMismatch {
+                        table_id: ctx.table_id,
+                        path: ctx.path.to_path_buf(),
+                        offset,
+                        data_length: header.data_length,
+                    });
+                }
             }
         }
 

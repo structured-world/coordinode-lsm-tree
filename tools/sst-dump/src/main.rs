@@ -246,14 +246,24 @@ enum Command {
     /// Salvage the readable data blocks of a (possibly corrupt) SST into a
     /// fresh SST at `<dest>`. Walks every data block, re-emits the ones that
     /// pass their checksum into a new file with fresh checksums / index /
-    /// filter, and reports the key range of every block it had to drop. A
-    /// columnar segment with a damaged sidecar (delete-bitmap / zone map)
-    /// degrades to a conservative "all rows live" state rather than failing.
-    /// The `<path>` positional is the source SST. Exits non-zero only when the
-    /// source cannot be opened or nothing was recoverable.
+    /// filter, and reports the key range of every block it had to drop. The
+    /// `<path>` positional is the source SST. Exits non-zero when the salvage
+    /// is refused (e.g. delete semantics cannot be preserved) or fails, or
+    /// when nothing was recoverable.
+    ///
+    /// Like `repair`, this uses the DEFAULT comparator, no encryption, and no
+    /// compression dictionary: a custom-comparator, encrypted, or
+    /// dictionary-compressed source is not recovered faithfully here.
     Salvage {
         /// Destination path for the recovered SST (must not already exist).
         dest: PathBuf,
+        /// Salvage a delete-bearing columnar SST whose positional delete
+        /// bitmap cannot be applied (unreadable bitmap, or a bitmap whose
+        /// positioning zone map is unreadable) by emitting EVERY row live.
+        /// Positionally-deleted rows come back in the recovered SST, so this
+        /// degradation is off by default and the salvage fails closed.
+        #[arg(long)]
+        allow_delete_resurrection: bool,
     },
 }
 
@@ -283,7 +293,10 @@ fn main() -> ExitCode {
             table_id,
             reconstruct_aad,
         } => run_dump_block(&cli.path, offset, tree_id, table_id, reconstruct_aad),
-        Command::Salvage { dest } => run_salvage(&cli.path, &dest),
+        Command::Salvage {
+            dest,
+            allow_delete_resurrection,
+        } => run_salvage(&cli.path, &dest, allow_delete_resurrection),
     }
 }
 
@@ -329,11 +342,24 @@ fn run_repair(db_dir: &std::path::Path, salvage: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_salvage(source: &std::path::Path, dest: &std::path::Path) -> ExitCode {
+fn run_salvage(
+    source: &std::path::Path,
+    dest: &std::path::Path,
+    allow_delete_resurrection: bool,
+) -> ExitCode {
     use std::sync::Arc;
 
     let fs: Arc<dyn lsm_tree::fs::Fs> = Arc::new(lsm_tree::fs::StdFs);
-    let report = match lsm_tree::salvage::salvage_sst(source, dest.to_path_buf(), &fs) {
+    let options = lsm_tree::salvage::SalvageOptions {
+        allow_delete_resurrection,
+        ..lsm_tree::salvage::SalvageOptions::default()
+    };
+    let report = match lsm_tree::salvage::salvage_sst_with_options(
+        source,
+        dest.to_path_buf(),
+        &fs,
+        &options,
+    ) {
         Ok(report) => report,
         Err(err) => {
             eprintln!("salvage failed: {err}");
@@ -367,18 +393,32 @@ fn run_salvage(source: &std::path::Path, dest: &std::path::Path) -> ExitCode {
         );
     }
 
-    if report.is_complete() {
+    // Warn ONLY when the opt-in actually resurrected positionally-deleted rows
+    // (an unappliable delete mask that the flag let through), not merely because
+    // the flag was passed.
+    if report.delete_rows_resurrected {
+        println!(
+            "warning:         --allow-delete-resurrection re-emitted positionally-deleted \
+             rows LIVE (the delete mask could not be applied faithfully)"
+        );
+    }
+
+    // Check the destination FIRST: `is_complete()` (nothing dropped) is true even
+    // when every block was wholly deleted, in which case no file is written and
+    // `<dest>` does not exist. Reporting "fully recovered" then would tell
+    // automation the destination is ready when the command produced none.
+    if report.salvaged_path.is_none() {
+        println!("status:          nothing recoverable");
+        ExitCode::FAILURE
+    } else if report.is_complete() {
         println!("status:          fully recovered");
         ExitCode::SUCCESS
-    } else if report.salvaged_path.is_some() {
+    } else {
         println!(
             "status:          partially recovered ({} block(s) dropped)",
             report.dropped.len(),
         );
         ExitCode::SUCCESS
-    } else {
-        println!("status:          nothing recoverable");
-        ExitCode::FAILURE
     }
 }
 
@@ -401,14 +441,15 @@ fn run_verify(path: &std::path::Path, verbose: bool) -> ExitCode {
     for (idx, err) in report.errors.iter().take(to_show).enumerate() {
         // Show each error with its variant tag so consumers grep'ing
         // for a specific failure mode (HeaderCorrupted, DataCorrupted,
-        // DataReadError, TocCorrupted, SstFileUnreadable) get a stable
-        // anchor. The Display impl includes file path + offset + a
-        // human reason.
+        // DataReadError, EccParityMismatch, TocCorrupted,
+        // SstFileUnreadable) get a stable anchor. The Display impl
+        // includes file path + offset + a human reason.
         let kind = match err {
             BlockVerifyError::SstFileUnreadable { .. } => "SstFileUnreadable",
             BlockVerifyError::HeaderCorrupted { .. } => "HeaderCorrupted",
             BlockVerifyError::DataCorrupted { .. } => "DataCorrupted",
             BlockVerifyError::DataReadError { .. } => "DataReadError",
+            BlockVerifyError::EccParityMismatch { .. } => "EccParityMismatch",
             BlockVerifyError::TocCorrupted { .. } => "TocCorrupted",
             // `BlockVerifyError` is `#[non_exhaustive]` upstream — a
             // future lib release can add new variants without bumping
