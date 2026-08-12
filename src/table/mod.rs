@@ -3769,19 +3769,22 @@ impl Table {
         // at the (seqno, start)-minimal tombstone), or `None` when the table is
         // not RT-only. Excluded ONCE from the decoded KV seqno bounds below.
         //
-        // Only an RT-ONLY table carries a synthetic sentinel: the writer emits it
-        // SOLELY to give an otherwise KV-empty range-tombstone table one index
-        // entry (see the writer's `finish`), so `meta.item_count` is exactly 1. A
-        // table with real KV entries (`item_count > 1`) never has one; deriving a
-        // sentinel there and excluding a REAL weak tombstone that merely matches
-        // the RT-minimal `(key, seqno)` would drop the true minimum from the
-        // seqno-bounds cross-check below and let a checksum-restamped `seqno#min`
-        // raised above that entry pass repair — making snapshot reads skip the
-        // table and resurrect an older value.
+        // Only an RT-ONLY table (no real KV items) carries a synthetic sentinel,
+        // written SOLELY to give an otherwise KV-empty range-tombstone table one
+        // index entry. The writer keeps the sentinel's RT-derived seqno OUT of
+        // `highest_kv_seqno` (it restores the pre-sentinel value in `finish`), so
+        // the sentinel lies strictly ABOVE the recorded KV seqno range:
+        // `sentinel_seqno > highest_kv_seqno`. A REAL weak tombstone — even the
+        // sole entry of a single-KV table (`item_count == 1` with no sentinel) —
+        // ALWAYS contributed to `highest_kv_seqno`, so its seqno is `<=` it and
+        // it must NOT be excluded. Gating on `item_count == 1` alone would drop
+        // that real entry from the seqno-bounds cross-check below, letting a
+        // checksum-restamped `seqno#min` raised above it pass repair and make
+        // snapshot reads skip the table. Discriminate on the seqno instead.
         let sentinel = tombstones
             .as_deref()
-            .filter(|_| meta.item_count == 1)
             .and_then(crate::range_tombstone::RangeTombstone::sentinel)
+            .filter(|&(_, seqno)| seqno > meta.highest_kv_seqno)
             .map(|(k, s)| (k.clone(), s));
         let mut sentinel_excluded = false;
 

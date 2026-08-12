@@ -3199,12 +3199,13 @@ fn verify_metadata_bounds_rejects_a_raised_seqno_min_on_a_range_tombstone_table(
 }
 
 /// The synthetic-sentinel exclusion must NOT fire on a table with REAL KV
-/// entries. Only an RT-ONLY table (no KV items) carries a synthetic sentinel, so
-/// `meta.item_count == 1`. On an RT+KV table a real weak tombstone whose key and
-/// seqno happen to match the RT-minimal `(start, seqno)` must be counted toward
-/// the seqno bounds — excluding it as if it were the sentinel drops the true
-/// minimum, letting a `seqno#min` restamped above that entry pass and hide the
-/// live version from snapshots at/below the forged minimum.
+/// entries. Only an RT-ONLY table carries a synthetic sentinel, whose RT-derived
+/// seqno the writer keeps ABOVE `highest_kv_seqno`. On an RT+KV table a real weak
+/// tombstone whose key and seqno happen to match the RT-minimal `(start, seqno)`
+/// contributed to `highest_kv_seqno` (so its seqno is `<=` it) and must be counted
+/// toward the seqno bounds — excluding it as if it were the sentinel drops the
+/// true minimum, letting a `seqno#min` restamped above that entry pass and hide
+/// the live version from snapshots at/below the forged minimum.
 #[test]
 fn verify_metadata_bounds_keeps_a_real_weak_tombstone_matching_the_rt_sentinel() -> crate::Result<()>
 {

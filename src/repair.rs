@@ -311,6 +311,29 @@ fn restore_quarantined(
     Ok(())
 }
 
+/// Whether an error is a TRANSIENT (retryable) I/O failure, as opposed to a
+/// structural one a re-read cannot fix. A corrupt on-disk structure surfaces as
+/// an [`crate::Error::Io`] too — a bad length / offset reads back `InvalidInput`,
+/// a truncation `UnexpectedEof`, malformed bytes `InvalidData`, a missing /
+/// dangling file `NotFound` — but those are genuine, non-retryable failures that
+/// must be recorded / salvaged like any other corruption rather than aborting the
+/// repair for a retry that would fail identically. Only an ALLOWLIST of genuinely
+/// transient kinds is retryable: `Other` (the crate maps a raw `EIO`, a timeout,
+/// and an injected fault here), `Interrupted` (`EINTR`), and `WouldBlock`
+/// (`EAGAIN`).
+fn is_transient_io(e: &crate::Error) -> bool {
+    matches!(
+        e,
+        crate::Error::Io(io)
+            if matches!(
+                io.kind(),
+                crate::io::ErrorKind::Other
+                    | crate::io::ErrorKind::Interrupted
+                    | crate::io::ErrorKind::WouldBlock
+            )
+    )
+}
+
 /// Block-salvages a corrupt SST during repair: reads the ALREADY-QUARANTINED
 /// original (the caller performs the move, which frees `table_path`), writes a
 /// fresh SST holding its recoverable blocks into that path, and reopens it.
@@ -1010,6 +1033,14 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
 
             let checksum = match compute_table_checksum(&*folder_fs, &table_path) {
                 Ok(c) => crate::Checksum::from_raw(c),
+                // A TRANSIENT read (flaky I/O) while hashing the file is
+                // retryable: recording it unreadable commits a manifest without the
+                // still-in-place file, which the next open's orphan cleanup then
+                // deletes — permanent loss from a one-shot failure. Propagate it so
+                // a retry re-reads the table, mirroring the `Table::recover`
+                // failure path below. A structural I/O (a corrupt trailer reads
+                // back `InvalidInput`) is genuine damage: record it unreadable.
+                Err(e) if is_transient_io(&e) => return Err(e),
                 Err(e) => {
                     // Mirror the `Table::recover` failure path below: free the id
                     // so an aliased copy in another scanned folder can still be
@@ -1129,7 +1160,7 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                                     // salvage it. A STRUCTURAL failure is genuine
                                     // unsalvageability: record it (the original
                                     // stays quarantined for manual recovery).
-                                    if matches!(salvage_err, crate::Error::Io(_)) {
+                                    if is_transient_io(&salvage_err) {
                                         restore_quarantined(
                                             &*folder_fs,
                                             &quarantined,
@@ -1153,10 +1184,22 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                 }
                 Ok(table) => recovered_tables.push(table),
                 Err(e) if salvage => {
-                    // Whole-file recovery failed; try block-level salvage: the
-                    // corrupt original is quarantined and a fresh SST holding
-                    // its recoverable blocks is written in its place. A FAILED
-                    // quarantine aborts the repair (the `?`): a manifest
+                    // A TRANSIENT recovery failure (Io) is retryable and must NOT
+                    // be routed through salvage: quarantining the healthy SST and
+                    // salvaging it would, for a range-tombstone table, fail
+                    // deterministically with FeatureUnsupported (a non-Io error
+                    // recorded as unsalvageable), committing a manifest without the
+                    // table — turning a one-shot read failure into permanent loss.
+                    // Propagate the I/O error BEFORE moving the file so a retry
+                    // re-recovers it, mirroring the verification / salvage-error
+                    // paths.
+                    if is_transient_io(&e) {
+                        return Err(e);
+                    }
+                    // Whole-file recovery failed structurally; try block-level
+                    // salvage: the corrupt original is quarantined and a fresh SST
+                    // holding its recoverable blocks is written in its place. A
+                    // FAILED quarantine aborts the repair (the `?`): a manifest
                     // omitting a still-in-place file would let the next open's
                     // orphan cleanup delete the only copy.
                     let quarantined = quarantine_file(
@@ -1185,7 +1228,7 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                             // Transient I/O salvage failure: restore the original
                             // and abort so a retry can recover it (see the sibling
                             // salvage arm above). A structural failure is recorded.
-                            if matches!(salvage_err, crate::Error::Io(_)) {
+                            if is_transient_io(&salvage_err) {
                                 restore_quarantined(
                                     &*folder_fs,
                                     &quarantined,
@@ -1203,6 +1246,15 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                     }
                 }
                 Err(e) => {
+                    // A TRANSIENT recovery failure (Io) is retryable: recording it
+                    // unreadable commits a manifest without the still-in-place
+                    // file, which the next open's orphan cleanup then DELETES —
+                    // permanent loss from a one-shot read failure. Propagate it so
+                    // a retry re-recovers the table; only a structural failure is a
+                    // genuine unreadable report.
+                    if is_transient_io(&e) {
+                        return Err(e);
+                    }
                     seen_ids.remove(&table_id);
                     unreadable_files.push((table_path, e.to_string()));
                 }
