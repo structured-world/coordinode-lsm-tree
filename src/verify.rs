@@ -1163,12 +1163,14 @@ fn read_ecc_params_out_of_band(
                 // masks the ECC descriptor only when a mirror is unrecognized.
                 decoded.push(meta);
             }
-            // A TRANSIENT read fault must not silently drop a mirror from
+            // Only a TRANSIENT read fault must not silently drop a mirror from
             // arbitration: with one mirror gone the divergence check goes false
             // and could admit an SST under the surviving (possibly forged) copy
-            // that a retry would expose. Propagate it; a STRUCTURAL decode failure
-            // keeps the existing fallback (skip this mirror).
-            Err(crate::Error::Io(e)) => return Err(e.into()),
+            // that a retry would expose. Propagate it. A PERSISTENT read failure (a
+            // bad sector a retry cannot fix) or a STRUCTURAL decode failure keeps
+            // the existing fallback (skip this mirror) so the remaining decoded
+            // copy can still supply the ECC state.
+            Err(crate::Error::Io(e)) if e.kind().is_transient() => return Err(e.into()),
             Err(_) => {}
         }
     }

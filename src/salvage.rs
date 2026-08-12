@@ -1100,14 +1100,18 @@ fn salvage_blocks(
                     (end <= toc_pos).then_some((s.pos(), end))
                 })
             }
-            // A TRANSIENT I/O error re-reading the trailer would silently disable
-            // the physical walk that recovers index-omitted blocks: if the index
-            // is checksum-consistent but omits a block, salvage would then publish
-            // the indexed subset and report a COMPLETE recovery while losing the
-            // omitted keys. Abort so the caller retries. A STRUCTURAL trailer error
-            // is the genuine "no physical fallback" case (an unreadable TOC): fall
-            // back to the index enumeration alone, as before.
-            Err(crate::sfa::Error::Io(e)) => return Err(crate::Error::Io(e)),
+            // Only a TRANSIENT I/O error re-reading the trailer would silently
+            // disable the physical walk that recovers index-omitted blocks: if the
+            // index is checksum-consistent but omits a block, salvage would then
+            // publish the indexed subset and report a COMPLETE recovery while
+            // losing the omitted keys. Abort so the caller retries. A PERSISTENT
+            // I/O failure (a retry cannot fix a bad sector / truncated trailer) or
+            // a STRUCTURAL trailer error is the genuine "no physical fallback" case
+            // (an unreadable TOC): fall back to the index enumeration alone, so the
+            // already-open table's indexed blocks stay recoverable.
+            Err(crate::sfa::Error::Io(e)) if e.kind().is_transient() => {
+                return Err(crate::Error::Io(e));
+            }
             Err(_) => None,
         }
     };
@@ -1963,13 +1967,21 @@ pub fn salvage_blob_file(
     use crate::vlog::blob_file::{scanner::Scanner, writer::Writer as BlobWriter};
     use alloc::format;
 
-    // Read the source's metadata (this does not scan the data, so a data-corrupt
-    // file still opens) to reject a compressed source: the scanner yields on-disk
-    // (compressed) bytes, and re-emitting them verbatim under a no-compression
-    // descriptor would store undecodable values. Fail closed, the same way SST
-    // salvage fails closed on range tombstones.
-    let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&**fs, source)?);
-    let source_handle = crate::vlog::recover_blob_file(source, blob_file_id, checksum, 0, fs)?;
+    // Read the source's metadata (only the TOC + meta section, NOT the data
+    // section, so a data-corrupt file still opens) to reject a compressed source:
+    // the scanner yields on-disk (compressed) bytes, and re-emitting them verbatim
+    // under a no-compression descriptor would store undecodable values. Fail
+    // closed, the same way SST salvage fails closed on range tombstones.
+    //
+    // A placeholder checksum is passed on purpose: `recover_blob_file` only STORES
+    // it (it never verifies the source against it), and only `compression()` is
+    // read from the handle. Computing the real whole-file digest here would stream
+    // every byte — including a persistently unreadable later frame or truncated
+    // tail sector — and abort before the scanner and writer are even created,
+    // making the valid-prefix recovery below unreachable. The salvaged dest gets
+    // its own digest on finish.
+    let source_handle =
+        crate::vlog::recover_blob_file(source, blob_file_id, crate::Checksum::from_raw(0), 0, fs)?;
     if source_handle.compression() != crate::CompressionType::None {
         return Err(crate::Error::FeatureUnsupported(
             "salvage of a compressed blob file",
