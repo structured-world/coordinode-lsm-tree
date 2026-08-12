@@ -8,6 +8,14 @@ use crate::{
 use std::sync::Arc;
 use test_log::test;
 
+/// Shared key count and formatter for the tight-space crash-recovery tests, so
+/// the writer (in `tight_space_crash_and_reopen`) and the reopen assertion loop
+/// always cover the identical key set.
+const TIGHT_SPACE_KEYS: u64 = 2_000;
+fn tight_space_key(i: u64) -> String {
+    format!("key{i:08}")
+}
+
 /// Ranks keys by their first byte only, so byte-distinct keys that share a
 /// first byte compare equal — exercises the comparator-aware dedup path that
 /// raw `dedup()` would miss.
@@ -129,9 +137,6 @@ fn failed_subcompaction_rolls_back_and_restores_inputs() -> crate::Result<()> {
 /// those still in the punched input's intact suffix) reads back.
 #[test]
 fn tight_space_crash_after_first_slice_recovers_all_keys_on_reopen() -> crate::Result<()> {
-    const N: u64 = 2_000;
-    let k = |i: u64| format!("key{i:08}");
-
     let dir = tempfile::tempdir()?;
     let mem = crate::fs::MemFs::with_capacity(u64::MAX);
     // Force the single-table major compaction to be gated, opting in to
@@ -142,9 +147,11 @@ fn tight_space_crash_after_first_slice_recovers_all_keys_on_reopen() -> crate::R
         |used| mem.set_capacity(used + used / 4),
         || mem.punched_bytes(),
     )?;
-    for i in 0..N {
+    for i in 0..TIGHT_SPACE_KEYS {
         assert!(
-            reopened.get(k(i).as_bytes(), crate::MAX_SEQNO)?.is_some(),
+            reopened
+                .get(tight_space_key(i).as_bytes(), crate::MAX_SEQNO)?
+                .is_some(),
             "key {i} lost after a crash mid tight-space compaction + reopen",
         );
     }
@@ -291,9 +298,6 @@ fn tight_space_crash_and_reopen(
 ) -> crate::Result<crate::AnyTree> {
     use core::sync::atomic::Ordering;
 
-    const N: u64 = 2_000;
-    let k = |i: u64| format!("key{i:08}");
-
     let config = Config::new(
         dir,
         SequenceNumberCounter::default(),
@@ -307,8 +311,8 @@ fn tight_space_crash_and_reopen(
         crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
     };
 
-    for i in 0..N {
-        tree.insert(k(i).as_bytes(), vec![0xCDu8; 64], i);
+    for i in 0..TIGHT_SPACE_KEYS {
+        tree.insert(tight_space_key(i).as_bytes(), vec![0xCDu8; 64], i);
     }
     tree.flush_active_memtable(0)?;
     let used = tree.storage_stats()?.used_bytes;
