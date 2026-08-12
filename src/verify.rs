@@ -209,9 +209,7 @@ pub fn verify_integrity(tree: &impl crate::AbstractTree) -> IntegrityReport {
                 // restricted table as corrupted. Mirror `scan_one_table`, which
                 // routes the same transient failure to an unreadable/IoError
                 // classification and skips the checksum comparison.
-                Err(crate::Error::Io(error))
-                    if crate::repair::is_transient_io_kind(error.kind()) =>
-                {
+                Err(crate::Error::Io(error)) if error.kind().is_transient() => {
                     report.errors.push(IntegrityError::IoError {
                         path: (*table.path).clone(),
                         error,
@@ -667,7 +665,7 @@ fn scan_one_table(table: &crate::table::Table) -> BlockVerifyReport {
     let data_start = match table.restrict_lower_bound() {
         Some(bound) => match table.punch_offset_for(bound) {
             Ok(offset) => offset,
-            Err(crate::Error::Io(error)) if crate::repair::is_transient_io_kind(error.kind()) => {
+            Err(crate::Error::Io(error)) if error.kind().is_transient() => {
                 report.errors.push(BlockVerifyError::SstFileUnreadable {
                     table_id,
                     path: path.to_path_buf(),
