@@ -253,9 +253,12 @@ pub(super) fn attests_in_progress(
 /// # Errors
 ///
 /// Propagates the AEAD seal error (encrypted tables) and any I/O error from the
-/// write / sync. The caller treats a failure as best-effort — it only means a
-/// crashed refresh will not be recoverable by the next scrub (the pre-sidecar
-/// behavior), never that the heal itself failed.
+/// write / sync. The caller must FAIL CLOSED on such an error: the heal /
+/// reconciliation must not proceed, `refresh_healed_checksum` returns
+/// `ScrubError::ChecksumRefreshFailed` without updating the manifest digest, and
+/// the `.heal-attest` sidecar is left in place for the next scrub to retry. A
+/// silently-dropped attestation would let a crash mid-refresh strand a stale
+/// digest with no marker to reconcile it.
 pub fn write(
     fs: &dyn Fs,
     table_path: &Path,

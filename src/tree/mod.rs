@@ -4367,16 +4367,6 @@ impl Tree {
         Ok(version)
     }
 
-    /// Removes stale version files left over from a crash during version swap.
-    ///
-    /// # Behavior change vs pre-Fs-trait code
-    ///
-    /// The previous implementation used `std::fs::read_dir` + `to_string_lossy()`,
-    /// which silently skipped non-UTF-8 filenames. `Fs::read_dir` returns
-    /// `InvalidData` for such entries instead (see [`FsDirEntry`](crate::fs::FsDirEntry) docs), so this
-    /// function now fails fast on non-UTF-8 names. This is intentional: version
-    /// files are always `v{u64}` — any non-UTF-8 entry indicates filesystem
-    /// corruption and should surface as an error rather than be silently ignored.
     /// Removes a recovery-swept artifact (an abandoned heal copy / temp / marker),
     /// treating a concurrent removal (`NotFound`) as success. A benign race (a
     /// retry, or another scanner that already swept it) must not fail recovery,
@@ -4394,6 +4384,15 @@ impl Tree {
     /// log except the live snapshot's (`edits-{snapshot_id}`). A crashed
     /// rotation can leak an old snapshot or its log; this sweeps them on open.
     /// The live snapshot and log are exactly the generation `CURRENT` points at.
+    ///
+    /// # Behavior change vs pre-Fs-trait code
+    ///
+    /// The previous implementation used `std::fs::read_dir` + `to_string_lossy()`,
+    /// which silently skipped non-UTF-8 filenames. `Fs::read_dir` returns
+    /// `InvalidData` for such entries instead (see [`FsDirEntry`](crate::fs::FsDirEntry) docs), so this
+    /// function now fails fast on non-UTF-8 names. This is intentional: version
+    /// files are always `v{u64}` — any non-UTF-8 entry indicates filesystem
+    /// corruption and should surface as an error rather than be silently ignored.
     fn cleanup_orphaned_version(
         path: &Path,
         snapshot_id: crate::version::VersionId,
