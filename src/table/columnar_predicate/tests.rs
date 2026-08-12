@@ -237,3 +237,29 @@ fn take_rows_repeats_a_bytes_value_and_keeps_offsets_monotonic() {
         "the repeated index emits its value each time, framed by a monotonic offset table",
     );
 }
+
+/// The `Bytes` offset accumulator's overflow guard, exercised WITHOUT
+/// materializing a multi-GiB payload: the arithmetic is driven directly at the
+/// u32 boundary.
+#[test]
+fn advance_bytes_offset_rejects_a_u32_offset_overflow() {
+    // A repeated gather can push the accumulated total past u32::MAX; the
+    // `checked_add` guard rejects it (a tiny `value_len`, nothing allocated).
+    assert!(matches!(
+        super::advance_bytes_offset(u32::MAX - 3, 10),
+        Err(crate::Error::DecompressedSizeTooLarge { .. }),
+    ));
+    // A single value longer than u32::MAX trips the `u32::try_from` guard. Only
+    // reachable where usize is wider than u32 (64-bit); on a 32-bit target usize
+    // IS u32, so a length can never exceed it.
+    #[cfg(target_pointer_width = "64")]
+    assert!(matches!(
+        super::advance_bytes_offset(0, (u32::MAX as usize) + 1),
+        Err(crate::Error::DecompressedSizeTooLarge { .. }),
+    ));
+    // A normal advance within the u32 ceiling succeeds.
+    assert_eq!(
+        super::advance_bytes_offset(100, 50).expect("within the u32 offset ceiling"),
+        150,
+    );
+}

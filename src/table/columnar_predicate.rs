@@ -237,6 +237,27 @@ pub(crate) fn take_rows(batch: &ColumnBatch, indices: &[u32]) -> crate::Result<C
 /// rebuilding its framing (fixed chunks copied, `Bytes` offset table + payload
 /// repacked) and its validity bitmap. Sibling of [`filter_column`] for the
 /// index-driven [`take_rows`] gather.
+/// Advances the running `Bytes` offset accumulator by one gathered value's
+/// length, returning the new offset. Unlike the mask-driven `filter_column`, a
+/// gather may REPEAT an index (any index list is permitted), so the emitted
+/// payload is not a subset of the original and the running u32 offset can exceed
+/// the original total. A saturating accumulator would peg the offsets at
+/// `u32::MAX` while the payload kept growing, desyncing the offset table from the
+/// payload (later rows mis-sliced on read); instead this returns
+/// [`crate::Error::DecompressedSizeTooLarge`] when either a single value's length
+/// or the accumulated total would exceed the u32 offset-table capacity.
+fn advance_bytes_offset(acc: u32, value_len: usize) -> crate::Result<u32> {
+    let len = u32::try_from(value_len).map_err(|_| crate::Error::DecompressedSizeTooLarge {
+        declared: value_len as u64,
+        limit: u64::from(u32::MAX),
+    })?;
+    acc.checked_add(len)
+        .ok_or_else(|| crate::Error::DecompressedSizeTooLarge {
+            declared: u64::from(acc) + u64::from(len),
+            limit: u64::from(u32::MAX),
+        })
+}
+
 fn take_column(col: &Column, rows: usize, indices: &[u32]) -> crate::Result<Column> {
     let data = match col.type_tag {
         TypeTag::Fixed(width) => {
@@ -266,27 +287,10 @@ fn take_column(col: &Column, rows: usize, indices: &[u32]) -> crate::Result<Colu
                 // A missing cell degrades to empty (one offset still written), so
                 // the offset table stays in lockstep with the output row count.
                 let value = bytes_row(&col.data, rows, i as usize).unwrap_or(&[]);
-                // Unlike the mask-driven `filter_column`, a gather may REPEAT an
-                // index (any index list is permitted), so the emitted payload is
-                // NOT a subset of the original and the running u32 offset can
-                // exceed the original total. A saturating accumulator would peg
-                // the last offsets at `u32::MAX` while the payload kept growing,
-                // desyncing the offset table from the payload (later rows would
-                // be mis-sliced on read). Fail loudly on overflow BEFORE
-                // appending the value, so a genuinely oversized gather is a
-                // clean error rather than a silently corrupt batch.
-                let len = u32::try_from(value.len()).map_err(|_| {
-                    crate::Error::DecompressedSizeTooLarge {
-                        declared: value.len() as u64,
-                        limit: u64::from(u32::MAX),
-                    }
-                })?;
-                acc =
-                    acc.checked_add(len)
-                        .ok_or_else(|| crate::Error::DecompressedSizeTooLarge {
-                            declared: u64::from(acc) + u64::from(len),
-                            limit: u64::from(u32::MAX),
-                        })?;
+                // Advance the offset accumulator BEFORE appending the value, so a
+                // genuinely oversized gather is a clean error rather than a
+                // silently corrupt batch (see `advance_bytes_offset`).
+                acc = advance_bytes_offset(acc, value.len())?;
                 payload.extend_from_slice(value);
                 offsets.extend_from_slice(&acc.to_le_bytes());
             }
