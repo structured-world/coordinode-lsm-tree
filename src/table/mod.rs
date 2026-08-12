@@ -4103,12 +4103,18 @@ impl Table {
                     )]
                     let end_block = (idx + 1) as u32;
                     src.set_position(0);
-                    decoder
-                        .reset(&mut src)
-                        .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
+                    // A zstd reset / decode failure on a checksum-clean frame is
+                    // DETERMINISTIC codec corruption (a forge that kept the block
+                    // checksum but broke the inner framing), NOT transient I/O:
+                    // map it to the structural `ERR` so repair's is_corruption
+                    // gate routes the table through salvage (which drops / re-
+                    // encodes the block) instead of aborting for a retry that can
+                    // never succeed. `Error::Io` stays reserved for real fs reads
+                    // (the frame read above still propagates its own I/O).
+                    decoder.reset(&mut src).map_err(|_| ERR)?;
                     let pd = decoder
                         .decode_blocks_partial(&mut src, 0, end_block, None, false)
-                        .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
+                        .map_err(|_| ERR)?;
                     if pd.stopped_at.is_some()
                         || pd.blocks_decoded != end_block
                         || pd.data.len() != end as usize

@@ -736,12 +736,28 @@ fn refresh_healed_checksum(
     // warnings as well: an unrecognized-ECC or parity-unverifiable walk
     // skipped bytes, so the file is not provably clean.
     // A restricted view's punched data-block prefix reads as zeros; walk only
-    // its live suffix (a block-index read failure falls back to `0`, so a truly
-    // corrupt table still fails the walk rather than skipping everything).
-    let data_start = table
-        .restrict_lower_bound()
-        .and_then(|bound| table.punch_offset_for(bound).ok())
-        .unwrap_or(0);
+    // its live suffix. The punch-offset lookup is fallible (a volatile /
+    // partitioned index read), and falling back to `0` would walk the punched
+    // prefix — whose zero bytes surface as STRUCTURAL errors the definitive
+    // classifier below then treats as proven corruption, removing this pass's
+    // valid heal attestation while the manifest digest stays stale (later
+    // patrols can no longer attribute the healed bytes). Treat a lookup failure
+    // as INCONCLUSIVE instead: keep the marker for the next patrol to retry.
+    let data_start = match table.restrict_lower_bound() {
+        Some(bound) => match table.punch_offset_for(bound) {
+            Ok(offset) => offset,
+            Err(e) => {
+                return refuse(
+                    alloc::format!(
+                        "restricted-view punch-offset lookup failed ({e}); the manifest \
+                         digest was not refreshed"
+                    ),
+                    false,
+                );
+            }
+        },
+        None => 0,
+    };
     let walk = crate::verify::verify_sst_file_with_context(
         &*table.fs,
         &table.path,

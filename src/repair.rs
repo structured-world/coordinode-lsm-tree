@@ -288,6 +288,29 @@ fn quarantine_file(
     Ok(dest)
 }
 
+/// Moves a quarantined original back to its `table_path`, durably. The inverse of
+/// [`quarantine_file`], used when a TRANSIENT salvage failure must not strand the
+/// only copy in quarantine (which a retry, no longer finding it under `tables/`,
+/// would never rediscover). `rename` replaces any partial / salvaged output the
+/// aborted salvage left at `table_path`, and both affected directory entries are
+/// synced so the restore survives a power loss the same way the quarantine move
+/// does.
+fn restore_quarantined(
+    fs: &dyn crate::fs::Fs,
+    quarantined: &std::path::Path,
+    table_path: &std::path::Path,
+    sync_mode: crate::fs::SyncMode,
+) -> crate::Result<()> {
+    fs.rename(quarantined, table_path)?;
+    if let Some(dst_dir) = table_path.parent() {
+        fs.sync_directory_with(dst_dir, sync_mode)?;
+    }
+    if let Some(src_dir) = quarantined.parent() {
+        fs.sync_directory_with(src_dir, sync_mode)?;
+    }
+    Ok(())
+}
+
 /// Block-salvages a corrupt SST during repair: reads the ALREADY-QUARANTINED
 /// original (the caller performs the move, which frees `table_path`), writes a
 /// fresh SST holding its recoverable blocks into that path, and reopens it.
@@ -1097,6 +1120,24 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                                     ));
                                 }
                                 Err(salvage_err) => {
+                                    // A TRANSIENT I/O salvage failure is retryable:
+                                    // committing a manifest that omits the table
+                                    // would lose it permanently (the original is in
+                                    // quarantine, which the next repair won't
+                                    // rediscover). Restore the original to its path
+                                    // and abort the whole repair so a retry can
+                                    // salvage it. A STRUCTURAL failure is genuine
+                                    // unsalvageability: record it (the original
+                                    // stays quarantined for manual recovery).
+                                    if matches!(salvage_err, crate::Error::Io(_)) {
+                                        restore_quarantined(
+                                            &*folder_fs,
+                                            &quarantined,
+                                            &table_path,
+                                            config.sync_mode,
+                                        )?;
+                                        return Err(salvage_err);
+                                    }
                                     seen_ids.remove(&table_id);
                                     unreadable_files.push((
                                         table_path,
@@ -1141,6 +1182,18 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                             ));
                         }
                         Err(salvage_err) => {
+                            // Transient I/O salvage failure: restore the original
+                            // and abort so a retry can recover it (see the sibling
+                            // salvage arm above). A structural failure is recorded.
+                            if matches!(salvage_err, crate::Error::Io(_)) {
+                                restore_quarantined(
+                                    &*folder_fs,
+                                    &quarantined,
+                                    &table_path,
+                                    config.sync_mode,
+                                )?;
+                                return Err(salvage_err);
+                            }
                             seen_ids.remove(&table_id);
                             unreadable_files.push((
                                 table_path,

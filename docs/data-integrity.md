@@ -261,8 +261,12 @@ inspection, or rollback to a known-good point.
   recovering "all rows live" would resurrect deleted rows — unless explicitly
   opted in (`SalvageOptions::allow_delete_resurrection`, `sst-dump salvage
   --allow-delete-resurrection`).
-- **`salvage::salvage_blob_file(src, dest, &fs, id) -> BlobSalvageReport`**:
-  record-granular salvage of one blob (vlog) file. When a frame fails checksum,
+- **`salvage::salvage_blob_file(src, dest, &fs, id, &comparator) -> BlobSalvageReport`**:
+  record-granular salvage of one blob (vlog) file. The `comparator` must be the
+  SAME `SharedComparator` the source tree was written with (pass the tree's
+  configured comparator, or `comparator::default_comparator()` for the default
+  lexicographic ordering): the salvage walk orders and validates recovered
+  records under it, so a mismatched comparator would mis-order the output. When a frame fails checksum,
   header-CRC, or structural validation, the record stream re-syncs to the next
   frame magic WHEN one is found in-bounds; if none is (for example a CRC-vouched
   frame end overruns the data section), the scan terminates. Either way the
