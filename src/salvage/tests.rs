@@ -3198,16 +3198,52 @@ fn verify_zone_map_rejects_a_present_empty_map_on_a_nonempty_table() -> crate::R
     Ok(())
 }
 
-/// `verify_zone_map` must authenticate the synthetic column's IDENTITY, not
-/// only its min / max / row count. The writer stamps every whole-block column
-/// with `column_id == 0` and zero type / codec / null fields; a re-stamped map
-/// can change that id to a consumer value-column id while leaving the key
-/// bounds untouched. The bounds check then passes, repair keeps the table, and
-/// `ColumnRangePredicate::can_skip_block` reads those key bounds as
-/// value-column statistics and can skip blocks holding matching rows.
-#[cfg(feature = "columnar")]
+/// On a ROW table `verify_zone_map` must authenticate the synthetic column's
+/// IDENTITY, not only its min / max / row count. The writer stamps every
+/// whole-block column with `column_id == 0` and zero type / codec / null
+/// fields; a re-stamped map can change that id to a consumer value-column id
+/// while leaving the key bounds untouched. The bounds check then passes, repair
+/// keeps the table, and `ColumnRangePredicate::can_skip_block` reads those key
+/// bounds as value-column statistics and can skip blocks holding matching rows.
 #[test]
 fn verify_zone_map_rejects_a_forged_synthetic_column_id() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_zone_map(true);
+    for i in 0u32..64 {
+        writer.write(iv(i))?;
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source row+zonemap SST is non-empty"
+    );
+
+    // Repurpose the first block's whole-block key statistic as a value-column
+    // statistic by changing its id, leaving min / max / row count intact.
+    crate::test_forge::forge_zone_map_column_id(&source, 0)?;
+
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_zone_map() else {
+        panic!("a non-zero synthetic column id must be rejected");
+    };
+    assert!(
+        matches!(err, crate::Error::InvalidHeader(msg) if msg.contains("zone_map synthetic column")),
+        "the rejection must name the synthetic column identity, got {err:?}",
+    );
+    Ok(())
+}
+
+/// On a COLUMNAR table `verify_zone_map` authenticates the FULL per-column map
+/// by re-deriving it from each decoded block: a columnar block records one entry
+/// per stored column, so a re-stamped id (here the user-key column's id flipped
+/// to a consumer value-column id) no longer matches the re-derivation and is
+/// rejected. This is the columnar counterpart of the row-block synthetic-column
+/// identity check.
+#[cfg(feature = "columnar")]
+#[test]
+fn verify_zone_map_rejects_a_forged_columnar_column_id() -> crate::Result<()> {
     let dir = tempdir()?;
     let source = dir.path().join("source");
     let fs: Arc<dyn Fs> = Arc::new(StdFs);
@@ -3223,17 +3259,18 @@ fn verify_zone_map_rejects_a_forged_synthetic_column_id() -> crate::Result<()> {
         "source columnar+zonemap SST is non-empty"
     );
 
-    // Repurpose the first block's whole-block key statistic as a value-column
-    // statistic by changing its id, leaving min / max / row count intact.
+    // Flip the first block's first (user-key) column id, leaving every other
+    // recorded field intact: the re-derived per-column map still expects the
+    // user-key column at id 0, so the mismatch is caught.
     crate::test_forge::forge_zone_map_column_id(&source, 0)?;
 
     let table = open(source, &fs)?;
     let Err(err) = table.verify_zone_map() else {
-        panic!("a non-zero synthetic column id must be rejected");
+        panic!("a forged columnar column id must be rejected");
     };
     assert!(
-        matches!(err, crate::Error::InvalidHeader(msg) if msg.contains("zone_map synthetic column")),
-        "the rejection must name the synthetic column identity, got {err:?}",
+        matches!(err, crate::Error::InvalidHeader(msg) if msg.contains("per-column statistics")),
+        "the rejection must name the columnar per-column mismatch, got {err:?}",
     );
     Ok(())
 }

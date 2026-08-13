@@ -1156,6 +1156,7 @@ impl Writer {
             seqno_bounds,
             item_count,
             zone_block_min,
+            None, // row block: register synthesizes the whole-block key range
         )?;
 
         // IMPORTANT: Clear chunk after everything else
@@ -1233,6 +1234,12 @@ impl Writer {
         )?;
         let layout = core::mem::take(&mut prepared.layout);
         let header = prepared.write_to(&mut self.file_writer)?;
+        // Per-column zone-map stats for this columnar block, derived once from
+        // the batch. Gated on the zone-map policy exactly like the row-block
+        // synthetic entry (`zone_block_min` is `Some` iff the policy is on), so
+        // a zone-map-off table writes no zone-map section. `verify_zone_map`
+        // re-derives these from the decoded block to authenticate the section.
+        let columnar_columns = zone_block_min.as_ref().map(|_| batch.zone_stats());
         self.register_written_block(
             header,
             layout,
@@ -1241,6 +1248,7 @@ impl Writer {
             seqno_bounds,
             item_count,
             zone_block_min,
+            columnar_columns,
         )
     }
 
@@ -1453,6 +1461,7 @@ impl Writer {
         seqno_bounds: Option<(u64, u64)>,
         item_count: usize,
         zone_block_min: Option<UserKey>,
+        columnar_columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
     ) -> crate::Result<()> {
         self.meta.uncompressed_size += u64::from(header.uncompressed_length);
 
@@ -1482,21 +1491,33 @@ impl Writer {
                 .push((self.meta.file_pos, (seqno_min, seqno_max)));
         }
         // Zone-map entry for this block (parallel section keyed by file offset,
-        // like seqno_bounds). A row block records one synthetic column with the
-        // block's key range; the row count never approaches `u32::MAX` (a data
-        // block holds at most a few thousand entries), so the cap is defensive.
+        // like seqno_bounds). A columnar block records one entry per stored
+        // column (`columnar_columns`, pre-derived from the batch); a row block
+        // records one synthetic column with the block's key range. The row count
+        // never approaches `u32::MAX` (a data block holds at most a few thousand
+        // entries), so the cap is defensive. `zone_block_min` is `Some` exactly
+        // when the zone-map policy is on, gating both variants alike.
         if let Some(min_key) = zone_block_min {
-            let row_count = u32::try_from(item_count).unwrap_or(u32::MAX);
-            let columns = alloc::vec![crate::table::zone_map::ColumnStats {
-                column_id: 0,
-                type_tag: 0,
-                codec_id: 0,
-                null_count: 0,
-                row_count,
-                min: min_key.to_vec(),
-                max: last_key.to_vec(),
-            }];
-            self.zone_map_section.push((self.meta.file_pos, columns));
+            let columns = if let Some(cols) = columnar_columns {
+                cols
+            } else {
+                let row_count = u32::try_from(item_count).unwrap_or(u32::MAX);
+                alloc::vec![crate::table::zone_map::ColumnStats {
+                    column_id: 0,
+                    type_tag: 0,
+                    codec_id: 0,
+                    null_count: 0,
+                    row_count,
+                    min: min_key.to_vec(),
+                    max: last_key.to_vec(),
+                }]
+            };
+            // A valid columnar batch always has at least the user-key column, so
+            // this is non-empty in practice; guard defensively so an empty stats
+            // vector never registers a column-less zone-map entry.
+            if !columns.is_empty() {
+                self.zone_map_section.push((self.meta.file_pos, columns));
+            }
         }
         self.index_writer.register_data_block(handle)?;
 
@@ -1703,6 +1724,7 @@ impl Writer {
             inputs.seqno_bounds,
             inputs.item_count,
             inputs.zone_block_min,
+            None, // verbatim row block: register synthesizes the key range
         )?;
         if self.locator.is_some() {
             self.locator_block_id += 1;
@@ -1808,6 +1830,7 @@ impl Writer {
             meta.seqno_bounds,
             meta.item_count,
             meta.zone_block_min,
+            None, // parallel pipeline handles row (Data) blocks only
         )
     }
 

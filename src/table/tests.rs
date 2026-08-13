@@ -4646,6 +4646,73 @@ fn delete_bitmap_section_absent_when_no_deletes() -> crate::Result<()> {
     Ok(())
 }
 
+/// A columnar table's zone map records one entry PER stored column (the
+/// user-key column AND the value column), each with its own range, and the
+/// verifier re-derives them from the decoded blocks so the honest table passes
+/// its forgery cross-check. Regression: the writer once stamped a single
+/// synthetic key-range column for every columnar block, hiding the non-key
+/// columns from `can_skip_block` pushdown.
+#[cfg(feature = "columnar")]
+#[test]
+fn columnar_zone_map_records_per_column_stats_and_round_trips() -> crate::Result<()> {
+    use crate::table::columnar::{COL_USER_KEY, COL_VALUE};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+
+    // Distinct keys AND distinct values so the user-key and value columns have
+    // genuinely different ranges: a single synthetic key-range column could not
+    // describe the value column.
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    for i in 0..32u32 {
+        let key = format!("k{i:04}").into_bytes();
+        let value = format!("v{i:04}").into_bytes();
+        writer.write(crate::InternalValue::from_components(
+            key,
+            value,
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    assert!(table.metadata.columnar, "written as a columnar table");
+    assert!(!table.zone_map.is_empty(), "zone map populated");
+
+    // Every data block records BOTH the user-key column (0) and the value
+    // column (3), each with its own range — not a single synthetic column.
+    let mut saw_value_column = false;
+    for handle in table.block_index.iter() {
+        let handle = handle?;
+        let stats = table
+            .zone_map
+            .columns_for(handle.offset().0)
+            .expect("every data block has a zone-map entry");
+        let ids: Vec<u32> = stats.iter().map(|s| s.column_id).collect();
+        assert!(
+            ids.contains(&u32::from(COL_USER_KEY)),
+            "the user-key column is recorded, got ids {ids:?}",
+        );
+        if let Some(v) = stats.iter().find(|s| s.column_id == u32::from(COL_VALUE)) {
+            saw_value_column = true;
+            assert!(v.min <= v.max, "the value column's range is ordered");
+            assert!(!v.min.is_empty(), "the value column carries a real range");
+        }
+    }
+    assert!(
+        saw_value_column,
+        "at least one block records the non-key value column's stats",
+    );
+
+    // The writer's per-column map and the verifier's re-derivation agree, so the
+    // forgery cross-check accepts the honest table.
+    table.verify_zone_map()?;
+    Ok(())
+}
+
 #[cfg(feature = "columnar")]
 #[test]
 fn delete_bitmap_masks_rows_in_columnar_scan() -> crate::Result<()> {

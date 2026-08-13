@@ -3018,10 +3018,11 @@ impl Table {
     /// section's block is checksum-clean to the out-of-band walk even when
     /// its PAYLOAD was re-stamped to another structurally valid map, and
     /// `columnar_scan` trusts its min/max to SKIP blocks — a forged range
-    /// silently omits matching rows. Each block records one synthetic column
-    /// (whole-block key range + row count); every block must be recorded and
-    /// its recorded stats must equal the decoded ones. A no-op for tables
-    /// without the section.
+    /// silently omits matching rows. A row block records one synthetic column
+    /// (whole-block key range + row count); a columnar block records one entry
+    /// per stored column, re-derived from the decoded batch. Every block must
+    /// be recorded and its recorded stats must equal the decoded ones. A no-op
+    /// for tables without the section.
     ///
     /// # Errors
     ///
@@ -3100,54 +3101,32 @@ impl Table {
                     "zone_map is missing a data block's entry",
                 ));
             };
-            // The writer records exactly one synthetic whole-block column.
-            let [col] = recorded else {
-                return Err(crate::Error::InvalidHeader(
-                    "zone_map block does not carry exactly one synthetic column",
-                ));
-            };
-            // Authenticate the column's IDENTITY, not just its key bounds. The
-            // writer stamps a fixed whole-block column: `column_id == 0` and
-            // zero type / codec / null fields. A re-stamped map that keeps the
-            // checked min / max / row_count but changes the id to a consumer
-            // value-column id would let `ColumnRangePredicate::can_skip_block`
-            // read those key bounds as value-column statistics and skip blocks
-            // holding matching rows. Reject any deviation from the synthetic
-            // column the writer actually emits.
-            if col.column_id != 0 || col.type_tag != 0 || col.codec_id != 0 || col.null_count != 0 {
-                return Err(crate::Error::InvalidHeader(
-                    "zone_map synthetic column identity disagrees with the \
-                     writer's whole-block column (id / type / codec / null)",
-                ));
-            }
-            // Derive (min_key, max_key, row_count) from the decoded block.
-            let (min_key, max_key, rows) = {
-                #[cfg(feature = "columnar")]
-                if self.metadata.columnar {
-                    let block = self.load_block_from_disk(&block_handle, BlockType::Columnar)?;
-                    let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
-                    let entries = crate::table::columnar::column_batch_to_entries(&batch)?;
-                    let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
-                        return Err(crate::Error::InvalidHeader(
-                            "columnar data block decodes to zero rows",
-                        ));
-                    };
-                    (
-                        first.key.user_key.to_vec(),
-                        last.key.user_key.to_vec(),
-                        entries.len(),
-                    )
-                } else {
-                    self.zone_stats_from_row_block(&block_handle)?
+            // Authenticate the recorded entry against the block's ACTUAL decoded
+            // statistics. A columnar block records one entry per stored column,
+            // re-derived here by the SAME function the writer used, so any
+            // divergence (a re-stamped range, an added / dropped column, a
+            // flipped id) is a forgery. A row block records a single synthetic
+            // whole-block key range (checked in `verify_row_block_zone_entry`).
+            #[cfg(feature = "columnar")]
+            if self.metadata.columnar {
+                let block = self.load_block_from_disk(&block_handle, BlockType::Columnar)?;
+                let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
+                if batch.row_count == 0 {
+                    return Err(crate::Error::InvalidHeader(
+                        "columnar data block decodes to zero rows",
+                    ));
                 }
-                #[cfg(not(feature = "columnar"))]
-                self.zone_stats_from_row_block(&block_handle)?
-            };
-            if col.min != min_key || col.max != max_key || col.row_count as usize != rows {
-                return Err(crate::Error::InvalidHeader(
-                    "zone_map disagrees with the block's decoded key range or row count",
-                ));
+                if recorded != batch.zone_stats().as_slice() {
+                    return Err(crate::Error::InvalidHeader(
+                        "zone_map disagrees with the columnar block's per-column statistics",
+                    ));
+                }
+            } else {
+                self.verify_row_block_zone_entry(recorded, &block_handle)?;
             }
+            #[cfg(not(feature = "columnar"))]
+            self.verify_row_block_zone_entry(recorded, &block_handle)?;
+
             checked = checked
                 .checked_add(1)
                 .ok_or(crate::Error::InvalidHeader("zone_map"))?;
@@ -3155,6 +3134,44 @@ impl Table {
         if checked != zone_map.live_len(punch) {
             return Err(crate::Error::InvalidHeader(
                 "zone_map carries entries for blocks the index does not hold",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Cross-checks a ROW data block's recorded zone-map entry: it must be
+    /// exactly one synthetic whole-block column (`column_id == 0`, zero type /
+    /// codec / null fields) whose `min` / `max` / `row_count` equal the block's
+    /// decoded key range and row count.
+    ///
+    /// Authenticates the column's IDENTITY, not just its key bounds. A
+    /// re-stamped map that keeps the checked min / max / `row_count` but changes
+    /// the id to a consumer value-column id would let
+    /// [`ColumnRangePredicate::can_skip_block`](crate::table::columnar_predicate::ColumnRangePredicate::can_skip_block)
+    /// read those key bounds as value-column statistics and skip blocks holding
+    /// matching rows. Split out of [`Self::verify_zone_map`] so the columnar
+    /// path can authenticate its per-column entry instead.
+    #[cfg(feature = "std")]
+    fn verify_row_block_zone_entry(
+        &self,
+        recorded: &[crate::table::zone_map::ColumnStats],
+        block_handle: &BlockHandle,
+    ) -> crate::Result<()> {
+        let [col] = recorded else {
+            return Err(crate::Error::InvalidHeader(
+                "zone_map block does not carry exactly one synthetic column",
+            ));
+        };
+        if col.column_id != 0 || col.type_tag != 0 || col.codec_id != 0 || col.null_count != 0 {
+            return Err(crate::Error::InvalidHeader(
+                "zone_map synthetic column identity disagrees with the \
+                 writer's whole-block column (id / type / codec / null)",
+            ));
+        }
+        let (min_key, max_key, rows) = self.zone_stats_from_row_block(block_handle)?;
+        if col.min != min_key || col.max != max_key || col.row_count as usize != rows {
+            return Err(crate::Error::InvalidHeader(
+                "zone_map disagrees with the block's decoded key range or row count",
             ));
         }
         Ok(())
