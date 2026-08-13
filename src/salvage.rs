@@ -365,51 +365,43 @@ pub(crate) fn salvage_with_context(
         false,
     );
 
-    // Completeness ranking of a successful attempt: more recovered blocks
-    // first, then more recovered entries (equal block counts can hold different
-    // key counts — block sizes vary), then fewer dropped blocks. Equal block
-    // counts alone do NOT imply equal recovered data, so the tail preference is
-    // the FINAL tie-break, applied only when every completeness dimension ties.
-    let completeness = |rep: &SalvageReport| {
-        (
-            rep.blocks_salvaged,
-            rep.entries_salvaged,
-            core::cmp::Reverse(rep.dropped.len()),
-        )
-    };
-    let mid_wins = match (&tail, &mid) {
-        // An erroring attempt never beats a successful one; between two
-        // successes, a strictly more complete recovery wins (exact ties keep
-        // the tail, authoritative-by-convention, copy).
-        //
-        // An exact tie under divergence is SAFE to resolve by convention: the
-        // recovered copy re-derives every authoritative field from the actual
-        // re-emitted entries (key range, seqnos, counts) and re-stamps
-        // `created_at` fresh, mirroring only the layout (re-encoded, never
-        // byte-copied when diverged). So the losing mirror's non-derivable
-        // metadata (a backdated `created_at`, a forged count) never reaches the
-        // copy; the tie-break chooses only which layout drives the re-encode, and
-        // both layouts produce a self-consistent copy.
-        (Err(_), Ok(_)) => true,
-        (_, Err(_)) => false,
-        (Ok(t), Ok(m)) => completeness(m) > completeness(t),
-    };
     // Publish the winner from its temp; discard the loser's temp first so no
     // artifact lingers outside the `.healtmp-` sweep namespace, but ONLY when
     // this invocation actually created that temp. An attempt whose `create_new`
     // lost a race to a concurrent salvage returns `AlreadyExists` WITHOUT
     // creating the file, so discarding its path would delete the file the race
     // winner owns (see [`attempt_owns_temp`]).
-    if mid_wins {
-        if attempt_owns_temp(&tail) {
-            discard_partial(fs, &tail_dest);
+    match arbitrate_mirrors(&tail, &mid) {
+        MirrorArbitration::Propagate => {
+            // A transient failure lost only to an INCOMPLETE success; a retry
+            // could recover the dropped blocks. Clean up any temp this
+            // invocation created, then propagate the transient error so the
+            // caller retries the whole salvage.
+            if attempt_owns_temp(&tail) {
+                discard_partial(fs, &tail_dest);
+            }
+            if attempt_owns_temp(&mid) {
+                discard_partial(fs, &mid_dest);
+            }
+            // Return whichever attempt raised the transient error.
+            if matches!(&tail, Err(crate::Error::Io(e)) if e.kind().is_transient()) {
+                tail
+            } else {
+                mid
+            }
         }
-        publish_from_temp(fs, mid, &mid_dest, &dest, options)
-    } else {
-        if attempt_owns_temp(&mid) {
-            discard_partial(fs, &mid_dest);
+        MirrorArbitration::PublishMid => {
+            if attempt_owns_temp(&tail) {
+                discard_partial(fs, &tail_dest);
+            }
+            publish_from_temp(fs, mid, &mid_dest, &dest, options)
         }
-        publish_from_temp(fs, tail, &tail_dest, &dest, options)
+        MirrorArbitration::PublishTail => {
+            if attempt_owns_temp(&mid) {
+                discard_partial(fs, &mid_dest);
+            }
+            publish_from_temp(fs, tail, &tail_dest, &dest, options)
+        }
     }
 }
 
@@ -430,6 +422,63 @@ pub(crate) fn salvage_with_context(
 ///   (`salvaged_path == None`).
 fn attempt_owns_temp(result: &crate::Result<SalvageReport>) -> bool {
     matches!(result, Ok(r) if r.salvaged_path.is_some())
+}
+
+/// Which divergent-mirror attempt to publish, or whether to propagate a
+/// transient failure.
+#[derive(Debug, PartialEq, Eq)]
+enum MirrorArbitration {
+    /// Publish the tail (authoritative-by-convention) attempt.
+    PublishTail,
+    /// Publish the mid attempt.
+    PublishMid,
+    /// Propagate the transient failure: a retry could recover more than the
+    /// incomplete success it would otherwise lose to.
+    Propagate,
+}
+
+/// Chooses which divergent-mirror attempt to publish, or whether to propagate a
+/// transient failure so the caller retries.
+///
+/// A TRANSIENT failure on one attempt must NOT lose to an INCOMPLETE success on
+/// the other: a retry of the transiently-failing mirror could recover the blocks
+/// the incomplete winner dropped, so propagate it. A COMPLETE success still wins
+/// (a retry cannot improve on it), and a PERSISTENT failure always loses to any
+/// success (a retry cannot help there). Between two successes the strictly more
+/// complete recovery wins; an exact tie keeps the tail copy (authoritative by
+/// convention — the recovered copy re-derives every authoritative field from the
+/// re-emitted entries, so the losing mirror's non-derivable metadata never
+/// reaches it and the tie-break only chooses which layout drives the re-encode).
+fn arbitrate_mirrors(
+    tail: &crate::Result<SalvageReport>,
+    mid: &crate::Result<SalvageReport>,
+) -> MirrorArbitration {
+    let is_transient = |r: &crate::Result<SalvageReport>| matches!(r, Err(crate::Error::Io(e)) if e.kind().is_transient());
+    let complete = |r: &crate::Result<SalvageReport>| matches!(r, Ok(rep) if rep.is_complete());
+    if (is_transient(tail) && !complete(mid)) || (is_transient(mid) && !complete(tail)) {
+        return MirrorArbitration::Propagate;
+    }
+    // Completeness ranking: more recovered blocks first, then more recovered
+    // entries (equal block counts can hold different key counts — block sizes
+    // vary), then fewer dropped blocks.
+    let completeness = |rep: &SalvageReport| {
+        (
+            rep.blocks_salvaged,
+            rep.entries_salvaged,
+            core::cmp::Reverse(rep.dropped.len()),
+        )
+    };
+    match (tail, mid) {
+        (Err(_), Ok(_)) => MirrorArbitration::PublishMid,
+        (_, Err(_)) => MirrorArbitration::PublishTail,
+        (Ok(t), Ok(m)) => {
+            if completeness(m) > completeness(t) {
+                MirrorArbitration::PublishMid
+            } else {
+                MirrorArbitration::PublishTail
+            }
+        }
+    }
 }
 
 /// Probes forward from a process-local counter to a free `.healtmp-{n}` sibling

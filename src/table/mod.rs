@@ -818,9 +818,13 @@ impl Table {
         for keyed in self.block_index.iter() {
             let keyed = match keyed {
                 Ok(keyed) => keyed,
-                // A TRANSIENT read propagates (a retry could verify the mask); a
-                // STRUCTURAL index failure makes every later position unverifiable.
-                Err(e @ crate::Error::Io(_)) => return Err(e),
+                // Only a TRANSIENT read propagates (a retry could verify the
+                // mask); a PERSISTENT index failure makes every later position
+                // unverifiable, so degrade to an unpositionable mask (`Ok(false)`)
+                // and let the caller's resurrection opt-in decide.
+                Err(crate::Error::Io(e)) if e.kind().is_transient() => {
+                    return Err(crate::Error::Io(e));
+                }
                 Err(_) => return Ok(false),
             };
             let offset = keyed.offset().0;
@@ -842,11 +846,14 @@ impl Table {
                 self.zstd_dictionary.as_deref(),
             ) {
                 Ok(block) => block,
-                // A TRANSIENT read propagates; a STRUCTURAL load failure leaves
-                // the block's actual count unknowable, so every later position is
-                // unverifiable — fail closed rather than trust the (potentially
-                // tampered) zone-map claim for it.
-                Err(e @ crate::Error::Io(_)) => return Err(e),
+                // Only a TRANSIENT read propagates; a PERSISTENT load failure
+                // leaves the block's actual count unknowable, so every later
+                // position is unverifiable — degrade to an unpositionable mask
+                // (`Ok(false)`) rather than trust the (potentially tampered)
+                // zone-map claim for it, and let the resurrection opt-in decide.
+                Err(crate::Error::Io(e)) if e.kind().is_transient() => {
+                    return Err(crate::Error::Io(e));
+                }
                 Err(_) => return Ok(false),
             };
             // FULLY decode the batch rather than trusting the leading LE u32
@@ -6539,10 +6546,14 @@ impl Table {
             };
             match load() {
                 Ok(m) => m,
-                // A TRANSIENT read propagates so repair retries; only a STRUCTURAL
-                // failure degrades this rebuildable section into a fail-closed
-                // quarantine.
-                Err(e @ crate::Error::Io(_)) => return Err(e),
+                // Only a TRANSIENT read propagates so repair retries; a PERSISTENT
+                // failure (bad sector, truncation) degrades this rebuildable,
+                // derived section to an empty map (seqno block-skip disabled)
+                // rather than failing the whole open — turning an optimization's
+                // bit-rot into a hard availability loss would be wrong.
+                Err(crate::Error::Io(e)) if e.kind().is_transient() => {
+                    return Err(crate::Error::Io(e));
+                }
                 Err(e) => {
                     log::warn!(
                         "seqno-bounds section for table {:?} is unreadable ({e}); disabling seqno block-skip",
@@ -6599,10 +6610,12 @@ impl Table {
             };
             match load() {
                 Ok(m) => m,
-                // A TRANSIENT read propagates so repair retries; only a STRUCTURAL
-                // failure degrades this rebuildable section into a fail-closed
-                // quarantine.
-                Err(e @ crate::Error::Io(_)) => return Err(e),
+                // Only a TRANSIENT read propagates so repair retries; a PERSISTENT
+                // failure degrades this rebuildable, derived section to an empty
+                // map (block-skip disabled) rather than failing the whole open.
+                Err(crate::Error::Io(e)) if e.kind().is_transient() => {
+                    return Err(crate::Error::Io(e));
+                }
                 Err(e) => {
                     log::warn!(
                         "zone-map section for table {:?} is unreadable ({e}); disabling block-skip",
