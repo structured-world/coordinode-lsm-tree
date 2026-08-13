@@ -73,6 +73,13 @@ pub struct ParsedMeta {
     /// positionally-deleted row.
     pub delete_bitmap_len: Option<u64>,
 
+    /// XXH3-128 of the delete-bitmap section's encoded bytes, binding its
+    /// CONTENTS (not just its cardinality) into the meta. `None` on tables
+    /// written before this field. A count-only cross-check would accept an
+    /// equal-cardinality checksum-valid substitution that, during manifest repair
+    /// (no original whole-file digest), resurrects deleted rows / drops live ones.
+    pub delete_bitmap_hash: Option<u128>,
+
     pub weak_tombstone_count: u64,
     pub weak_tombstone_reclaimable: u64,
 
@@ -489,6 +496,17 @@ impl ParsedMeta {
                 None => Ok(None),
             }
         };
+        // Present-but-wrong-width is corrupt meta, so require exactly 16 bytes.
+        let read_opt_u128 = |key: &[u8]| -> crate::Result<Option<u128>> {
+            match block.point_read(key, SeqNo::MAX, &cmp)? {
+                Some(item) => {
+                    let bytes = <[u8; 16]>::try_from(&item.value[..])
+                        .map_err(|_| crate::Error::InvalidHeader("TableMeta"))?;
+                    Ok(Some(u128::from_le_bytes(bytes)))
+                }
+                None => Ok(None),
+            }
+        };
         let sum_user_key_bytes = read_opt_u64(b"key_bytes#sum")?;
         let sum_value_bytes = read_opt_u64(b"value_bytes#sum")?;
         // Intentionally OPTIONAL, not a required `read_u64!`: tables written
@@ -498,6 +516,7 @@ impl ParsedMeta {
         // and the mirror, so a stripped or forged key fails meta integrity long
         // before the `delete_bitmap_len` cross-check would run.
         let delete_bitmap_len = read_opt_u64(b"descriptor#delete_bitmap_len")?;
+        let delete_bitmap_hash = read_opt_u128(b"descriptor#delete_bitmap_hash")?;
 
         Ok(Self {
             id,
@@ -512,6 +531,7 @@ impl ParsedMeta {
             tombstone_count,
             range_tombstone_count,
             delete_bitmap_len,
+            delete_bitmap_hash,
             weak_tombstone_count,
             weak_tombstone_reclaimable,
             sum_user_key_bytes,

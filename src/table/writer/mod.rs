@@ -2239,6 +2239,19 @@ impl Writer {
             } else {
                 0
             },
+            // Bind the delete-bitmap CONTENTS, not just its count, into the meta:
+            // an equal-cardinality but checksum-valid bitmap substituted for the
+            // real one would otherwise pass the count cross-check and, during
+            // manifest repair (no original whole-file digest to compare against),
+            // silently resurrect deleted rows / drop live ones. The hash is over
+            // the exact encoded bytes written to the section above; the meta block
+            // is itself checksum- and mirror-protected, so this authenticates the
+            // section content transitively.
+            delete_bitmap_hash: if writes_delete_bitmap {
+                crate::hash::hash128(&self.delete_bitmap.encode())
+            } else {
+                0
+            },
             created_at_nanos,
         };
 
@@ -2465,6 +2478,10 @@ struct MetaSectionParams<'a> {
     /// valid optional section) and resurrect every positionally-deleted row. A
     /// `> 0` count with no readable delete-bitmap section is then a forgery.
     delete_bitmap_len: u64,
+    /// XXH3-128 of the delete-bitmap section's encoded bytes (0 when no section
+    /// is written), binding its CONTENTS into the meta so an equal-cardinality
+    /// substitution cannot pass the count-only cross-check.
+    delete_bitmap_hash: u128,
     /// `created_at` snapshot taken once in `finish()`. Both MID and
     /// TAIL writes consume this same value; generating it inside
     /// `write_meta_section` per call would stamp the two copies with
@@ -2608,6 +2625,10 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
         // optional (omitted when empty), so this count lets a reader detect a
         // re-stamped TOC that hid a non-empty bitmap. A `> 0` count with no
         // readable bitmap section is a forgery that would resurrect deleted rows.
+        meta(
+            "descriptor#delete_bitmap_hash",
+            &p.delete_bitmap_hash.to_le_bytes(),
+        ),
         meta(
             "descriptor#delete_bitmap_len",
             &p.delete_bitmap_len.to_le_bytes(),

@@ -2693,6 +2693,53 @@ fn verify_metadata_bounds_rejects_a_hidden_delete_bitmap() -> crate::Result<()> 
     Ok(())
 }
 
+/// An EQUAL-CARDINALITY `delete_bitmap` substitution (a different, checksum-valid
+/// bitmap with the same number of positions) passes the count-only cross-check
+/// but must be rejected by the content hash: during manifest repair, with no
+/// original whole-file digest, it would otherwise resurrect the originally
+/// deleted rows and drop different live ones.
+#[cfg(feature = "columnar")]
+#[test]
+fn verify_metadata_bounds_rejects_an_equal_cardinality_delete_bitmap_substitution()
+-> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let n = 64u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    for pos in [5u32, 20, 40] {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    // Replace the bitmap with a DIFFERENT set of three positions (same chunk,
+    // same cardinality and encoded length, so the count cross-check still
+    // passes) — only the CONTENTS differ.
+    crate::test_forge::forge_delete_bitmap_substitute(&source, 0, &[6, 21, 41])?;
+
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_metadata_bounds() else {
+        panic!("an equal-cardinality bitmap substitution must be rejected by the content hash");
+    };
+    assert!(
+        matches!(err, crate::Error::InvalidHeader(msg) if msg.contains("delete_bitmap contents disagree")),
+        "the rejection must name the delete_bitmap content-hash mismatch, got {err:?}",
+    );
+    Ok(())
+}
+
 /// A PRESENT `delete_bitmap` section that decodes to an EMPTY bitmap must fail
 /// salvage closed. The writer only emits the section when the bitmap is
 /// non-empty, so a checksum-consistent corruption to empty is a forge: it keeps

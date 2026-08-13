@@ -1535,6 +1535,35 @@ pub fn forge_delete_bitmap_empty(
     replace_section_frame(path, b"delete_bitmap", &forged)
 }
 
+/// REPLACES the `delete_bitmap` section with a valid, checksum-consistent
+/// `DeleteBitmap` built from `positions`, re-stamping the TOC + trailer. With the
+/// SAME number of positions in the same chunk as the original it keeps the
+/// encoded length (and cardinality) identical — passing the count-only
+/// cross-check — while its CONTENTS differ, modelling an equal-cardinality
+/// substitution that resurrects different rows. The SST must be PLAIN.
+pub fn forge_delete_bitmap_substitute(
+    path: &std::path::Path,
+    table_id: crate::TableId,
+    positions: &[u32],
+) -> crate::Result<()> {
+    use crate::table::block::{Block, BlockIdentity, BlockTransform, BlockType};
+
+    let mut bitmap = crate::table::delete_bitmap::DeleteBitmap::new();
+    for &pos in positions {
+        bitmap.insert(pos);
+    }
+    let payload = bitmap.encode();
+    let identity = BlockIdentity {
+        table_id,
+        block_type: BlockType::DeleteBitmap,
+        dict_id: 0,
+        window_log: 0,
+    };
+    let mut forged = Vec::new();
+    Block::write_into(&mut forged, &payload, identity, &BlockTransform::PLAIN)?;
+    replace_section_frame(path, b"delete_bitmap", &forged)
+}
+
 /// REPLACES the `filter` section with a valid, checksum-consistent Filter block
 /// carrying an EMPTY payload (the "no filter installed" sentinel), re-stamping
 /// the TOC + trailer. Models a `delete_bitmap` renamed and re-roled to an empty

@@ -4037,6 +4037,30 @@ impl Table {
                 ));
             }
         }
+        // Authenticate the delete-bitmap CONTENTS, not just its cardinality: the
+        // count check above accepts an equal-cardinality checksum-valid bitmap
+        // substituted for the real one, which — during manifest repair, with no
+        // original whole-file digest to compare against — would resurrect the
+        // originally-deleted rows and drop different live ones. The meta-bound
+        // hash of the section's encoded bytes catches any content substitution;
+        // the meta block is itself checksum- and mirror-verified, so a forger
+        // cannot restamp the hash without failing meta integrity. `None` is an
+        // older table without the field. Re-encoding the decoded bitmap is
+        // byte-identical to the on-disk section (the container kind and its
+        // contents round-trip verbatim), so this matches the writer's hash.
+        #[cfg(feature = "columnar")]
+        if let Some(recorded_hash) = meta.delete_bitmap_hash
+            && self.has_delete_bitmap_section()
+        {
+            let actual_hash = crate::hash::hash128(&self.delete_bitmap().encode());
+            if actual_hash != recorded_hash {
+                return Err(crate::Error::InvalidHeader(
+                    "delete_bitmap contents disagree with the recorded \
+                     descriptor#delete_bitmap_hash (an equal-cardinality bitmap \
+                     was substituted)",
+                ));
+            }
+        }
         // Range tombstones mask entries in OLDER tables during reads and
         // merges, so a key range narrowed below a tombstone's extent routes
         // reads around this table and resurrects the data it deletes. Reuse the
