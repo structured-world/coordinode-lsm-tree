@@ -1570,10 +1570,19 @@ fn salvage_blocks(
                                 // is block-local malformed content — drop the block
                                 // and keep walking; destination I/O errors stay hard.
                                 let emitted = match verbatim_source {
-                                    // Clean: copy the block's raw bytes as-is.
+                                    // Clean: copy the block's raw bytes as-is,
+                                    // carrying the block's per-column zone-map
+                                    // stats (this is the columnar path, so the
+                                    // synthetic row-block stat would be rejected
+                                    // by the copy's own `verify_zone_map`).
                                     Some((raw, header, layout)) => writer
                                         .append_verbatim_data_block(
-                                            &raw, header, layout, &entries, comparator,
+                                            &raw,
+                                            header,
+                                            layout,
+                                            &entries,
+                                            Some(batch.zone_stats()),
+                                            comparator,
                                         )
                                         .map(|_| true),
                                     // ECC-recovered (or delete-bearing): re-encode the
@@ -1749,7 +1758,7 @@ fn salvage_blocks(
                                     if let Some((raw, header, layout)) = sb.verbatim {
                                         writer
                                             .append_verbatim_data_block(
-                                                &raw, header, layout, &entries, comparator,
+                                                &raw, header, layout, &entries, None, comparator,
                                             )
                                             .map(|_| true)
                                     } else {

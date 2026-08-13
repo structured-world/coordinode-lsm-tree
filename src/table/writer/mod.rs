@@ -1687,6 +1687,13 @@ impl Writer {
         header: crate::table::block::Header,
         layout: alloc::vec::Vec<u32>,
         entries: &[InternalValue],
+        // Per-column zone-map stats for a COLUMNAR block being copied verbatim
+        // (`Some`, pre-derived from its decoded `ColumnBatch`); `None` for a row
+        // block, where `register_written_block` synthesizes the whole-block key
+        // range. A columnar block copied with `None` would record the row-block
+        // synthetic column-0 stat, which `verify_zone_map` then rejects on the
+        // columnar table.
+        columnar_columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
         comparator: &crate::SharedComparator,
     ) -> crate::Result<Option<crate::UserKey>> {
         // The copied bytes ARE the block; their length must equal what the index
@@ -1724,7 +1731,7 @@ impl Writer {
             inputs.seqno_bounds,
             inputs.item_count,
             inputs.zone_block_min,
-            None, // verbatim row block: register synthesizes the key range
+            columnar_columns,
         )?;
         if self.locator.is_some() {
             self.locator_block_id += 1;
