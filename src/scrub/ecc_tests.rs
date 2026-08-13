@@ -3233,9 +3233,12 @@ fn heal_in_place_aborts_when_the_attestation_cannot_be_persisted() -> crate::Res
 
 /// The checkpoint's pre-window reconciliation only scans ECC tables, so a
 /// pending `.heal-attest` marker it cannot consume (here: one on a non-ECC
-/// table) must still be caught by the post-link-window fail-closed guard rather
-/// than snapshot the table under a possibly-stale digest with no marker. Models
-/// the residual race where a marker survives the pre-window reconcile.
+/// table) whose digest is STALE — healed bytes not yet reconciled — must still
+/// be caught by the post-link-window fail-closed guard rather than snapshot the
+/// table under that stale digest with no marker. Models the residual race where
+/// a genuine pending heal survives the pre-window reconcile. (A marker whose
+/// digest already matches the manifest is obsolete and does NOT abort; see
+/// [`abort_checkpoint_ignores_an_obsolete_marker_but_aborts_on_a_stale_digest`].)
 #[test]
 fn checkpoint_aborts_when_a_pending_marker_survives_the_pre_window_reconcile() -> crate::Result<()>
 {
@@ -3267,6 +3270,16 @@ fn checkpoint_aborts_when_a_pending_marker_survives_the_pre_window_reconcile() -
         (*table.path).clone()
     };
 
+    // Make the on-disk digest diverge from the manifest so the surviving marker
+    // models a GENUINE pending heal (healed bytes the reconcile has not caught
+    // up to), the case the post-window guard must abort on. Flip an interior
+    // byte (length and trailer intact); the manifest still records the pre-flip
+    // digest.
+    let mut bytes = std::fs::read(&sst_path)?;
+    if let Some(b) = bytes.get_mut(50) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&sst_path, &bytes)?;
     // Plant a pending marker the ECC-only pre-window reconcile will not consume.
     std::fs::write(heal_attest_path(&sst_path), b"pending marker")?;
 
@@ -3274,8 +3287,8 @@ fn checkpoint_aborts_when_a_pending_marker_survives_the_pre_window_reconcile() -
     let result = tree.create_checkpoint(&dst);
     assert!(
         result.is_err(),
-        "a pending marker the pre-window reconcile cannot consume must abort the \
-         checkpoint at the post-link-window guard: {result:?}",
+        "a pending marker with a stale digest the pre-window reconcile cannot consume must \
+         abort the checkpoint at the post-link-window guard: {result:?}",
     );
     Ok(())
 }
