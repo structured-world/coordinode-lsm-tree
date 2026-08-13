@@ -414,7 +414,14 @@ fn block_verify_verdict(
         | crate::verify::BlockVerifyError::DataReadError { error, .. } = e
             && error.kind().is_transient()
         {
-            return Err(crate::Error::Io(crate::io::Error::other(error.to_string())));
+            // Preserve the transient ErrorKind: re-wrapping as `Other` would make
+            // the caller's `is_transient_io` check see a non-transient kind and
+            // re-grade this retryable failure as corruption, defeating the
+            // transient-propagation intent of this very gate.
+            return Err(crate::Error::Io(crate::io::Error::new(
+                error.kind(),
+                error.to_string(),
+            )));
         }
     }
 
