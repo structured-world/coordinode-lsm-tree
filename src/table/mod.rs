@@ -2566,18 +2566,27 @@ impl Table {
     ///
     /// # Errors
     ///
-    /// Propagates a transient [`crate::Error::Io`] from opening / reading the
-    /// index mirrors. `Ok(false)` is reserved for a STRUCTURAL authentication
-    /// failure (mirrors disagree, pointers do not verify, handles do not tile):
-    /// folding a flaky read into `false` would make the salvage walk fall back to
-    /// physical-chain provenance and surrender every block past the first header
-    /// break, dropping otherwise healthy keys the intact TLI could have anchored
-    /// on retry.
+    /// Propagates only a TRANSIENT [`crate::Error::Io`] from opening / reading
+    /// the index mirrors: folding a flaky read into `false` would make the
+    /// salvage walk fall back to physical-chain provenance and surrender every
+    /// block past the first header break, dropping otherwise healthy keys the
+    /// intact TLI could have anchored on retry. `Ok(false)` covers a STRUCTURAL
+    /// authentication failure (mirrors disagree, pointers do not verify, handles
+    /// do not tile) AND a PERSISTENT read failure of one mirror: both mean the
+    /// index cannot be trusted here, so the walk should fall back to the readable
+    /// data section rather than abort and recover nothing.
     #[cfg(feature = "std")]
     pub(crate) fn tli_structure_authenticated(&self) -> crate::Result<bool> {
         match self.verify_tli_mirrors_inner(false) {
             Ok(()) => Ok(true),
-            Err(e @ crate::Error::Io(_)) => Err(e),
+            // Only a TRANSIENT read propagates (so the salvage walk aborts for a
+            // retry rather than surrendering an intact index to a flaky read). A
+            // PERSISTENT mirror failure (a bad-sector `UnexpectedEof` on one
+            // mirror while the other and the data section stay readable) is
+            // untrusted input, not a reason to abort: fold it into `false` so the
+            // walk falls back to physical-chain provenance and still recovers the
+            // readable data blocks.
+            Err(crate::Error::Io(e)) if e.kind().is_transient() => Err(crate::Error::Io(e)),
             Err(_) => Ok(false),
         }
     }
@@ -6647,10 +6656,16 @@ impl Table {
             };
             match load() {
                 Ok(db) => db,
-                // A TRANSIENT read propagates so repair retries; degrading the
+                // A TRANSIENT read propagates so repair retries: degrading the
                 // delete mask to "all rows live" on a one-shot fault would
-                // resurrect deleted rows in the rebuilt table.
-                Err(e @ crate::Error::Io(_)) => return Err(e),
+                // resurrect deleted rows in the rebuilt table. A PERSISTENT read
+                // failure in salvage mode instead falls through to the
+                // degradation branch below, where the caller's
+                // `allow_delete_resurrection` opt-in is honored downstream (a
+                // non-salvage open still fails closed via the final arm).
+                Err(crate::Error::Io(e)) if e.kind().is_transient() => {
+                    return Err(crate::Error::Io(e));
+                }
                 Err(e) if salvage => {
                     log::warn!(
                         "delete-bitmap for table {:?} is unreadable ({e}); salvaging all rows as live",
