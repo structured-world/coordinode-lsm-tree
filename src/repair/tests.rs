@@ -477,7 +477,7 @@ fn repair_with_salvage_recovers_a_table_whose_whole_file_hash_faults() -> crate:
     // the whole-file hash, not on any block read).
     {
         let build_fs: Arc<dyn Fs> = Arc::new(StdFs);
-        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&build_fs))?.use_data_block_size(128);
+        let mut w = Writer::new(sst, 0, 0, Arc::clone(&build_fs))?.use_data_block_size(128);
         for i in 0..64u32 {
             w.write(InternalValue::from_components(
                 format!("k{i:05}").into_bytes(),
