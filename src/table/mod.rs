@@ -4044,21 +4044,38 @@ impl Table {
         // originally-deleted rows and drop different live ones. The meta-bound
         // hash of the section's encoded bytes catches any content substitution;
         // the meta block is itself checksum- and mirror-verified, so a forger
-        // cannot restamp the hash without failing meta integrity. `None` is an
-        // older table without the field. Re-encoding the decoded bitmap is
-        // byte-identical to the on-disk section (the container kind and its
-        // contents round-trip verbatim), so this matches the writer's hash.
+        // cannot restamp the hash without failing meta integrity. Re-encoding the
+        // decoded bitmap is byte-identical to the on-disk section (the container
+        // kind and its contents round-trip verbatim), so it matches the writer's
+        // hash.
+        //
+        // This gate runs ONLY during repair / heal reconciliation, never on an
+        // ordinary read (which the manifest's whole-file digest already
+        // protects). Those paths have no original digest, so a PRESENT bitmap
+        // section MUST carry a content hash to be authenticated here: a table
+        // written before this field (`None`) cannot be authenticated, so it fails
+        // closed rather than accepting a possibly-substituted equal-cardinality
+        // mask. Ordinary reads of such an older table are unaffected.
         #[cfg(feature = "columnar")]
-        if let Some(recorded_hash) = meta.delete_bitmap_hash
-            && self.has_delete_bitmap_section()
-        {
-            let actual_hash = crate::hash::hash128(&self.delete_bitmap().encode());
-            if actual_hash != recorded_hash {
-                return Err(crate::Error::InvalidHeader(
-                    "delete_bitmap contents disagree with the recorded \
-                     descriptor#delete_bitmap_hash (an equal-cardinality bitmap \
-                     was substituted)",
-                ));
+        if self.has_delete_bitmap_section() {
+            match meta.delete_bitmap_hash {
+                Some(recorded_hash) => {
+                    let actual_hash = crate::hash::hash128(&self.delete_bitmap().encode());
+                    if actual_hash != recorded_hash {
+                        return Err(crate::Error::InvalidHeader(
+                            "delete_bitmap contents disagree with the recorded \
+                             descriptor#delete_bitmap_hash (an equal-cardinality bitmap \
+                             was substituted)",
+                        ));
+                    }
+                }
+                None => {
+                    return Err(crate::Error::InvalidHeader(
+                        "delete_bitmap section present without a \
+                         descriptor#delete_bitmap_hash; its contents cannot be \
+                         authenticated during repair / heal",
+                    ));
+                }
             }
         }
         // Range tombstones mask entries in OLDER tables during reads and
