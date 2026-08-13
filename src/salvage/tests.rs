@@ -2740,6 +2740,35 @@ fn verify_metadata_bounds_rejects_an_equal_cardinality_delete_bitmap_substitutio
     Ok(())
 }
 
+/// `attempt_owns_temp` must prove ownership from the OUTCOME (a written temp),
+/// not infer it from the error kind: a salvage attempt that errors BEFORE
+/// `Writer::new` (e.g. a range-tombstone refusal) never created the temp, so the
+/// arbitration cleanup must NOT discard that path — on shared storage it could be
+/// a concurrent creator's file.
+#[test]
+fn attempt_owns_temp_tracks_the_written_outcome_not_the_error_kind() {
+    let report = |salvaged_path| super::SalvageReport {
+        salvaged_path,
+        blocks_total: 1,
+        blocks_salvaged: 1,
+        blocks_copied_verbatim: 0,
+        entries_salvaged: 1,
+        dropped: alloc::vec::Vec::new(),
+        delete_rows_resurrected: false,
+    };
+
+    // Wrote a temp → owned.
+    assert!(super::attempt_owns_temp(&Ok(report(Some(
+        std::path::PathBuf::from("/x")
+    )))));
+    // Recovered nothing (empty temp already discarded) → not owned.
+    assert!(!super::attempt_owns_temp(&Ok(report(None))));
+    // Errored BEFORE create (range tombstones) → temp never created → not owned.
+    assert!(!super::attempt_owns_temp(&Err(
+        crate::Error::FeatureUnsupported("range tombstones")
+    )));
+}
+
 /// A PRESENT `delete_bitmap` section that decodes to an EMPTY bitmap must fail
 /// salvage closed. The writer only emits the section when the bitmap is
 /// non-empty, so a checksum-consistent corruption to empty is a forge: it keeps

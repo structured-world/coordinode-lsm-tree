@@ -413,19 +413,23 @@ pub(crate) fn salvage_with_context(
     }
 }
 
-/// Whether a salvage attempt CREATED (and therefore owns) its destination temp.
+/// Whether a salvage attempt left a destination temp for the caller to clean up.
 ///
-/// Every attempt opens its temp with `create_new`, which atomically claims the
-/// path: any outcome other than `AlreadyExists` means this invocation owns the
-/// temp (a success, or a later write / finish error AFTER `create_new` proved
-/// ownership) and must clean it up. `AlreadyExists` means `create_new` lost a
-/// race to a concurrent creator and created nothing, so the path belongs to
-/// that other process and this invocation must NOT discard it.
+/// Ownership is proven by the actual OUTCOME — a present `salvaged_path` — not
+/// inferred from the final error kind. An attempt leaves a temp to discard ONLY
+/// when it succeeded AND actually wrote one (`Ok` with `salvaged_path == Some`).
+/// Every other outcome leaves nothing for the caller to remove:
+/// - an error BEFORE `Writer::new` (a checksum / recover / range-tombstone /
+///   deletion-guard failure) never created the temp — inferring ownership from
+///   the non-`AlreadyExists` error kind would delete a concurrent creator's file
+///   on shared storage;
+/// - an error AFTER `Writer::new` (a walk / finish failure) already discarded its
+///   partial output internally;
+/// - an `AlreadyExists` from `create_new` lost the race and created nothing;
+/// - an `Ok` attempt that recovered nothing discarded its empty temp too
+///   (`salvaged_path == None`).
 fn attempt_owns_temp(result: &crate::Result<SalvageReport>) -> bool {
-    !matches!(
-        result,
-        Err(crate::Error::Io(e)) if e.kind() == crate::io::ErrorKind::AlreadyExists
-    )
+    matches!(result, Ok(r) if r.salvaged_path.is_some())
 }
 
 /// Probes forward from a process-local counter to a free `.healtmp-{n}` sibling
