@@ -1070,49 +1070,50 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                 continue;
             }
 
-            let checksum = match compute_table_checksum(&*folder_fs, &table_path) {
-                Ok(c) => crate::Checksum::from_raw(c),
-                // A TRANSIENT read (flaky I/O) while hashing the file is
-                // retryable: recording it unreadable commits a manifest without the
+            // Hash the file and open it. A non-transient hashing failure (a bad
+            // data sector) is FOLDED into the recover Result so the salvage arm
+            // below can recover the table's intact blocks, instead of recording
+            // the whole table unreadable — which the next open's orphan cleanup
+            // would then delete. Table::recover would fail on the same bytes, so
+            // skip it; block salvage opens with a placeholder digest and drops
+            // only the unreadable blocks. global_seqno = 0: a recovered table's
+            // intrinsic sequence numbers are authoritative; there is no
+            // ingestion-time translation offset. tree_id = 0 and
+            // descriptor_table = None keep the transient open from polluting any
+            // shared cache keyed by the real tree id (the tree reopens fresh
+            // after repair).
+            let recovered = match compute_table_checksum(&*folder_fs, &table_path) {
+                Ok(c) => Table::recover(
+                    table_path.clone(),
+                    crate::Checksum::from_raw(c),
+                    0,
+                    0,
+                    table_id,
+                    config.cache.clone(),
+                    None,
+                    folder_fs.clone(),
+                    false,
+                    false,
+                    config.encryption.clone(),
+                    #[cfg(zstd_any)]
+                    config.zstd_dictionary.clone(),
+                    config.comparator.clone(),
+                    #[cfg(feature = "metrics")]
+                    Arc::new(crate::metrics::Metrics::default()),
+                ),
+                // A TRANSIENT read (flaky I/O) while hashing is retryable:
+                // recording it unreadable commits a manifest without the
                 // still-in-place file, which the next open's orphan cleanup then
-                // deletes — permanent loss from a one-shot failure. Propagate it so
-                // a retry re-reads the table, mirroring the `Table::recover`
-                // failure path below. A structural I/O (a corrupt trailer reads
-                // back `InvalidInput`) is genuine damage: record it unreadable.
+                // deletes — permanent loss from a one-shot failure. Propagate it
+                // so a retry re-reads the table, mirroring the recover arms below.
                 Err(e) if is_transient_io(&e) => return Err(e),
-                Err(e) => {
-                    // Mirror the `Table::recover` failure path below: free the id
-                    // so an aliased copy in another scanned folder can still be
-                    // retried.
-                    seen_ids.remove(&table_id);
-                    unreadable_files.push((table_path, e.to_string()));
-                    continue;
-                }
+                // A PERSISTENT read failure (a bad data sector, a corrupt trailer)
+                // is genuine damage but does not doom the whole table: fold it into
+                // the recover Result so the structural-failure salvage arm below
+                // recovers the intact blocks (or records it unreadable with salvage
+                // off).
+                Err(e) => Err(e),
             };
-
-            // global_seqno = 0: a recovered table's intrinsic sequence numbers
-            // are authoritative; there is no ingestion-time translation offset
-            // to reapply. tree_id = 0 and descriptor_table = None keep the
-            // transient open from polluting any shared cache keyed by the real
-            // tree id (the tree is reopened fresh after repair).
-            let recovered = Table::recover(
-                table_path.clone(),
-                checksum,
-                0,
-                0,
-                table_id,
-                config.cache.clone(),
-                None,
-                folder_fs.clone(),
-                false,
-                false,
-                config.encryption.clone(),
-                #[cfg(zstd_any)]
-                config.zstd_dictionary.clone(),
-                config.comparator.clone(),
-                #[cfg(feature = "metrics")]
-                Arc::new(crate::metrics::Metrics::default()),
-            );
 
             match recovered {
                 // In salvage mode a table whose whole-file recovery succeeded can

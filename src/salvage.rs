@@ -642,7 +642,16 @@ fn salvage_attempt(
     // Digest the source through the injected `Fs`, not `std::fs`: salvage runs
     // over MemFs / fault-injected / routed backends (repair passes its own `fs`),
     // where a direct `std::fs` read would miss the file or hash the wrong bytes.
-    let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&**fs, source)?);
+    // A persistent bad sector fails the whole-file digest, but salvage does not
+    // need it: the block walk classifies unreadable blocks itself, and the
+    // recovered copy is written under its own fresh digest. Fall back to a
+    // placeholder so a bad-sector source still reaches block-level recovery
+    // (mirrors the blob salvage path, which also opens with `from_raw(0)`); a
+    // healthy source keeps its real digest.
+    let checksum = match crate::repair::compute_table_checksum(&**fs, source) {
+        Ok(c) => crate::Checksum::from_raw(c),
+        Err(_) => crate::Checksum::from_raw(0),
+    };
     let cache = Arc::new(crate::cache::Cache::with_capacity_bytes(8 * 1024 * 1024));
     let descriptor = Arc::new(crate::descriptor_table::DescriptorTable::new(64));
     #[cfg(feature = "metrics")]
