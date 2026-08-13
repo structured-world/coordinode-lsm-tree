@@ -2999,6 +2999,53 @@ fn reconcile_reclaims_an_obsolete_marker_when_the_digest_already_matches() -> cr
     Ok(())
 }
 
+/// The checkpoint-time guard `abort_checkpoint_if_pending_heals` must not wedge
+/// on an OBSOLETE marker: a prior reconcile installed the refreshed digest but
+/// crashed before removing the sidecar, so the file ALREADY matches the
+/// manifest. A build WITHOUT `page_ecc` never runs reconciliation to clear it,
+/// so an unconditional abort would fail EVERY checkpoint forever. When the
+/// live-region digest already agrees with the manifest the guard reclaims the
+/// stale marker and proceeds; a genuine pending heal (a digest that does NOT
+/// match) still aborts.
+#[test]
+fn abort_checkpoint_ignores_an_obsolete_marker_but_aborts_on_a_stale_digest() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    // A clean ECC table: its on-disk digest already matches the manifest.
+    let (sst_path, _block) = write_ecc_sst(dir.path());
+    let marker = heal_attest_path(&sst_path);
+
+    // Case 1: an obsolete leftover marker (a crash between the digest refresh
+    // and the marker unlink). The guard must proceed and reclaim it.
+    std::fs::write(&marker, b"obsolete marker")?;
+    let tree = open_ecc_tree(dir.path());
+    crate::scrub::abort_checkpoint_if_pending_heals(&tree, "obsolete-marker case")?;
+    assert!(
+        !marker.exists(),
+        "an obsolete marker matching the manifest must be reclaimed, not wedge the checkpoint",
+    );
+
+    // Case 2: a genuine pending heal — the on-disk digest no longer matches the
+    // manifest. Flip an interior data byte (length and trailer intact) so the
+    // streamed digest diverges while the in-memory manifest entry is unchanged.
+    std::fs::write(&marker, b"pending marker")?;
+    let mut bytes = std::fs::read(&sst_path)?;
+    if let Some(b) = bytes.get_mut(64) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&sst_path, &bytes)?;
+    let err = crate::scrub::abort_checkpoint_if_pending_heals(&tree, "stale-digest case")
+        .expect_err("a pending heal whose digest does not match the manifest must abort");
+    assert!(
+        matches!(err, crate::Error::Io(_)),
+        "the abort is surfaced as an Io error, got {err:?}",
+    );
+    assert!(
+        marker.exists(),
+        "a genuine pending marker is kept for the next reconciliation",
+    );
+    Ok(())
+}
+
 /// A checkpoint taken while a table carries a PENDING heal attestation (healed
 /// bytes on disk, the live version still recording the pre-heal digest, and the
 /// `.heal-attest` sidecar which the checkpoint does NOT copy) must not capture
