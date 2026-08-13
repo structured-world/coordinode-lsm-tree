@@ -1152,6 +1152,44 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                 continue;
             }
 
+            // Rebuild the restricted view of a tight-space-PUNCHED SST. Tight-space
+            // compaction reclaims a table's consumed prefix data blocks in place
+            // (hole-punched, reading back as zeros) and records the restriction
+            // lower bound in the manifest — but the SST itself does not carry it.
+            // A rebuilt manifest would open the table UNRESTRICTED, so later reads
+            // and compactions traverse the punched blocks and fail. Detect the
+            // punch (physically allocated bytes below the logical length: only
+            // hole-punching frees blocks on a densely-written SST) and recover the
+            // live suffix restricted to its first readable key — the manifest
+            // snapshot then persists the restriction. A punched table with NO
+            // readable block is wholly consumed and unrecoverable.
+            let recovered = 'restrict: {
+                let Ok(table) = recovered else {
+                    break 'restrict recovered;
+                };
+                let punched = matches!(
+                    (
+                        folder_fs.allocated_size(&table_path),
+                        folder_fs.metadata(&table_path),
+                    ),
+                    (Ok(Some(allocated)), Ok(meta)) if allocated < meta.len
+                );
+                if !punched {
+                    break 'restrict Ok(table);
+                }
+                match table.first_readable_data_key() {
+                    // The first live block's first key is the restriction bound;
+                    // `reopen_restricted` re-recovers under the suffix digest and
+                    // installs the bound. Repair holds no concurrent heal (the tree
+                    // is not open), so it needs no heal lock around this.
+                    Ok(Some(bound)) => table.reopen_restricted(bound),
+                    // No readable data block: the table is wholly punched /
+                    // consumed. Record it unreadable via the structural Err arm.
+                    Ok(None) => Err(crate::Error::Unrecoverable),
+                    Err(e) => Err(e),
+                }
+            };
+
             match recovered {
                 // In salvage mode a table whose whole-file recovery succeeded can
                 // still hold corrupt data blocks (recovery is lazy on the data

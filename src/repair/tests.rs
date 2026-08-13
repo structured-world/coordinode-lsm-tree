@@ -1150,6 +1150,126 @@ fn repair_quarantines_a_table_with_an_unrecoverable_ingest_offset() -> crate::Re
     Ok(())
 }
 
+/// Opens an SST as a `Table` under a given filesystem, stamping the open with
+/// the file's CURRENT whole-file digest (matching what repair computes). Used to
+/// inspect block layout and to re-read a punched file.
+fn recover_sst(
+    path: std::path::PathBuf,
+    fs: &std::sync::Arc<dyn crate::fs::Fs>,
+) -> crate::Result<crate::Table> {
+    let checksum = crate::Checksum::from_raw(compute_table_checksum(&**fs, &path)?);
+    crate::Table::recover(
+        path,
+        checksum,
+        0,
+        0,
+        0,
+        std::sync::Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+        Some(std::sync::Arc::new(
+            crate::descriptor_table::DescriptorTable::new(8),
+        )),
+        std::sync::Arc::clone(fs),
+        false,
+        false,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        crate::comparator::default_comparator(),
+        #[cfg(feature = "metrics")]
+        std::sync::Arc::new(crate::Metrics::default()),
+    )
+}
+
+/// A tight-space-PUNCHED SST records its restriction bound only in the manifest,
+/// not the SST. When manifest repair rebuilds without that bound, the punched
+/// table would open UNRESTRICTED and later reads would traverse its zero-reading
+/// (punched) blocks and fail. Repair must detect the punch (allocated < logical)
+/// and recover the live suffix restricted to its first readable key, so the
+/// reopened tree serves the suffix and routes the punched prefix away instead of
+/// erroring. Uses `MemFs` for a byte-precise punch.
+#[test]
+fn repair_restricts_a_tight_space_punched_table() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::table::Writer;
+    use crate::{AbstractTree, Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::PathBuf::from("/db");
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+
+    // An SST with several small data blocks so a prefix can be punched.
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+        for i in 0..256u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                u64::from(i) + 1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Reclaim the FIRST data block in place (the tight-space prefix punch).
+    let (first_offset, first_size) = {
+        use crate::table::block_index::BlockIndex as _;
+        let table = recover_sst(sst.clone(), &fs)?;
+        let Some(b0) = table.block_index.iter().next() else {
+            panic!("the SST has at least one data block");
+        };
+        let b0 = b0?;
+        (b0.offset().0, b0.size())
+    };
+    memfs.punch_hole(&sst, first_offset, u64::from(first_size))?;
+
+    // The restriction bound is the first key of the first LIVE (post-punch) block.
+    let Some(bound) = recover_sst(sst, &fs)?.first_readable_data_key()? else {
+        panic!("a live suffix block remains after punching only the first block");
+    };
+    assert!(
+        bound.as_ref() > b"k00000".as_ref(),
+        "the bound is past the punched first key, got {bound:?}",
+    );
+
+    // Repair rebuilds the manifest, recovering the punched table RESTRICTED.
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "the punched table is recovered restricted: {report:?}",
+    );
+    assert_eq!(report.unreadable, 0, "{:?}", report.unreadable_files);
+
+    // Reopen: a live suffix key is served; a punched-prefix key is routed away
+    // (absent) rather than erroring on a hole.
+    let tree = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .open()?;
+    assert!(
+        tree.get(b"k00255", crate::MAX_SEQNO)?.is_some(),
+        "a live suffix key is served after repair",
+    );
+    assert!(
+        tree.get(b"k00000", crate::MAX_SEQNO)?.is_none(),
+        "a punched-prefix key is restricted away, not an error",
+    );
+    Ok(())
+}
+
 /// A file whose name only LOOKS like a heal-temp — `{id}.healtmp-{non-numeric}`
 /// (e.g. `5.healtmp-backup`) — must NOT be skipped as an owned artifact: recovery
 /// owns only `{id}.healtmp-{numeric}`, so leaving it in place makes the next

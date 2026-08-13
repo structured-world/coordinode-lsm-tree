@@ -3219,6 +3219,63 @@ impl Table {
         ))
     }
 
+    /// The first user key of the first data block that LOADS successfully, or
+    /// `None` when no data block is readable.
+    ///
+    /// For a tight-space-punched table — a PREFIX of data blocks reclaimed to
+    /// holes that read back as zeros and fail to decode, while the live suffix
+    /// stays intact — this is the restriction lower bound: the first LIVE key,
+    /// below which the table's data was superseded by a merged output table.
+    /// Manifest repair uses it to rebuild the restricted view a punched SST
+    /// needs (the manifest recorded the bound, but the SST does not carry it).
+    /// Data blocks are yielded in key (= offset) order, so the first readable one
+    /// is exactly the first live block past the punched prefix.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a block-index read error; a per-block load / decode failure is
+    /// treated as "punched / unreadable" and skipped, not surfaced.
+    #[cfg(feature = "std")]
+    pub(crate) fn first_readable_data_key(&self) -> crate::Result<Option<UserKey>> {
+        for handle in self.block_index.iter() {
+            let handle = handle?;
+            let block_handle = BlockHandle::new(handle.offset(), handle.size());
+            if let Ok(key) = self.block_first_user_key(&block_handle) {
+                return Ok(Some(key));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The first entry's user key of one data block (row or columnar). Errors if
+    /// the block cannot be loaded / decoded (e.g. a punched block reading as
+    /// zeros), which [`first_readable_data_key`](Self::first_readable_data_key)
+    /// treats as "skip this block".
+    #[cfg(feature = "std")]
+    fn block_first_user_key(&self, block_handle: &BlockHandle) -> crate::Result<UserKey> {
+        #[cfg(feature = "columnar")]
+        if self.metadata.columnar {
+            let block = self.load_block_from_disk(block_handle, BlockType::Columnar)?;
+            let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
+            let entries = crate::table::columnar::column_batch_to_entries(&batch)?;
+            let first = entries.first().ok_or(crate::Error::InvalidHeader(
+                "columnar data block decodes to zero rows",
+            ))?;
+            return Ok(first.key.user_key.clone());
+        }
+        use crate::table::block::ParsedItem as _;
+        let block = self.load_block_from_disk(block_handle, BlockType::Data)?;
+        let data_block = DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())?;
+        let first = data_block
+            .try_iter(self.comparator.clone())?
+            .next()
+            .ok_or(crate::Error::InvalidHeader(
+                "row data block decodes to zero entries",
+            ))?
+            .materialize(data_block.as_slice());
+        Ok(first.key.user_key)
+    }
+
     /// Cross-checks the recorded `locator` section against the ACTUAL
     /// key → newest-version-block mapping derived from decoding every data
     /// block. A checksum- and parity-consistent forged locator is accepted by
