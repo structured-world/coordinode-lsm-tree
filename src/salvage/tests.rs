@@ -2342,7 +2342,10 @@ fn iv(i: u32) -> InternalValue {
 /// File offset of the named SFA section, for a fault rule that targets one
 /// section's positional read.
 fn section_pos(path: &std::path::Path, name: &[u8]) -> u64 {
-    let mut f = std::fs::File::open(path).expect("open source");
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => panic!("opening the source failed: {e:?}"),
+    };
     let reader = match crate::sfa::Reader::from_reader(&mut f) {
         Ok(r) => r,
         Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
