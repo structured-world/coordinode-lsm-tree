@@ -486,16 +486,14 @@ fn publish_from_temp(
     let mut rep = match result {
         Ok(rep) => rep,
         Err(e) => {
-            // A `create_new` that lost a race returns `AlreadyExists` without
-            // creating `temp`; discarding it would delete the race winner's file.
-            // Any other error created `temp` (or nothing) and is safe to clean up.
-            let lost_race = matches!(
-                &e,
-                crate::Error::Io(io) if io.kind() == crate::io::ErrorKind::AlreadyExists
-            );
-            if !lost_race {
-                discard_partial(fs, temp);
-            }
+            // An erroring attempt leaves nothing for the caller to remove, so
+            // NEVER discard `temp` here (ownership is proven by the OUTCOME, not
+            // inferred from the error kind — see [`attempt_owns_temp`]): a
+            // failure BEFORE `Writer::new` never created `temp` (deleting it
+            // would remove a concurrent creator's file on shared storage, e.g.
+            // across PID namespaces with the same numeric id), a failure AFTER
+            // `Writer::new` already discarded its own partial internally, and an
+            // `AlreadyExists` race loser created nothing.
             return Err(e);
         }
     };
