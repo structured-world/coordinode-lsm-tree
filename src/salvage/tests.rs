@@ -2769,6 +2769,42 @@ fn attempt_owns_temp_tracks_the_written_outcome_not_the_error_kind() {
     )));
 }
 
+/// `publish_from_temp` must not delete `temp` when the winning attempt ERRORED:
+/// a failure BEFORE `Writer::new` never created it, and a failure after already
+/// discarded its own partial, so the caller owns nothing to remove. Ownership is
+/// proven by the OUTCOME, never inferred from the error kind — otherwise, on
+/// shared storage, an attempt whose `temp` path collides with a concurrent
+/// process's file (e.g. across PID namespaces with the same numeric id) would
+/// delete that process's file. Regression for the winner-publication arm, the
+/// sibling of the arbitration loser-cleanup fix.
+#[test]
+fn publish_from_temp_keeps_a_foreign_temp_on_an_erroring_attempt() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let temp = dir.path().join("dest.healtmp-0");
+    let dest = dir.path().join("dest");
+
+    // A concurrent process owns the temp path; THIS attempt never created it.
+    std::fs::write(&temp, b"foreign process output")?;
+
+    // The published attempt errored BEFORE `Writer::new` (a deletion-guard
+    // refusal is a FeatureUnsupported, not an AlreadyExists race loss).
+    let result = Err(crate::Error::FeatureUnsupported("deletion guard"));
+    let Err(err) = super::publish_from_temp(&fs, result, &temp, &dest, &SalvageOptions::default())
+    else {
+        panic!("an erroring attempt must propagate its error");
+    };
+    assert!(
+        matches!(err, crate::Error::FeatureUnsupported("deletion guard")),
+        "the original error propagates unchanged, got {err:?}",
+    );
+    assert!(
+        temp.exists(),
+        "the foreign temp must survive: this attempt never created it",
+    );
+    Ok(())
+}
+
 /// A PRESENT `delete_bitmap` section that decodes to an EMPTY bitmap must fail
 /// salvage closed. The writer only emits the section when the bitmap is
 /// non-empty, so a checksum-consistent corruption to empty is a forge: it keeps
