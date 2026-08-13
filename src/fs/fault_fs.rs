@@ -515,6 +515,10 @@ impl<F: Fs> Fs for FaultFs<F> {
     fn available_space(&self, path: &Path) -> io::Result<u64> {
         self.inner.available_space(path)
     }
+
+    fn allocated_size(&self, path: &Path) -> io::Result<Option<u64>> {
+        self.inner.allocated_size(path)
+    }
 }
 
 /// A fault-injecting [`FsFile`] wrapping an inner handle.

@@ -265,6 +265,11 @@ impl Fs for StdFs {
         available_space_sys::disk_free_available(path).map_err(io::Error::from)
     }
 
+    #[cfg(unix)]
+    fn allocated_size(&self, path: &Path) -> io::Result<Option<u64>> {
+        Ok(super::unix_allocated_size(path))
+    }
+
     fn sync_directory(&self, path: &Path) -> io::Result<()> {
         #[cfg(not(target_os = "windows"))]
         {

@@ -1094,6 +1094,33 @@ pub trait Fs: Send + Sync + 'static {
         let _ = path;
         Ok(u64::MAX)
     }
+
+    /// Physically ALLOCATED bytes of the file at `path` (blocks actually backed
+    /// by storage), or `None` when the backend cannot report it.
+    ///
+    /// Differs from the file's logical length ([`FsMetadata::len`]) when the
+    /// file is SPARSE: a hole-punched range (via [`punch_hole`](Self::punch_hole))
+    /// frees physical blocks while the logical length is unchanged, so
+    /// `allocated_size < len`. Manifest repair uses this to recognize a
+    /// tight-space-punched SST (whose consumed prefix data blocks were reclaimed)
+    /// that a rebuilt manifest would otherwise open as an unrestricted table,
+    /// letting reads traverse the punched (zero-reading) blocks and fail.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns `Ok(None)` ("cannot tell"): a backend that does not track physical
+    /// allocation (and thus never punches) reports nothing, and repair treats the
+    /// file as unpunched — its current behaviour. Backends that support hole
+    /// punching override it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the underlying probe fails on a backend that
+    /// supports it.
+    fn allocated_size(&self, path: &Path) -> io::Result<Option<u64>> {
+        let _ = path;
+        Ok(None)
+    }
 }
 
 /// Bytes available to an unprivileged process on the filesystem backing
@@ -1148,6 +1175,19 @@ pub(crate) fn statvfs_available_space(path: &Path) -> std::io::Result<u64> {
 pub(crate) fn unix_volume_id(path: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(path).ok().map(|m| m.dev())
+}
+
+/// Physically allocated bytes of `path` via `stat(2)`'s `st_blocks`
+/// (`blocks * 512`, the POSIX-fixed block unit — unrelated to the filesystem's
+/// I/O block size). Less than the logical length for a sparse / hole-punched
+/// file. `None` if `path` cannot be stat-ed. Shared by the std and `io_uring`
+/// (libc) backends.
+#[cfg(all(unix, feature = "std"))]
+pub(crate) fn unix_allocated_size(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    // `st_blocks` is always in 512-byte units per POSIX, regardless of the
+    // filesystem block size; multiply to bytes. `blocks()` is u64.
+    std::fs::metadata(path).ok().map(|m| m.blocks() * 512)
 }
 
 /// Streamed independent copy of `src` to `dst` through `fs`'s own [`Fs::open`].

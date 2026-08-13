@@ -979,6 +979,23 @@ impl Fs for MemFs {
         }
     }
 
+    fn allocated_size(&self, path: &Path) -> io::Result<Option<u64>> {
+        let state = read_state(&self.state)?;
+        let Some(data) = state.files.get(path) else {
+            return Ok(None);
+        };
+        // Physically-backed bytes = logical length minus the bytes punched out of
+        // it (clipped to the current length), mirroring `stored_bytes`. A punched
+        // file reports `allocated < len`; a never-punched file reports `len`. The
+        // subtraction never underflows: `clipped_punched_len` clips to `len`.
+        let len = lock(data)?.len() as u64;
+        let punched = state
+            .punched
+            .get(path)
+            .map_or(0, |ranges| clipped_punched_len(ranges, len));
+        Ok(Some(len - punched))
+    }
+
     fn sync_directory(&self, path: &Path) -> io::Result<()> {
         // Durability is a no-op, but validate the path is an existing directory.
         let state = read_state(&self.state)?;

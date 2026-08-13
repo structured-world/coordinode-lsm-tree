@@ -369,6 +369,10 @@ impl Fs for CrashFs {
     fn available_space(&self, path: &Path) -> io::Result<u64> {
         self.inner.available_space(path)
     }
+
+    fn allocated_size(&self, path: &Path) -> io::Result<Option<u64>> {
+        self.inner.allocated_size(path)
+    }
 }
 
 /// A file handle that records its durable image on `fsync`.
