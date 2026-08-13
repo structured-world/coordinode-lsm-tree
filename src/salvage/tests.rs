@@ -2339,6 +2339,23 @@ fn iv(i: u32) -> InternalValue {
     )
 }
 
+/// File offset of the named SFA section, for a fault rule that targets one
+/// section's positional read.
+fn section_pos(path: &std::path::Path, name: &[u8]) -> u64 {
+    let mut f = std::fs::File::open(path).expect("open source");
+    let reader = match crate::sfa::Reader::from_reader(&mut f) {
+        Ok(r) => r,
+        Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+    };
+    let Some(entry) = reader.toc().iter().find(|e| e.name() == name) else {
+        panic!(
+            "source must carry a {} section",
+            String::from_utf8_lossy(name)
+        );
+    };
+    entry.pos()
+}
+
 /// Opens an SST as a `Table`, stamping the open with the file's current digest
 /// (the source may be corrupt; per-block checksums catch the actual damage).
 fn open(path: std::path::PathBuf, fs: &Arc<dyn Fs>) -> crate::Result<Table> {
@@ -2767,6 +2784,70 @@ fn attempt_owns_temp_tracks_the_written_outcome_not_the_error_kind() {
     assert!(!super::attempt_owns_temp(&Err(
         crate::Error::FeatureUnsupported("range tombstones")
     )));
+}
+
+/// Divergent-mirror arbitration must not let a TRANSIENT failure on one attempt
+/// lose to an INCOMPLETE success on the other: a retry of the transient mirror
+/// could recover the blocks the incomplete winner dropped, so the arbitration
+/// propagates the transient error. A COMPLETE success still wins (a retry cannot
+/// improve on it), and a PERSISTENT failure always loses to any success.
+#[test]
+fn arbitrate_mirrors_propagates_a_transient_loss_to_an_incomplete_success() {
+    use super::{DropReason, DroppedBlock, MirrorArbitration, SalvageReport, arbitrate_mirrors};
+
+    let report = |dropped: usize| SalvageReport {
+        salvaged_path: Some(std::path::PathBuf::from("/x")),
+        blocks_total: 4,
+        blocks_salvaged: 4 - dropped,
+        blocks_copied_verbatim: 0,
+        entries_salvaged: 4,
+        dropped: (0..dropped)
+            .map(|i| DroppedBlock {
+                offset: i as u64,
+                section: b"data".to_vec(),
+                reason: DropReason::ChecksumMismatch,
+                key_range: None,
+            })
+            .collect(),
+        delete_rows_resurrected: false,
+    };
+    let complete = || Ok(report(0));
+    let incomplete = || Ok(report(1));
+    let transient = || {
+        Err(crate::Error::Io(crate::io::Error::from(
+            crate::io::ErrorKind::Interrupted,
+        )))
+    };
+    let persistent = || {
+        Err(crate::Error::Io(crate::io::Error::from(
+            crate::io::ErrorKind::Other,
+        )))
+    };
+
+    // Transient loss vs an INCOMPLETE success → propagate (either side).
+    assert_eq!(
+        arbitrate_mirrors(&transient(), &incomplete()),
+        MirrorArbitration::Propagate,
+    );
+    assert_eq!(
+        arbitrate_mirrors(&incomplete(), &transient()),
+        MirrorArbitration::Propagate,
+    );
+    // Transient loss vs a COMPLETE success → the complete success wins.
+    assert_eq!(
+        arbitrate_mirrors(&transient(), &complete()),
+        MirrorArbitration::PublishMid,
+    );
+    assert_eq!(
+        arbitrate_mirrors(&complete(), &transient()),
+        MirrorArbitration::PublishTail,
+    );
+    // PERSISTENT failure vs an incomplete success → the success wins (a retry
+    // cannot help the persistent failure).
+    assert_eq!(
+        arbitrate_mirrors(&persistent(), &incomplete()),
+        MirrorArbitration::PublishMid,
+    );
 }
 
 /// `publish_from_temp` must not delete `temp` when the winning attempt ERRORED:
@@ -5753,6 +5834,76 @@ fn salvage_tolerates_a_persistently_unreadable_delete_bitmap_as_all_live() -> cr
     Ok(())
 }
 
+/// A PERSISTENT read failure of the derived `zone_map` SECTION must not fail the
+/// whole `Table::recover`: the zone map is a rebuildable block-skip
+/// optimization, so a bad sector in it degrades to an empty map (block-skip
+/// disabled) rather than making an otherwise-readable SST unopenable. Only a
+/// transient read propagates for a retry.
+#[test]
+fn recover_degrades_a_persistently_unreadable_zone_map_section() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let clean: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&clean))?.use_zone_map(true);
+    for i in 0..64u32 {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+    let zm_pos = section_pos(&source, b"zone_map");
+
+    let fault = FaultFs::new(StdFs);
+    fault
+        .injector()
+        .arm(FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other)).at_offset(zm_pos));
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    // Open must SUCCEED with block-skip disabled, not abort on the bad sector.
+    let table = open(source, &fs)?;
+    assert!(
+        table.zone_map.is_empty(),
+        "the persistently unreadable zone map degrades to an empty map",
+    );
+    Ok(())
+}
+
+/// As above for the derived `seqno_bounds` SECTION: a persistent read failure
+/// disables the seqno block-skip rather than failing `Table::recover`.
+#[test]
+fn recover_degrades_a_persistently_unreadable_seqno_bounds_section() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let clean: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer =
+        Writer::new(source.clone(), 0, 0, Arc::clone(&clean))?.use_seqno_in_index(true);
+    for i in 0..64u32 {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+    let sb_pos = section_pos(&source, b"seqno_bounds");
+
+    let fault = FaultFs::new(StdFs);
+    fault
+        .injector()
+        .arm(FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other)).at_offset(sb_pos));
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    // Open must SUCCEED with the seqno block-skip disabled, not abort.
+    let table = open(source, &fs)?;
+    assert!(
+        table.seqno_bounds.is_empty(),
+        "the persistently unreadable seqno-bounds section degrades to an empty map",
+    );
+    Ok(())
+}
+
 /// An UNREADABLE data block inside a delete-bearing columnar SST makes every
 /// later delete position unverifiable: the block's actual row count is
 /// unknowable, and trusting the zone map's claim for it would let a
@@ -7472,10 +7623,11 @@ fn delete_positions_verified_propagates_a_transient_block_read_failure() -> crat
     );
 
     // Open cleanly (footer + block-index reads happen here), THEN fault the
-    // first positional read the verification walk issues on the source.
+    // first positional read the verification walk issues with a TRANSIENT
+    // (`Interrupted`) kind.
     let table = open(source, &fs)?;
     injector.arm(
-        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other))
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Interrupted))
             .on_path("source")
             .once(),
     );
@@ -7485,6 +7637,58 @@ fn delete_positions_verified_propagates_a_transient_block_read_failure() -> crat
         matches!(result, Err(crate::Error::Io(_))),
         "a transient read during delete-position validation must propagate, not be read \
          as a persistent unpositionable mask: {result:?}",
+    );
+    Ok(())
+}
+
+/// `delete_positions_verified` must DEGRADE a PERSISTENT positional read failure
+/// to `Ok(false)` (an unpositionable mask), not propagate it: with
+/// `allow_delete_resurrection` a bad sector under one block still lets the caller
+/// re-emit the remaining readable rows unmasked, instead of aborting the whole
+/// salvage.
+#[cfg(feature = "columnar")]
+#[test]
+fn delete_positions_verified_degrades_a_persistent_block_read_failure() -> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    let n = 64u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    for pos in [5u32, 20, 40] {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    // Open cleanly, THEN fault the first positional read the verification walk
+    // issues with a PERSISTENT (`Other`/EIO) kind.
+    let table = open(source, &fs)?;
+    injector.arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other))
+            .on_path("source")
+            .once(),
+    );
+    let result = table.delete_positions_verified();
+    injector.clear();
+    assert!(
+        matches!(result, Ok(false)),
+        "a persistent read during delete-position validation must degrade to an \
+         unpositionable mask so the resurrection opt-in can take effect: {result:?}",
     );
     Ok(())
 }
