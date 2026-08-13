@@ -5675,6 +5675,84 @@ fn salvage_tolerates_a_corrupt_delete_bitmap_as_all_live() -> crate::Result<()> 
     Ok(())
 }
 
+/// A PERSISTENT read failure of the delete-bitmap SECTION (a bad sector) must
+/// honor the salvage opt-in, not abort recovery unconditionally. It fails closed
+/// by default, but with the explicit
+/// [`SalvageOptions::allow_delete_resurrection`] opt-in it degrades the mask to
+/// "all rows live" and recovers every block — the same outcome as a
+/// decode-level corruption, reached through the I/O path. Only a TRANSIENT read
+/// still propagates for a retry.
+#[cfg(feature = "columnar")]
+#[test]
+fn salvage_tolerates_a_persistently_unreadable_delete_bitmap_as_all_live() -> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let clean: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let n = 200u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&clean))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_data_block_size(256)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    for pos in [5u32, 50, 150] {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    // Resolve the delete-bitmap section's file offset.
+    let db_pos = {
+        let mut f = std::fs::File::open(&source)?;
+        let reader = match crate::sfa::Reader::from_reader(&mut f) {
+            Ok(r) => r,
+            Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
+        };
+        let Some(entry) = reader.toc().iter().find(|e| e.name() == b"delete_bitmap") else {
+            panic!("source must carry a delete_bitmap section");
+        };
+        entry.pos()
+    };
+
+    // Every positional read of the delete-bitmap section fails with a persistent
+    // `Other`/EIO; the data blocks (at other offsets) stay readable.
+    let fault = FaultFs::new(StdFs);
+    fault
+        .injector()
+        .arm(FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other)).at_offset(db_pos));
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    // Default policy fails closed: an unreadable bitmap would resurrect deleted rows.
+    assert!(
+        salvage_sst(&source, dest.clone(), &fs).is_err(),
+        "default salvage must fail closed on a persistently unreadable delete-bitmap",
+    );
+
+    // With the opt-in, salvage degrades to "all rows live" and recovers every block.
+    let options = SalvageOptions {
+        allow_delete_resurrection: true,
+        ..SalvageOptions::default()
+    };
+    let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
+    assert_eq!(
+        report.entries_salvaged,
+        u64::from(n),
+        "every row is recovered live once the unreadable bitmap degrades: {report:?}",
+    );
+    assert_eq!(reopen_item_count(dest, &fs)?, u64::from(n));
+    Ok(())
+}
+
 /// An UNREADABLE data block inside a delete-bearing columnar SST makes every
 /// later delete position unverifiable: the block's actual row count is
 /// unknowable, and trusting the zone map's claim for it would let a
@@ -7275,14 +7353,14 @@ fn salvage_load_block_reencodes_when_the_verbatim_reread_fails() -> crate::Resul
     Ok(())
 }
 
-/// `tli_structure_authenticated` must PROPAGATE a transient I/O fault from
+/// `tli_structure_authenticated` must PROPAGATE a TRANSIENT I/O fault from
 /// opening / reading the index mirrors rather than fold it into `false` (an
 /// untrusted index). The salvage walk consults this to decide whether an indexed
 /// offset is a trusted block boundary; reading a flaky open as `false` degrades
 /// to physical-chain-only provenance and surrenders every block past the first
 /// header break — dropping healthy keys the intact TLI could anchor on retry. A
-/// single `Open` fault on the dedicated authentication read reproduces the
-/// transient failure; the method must return the propagated I/O error.
+/// single transient-kind (`Interrupted`) `Open` fault reproduces the flaky
+/// failure; the method must return the propagated I/O error.
 #[test]
 fn tli_structure_authenticated_propagates_a_transient_read_failure() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
@@ -7300,10 +7378,11 @@ fn tli_structure_authenticated_propagates_a_transient_read_failure() -> crate::R
     }
     assert!(writer.finish()?.is_some(), "source SST is non-empty");
 
-    // Open cleanly, THEN fault the dedicated open the authentication read issues.
+    // Open cleanly, THEN fault the dedicated open the authentication read issues
+    // with a TRANSIENT (`Interrupted`) kind.
     let table = open(source, &fs)?;
     injector.arm(
-        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Interrupted))
             .on_path("source")
             .once(),
     );
@@ -7313,6 +7392,44 @@ fn tli_structure_authenticated_propagates_a_transient_read_failure() -> crate::R
         matches!(result, Err(crate::Error::Io(_))),
         "a transient failure authenticating the index structure must propagate, not be \
          read as an untrusted index: {result:?}",
+    );
+    Ok(())
+}
+
+/// `tli_structure_authenticated` must DEGRADE a PERSISTENT I/O fault to `false`
+/// (an untrusted index) rather than propagate it. When one mirror is
+/// persistently unreadable (a bad sector) but the other mirror and the data
+/// section stay readable, propagating the error makes the `salvage_blocks`
+/// caller's `?` abort before its physical-chain fallback, recovering NONE of the
+/// intact data blocks. `false` lets the walk fall back to physical-chain
+/// provenance and recover the readable blocks.
+#[test]
+fn tli_structure_authenticated_degrades_a_persistent_read_failure() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0..50u32 {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Open cleanly, THEN fault the authentication read's open with a PERSISTENT
+    // (`Other`/EIO) kind.
+    let table = open(source, &fs)?;
+    injector.arm(FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other)).on_path("source"));
+    let result = table.tli_structure_authenticated();
+    injector.clear();
+    assert!(
+        matches!(result, Ok(false)),
+        "a persistent authentication failure must degrade to an untrusted index so the \
+         salvage walk can still recover the readable data: {result:?}",
     );
     Ok(())
 }
