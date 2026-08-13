@@ -452,6 +452,80 @@ fn repair_with_salvage_reports_a_sole_corrupt_block_as_unsalvageable() -> crate:
     Ok(())
 }
 
+/// A PERSISTENT read failure while hashing the whole file (a bad data sector)
+/// must not doom a salvageable table: pre-fix, repair recorded it unreadable
+/// BEFORE block-salvage could run, and the next open's orphan cleanup then
+/// deleted its intact blocks. With `repair_with_salvage(true)` the whole-file
+/// hash failure is folded into the recovery path, so block-salvage recovers the
+/// readable blocks. The fault fires once on the preliminary hash of the
+/// original (block-salvage reads the quarantined copy and the reopened salvaged
+/// copy, both unaffected).
+#[test]
+fn repair_with_salvage_recovers_a_table_whose_whole_file_hash_faults() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs};
+    use crate::io::ErrorKind;
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+
+    // Several small blocks: block-salvage can recover them all (the fault is on
+    // the whole-file hash, not on any block read).
+    {
+        let build_fs: Arc<dyn Fs> = Arc::new(StdFs);
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&build_fs))?.use_data_block_size(128);
+        for i in 0..64u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Fault the FIRST streaming read of the original SST (the preliminary
+    // whole-file hash) with a persistent `Other`/EIO. `.once()` leaves the
+    // block-salvage reads of the quarantined copy — and the reopen-hash of the
+    // clean salvaged copy — unfaulted, so recovery proceeds.
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    injector.arm(
+        FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .once(),
+    );
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair_with_salvage(true)?;
+    injector.clear();
+
+    assert_eq!(
+        report.unreadable, 0,
+        "a whole-file hash fault must not record the table unreadable: {:?}",
+        report.unreadable_files,
+    );
+    assert_eq!(
+        report.salvaged, 1,
+        "the table is recovered through block-salvage"
+    );
+    assert_eq!(
+        report.recovered, 1,
+        "the salvaged table joins the rebuilt manifest"
+    );
+    Ok(())
+}
+
 /// A TRANSIENT I/O failure during block-salvage must not commit a manifest that
 /// OMITS the table: the original is already in `repair-quarantine`, so a retry
 /// (no longer finding it under `tables/`) would never rediscover it and the SST
