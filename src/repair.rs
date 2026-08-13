@@ -1115,6 +1115,43 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                 Err(e) => Err(e),
             };
 
+            // Fail closed on a bulk-ingest table whose sequence offset cannot be
+            // reconstructed. A bulk-ingested SST (flagged `descriptor#bulk_ingested`
+            // at write time) stores every entry at LOCAL seqno 0 and relies on a
+            // manifest-only `global_seqno` for its effective MVCC ordering; the
+            // on-disk seqnos carry no trace of it. The rebuilt manifest hard-codes
+            // offset 0, so keeping such a table would make its entries appear OLDER
+            // than they are — visible to snapshots that never saw them and sorted
+            // into the wrong L0 order. Quarantine it instead of silently corrupting
+            // MVCC. The flag is precise: a normal flush whose entries merely sit at
+            // seqno 0 (a fresh tree's first batch) is NOT flagged and is recovered
+            // as usual, since its offset genuinely is 0.
+            if matches!(&recovered, Ok(t) if t.metadata.bulk_ingested) {
+                drop(recovered); // release the file handle before the move
+                seen_ids.remove(&table_id);
+                match quarantine_file(
+                    &*folder_fs,
+                    &table_base_folder,
+                    &table_path,
+                    &file_name,
+                    config.sync_mode,
+                ) {
+                    Ok(dest) => unreadable_files.push((
+                        table_path,
+                        format!(
+                            "bulk-ingest sequence offset cannot be reconstructed from the SST; \
+                             quarantined to {}",
+                            dest.display()
+                        ),
+                    )),
+                    // A FAILED quarantine aborts the whole repair: a manifest
+                    // omitting a still-in-place file would let the next open's
+                    // orphan cleanup DELETE the only copy meant to be preserved.
+                    Err(e) => return Err(e),
+                }
+                continue;
+            }
+
             match recovered {
                 // In salvage mode a table whose whole-file recovery succeeded can
                 // still hold corrupt data blocks (recovery is lazy on the data

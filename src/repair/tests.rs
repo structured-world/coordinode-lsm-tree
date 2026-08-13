@@ -1085,6 +1085,71 @@ fn repair_preserves_a_pending_heal_attestation_sidecar() -> crate::Result<()> {
     Ok(())
 }
 
+/// A table flagged `descriptor#bulk_ingested` must be QUARANTINED, not
+/// registered with `global_seqno` 0. A bulk-ingested SST stores every entry at
+/// local seqno 0 and relies on a manifest-only offset for its effective MVCC
+/// ordering; the rebuilt manifest cannot recover that offset from the SST, so
+/// keeping the table with offset 0 would make its entries appear older than they
+/// are (MVCC corruption). Repair fails closed instead. The flag is precise — a
+/// normal flush at seqno 0 (unflagged) is recovered as usual (see
+/// `repair_clears_torn_edit_log_tail_and_reopens_under_default`).
+#[test]
+fn repair_quarantines_a_table_with_an_unrecoverable_ingest_offset() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    // A bulk-ingested table: entries at local seqno 0, flagged bulk-ingested (as
+    // the ingest path writes them), so its effective ordering lives in a
+    // manifest-only global_seqno the rebuilt manifest cannot recover.
+    {
+        let mut w = Writer::new(sst, 0, 0, Arc::clone(&fs))?.use_bulk_ingested(true);
+        for i in 0..8u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                0,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+
+    assert_eq!(
+        report.recovered, 0,
+        "a table with an unrecoverable ingest offset must not join the manifest: {report:?}",
+    );
+    assert_eq!(
+        report.unreadable, 1,
+        "the ambiguous-offset table is reported unreadable: {:?}",
+        report.unreadable_files,
+    );
+    let [(_, reason)] = report.unreadable_files.as_slice() else {
+        panic!(
+            "expected exactly one unreadable file, got {:?}",
+            report.unreadable_files,
+        );
+    };
+    assert!(
+        reason.contains("sequence offset"),
+        "the reason names the unrecoverable ingest offset, got: {reason}",
+    );
+    Ok(())
+}
+
 /// A file whose name only LOOKS like a heal-temp — `{id}.healtmp-{non-numeric}`
 /// (e.g. `5.healtmp-backup`) — must NOT be skipped as an owned artifact: recovery
 /// owns only `{id}.healtmp-{numeric}`, so leaving it in place makes the next
