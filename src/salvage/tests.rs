@@ -3311,6 +3311,52 @@ fn verify_zone_map_rejects_a_forged_columnar_column_id() -> crate::Result<()> {
     Ok(())
 }
 
+/// A salvaged COLUMNAR table must keep its per-column zone-map statistics. The
+/// clean-block verbatim copy-through re-emits columnar blocks byte-for-byte via
+/// `append_verbatim_data_block`; if that path recorded the row-block synthetic
+/// column-0 statistic instead of the per-column stats, the salvaged table would
+/// fail its own `verify_zone_map` forgery cross-check (the verifier re-derives
+/// per-column stats from the decoded columnar block).
+#[cfg(feature = "columnar")]
+#[test]
+fn salvaged_columnar_table_keeps_per_column_zone_statistics() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // A clean columnar SST with a zone map and several small data blocks, so at
+    // least one clean block is byte-copied verbatim during salvage.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_data_block_size(128);
+    for i in 0u32..64 {
+        writer.write(iv(i))?;
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar SST is non-empty"
+    );
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert!(
+        report.salvaged_path.is_some(),
+        "the clean SST salvages: {report:?}",
+    );
+    assert!(
+        report.blocks_copied_verbatim > 0,
+        "at least one clean columnar block is byte-copied verbatim: {report:?}",
+    );
+
+    let table = open(dest, &fs)?;
+    assert!(table.has_zone_map(), "the salvaged copy carries a zone map");
+    // The per-column stats the copy-through recorded must equal what the
+    // verifier re-derives from each decoded columnar block.
+    table.verify_zone_map()?;
+    Ok(())
+}
+
 /// `verify_block_layout` must apply the present-empty rejection to ENCRYPTED
 /// tables too. The emptiness check used to sit AFTER the `self.encryption`
 /// early return, so an encrypted table's empty `block_layout` (a `delete_bitmap`
