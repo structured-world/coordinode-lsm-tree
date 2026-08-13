@@ -484,6 +484,24 @@ pub(crate) fn abort_checkpoint_if_pending_heals(
     let version = tree.current_version();
     for table in version.iter_tables() {
         if heal_attest::exists(&*table.fs, &table.path).map_err(crate::Error::Io)? {
+            // The marker may be OBSOLETE: a heal that refreshed the manifest
+            // digest but crashed (or whose best-effort unlink failed) before
+            // removing the sidecar leaves a marker whose file ALREADY matches the
+            // manifest. A build WITHOUT `page_ecc` never runs reconciliation to
+            // clear it, so an unconditional abort would wedge EVERY checkpoint
+            // forever. When the live-region digest already agrees with the
+            // manifest the heal completed and snapshotting under that digest is
+            // consistent: reclaim the stale marker and continue. This removal is
+            // safe at both call sites — the pre-window call is `page_ecc`-free
+            // (no concurrent heal can write a marker) and the post-window call
+            // holds the link window that excludes heals. A digest read failure
+            // falls through to the abort (fail-closed).
+            if let Ok(fresh) = table.live_region_checksum()
+                && fresh == table.checksum()
+            {
+                heal_attest::remove(&*table.fs, &table.path);
+                continue;
+            }
             return Err(crate::Error::from(std::io::Error::other(alloc::format!(
                 "checkpoint aborted: table #{} has a pending heal attestation that cannot be \
                  reconciled here ({reason}); retry the checkpoint",
