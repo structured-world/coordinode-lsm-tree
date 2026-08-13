@@ -40,6 +40,12 @@ impl From<u128> for Timestamp {
 // compare an ECC-masked copy ([`Self::without_ecc`]) without consuming the
 // original.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "parsed on-disk metadata: each bool mirrors an independent descriptor \
+              flag (columnar, bulk_ingested, ecc_unrecognized); an enum would obscure \
+              the one-to-one mapping to the persisted meta keys"
+)]
 pub struct ParsedMeta {
     pub id: TableId,
     pub created_at: Timestamp,
@@ -154,6 +160,14 @@ pub struct ParsedMeta {
     /// defaults to `false` for SSTs written without it (row-major). The reader
     /// reconstructs row entries from a columnar block on load.
     pub columnar: bool,
+
+    /// Whether this table was bulk-ingested: every entry stored at LOCAL seqno 0
+    /// with its effective MVCC ordering carried by a manifest-only `global_seqno`
+    /// offset. Read from the optional `descriptor#bulk_ingested` property; absent
+    /// on flush / compaction SSTs (and older tables), which have offset 0.
+    /// Manifest repair uses it to fail closed on a table whose offset it cannot
+    /// reconstruct from the SST alone.
+    pub bulk_ingested: bool,
 }
 
 macro_rules! read_u8 {
@@ -334,6 +348,18 @@ impl ParsedMeta {
         // row-major; otherwise exactly one byte, non-zero meaning columnar. An
         // empty or overlong payload is on-disk corruption, rejected here.
         let columnar = match block.point_read(b"descriptor#columnar", SeqNo::MAX, &cmp)? {
+            None => false,
+            Some(v) => match v.value.as_ref() {
+                [b] => *b != 0,
+                _ => return Err(crate::Error::InvalidHeader("TableMeta")),
+            },
+        };
+
+        // Optional bulk-ingest provenance: absent (older / flush / compaction
+        // SSTs) means not bulk-ingested; otherwise exactly one byte, non-zero
+        // meaning the table stores local seqno 0 and relies on a manifest-only
+        // global_seqno offset (used by manifest repair to fail closed).
+        let bulk_ingested = match block.point_read(b"descriptor#bulk_ingested", SeqNo::MAX, &cmp)? {
             None => false,
             Some(v) => match v.value.as_ref() {
                 [b] => *b != 0,
@@ -545,6 +571,7 @@ impl ParsedMeta {
             data_block_restart_interval,
             index_block_restart_interval,
             columnar,
+            bulk_ingested,
         })
     }
 }

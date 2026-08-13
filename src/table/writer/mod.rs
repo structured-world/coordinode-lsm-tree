@@ -82,6 +82,12 @@ pub struct LinkedFile {
 /// `BlockIndexWriter` / `FilterWriter` are generic over a writer `W: Write + Seek`.
 /// `Fs::open()` returns `Box<dyn FsFile>` which implements `Write + Seek`,
 /// so `BufWriter<Box<dyn FsFile>>` satisfies the required trait bounds.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "table-writer config: each bool is an independent feature toggle \
+              (columnar, bulk_ingested, seqno-in-index, zone-map, ...); enums would \
+              obscure the per-feature wiring, matching MultiWriter"
+)]
 pub struct Writer {
     /// Filesystem backend
     fs: Arc<dyn Fs>,
@@ -268,6 +274,14 @@ pub struct Writer {
     /// the first key is added.
     use_columnar: bool,
 
+    /// Whether this SST is written by the bulk-ingest path, which stores every
+    /// entry at LOCAL seqno 0 and relies on a manifest-only `global_seqno` for
+    /// its effective MVCC ordering. Persisted as `descriptor#bulk_ingested` so
+    /// manifest repair can tell such a table apart from a normal flush whose
+    /// entries merely happen to sit at seqno 0 (a fresh tree's first batch),
+    /// whose offset genuinely is 0. Default `false`.
+    bulk_ingested: bool,
+
     /// Pre-trained zstd dictionary for dictionary compression
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
@@ -410,6 +424,7 @@ impl Writer {
             use_seqno_in_index: false,
             use_zone_map: false,
             use_columnar: false,
+            bulk_ingested: false,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -715,6 +730,10 @@ impl Writer {
             // recovered rows back into PAX blocks), rather than degrading to a
             // row-major copy.
             .use_columnar(meta.columnar)
+            // A bulk-ingested source stays flagged so a salvaged / re-emitted
+            // copy is still recognized by manifest repair as relying on a
+            // manifest-only global_seqno offset.
+            .use_bulk_ingested(meta.bulk_ingested)
             .use_zone_map(has_zone_map)
             // A source with a seqno_bounds section keeps its seqno-scoped
             // block-skip: the writer re-derives the per-block ranges from
@@ -837,6 +856,17 @@ impl Writer {
         // persisted `descriptor#columnar` never advertises a layout the blocks
         // do not have (which would misroute the reader's block identity).
         self.use_columnar = columnar && cfg!(feature = "columnar");
+        self
+    }
+
+    /// Marks this SST as bulk-ingested (see [`Self::bulk_ingested`] field), so
+    /// the persisted `descriptor#bulk_ingested` lets manifest repair distinguish
+    /// it from a normal flush whose entries merely sit at seqno 0. Must be set
+    /// before the first key is written.
+    #[must_use]
+    pub(crate) fn use_bulk_ingested(mut self, bulk_ingested: bool) -> Self {
+        self.assert_not_started("use_bulk_ingested");
+        self.bulk_ingested = bulk_ingested;
         self
     }
 
@@ -2257,6 +2287,7 @@ impl Writer {
             index_block_restart_interval: self.index_block_restart_interval,
             initial_level: self.initial_level,
             use_columnar: self.use_columnar,
+            bulk_ingested: self.bulk_ingested,
             range_tombstone_count,
             // Record the count that corresponds to the delete_bitmap section
             // ACTUALLY written above, via the single `writes_delete_bitmap`
@@ -2500,6 +2531,7 @@ struct MetaSectionParams<'a> {
     index_block_restart_interval: u8,
     initial_level: u8,
     use_columnar: bool,
+    bulk_ingested: bool,
     range_tombstone_count: u64,
     /// Number of positions in this table's delete bitmap. Recorded so a reader
     /// can AUTHENTICATE the bitmap's presence: the section itself is optional
@@ -2646,6 +2678,11 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
             "data_block_hash_ratio",
             &p.data_block_hash_ratio.to_le_bytes(),
         ),
+        // Per-SST provenance: whether this table was bulk-ingested (every entry
+        // at local seqno 0, relying on a manifest-only global_seqno offset). One
+        // byte; lets manifest repair distinguish it from a normal flush whose
+        // entries merely sit at seqno 0. Sorted before `descriptor#columnar`.
+        meta("descriptor#bulk_ingested", &[u8::from(p.bulk_ingested)]),
         // Per-SST layout descriptor: whether every data block in this table is
         // column-organized (PAX) rather than row-major. One byte for the whole
         // homogeneous SST, so the read path learns the layout from the

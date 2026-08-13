@@ -629,10 +629,19 @@ fn sorted_sst_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// still opens but one data block fails its checksum.
 fn corrupt_data_region(path: &std::path::Path) -> std::io::Result<()> {
     let mut bytes = std::fs::read(path)?;
-    let at = bytes.len() / 4;
-    if let Some(b) = bytes.get_mut(at) {
-        *b ^= 0xFF;
-    }
+    // The SFA `data` section is written first, so the first data block starts at
+    // offset 0. Corrupt a byte well inside it (past any block header, deep in the
+    // payload). A FIXED front offset is stable against tail growth: the index /
+    // filter / meta / trailer that follow the data can change size (e.g. a new
+    // meta key) without moving this target, unlike a `len / N` fraction that
+    // could drift across a block boundary and miss the data region entirely.
+    const AT: usize = 512;
+    assert!(
+        bytes.len() > AT,
+        "SST ({} bytes) is too small to corrupt a data block at offset {AT}",
+        bytes.len(),
+    );
+    bytes[AT] ^= 0xFF;
     std::fs::write(path, &bytes)
 }
 

@@ -154,6 +154,11 @@ impl<'a> Ingestion<'a> {
         // tables are columnar too (a row ingest is transposed at spill, a
         // columnar batch is stored directly via `write_columnar_batch`).
         writer = writer.use_columnar(rc.columnar);
+        // Flag every ingested SST: its entries are written at local seqno 0 and
+        // rely on the `global_seqno` allocated at commit, so manifest repair must
+        // recognize the manifest-only offset (and fail closed when it is lost)
+        // rather than mistake the table for a normal flush at seqno 0.
+        writer = writer.use_bulk_ingested(true);
         writer = writer.use_disable_cow_on_sst(rc.disable_cow_on_sst_files);
         writer = writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
         writer = writer.use_locator(tree.config.locator_policy.get(INITIAL_CANONICAL_LEVEL));
