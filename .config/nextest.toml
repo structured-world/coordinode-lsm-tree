@@ -62,6 +62,14 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 filter = "test(concurrent_encrypted_no_corruption)"
 threads-required = "num-cpus"
 
+# The single-byte-bitrot heal fuzzer runs for a fixed ~45s wall-clock budget
+# (`#[ignore]`d, so it only runs under `--run-ignored`), well past the 10s
+# ceiling by design. Give it a generous window so a slower runner's corpus
+# build does not push it into a spurious termination.
+[[profile.default.overrides]]
+filter = "test(fuzz_heal_bitrot)"
+slow-timeout = { period = "90s", terminate-after = 2 }
+
 # CI profile: retries for flaky tests, JUnit XML output, longer timeouts.
 [profile.ci]
 retries = 2
@@ -85,3 +93,9 @@ slow-timeout = { period = "120s", terminate-after = 4 }
 [[profile.ci.overrides]]
 filter = "test(concurrent_encrypted_no_corruption)"
 threads-required = "num-cpus"
+
+# The bitrot heal fuzzer's fixed ~45s budget (see the default-profile note); a
+# generous timeout keeps it from a spurious termination on a slow CI runner.
+[[profile.ci.overrides]]
+filter = "test(fuzz_heal_bitrot)"
+slow-timeout = { period = "90s", terminate-after = 2 }

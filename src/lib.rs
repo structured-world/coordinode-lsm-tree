@@ -450,6 +450,12 @@ pub use storage_stats::{
 mod version;
 mod vlog;
 
+// Reproducible single-byte-bitrot heal/read fuzzer. `#[ignore]`d, so it is
+// excluded from the normal suite and run as its own CI step; needs crate-internal
+// `Table` / `Writer` access, so it lives here rather than in `tests/`.
+#[cfg(all(test, feature = "std"))]
+mod fuzz_heal;
+
 /// User defined key (byte array)
 pub type UserKey = Slice;
 
