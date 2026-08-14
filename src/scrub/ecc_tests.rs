@@ -774,6 +774,59 @@ fn heal_in_place_keeps_the_marker_when_a_write_back_fails() -> crate::Result<()>
     Ok(())
 }
 
+/// The RESTORATIVE heal path — the current bytes already differ from the manifest
+/// digest, but healing restores exactly what the manifest describes — must ALSO
+/// persist its `.heal-attest` marker BEFORE the first write-back. Otherwise a
+/// crash after syncing some of several corrections leaves the file matching
+/// neither the manifest nor the healed digest, and with no marker a checkpoint
+/// hard-links those intermediate bytes under the stale manifest digest, producing
+/// a permanently inconsistent checkpoint. Rot a parity trailer but leave the
+/// manifest holding the ORIGINAL digest (so the heal is restorative, not
+/// attributable), fault the write-back after the marker lands, and assert the
+/// marker persists (#78).
+#[cfg(feature = "page_ecc")]
+#[test]
+fn heal_in_place_keeps_the_marker_when_a_restorative_write_back_fails() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst_footered(dir.path());
+
+    // Rot a parity trailer but DO NOT rebuild the manifest: the current bytes now
+    // differ from the manifest digest (pre-heal does NOT match), yet rebuilding the
+    // trailer restores exactly the original bytes the manifest still describes
+    // (predicted == manifest) — the restorative path.
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
+
+    let fault = FaultFs::new(crate::fs::StdFs);
+    let injector = fault.injector();
+    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));
+
+    // The FIRST write to `tables/` is the marker sidecar; the SECOND is the trailer
+    // rebuild. Let the marker land, then fail the write-back so the file may be
+    // partially modified with the marker still present.
+    injector.arm(
+        FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .skip(1)
+            .once(),
+    );
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    injector.clear();
+
+    assert_eq!(
+        report.blocks_healed_in_place, 0,
+        "a failed write-back heals no block: {report:?}",
+    );
+    assert!(
+        heal_attest_path(&sst_path).exists(),
+        "the restorative heal must persist its marker BEFORE the first write-back, so a \
+         crash cannot expose unattested intermediate bytes to a checkpoint hard-link",
+    );
+    Ok(())
+}
+
 /// The marker IS removed when no write was ever attempted: every candidate block
 /// is uncorrectable, so the file is untouched and the marker attests to a heal
 /// that never happened. Removing it prevents its unexpiring `pre == manifest`
