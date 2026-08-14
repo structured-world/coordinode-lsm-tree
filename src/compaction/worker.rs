@@ -1030,6 +1030,24 @@ fn run_tight_space_compaction(
             // Classify each input at this boundary: restrict (extends past it) or
             // remove (fully consumed by this slice). Re-open restricted views as
             // distinct Inners so a prior view drops and punches independently.
+            //
+            // `run_subcompaction` above already finalized this slice's output SSTs
+            // and blob files, but the install below is what references them. A
+            // failure between here and the install (a sidecar write or a restricted
+            // reopen) returns before any version points at those outputs, so — like
+            // the install error path below — roll them back now instead of pinning
+            // the space until the next open's orphan sweep. Tight-space runs exactly
+            // when free space is scarce, so an ENOSPC here would otherwise both abort
+            // the reclaim and hold the bytes this slice just consumed.
+            let rollback = |e: crate::Error| -> crate::Error {
+                for t in &outputs {
+                    t.mark_as_deleted();
+                }
+                for b in &blobs_for_cleanup {
+                    b.mark_as_deleted();
+                }
+                e
+            };
             let mut restricted_pairs: Vec<(TableId, Table)> = Vec::new();
             let mut removed_ids: Vec<TableId> = Vec::new();
             let mut next_views: Vec<Table> = Vec::new();
@@ -1049,8 +1067,9 @@ fn run_tight_space_compaction(
                     // present beside an unpunched, unmodified SST; repair only trusts
                     // it once it independently confirms the prefix is punched, so the
                     // stray sidecar is harmless (a re-run overwrites it atomically).
-                    view.write_restrict_sidecar(boundary, opts.config.sync_mode)?;
-                    let restricted = view.reopen_restricted(boundary.clone())?;
+                    view.write_restrict_sidecar(boundary, opts.config.sync_mode)
+                        .map_err(rollback)?;
+                    let restricted = view.reopen_restricted(boundary.clone()).map_err(rollback)?;
                     restricted_pairs.push((view.id(), restricted.clone()));
                     next_views.push(restricted);
                 }
