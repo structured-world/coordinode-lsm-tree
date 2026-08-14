@@ -450,6 +450,97 @@ fn tight_space_writes_a_restrict_bound_sidecar_matching_the_manifest_bound() -> 
     Ok(())
 }
 
+/// `run_subcompaction` finalizes a slice's output SSTs before the tight-space loop
+/// publishes each surviving input's `.restrict-bound` sidecar. If that sidecar
+/// write fails — an `ENOSPC` is the likely cause, since tight-space runs precisely
+/// when free space is scarce — the install never references those finalized
+/// outputs. They must be rolled back at once (marked deleted, so their blocks free
+/// on drop), not left to pin the space the slice just consumed until the next
+/// open's orphan sweep. A fault on the FIRST sidecar write must leave NO full-size
+/// orphan output behind.
+#[test]
+fn tight_space_rolls_back_finalized_outputs_when_the_sidecar_write_fails() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let capfs = capfs::CapacityFs::new();
+    let fault = FaultFs::new(capfs.clone());
+    let injector = fault.injector();
+    let shared: Arc<dyn crate::fs::Fs> = Arc::new(fault);
+
+    let config = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_shared_fs(Arc::clone(&shared));
+    let tree = match config.open()? {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    for i in 0..TIGHT_SPACE_KEYS {
+        tree.insert(tight_space_key(i).as_bytes(), vec![0xCDu8; 64], i);
+    }
+    tree.flush_active_memtable(0)?;
+    let used = tree.storage_stats()?.used_bytes;
+
+    // The all-digit table files on disk BEFORE the compaction (the flushed inputs).
+    let tables_dir = dir.path().join(crate::file::TABLES_FOLDER);
+    let numeric_files = || -> Vec<(std::ffi::OsString, u64)> {
+        std::fs::read_dir(&tables_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .bytes()
+                    .all(|b| b.is_ascii_digit())
+            })
+            .filter_map(|e| e.metadata().ok().map(|m| (e.file_name(), m.len())))
+            .collect()
+    };
+    let inputs: std::collections::HashSet<std::ffi::OsString> =
+        numeric_files().into_iter().map(|(name, _)| name).collect();
+    assert!(
+        !inputs.is_empty(),
+        "the flush produced at least one input SST"
+    );
+
+    // Leave only a quarter of the footprint free so a full rewrite cannot fit and
+    // the compaction takes the tight-space slice-and-punch path, then fail the
+    // FIRST `.restrict-bound` sidecar publish (its temp create).
+    capfs.set_available_space(used / 4);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = true;
+    })?;
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
+            .on_path("restrict-bound")
+            .once(),
+    );
+
+    assert!(
+        tree.major_compact(64 * 1024 * 1024, 0).is_err(),
+        "the sidecar-write fault must abort the tight-space compaction",
+    );
+
+    // No NEW full-size table file may survive: the aborted slice's finalized
+    // outputs were rolled back, not orphaned. Without the rollback a full-size
+    // output lingers under a fresh id, pinning the space the slice consumed.
+    for (name, len) in numeric_files() {
+        assert!(
+            len == 0 || inputs.contains(&name),
+            "a finalized slice output ({name:?}, {len} bytes) was orphaned instead of \
+             rolled back after the sidecar write failed",
+        );
+    }
+    Ok(())
+}
+
 /// A KV-separated tight-space compaction that RELOCATES a fragmented blob
 /// file in slices and crashes after the first slice must reopen consistently:
 /// the relocated entries (now in fresh compact files referenced by the
