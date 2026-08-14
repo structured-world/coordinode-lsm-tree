@@ -591,7 +591,10 @@ impl MultiWriter {
     #[must_use]
     pub(crate) fn use_bulk_ingested(mut self, bulk_ingested: bool) -> Self {
         self.bulk_ingested = bulk_ingested;
-        self.writer = self.writer.use_bulk_ingested(bulk_ingested);
+        // A multi-writer only produces flush / compaction / ingest output, whose
+        // provenance is always KNOWN — never the unknown (`None`) case that only
+        // salvage's mirror path yields.
+        self.writer = self.writer.use_bulk_ingested(Some(bulk_ingested));
         self
     }
 
@@ -669,7 +672,7 @@ impl MultiWriter {
         new_writer = new_writer.use_seqno_in_index(self.use_seqno_in_index);
         new_writer = new_writer.use_zone_map(self.use_zone_map);
         new_writer = new_writer.use_columnar(self.use_columnar);
-        new_writer = new_writer.use_bulk_ingested(self.bulk_ingested);
+        new_writer = new_writer.use_bulk_ingested(Some(self.bulk_ingested));
         new_writer = new_writer.delete_strategy(self.delete_strategy);
         new_writer = new_writer.use_disable_cow(self.disable_cow_on_sst);
         new_writer = new_writer.use_locator(self.locator_entry);

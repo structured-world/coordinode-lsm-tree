@@ -82,12 +82,6 @@ pub struct LinkedFile {
 /// `BlockIndexWriter` / `FilterWriter` are generic over a writer `W: Write + Seek`.
 /// `Fs::open()` returns `Box<dyn FsFile>` which implements `Write + Seek`,
 /// so `BufWriter<Box<dyn FsFile>>` satisfies the required trait bounds.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "table-writer config: each bool is an independent feature toggle \
-              (columnar, bulk_ingested, seqno-in-index, zone-map, ...); enums would \
-              obscure the per-feature wiring, matching MultiWriter"
-)]
 pub struct Writer {
     /// Filesystem backend
     fs: Arc<dyn Fs>,
@@ -279,8 +273,16 @@ pub struct Writer {
     /// its effective MVCC ordering. Persisted as `descriptor#bulk_ingested` so
     /// manifest repair can tell such a table apart from a normal flush whose
     /// entries merely happen to sit at seqno 0 (a fresh tree's first batch),
-    /// whose offset genuinely is 0. Default `false`.
-    bulk_ingested: bool,
+    /// whose offset genuinely is 0.
+    ///
+    /// Three-state: `Some(true)` bulk-ingested, `Some(false)` authoritatively a
+    /// normal flush / compaction, `None` UNKNOWN. `None` omits the on-disk key
+    /// entirely (matching a legacy SST written before the descriptor existed) so
+    /// that salvaging a legacy table via [`Self::mirror_from`] preserves the
+    /// unknown provenance instead of falsely stamping "not ingested" — which
+    /// would let repair install it with `global_seqno` 0 and corrupt MVCC.
+    /// Default `Some(false)`.
+    bulk_ingested: Option<bool>,
 
     /// Pre-trained zstd dictionary for dictionary compression
     #[cfg(zstd_any)]
@@ -424,7 +426,7 @@ impl Writer {
             use_seqno_in_index: false,
             use_zone_map: false,
             use_columnar: false,
-            bulk_ingested: false,
+            bulk_ingested: Some(false),
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -734,7 +736,7 @@ impl Writer {
             // copy is still recognized by manifest repair as relying on a
             // manifest-only global_seqno offset. A legacy source of unknown
             // provenance (`None`) re-emits unflagged (we do not guess).
-            .use_bulk_ingested(meta.bulk_ingested.unwrap_or(false))
+            .use_bulk_ingested(meta.bulk_ingested)
             .use_zone_map(has_zone_map)
             // A source with a seqno_bounds section keeps its seqno-scoped
             // block-skip: the writer re-derives the per-block ranges from
@@ -860,12 +862,14 @@ impl Writer {
         self
     }
 
-    /// Marks this SST as bulk-ingested (see [`Self::bulk_ingested`] field), so
+    /// Sets the bulk-ingest provenance (see [`Self::bulk_ingested`] field), so
     /// the persisted `descriptor#bulk_ingested` lets manifest repair distinguish
-    /// it from a normal flush whose entries merely sit at seqno 0. Must be set
-    /// before the first key is written.
+    /// a bulk-ingested table from a normal flush whose entries merely sit at
+    /// seqno 0. `None` omits the key (unknown provenance, preserving a legacy
+    /// SST's absence through salvage). Must be set before the first key is
+    /// written.
     #[must_use]
-    pub(crate) fn use_bulk_ingested(mut self, bulk_ingested: bool) -> Self {
+    pub(crate) fn use_bulk_ingested(mut self, bulk_ingested: Option<bool>) -> Self {
         self.assert_not_started("use_bulk_ingested");
         self.bulk_ingested = bulk_ingested;
         self
@@ -2532,7 +2536,9 @@ struct MetaSectionParams<'a> {
     index_block_restart_interval: u8,
     initial_level: u8,
     use_columnar: bool,
-    bulk_ingested: bool,
+    /// Bulk-ingest provenance: `Some(_)` writes `descriptor#bulk_ingested`,
+    /// `None` omits it (unknown provenance, preserving a legacy SST's absence).
+    bulk_ingested: Option<bool>,
     range_tombstone_count: u64,
     /// Number of positions in this table's delete bitmap. Recorded so a reader
     /// can AUTHENTICATE the bitmap's presence: the section itself is optional
@@ -2654,7 +2660,7 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
     };
 
     let meta = meta_kv;
-    let meta_items = [
+    let mut meta_items = vec![
         meta("block_count#data", &p.data_block_count.to_le_bytes()),
         meta(
             "block_count#filter",
@@ -2679,11 +2685,6 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
             "data_block_hash_ratio",
             &p.data_block_hash_ratio.to_le_bytes(),
         ),
-        // Per-SST provenance: whether this table was bulk-ingested (every entry
-        // at local seqno 0, relying on a manifest-only global_seqno offset). One
-        // byte; lets manifest repair distinguish it from a normal flush whose
-        // entries merely sit at seqno 0. Sorted before `descriptor#columnar`.
-        meta("descriptor#bulk_ingested", &[u8::from(p.bulk_ingested)]),
         // Per-SST layout descriptor: whether every data block in this table is
         // column-organized (PAX) rather than row-major. One byte for the whole
         // homogeneous SST, so the read path learns the layout from the
@@ -2757,11 +2758,20 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
         ),
     ];
 
-    #[cfg(debug_assertions)]
-    {
-        let is_sorted = meta_items.iter().is_sorted_by_key(|kv| &kv.key);
-        assert!(is_sorted, "meta items not sorted correctly");
+    // Per-SST provenance: whether this table was bulk-ingested (every entry at
+    // local seqno 0, relying on a manifest-only global_seqno offset). Emitted
+    // ONLY when the provenance is KNOWN — a `None` (legacy SST, or one salvaged
+    // from a legacy source) omits the key so manifest repair reads it as unknown
+    // and applies its seqno heuristic, rather than a stamped "not ingested" that
+    // would wrongly keep a bulk-ingested table with global_seqno 0. Inserted out
+    // of order, then the whole list is sorted below.
+    if let Some(flag) = p.bulk_ingested {
+        meta_items.push(meta("descriptor#bulk_ingested", &[u8::from(flag)]));
     }
+
+    // The data-block encoder requires sorted keys; the entry above may be out of
+    // position (and future optional entries likewise), so sort rather than assert.
+    meta_items.sort_by(|a, b| a.key.cmp(&b.key));
 
     block_buffer.clear();
     DataBlock::encode_into(block_buffer, &meta_items, 1, 0.0)?;
