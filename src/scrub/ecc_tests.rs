@@ -688,11 +688,14 @@ fn heal_in_place_reports_a_failed_trailer_writeback_as_uncorrectable() -> crate:
     let injector = fault.injector();
     let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));
 
-    // The heal pass performs no other writes to the SST, so the first write
-    // is the trailer rebuild.
+    // The rot leaves the file differing from the (un-rebuilt) manifest, so this is
+    // the restorative heal path: the FIRST write to `tables/` is the crash-recovery
+    // marker sidecar, the SECOND is the trailer rebuild. Let the marker land, then
+    // fail the trailer write-back.
     injector.arm(
         FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::Other))
             .on_path("tables")
+            .skip(1)
             .once(),
     );
     let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
