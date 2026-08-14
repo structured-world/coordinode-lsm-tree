@@ -375,6 +375,13 @@ fn scan_and_reconcile(
     let heal_lock = heals.then(|| table.heal_lock_arc());
     #[cfg(feature = "page_ecc")]
     let _heal_exclusive = heal_lock.as_ref().map(|l| l.lock());
+    // The pause is installed on EVERY live table before it becomes visible: flush
+    // outputs via `register_tables`, compaction outputs via `install_merge` and the
+    // tight-space slice loop (both call `install_deletion_pause`). So for a healable
+    // (Page-ECC) table `deletion_pause.get()` is `Some`, and this heal enters the
+    // checkpoint mutation window rather than racing a concurrent checkpoint's
+    // hard-link. `None` (a table with no pause, e.g. a diagnostic reader) just
+    // skips the window.
     let _mutation_window = heals
         .then(|| {
             table
