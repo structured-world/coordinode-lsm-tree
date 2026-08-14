@@ -2769,7 +2769,23 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
         meta_items.push(meta("descriptor#bulk_ingested", &[u8::from(flag)]));
     }
 
-    // The data-block encoder requires sorted keys; the entry above may be out of
+    // Tight-space restriction position: two little-endian u32s (block_ordinal,
+    // entry_ordinal). ALWAYS present with the `(u32::MAX, u32::MAX)` sentinel
+    // (= unrestricted) so tight-space compaction can later patch the real
+    // position into this fixed-width value IN PLACE (same size) without a meta
+    // re-layout. See `ParsedMeta::restrict_position`.
+    let restrict_position_sentinel: [u8; 8] = {
+        let mut b = [0u8; 8];
+        b[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        b[4..].copy_from_slice(&u32::MAX.to_le_bytes());
+        b
+    };
+    meta_items.push(meta(
+        "descriptor#restrict_position",
+        &restrict_position_sentinel,
+    ));
+
+    // The data-block encoder requires sorted keys; the entries above may be out of
     // position (and future optional entries likewise), so sort rather than assert.
     meta_items.sort_by(|a, b| a.key.cmp(&b.key));
 

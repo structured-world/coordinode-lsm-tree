@@ -408,6 +408,47 @@ fn restricted_view_passes_every_reconcile_gate() -> crate::Result<()> {
     Ok(())
 }
 
+/// A REAL tight-space compaction must make its punched input SELF-DESCRIBING: it
+/// stamps the restriction POSITION into the SST's own meta
+/// (`descriptor#restrict_position`) before punching. That position must resolve
+/// back to EXACTLY the manifest's restriction lower bound — the invariant that
+/// lets manifest repair recover the punched table's exact bound from the SST
+/// alone, with no `allocated_size` inference and no block-boundary guessing.
+#[test]
+fn tight_space_stamps_restrict_position_matching_the_manifest_bound() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fs = capfs::CapacityFs::new();
+    let reopened = tight_space_crash_and_reopen(
+        dir.path(),
+        Arc::new(fs.clone()),
+        |used| fs.set_available_space(used / 4),
+        || fs.punched_bytes(),
+    )?;
+
+    let version = reopened.current_version();
+    let Some(restricted) = version
+        .iter_tables()
+        .find(|t| t.restrict_lower_bound().is_some())
+    else {
+        panic!("the punched input must reopen as a restricted table");
+    };
+    let Some(manifest_bound) = restricted.restrict_lower_bound().cloned() else {
+        panic!("restricted table has a manifest bound");
+    };
+
+    // The compaction stamped a NON-sentinel position into the meta...
+    let Some((bo, eo)) = restricted.metadata.restrict_position else {
+        panic!("a punched table's meta must carry a restrict_position");
+    };
+    // ...and resolving it against the SST reproduces the manifest bound exactly.
+    let resolved = restricted.restrict_bound_at(bo, eo)?;
+    assert_eq!(
+        resolved, manifest_bound,
+        "the self-describing restrict_position must resolve to the manifest bound",
+    );
+    Ok(())
+}
+
 /// A KV-separated tight-space compaction that RELOCATES a fragmented blob
 /// file in slices and crashes after the first slice must reopen consistently:
 /// the relocated entries (now in fresh compact files referenced by the
@@ -1295,5 +1336,53 @@ fn space_gate_for_merge_narrows_a_full_run_that_exceeds_free() -> crate::Result<
         super::SpaceGate::Skip => panic!("expected Narrowed, got Skip (no pair admitted)"),
     }
 
+    Ok(())
+}
+
+/// Every compaction-produced table must inherit the tree's shared deletion pause
+/// before it becomes visible. A flush registers it (via `register_tables`), but a
+/// compaction installs its outputs directly in `install_merge` — so without an
+/// explicit install, a Page-ECC compaction output's in-place heal would skip the
+/// checkpoint mutation window (`deletion_pause.get()` is `None`), race a
+/// checkpoint that hard-links the SST, and overwrite the shared inode.
+#[test]
+fn compaction_outputs_inherit_the_deletion_pause() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = match Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?
+    {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+
+    // Two flushes → two L0 tables, then a major compaction merges them into one
+    // output installed via `install_merge`.
+    for i in 0..100u64 {
+        tree.insert(format!("k{i:05}").as_bytes(), vec![1u8; 16], i);
+    }
+    tree.flush_active_memtable(0)?;
+    for i in 100..200u64 {
+        tree.insert(format!("k{i:05}").as_bytes(), vec![1u8; 16], i);
+    }
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+
+    let version = tree.current_version();
+    let tables: Vec<_> = version.iter_tables().collect();
+    assert!(
+        !tables.is_empty(),
+        "the major compaction produced an output"
+    );
+    for t in &tables {
+        assert!(
+            t.deletion_pause.get().is_some(),
+            "compaction output table {} must inherit the deletion pause",
+            t.id(),
+        );
+    }
     Ok(())
 }

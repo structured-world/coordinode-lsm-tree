@@ -447,7 +447,7 @@ fn quarantine_duplicate(
 /// by the decision. The one path every recovered table takes to enter the
 /// manifest, so a superseded same-id file is never left discoverable.
 #[cfg(feature = "std")]
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "location + report threaded through"
 )]
@@ -1322,53 +1322,37 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
 
             // Rebuild the restricted view of a tight-space-PUNCHED SST. Tight-space
             // compaction reclaims a table's consumed prefix data blocks in place
-            // (hole-punched, reading back as zeros) and records the restriction
-            // lower bound in the manifest — but the SST itself does not carry it.
-            // A rebuilt manifest would open the table UNRESTRICTED, so later reads
-            // and compactions traverse the punched blocks and fail. Detect the
-            // punch (physically allocated bytes below the logical length: only
-            // hole-punching frees blocks on a densely-written SST) and recover the
-            // live suffix restricted to a SAFE re-derived bound — the manifest
-            // snapshot then persists the restriction. A punched table with fewer
-            // than two readable blocks has no recoverable bound and fails closed.
+            // (hole-punched, reading back as zeros) and stamps the restriction
+            // POSITION into the SST's own meta (`descriptor#restrict_position`, a
+            // fixed-width `(block_ordinal, entry_ordinal)` locating the first live
+            // key). A rebuilt manifest must re-apply that restriction, or later
+            // reads and compactions traverse the punched blocks and fail. The SST
+            // is SELF-DESCRIBING: read the position and resolve it to the EXACT
+            // bound from the surviving (never-punched) straddling block — no
+            // `allocated_size` inference (which false-positives on compressed /
+            // sparse filesystems) and no block-boundary guessing (which would drop
+            // live keys or resurrect superseded ones).
             let recovered = 'restrict: {
                 let Ok(table) = recovered else {
                     break 'restrict recovered;
                 };
-                // A probe error must NOT be read as "dense / unpunched" — that
-                // would drop the safety-critical restriction and expose the zeroed
-                // prefix on later reads. Surface it as a recovery error so the Err
-                // arm below classifies it (transient → retry, persistent →
-                // salvage / unreadable). `allocated_size` returning `Ok(None)`
-                // (a backend that cannot report allocation, i.e. one that never
-                // punches) IS the unpunched case.
-                let allocated = match folder_fs.allocated_size(&table_path) {
-                    Ok(a) => a,
-                    Err(e) => break 'restrict Err(crate::Error::Io(e)),
-                };
-                let logical = match folder_fs.metadata(&table_path) {
-                    Ok(m) => m.len,
-                    Err(e) => break 'restrict Err(crate::Error::Io(e)),
-                };
-                if !matches!(allocated, Some(a) if a < logical) {
+                let Some((block_ordinal, entry_ordinal)) = table.metadata.restrict_position else {
+                    // No restriction descriptor (the common case, or a legacy SST
+                    // written before the descriptor existed): keep the table as-is.
+                    // A legacy punched SST with a lost manifest has no recoverable
+                    // bound, so its zeroed blocks surface as corruption through the
+                    // block-verify / salvage path below rather than silent loss.
                     break 'restrict Ok(table);
-                }
-                match table.punched_restriction_bound() {
-                    // The SECOND readable block's first key is a SAFE restriction
-                    // bound: the punch boundary can fall inside the FIRST surviving
-                    // block (leaving superseded keys below it), so restricting to
-                    // that block's first key would resurrect them. The second block
-                    // starts at/above the true boundary. `reopen_restricted`
-                    // re-recovers under the suffix digest and installs the bound.
-                    // Repair holds no concurrent heal (the tree is not open), so it
-                    // needs no heal lock around this.
-                    Ok(Some(bound)) => table.reopen_restricted(bound),
-                    // Fewer than two readable data blocks: the exact boundary is
-                    // unrecoverable (a single straddling block cannot yield a bound
-                    // that excludes its own superseded prefix). Fail closed —
-                    // record it unreadable via the structural Err arm rather than
-                    // guess a bound that could resurrect deleted keys.
-                    Ok(None) => Err(crate::Error::Unrecoverable),
+                };
+                match table.restrict_bound_at(block_ordinal, entry_ordinal) {
+                    // Resolve the position to the exact restriction key and reopen
+                    // the live suffix restricted to it. Repair holds no concurrent
+                    // heal (the tree is not open), so it needs no heal lock here.
+                    Ok(bound) => table.reopen_restricted(bound),
+                    // A forged / corrupt / transient position resolution: surface it
+                    // so the Err arm classifies it (transient → retry, persistent →
+                    // salvage / unreadable) rather than installing an unrestricted
+                    // view that would expose the punched prefix.
                     Err(e) => Err(e),
                 }
             };

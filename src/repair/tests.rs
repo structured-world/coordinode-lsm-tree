@@ -1342,12 +1342,14 @@ fn recover_sst(
 /// A tight-space-PUNCHED SST records its restriction bound only in the manifest,
 /// not the SST. When manifest repair rebuilds without that bound, the punched
 /// table would open UNRESTRICTED and later reads would traverse its zero-reading
-/// (punched) blocks and fail. Repair must detect the punch (allocated < logical)
-/// and recover the live suffix restricted to a SAFE re-derived bound — the first
-/// key of the SECOND readable block, NOT the first, because the punch boundary
-/// can fall inside the first surviving block. The reopened tree then serves keys
-/// at/above the bound and routes lower keys away, and — critically — resurrects
-/// NO key below the bound. Uses `MemFs` for a byte-precise punch.
+/// (punched) blocks and fail. A tight-space-punched SST is SELF-DESCRIBING: its
+/// meta carries the restriction POSITION (`descriptor#restrict_position`, a
+/// fixed-width `(block_ordinal, entry_ordinal)`) that compaction stamps before
+/// punching. Repair reads the position and resolves it to the EXACT bound from
+/// the surviving straddling block — so a MID-BLOCK boundary recovers with zero
+/// loss of the block's live suffix (proving #60) and zero resurrection of its
+/// consumed prefix, with no `allocated_size` inference (proving #61). Probes
+/// every key: served IFF key >= exact bound. Uses `MemFs` for a byte-precise punch.
 #[test]
 fn repair_restricts_a_tight_space_punched_table() -> crate::Result<()> {
     use crate::fs::{Fs, MemFs};
@@ -1376,52 +1378,44 @@ fn repair_restricts_a_tight_space_punched_table() -> crate::Result<()> {
         assert!(w.finish()?.is_some(), "the SST is non-empty");
     }
 
-    // Reclaim the FIRST data block in place (the tight-space prefix punch).
-    let (first_offset, first_size) = {
+    // A restriction bound chosen to fall MID-BLOCK: `k00130` is a real key, and
+    // its straddling block also holds keys below it (the consumed prefix repair
+    // must hide) and at/above it (the live suffix repair must keep).
+    let bound = b"k00130".to_vec();
+    {
         use crate::table::block_index::BlockIndex as _;
         let table = recover_sst(sst.clone(), &fs)?;
-        let Some(b0) = table.block_index.iter().next() else {
-            panic!("the SST has at least one data block");
-        };
-        let b0 = b0?;
-        (b0.offset().0, b0.size())
-    };
-    memfs.punch_hole(&sst, first_offset, u64::from(first_size))?;
 
-    // The bound is the first key of the SECOND readable block (over-restricting
-    // past the first live block, which may straddle the boundary). Capture the
-    // first key of BOTH the first-live (block 1) and second-live (block 2) blocks
-    // to pin the contract: bound == block2.first, strictly ABOVE block1.first.
-    // Restricting to block1.first instead (the old behavior) would resurrect any
-    // superseded key sitting in block 1 above the true mid-block boundary.
-    let (block1_first, block2_first, bound) = {
-        use crate::table::BlockHandle;
-        use crate::table::block_index::BlockIndex as _;
-        let table = recover_sst(sst, &fs)?;
-        let mut it = table.block_index.iter();
-        let (Some(_b0), Some(b1), Some(b2)) = (it.next(), it.next(), it.next()) else {
-            panic!("the SST has at least three data blocks");
-        };
-        let b1 = b1?;
-        let b2 = b2?;
-        let block1_first = table.block_first_user_key(&BlockHandle::new(b1.offset(), b1.size()))?;
-        let block2_first = table.block_first_user_key(&BlockHandle::new(b2.offset(), b2.size()))?;
-        let Some(bound) = table.punched_restriction_bound()? else {
-            panic!("two live suffix blocks remain after punching only the first block");
-        };
-        (block1_first, block2_first, bound)
-    };
-    assert_eq!(
-        bound, block2_first,
-        "the bound is the SECOND readable block's first key",
-    );
-    assert!(
-        bound.as_ref() > block1_first.as_ref(),
-        "the bound over-restricts past the first live block ({block1_first:?}), \
-         so a superseded key straddling the boundary cannot be resurrected; got {bound:?}",
-    );
+        // Stamp the restriction position into the SST meta (what tight-space
+        // compaction does before punching), then punch the consumed prefix.
+        let (bo, eo) = table.restrict_position_for(&bound)?;
+        table.persist_restrict_position(bo, eo, crate::fs::SyncMode::Normal)?;
 
-    // Repair rebuilds the manifest, recovering the punched table RESTRICTED.
+        // Assert the bound is genuinely mid-block: the straddling block's first
+        // key is strictly below it, so the position — not a block boundary — is
+        // what pins the exact bound.
+        let Some(straddling) = table.block_index.iter().nth(bo as usize) else {
+            panic!("straddling block in range");
+        };
+        let straddling = straddling?;
+        let straddling_first = table.block_user_keys(&crate::table::BlockHandle::new(
+            straddling.offset(),
+            straddling.size(),
+        ))?;
+        assert!(
+            straddling_first
+                .first()
+                .is_some_and(|k| k.as_ref() < bound.as_slice()),
+            "the bound must fall inside a block (consumed keys precede it): {straddling_first:?}",
+        );
+
+        // Punch [0, punch_offset) — the whole blocks strictly below the straddler.
+        let punch_offset = table.punch_offset_for(&bound)?;
+        memfs.punch_hole(&sst, 0, punch_offset)?;
+    }
+
+    // Repair rebuilds the manifest, recovering the punched table RESTRICTED to the
+    // EXACT bound resolved from the meta position.
     let report = Config::new(
         &root,
         SequenceNumberCounter::default(),
@@ -1435,10 +1429,10 @@ fn repair_restricts_a_tight_space_punched_table() -> crate::Result<()> {
     );
     assert_eq!(report.unreadable, 0, "{:?}", report.unreadable_files);
 
-    // Reopen and probe EVERY key: a key is served IFF it is at/above the bound.
-    // The "no key below the bound is served" half is the resurrection guard —
-    // the second-readable-block bound sits at/above the true punch boundary, so
-    // no superseded key below it can leak back.
+    // Reopen and probe EVERY key: served IFF key >= exact bound. The lower half
+    // (no key below the bound served) is the no-resurrection guard; the upper half
+    // (every key at/above the bound served, INCLUDING the straddling block's live
+    // suffix `[k00130, block_end)`) is the no-loss guard that #60 demands.
     let tree = Config::new(
         &root,
         SequenceNumberCounter::default(),
@@ -1451,10 +1445,10 @@ fn repair_restricts_a_tight_space_punched_table() -> crate::Result<()> {
         let served = tree.get(&key, crate::MAX_SEQNO)?.is_some();
         assert_eq!(
             served,
-            key.as_slice() >= bound.as_ref(),
-            "key {key:?} served={served} but bound is {bound:?} \
-             (served must equal key >= bound; a served key below the bound is a \
-             resurrected superseded key)",
+            key.as_slice() >= bound.as_slice(),
+            "key {key:?} served={served}; expected served == (key >= {bound:?}) \
+             (a served key below the bound is resurrected; an unserved key at/above \
+             it is lost)",
         );
     }
     Ok(())
@@ -1480,60 +1474,13 @@ fn write_multiblock_sst(
     Ok(())
 }
 
-/// `punched_restriction_bound` must PROPAGATE a transient read on a live suffix
-/// block, not skip it as though punched: skipping would shift the second-readable
-/// bound higher and permanently hide that block's healthy rows.
+/// Repair must PROPAGATE a transient read while resolving the restriction
+/// position, not silently open the punched table unrestricted (which would expose
+/// the zeroed prefix). The bound resolution reads the straddling block; a
+/// one-shot `Interrupted` there is retryable, so repair returns an error rather
+/// than installing a manifest without the restriction.
 #[test]
-fn punched_restriction_bound_propagates_a_transient_block_read() -> crate::Result<()> {
-    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
-    use crate::io::ErrorKind;
-    use std::sync::Arc;
-
-    let memfs = Arc::new(MemFs::new());
-    let membase: Arc<dyn Fs> = memfs.clone();
-    membase.create_dir_all(std::path::Path::new("/d"))?;
-    let sst = std::path::PathBuf::from("/d/0");
-    write_multiblock_sst(&sst, &membase)?;
-
-    // Punch block 0; capture block 1's offset (the first LIVE block).
-    let (off0, size0, off1) = {
-        use crate::table::block_index::BlockIndex as _;
-        let t = recover_sst(sst.clone(), &membase)?;
-        let mut it = t.block_index.iter();
-        let Some(b0) = it.next() else {
-            panic!("a first data block");
-        };
-        let b0 = b0?;
-        let Some(b1) = it.next() else {
-            panic!("a second (live) data block");
-        };
-        let b1 = b1?;
-        (b0.offset().0, b0.size(), b1.offset().0)
-    };
-    memfs.punch_hole(&sst, off0, u64::from(size0))?;
-
-    // Fault the FIRST live block's positioned read with a TRANSIENT kind.
-    let fault = FaultFs::new(memfs.as_ref().clone());
-    fault
-        .injector()
-        .arm(FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Interrupted)).at_offset(off1));
-    let faulting: Arc<dyn Fs> = Arc::new(fault);
-
-    let table = recover_sst(sst, &faulting)?;
-    let result = table.punched_restriction_bound();
-    assert!(
-        matches!(result, Err(crate::Error::Io(_))),
-        "a transient read on the first live block must propagate, not be skipped \
-         as a punched block: {result:?}",
-    );
-    Ok(())
-}
-
-/// Repair must PROPAGATE a transient allocated-size probe failure on a punched
-/// SST rather than interpret it as "dense / unpunched" (which would rebuild the
-/// manifest without the restriction and expose the zeroed prefix on later reads).
-#[test]
-fn repair_propagates_a_transient_allocated_size_probe_failure() -> crate::Result<()> {
+fn repair_propagates_a_transient_restrict_bound_read() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
     use crate::io::ErrorKind;
     use crate::{Config, SequenceNumberCounter};
@@ -1547,23 +1494,29 @@ fn repair_propagates_a_transient_allocated_size_probe_failure() -> crate::Result
     let sst = tables.join("0");
     write_multiblock_sst(&sst, &membase)?;
 
-    // Punch block 0 so the file is genuinely hole-punched.
-    let (off0, size0) = {
+    // Stamp a mid-block restriction position, then punch the consumed prefix; the
+    // straddling block (which holds the bound key) survives and must be read to
+    // resolve the position.
+    let bound = b"k00130".to_vec();
+    let straddling_offset = {
         use crate::table::block_index::BlockIndex as _;
-        let t = recover_sst(sst.clone(), &membase)?;
-        let Some(b0) = t.block_index.iter().next() else {
-            panic!("a first data block");
+        let table = recover_sst(sst.clone(), &membase)?;
+        let (bo, eo) = table.restrict_position_for(&bound)?;
+        table.persist_restrict_position(bo, eo, crate::fs::SyncMode::Normal)?;
+        let Some(straddling) = table.block_index.iter().nth(bo as usize) else {
+            panic!("straddling block in range");
         };
-        let b0 = b0?;
-        (b0.offset().0, b0.size())
+        let straddling = straddling?;
+        let off = straddling.offset().0;
+        memfs.punch_hole(&sst, 0, off)?;
+        off
     };
-    memfs.punch_hole(&sst, off0, u64::from(size0))?;
 
-    // Fault the allocated-size probe with a TRANSIENT kind.
+    // Fault the straddling block's positioned read with a TRANSIENT kind.
     let fault = FaultFs::new(memfs.as_ref().clone());
     fault.injector().arm(
-        FaultRule::new(FaultOp::AllocatedSize, Fault::Error(ErrorKind::Interrupted))
-            .on_path("tables"),
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Interrupted))
+            .at_offset(straddling_offset),
     );
 
     let result = Config::new(
@@ -1575,8 +1528,8 @@ fn repair_propagates_a_transient_allocated_size_probe_failure() -> crate::Result
     .repair_with_salvage(true);
     assert!(
         result.is_err(),
-        "a transient allocated_size probe failure on a punched table must propagate, \
-         not silently open it unrestricted: {result:?}",
+        "a transient read while resolving the restriction bound must propagate, \
+         not silently open the punched table unrestricted: {result:?}",
     );
     Ok(())
 }

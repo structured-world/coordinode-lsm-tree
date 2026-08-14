@@ -197,7 +197,7 @@ fn read_sidecar(
 
 /// Whether an attestation attests the current bytes, is absent, or could not be
 /// read. See [`attests`].
-pub(super) enum AttestResult {
+pub enum AttestResult {
     /// A completed marker binds exactly `(pre == manifest, post == current)`
     /// for this table: the stale manifest digest is safe to reconcile.
     Attests,
@@ -310,18 +310,29 @@ pub(super) fn attests(
 /// heal path recognize that re-healing a not-matched file back to an
 /// already-attested `post` is safe — the existing marker still reconciles it —
 /// so such a heal need not be skipped as "diverging".
+///
+/// Tri-state so a TRANSIENT sidecar read (`Inconclusive`) is never collapsed to
+/// "does not attest": a caller that skipped the heal on that basis would leave
+/// the file diverged from the marker's `post`, and the reconcile that follows
+/// would reread the now-readable marker, find it no longer matches the current
+/// bytes, and delete it — stranding the table with neither attribution nor
+/// marker. On `Inconclusive` the caller must preserve the marker and retry.
 pub fn attests_post(
     fs: &dyn Fs,
     table_path: &Path,
     encryption: Option<&dyn EncryptionProvider>,
     table_id: u64,
     post: Checksum,
-) -> bool {
-    matches!(
-        read_sidecar(fs, table_path, encryption),
+) -> AttestResult {
+    match read_sidecar(fs, table_path, encryption) {
         SidecarRead::Present(kind, id, _pre, marker_post)
-            if kind == KIND_COMPLETED && id == table_id && marker_post == post.into_u128()
-    )
+            if kind == KIND_COMPLETED && id == table_id && marker_post == post.into_u128() =>
+        {
+            AttestResult::Attests
+        }
+        SidecarRead::Present(..) | SidecarRead::Missing => AttestResult::Absent,
+        SidecarRead::Inconclusive => AttestResult::Inconclusive,
+    }
 }
 
 /// Removes the attestation (best-effort), syncing the parent so the removal is

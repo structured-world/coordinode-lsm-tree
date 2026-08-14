@@ -1752,15 +1752,42 @@ impl Table {
         // NOT diverging, so it proceeds. `None` (nothing to heal) is unaffected.
         if pre_heal_matched == Some(false)
             && Checksum::from_raw(predicted_digest) != manifest_checksum
-            && !crate::scrub::heal_attest::attests_post(
+        {
+            use crate::scrub::heal_attest::AttestResult;
+            match crate::scrub::heal_attest::attests_post(
                 &*self.fs,
                 &self.path,
                 self.encryption.as_deref(),
                 self.id(),
                 Checksum::from_raw(predicted_digest),
-            )
-        {
-            return (report, false);
+            ) {
+                // An existing COMPLETED marker already attests the predicted post:
+                // the heal restores an attested digest, not a divergence — proceed.
+                AttestResult::Attests => {}
+                // No attesting marker: healing would drift the file off any
+                // marker's post with no chaining attribution, so the reconcile
+                // could not attribute it and would strip the marker. Fail closed.
+                AttestResult::Absent => return (report, false),
+                // The attestation probe hit a TRANSIENT read. Collapsing that to
+                // "does not attest" (the old behavior) would skip the heal, leaving
+                // the file diverged from a marker that MAY attest the predicted
+                // post; the reconcile then rereads the now-readable marker, finds
+                // it no longer matches the current bytes, and deletes it — stranding
+                // the table. Record a finding so the report is non-clean (a
+                // checkpoint's `reconcile_pending_heals` then aborts instead of
+                // removing) and skip; the next patrol retries once the probe reads
+                // cleanly and the marker's verdict is conclusive.
+                AttestResult::Inconclusive => {
+                    report.errors.push(ScrubError::ChecksumRefreshFailed {
+                        table_id: self.id(),
+                        path: self.path.to_path_buf(),
+                        reason: "heal attestation probe was inconclusive (transient read); heal \
+                                 skipped to preserve the existing marker for the next patrol"
+                            .to_string(),
+                    });
+                    return (report, false);
+                }
+            }
         }
 
         for entry in self.block_index.iter() {
@@ -3219,95 +3246,99 @@ impl Table {
         ))
     }
 
-    /// The restriction lower bound for a tight-space-PUNCHED table: the first
-    /// user key of the SECOND data block that LOADS successfully, or `None` when
-    /// fewer than two data blocks are readable.
-    ///
-    /// Tight-space compaction reclaims a PREFIX of consumed data blocks to holes
-    /// (they read back as zeros and fail to decode); the live suffix stays
-    /// intact. The manifest recorded the exact boundary key, but the SST does not
-    /// carry it, so repair must re-derive a safe lower bound from the surviving
-    /// blocks alone.
-    ///
-    /// The boundary can fall INSIDE the first surviving block: hole punching frees
-    /// only WHOLE blocks below it, so a straddling block keeps both consumed keys
-    /// (below the boundary, already superseded by a merged output table) and live
-    /// keys (at/above it). That block's first key is therefore BELOW the true
-    /// boundary — restricting to it would RESURRECT the superseded keys. The
-    /// SECOND readable block starts strictly ABOVE every key of the first, hence
-    /// at or above the true boundary, so restricting to it never exposes a
-    /// superseded key. The cost is over-restriction: the first surviving block's
-    /// live keys are also dropped — a safe, lossy trade, since those keys survive
-    /// in the merged output table the compaction produced. `None` (fewer than two
-    /// readable blocks) means the bound is unrecoverable and the caller
-    /// quarantines the file rather than guessing.
-    ///
-    /// # Errors
-    ///
-    /// Propagates a block-index read error or a TRANSIENT per-block read; a
-    /// persistent per-block load / decode failure is treated as "punched /
-    /// unreadable" and skipped, not surfaced.
+    /// Every entry's user key in one data block (row or columnar), in stored
+    /// order. Errors if the block cannot be loaded / decoded (e.g. a punched
+    /// block reading as zeros). Used to resolve a tight-space restriction
+    /// POSITION `(block_ordinal, entry_ordinal)` to its exact bound key
+    /// ([`restrict_bound_at`](Self::restrict_bound_at)) and to locate the first
+    /// live key at punch time ([`restrict_position_for`](Self::restrict_position_for)).
     #[cfg(feature = "std")]
-    pub(crate) fn punched_restriction_bound(&self) -> crate::Result<Option<UserKey>> {
-        let mut readable = 0u32;
-        for handle in self.block_index.iter() {
-            let handle = handle?;
-            let block_handle = BlockHandle::new(handle.offset(), handle.size());
-            match self.block_first_user_key(&block_handle) {
-                Ok(key) => {
-                    readable += 1;
-                    // The FIRST surviving block may straddle the punch boundary
-                    // (consumed + live keys); only the SECOND readable block is
-                    // guaranteed to start at/above the true boundary.
-                    if readable == 2 {
-                        return Ok(Some(key));
-                    }
-                }
-                // A TRANSIENT read (one-shot Interrupted / WouldBlock) propagates:
-                // a retry could read this block, and skipping it would shift the
-                // second-readable bound HIGHER, permanently hiding healthy rows.
-                // Only a STRUCTURAL / persistent failure (a punched block reading
-                // as zeros, genuine bit-rot) means the block is not part of the
-                // live suffix and is skipped.
-                Err(crate::Error::Io(e)) if e.kind().is_transient() => {
-                    return Err(crate::Error::Io(e));
-                }
-                Err(_) => {}
-            }
-        }
-        Ok(None)
-    }
-
-    /// The first entry's user key of one data block (row or columnar). Errors if
-    /// the block cannot be loaded / decoded (e.g. a punched block reading as
-    /// zeros), which [`punched_restriction_bound`](Self::punched_restriction_bound)
-    /// treats as "skip this block".
-    #[cfg(feature = "std")]
-    pub(crate) fn block_first_user_key(
+    pub(crate) fn block_user_keys(
         &self,
         block_handle: &BlockHandle,
-    ) -> crate::Result<UserKey> {
+    ) -> crate::Result<Vec<UserKey>> {
         #[cfg(feature = "columnar")]
         if self.metadata.columnar {
             let block = self.load_block_from_disk(block_handle, BlockType::Columnar)?;
             let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
             let entries = crate::table::columnar::column_batch_to_entries(&batch)?;
-            let first = entries.first().ok_or(crate::Error::InvalidHeader(
-                "columnar data block decodes to zero rows",
-            ))?;
-            return Ok(first.key.user_key.clone());
+            return Ok(entries.into_iter().map(|e| e.key.user_key).collect());
         }
         use crate::table::block::ParsedItem as _;
         let block = self.load_block_from_disk(block_handle, BlockType::Data)?;
         let data_block = DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())?;
-        let first = data_block
+        let slice = data_block.as_slice();
+        data_block
             .try_iter(self.comparator.clone())?
-            .next()
+            .map(|item| Ok(item.materialize(slice).key.user_key))
+            .collect()
+    }
+
+    /// The tight-space restriction bound recorded as a POSITION in this SST's
+    /// meta: the user key of the entry at `entry_ordinal` inside the data block at
+    /// `block_ordinal`. Manifest repair reads the position from the meta and
+    /// resolves it here to the EXACT bound, so a punched SST recovers its live
+    /// suffix without guessing (the straddling block that holds this key is never
+    /// punched, only the whole blocks below it).
+    ///
+    /// # Errors
+    ///
+    /// Fails if the ordinals are out of range or the block cannot be decoded — a
+    /// forged / corrupt position, treated as an unrecoverable table by the caller.
+    #[cfg(feature = "std")]
+    pub(crate) fn restrict_bound_at(
+        &self,
+        block_ordinal: u32,
+        entry_ordinal: u32,
+    ) -> crate::Result<UserKey> {
+        let handle = self.block_index.iter().nth(block_ordinal as usize).ok_or(
+            crate::Error::InvalidHeader("restrict_position block ordinal out of range"),
+        )??;
+        let keys = self.block_user_keys(&BlockHandle::new(handle.offset(), handle.size()))?;
+        keys.into_iter()
+            .nth(entry_ordinal as usize)
             .ok_or(crate::Error::InvalidHeader(
-                "row data block decodes to zero entries",
-            ))?
-            .materialize(data_block.as_slice());
-        Ok(first.key.user_key)
+                "restrict_position entry ordinal out of range",
+            ))
+    }
+
+    /// The POSITION `(block_ordinal, entry_ordinal)` of the first key `>= lower`,
+    /// for tight-space compaction to stamp into the meta before punching. The
+    /// block is located exactly as [`punch_offset_for`](Self::punch_offset_for)
+    /// locates the punch boundary (first block whose last key reaches `lower`), so
+    /// the recorded position always lands in the block that SURVIVES the punch.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `lower` is past every key (no live entry to restrict to) or a
+    /// block cannot be decoded.
+    #[cfg(feature = "std")]
+    pub(crate) fn restrict_position_for(&self, lower: &[u8]) -> crate::Result<(u32, u32)> {
+        let mut block_ordinal = 0u32;
+        for handle in self.block_index.iter() {
+            let handle = handle?;
+            if self.comparator.compare(handle.end_key(), lower) != core::cmp::Ordering::Less {
+                let keys =
+                    self.block_user_keys(&BlockHandle::new(handle.offset(), handle.size()))?;
+                let entry_ordinal = keys
+                    .iter()
+                    .position(|k| self.comparator.compare(k, lower) != core::cmp::Ordering::Less)
+                    .ok_or(crate::Error::InvalidHeader(
+                        "restrict bound not found in its straddling block",
+                    ))?;
+                // Ordinals index in-SST structures bounded by u32 counts already.
+                let entry_ordinal = u32::try_from(entry_ordinal).map_err(|_| {
+                    crate::Error::InvalidHeader("restrict entry ordinal exceeds u32")
+                })?;
+                return Ok((block_ordinal, entry_ordinal));
+            }
+            block_ordinal = block_ordinal
+                .checked_add(1)
+                .ok_or(crate::Error::InvalidHeader("data block count exceeds u32"))?;
+        }
+        Err(crate::Error::InvalidHeader(
+            "restrict bound is past every key",
+        ))
     }
 
     /// Cross-checks the recorded `locator` section against the ACTUAL
@@ -7062,6 +7093,122 @@ impl Table {
         #[cfg(all(feature = "std", feature = "page_ecc"))]
         reopened.install_heal_lock(self.heal_lock_arc());
         Ok(reopened.with_restriction(lower))
+    }
+
+    /// Stamps the tight-space restriction POSITION `(block_ordinal, entry_ordinal)`
+    /// into BOTH meta copies (mid + tail) in place, so a punched SST is
+    /// self-describing: manifest repair reads the exact bound from the SST alone
+    /// (no `allocated_size` inference, no block-boundary guessing). The writer
+    /// always stamps a fixed-width `(u32::MAX, u32::MAX)` sentinel for this
+    /// descriptor, so re-encoding it with a same-width value yields a byte-identical
+    /// block that overwrites its region without shifting the SFA layout.
+    ///
+    /// MUST be called (and synced) BEFORE the consumed prefix is hole-punched: the
+    /// meta blocks live in the file's suffix (untouched by the punch), so once this
+    /// returns the on-disk restriction survives a crash between here and the punch.
+    ///
+    /// Encryption-aware: the meta block is decoded through the table's provider and
+    /// re-sealed with a FRESH nonce (the seal path draws one per call), so the
+    /// AEAD stays valid and the ciphertext length — hence the block size — is
+    /// unchanged. A same-size mismatch (e.g. a cross-build Page-ECC layout the
+    /// current build cannot reproduce) fails loudly rather than corrupting the file.
+    ///
+    /// # Errors
+    ///
+    /// Propagates I/O / decode failures, and fails if a re-sealed block would not
+    /// be byte-identical in size to the region it replaces.
+    #[cfg(feature = "std")]
+    pub(crate) fn persist_restrict_position(
+        &self,
+        block_ordinal: u32,
+        entry_ordinal: u32,
+        sync_mode: crate::fs::SyncMode,
+    ) -> crate::Result<()> {
+        use crate::table::block::{BlockIdentity, BlockTransform, EccParams};
+        use std::io::{Seek, SeekFrom, Write};
+
+        let identity = BlockIdentity {
+            table_id: self.metadata.id,
+            block_type: BlockType::Meta,
+            dict_id: 0,
+            window_log: 0,
+        };
+        // The writer seals the self-describing meta block with the FIXED RS(4,2)
+        // ECC layout when this build+table use Page ECC (the reader strips it
+        // transparently, so the read transform never carries ECC). Reproduce that
+        // exact choice on write-back, or the re-sealed block would change size.
+        let use_ecc = cfg!(feature = "page_ecc") && self.metadata.ecc_params.is_some();
+
+        let mut value = [0u8; 8];
+        value[..4].copy_from_slice(&block_ordinal.to_le_bytes());
+        value[4..].copy_from_slice(&entry_ordinal.to_le_bytes());
+
+        let mut regions = alloc::vec![self.regions.metadata];
+        if let Some(mid) = self.regions.metadata_mid {
+            regions.push(mid);
+        }
+
+        let mut file = self
+            .fs
+            .open(&self.path, &FsOpenOptions::new().read(true).write(true))?;
+
+        for region in regions {
+            // Decode the existing meta entries (ECC transparent on read; only
+            // encryption shapes the read transform).
+            let enc = self.encryption.as_deref();
+            let read_transform = match enc {
+                Some(e) => BlockTransform::Encrypted(e),
+                None => BlockTransform::PLAIN,
+            };
+            let block = Block::from_file(&*file, region, identity, &read_transform)?;
+            let data = DataBlock::new(block);
+            let cmp = crate::comparator::default_comparator();
+            let mut entries: Vec<InternalValue> = data
+                .iter(cmp)
+                .map(|item| item.materialize(data.as_slice()))
+                .collect();
+
+            let mut patched = false;
+            for entry in &mut entries {
+                if entry.key.user_key.as_ref() == b"descriptor#restrict_position" {
+                    entry.value = crate::UserValue::from(&value[..]);
+                    patched = true;
+                }
+            }
+            if !patched {
+                return Err(crate::Error::InvalidHeader(
+                    "meta block missing descriptor#restrict_position",
+                ));
+            }
+
+            let mut payload = Vec::new();
+            DataBlock::encode_into(&mut payload, &entries, 1, 0.0)?;
+
+            let write_transform = {
+                let t = match enc {
+                    Some(e) => BlockTransform::Encrypted(e),
+                    None => BlockTransform::PLAIN,
+                };
+                if use_ecc {
+                    t.with_ecc(EccParams::RS_4_2)
+                } else {
+                    t
+                }
+            };
+            let mut block_bytes = Vec::new();
+            Block::write_into(&mut block_bytes, &payload, identity, &write_transform)?;
+
+            if block_bytes.len() as u64 != u64::from(region.size()) {
+                return Err(crate::Error::InvalidHeader(
+                    "re-sealed meta block size differs from its region",
+                ));
+            }
+            file.seek(SeekFrom::Start(region.offset().0))?;
+            file.write_all(&block_bytes)?;
+        }
+
+        file.sync_all_with(sync_mode)?;
+        Ok(())
     }
 
     /// Marks this view to punch `[0, offset)` when its last `Arc` drops (see

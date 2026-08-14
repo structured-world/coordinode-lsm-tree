@@ -355,6 +355,14 @@ pub(super) fn install_merge(
 
     let tables_out = created_tables.len();
 
+    // Install the tree-wide deletion pause on every output BEFORE the version edit
+    // makes it visible. A flush registers this via `register_tables`; a compaction
+    // installs its outputs here, so without this an output's in-place heal would
+    // skip the checkpoint mutation window and could race a checkpoint hard-link.
+    for table in &created_tables {
+        table.install_deletion_pause(alloc::sync::Arc::clone(&opts.deletion_pause));
+    }
+
     // Globally-dead blob files are dropped once, from the install-time version.
     let current_version = super_version.latest_version();
     for blob_file in current_version.version.blob_files.iter() {

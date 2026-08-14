@@ -2822,30 +2822,69 @@ fn attests_post_matches_only_the_recorded_completed_post() -> crate::Result<()> 
     let post = crate::Checksum::from_raw(0x2222);
     crate::scrub::heal_attest::write(&crate::fs::StdFs, &path, None, 7, pre, post)?;
 
+    use crate::scrub::heal_attest::AttestResult;
     // The recorded post matches for the right table, whatever the `pre` was.
-    assert!(crate::scrub::heal_attest::attests_post(
-        &crate::fs::StdFs,
-        &path,
-        None,
-        7,
-        post,
+    assert!(matches!(
+        crate::scrub::heal_attest::attests_post(&crate::fs::StdFs, &path, None, 7, post),
+        AttestResult::Attests,
     ));
     // A different post does not match.
-    assert!(!crate::scrub::heal_attest::attests_post(
+    assert!(matches!(
+        crate::scrub::heal_attest::attests_post(
+            &crate::fs::StdFs,
+            &path,
+            None,
+            7,
+            crate::Checksum::from_raw(0x3333),
+        ),
+        AttestResult::Absent,
+    ));
+    // A different table id does not match.
+    assert!(matches!(
+        crate::scrub::heal_attest::attests_post(&crate::fs::StdFs, &path, None, 8, post),
+        AttestResult::Absent,
+    ));
+    Ok(())
+}
+
+/// A TRANSIENT read of the attestation sidecar must resolve to `Inconclusive`,
+/// never `Absent`. Collapsing it to "does not attest" (the old `bool` return)
+/// would make the diverging-heal check skip the heal, then let the reconcile
+/// reread the now-readable marker, find it no longer matches the current bytes,
+/// and delete a VALID marker — permanently stranding the healed table.
+#[test]
+fn attests_post_is_inconclusive_on_a_transient_sidecar_read() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+    use crate::scrub::heal_attest::AttestResult;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("t.sst");
+    std::fs::write(&path, b"x")?;
+    let post = crate::Checksum::from_raw(0x2222);
+    crate::scrub::heal_attest::write(
         &crate::fs::StdFs,
         &path,
         None,
         7,
-        crate::Checksum::from_raw(0x3333),
-    ));
-    // A different table id does not match.
-    assert!(!crate::scrub::heal_attest::attests_post(
-        &crate::fs::StdFs,
-        &path,
-        None,
-        8,
+        crate::Checksum::from_raw(0x1111),
         post,
-    ));
+    )?;
+
+    // Fault the sidecar OPEN with a transient (non-NotFound) error: `read_sidecar`
+    // maps that to `Inconclusive`, and `attests_post` must propagate it.
+    let fault = FaultFs::new(crate::fs::StdFs);
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Interrupted)).on_path("heal-attest"),
+    );
+
+    assert!(
+        matches!(
+            crate::scrub::heal_attest::attests_post(&fault, &path, None, 7, post),
+            AttestResult::Inconclusive,
+        ),
+        "a transient sidecar read must be Inconclusive, not Absent",
+    );
     Ok(())
 }
 

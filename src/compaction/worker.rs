@@ -80,6 +80,13 @@ pub struct Options {
 
     pub compaction_state: Arc<Mutex<CompactionState>>,
 
+    /// The tree-wide deletion pause, installed on every compaction-produced table
+    /// before it becomes visible. A flush registers it via `register_tables`, but
+    /// compaction installs its outputs directly (`install_merge` / tight-space),
+    /// so it must be threaded here — without it a Page-ECC output's in-place heal
+    /// skips the checkpoint mutation window and can race a checkpoint hard-link.
+    pub deletion_pause: Arc<crate::deletion_pause::DeletionPause>,
+
     /// Shared handle to the live runtime config. Compaction loads
     /// a fresh snapshot via [`crate::runtime_config::handle::RuntimeConfigHandle::load_full`]
     /// each time it writes the manifest, so toggles applied via
@@ -117,6 +124,7 @@ impl Options {
             mvcc_gc_watermark: 0,
 
             compaction_state: tree.compaction_state.clone(),
+            deletion_pause: tree.deletion_pause.clone(),
             runtime_config: tree.runtime_config.clone(),
             encryption: tree.config.encryption.clone(),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::new(
@@ -942,6 +950,13 @@ fn run_tight_space_compaction(
             drop(version);
 
             let outputs: Vec<Table> = produced.created_tables().to_vec();
+            // Install the tree-wide deletion pause on each slice output before the
+            // version edit makes it visible (mirrors `install_merge` — a compaction
+            // output that skipped it could race a checkpoint hard-link on a later
+            // in-place heal).
+            for table in &outputs {
+                table.install_deletion_pause(Arc::clone(&opts.deletion_pause));
+            }
             // KV-separation: blob files this slice relocated live entries into,
             // plus the GC diff of entries it dropped.
             let mut new_blobs: Vec<BlobFile> = produced.created_blob_files().to_vec();
@@ -1024,6 +1039,26 @@ fn run_tight_space_compaction(
                 {
                     removed_ids.push(view.id());
                 } else {
+                    // Stamp the restriction POSITION into the input's own meta
+                    // BEFORE `reopen_restricted` captures the live-suffix digest,
+                    // so that digest (and the manifest entry the install records)
+                    // covers the patched meta. The meta lives in the file's suffix,
+                    // so the later prefix punch never disturbs it. This makes the
+                    // punched SST self-describing: manifest repair recovers the
+                    // exact bound from the meta alone.
+                    //
+                    // A crash in the window before the install below leaves the
+                    // input with a patched meta while the current manifest still
+                    // references it: harmless, since a normal (manifest-authoritative)
+                    // open ignores the meta's position and does not re-verify the
+                    // whole-file digest on open, and a re-run of the tight-space
+                    // compaction re-stamps and installs.
+                    let (block_ordinal, entry_ordinal) = view.restrict_position_for(boundary)?;
+                    view.persist_restrict_position(
+                        block_ordinal,
+                        entry_ordinal,
+                        opts.config.sync_mode,
+                    )?;
                     let restricted = view.reopen_restricted(boundary.clone())?;
                     restricted_pairs.push((view.id(), restricted.clone()));
                     next_views.push(restricted);
