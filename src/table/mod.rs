@@ -1739,20 +1739,7 @@ impl Table {
                 // digest, producing a permanently inconsistent checkpoint. The
                 // marker records `(manifest, predicted)` (here equal), so a reconcile
                 // trusts the file only once it hashes to the restored digest. (The
-                // DIVERGING sub-case — predicted != manifest — is gated separately
-                // below against an EXISTING completed marker via `attests_post`.)
-                // NOT-matched pre-heal: the current bytes already differ from the
-                // manifest digest. If the predicted heal RESTORES the manifest
-                // digest (the common restorative case: a rotted file healing back to
-                // exactly what the manifest describes), the write window STILL needs
-                // a durable marker BEFORE the first mutation. A crash after syncing
-                // SOME of several corrections leaves the file matching neither the
-                // manifest nor the predicted digest; with no marker a checkpoint
-                // hard-links those intermediate bytes under the stale manifest
-                // digest, producing a permanently inconsistent checkpoint. The
-                // marker records `(manifest, predicted)` (here equal), so a reconcile
-                // trusts the file only once it hashes to the restored digest. (The
-                // DIVERGING sub-case — predicted != manifest — is gated separately
+                // DIVERGING sub-case, predicted != manifest, is gated separately
                 // below against an EXISTING completed marker via `attests_post`.)
                 if Checksum::from_raw(predicted_digest) == manifest_checksum
                     && let Err(e) = crate::scrub::heal_attest::write(
@@ -6956,15 +6943,6 @@ impl Table {
                 },
             ) {
                 Ok(block) => Some(block),
-                // A TRANSIENT locator read during salvage must PROPAGATE, not
-                // degrade: `rebuildable_section_degraded` makes `salvage_attempt`
-                // read a delete-free table as possibly hiding deletion metadata and
-                // fail the whole SST (`FeatureUnsupported`), quarantining an
-                // otherwise-salvageable table instead of retrying the retryable
-                // read. Mirrors the zone-map / seqno-bounds / delete-bitmap loaders.
-                // A non-salvage open keeps the best-effort accelerator behavior
-                // (degrade to the sorted-index path), so a flaky read there never
-                // fails the open.
                 // A TRANSIENT locator read during salvage must PROPAGATE, not
                 // degrade: `rebuildable_section_degraded` makes `salvage_attempt`
                 // read a delete-free table as possibly hiding deletion metadata and

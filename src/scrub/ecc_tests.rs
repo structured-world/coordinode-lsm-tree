@@ -777,8 +777,8 @@ fn heal_in_place_keeps_the_marker_when_a_write_back_fails() -> crate::Result<()>
     Ok(())
 }
 
-/// The RESTORATIVE heal path — the current bytes already differ from the manifest
-/// digest, but healing restores exactly what the manifest describes — must ALSO
+/// The RESTORATIVE heal path (the current bytes already differ from the manifest
+/// digest, but healing restores exactly what the manifest describes) must ALSO
 /// persist its `.heal-attest` marker BEFORE the first write-back. Otherwise a
 /// crash after syncing some of several corrections leaves the file matching
 /// neither the manifest nor the healed digest, and with no marker a checkpoint
@@ -799,7 +799,7 @@ fn heal_in_place_keeps_the_marker_when_a_restorative_write_back_fails() -> crate
     // Rot a parity trailer but DO NOT rebuild the manifest: the current bytes now
     // differ from the manifest digest (pre-heal does NOT match), yet rebuilding the
     // trailer restores exactly the original bytes the manifest still describes
-    // (predicted == manifest) — the restorative path.
+    // (predicted == manifest): the restorative path.
     corrupt_parity_trailer_byte(&sst_path, &block)?;
 
     let fault = FaultFs::new(crate::fs::StdFs);

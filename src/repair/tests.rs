@@ -1439,7 +1439,7 @@ fn repair_restricts_a_tight_space_punched_table() -> crate::Result<()> {
 /// salvaged away. The salvage-gate block walk must start at the view's live data
 /// start (`punch_offset`), not byte 0: walking the hole-punched `[0, punch)` prefix
 /// reads zeroed block headers, reports them as corruption, and the restricted-table
-/// safeguard then quarantines the healthy SST — dropping it from the manifest
+/// safeguard then quarantines the healthy SST, dropping it from the manifest
 /// precisely because salvage was enabled (#79).
 #[test]
 fn repair_with_salvage_keeps_a_healthy_restricted_punched_table() -> crate::Result<()> {
@@ -1457,7 +1457,7 @@ fn repair_with_salvage_keeps_a_healthy_restricted_punched_table() -> crate::Resu
     write_multiblock_sst(&sst, &fs)?;
 
     // A mid-block bound, published to the sidecar, with the whole prefix below it
-    // punched — a legitimately restricted, otherwise-healthy view.
+    // punched: a legitimately restricted, otherwise-healthy view.
     let bound = b"k00130".to_vec();
     {
         let table = recover_sst(sst.clone(), &fs)?;
@@ -1484,7 +1484,7 @@ fn repair_with_salvage_keeps_a_healthy_restricted_punched_table() -> crate::Resu
         report.unreadable_files,
     );
 
-    // Probe every key: served IFF key >= bound — the restriction survived intact.
+    // Probe every key: served IFF key >= bound, so the restriction survived intact.
     let tree = Config::new(
         &root,
         SequenceNumberCounter::default(),
@@ -1525,7 +1525,7 @@ fn write_multiblock_sst(
 }
 
 /// Builds a multi-block SST at `tables/0` under `memfs`, then punches its consumed
-/// prefix `[0, punch(k00050))` — the on-disk state of a tight-space-PUNCHED SST.
+/// prefix `[0, punch(k00050))`, the on-disk state of a tight-space-PUNCHED SST.
 /// The caller then publishes (or withholds / corrupts / mismatches) a
 /// `.restrict-bound` sidecar to drive repair through each no-trustworthy-bound
 /// path. Returns the SST path.
@@ -1660,7 +1660,7 @@ fn repair_quarantines_a_restricted_punched_sst_with_a_corrupt_suffix() -> crate:
 /// extent is untrustworthy. If an earlier slice punched `[0, B1)` but a later,
 /// larger sidecar bound `B2 > B1` never committed (crash / install failure), the
 /// blocks in `[B1, B2)` are still LIVE and the prefix below `B2` is NOT fully
-/// punched — repair rejects `B2`. Because the SST IS punched, it cannot be opened
+/// punched, so repair rejects `B2`. Because the SST IS punched, it cannot be opened
 /// unrestricted (that would re-serve the straddling block's superseded sub-`B1`
 /// rows) nor salvaged (same resurrection): repair fails CLOSED, quarantining the
 /// SST for manual recovery (#68/#76).
@@ -1701,7 +1701,7 @@ fn repair_quarantines_a_punched_sst_whose_sidecar_bound_overshoots_the_punch() -
         report.unreadable_files,
     );
 
-    // Fail closed: NO key survives — not a superseded sub-`k00050` row (which an
+    // Fail closed: NO key survives, not a superseded sub-`k00050` row (which an
     // unrestricted open would RESURRECT) nor a live `[k00050, k00130)` suffix row.
     let tree = Config::new(
         &root,
@@ -1714,7 +1714,7 @@ fn repair_quarantines_a_punched_sst_whose_sidecar_bound_overshoots_the_punch() -
         let key = format!("k{i:05}").into_bytes();
         assert!(
             tree.get(&key, crate::MAX_SEQNO)?.is_none(),
-            "key {key:?} must NOT be served — the punched SST was quarantined whole",
+            "key {key:?} must NOT be served; the punched SST was quarantined whole",
         );
     }
     Ok(())
@@ -1788,8 +1788,8 @@ fn repair_rejects_a_restrict_bound_over_an_unpunched_sst() -> crate::Result<()> 
 }
 
 /// Asserts a punched SST at `tables/0` under `memfs` was quarantined whole by
-/// repair: nothing recovered, exactly one file reported unreadable, and NO key —
-/// neither a superseded sub-bound row nor a live suffix row — survives in the
+/// repair: nothing recovered, exactly one file reported unreadable, and NO key
+/// (neither a superseded sub-bound row nor a live suffix row) survives in the
 /// reopened tree. Shared by the no-trustworthy-bound quarantine tests.
 fn assert_punched_sst_quarantined_whole(
     memfs: &std::sync::Arc<crate::fs::MemFs>,
@@ -1826,7 +1826,7 @@ fn assert_punched_sst_quarantined_whole(
         let key = format!("k{i:05}").into_bytes();
         assert!(
             tree.get(&key, crate::MAX_SEQNO)?.is_none(),
-            "key {key:?} must NOT be served — the punched SST was quarantined whole",
+            "key {key:?} must NOT be served; the punched SST was quarantined whole",
         );
     }
     Ok(())
@@ -1835,7 +1835,7 @@ fn assert_punched_sst_quarantined_whole(
 /// A punched SST with NO `.restrict-bound` sidecar (a legacy punched SST predating
 /// sidecars, or one whose sidecar was lost) has no recoverable bound. Repair must
 /// NOT treat the sidecar's absence as proof no punch occurred and open it
-/// unrestricted — that exposes the zeroed prefix AND re-serves the straddling
+/// unrestricted, which exposes the zeroed prefix AND re-serves the straddling
 /// block's superseded sub-bound rows. It fails CLOSED: quarantine (#76).
 #[test]
 fn repair_quarantines_a_punched_sst_with_no_sidecar() -> crate::Result<()> {
@@ -1855,7 +1855,7 @@ fn repair_quarantines_a_punched_sst_with_no_sidecar() -> crate::Result<()> {
 
 /// A punched SST whose `.restrict-bound` sidecar reads back MALFORMED (a flipped
 /// byte fails its checksum) has an unrecoverable bound. Repair must route it
-/// DIRECTLY to quarantine, not the generic salvage path — salvage would rewrite it
+/// DIRECTLY to quarantine, not the generic salvage path: salvage would rewrite it
 /// unpunched and re-emit the straddling block's superseded sub-bound rows (#77).
 #[test]
 fn repair_quarantines_a_punched_sst_with_a_corrupt_sidecar() -> crate::Result<()> {
@@ -1878,7 +1878,9 @@ fn repair_quarantines_a_punched_sst_with_a_corrupt_sidecar() -> crate::Result<()
         let mut buf = Vec::new();
         fs.open(&sidecar, &FsOpenOptions::new().read(true))?
             .read_to_end(&mut buf)?;
-        buf[0] ^= 0xFF;
+        if let Some(b) = buf.first_mut() {
+            *b ^= 0xFF;
+        }
         let mut f = fs.open(&sidecar, &FsOpenOptions::new().write(true))?;
         f.seek(SeekFrom::Start(0))?;
         f.write_all(&buf)?;
@@ -1892,7 +1894,7 @@ fn repair_quarantines_a_punched_sst_with_a_corrupt_sidecar() -> crate::Result<()
 /// stale sidecar left by a reused id) does not authenticate this SST's bound.
 /// Repair must not treat the id-mismatch as "unrestricted" and open the punched
 /// SST whole (resurrecting its straddling block's superseded rows): it fails
-/// CLOSED — quarantine (#71).
+/// CLOSED: quarantine (#71).
 #[test]
 fn repair_quarantines_a_punched_sst_with_a_mismatched_sidecar_id() -> crate::Result<()> {
     use crate::fs::{Fs, MemFs};

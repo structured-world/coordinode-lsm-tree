@@ -1034,8 +1034,8 @@ fn run_tight_space_compaction(
             // `run_subcompaction` above already finalized this slice's output SSTs
             // and blob files, but the install below is what references them. A
             // failure between here and the install (a sidecar write or a restricted
-            // reopen) returns before any version points at those outputs, so — like
-            // the install error path below — roll them back now instead of pinning
+            // reopen) returns before any version points at those outputs, so, like
+            // the install error path below, roll them back now instead of pinning
             // the space until the next open's orphan sweep. Tight-space runs exactly
             // when free space is scarce, so an ENOSPC here would otherwise both abort
             // the reclaim and hold the bytes this slice just consumed.

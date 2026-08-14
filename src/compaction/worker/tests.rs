@@ -452,8 +452,8 @@ fn tight_space_writes_a_restrict_bound_sidecar_matching_the_manifest_bound() -> 
 
 /// `run_subcompaction` finalizes a slice's output SSTs before the tight-space loop
 /// publishes each surviving input's `.restrict-bound` sidecar. If that sidecar
-/// write fails — an `ENOSPC` is the likely cause, since tight-space runs precisely
-/// when free space is scarce — the install never references those finalized
+/// write fails (an `ENOSPC` is the likely cause, since tight-space runs precisely
+/// when free space is scarce), the install never references those finalized
 /// outputs. They must be rolled back at once (marked deleted, so their blocks free
 /// on drop), not left to pin the space the slice just consumed until the next
 /// open's orphan sweep. A fault on the FIRST sidecar write must leave NO full-size

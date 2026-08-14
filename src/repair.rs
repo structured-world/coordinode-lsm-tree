@@ -1402,7 +1402,7 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                     match table.prefix_is_punched(bound) {
                         Ok(true) => break 'restrict table.reopen_restricted(bound.clone().into()),
                         // The bound is not fully backed by the punch (e.g. a larger
-                        // slice's install never committed) — fall through to the
+                        // slice's install never committed): fall through to the
                         // no-trustworthy-bound tail below.
                         Ok(false) => {}
                         Err(e) => break 'restrict Err(e),
@@ -1412,7 +1412,7 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                 // No trustworthy restriction: a MISSING sidecar (a legacy punched SST
                 // predating sidecars), an id-MISMATCH (reused id), a CORRUPT sidecar,
                 // or a bound the punch does not fully back. If the SST is PUNCHED AT
-                // ALL, its bound is unrecoverable — fail CLOSED: quarantine it for
+                // ALL, its bound is unrecoverable, so fail CLOSED: quarantine it for
                 // manual recovery rather than open it unrestricted (which exposes the
                 // zeroed prefix AND re-serves the straddling block's superseded
                 // sub-bound rows) or salvage it (which re-emits those rows too). If it
