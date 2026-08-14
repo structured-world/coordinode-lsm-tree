@@ -6932,8 +6932,9 @@ impl Table {
         // which isolates a corrupt sub-index partition to its own keys — so
         // enabling the locator by default does NOT widen the blast radius of a
         // partitioned-index corruption from "one partition" back to "whole SST".
-        let locator_index = regions.locator.and_then(|loc_handle| {
-            let block = Block::from_file(
+        let locator_block = match regions.locator {
+            None => None,
+            Some(loc_handle) => match Block::from_file(
                 file_handle.as_ref(),
                 loc_handle,
                 crate::table::block::BlockIdentity {
@@ -6953,12 +6954,37 @@ impl Table {
                         t
                     }
                 },
-            )
-            .inspect_err(|e| {
-                log::warn!("retrieval-ribbon locator disabled: section load failed: {e:?}");
-                rebuildable_section_degraded = true;
-            })
-            .ok()?;
+            ) {
+                Ok(block) => Some(block),
+                // A TRANSIENT locator read during salvage must PROPAGATE, not
+                // degrade: `rebuildable_section_degraded` makes `salvage_attempt`
+                // read a delete-free table as possibly hiding deletion metadata and
+                // fail the whole SST (`FeatureUnsupported`), quarantining an
+                // otherwise-salvageable table instead of retrying the retryable
+                // read. Mirrors the zone-map / seqno-bounds / delete-bitmap loaders.
+                // A non-salvage open keeps the best-effort accelerator behavior
+                // (degrade to the sorted-index path), so a flaky read there never
+                // fails the open.
+                // A TRANSIENT locator read during salvage must PROPAGATE, not
+                // degrade: `rebuildable_section_degraded` makes `salvage_attempt`
+                // read a delete-free table as possibly hiding deletion metadata and
+                // fail the whole SST (`FeatureUnsupported`), quarantining an
+                // otherwise-salvageable table instead of retrying the retryable
+                // read. Mirrors the zone-map / seqno-bounds / delete-bitmap loaders.
+                // A non-salvage open keeps the best-effort accelerator behavior
+                // (degrade to the sorted-index path), so a flaky read there never
+                // fails the open.
+                Err(crate::Error::Io(e)) if salvage && e.kind().is_transient() => {
+                    return Err(crate::Error::Io(e));
+                }
+                Err(e) => {
+                    log::warn!("retrieval-ribbon locator disabled: section load failed: {e:?}");
+                    rebuildable_section_degraded = true;
+                    None
+                }
+            },
+        };
+        let locator_index = locator_block.and_then(|block| {
             if block.header.block_type != BlockType::Locator {
                 log::warn!(
                     "retrieval-ribbon locator disabled: unexpected block type {:?}",
