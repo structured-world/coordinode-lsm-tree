@@ -5245,3 +5245,109 @@ fn write_columnar_batch_on_an_empty_batch_writes_no_block() -> crate::Result<()>
     );
     Ok(())
 }
+
+/// A TRANSIENT locator-section read during a SALVAGE open must PROPAGATE, not
+/// degrade the section to `None`. The degradation sets `rebuildable_section_degraded`,
+/// which makes `salvage_attempt` read a delete-free table as possibly hiding
+/// deletion metadata and fail the whole SST (`FeatureUnsupported`), quarantining an
+/// otherwise-salvageable table instead of retrying the retryable read. A non-salvage
+/// open keeps the best-effort accelerator behavior (degrade to the sorted-index
+/// path), so this only applies in salvage mode (#80).
+#[test]
+fn recover_salvage_propagates_a_transient_locator_read() -> crate::Result<()> {
+    use crate::config::{LocatorPolicyEntry, LocatorPrecision};
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let sst = dir.path().join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?
+            .use_data_block_size(128)
+            .use_locator(LocatorPolicyEntry::Enabled {
+                precision: LocatorPrecision::Entry,
+                block_id_bits: None,
+                slot_bits: None,
+            });
+        for i in 0..256u32 {
+            w.write(crate::InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                u64::from(i) + 1,
+                crate::ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Resolve the locator section's byte offset from a clean (Live) open.
+    let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &sst)?);
+    let loc_offset = {
+        let live = Table::recover(
+            sst.clone(),
+            checksum,
+            0,
+            0,
+            0,
+            Arc::new(Cache::with_capacity_bytes(1 << 20)),
+            Some(Arc::new(DescriptorTable::new(8))),
+            Arc::clone(&fs),
+            false,
+            false,
+            None,
+            #[cfg(zstd_any)]
+            None,
+            crate::comparator::default_comparator(),
+            #[cfg(feature = "metrics")]
+            Arc::new(Metrics::default()),
+        )?;
+        live.regions
+            .locator
+            .expect("the multi-block SST carries a locator section")
+            .offset()
+            .0
+    };
+
+    // Fault ONLY the positioned read at the locator offset, once, with a genuine
+    // transient kind.
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    injector.arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Interrupted))
+            .at_offset(loc_offset)
+            .once(),
+    );
+    let faulted: Arc<dyn crate::fs::Fs> = Arc::new(fault);
+
+    let result = Table::recover_inner(
+        sst.clone(),
+        checksum,
+        0,
+        0,
+        0,
+        Arc::new(Cache::with_capacity_bytes(1 << 20)),
+        Some(Arc::new(DescriptorTable::new(8))),
+        Arc::clone(&faulted),
+        false,
+        false,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        crate::comparator::default_comparator(),
+        #[cfg(feature = "metrics")]
+        Arc::new(Metrics::default()),
+        RecoveryMode::Salvage {
+            expected_id: None,
+            prefer_mid_meta: false,
+        },
+    );
+    injector.clear();
+
+    assert!(
+        matches!(&result, Err(crate::Error::Io(e)) if e.kind() == ErrorKind::Interrupted),
+        "a transient locator read in salvage mode must propagate (not degrade to a \
+         section-degraded open that later fails as FeatureUnsupported): {result:?}",
+    );
+    Ok(())
+}
