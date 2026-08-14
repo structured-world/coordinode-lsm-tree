@@ -1434,6 +1434,76 @@ fn repair_restricts_a_tight_space_punched_table() -> crate::Result<()> {
     Ok(())
 }
 
+/// With salvage ENABLED, an otherwise-healthy tight-space RESTRICTED SST (a valid
+/// `.restrict-bound` sidecar, fully punch-backed) must be KEPT restricted, not
+/// salvaged away. The salvage-gate block walk must start at the view's live data
+/// start (`punch_offset`), not byte 0: walking the hole-punched `[0, punch)` prefix
+/// reads zeroed block headers, reports them as corruption, and the restricted-table
+/// safeguard then quarantines the healthy SST — dropping it from the manifest
+/// precisely because salvage was enabled (#79).
+#[test]
+fn repair_with_salvage_keeps_a_healthy_restricted_punched_table() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::PathBuf::from("/db");
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+
+    write_multiblock_sst(&sst, &fs)?;
+
+    // A mid-block bound, published to the sidecar, with the whole prefix below it
+    // punched — a legitimately restricted, otherwise-healthy view.
+    let bound = b"k00130".to_vec();
+    {
+        let table = recover_sst(sst.clone(), &fs)?;
+        crate::restrict_bound::write(&*fs, &sst, None, 0, &bound, crate::fs::SyncMode::Normal)?;
+        let punch = table.punch_offset_for(&bound)?;
+        memfs.punch_hole(&sst, 0, punch)?;
+    }
+
+    // Salvage ENABLED is the trigger: the salvage gate's block walk runs only here.
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.recovered, 1,
+        "a healthy restricted SST must be kept restricted even with salvage on: {report:?}",
+    );
+    assert_eq!(
+        report.unreadable, 0,
+        "the healthy restricted SST must NOT be quarantined: {:?}",
+        report.unreadable_files,
+    );
+
+    // Probe every key: served IFF key >= bound — the restriction survived intact.
+    let tree = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .open()?;
+    for i in 0..256u32 {
+        let key = format!("k{i:05}").into_bytes();
+        let served = tree.get(&key, crate::MAX_SEQNO)?.is_some();
+        assert_eq!(
+            served,
+            key.as_slice() >= bound.as_slice(),
+            "key {key:?} served={served}; expected served == (key >= {bound:?})",
+        );
+    }
+    Ok(())
+}
+
 /// Builds a multi-data-block SST under `fs` at `path` (keys `k00000..k00255`).
 fn write_multiblock_sst(
     path: &std::path::Path,
