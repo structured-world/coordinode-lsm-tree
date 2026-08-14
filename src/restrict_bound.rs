@@ -195,7 +195,18 @@ pub fn read(
         return Ok(SidecarRead::Corrupt);
     }
     let mut content = Vec::new();
-    std::io::Read::read_to_end(&mut file, &mut content).map_err(crate::Error::from)?;
+    // Cap the reader at the same bound as the metadata probe, so the allocation
+    // limit holds even if the file grew after the probe (a concurrent writer, or a
+    // backend whose metadata disagrees with its data). Reading `max_len + 1` bytes
+    // lets an over-long payload surface as `Corrupt` below.
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(&mut file, max_len.saturating_add(1)),
+        &mut content,
+    )
+    .map_err(crate::Error::from)?;
+    if content.len() as u64 > max_len {
+        return Ok(SidecarRead::Corrupt);
+    }
     let plain = match encryption {
         Some(enc) => match enc.decrypt(&content) {
             Ok(plain) => plain,

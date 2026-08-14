@@ -65,6 +65,26 @@ fn truncated_sidecar_reads_corrupt() {
     ));
 }
 
+/// An OVER-LONG sidecar (larger than a valid header + max-length bound + checksum)
+/// reads as `Corrupt` and never forces a large allocation: the read is bounded, so
+/// a corrupt / padded file is rejected at the size branch before it is
+/// materialized.
+#[test]
+fn oversized_sidecar_reads_corrupt() {
+    let dir = tempfile::tempdir().unwrap();
+    let sst = dir.path().join("7");
+    write(&StdFs, &sst, None, 7, b"k00130", SyncMode::Normal).unwrap();
+
+    // One byte past the largest a valid plaintext sidecar can be.
+    let over = HEADER_LEN + u16::MAX as usize + CHECKSUM_LEN + 1;
+    std::fs::write(sidecar_path(&sst), vec![0u8; over]).unwrap();
+
+    assert!(matches!(
+        read(&StdFs, &sst, None).unwrap(),
+        SidecarRead::Corrupt
+    ));
+}
+
 /// `remove` deletes the sidecar; a subsequent read is `Missing`.
 #[test]
 fn remove_deletes_the_sidecar() {
