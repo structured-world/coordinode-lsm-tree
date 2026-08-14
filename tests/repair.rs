@@ -1354,3 +1354,74 @@ fn repair_prefers_an_intact_duplicate_over_a_lossy_salvage() -> lsm_tree::Result
     );
     Ok(())
 }
+
+/// When the same table id exists intact in two configured folders, repair keeps
+/// ONE and must QUARANTINE the duplicate out of `tables/`. The rebuilt manifest
+/// records only `id + checksum` (no path), so a duplicate left in place would let
+/// the reopened tree resolve the wrong file for that id by folder order — and
+/// reopen it against the kept copy's mismatched checksum. The primary is scanned
+/// first, so it wins; the routed (cold) duplicate must land in `cold/`'s
+/// `repair-quarantine`, not stay under `cold/tables`.
+#[test]
+fn repair_quarantines_a_duplicate_table_file() -> lsm_tree::Result<()> {
+    use lsm_tree::config::LevelRoute;
+    use lsm_tree::fs::StdFs;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let primary = dir.path().join("primary");
+    let cold = dir.path().join("cold");
+    std::fs::create_dir_all(primary.join("tables"))?;
+    std::fs::create_dir_all(cold.join("tables"))?;
+
+    // One flushed SST, copied INTACT into both folders under its id name.
+    let id_name = {
+        let build = dir.path().join("build");
+        let tree = Config::new(
+            &build,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0..1000 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+        let ssts = sorted_sst_paths(&build);
+        assert_eq!(ssts.len(), 1, "one flush → one SST");
+        let name = ssts[0].file_name().expect("sst has a file name").to_owned();
+        std::fs::copy(&ssts[0], primary.join("tables").join(&name))?;
+        std::fs::copy(&ssts[0], cold.join("tables").join(&name))?;
+        name
+    };
+
+    let report = Config::new(
+        &primary,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .level_routes(vec![LevelRoute {
+        levels: 5..7,
+        path: cold.clone(),
+        fs: Arc::new(StdFs),
+    }])
+    .repair_with_salvage(true)?;
+
+    assert_eq!(report.recovered, 1, "one table recovered: {report:?}");
+    // The primary (first-scanned) copy stays; the routed duplicate is moved OUT of
+    // `cold/tables` into `cold/repair-quarantine`, so recovery can't resolve it.
+    assert!(
+        primary.join("tables").join(&id_name).exists(),
+        "the kept copy stays under the primary's tables/",
+    );
+    assert!(
+        !cold.join("tables").join(&id_name).exists(),
+        "the duplicate must NOT remain under cold/tables (recovery would resolve it \
+         for the id and reopen against a mismatched checksum): {report:?}",
+    );
+    assert!(
+        cold.join("repair-quarantine").join(&id_name).exists(),
+        "the duplicate must be quarantined into cold/repair-quarantine: {report:?}",
+    );
+    Ok(())
+}

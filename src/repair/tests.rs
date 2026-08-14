@@ -548,7 +548,7 @@ fn repair_with_salvage_quarantines_a_bulk_ingested_sst_that_fails_recovery() -> 
     {
         let build_fs: Arc<dyn Fs> = Arc::new(StdFs);
         let mut w = Writer::new(sst, 0, 0, Arc::clone(&build_fs))?
-            .use_bulk_ingested(true)
+            .use_bulk_ingested(Some(true))
             .use_data_block_size(128);
         for i in 0..64u32 {
             w.write(InternalValue::from_components(
@@ -587,6 +587,76 @@ fn repair_with_salvage_quarantines_a_bulk_ingested_sst_that_fails_recovery() -> 
     assert_eq!(
         report.unreadable, 1,
         "the bulk-ingested SST is reported unreadable: {:?}",
+        report.unreadable_files,
+    );
+    Ok(())
+}
+
+/// A LEGACY SST (no `descriptor#bulk_ingested` key at all — written before the
+/// descriptor existed) whose entries sit at local seqno 0 has UNKNOWN provenance:
+/// it may have been bulk-ingested with a manifest-only `global_seqno`. When
+/// whole-file recovery fails and it routes to block-salvage, the salvaged copy
+/// must PRESERVE that unknown (`None`) provenance, not stamp "not ingested" —
+/// otherwise the salvage guard's seqno heuristic never fires and the table is
+/// kept with `global_seqno` 0, silently mis-ordering it. The mirror writer omits
+/// the key for a `None` source, so the reopened copy re-parses as `None` and the
+/// guard quarantines it.
+#[test]
+fn repair_with_salvage_quarantines_a_legacy_seqno0_sst_that_fails_recovery() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs};
+    use crate::io::ErrorKind;
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+
+    // A LEGACY SST: provenance UNKNOWN (no flag key), entries at local seqno 0.
+    {
+        let build_fs: Arc<dyn Fs> = Arc::new(StdFs);
+        let mut w = Writer::new(sst, 0, 0, Arc::clone(&build_fs))?
+            .use_bulk_ingested(None)
+            .use_data_block_size(128);
+        for i in 0..64u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                0,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Fail whole-file recovery (persistent hash fault) so the table routes to
+    // block-salvage; salvage reopens the copy, which must re-parse as `None`.
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    injector.arm(
+        FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .once(),
+    );
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair_with_salvage(true)?;
+    injector.clear();
+
+    assert_eq!(
+        report.recovered, 0,
+        "a legacy seqno-0 SST of unknown provenance must not be salvaged-and-kept: {report:?}",
+    );
+    assert_eq!(
+        report.unreadable, 1,
+        "the legacy seqno-0 SST is reported unreadable: {:?}",
         report.unreadable_files,
     );
     Ok(())
@@ -1175,7 +1245,7 @@ fn repair_quarantines_a_table_with_an_unrecoverable_ingest_offset() -> crate::Re
     // the ingest path writes them), so its effective ordering lives in a
     // manifest-only global_seqno the rebuilt manifest cannot recover.
     {
-        let mut w = Writer::new(sst, 0, 0, Arc::clone(&fs))?.use_bulk_ingested(true);
+        let mut w = Writer::new(sst, 0, 0, Arc::clone(&fs))?.use_bulk_ingested(Some(true));
         for i in 0..8u32 {
             w.write(InternalValue::from_components(
                 format!("k{i:05}").into_bytes(),
@@ -1273,9 +1343,11 @@ fn recover_sst(
 /// not the SST. When manifest repair rebuilds without that bound, the punched
 /// table would open UNRESTRICTED and later reads would traverse its zero-reading
 /// (punched) blocks and fail. Repair must detect the punch (allocated < logical)
-/// and recover the live suffix restricted to its first readable key, so the
-/// reopened tree serves the suffix and routes the punched prefix away instead of
-/// erroring. Uses `MemFs` for a byte-precise punch.
+/// and recover the live suffix restricted to a SAFE re-derived bound — the first
+/// key of the SECOND readable block, NOT the first, because the punch boundary
+/// can fall inside the first surviving block. The reopened tree then serves keys
+/// at/above the bound and routes lower keys away, and — critically — resurrects
+/// NO key below the bound. Uses `MemFs` for a byte-precise punch.
 #[test]
 fn repair_restricts_a_tight_space_punched_table() -> crate::Result<()> {
     use crate::fs::{Fs, MemFs};
@@ -1316,13 +1388,37 @@ fn repair_restricts_a_tight_space_punched_table() -> crate::Result<()> {
     };
     memfs.punch_hole(&sst, first_offset, u64::from(first_size))?;
 
-    // The restriction bound is the first key of the first LIVE (post-punch) block.
-    let Some(bound) = recover_sst(sst, &fs)?.first_readable_data_key()? else {
-        panic!("a live suffix block remains after punching only the first block");
+    // The bound is the first key of the SECOND readable block (over-restricting
+    // past the first live block, which may straddle the boundary). Capture the
+    // first key of BOTH the first-live (block 1) and second-live (block 2) blocks
+    // to pin the contract: bound == block2.first, strictly ABOVE block1.first.
+    // Restricting to block1.first instead (the old behavior) would resurrect any
+    // superseded key sitting in block 1 above the true mid-block boundary.
+    let (block1_first, block2_first, bound) = {
+        use crate::table::BlockHandle;
+        use crate::table::block_index::BlockIndex as _;
+        let table = recover_sst(sst, &fs)?;
+        let mut it = table.block_index.iter();
+        let (Some(_b0), Some(b1), Some(b2)) = (it.next(), it.next(), it.next()) else {
+            panic!("the SST has at least three data blocks");
+        };
+        let b1 = b1?;
+        let b2 = b2?;
+        let block1_first = table.block_first_user_key(&BlockHandle::new(b1.offset(), b1.size()))?;
+        let block2_first = table.block_first_user_key(&BlockHandle::new(b2.offset(), b2.size()))?;
+        let Some(bound) = table.punched_restriction_bound()? else {
+            panic!("two live suffix blocks remain after punching only the first block");
+        };
+        (block1_first, block2_first, bound)
     };
+    assert_eq!(
+        bound, block2_first,
+        "the bound is the SECOND readable block's first key",
+    );
     assert!(
-        bound.as_ref() > b"k00000".as_ref(),
-        "the bound is past the punched first key, got {bound:?}",
+        bound.as_ref() > block1_first.as_ref(),
+        "the bound over-restricts past the first live block ({block1_first:?}), \
+         so a superseded key straddling the boundary cannot be resurrected; got {bound:?}",
     );
 
     // Repair rebuilds the manifest, recovering the punched table RESTRICTED.
@@ -1339,8 +1435,10 @@ fn repair_restricts_a_tight_space_punched_table() -> crate::Result<()> {
     );
     assert_eq!(report.unreadable, 0, "{:?}", report.unreadable_files);
 
-    // Reopen: a live suffix key is served; a punched-prefix key is routed away
-    // (absent) rather than erroring on a hole.
+    // Reopen and probe EVERY key: a key is served IFF it is at/above the bound.
+    // The "no key below the bound is served" half is the resurrection guard —
+    // the second-readable-block bound sits at/above the true punch boundary, so
+    // no superseded key below it can leak back.
     let tree = Config::new(
         &root,
         SequenceNumberCounter::default(),
@@ -1348,14 +1446,17 @@ fn repair_restricts_a_tight_space_punched_table() -> crate::Result<()> {
     )
     .with_fs(memfs.as_ref().clone())
     .open()?;
-    assert!(
-        tree.get(b"k00255", crate::MAX_SEQNO)?.is_some(),
-        "a live suffix key is served after repair",
-    );
-    assert!(
-        tree.get(b"k00000", crate::MAX_SEQNO)?.is_none(),
-        "a punched-prefix key is restricted away, not an error",
-    );
+    for i in 0..256u32 {
+        let key = format!("k{i:05}").into_bytes();
+        let served = tree.get(&key, crate::MAX_SEQNO)?.is_some();
+        assert_eq!(
+            served,
+            key.as_slice() >= bound.as_ref(),
+            "key {key:?} served={served} but bound is {bound:?} \
+             (served must equal key >= bound; a served key below the bound is a \
+             resurrected superseded key)",
+        );
+    }
     Ok(())
 }
 
@@ -1379,11 +1480,11 @@ fn write_multiblock_sst(
     Ok(())
 }
 
-/// `first_readable_data_key` must PROPAGATE a transient read on the first live
-/// suffix block, not skip it as though punched: skipping would pick a LATER key
-/// as the restriction bound and permanently hide that block's healthy rows.
+/// `punched_restriction_bound` must PROPAGATE a transient read on a live suffix
+/// block, not skip it as though punched: skipping would shift the second-readable
+/// bound higher and permanently hide that block's healthy rows.
 #[test]
-fn first_readable_data_key_propagates_a_transient_block_read() -> crate::Result<()> {
+fn punched_restriction_bound_propagates_a_transient_block_read() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
     use crate::io::ErrorKind;
     use std::sync::Arc;
@@ -1419,7 +1520,7 @@ fn first_readable_data_key_propagates_a_transient_block_read() -> crate::Result<
     let faulting: Arc<dyn Fs> = Arc::new(fault);
 
     let table = recover_sst(sst, &faulting)?;
-    let result = table.first_readable_data_key();
+    let result = table.punched_restriction_bound();
     assert!(
         matches!(result, Err(crate::Error::Io(_))),
         "a transient read on the first live block must propagate, not be skipped \

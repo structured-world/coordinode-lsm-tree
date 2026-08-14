@@ -3219,35 +3219,56 @@ impl Table {
         ))
     }
 
-    /// The first user key of the first data block that LOADS successfully, or
-    /// `None` when no data block is readable.
+    /// The restriction lower bound for a tight-space-PUNCHED table: the first
+    /// user key of the SECOND data block that LOADS successfully, or `None` when
+    /// fewer than two data blocks are readable.
     ///
-    /// For a tight-space-punched table — a PREFIX of data blocks reclaimed to
-    /// holes that read back as zeros and fail to decode, while the live suffix
-    /// stays intact — this is the restriction lower bound: the first LIVE key,
-    /// below which the table's data was superseded by a merged output table.
-    /// Manifest repair uses it to rebuild the restricted view a punched SST
-    /// needs (the manifest recorded the bound, but the SST does not carry it).
-    /// Data blocks are yielded in key (= offset) order, so the first readable one
-    /// is exactly the first live block past the punched prefix.
+    /// Tight-space compaction reclaims a PREFIX of consumed data blocks to holes
+    /// (they read back as zeros and fail to decode); the live suffix stays
+    /// intact. The manifest recorded the exact boundary key, but the SST does not
+    /// carry it, so repair must re-derive a safe lower bound from the surviving
+    /// blocks alone.
+    ///
+    /// The boundary can fall INSIDE the first surviving block: hole punching frees
+    /// only WHOLE blocks below it, so a straddling block keeps both consumed keys
+    /// (below the boundary, already superseded by a merged output table) and live
+    /// keys (at/above it). That block's first key is therefore BELOW the true
+    /// boundary — restricting to it would RESURRECT the superseded keys. The
+    /// SECOND readable block starts strictly ABOVE every key of the first, hence
+    /// at or above the true boundary, so restricting to it never exposes a
+    /// superseded key. The cost is over-restriction: the first surviving block's
+    /// live keys are also dropped — a safe, lossy trade, since those keys survive
+    /// in the merged output table the compaction produced. `None` (fewer than two
+    /// readable blocks) means the bound is unrecoverable and the caller
+    /// quarantines the file rather than guessing.
     ///
     /// # Errors
     ///
-    /// Propagates a block-index read error; a per-block load / decode failure is
-    /// treated as "punched / unreadable" and skipped, not surfaced.
+    /// Propagates a block-index read error or a TRANSIENT per-block read; a
+    /// persistent per-block load / decode failure is treated as "punched /
+    /// unreadable" and skipped, not surfaced.
     #[cfg(feature = "std")]
-    pub(crate) fn first_readable_data_key(&self) -> crate::Result<Option<UserKey>> {
+    pub(crate) fn punched_restriction_bound(&self) -> crate::Result<Option<UserKey>> {
+        let mut readable = 0u32;
         for handle in self.block_index.iter() {
             let handle = handle?;
             let block_handle = BlockHandle::new(handle.offset(), handle.size());
             match self.block_first_user_key(&block_handle) {
-                Ok(key) => return Ok(Some(key)),
+                Ok(key) => {
+                    readable += 1;
+                    // The FIRST surviving block may straddle the punch boundary
+                    // (consumed + live keys); only the SECOND readable block is
+                    // guaranteed to start at/above the true boundary.
+                    if readable == 2 {
+                        return Ok(Some(key));
+                    }
+                }
                 // A TRANSIENT read (one-shot Interrupted / WouldBlock) propagates:
-                // a retry could read this block, and skipping it would pick a
-                // LATER key as the restriction bound, permanently hiding this
-                // block's healthy rows. Only a STRUCTURAL / persistent failure (a
-                // punched block reading as zeros, genuine bit-rot) means the block
-                // is not part of the live suffix and is skipped.
+                // a retry could read this block, and skipping it would shift the
+                // second-readable bound HIGHER, permanently hiding healthy rows.
+                // Only a STRUCTURAL / persistent failure (a punched block reading
+                // as zeros, genuine bit-rot) means the block is not part of the
+                // live suffix and is skipped.
                 Err(crate::Error::Io(e)) if e.kind().is_transient() => {
                     return Err(crate::Error::Io(e));
                 }
@@ -3259,10 +3280,13 @@ impl Table {
 
     /// The first entry's user key of one data block (row or columnar). Errors if
     /// the block cannot be loaded / decoded (e.g. a punched block reading as
-    /// zeros), which [`first_readable_data_key`](Self::first_readable_data_key)
+    /// zeros), which [`punched_restriction_bound`](Self::punched_restriction_bound)
     /// treats as "skip this block".
     #[cfg(feature = "std")]
-    fn block_first_user_key(&self, block_handle: &BlockHandle) -> crate::Result<UserKey> {
+    pub(crate) fn block_first_user_key(
+        &self,
+        block_handle: &BlockHandle,
+    ) -> crate::Result<UserKey> {
         #[cfg(feature = "columnar")]
         if self.metadata.columnar {
             let block = self.load_block_from_disk(block_handle, BlockType::Columnar)?;

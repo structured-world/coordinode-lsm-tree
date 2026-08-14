@@ -371,30 +371,110 @@ fn has_unrecoverable_ingest_offset(
 /// recovery) or a LOSSY block-salvage that may have dropped corrupt blocks'
 /// keys. Repair keeps the best copy per table id, so a duplicate id in another
 /// table folder can supersede an earlier DAMAGED copy.
+///
+/// The physical location (`fs` / `base_folder` / `path` / `file_name`) travels
+/// with the candidate so that when a duplicate SUPERSEDES it, the loser's file
+/// can be quarantined out of `tables/`. The rebuilt manifest records only
+/// `id + checksum`, so two same-id files left in different folders would let
+/// recovery resolve the stale one by folder order and reopen it against the kept
+/// copy's mismatched checksum.
 struct TableCandidate {
     table: Table,
     complete: bool,
+    fs: Arc<dyn crate::fs::Fs>,
+    base_folder: PathBuf,
+    path: PathBuf,
+    file_name: String,
 }
 
-/// Records `table` as the candidate for `id`, keeping the BETTER of the existing
-/// and the new copy: a COMPLETE recovery replaces a lossy salvage, so an intact
-/// duplicate in a later-scanned folder supersedes an earlier lossy one. Two
-/// completes (or two salvages) are equivalent for the rebuilt manifest — which
-/// needs only one readable copy per id — so the first-seen stays.
+/// Records `candidate` for `id`, keeping the BETTER of the existing and the new
+/// copy: a COMPLETE recovery replaces a lossy salvage, so an intact duplicate in
+/// a later-scanned folder supersedes an earlier lossy one. Two completes (or two
+/// salvages) are equivalent for the rebuilt manifest — which needs only one
+/// readable copy per id — so the first-seen stays.
+///
+/// Returns the DISPLACED loser (the rejected new candidate, or the superseded old
+/// one) so the caller can quarantine its on-disk file; `None` when `id` was
+/// previously unseen (nothing displaced).
+#[must_use = "the displaced duplicate's file must be quarantined out of tables/"]
 fn keep_best_candidate(
     map: &mut crate::HashMap<TableId, TableCandidate>,
     id: TableId,
-    table: Table,
-    complete: bool,
-) {
+    candidate: TableCandidate,
+) -> Option<TableCandidate> {
     match map.get(&id) {
         // Keep the existing copy when it is already complete, or when the new one
-        // is not an improvement (a lossy duplicate of a lossy copy).
-        Some(existing) if existing.complete || !complete => {}
-        _ => {
-            map.insert(id, TableCandidate { table, complete });
-        }
+        // is not an improvement (a lossy duplicate of a lossy copy): the NEW
+        // candidate is displaced.
+        Some(existing) if existing.complete || !candidate.complete => Some(candidate),
+        // The new candidate supersedes: `insert` returns the displaced old copy.
+        _ => map.insert(id, candidate),
     }
+}
+
+/// Quarantines a duplicate table file that lost to a better same-id copy, moving
+/// it out of `tables/` (so recovery cannot resolve it) and recording it as
+/// considered-but-not-referenced. A failed quarantine aborts the whole repair:
+/// leaving both same-id files in place would let recovery reopen the wrong one.
+#[cfg(feature = "std")]
+fn quarantine_duplicate(
+    loser: TableCandidate,
+    unreadable_files: &mut Vec<(PathBuf, String)>,
+    sync_mode: crate::fs::SyncMode,
+) -> crate::Result<()> {
+    let TableCandidate {
+        table,
+        fs,
+        base_folder,
+        path,
+        file_name,
+        ..
+    } = loser;
+    drop(table); // release the open file handle before the move
+    let dest = quarantine_file(&*fs, &base_folder, &path, &file_name, sync_mode)?;
+    unreadable_files.push((
+        path,
+        format!(
+            "duplicate table id superseded by another copy; quarantined to {}",
+            dest.display()
+        ),
+    ));
+    Ok(())
+}
+
+/// Builds a [`TableCandidate`] from a recovered table plus its physical location,
+/// records it as the best copy for `id`, and quarantines any duplicate displaced
+/// by the decision. The one path every recovered table takes to enter the
+/// manifest, so a superseded same-id file is never left discoverable.
+#[cfg(feature = "std")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "location + report threaded through"
+)]
+fn record_best(
+    map: &mut crate::HashMap<TableId, TableCandidate>,
+    unreadable_files: &mut Vec<(PathBuf, String)>,
+    id: TableId,
+    table: Table,
+    complete: bool,
+    fs: &Arc<dyn crate::fs::Fs>,
+    base_folder: &std::path::Path,
+    path: &std::path::Path,
+    file_name: &str,
+    sync_mode: crate::fs::SyncMode,
+) -> crate::Result<()> {
+    let candidate = TableCandidate {
+        table,
+        complete,
+        fs: Arc::clone(fs),
+        base_folder: base_folder.to_path_buf(),
+        path: path.to_path_buf(),
+        file_name: file_name.to_string(),
+    };
+    if let Some(loser) = keep_best_candidate(map, id, candidate) {
+        quarantine_duplicate(loser, unreadable_files, sync_mode)?;
+    }
+    Ok(())
 }
 
 /// Block-salvages a corrupt SST during repair: reads the ALREADY-QUARANTINED
@@ -1136,10 +1216,25 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
             // Skip a duplicate id ONLY when we already hold a COMPLETE copy — a
             // duplicate cannot improve on it. A previously-seen LOSSY salvage does
             // NOT skip: this copy is still evaluated and may supersede it.
-            // Skip a duplicate id ONLY when we already hold a COMPLETE copy — a
-            // duplicate cannot improve on it. A previously-seen LOSSY salvage does
-            // NOT skip: this copy is still evaluated and may supersede it.
+            // Quarantine the redundant duplicate out of `tables/` so recovery
+            // cannot later resolve it instead of the kept copy (the manifest
+            // records only id + checksum, not a path).
             if recovered_by_id.get(&table_id).is_some_and(|c| c.complete) {
+                let dest = quarantine_file(
+                    &*folder_fs,
+                    &table_base_folder,
+                    &table_path,
+                    &file_name,
+                    config.sync_mode,
+                )?;
+                unreadable_files.push((
+                    table_path,
+                    format!(
+                        "duplicate table id; a complete copy is already held; \
+                         quarantined to {}",
+                        dest.display()
+                    ),
+                ));
                 continue;
             }
 
@@ -1233,9 +1328,9 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
             // and compactions traverse the punched blocks and fail. Detect the
             // punch (physically allocated bytes below the logical length: only
             // hole-punching frees blocks on a densely-written SST) and recover the
-            // live suffix restricted to its first readable key — the manifest
-            // snapshot then persists the restriction. A punched table with NO
-            // readable block is wholly consumed and unrecoverable.
+            // live suffix restricted to a SAFE re-derived bound — the manifest
+            // snapshot then persists the restriction. A punched table with fewer
+            // than two readable blocks has no recoverable bound and fails closed.
             let recovered = 'restrict: {
                 let Ok(table) = recovered else {
                     break 'restrict recovered;
@@ -1258,14 +1353,21 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                 if !matches!(allocated, Some(a) if a < logical) {
                     break 'restrict Ok(table);
                 }
-                match table.first_readable_data_key() {
-                    // The first live block's first key is the restriction bound;
-                    // `reopen_restricted` re-recovers under the suffix digest and
-                    // installs the bound. Repair holds no concurrent heal (the tree
-                    // is not open), so it needs no heal lock around this.
+                match table.punched_restriction_bound() {
+                    // The SECOND readable block's first key is a SAFE restriction
+                    // bound: the punch boundary can fall inside the FIRST surviving
+                    // block (leaving superseded keys below it), so restricting to
+                    // that block's first key would resurrect them. The second block
+                    // starts at/above the true boundary. `reopen_restricted`
+                    // re-recovers under the suffix digest and installs the bound.
+                    // Repair holds no concurrent heal (the tree is not open), so it
+                    // needs no heal lock around this.
                     Ok(Some(bound)) => table.reopen_restricted(bound),
-                    // No readable data block: the table is wholly punched /
-                    // consumed. Record it unreadable via the structural Err arm.
+                    // Fewer than two readable data blocks: the exact boundary is
+                    // unrecoverable (a single straddling block cannot yield a bound
+                    // that excludes its own superseded prefix). Fail closed —
+                    // record it unreadable via the structural Err arm rather than
+                    // guess a bound that could resurrect deleted keys.
                     Ok(None) => Err(crate::Error::Unrecoverable),
                     Err(e) => Err(e),
                 }
@@ -1286,7 +1388,18 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                 Ok(table) if salvage => {
                     match verify_keep_decision(config, &folder_fs, &table_path, &table)? {
                         RepairKeepDecision::Keep => {
-                            keep_best_candidate(&mut recovered_by_id, table_id, table, true);
+                            record_best(
+                                &mut recovered_by_id,
+                                &mut unreadable_files,
+                                table_id,
+                                table,
+                                true,
+                                &folder_fs,
+                                &table_base_folder,
+                                &table_path,
+                                &file_name,
+                                config.sync_mode,
+                            )?;
                         }
                         RepairKeepDecision::Quarantine(reason) => {
                             drop(table);
@@ -1336,12 +1449,18 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                                 table_id,
                             ) {
                                 Ok(Some(table)) => {
-                                    keep_best_candidate(
+                                    record_best(
                                         &mut recovered_by_id,
+                                        &mut unreadable_files,
                                         table_id,
                                         table,
                                         false,
-                                    );
+                                        &folder_fs,
+                                        &table_base_folder,
+                                        &table_path,
+                                        &file_name,
+                                        config.sync_mode,
+                                    )?;
                                 }
                                 Ok(None) => {
                                     unreadable_files.push((
@@ -1382,7 +1501,18 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                     }
                 }
                 Ok(table) => {
-                    keep_best_candidate(&mut recovered_by_id, table_id, table, true);
+                    record_best(
+                        &mut recovered_by_id,
+                        &mut unreadable_files,
+                        table_id,
+                        table,
+                        true,
+                        &folder_fs,
+                        &table_base_folder,
+                        &table_path,
+                        &file_name,
+                        config.sync_mode,
+                    )?;
                 }
                 Err(e) if salvage => {
                     // A TRANSIENT recovery failure (Io) is retryable and must NOT
@@ -1413,7 +1543,18 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                     match try_salvage_table(config, &folder_fs, &quarantined, &table_path, table_id)
                     {
                         Ok(Some(table)) => {
-                            keep_best_candidate(&mut recovered_by_id, table_id, table, false);
+                            record_best(
+                                &mut recovered_by_id,
+                                &mut unreadable_files,
+                                table_id,
+                                table,
+                                false,
+                                &folder_fs,
+                                &table_base_folder,
+                                &table_path,
+                                &file_name,
+                                config.sync_mode,
+                            )?;
                         }
                         Ok(None) => {
                             unreadable_files.push((
