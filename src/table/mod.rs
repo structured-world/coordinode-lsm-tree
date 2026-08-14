@@ -1728,6 +1728,52 @@ impl Table {
                 }
                 Some(true)
             } else {
+                // NOT-matched pre-heal: the current bytes already differ from the
+                // manifest digest. If the predicted heal RESTORES the manifest
+                // digest (the common restorative case: a rotted file healing back to
+                // exactly what the manifest describes), the write window STILL needs
+                // a durable marker BEFORE the first mutation. A crash after syncing
+                // SOME of several corrections leaves the file matching neither the
+                // manifest nor the predicted digest; with no marker a checkpoint
+                // hard-links those intermediate bytes under the stale manifest
+                // digest, producing a permanently inconsistent checkpoint. The
+                // marker records `(manifest, predicted)` (here equal), so a reconcile
+                // trusts the file only once it hashes to the restored digest. (The
+                // DIVERGING sub-case — predicted != manifest — is gated separately
+                // below against an EXISTING completed marker via `attests_post`.)
+                // NOT-matched pre-heal: the current bytes already differ from the
+                // manifest digest. If the predicted heal RESTORES the manifest
+                // digest (the common restorative case: a rotted file healing back to
+                // exactly what the manifest describes), the write window STILL needs
+                // a durable marker BEFORE the first mutation. A crash after syncing
+                // SOME of several corrections leaves the file matching neither the
+                // manifest nor the predicted digest; with no marker a checkpoint
+                // hard-links those intermediate bytes under the stale manifest
+                // digest, producing a permanently inconsistent checkpoint. The
+                // marker records `(manifest, predicted)` (here equal), so a reconcile
+                // trusts the file only once it hashes to the restored digest. (The
+                // DIVERGING sub-case — predicted != manifest — is gated separately
+                // below against an EXISTING completed marker via `attests_post`.)
+                if Checksum::from_raw(predicted_digest) == manifest_checksum
+                    && let Err(e) = crate::scrub::heal_attest::write(
+                        &*self.fs,
+                        &self.path,
+                        self.encryption.as_deref(),
+                        self.id(),
+                        manifest_checksum,
+                        Checksum::from_raw(predicted_digest),
+                    )
+                {
+                    report.errors.push(ScrubError::ChecksumRefreshFailed {
+                        table_id: self.id(),
+                        path: self.path.to_path_buf(),
+                        reason: alloc::format!(
+                            "could not persist the restorative heal attestation; heal \
+                             skipped to keep the table reconcilable: {e}"
+                        ),
+                    });
+                    return (report, false);
+                }
                 Some(false)
             }
         };
