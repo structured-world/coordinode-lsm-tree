@@ -3359,12 +3359,12 @@ fn heal_data_blocks_in_place_reports_a_block_whose_write_back_fails() -> crate::
     }
     std::fs::write(&file, &bytes)?;
 
-    // Fail every write through the fs: the heal reads + recovers the block, then
-    // its write-back errors.
-    injector.arm(FaultRule::new(
-        FaultOp::Write,
-        Fault::Error(ErrorKind::Other),
-    ));
+    // The rot leaves the file differing from the (healthy) manifest checksum, so
+    // this is the restorative heal path: its FIRST write is the crash-recovery
+    // marker sidecar. Skip that write so the marker lands, then fail every
+    // subsequent write, so the heal reads + recovers the block and its write-back
+    // is what errors.
+    injector.arm(FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::Other)).skip(1));
 
     let table = recover_table_on(&file, checksum, fs);
     let (report, _) = table.heal_data_blocks_in_place(crate::fs::SyncMode::Full, table.checksum());
@@ -5321,7 +5321,7 @@ fn recover_salvage_propagates_a_transient_locator_read() -> crate::Result<()> {
     let faulted: Arc<dyn crate::fs::Fs> = Arc::new(fault);
 
     let result = Table::recover_inner(
-        sst.clone(),
+        sst,
         checksum,
         0,
         0,
