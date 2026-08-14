@@ -1425,3 +1425,66 @@ fn repair_quarantines_a_duplicate_table_file() -> lsm_tree::Result<()> {
     );
     Ok(())
 }
+
+/// When two configured table folders are ALIASES of one physical directory (here
+/// a symlink), the second scan sees the SAME file the first already retained.
+/// Quarantining that repeated sighting would MOVE the kept file (both names
+/// resolve to the same directory entry) and leave the manifest referencing a
+/// missing SST. Repair must detect the alias and skip the sighting in place, so
+/// the kept SST survives and stays recovered (#69).
+#[cfg(unix)]
+#[test]
+fn repair_does_not_quarantine_an_aliased_copy_of_the_kept_sst() -> lsm_tree::Result<()> {
+    use lsm_tree::config::LevelRoute;
+    use lsm_tree::fs::StdFs;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let primary = dir.path().join("primary");
+    std::fs::create_dir_all(primary.join("tables"))?;
+    // `cold` is a SYMLINK to `primary`: both configured folders resolve to the
+    // same physical tables directory, so the SST is seen twice as one file.
+    let cold = dir.path().join("cold");
+    std::os::unix::fs::symlink(&primary, &cold)?;
+
+    let id_name = {
+        let build = dir.path().join("build");
+        let tree = Config::new(
+            &build,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0..1000 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+        let ssts = sorted_sst_paths(&build);
+        assert_eq!(ssts.len(), 1, "one flush → one SST");
+        let name = ssts[0].file_name().expect("sst has a file name").to_owned();
+        std::fs::copy(&ssts[0], primary.join("tables").join(&name))?;
+        name
+    };
+
+    let report = Config::new(
+        &primary,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .level_routes(vec![LevelRoute {
+        levels: 5..7,
+        path: cold,
+        fs: Arc::new(StdFs),
+    }])
+    .repair_with_salvage(true)?;
+
+    assert_eq!(report.recovered, 1, "one table recovered: {report:?}");
+    // The aliased sighting was skipped in place, NOT quarantined: the kept file
+    // still exists under its (single, shared) tables directory.
+    assert!(
+        primary.join("tables").join(&id_name).exists(),
+        "the aliased SST must not be moved out of tables/ (that would orphan the \
+         manifest entry): {report:?}",
+    );
+    Ok(())
+}

@@ -1562,6 +1562,79 @@ fn repair_quarantines_a_restricted_punched_sst_with_a_corrupt_suffix() -> crate:
     Ok(())
 }
 
+/// A `.restrict-bound` sidecar whose bound reaches PAST the actually-punched
+/// extent must be rejected. If an earlier slice punched `[0, B1)` but a later,
+/// larger sidecar bound `B2 > B1` never committed (crash / install failure), the
+/// blocks in `[B1, B2)` are still LIVE — checking only the first below-`B2` block
+/// (punched, at offset 0) would accept `B2` and hide those live keys. Repair must
+/// verify the WHOLE prefix below the bound is punched and, finding a live block,
+/// fail closed — serving every key (#68).
+#[test]
+fn repair_rejects_a_restrict_bound_past_the_punched_extent() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::table::Writer;
+    use crate::{AbstractTree, Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::PathBuf::from("/db");
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+        for i in 0..256u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                u64::from(i) + 1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Punch only the SMALL committed extent `[0, punch(k00050))`, but write a
+    // LARGER sidecar bound `k00130` (as if a later slice's install never landed).
+    // The blocks in `[k00050, k00130)` stay LIVE.
+    {
+        let table = recover_sst(sst.clone(), &fs)?;
+        let committed = table.punch_offset_for(b"k00050")?;
+        memfs.punch_hole(&sst, 0, committed)?;
+    }
+    crate::restrict_bound::write(&*fs, &sst, None, 0, b"k00130", crate::fs::SyncMode::Normal)?;
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .repair_with_salvage(true)?;
+    assert_eq!(report.recovered, 1, "the table is recovered: {report:?}");
+
+    // The overreaching restriction is rejected: every key at/above the actual
+    // punch (k00050..) is served — the live `[k00050, k00130)` keys are NOT hidden.
+    let tree = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .open()?;
+    for i in 50..256u32 {
+        let key = format!("k{i:05}").into_bytes();
+        assert!(
+            tree.get(&key, crate::MAX_SEQNO)?.is_some(),
+            "key {key:?} (live, above the committed punch) must be served — a sidecar \
+             bound past the punched extent must not hide it",
+        );
+    }
+    Ok(())
+}
+
 /// A `.restrict-bound` sidecar is trusted ONLY when the prefix below the bound is
 /// physically punched. A forged / stale sidecar over a HEALTHY (unpunched) SST
 /// must be REJECTED — repair opens the table unrestricted, serving EVERY key — so

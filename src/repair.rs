@@ -412,6 +412,23 @@ fn keep_best_candidate(
     }
 }
 
+/// Whether `a` and `b` name the SAME physical file — a symlink, junction, or
+/// case-insensitive alias resolving to one directory entry (two configured table
+/// folders pointing at the same location). Used so a repeated sighting of one SST
+/// through an alias is never quarantined as a "duplicate" (which would move the
+/// kept copy and orphan the manifest entry).
+///
+/// Canonicalization that fails on EITHER path (e.g. a virtual `MemFs` path with no
+/// OS presence) conservatively returns `false` — treat the paths as distinct — so
+/// a genuine duplicate is still quarantined; a virtual filesystem has no aliases.
+#[cfg(feature = "std")]
+fn same_physical_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
 /// Quarantines a duplicate table file that lost to a better same-id copy, moving
 /// it out of `tables/` (so recovery cannot resolve it) and recording it as
 /// considered-but-not-referenced. A failed quarantine aborts the whole repair:
@@ -472,7 +489,16 @@ fn record_best(
         file_name: file_name.to_string(),
     };
     if let Some(loser) = keep_best_candidate(map, id, candidate) {
-        quarantine_duplicate(loser, unreadable_files, sync_mode)?;
+        // If the displaced copy physically ALIASES the kept one (same directory
+        // entry via a symlink / junction / case-insensitive path), it is the SAME
+        // file — quarantining it would move the kept copy and orphan the manifest
+        // entry. Drop the loser's handle in place instead of quarantining.
+        let is_alias = map
+            .get(&id)
+            .is_some_and(|kept| same_physical_file(&loser.path, &kept.path));
+        if !is_alias {
+            quarantine_duplicate(loser, unreadable_files, sync_mode)?;
+        }
     }
     Ok(())
 }
@@ -1222,10 +1248,19 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
             // Skip a duplicate id ONLY when we already hold a COMPLETE copy — a
             // duplicate cannot improve on it. A previously-seen LOSSY salvage does
             // NOT skip: this copy is still evaluated and may supersede it.
-            // Quarantine the redundant duplicate out of `tables/` so recovery
-            // cannot later resolve it instead of the kept copy (the manifest
-            // records only id + checksum, not a path).
-            if recovered_by_id.get(&table_id).is_some_and(|c| c.complete) {
+            if let Some(existing) = recovered_by_id.get(&table_id).filter(|c| c.complete) {
+                // If this path physically ALIASES the retained copy (a symlink /
+                // junction / case-insensitive alias resolving to the same directory
+                // entry, e.g. two configured folders pointing at one location), it
+                // is the SAME file, not a genuine duplicate. Quarantining it would
+                // MOVE the kept copy and leave the manifest referencing a missing
+                // SST, so skip it IN PLACE.
+                if same_physical_file(&table_path, &existing.path) {
+                    continue;
+                }
+                // A genuine duplicate: quarantine it out of `tables/` so recovery
+                // cannot later resolve it instead of the kept copy (the manifest
+                // records only id + checksum, not a path).
                 let dest = quarantine_file(
                     &*folder_fs,
                     &table_base_folder,

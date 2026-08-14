@@ -3293,29 +3293,46 @@ impl Table {
         Ok(bytes.iter().all(|&b| b == 0))
     }
 
-    /// Whether the data block(s) BELOW `bound` are physically hole-punched (read
-    /// as zeros) — the independent punch evidence repair requires before trusting
-    /// a `.restrict-bound` sidecar. Checks the first data block whose keys all sit
-    /// below `bound`: a real tight-space punch reclaimed `[0, punch_offset)`, so
-    /// that block reads as zeros; a forged or stale sidecar over an UNPUNCHED file
-    /// finds it intact, and the restriction is rejected.
+    /// Whether the ENTIRE prefix below `bound` is physically hole-punched (every
+    /// data block whose keys all sit below `bound` reads as zeros) — the
+    /// independent punch evidence repair requires before trusting a
+    /// `.restrict-bound` sidecar.
     ///
-    /// Returns `false` when no block sits entirely below `bound` (nothing was
-    /// reclaimable, so a restriction would be spurious) — fail closed.
+    /// Checking only the FIRST below-bound block is unsound: an earlier tight-space
+    /// slice may have punched `[0, B1)` while a LATER slice wrote a larger sidecar
+    /// bound `B2 > B1` whose `upgrade_version` never committed (crash / install
+    /// failure). The blocks in `[B1, B2)` are then still LIVE, yet the first
+    /// below-`B2` block (at offset 0) is punched — so a first-block-only check
+    /// would accept `B2` and permanently omit the live keys between `B1` and `B2`.
+    /// Requiring EVERY below-bound block to be zeroed rejects such a partially
+    /// punched extent (any readable below-bound block → `false`), failing closed.
+    ///
+    /// A real tight-space punch reclaimed `[0, punch_offset)`, so all below-bound
+    /// blocks read as zeros; a forged or stale sidecar over an UNPUNCHED file finds
+    /// intact data and is rejected. Returns `false` when no block sits entirely
+    /// below `bound` (nothing was reclaimable, so a restriction would be spurious).
     ///
     /// # Errors
     ///
     /// Propagates a block-index or positioned-read failure.
     #[cfg(feature = "std")]
     pub(crate) fn prefix_is_punched(&self, bound: &[u8]) -> crate::Result<bool> {
+        let mut saw_below_bound = false;
         for handle in self.block_index.iter() {
             let handle = handle?;
-            // The FIRST block entirely below the bound: its last key < bound.
-            if self.comparator.compare(handle.end_key(), bound) == core::cmp::Ordering::Less {
-                return self.block_is_zeroed(&BlockHandle::new(handle.offset(), handle.size()));
+            // Blocks are yielded in key order, so once a block's keys reach the
+            // bound, no later block sits entirely below it either.
+            if self.comparator.compare(handle.end_key(), bound) != core::cmp::Ordering::Less {
+                break;
+            }
+            saw_below_bound = true;
+            if !self.block_is_zeroed(&BlockHandle::new(handle.offset(), handle.size()))? {
+                // A live block below the claimed bound: the punched extent does not
+                // reach it, so the bound is unbacked — fail closed.
+                return Ok(false);
             }
         }
-        Ok(false)
+        Ok(saw_below_bound)
     }
 
     /// Whether this table's FIRST data block is hole-punched (reads as zeros).
