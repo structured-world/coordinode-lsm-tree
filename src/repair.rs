@@ -1179,7 +1179,7 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
             continue;
         }
 
-        for dirent in folder_fs.read_dir(&table_base_folder)? {
+        'dirent: for dirent in folder_fs.read_dir(&table_base_folder)? {
             let crate::fs::FsDirEntry {
                 path: table_path,
                 file_name,
@@ -1387,38 +1387,59 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                     Ok(s) => s,
                     Err(e) => break 'restrict Err(e),
                 };
-                match sidecar {
-                    // No sidecar: the common (unrestricted) case.
-                    crate::restrict_bound::SidecarRead::Missing => break 'restrict Ok(table),
-                    crate::restrict_bound::SidecarRead::Present(id, bound) => {
-                        // The sidecar binds the table id; a mismatch is a stale
-                        // sidecar for a reused id — ignore it (treat as unrestricted).
-                        if id != table_id {
-                            break 'restrict Ok(table);
-                        }
-                        // Authenticate against physical punch evidence: only restrict
-                        // when the prefix below the bound genuinely reads as zeros.
-                        // A forged / stale sidecar over an unpunched file finds intact
-                        // data there and is rejected (kept unrestricted), so it can
-                        // never hide healthy rows.
-                        match table.prefix_is_punched(&bound) {
-                            Ok(true) => table.reopen_restricted(bound.into()),
-                            Ok(false) => break 'restrict Ok(table),
-                            Err(e) => Err(e),
-                        }
+
+                // A TRUSTWORTHY restriction is a `Present` sidecar bound for THIS id
+                // whose ENTIRE prefix is physically punched (authenticated against
+                // the on-disk zeros). Only then reopen restricted to the exact bound.
+                if let crate::restrict_bound::SidecarRead::Present(id, bound) = &sidecar
+                    && *id == table_id
+                {
+                    match table.prefix_is_punched(bound) {
+                        Ok(true) => break 'restrict table.reopen_restricted(bound.clone().into()),
+                        // The bound is not fully backed by the punch (e.g. a larger
+                        // slice's install never committed) — fall through to the
+                        // no-trustworthy-bound tail below.
+                        Ok(false) => {}
+                        Err(e) => break 'restrict Err(e),
                     }
-                    crate::restrict_bound::SidecarRead::Corrupt => {
-                        // A read-but-malformed sidecar is PERSISTENT. If the SST is
-                        // genuinely punched (its first data block reads as zeros) the
-                        // bound is unrecoverable — fail closed via the structural Err
-                        // arm (salvage / unreadable) rather than open it unrestricted
-                        // and expose the zeroed prefix. If it is NOT punched, the
-                        // sidecar is spurious — keep the table unrestricted.
-                        match table.first_data_block_is_punched() {
-                            Ok(true) => Err(crate::Error::Unrecoverable),
-                            Ok(false) => break 'restrict Ok(table),
-                            Err(e) => Err(e),
+                }
+
+                // No trustworthy restriction: a MISSING sidecar (a legacy punched SST
+                // predating sidecars), an id-MISMATCH (reused id), a CORRUPT sidecar,
+                // or a bound the punch does not fully back. If the SST is PUNCHED AT
+                // ALL, its bound is unrecoverable — fail CLOSED: quarantine it for
+                // manual recovery rather than open it unrestricted (which exposes the
+                // zeroed prefix AND re-serves the straddling block's superseded
+                // sub-bound rows) or salvage it (which re-emits those rows too). If it
+                // is NOT punched, any sidecar is spurious / forged, so open the intact
+                // table unrestricted.
+                match table.first_data_block_is_punched() {
+                    Ok(false) => break 'restrict Ok(table),
+                    Err(e) => break 'restrict Err(e),
+                    Ok(true) => {
+                        drop(table);
+                        // Remove the (untrustworthy) sidecar too, so it does not
+                        // linger to restrict an unrelated later file that reuses the id.
+                        crate::restrict_bound::remove(&*folder_fs, &table_path, config.sync_mode);
+                        match quarantine_file(
+                            &*folder_fs,
+                            &table_base_folder,
+                            &table_path,
+                            &file_name,
+                            config.sync_mode,
+                        ) {
+                            Ok(dest) => unreadable_files.push((
+                                table_path,
+                                format!(
+                                    "punched SST without a recoverable restriction bound \
+                                     (missing / corrupt / mismatched / unbacked sidecar); \
+                                     quarantined to {}",
+                                    dest.display()
+                                ),
+                            )),
+                            Err(e) => return Err(e),
                         }
+                        continue 'dirent;
                     }
                 }
             };
