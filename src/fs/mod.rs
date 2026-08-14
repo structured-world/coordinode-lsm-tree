@@ -1180,14 +1180,19 @@ pub(crate) fn unix_volume_id(path: &Path) -> Option<u64> {
 /// Physically allocated bytes of `path` via `stat(2)`'s `st_blocks`
 /// (`blocks * 512`, the POSIX-fixed block unit — unrelated to the filesystem's
 /// I/O block size). Less than the logical length for a sparse / hole-punched
-/// file. `None` if `path` cannot be stat-ed. Shared by the std and `io_uring`
-/// (libc) backends.
+/// file. Shared by the std and `io_uring` (libc) backends.
+///
+/// A stat FAILURE is PROPAGATED as `Err`, never mapped to `None`: manifest
+/// repair reads `Ok(None)` as "allocation-unaware backend" and hence "unpunched",
+/// so swallowing the error on a genuinely punched file would drop its restriction
+/// and expose the zeroed prefix. Every unix file has `st_blocks`, so a successful
+/// stat always yields `Ok(Some(_))`.
 #[cfg(all(unix, feature = "std"))]
-pub(crate) fn unix_allocated_size(path: &Path) -> Option<u64> {
+pub(crate) fn unix_allocated_size(path: &Path) -> std::io::Result<Option<u64>> {
     use std::os::unix::fs::MetadataExt;
     // `st_blocks` is always in 512-byte units per POSIX, regardless of the
     // filesystem block size; multiply to bytes. `blocks()` is u64.
-    std::fs::metadata(path).ok().map(|m| m.blocks() * 512)
+    Ok(Some(std::fs::metadata(path)?.blocks() * 512))
 }
 
 /// Streamed independent copy of `src` to `dst` through `fs`'s own [`Fs::open`].

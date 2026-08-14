@@ -240,8 +240,9 @@ impl Fs for IoUringFs {
 
     fn allocated_size(&self, path: &Path) -> crate::io::Result<Option<u64>> {
         // Cold-path stat; the shared unix helper reads `st_blocks` (this backend
-        // is Linux-only, so `std::fs::metadata` is available).
-        Ok(super::unix_allocated_size(path))
+        // is Linux-only, so `std::fs::metadata` is available). A stat failure
+        // propagates as `Err` rather than being masked as `None` (unpunched).
+        Ok(super::unix_allocated_size(path)?)
     }
 
     fn sync_directory(&self, path: &Path) -> crate::io::Result<()> {

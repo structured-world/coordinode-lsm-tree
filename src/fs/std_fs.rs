@@ -267,7 +267,7 @@ impl Fs for StdFs {
 
     #[cfg(unix)]
     fn allocated_size(&self, path: &Path) -> io::Result<Option<u64>> {
-        Ok(super::unix_allocated_size(path))
+        Ok(super::unix_allocated_size(path)?)
     }
 
     fn sync_directory(&self, path: &Path) -> io::Result<()> {
