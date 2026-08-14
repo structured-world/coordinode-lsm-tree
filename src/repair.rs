@@ -542,6 +542,12 @@ fn block_verify_verdict(
     table_path: &std::path::Path,
     table: &Table,
 ) -> crate::Result<BlockVerifyVerdict> {
+    // Walk only the recovered view's LIVE data: for a tight-space RESTRICTED view
+    // (a valid `.restrict-bound` sidecar was accepted) the `[0, punch_offset)`
+    // prefix is hole-punched and reads as zeros, so starting at byte 0 would
+    // report those dead blocks as corruption and salvage would then quarantine an
+    // otherwise-healthy restricted SST. `punch_offset()` is `0` for a normal table.
+    let data_start = table.punch_offset()?;
     let report = crate::verify::verify_sst_file_with_context(
         &**folder_fs,
         table_path,
@@ -551,8 +557,7 @@ fn block_verify_verdict(
         // id check — a checksum-clean forged tail meta falls back to the
         // intact MID mirror instead of dictating a forged ECC descriptor.
         Some(table.metadata.id),
-        // Repair walks the file as-is (it has no restriction context).
-        0,
+        data_start,
     );
     // A TRANSIENT read failure DURING the walk (a retryable `Interrupted` /
     // `WouldBlock`) is not block corruption: routing it through salvage would
