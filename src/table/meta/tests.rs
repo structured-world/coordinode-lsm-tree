@@ -456,3 +456,90 @@ fn load_with_handle_missing_page_ecc_descriptor_returns_err() {
         "expected InvalidHeader(\"TableMeta\"), got {result:?}",
     );
 }
+
+/// Returns [`valid_meta_items`] with `extra` inserted / replacing its key,
+/// kept lexicographically sorted (the meta block is point-read by key, so it
+/// must stay ordered). Lets a corruption test add an OPTIONAL descriptor key
+/// (absent from `valid_meta_items` for backward compatibility) at a bad width.
+fn meta_items_with(extra: InternalValue) -> Vec<InternalValue> {
+    let mut items: Vec<_> = valid_meta_items()
+        .into_iter()
+        .filter(|iv| iv.key.user_key != extra.key.user_key)
+        .collect();
+    items.push(extra);
+    items.sort_by(|a, b| a.key.user_key.cmp(&b.key.user_key));
+    items
+}
+
+/// A one-byte `descriptor#bulk_ingested` parses as the provenance flag.
+#[test]
+fn load_with_handle_bulk_ingested_byte_parses_as_flag() {
+    let parsed =
+        load_meta_from_items(&meta_items_with(meta("descriptor#bulk_ingested", &[1u8]))).unwrap();
+    assert_eq!(parsed.bulk_ingested, Some(true));
+    let parsed =
+        load_meta_from_items(&meta_items_with(meta("descriptor#bulk_ingested", &[0u8]))).unwrap();
+    assert_eq!(parsed.bulk_ingested, Some(false));
+    // Absent (legacy) parses as unknown.
+    assert_eq!(
+        load_meta_from_items(&valid_meta_items())
+            .unwrap()
+            .bulk_ingested,
+        None
+    );
+}
+
+/// A `descriptor#bulk_ingested` value that is not exactly one byte is corrupt
+/// meta, not silently truncatable.
+#[test]
+fn load_with_handle_bulk_ingested_wrong_width_returns_err() {
+    let result = load_meta_from_items(&meta_items_with(meta(
+        "descriptor#bulk_ingested",
+        &[1u8, 2],
+    )));
+    assert!(
+        matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
+        "expected InvalidHeader(\"TableMeta\"), got {result:?}",
+    );
+}
+
+/// A `range_tombstone_count` that is not exactly eight bytes is corrupt meta.
+#[test]
+fn load_with_handle_range_tombstone_count_wrong_width_returns_err() {
+    let result = load_meta_from_items(&meta_items_with(meta(
+        "range_tombstone_count",
+        &[1u8, 2, 3],
+    )));
+    assert!(
+        matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
+        "expected InvalidHeader(\"TableMeta\"), got {result:?}",
+    );
+}
+
+/// A present `descriptor#delete_bitmap_len` that is not exactly eight bytes is
+/// corrupt meta (the field is optional, but present-but-wrong-width is not).
+#[test]
+fn load_with_handle_delete_bitmap_len_wrong_width_returns_err() {
+    let result = load_meta_from_items(&meta_items_with(meta(
+        "descriptor#delete_bitmap_len",
+        &[1u8],
+    )));
+    assert!(
+        matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
+        "expected InvalidHeader(\"TableMeta\"), got {result:?}",
+    );
+}
+
+/// A present `descriptor#delete_bitmap_hash` that is not exactly sixteen bytes
+/// is corrupt meta.
+#[test]
+fn load_with_handle_delete_bitmap_hash_wrong_width_returns_err() {
+    let result = load_meta_from_items(&meta_items_with(meta(
+        "descriptor#delete_bitmap_hash",
+        &[1u8, 2, 3],
+    )));
+    assert!(
+        matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
+        "expected InvalidHeader(\"TableMeta\"), got {result:?}",
+    );
+}

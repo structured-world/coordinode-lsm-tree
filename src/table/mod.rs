@@ -3240,8 +3240,18 @@ impl Table {
         for handle in self.block_index.iter() {
             let handle = handle?;
             let block_handle = BlockHandle::new(handle.offset(), handle.size());
-            if let Ok(key) = self.block_first_user_key(&block_handle) {
-                return Ok(Some(key));
+            match self.block_first_user_key(&block_handle) {
+                Ok(key) => return Ok(Some(key)),
+                // A TRANSIENT read (one-shot Interrupted / WouldBlock) propagates:
+                // a retry could read this block, and skipping it would pick a
+                // LATER key as the restriction bound, permanently hiding this
+                // block's healthy rows. Only a STRUCTURAL / persistent failure (a
+                // punched block reading as zeros, genuine bit-rot) means the block
+                // is not part of the live suffix and is skipped.
+                Err(crate::Error::Io(e)) if e.kind().is_transient() => {
+                    return Err(crate::Error::Io(e));
+                }
+                Err(_) => {}
             }
         }
         Ok(None)
@@ -7500,6 +7510,18 @@ impl Table {
     #[must_use]
     pub fn get_highest_seqno(&self) -> SeqNo {
         self.metadata.seqnos.1 + self.global_seqno()
+    }
+
+    /// The highest LOCAL (on-disk, pre-`global_seqno`) sequence number of any
+    /// entry, `0` for an empty table. Unlike [`get_highest_seqno`], it does NOT
+    /// add the offset. Manifest repair uses it as the LEGACY bulk-ingest
+    /// signature: a table of unknown provenance whose entries all sit at local
+    /// seqno 0 may itself be a legacy bulk-ingested table.
+    ///
+    /// [`get_highest_seqno`]: Self::get_highest_seqno
+    #[must_use]
+    pub(crate) fn max_local_seqno(&self) -> SeqNo {
+        self.metadata.seqnos.1
     }
 
     /// Returns the highest sequence number from KV entries only,

@@ -96,6 +96,10 @@ pub enum FaultOp {
     /// Failing it with [`io::ErrorKind::Unsupported`] models a backend that
     /// leaves the trait default in place (no hard-link support).
     HardLink,
+    /// [`Fs::allocated_size`] — the physical-allocation probe manifest repair
+    /// uses to detect a hole-punched SST. Failing it exercises the fail-closed
+    /// path (a probe error must not be read as "unpunched").
+    AllocatedSize,
 }
 
 /// What a matched [`FaultRule`] does to the operation.
@@ -517,6 +521,9 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn allocated_size(&self, path: &Path) -> io::Result<Option<u64>> {
+        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::AllocatedSize, Some(path)) {
+            return Err(fault_error(kind, FaultOp::AllocatedSize));
+        }
         self.inner.allocated_size(path)
     }
 }

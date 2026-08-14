@@ -732,8 +732,9 @@ impl Writer {
             .use_columnar(meta.columnar)
             // A bulk-ingested source stays flagged so a salvaged / re-emitted
             // copy is still recognized by manifest repair as relying on a
-            // manifest-only global_seqno offset.
-            .use_bulk_ingested(meta.bulk_ingested)
+            // manifest-only global_seqno offset. A legacy source of unknown
+            // provenance (`None`) re-emits unflagged (we do not guess).
+            .use_bulk_ingested(meta.bulk_ingested.unwrap_or(false))
             .use_zone_map(has_zone_map)
             // A source with a seqno_bounds section keeps its seqno-scoped
             // block-skip: the writer re-derives the per-block ranges from

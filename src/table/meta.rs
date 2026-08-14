@@ -40,12 +40,6 @@ impl From<u128> for Timestamp {
 // compare an ECC-masked copy ([`Self::without_ecc`]) without consuming the
 // original.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "parsed on-disk metadata: each bool mirrors an independent descriptor \
-              flag (columnar, bulk_ingested, ecc_unrecognized); an enum would obscure \
-              the one-to-one mapping to the persisted meta keys"
-)]
 pub struct ParsedMeta {
     pub id: TableId,
     pub created_at: Timestamp,
@@ -161,13 +155,15 @@ pub struct ParsedMeta {
     /// reconstructs row entries from a columnar block on load.
     pub columnar: bool,
 
-    /// Whether this table was bulk-ingested: every entry stored at LOCAL seqno 0
-    /// with its effective MVCC ordering carried by a manifest-only `global_seqno`
-    /// offset. Read from the optional `descriptor#bulk_ingested` property; absent
-    /// on flush / compaction SSTs (and older tables), which have offset 0.
-    /// Manifest repair uses it to fail closed on a table whose offset it cannot
-    /// reconstruct from the SST alone.
-    pub bulk_ingested: bool,
+    /// Bulk-ingest provenance from the optional `descriptor#bulk_ingested`
+    /// property: `Some(true)` = bulk-ingested (every entry at LOCAL seqno 0, MVCC
+    /// ordering carried by a manifest-only `global_seqno`), `Some(false)` = a
+    /// normal flush / compaction table (offset 0), `None` = the key is ABSENT, a
+    /// legacy SST of UNKNOWN provenance. Manifest repair fails closed on
+    /// `Some(true)` and treats `None` as ambiguous (a legacy table may itself
+    /// have been bulk-ingested), since it cannot reconstruct the offset from the
+    /// SST alone.
+    pub bulk_ingested: Option<bool>,
 }
 
 macro_rules! read_u8 {
@@ -355,14 +351,16 @@ impl ParsedMeta {
             },
         };
 
-        // Optional bulk-ingest provenance: absent (older / flush / compaction
-        // SSTs) means not bulk-ingested; otherwise exactly one byte, non-zero
-        // meaning the table stores local seqno 0 and relies on a manifest-only
-        // global_seqno offset (used by manifest repair to fail closed).
+        // Optional bulk-ingest provenance. `None` = the key is ABSENT: a legacy
+        // SST (written before the flag existed) whose provenance is UNKNOWN, so
+        // manifest repair must treat it as AMBIGUOUS (it may be a legacy
+        // bulk-ingested table that stored local seqno 0 under a manifest-only
+        // offset). `Some(true/false)` = a newer SST that authoritatively records
+        // whether it was bulk-ingested. One byte, non-zero meaning ingested.
         let bulk_ingested = match block.point_read(b"descriptor#bulk_ingested", SeqNo::MAX, &cmp)? {
-            None => false,
+            None => None,
             Some(v) => match v.value.as_ref() {
-                [b] => *b != 0,
+                [b] => Some(*b != 0),
                 _ => return Err(crate::Error::InvalidHeader("TableMeta")),
             },
         };

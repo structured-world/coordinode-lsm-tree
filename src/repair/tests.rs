@@ -526,6 +526,72 @@ fn repair_with_salvage_recovers_a_table_whose_whole_file_hash_faults() -> crate:
     Ok(())
 }
 
+/// A BULK-INGESTED SST whose whole-file recovery fails must NOT be recovered
+/// through block-salvage: `try_salvage_table` reopens the salvaged copy with
+/// `global_seqno` 0, and the copy still relies on the manifest-only offset (its
+/// entries stay at local seqno 0), so registering it would silently mis-order
+/// them. The salvage guard drops the copy and records the table unreadable.
+#[test]
+fn repair_with_salvage_quarantines_a_bulk_ingested_sst_that_fails_recovery() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs};
+    use crate::io::ErrorKind;
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+
+    // A bulk-ingested SST (flag set, entries at local seqno 0).
+    {
+        let build_fs: Arc<dyn Fs> = Arc::new(StdFs);
+        let mut w = Writer::new(sst, 0, 0, Arc::clone(&build_fs))?
+            .use_bulk_ingested(true)
+            .use_data_block_size(128);
+        for i in 0..64u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                0,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Fail whole-file recovery (persistent hash fault) so the table routes to
+    // block-salvage; salvage then reopens the copy, which carries the flag.
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    injector.arm(
+        FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .once(),
+    );
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair_with_salvage(true)?;
+    injector.clear();
+
+    assert_eq!(
+        report.recovered, 0,
+        "a bulk-ingested SST whose offset is lost must not be salvaged-and-kept: {report:?}",
+    );
+    assert_eq!(
+        report.unreadable, 1,
+        "the bulk-ingested SST is reported unreadable: {:?}",
+        report.unreadable_files,
+    );
+    Ok(())
+}
+
 /// A TRANSIENT I/O failure during block-salvage must not commit a manifest that
 /// OMITS the table: the original is already in `repair-quarantine`, so a retry
 /// (no longer finding it under `tables/`) would never rediscover it and the SST
@@ -1150,6 +1216,29 @@ fn repair_quarantines_a_table_with_an_unrecoverable_ingest_offset() -> crate::Re
     Ok(())
 }
 
+/// `has_unrecoverable_ingest_offset` must fail closed on an authoritatively
+/// bulk-ingested table AND on a LEGACY table (absent flag) whose entries carry
+/// the ingest signature (all at local seqno 0), while keeping a newer
+/// non-ingested table — even one whose entries happen to sit at seqno 0.
+#[test]
+fn has_unrecoverable_ingest_offset_classifies_provenance() {
+    use super::has_unrecoverable_ingest_offset;
+
+    // Authoritative flag wins outright.
+    assert!(has_unrecoverable_ingest_offset(Some(true), 8, 0));
+    assert!(has_unrecoverable_ingest_offset(Some(true), 8, 5));
+    // A newer non-ingested table is safe, even at all-seqno-0 (offset genuinely 0).
+    assert!(!has_unrecoverable_ingest_offset(Some(false), 8, 0));
+    assert!(!has_unrecoverable_ingest_offset(Some(false), 8, 5));
+    // Legacy (absent flag): the ingest signature (entries present, max local
+    // seqno 0) is treated as ambiguous → fail closed.
+    assert!(has_unrecoverable_ingest_offset(None, 8, 0));
+    // Legacy with a non-zero max seqno cannot be all-local-0 → safe.
+    assert!(!has_unrecoverable_ingest_offset(None, 8, 5));
+    // Legacy empty table: nothing to mis-order.
+    assert!(!has_unrecoverable_ingest_offset(None, 0, 0));
+}
+
 /// Opens an SST as a `Table` under a given filesystem, stamping the open with
 /// the file's CURRENT whole-file digest (matching what repair computes). Used to
 /// inspect block layout and to re-read a punched file.
@@ -1266,6 +1355,127 @@ fn repair_restricts_a_tight_space_punched_table() -> crate::Result<()> {
     assert!(
         tree.get(b"k00000", crate::MAX_SEQNO)?.is_none(),
         "a punched-prefix key is restricted away, not an error",
+    );
+    Ok(())
+}
+
+/// Builds a multi-data-block SST under `fs` at `path` (keys `k00000..k00255`).
+fn write_multiblock_sst(
+    path: &std::path::Path,
+    fs: &std::sync::Arc<dyn crate::fs::Fs>,
+) -> crate::Result<()> {
+    use crate::{InternalValue, ValueType};
+    let mut w = crate::table::Writer::new(path.to_path_buf(), 0, 0, std::sync::Arc::clone(fs))?
+        .use_data_block_size(128);
+    for i in 0..256u32 {
+        w.write(InternalValue::from_components(
+            format!("k{i:05}").into_bytes(),
+            format!("v{i}").into_bytes(),
+            u64::from(i) + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(w.finish()?.is_some(), "the SST is non-empty");
+    Ok(())
+}
+
+/// `first_readable_data_key` must PROPAGATE a transient read on the first live
+/// suffix block, not skip it as though punched: skipping would pick a LATER key
+/// as the restriction bound and permanently hide that block's healthy rows.
+#[test]
+fn first_readable_data_key_propagates_a_transient_block_read() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let membase: Arc<dyn Fs> = memfs.clone();
+    membase.create_dir_all(std::path::Path::new("/d"))?;
+    let sst = std::path::PathBuf::from("/d/0");
+    write_multiblock_sst(&sst, &membase)?;
+
+    // Punch block 0; capture block 1's offset (the first LIVE block).
+    let (off0, size0, off1) = {
+        use crate::table::block_index::BlockIndex as _;
+        let t = recover_sst(sst.clone(), &membase)?;
+        let mut it = t.block_index.iter();
+        let Some(b0) = it.next() else {
+            panic!("a first data block");
+        };
+        let b0 = b0?;
+        let Some(b1) = it.next() else {
+            panic!("a second (live) data block");
+        };
+        let b1 = b1?;
+        (b0.offset().0, b0.size(), b1.offset().0)
+    };
+    memfs.punch_hole(&sst, off0, u64::from(size0))?;
+
+    // Fault the FIRST live block's positioned read with a TRANSIENT kind.
+    let fault = FaultFs::new(memfs.as_ref().clone());
+    fault
+        .injector()
+        .arm(FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Interrupted)).at_offset(off1));
+    let faulting: Arc<dyn Fs> = Arc::new(fault);
+
+    let table = recover_sst(sst, &faulting)?;
+    let result = table.first_readable_data_key();
+    assert!(
+        matches!(result, Err(crate::Error::Io(_))),
+        "a transient read on the first live block must propagate, not be skipped \
+         as a punched block: {result:?}",
+    );
+    Ok(())
+}
+
+/// Repair must PROPAGATE a transient allocated-size probe failure on a punched
+/// SST rather than interpret it as "dense / unpunched" (which would rebuild the
+/// manifest without the restriction and expose the zeroed prefix on later reads).
+#[test]
+fn repair_propagates_a_transient_allocated_size_probe_failure() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let membase: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::PathBuf::from("/db");
+    let tables = root.join("tables");
+    membase.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    write_multiblock_sst(&sst, &membase)?;
+
+    // Punch block 0 so the file is genuinely hole-punched.
+    let (off0, size0) = {
+        use crate::table::block_index::BlockIndex as _;
+        let t = recover_sst(sst.clone(), &membase)?;
+        let Some(b0) = t.block_index.iter().next() else {
+            panic!("a first data block");
+        };
+        let b0 = b0?;
+        (b0.offset().0, b0.size())
+    };
+    memfs.punch_hole(&sst, off0, u64::from(size0))?;
+
+    // Fault the allocated-size probe with a TRANSIENT kind.
+    let fault = FaultFs::new(memfs.as_ref().clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::AllocatedSize, Fault::Error(ErrorKind::Interrupted))
+            .on_path("tables"),
+    );
+
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair_with_salvage(true);
+    assert!(
+        result.is_err(),
+        "a transient allocated_size probe failure on a punched table must propagate, \
+         not silently open it unrestricted: {result:?}",
     );
     Ok(())
 }

@@ -343,6 +343,60 @@ fn is_transient_io(e: &crate::Error) -> bool {
     matches!(e, crate::Error::Io(io) if io.kind().is_transient())
 }
 
+/// Whether manifest repair must fail closed on a table because its bulk-ingest
+/// sequence offset cannot be reconstructed from the SST alone (the rebuilt
+/// manifest would install it with offset 0 and silently mis-order / mis-expose
+/// its entries).
+///
+/// - `Some(true)`: authoritatively bulk-ingested — always fail closed.
+/// - `Some(false)`: a newer non-ingested table — safe (offset genuinely 0), even
+///   when its entries all sit at seqno 0 (a fresh tree's first batch).
+/// - `None`: a LEGACY SST written before the provenance flag existed — UNKNOWN.
+///   Treat it as bulk-ingested ONLY when its entries carry the ingest signature
+///   (present, and every LOCAL seqno 0), which a legacy bulk-ingest produces. A
+///   legacy first-batch-at-seqno-0 flush matches too and is conservatively
+///   quarantined; the ambiguity is unavoidable without the flag.
+fn has_unrecoverable_ingest_offset(
+    bulk_ingested: Option<bool>,
+    item_count: u64,
+    max_local_seqno: crate::SeqNo,
+) -> bool {
+    match bulk_ingested {
+        Some(flagged) => flagged,
+        None => item_count > 0 && max_local_seqno == 0,
+    }
+}
+
+/// A recovered table plus whether its recovery was COMPLETE (a clean whole-file
+/// recovery) or a LOSSY block-salvage that may have dropped corrupt blocks'
+/// keys. Repair keeps the best copy per table id, so a duplicate id in another
+/// table folder can supersede an earlier DAMAGED copy.
+struct TableCandidate {
+    table: Table,
+    complete: bool,
+}
+
+/// Records `table` as the candidate for `id`, keeping the BETTER of the existing
+/// and the new copy: a COMPLETE recovery replaces a lossy salvage, so an intact
+/// duplicate in a later-scanned folder supersedes an earlier lossy one. Two
+/// completes (or two salvages) are equivalent for the rebuilt manifest — which
+/// needs only one readable copy per id — so the first-seen stays.
+fn keep_best_candidate(
+    map: &mut crate::HashMap<TableId, TableCandidate>,
+    id: TableId,
+    table: Table,
+    complete: bool,
+) {
+    match map.get(&id) {
+        // Keep the existing copy when it is already complete, or when the new one
+        // is not an improvement (a lossy duplicate of a lossy copy).
+        Some(existing) if existing.complete || !complete => {}
+        _ => {
+            map.insert(id, TableCandidate { table, complete });
+        }
+    }
+}
+
 /// Block-salvages a corrupt SST during repair: reads the ALREADY-QUARANTINED
 /// original (the caller performs the move, which frees `table_path`), writes a
 /// fresh SST holding its recoverable blocks into that path, and reopens it.
@@ -800,6 +854,21 @@ fn try_salvage_table(
         #[cfg(feature = "metrics")]
         Arc::new(crate::metrics::Metrics::default()),
     )?;
+    // A salvaged copy of a bulk-ingested source still relies on the manifest-only
+    // global_seqno offset the rebuilt manifest cannot recover: its entries stay at
+    // local seqno 0, so installing it with offset 0 would silently mis-order and
+    // over-expose them. Treat it as unsalvageable — drop the freshly-written copy
+    // (a leftover reads back as a harmless orphan) and let the caller record it
+    // unreadable; the original stays quarantined for manual recovery.
+    if has_unrecoverable_ingest_offset(
+        table.metadata.bulk_ingested,
+        table.metadata.item_count,
+        table.max_local_seqno(),
+    ) {
+        drop(table);
+        let _ = fs.remove_file(table_path);
+        return Ok(None);
+    }
     Ok(Some(table))
 }
 
@@ -993,12 +1062,11 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
     let _directory_lock =
         crate::config::acquire_directory_lock(&*config.fs, &config.path, config.directory_lock)?;
 
-    let mut recovered_tables: Vec<Table> = Vec::new();
-    let mut salvaged = 0usize;
+    // Best recovered copy per table id: a complete recovery beats a lossy salvage,
+    // so a duplicate id across aliased / routed table folders keeps only the best
+    // (and is never added to two L0 runs). See `keep_best_candidate`.
+    let mut recovered_by_id: crate::HashMap<TableId, TableCandidate> = crate::HashMap::default();
     let mut unreadable_files: Vec<(PathBuf, String)> = Vec::new();
-    // Guard against the same file surfacing twice (symlinked / aliased table
-    // folders) so a table is not added to two L0 runs.
-    let mut seen_ids: crate::HashSet<TableId> = crate::HashSet::default();
 
     for (table_base_folder, folder_fs) in config.all_tables_folders() {
         if !folder_fs.exists(&table_base_folder)? {
@@ -1065,8 +1133,13 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                 continue;
             };
 
-            if !seen_ids.insert(table_id) {
-                // Already recovered via another scanned folder; skip silently.
+            // Skip a duplicate id ONLY when we already hold a COMPLETE copy — a
+            // duplicate cannot improve on it. A previously-seen LOSSY salvage does
+            // NOT skip: this copy is still evaluated and may supersede it.
+            // Skip a duplicate id ONLY when we already hold a COMPLETE copy — a
+            // duplicate cannot improve on it. A previously-seen LOSSY salvage does
+            // NOT skip: this copy is still evaluated and may supersede it.
+            if recovered_by_id.get(&table_id).is_some_and(|c| c.complete) {
                 continue;
             }
 
@@ -1115,20 +1188,20 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                 Err(e) => Err(e),
             };
 
-            // Fail closed on a bulk-ingest table whose sequence offset cannot be
-            // reconstructed. A bulk-ingested SST (flagged `descriptor#bulk_ingested`
-            // at write time) stores every entry at LOCAL seqno 0 and relies on a
-            // manifest-only `global_seqno` for its effective MVCC ordering; the
-            // on-disk seqnos carry no trace of it. The rebuilt manifest hard-codes
-            // offset 0, so keeping such a table would make its entries appear OLDER
-            // than they are — visible to snapshots that never saw them and sorted
-            // into the wrong L0 order. Quarantine it instead of silently corrupting
-            // MVCC. The flag is precise: a normal flush whose entries merely sit at
-            // seqno 0 (a fresh tree's first batch) is NOT flagged and is recovered
-            // as usual, since its offset genuinely is 0.
-            if matches!(&recovered, Ok(t) if t.metadata.bulk_ingested) {
+            // Fail closed on a table whose bulk-ingest sequence offset cannot be
+            // reconstructed. A bulk-ingested SST stores every entry at LOCAL seqno
+            // 0 and relies on a manifest-only `global_seqno` for its effective MVCC
+            // ordering; the on-disk seqnos carry no trace of it. The rebuilt
+            // manifest hard-codes offset 0, so keeping such a table would make its
+            // entries appear OLDER than they are — visible to snapshots that never
+            // saw them and sorted into the wrong L0 order. Quarantine it instead of
+            // silently corrupting MVCC (see `has_unrecoverable_ingest_offset`).
+            if matches!(&recovered, Ok(t) if has_unrecoverable_ingest_offset(
+                t.metadata.bulk_ingested,
+                t.metadata.item_count,
+                t.max_local_seqno(),
+            )) {
                 drop(recovered); // release the file handle before the move
-                seen_ids.remove(&table_id);
                 match quarantine_file(
                     &*folder_fs,
                     &table_base_folder,
@@ -1167,14 +1240,22 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                 let Ok(table) = recovered else {
                     break 'restrict recovered;
                 };
-                let punched = matches!(
-                    (
-                        folder_fs.allocated_size(&table_path),
-                        folder_fs.metadata(&table_path),
-                    ),
-                    (Ok(Some(allocated)), Ok(meta)) if allocated < meta.len
-                );
-                if !punched {
+                // A probe error must NOT be read as "dense / unpunched" — that
+                // would drop the safety-critical restriction and expose the zeroed
+                // prefix on later reads. Surface it as a recovery error so the Err
+                // arm below classifies it (transient → retry, persistent →
+                // salvage / unreadable). `allocated_size` returning `Ok(None)`
+                // (a backend that cannot report allocation, i.e. one that never
+                // punches) IS the unpunched case.
+                let allocated = match folder_fs.allocated_size(&table_path) {
+                    Ok(a) => a,
+                    Err(e) => break 'restrict Err(crate::Error::Io(e)),
+                };
+                let logical = match folder_fs.metadata(&table_path) {
+                    Ok(m) => m.len,
+                    Err(e) => break 'restrict Err(crate::Error::Io(e)),
+                };
+                if !matches!(allocated, Some(a) if a < logical) {
                     break 'restrict Ok(table);
                 }
                 match table.first_readable_data_key() {
@@ -1204,10 +1285,11 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                 // rewriting it on every repair.
                 Ok(table) if salvage => {
                     match verify_keep_decision(config, &folder_fs, &table_path, &table)? {
-                        RepairKeepDecision::Keep => recovered_tables.push(table),
+                        RepairKeepDecision::Keep => {
+                            keep_best_candidate(&mut recovered_by_id, table_id, table, true);
+                        }
                         RepairKeepDecision::Quarantine(reason) => {
                             drop(table);
-                            seen_ids.remove(&table_id);
                             // Quarantine (not leave-in-place): a later
                             // `Tree::open` orphan-cleans table files the
                             // rebuilt manifest does not reference, so an
@@ -1254,11 +1336,14 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                                 table_id,
                             ) {
                                 Ok(Some(table)) => {
-                                    salvaged += 1;
-                                    recovered_tables.push(table);
+                                    keep_best_candidate(
+                                        &mut recovered_by_id,
+                                        table_id,
+                                        table,
+                                        false,
+                                    );
                                 }
                                 Ok(None) => {
-                                    seen_ids.remove(&table_id);
                                     unreadable_files.push((
                                         table_path,
                                         "verify found corrupt blocks; nothing salvageable"
@@ -1284,7 +1369,6 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                                         )?;
                                         return Err(salvage_err);
                                     }
-                                    seen_ids.remove(&table_id);
                                     unreadable_files.push((
                                         table_path,
                                         format!(
@@ -1297,7 +1381,9 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                         }
                     }
                 }
-                Ok(table) => recovered_tables.push(table),
+                Ok(table) => {
+                    keep_best_candidate(&mut recovered_by_id, table_id, table, true);
+                }
                 Err(e) if salvage => {
                     // A TRANSIENT recovery failure (Io) is retryable and must NOT
                     // be routed through salvage: quarantining the healthy SST and
@@ -1327,11 +1413,9 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                     match try_salvage_table(config, &folder_fs, &quarantined, &table_path, table_id)
                     {
                         Ok(Some(table)) => {
-                            salvaged += 1;
-                            recovered_tables.push(table);
+                            keep_best_candidate(&mut recovered_by_id, table_id, table, false);
                         }
                         Ok(None) => {
-                            seen_ids.remove(&table_id);
                             unreadable_files.push((
                                 table_path,
                                 format!(
@@ -1352,7 +1436,6 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                                 )?;
                                 return Err(salvage_err);
                             }
-                            seen_ids.remove(&table_id);
                             unreadable_files.push((
                                 table_path,
                                 format!("recovery failed ({e}); salvage failed ({salvage_err})"),
@@ -1370,12 +1453,36 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                     if is_transient_io(&e) {
                         return Err(e);
                     }
-                    seen_ids.remove(&table_id);
-                    unreadable_files.push((table_path, e.to_string()));
+                    // QUARANTINE before recording unreadable: the rebuilt manifest
+                    // omits this file, so a later `Tree::open` would orphan-clean
+                    // (DELETE) it from `tables/`, contradicting the report's promise
+                    // that an operator can still investigate / recover it. Moving it
+                    // to the repair quarantine preserves it. A FAILED quarantine
+                    // aborts the whole repair (the file must not be both omitted and
+                    // left in place).
+                    match quarantine_file(
+                        &*folder_fs,
+                        &table_base_folder,
+                        &table_path,
+                        &file_name,
+                        config.sync_mode,
+                    ) {
+                        Ok(dest) => unreadable_files.push((
+                            table_path,
+                            format!("{e}; quarantined to {}", dest.display()),
+                        )),
+                        Err(qe) => return Err(qe),
+                    }
                 }
             }
         }
     }
+
+    // Collect the best copy per id. `salvaged` is derived from the FINAL
+    // candidates (a lossy copy later superseded by a complete duplicate must not
+    // count), not incremented inline.
+    let salvaged = recovered_by_id.values().filter(|c| !c.complete).count();
+    let mut recovered_tables: Vec<Table> = recovered_by_id.into_values().map(|c| c.table).collect();
 
     // Newest first: higher sequence number nearer the L0 head, matching the
     // ordering the merge reader expects for its newest-run-first short-circuit.

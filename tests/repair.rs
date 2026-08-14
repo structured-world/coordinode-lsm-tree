@@ -822,6 +822,62 @@ fn repair_with_salvage_reports_an_unopenable_sst_as_unreadable() -> lsm_tree::Re
     Ok(())
 }
 
+/// Ordinary `repair()` (salvage disabled) must QUARANTINE a structurally
+/// unreadable SST before publishing the manifest, not leave it under its numeric
+/// name in `tables/`: the rebuilt manifest omits it, so the next `Tree::open`
+/// would orphan-clean (DELETE) it — contradicting the report's promise that an
+/// operator can still investigate / recover it. The file must be moved out of
+/// `tables/` (into the repair quarantine).
+#[test]
+fn repair_quarantines_an_unreadable_sst_before_publishing() -> lsm_tree::Result<()> {
+    let dir = lsm_tree::get_tmp_folder();
+    {
+        let tree = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0..64 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let ssts = sorted_sst_paths(dir.path());
+    let victim = ssts.first().expect("an SST to corrupt").clone();
+    // Truncate the tail (SFA trailer): the container is unparseable, so recovery
+    // fails structurally on the ordinary (no-salvage) path.
+    let mut bytes = std::fs::read(&victim)?;
+    bytes.truncate(bytes.len() / 2);
+    std::fs::write(&victim, &bytes)?;
+    nuke_manifest(dir.path())?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+
+    assert_eq!(
+        report.recovered, 0,
+        "the only SST is unreadable: {report:?}"
+    );
+    assert_eq!(report.unreadable, 1, "it is reported unreadable");
+    assert!(
+        !victim.exists(),
+        "the unreadable SST must be MOVED out of tables/ (quarantined), not left to be \
+         orphan-deleted on the next open",
+    );
+    assert!(
+        report.unreadable_files[0].1.contains("quarantined to"),
+        "the reason records the quarantine destination: {:?}",
+        report.unreadable_files,
+    );
+    Ok(())
+}
+
 /// A PERSISTENT but ECC-correctable fault in an encrypted Page-ECC SST must
 /// drive `repair_with_salvage` into salvaging the table (rewriting it with
 /// clean bytes), not accept it as verified: the encrypted verify path scrubs
@@ -1233,5 +1289,68 @@ fn repair_with_salvage_healthy_encrypted_sst_remains_untouched() -> lsm_tree::Re
             key(i),
         );
     }
+    Ok(())
+}
+
+/// When the same table id exists in two configured table folders — one damaged
+/// (block-salvaged LOSSILY) and one intact — repair must keep the INTACT copy,
+/// not the lossy salvage of the first-scanned one. The primary folder is scanned
+/// first, so putting the damaged copy there and an intact duplicate in a routed
+/// folder proves the intact copy supersedes the lossy salvage. Asserts on the
+/// report (`salvaged == 0`): without the fix, marking the id seen before
+/// verifying makes the first (damaged) copy win and get salvaged lossily.
+#[test]
+fn repair_prefers_an_intact_duplicate_over_a_lossy_salvage() -> lsm_tree::Result<()> {
+    use lsm_tree::config::LevelRoute;
+    use lsm_tree::fs::StdFs;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let primary = dir.path().join("primary");
+    let cold = dir.path().join("cold");
+    std::fs::create_dir_all(primary.join("tables"))?;
+    std::fs::create_dir_all(cold.join("tables"))?;
+
+    // Build one SST via a plain flush, then place a copy in each folder under its
+    // own id name (so the file-name id matches the stored table id).
+    let id_name = {
+        let build = dir.path().join("build");
+        let tree = Config::new(
+            &build,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0..1000 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+        let ssts = sorted_sst_paths(&build);
+        assert_eq!(ssts.len(), 1, "one flush → one SST");
+        let name = ssts[0].file_name().expect("sst has a file name").to_owned();
+        std::fs::copy(&ssts[0], cold.join("tables").join(&name))?;
+        std::fs::copy(&ssts[0], primary.join("tables").join(&name))?;
+        name
+    };
+    // Damage the PRIMARY (first-scanned) copy so it can only be lossily salvaged.
+    corrupt_data_region(&primary.join("tables").join(&id_name))?;
+
+    let report = Config::new(
+        &primary,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .level_routes(vec![LevelRoute {
+        levels: 5..7,
+        path: cold,
+        fs: Arc::new(StdFs),
+    }])
+    .repair_with_salvage(true)?;
+
+    assert_eq!(report.recovered, 1, "one table recovered: {report:?}");
+    assert_eq!(
+        report.salvaged, 0,
+        "the intact duplicate must supersede the lossy salvage of the damaged copy: {report:?}",
+    );
     Ok(())
 }
