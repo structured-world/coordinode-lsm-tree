@@ -1526,15 +1526,25 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                                     &file_name,
                                     config.sync_mode,
                                 ) {
-                                    Ok(dest) => unreadable_files.push((
-                                        table_path,
-                                        format!(
-                                            "restricted punched SST with a corrupt live suffix is \
-                                             not auto-salvageable (would resurrect superseded rows); \
-                                             quarantined to {}",
-                                            dest.display()
-                                        ),
-                                    )),
+                                    Ok(dest) => {
+                                        // The SST left `tables/`; its bound sidecar
+                                        // must not linger to restrict a later file
+                                        // that reuses the id.
+                                        crate::restrict_bound::remove(
+                                            &*folder_fs,
+                                            &table_path,
+                                            config.sync_mode,
+                                        );
+                                        unreadable_files.push((
+                                            table_path,
+                                            format!(
+                                                "restricted punched SST with a corrupt live suffix \
+                                                 is not auto-salvageable (would resurrect superseded \
+                                                 rows); quarantined to {}",
+                                                dest.display()
+                                            ),
+                                        ));
+                                    }
                                     Err(e) => return Err(e),
                                 }
                                 continue;

@@ -1647,6 +1647,12 @@ fn repair_quarantines_a_restricted_punched_sst_with_a_corrupt_suffix() -> crate:
         "the restricted punched SST is quarantined: {:?}",
         report.unreadable_files,
     );
+    // The SST left `tables/`, so its bound sidecar must be reclaimed too: a stale
+    // sidecar left behind would restrict a later file that reuses the id.
+    assert!(
+        !crate::restrict_bound::exists(&*fs, &sst)?,
+        "the `.restrict-bound` sidecar must be removed when the SST is quarantined",
+    );
     Ok(())
 }
 
