@@ -74,10 +74,11 @@ impl Table {
         let mut src = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
         let reader = crate::sfa::Reader::from_reader(&mut src)?;
 
-        // Re-encode the meta KV block with the new id. The block is loaded TAIL
-        // (`meta`) since MID and TAIL carry identical content; the same patched
-        // payload is written to both sections below.
-        let meta_payload = self.repoint_meta_block(&*src, new_table_id)?;
+        // Re-encode the meta KV block with the new id AND the new delete-bitmap
+        // descriptors. The block is loaded TAIL (`meta`) since MID and TAIL carry
+        // identical content; the same patched payload is written to both sections
+        // below.
+        let meta_payload = self.repoint_meta_block(&*src, new_table_id, delete_bitmap)?;
 
         let out = out_fs.open(new_path, &FsOpenOptions::new().write(true).create_new(true))?;
 
@@ -152,13 +153,20 @@ impl Table {
     }
 
     /// Loads this segment's meta KV block, replaces the `table_id` entry's value
-    /// with `new_table_id`, and re-encodes the payload (uncompressed, ready for a
-    /// [`BlockType::Meta`] write). Every other meta field is preserved byte-exact,
-    /// so fields the parsed view does not expose still round-trip.
+    /// with `new_table_id` AND the two `descriptor#delete_bitmap_*` entries with
+    /// values describing `delete_bitmap` (the NEW positional bitmap this
+    /// relocation appends), then re-encodes the payload (uncompressed, ready for a
+    /// [`BlockType::Meta`] write). Every other meta field is preserved byte-exact.
+    ///
+    /// Without patching the delete-bitmap descriptors, the copied values would
+    /// still describe the SOURCE's (absent / different) bitmap, so
+    /// `verify_metadata_bounds` would flag the healthy relocated table during
+    /// `repair_with_salvage`, refuse to re-emit it, and quarantine it.
     fn repoint_meta_block(
         &self,
         src: &dyn FsFile,
         new_table_id: TableId,
+        delete_bitmap: &DeleteBitmap,
     ) -> crate::Result<Vec<u8>> {
         // Non-encrypted precondition (checked by the caller): PLAIN transform.
         let block = Block::from_file(
@@ -180,16 +188,39 @@ impl Table {
             .map(|item| item.materialize(block.as_slice()))
             .collect();
 
-        let mut patched = false;
+        // New delete-bitmap descriptor values (same key, same fixed width, so the
+        // in-place value swap preserves the meta block's sorted key order).
+        let db_len_bytes = delete_bitmap.len().to_le_bytes();
+        let db_hash_bytes = crate::hash::hash128(&delete_bitmap.encode()).to_le_bytes();
+        let (mut id_patched, mut len_patched, mut hash_patched) = (false, false, false);
         for entry in &mut entries {
-            if entry.key.user_key.as_ref() == b"table_id" {
-                entry.value = UserValue::from(&new_table_id.to_le_bytes()[..]);
-                patched = true;
+            match entry.key.user_key.as_ref() {
+                b"table_id" => {
+                    entry.value = UserValue::from(&new_table_id.to_le_bytes()[..]);
+                    id_patched = true;
+                }
+                b"descriptor#delete_bitmap_len" => {
+                    entry.value = UserValue::from(&db_len_bytes[..]);
+                    len_patched = true;
+                }
+                b"descriptor#delete_bitmap_hash" => {
+                    entry.value = UserValue::from(&db_hash_bytes[..]);
+                    hash_patched = true;
+                }
+                _ => {}
             }
         }
-        if !patched {
+        if !id_patched {
             return Err(crate::Error::InvalidHeader(
                 "relocate: meta block missing table_id",
+            ));
+        }
+        // The relocation source is a current-format columnar segment, which always
+        // records both descriptors; a missing one means the copied meta would
+        // mis-describe the appended bitmap, so fail loudly rather than write it.
+        if !(len_patched && hash_patched) {
+            return Err(crate::Error::InvalidHeader(
+                "relocate: meta block missing a delete-bitmap descriptor",
             ));
         }
 
