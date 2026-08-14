@@ -1479,6 +1479,14 @@ fn repair_does_not_quarantine_an_aliased_copy_of_the_kept_sst() -> lsm_tree::Res
     .repair_with_salvage(true)?;
 
     assert_eq!(report.recovered, 1, "one table recovered: {report:?}");
+    // The aliased sighting is skipped in place, never recorded as a failure: it is
+    // the SAME physical file as the kept copy, so reporting it unreadable /
+    // quarantined would misrepresent a healthy table as damaged.
+    assert_eq!(
+        report.unreadable, 0,
+        "the aliased sighting must not be reported unreadable: {:?}",
+        report.unreadable_files,
+    );
     // The aliased sighting was skipped in place, NOT quarantined: the kept file
     // still exists under its (single, shared) tables directory.
     assert!(
