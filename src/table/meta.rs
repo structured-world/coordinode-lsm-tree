@@ -164,21 +164,6 @@ pub struct ParsedMeta {
     /// have been bulk-ingested), since it cannot reconstruct the offset from the
     /// SST alone.
     pub bulk_ingested: Option<bool>,
-
-    /// Tight-space restriction position from the `descriptor#restrict_position`
-    /// property: `Some((block_ordinal, entry_ordinal))` locates the first LIVE
-    /// key of a tight-space-punched table — the entry at `entry_ordinal` inside
-    /// the data block at `block_ordinal` — whose user key is the exact restriction
-    /// lower bound. `None` is the common (unrestricted) case: either the sentinel
-    /// value `(u32::MAX, u32::MAX)` a current writer always stamps, or the key
-    /// absent entirely on a legacy SST written before the descriptor existed.
-    ///
-    /// Storing a POSITION (fixed 8 bytes), not the variable-length bound key,
-    /// lets tight-space compaction patch it into the already-written meta block in
-    /// place (same size) at punch time, and makes the punched SST self-describing:
-    /// manifest repair reads the exact bound from the SST alone, rather than
-    /// guessing it from block boundaries or inferring a punch from `allocated_size`.
-    pub restrict_position: Option<(u32, u32)>,
 }
 
 macro_rules! read_u8 {
@@ -379,24 +364,6 @@ impl ParsedMeta {
                 _ => return Err(crate::Error::InvalidHeader("TableMeta")),
             },
         };
-
-        // Optional tight-space restriction position: two little-endian u32s
-        // (block_ordinal, entry_ordinal). The sentinel `(u32::MAX, u32::MAX)`
-        // (which a current writer always stamps) and an absent key (legacy SST)
-        // both decode to `None` = unrestricted. Any other value locates the first
-        // live key of a punched table.
-        let restrict_position =
-            match block.point_read(b"descriptor#restrict_position", SeqNo::MAX, &cmp)? {
-                None => None,
-                Some(v) => match <[u8; 8]>::try_from(v.value.as_ref()) {
-                    Ok(bytes) => {
-                        let bo = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                        let eo = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-                        (bo != u32::MAX || eo != u32::MAX).then_some((bo, eo))
-                    }
-                    Err(_) => return Err(crate::Error::InvalidHeader("TableMeta")),
-                },
-            };
 
         let id = read_u64!(block, b"table_id", &cmp);
         // Cross-check the payload's stored id against the caller's durable
@@ -603,7 +570,6 @@ impl ParsedMeta {
             index_block_restart_interval,
             columnar,
             bulk_ingested,
-            restrict_position,
         })
     }
 }

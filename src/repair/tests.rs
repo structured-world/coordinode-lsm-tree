@@ -1339,17 +1339,15 @@ fn recover_sst(
     )
 }
 
-/// A tight-space-PUNCHED SST records its restriction bound only in the manifest,
-/// not the SST. When manifest repair rebuilds without that bound, the punched
-/// table would open UNRESTRICTED and later reads would traverse its zero-reading
-/// (punched) blocks and fail. A tight-space-punched SST is SELF-DESCRIBING: its
-/// meta carries the restriction POSITION (`descriptor#restrict_position`, a
-/// fixed-width `(block_ordinal, entry_ordinal)`) that compaction stamps before
-/// punching. Repair reads the position and resolves it to the EXACT bound from
-/// the surviving straddling block — so a MID-BLOCK boundary recovers with zero
-/// loss of the block's live suffix (proving #60) and zero resurrection of its
-/// consumed prefix, with no `allocated_size` inference (proving #61). Probes
-/// every key: served IFF key >= exact bound. Uses `MemFs` for a byte-precise punch.
+/// A tight-space-PUNCHED SST records its restriction bound only in the manifest.
+/// When manifest repair rebuilds without that bound, the punched table would open
+/// UNRESTRICTED and later reads would traverse its zero-reading (punched) blocks
+/// and fail. Compaction records the exact bound in a `.restrict-bound` sidecar
+/// beside the SST (without touching the SST). Repair reads the sidecar and — after
+/// confirming the prefix is really punched — restricts to the EXACT bound, so a
+/// MID-BLOCK boundary recovers with zero loss of the block's live suffix (#60) and
+/// zero resurrection of its consumed prefix. Probes every key: served IFF key >=
+/// exact bound. Uses `MemFs` for a byte-precise punch.
 #[test]
 fn repair_restricts_a_tight_space_punched_table() -> crate::Result<()> {
     use crate::fs::{Fs, MemFs};
@@ -1383,39 +1381,21 @@ fn repair_restricts_a_tight_space_punched_table() -> crate::Result<()> {
     // must hide) and at/above it (the live suffix repair must keep).
     let bound = b"k00130".to_vec();
     {
-        use crate::table::block_index::BlockIndex as _;
         let table = recover_sst(sst.clone(), &fs)?;
 
-        // Stamp the restriction position into the SST meta (what tight-space
-        // compaction does before punching), then punch the consumed prefix.
-        let (bo, eo) = table.restrict_position_for(&bound)?;
-        table.persist_restrict_position(bo, eo, crate::fs::SyncMode::Normal)?;
-
-        // Assert the bound is genuinely mid-block: the straddling block's first
-        // key is strictly below it, so the position — not a block boundary — is
-        // what pins the exact bound.
-        let Some(straddling) = table.block_index.iter().nth(bo as usize) else {
-            panic!("straddling block in range");
-        };
-        let straddling = straddling?;
-        let straddling_first = table.block_user_keys(&crate::table::BlockHandle::new(
-            straddling.offset(),
-            straddling.size(),
-        ))?;
-        assert!(
-            straddling_first
-                .first()
-                .is_some_and(|k| k.as_ref() < bound.as_slice()),
-            "the bound must fall inside a block (consumed keys precede it): {straddling_first:?}",
-        );
-
-        // Punch [0, punch_offset) — the whole blocks strictly below the straddler.
+        // Publish the exact bound to the sidecar (what tight-space compaction does
+        // before punching), then punch the consumed prefix. `punch_offset_for`
+        // returns the offset of the block that STRADDLES the bound, so `[0, offset)`
+        // is the whole blocks strictly below it; the straddling block (holding both
+        // the sub-bound consumed keys and the live suffix) survives. The
+        // served-iff-key>=bound probe below proves the mid-block split is exact.
+        crate::restrict_bound::write(&*fs, &sst, None, 0, &bound, crate::fs::SyncMode::Normal)?;
         let punch_offset = table.punch_offset_for(&bound)?;
         memfs.punch_hole(&sst, 0, punch_offset)?;
     }
 
     // Repair rebuilds the manifest, recovering the punched table RESTRICTED to the
-    // EXACT bound resolved from the meta position.
+    // EXACT bound read from the sidecar.
     let report = Config::new(
         &root,
         SequenceNumberCounter::default(),
@@ -1474,11 +1454,186 @@ fn write_multiblock_sst(
     Ok(())
 }
 
-/// Repair must PROPAGATE a transient read while resolving the restriction
-/// position, not silently open the punched table unrestricted (which would expose
-/// the zeroed prefix). The bound resolution reads the straddling block; a
-/// one-shot `Interrupted` there is retryable, so repair returns an error rather
-/// than installing a manifest without the restriction.
+/// Writing the `.restrict-bound` sidecar must NEVER mutate the SST — that is the
+/// point of a separate file: the manifest's whole-file checksum for the SST stays
+/// valid across the write, so a crash between the sidecar write and the manifest
+/// commit can never make a scrub see the SST as corrupt or a checkpoint hard-link
+/// modified bytes under a stale digest (#64).
+#[test]
+fn writing_the_sidecar_does_not_mutate_the_sst() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::table::Writer;
+    use crate::{InternalValue, ValueType};
+    use std::sync::Arc;
+
+    let fs: Arc<dyn Fs> = Arc::new(MemFs::new());
+    fs.create_dir_all(std::path::Path::new("/d"))?;
+    let sst = std::path::PathBuf::from("/d/0");
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+        for i in 0..64u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                u64::from(i) + 1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    let before = compute_table_checksum(&*fs, &sst)?;
+    crate::restrict_bound::write(&*fs, &sst, None, 0, b"k00030", crate::fs::SyncMode::Normal)?;
+    let after = compute_table_checksum(&*fs, &sst)?;
+    assert_eq!(
+        before, after,
+        "publishing the sidecar must leave the SST byte-identical",
+    );
+    Ok(())
+}
+
+/// A restricted, punched SST whose LIVE suffix is corrupt must NOT be
+/// block-salvaged: salvage would rewrite it unpunched and re-emit the straddling
+/// block's superseded sub-bound rows, and the manifest (unable to re-authenticate
+/// the restriction against a now-absent punch) would resurrect them. Repair fails
+/// closed — quarantines it for manual recovery (#65) — rather than salvage.
+#[test]
+fn repair_quarantines_a_restricted_punched_sst_with_a_corrupt_suffix() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::PathBuf::from("/db");
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+        for i in 0..256u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                u64::from(i) + 1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Record the bound, punch the consumed prefix, then CORRUPT the first live
+    // (straddling) block so the restricted view's verify flags it for salvage.
+    let bound = b"k00130".to_vec();
+    let punch_offset = {
+        let table = recover_sst(sst.clone(), &fs)?;
+        crate::restrict_bound::write(&*fs, &sst, None, 0, &bound, crate::fs::SyncMode::Normal)?;
+        let off = table.punch_offset_for(&bound)?;
+        memfs.punch_hole(&sst, 0, off)?;
+        off
+    };
+    {
+        let mut f = fs.open(&sst, &FsOpenOptions::new().write(true))?;
+        f.seek(SeekFrom::Start(punch_offset + 20))?;
+        f.write_all(&[0xFFu8])?;
+        f.sync_all()?;
+    }
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.recovered, 0,
+        "a restricted punched SST with a corrupt suffix must be quarantined, not \
+         salvaged (which would resurrect superseded rows): {report:?}",
+    );
+    assert_eq!(
+        report.unreadable, 1,
+        "the restricted punched SST is quarantined: {:?}",
+        report.unreadable_files,
+    );
+    Ok(())
+}
+
+/// A `.restrict-bound` sidecar is trusted ONLY when the prefix below the bound is
+/// physically punched. A forged / stale sidecar over a HEALTHY (unpunched) SST
+/// must be REJECTED — repair opens the table unrestricted, serving EVERY key — so
+/// a forged restriction can never hide healthy rows (#66).
+#[test]
+fn repair_rejects_a_restrict_bound_over_an_unpunched_sst() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::table::Writer;
+    use crate::{AbstractTree, Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::PathBuf::from("/db");
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+
+    // A perfectly HEALTHY multi-block SST — no punch.
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+        for i in 0..256u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                u64::from(i) + 1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Forge a valid sidecar claiming a restriction, WITHOUT any physical punch.
+    crate::restrict_bound::write(&*fs, &sst, None, 0, b"k00130", crate::fs::SyncMode::Normal)?;
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "the healthy table is recovered: {report:?}"
+    );
+    assert_eq!(report.unreadable, 0, "{:?}", report.unreadable_files);
+
+    // The forged restriction is rejected (prefix not punched): EVERY key is served.
+    let tree = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .open()?;
+    for i in 0..256u32 {
+        let key = format!("k{i:05}").into_bytes();
+        assert!(
+            tree.get(&key, crate::MAX_SEQNO)?.is_some(),
+            "key {key:?} must be served — a forged restriction over an unpunched SST \
+             must never hide healthy rows",
+        );
+    }
+    Ok(())
+}
+
+/// Repair must PROPAGATE a transient `.restrict-bound` sidecar read on a punched
+/// SST, not silently open it unrestricted (which would expose the zeroed prefix).
+/// A one-shot `Interrupted` opening the sidecar is retryable, so `read` returns an
+/// I/O error that repair classifies as transient and re-raises, rather than
+/// installing a manifest without the restriction.
 #[test]
 fn repair_propagates_a_transient_restrict_bound_read() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
@@ -1494,29 +1649,27 @@ fn repair_propagates_a_transient_restrict_bound_read() -> crate::Result<()> {
     let sst = tables.join("0");
     write_multiblock_sst(&sst, &membase)?;
 
-    // Stamp a mid-block restriction position, then punch the consumed prefix; the
-    // straddling block (which holds the bound key) survives and must be read to
-    // resolve the position.
+    // Record a mid-block bound in the sidecar, then punch the consumed prefix.
     let bound = b"k00130".to_vec();
-    let straddling_offset = {
-        use crate::table::block_index::BlockIndex as _;
+    {
         let table = recover_sst(sst.clone(), &membase)?;
-        let (bo, eo) = table.restrict_position_for(&bound)?;
-        table.persist_restrict_position(bo, eo, crate::fs::SyncMode::Normal)?;
-        let Some(straddling) = table.block_index.iter().nth(bo as usize) else {
-            panic!("straddling block in range");
-        };
-        let straddling = straddling?;
-        let off = straddling.offset().0;
-        memfs.punch_hole(&sst, 0, off)?;
-        off
-    };
+        crate::restrict_bound::write(
+            &*membase,
+            &sst,
+            None,
+            0,
+            &bound,
+            crate::fs::SyncMode::Normal,
+        )?;
+        let punch = table.punch_offset_for(&bound)?;
+        memfs.punch_hole(&sst, 0, punch)?;
+    }
 
-    // Fault the straddling block's positioned read with a TRANSIENT kind.
+    // Fault the sidecar OPEN with a TRANSIENT kind.
     let fault = FaultFs::new(memfs.as_ref().clone());
     fault.injector().arm(
-        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Interrupted))
-            .at_offset(straddling_offset),
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Interrupted))
+            .on_path("restrict-bound"),
     );
 
     let result = Config::new(
@@ -1528,8 +1681,8 @@ fn repair_propagates_a_transient_restrict_bound_read() -> crate::Result<()> {
     .repair_with_salvage(true);
     assert!(
         result.is_err(),
-        "a transient read while resolving the restriction bound must propagate, \
-         not silently open the punched table unrestricted: {result:?}",
+        "a transient sidecar read on a punched SST must propagate, not silently \
+         open it unrestricted: {result:?}",
     );
     Ok(())
 }

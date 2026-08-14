@@ -1039,26 +1039,17 @@ fn run_tight_space_compaction(
                 {
                     removed_ids.push(view.id());
                 } else {
-                    // Stamp the restriction POSITION into the input's own meta
-                    // BEFORE `reopen_restricted` captures the live-suffix digest,
-                    // so that digest (and the manifest entry the install records)
-                    // covers the patched meta. The meta lives in the file's suffix,
-                    // so the later prefix punch never disturbs it. This makes the
-                    // punched SST self-describing: manifest repair recovers the
-                    // exact bound from the meta alone.
-                    //
-                    // A crash in the window before the install below leaves the
-                    // input with a patched meta while the current manifest still
-                    // references it: harmless, since a normal (manifest-authoritative)
-                    // open ignores the meta's position and does not re-verify the
-                    // whole-file digest on open, and a re-run of the tight-space
-                    // compaction re-stamps and installs.
-                    let (block_ordinal, entry_ordinal) = view.restrict_position_for(boundary)?;
-                    view.persist_restrict_position(
-                        block_ordinal,
-                        entry_ordinal,
-                        opts.config.sync_mode,
-                    )?;
+                    // Publish the restriction bound to the input's `.restrict-bound`
+                    // sidecar BEFORE the punch, so manifest repair can recover the
+                    // exact bound. The sidecar is a SEPARATE file written through an
+                    // atomic `temp + rename`, so — unlike an in-place meta edit — the
+                    // SST bytes are never touched: its manifest whole-file checksum
+                    // stays valid in every crash window, and there are no two mirrors
+                    // to diverge. A crash before the install below leaves the sidecar
+                    // present beside an unpunched, unmodified SST; repair only trusts
+                    // it once it independently confirms the prefix is punched, so the
+                    // stray sidecar is harmless (a re-run overwrites it atomically).
+                    view.write_restrict_sidecar(boundary, opts.config.sync_mode)?;
                     let restricted = view.reopen_restricted(boundary.clone())?;
                     restricted_pairs.push((view.id(), restricted.clone()));
                     next_views.push(restricted);

@@ -360,6 +360,13 @@ pub mod runtime_config;
 #[cfg(feature = "std")]
 pub mod repair;
 
+// Tight-space restriction sidecar: `{id}.restrict-bound` records the exact
+// lower bound of a hole-punched SST next to it, so manifest repair recovers the
+// restriction without mutating (and thus invalidating the manifest checksum of)
+// the SST itself.
+#[cfg(feature = "std")]
+pub mod restrict_bound;
+
 // std-only: block-granular SST salvage; reads source blocks and writes a
 // recovered SST via std::fs (see also `crate::repair`, `crate::verify`).
 #[cfg(feature = "std")]

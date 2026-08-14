@@ -4240,6 +4240,44 @@ impl Tree {
                     continue;
                 }
 
+                // A `{id}.restrict-bound.tmp` is a crashed sidecar-publish temp
+                // (written + synced for an atomic rename onto `{id}.restrict-bound`
+                // that never landed). Disposable — sweep it. Checked BEFORE the
+                // `.restrict-bound` skip because that suffix is a prefix of this one.
+                if table_file_name
+                    .strip_suffix(".restrict-bound.tmp")
+                    .is_some_and(|id| id.parse::<TableId>().is_ok())
+                {
+                    log::warn!(
+                        "Removing abandoned restrict-bound temp: {}",
+                        table_file_path.display()
+                    );
+                    Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                    continue;
+                }
+
+                // A `{id}.restrict-bound` sidecar records the exact tight-space
+                // restriction bound of a hole-punched `{id}`, so manifest repair
+                // can recover the restriction. It is never a table file, so never
+                // parse it as an id. A LIVE table's sidecar is preserved (repair
+                // needs it); an ORPHAN one (its SST retired from the manifest) is
+                // swept so a reused id cannot later pick up a stale restriction.
+                // Only the EXACT shape (numeric id + exact suffix) is owned; a
+                // foreign name merely containing the suffix falls through unharmed.
+                if let Some(bound_id) = table_file_name
+                    .strip_suffix(".restrict-bound")
+                    .and_then(|id| id.parse::<TableId>().ok())
+                {
+                    if !manifest_ids.contains(&bound_id) {
+                        log::warn!(
+                            "Removing orphaned restrict-bound sidecar (its table is gone): {}",
+                            table_file_path.display()
+                        );
+                        Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                    }
+                    continue;
+                }
+
                 let table_id = table_file_name.parse::<TableId>().map_err(|e| {
                     log::error!("invalid table file name {table_file_name:?}: {e:?}");
                     crate::Error::Unrecoverable

@@ -408,14 +408,13 @@ fn restricted_view_passes_every_reconcile_gate() -> crate::Result<()> {
     Ok(())
 }
 
-/// A REAL tight-space compaction must make its punched input SELF-DESCRIBING: it
-/// stamps the restriction POSITION into the SST's own meta
-/// (`descriptor#restrict_position`) before punching. That position must resolve
-/// back to EXACTLY the manifest's restriction lower bound — the invariant that
-/// lets manifest repair recover the punched table's exact bound from the SST
-/// alone, with no `allocated_size` inference and no block-boundary guessing.
+/// A REAL tight-space compaction must record its punched input's exact bound in a
+/// `.restrict-bound` sidecar before punching, WITHOUT touching the SST. That
+/// sidecar bound must equal the manifest's restriction lower bound — the invariant
+/// that lets manifest repair recover the same restriction from the on-disk files
+/// alone. Reading it back also proves the sidecar survives the reopen.
 #[test]
-fn tight_space_stamps_restrict_position_matching_the_manifest_bound() -> crate::Result<()> {
+fn tight_space_writes_a_restrict_bound_sidecar_matching_the_manifest_bound() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
     let fs = capfs::CapacityFs::new();
     let reopened = tight_space_crash_and_reopen(
@@ -436,16 +435,18 @@ fn tight_space_stamps_restrict_position_matching_the_manifest_bound() -> crate::
         panic!("restricted table has a manifest bound");
     };
 
-    // The compaction stamped a NON-sentinel position into the meta...
-    let Some((bo, eo)) = restricted.metadata.restrict_position else {
-        panic!("a punched table's meta must carry a restrict_position");
-    };
-    // ...and resolving it against the SST reproduces the manifest bound exactly.
-    let resolved = restricted.restrict_bound_at(bo, eo)?;
-    assert_eq!(
-        resolved, manifest_bound,
-        "the self-describing restrict_position must resolve to the manifest bound",
-    );
+    // The compaction published the exact bound to the SST's `.restrict-bound`
+    // sidecar; it must read back as the manifest bound.
+    match crate::restrict_bound::read(&fs, &restricted.path, None)? {
+        crate::restrict_bound::SidecarRead::Present(_id, bound) => {
+            assert_eq!(
+                bound.as_slice(),
+                manifest_bound.as_ref(),
+                "the sidecar bound must equal the manifest restriction bound",
+            );
+        }
+        _ => panic!("a punched table must carry a valid .restrict-bound sidecar"),
+    }
     Ok(())
 }
 

@@ -1173,9 +1173,15 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
             // digest. Match the exact shapes recovery owns (numeric id + heal
             // suffix); a foreign name merely containing the suffix falls through
             // to the id parse below and is quarantined as before.
-            let is_heal_artifact = file_name
+            let is_sidecar_artifact = file_name
                 .strip_suffix(".heal-attest")
                 .or_else(|| file_name.strip_suffix(".heal-attest.tmp"))
+                // The `.restrict-bound` sidecar (and its crashed `.tmp`) carries a
+                // punched SST's restriction bound; repair reads it FOR its SST (via
+                // `restrict_bound::read`), so the sidecar file itself is never a
+                // table and must not be parsed / quarantined as one.
+                .or_else(|| file_name.strip_suffix(".restrict-bound"))
+                .or_else(|| file_name.strip_suffix(".restrict-bound.tmp"))
                 .is_some_and(|id| id.parse::<TableId>().is_ok())
                 // {id}.healtmp-{n}: BOTH the id and the numeric sequence must
                 // parse, matching recovery's ownership check. A foreign name like
@@ -1184,7 +1190,7 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                 || file_name.split_once(".healtmp-").is_some_and(|(id, seq)| {
                     id.parse::<TableId>().is_ok() && seq.parse::<u64>().is_ok()
                 });
-            if is_heal_artifact {
+            if is_sidecar_artifact {
                 continue;
             }
 
@@ -1322,38 +1328,63 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
 
             // Rebuild the restricted view of a tight-space-PUNCHED SST. Tight-space
             // compaction reclaims a table's consumed prefix data blocks in place
-            // (hole-punched, reading back as zeros) and stamps the restriction
-            // POSITION into the SST's own meta (`descriptor#restrict_position`, a
-            // fixed-width `(block_ordinal, entry_ordinal)` locating the first live
-            // key). A rebuilt manifest must re-apply that restriction, or later
-            // reads and compactions traverse the punched blocks and fail. The SST
-            // is SELF-DESCRIBING: read the position and resolve it to the EXACT
-            // bound from the surviving (never-punched) straddling block — no
-            // `allocated_size` inference (which false-positives on compressed /
-            // sparse filesystems) and no block-boundary guessing (which would drop
-            // live keys or resurrect superseded ones).
+            // (hole-punched, reading back as zeros) and records the exact bound in a
+            // `.restrict-bound` sidecar beside the SST. A rebuilt manifest must
+            // re-apply that restriction, or later reads and compactions traverse the
+            // punched blocks and fail. The bound comes from the sidecar (the SST
+            // itself is never mutated, so its whole-file checksum stays valid); it
+            // is trusted ONLY after independently confirming the prefix below it is
+            // actually punched (reads as zeros), so a forged or stale sidecar over
+            // an unpunched file cannot hide healthy keys.
             let recovered = 'restrict: {
                 let Ok(table) = recovered else {
                     break 'restrict recovered;
                 };
-                let Some((block_ordinal, entry_ordinal)) = table.metadata.restrict_position else {
-                    // No restriction descriptor (the common case, or a legacy SST
-                    // written before the descriptor existed): keep the table as-is.
-                    // A legacy punched SST with a lost manifest has no recoverable
-                    // bound, so its zeroed blocks surface as corruption through the
-                    // block-verify / salvage path below rather than silent loss.
-                    break 'restrict Ok(table);
+                // A sidecar OPEN / READ I/O failure surfaces as `Err` and drops to
+                // the structural arm below (transient → retry, persistent →
+                // salvage), so a flaky read never silently opens a punched SST
+                // unrestricted.
+                let sidecar = match crate::restrict_bound::read(
+                    &*folder_fs,
+                    &table_path,
+                    config.encryption.as_deref(),
+                ) {
+                    Ok(s) => s,
+                    Err(e) => break 'restrict Err(e),
                 };
-                match table.restrict_bound_at(block_ordinal, entry_ordinal) {
-                    // Resolve the position to the exact restriction key and reopen
-                    // the live suffix restricted to it. Repair holds no concurrent
-                    // heal (the tree is not open), so it needs no heal lock here.
-                    Ok(bound) => table.reopen_restricted(bound),
-                    // A forged / corrupt / transient position resolution: surface it
-                    // so the Err arm classifies it (transient → retry, persistent →
-                    // salvage / unreadable) rather than installing an unrestricted
-                    // view that would expose the punched prefix.
-                    Err(e) => Err(e),
+                match sidecar {
+                    // No sidecar: the common (unrestricted) case.
+                    crate::restrict_bound::SidecarRead::Missing => break 'restrict Ok(table),
+                    crate::restrict_bound::SidecarRead::Present(id, bound) => {
+                        // The sidecar binds the table id; a mismatch is a stale
+                        // sidecar for a reused id — ignore it (treat as unrestricted).
+                        if id != table_id {
+                            break 'restrict Ok(table);
+                        }
+                        // Authenticate against physical punch evidence: only restrict
+                        // when the prefix below the bound genuinely reads as zeros.
+                        // A forged / stale sidecar over an unpunched file finds intact
+                        // data there and is rejected (kept unrestricted), so it can
+                        // never hide healthy rows.
+                        match table.prefix_is_punched(&bound) {
+                            Ok(true) => table.reopen_restricted(bound.into()),
+                            Ok(false) => break 'restrict Ok(table),
+                            Err(e) => Err(e),
+                        }
+                    }
+                    crate::restrict_bound::SidecarRead::Corrupt => {
+                        // A read-but-malformed sidecar is PERSISTENT. If the SST is
+                        // genuinely punched (its first data block reads as zeros) the
+                        // bound is unrecoverable — fail closed via the structural Err
+                        // arm (salvage / unreadable) rather than open it unrestricted
+                        // and expose the zeroed prefix. If it is NOT punched, the
+                        // sidecar is spurious — keep the table unrestricted.
+                        match table.first_data_block_is_punched() {
+                            Ok(true) => Err(crate::Error::Unrecoverable),
+                            Ok(false) => break 'restrict Ok(table),
+                            Err(e) => Err(e),
+                        }
+                    }
                 }
             };
 
@@ -1411,7 +1442,42 @@ fn repair_tree(config: &Config, salvage: bool) -> crate::Result<RepairReport> {
                             }
                         }
                         RepairKeepDecision::Salvage => {
+                            // A tight-space RESTRICTED punched SST must NOT be
+                            // block-salvaged: salvage rewrites it as a FRESH,
+                            // UNPUNCHED SST that re-emits the straddling block's
+                            // sub-bound (superseded) entries, and — the replacement
+                            // no longer being punched — the restriction can no
+                            // longer be authenticated against physical punch, so
+                            // the rebuilt manifest would resurrect those deleted
+                            // rows. Fail closed: quarantine it for manual recovery
+                            // (its live suffix is preserved on disk, just not
+                            // auto-salvaged). This double-failure — an emergency
+                            // tight-space punch AND corruption in the surviving
+                            // suffix — is rare enough that safe quarantine beats a
+                            // resurrection-prone rewrite.
+                            let is_restricted = table.restrict_lower_bound().is_some();
                             drop(table);
+                            if is_restricted {
+                                match quarantine_file(
+                                    &*folder_fs,
+                                    &table_base_folder,
+                                    &table_path,
+                                    &file_name,
+                                    config.sync_mode,
+                                ) {
+                                    Ok(dest) => unreadable_files.push((
+                                        table_path,
+                                        format!(
+                                            "restricted punched SST with a corrupt live suffix is \
+                                             not auto-salvageable (would resurrect superseded rows); \
+                                             quarantined to {}",
+                                            dest.display()
+                                        ),
+                                    )),
+                                    Err(e) => return Err(e),
+                                }
+                                continue;
+                            }
                             // Quarantine BEFORE salvage, aborting the repair
                             // on failure: a manifest omitting a still-in-place
                             // file would let the next open's orphan cleanup
