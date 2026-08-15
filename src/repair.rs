@@ -887,7 +887,7 @@ fn verify_keep_decision(
                     RepairKeepDecision::Quarantine(
                         "ECC descriptor unrecognized (the block walk cannot verify the \
                      table) and salvage cannot re-emit its range tombstones; the table \
-                     is excluded — recompact it under a supported scheme to re-admit it",
+                     is excluded (recompact it under a supported scheme to re-admit it)",
                     )
                 }
             }
@@ -992,6 +992,47 @@ fn try_salvage_table(
         return Ok(None);
     }
     Ok(Some(table))
+}
+
+/// Re-imposes a tight-space restriction on a SALVAGED replacement SST, the single
+/// point every salvage output funnels through so the restriction can never be
+/// dropped on one path and kept on another.
+///
+/// Salvage rewrites its source as a fresh, UNPUNCHED table that re-emits the
+/// straddling block's sub-bound rows, so a punched source's restriction must be
+/// re-applied to the output or those superseded / deleted rows resurrect. With a
+/// known `bound` and resurrection off, the sidecar is re-written (so a later
+/// manifest-loss repair honors it against the now-unpunched file) and the table
+/// reopened restricted. Otherwise (resurrection on, or no recoverable bound) the
+/// salvaged table is kept whole and any stale sidecar cleared, since a lingering
+/// sidecar would wrongly restrict the unpunched replacement on a later repair.
+#[cfg(feature = "std")]
+fn restrict_salvaged_output(
+    folder_fs: &dyn crate::fs::Fs,
+    config: &Config,
+    table_path: &std::path::Path,
+    table_id: TableId,
+    salvaged: Table,
+    restrict_bound: Option<crate::UserKey>,
+    allow_resurrection: bool,
+) -> crate::Result<Table> {
+    match restrict_bound {
+        Some(bound) if !allow_resurrection => {
+            crate::restrict_bound::write(
+                folder_fs,
+                table_path,
+                config.encryption.as_deref(),
+                table_id,
+                &bound,
+                config.sync_mode,
+            )?;
+            salvaged.reopen_restricted(bound)
+        }
+        _ => {
+            crate::restrict_bound::remove(folder_fs, table_path, config.sync_mode);
+            Ok(salvaged)
+        }
+    }
 }
 
 /// Discovers the blob files of a KV-separated tree for `repair` by scanning the
@@ -1604,24 +1645,18 @@ fn repair_tree(
                                 table_id,
                             ) {
                                 Ok(Some(salvaged)) => {
-                                    // Re-restrict a salvaged tight-space view to its
-                                    // recorded bound (resurrection off), re-recording
-                                    // the sidecar so a later repair honors it; keep
-                                    // the whole region with resurrection on.
-                                    let table = match &restrict_bound {
-                                        Some(bound) if !allow_resurrection => {
-                                            crate::restrict_bound::write(
-                                                &*folder_fs,
-                                                &table_path,
-                                                config.encryption.as_deref(),
-                                                table_id,
-                                                bound,
-                                                config.sync_mode,
-                                            )?;
-                                            salvaged.reopen_restricted(bound.clone())?
-                                        }
-                                        _ => salvaged,
-                                    };
+                                    // Re-impose the tight-space restriction on the
+                                    // salvaged output (fail-closed unless resurrection
+                                    // is on), the shared path both salvage arms use.
+                                    let table = restrict_salvaged_output(
+                                        &*folder_fs,
+                                        config,
+                                        &table_path,
+                                        table_id,
+                                        salvaged,
+                                        restrict_bound.clone(),
+                                        allow_resurrection,
+                                    )?;
                                     record_best(
                                         &mut recovered_by_id,
                                         &mut unreadable_files,
@@ -1700,6 +1735,28 @@ fn repair_tree(
                     if is_transient_io(&e) {
                         return Err(e);
                     }
+                    // A tight-space-punched SST that fails whole-file recovery still
+                    // carries its restriction in the `.restrict-bound` sidecar, but
+                    // recovery produced no `Table` to read the bound from. Read it
+                    // directly BEFORE quarantining moves the SST (the sidecar is a
+                    // sibling file, so its bound is captured while both are in place),
+                    // and re-impose it on the salvaged output below, exactly as the
+                    // verification-failure arm does. A TRANSIENT sidecar read
+                    // propagates; anything else leaves no trustworthy bound, so the
+                    // salvaged output stays unrestricted (a genuinely unpunched SST).
+                    let restrict_bound: Option<crate::UserKey> = match crate::restrict_bound::read(
+                        &*folder_fs,
+                        &table_path,
+                        config.encryption.as_deref(),
+                    ) {
+                        Ok(crate::restrict_bound::SidecarRead::Present(id, b))
+                            if id == table_id =>
+                        {
+                            Some(b.into())
+                        }
+                        Err(read_err) if is_transient_io(&read_err) => return Err(read_err),
+                        Ok(_) | Err(_) => None,
+                    };
                     // Whole-file recovery failed structurally; try block-level
                     // salvage: the corrupt original is quarantined and a fresh SST
                     // holding its recoverable blocks is written in its place. A
@@ -1721,7 +1778,19 @@ fn repair_tree(
                         &table_path,
                         table_id,
                     ) {
-                        Ok(Some(table)) => {
+                        Ok(Some(salvaged)) => {
+                            // Re-impose the tight-space restriction on the salvaged
+                            // output (fail-closed unless resurrection is on), the
+                            // shared path both salvage arms use.
+                            let table = restrict_salvaged_output(
+                                &*folder_fs,
+                                config,
+                                &table_path,
+                                table_id,
+                                salvaged,
+                                restrict_bound,
+                                allow_resurrection,
+                            )?;
                             record_best(
                                 &mut recovered_by_id,
                                 &mut unreadable_files,

@@ -526,6 +526,82 @@ fn repair_with_salvage_recovers_a_table_whose_whole_file_hash_faults() -> crate:
     Ok(())
 }
 
+/// A tight-space-punched, RESTRICTED SST whose WHOLE-FILE recovery fails
+/// persistently (a bad sector on the preliminary hash) is block-salvaged AND
+/// re-restricted to its sidecar bound. The recovery-failure salvage arm produced
+/// no `Table` to read the bound from, so it reads the `.restrict-bound` sidecar
+/// directly before quarantining and reopens the salvaged replacement restricted:
+/// no superseded sub-bound row resurrects under the default fail-closed policy.
+/// Without the re-restriction the salvage walk re-emits the straddling block's
+/// sub-bound rows unrestricted.
+#[test]
+fn repair_restricts_a_punched_sst_whose_whole_file_recovery_faults() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+
+    // A multi-block SST punched at k00050, its exact bound recorded in the sidecar.
+    let sst = build_punched_prefix_sst(&memfs, &fs, &tables)?;
+    let bound = b"k00050".to_vec();
+    crate::restrict_bound::write(&*fs, &sst, None, 0, &bound, crate::fs::SyncMode::Normal)?;
+
+    // Fault the FIRST streaming read of the original (the whole-file hash) so
+    // whole-file recovery fails structurally and repair falls to block-salvage.
+    // `.once()` leaves the sidecar read and the salvage reads unfaulted.
+    let fault = FaultFs::new(memfs.as_ref().clone());
+    let injector = fault.injector();
+    injector.arm(
+        FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .once(),
+    );
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair_with_salvage(true)?;
+    injector.clear();
+
+    assert_eq!(
+        report.recovered, 1,
+        "the salvaged table joins the manifest: {report:?}",
+    );
+    assert_eq!(report.unreadable, 0, "{:?}", report.unreadable_files);
+
+    let tree = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .open()?;
+    // No sub-bound key resurrects, despite the whole-file recovery failure.
+    for i in 0..50u32 {
+        let key = format!("k{i:05}").into_bytes();
+        assert!(
+            tree.get(&key, crate::MAX_SEQNO)?.is_none(),
+            "sub-bound key {} must not resurrect after recovery-failure salvage",
+            String::from_utf8_lossy(&key),
+        );
+    }
+    // The live suffix survives.
+    assert!(
+        tree.get(b"k00200", crate::MAX_SEQNO)?.is_some(),
+        "the live suffix must survive salvage",
+    );
+    Ok(())
+}
+
 /// A BULK-INGESTED SST whose whole-file recovery fails must NOT be recovered
 /// through block-salvage: `try_salvage_table` reopens the salvaged copy with
 /// `global_seqno` 0, and the copy still relies on the manifest-only offset (its
@@ -1357,7 +1433,11 @@ fn repair_restricts_a_tight_space_punched_table() -> crate::Result<()> {
 
     let memfs = Arc::new(MemFs::new());
     let fs: Arc<dyn Fs> = memfs.clone();
-    let root = std::path::PathBuf::from("/db");
+    // Absolute so the MemFs directory keys match what `Writer::new` writes: the
+    // writer rewrites its output path through `std::path::absolute`, which on
+    // Windows prepends the current drive (`/db` -> `D:\db`). Building the root the
+    // same way keeps `create_dir_all` and the writer agreed on one namespace.
+    let root = std::path::absolute("/db")?;
     let tables = root.join("tables");
     fs.create_dir_all(&tables)?;
     let sst = tables.join("0");
@@ -1449,7 +1529,11 @@ fn repair_with_salvage_keeps_a_healthy_restricted_punched_table() -> crate::Resu
 
     let memfs = Arc::new(MemFs::new());
     let fs: Arc<dyn Fs> = memfs.clone();
-    let root = std::path::PathBuf::from("/db");
+    // Absolute so the MemFs directory keys match what `Writer::new` writes: the
+    // writer rewrites its output path through `std::path::absolute`, which on
+    // Windows prepends the current drive (`/db` -> `D:\db`). Building the root the
+    // same way keeps `create_dir_all` and the writer agreed on one namespace.
+    let root = std::path::absolute("/db")?;
     let tables = root.join("tables");
     fs.create_dir_all(&tables)?;
     let sst = tables.join("0");
@@ -1555,8 +1639,11 @@ fn writing_the_sidecar_does_not_mutate_the_sst() -> crate::Result<()> {
     use std::sync::Arc;
 
     let fs: Arc<dyn Fs> = Arc::new(MemFs::new());
-    fs.create_dir_all(std::path::Path::new("/d"))?;
-    let sst = std::path::PathBuf::from("/d/0");
+    // Absolute so the MemFs directory key matches what `Writer::new` writes (it
+    // rewrites through `std::path::absolute`, prepending the drive on Windows).
+    let base = std::path::absolute("/d")?;
+    fs.create_dir_all(&base)?;
+    let sst = base.join("0");
     {
         let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
         for i in 0..64u32 {
@@ -1585,8 +1672,8 @@ fn writing_the_sidecar_does_not_mutate_the_sst() -> crate::Result<()> {
 /// blocks (dropping the zeroed prefix and the corrupt straddling block), then the
 /// result is reopened restricted to the recorded bound and its sidecar is
 /// re-written, so the live suffix survives while nothing below the bound is
-/// resurrected (#65). The corrupt straddling block's keys are the only casualty
-/// — that is the price of the corruption, not of the restriction.
+/// resurrected (#65). The corrupt straddling block's keys are the only casualty:
+/// that is the price of the corruption, not of the restriction.
 #[test]
 fn repair_salvages_a_restricted_punched_sst_with_a_corrupt_suffix() -> crate::Result<()> {
     use crate::fs::{Fs, FsOpenOptions, MemFs};
@@ -1597,7 +1684,11 @@ fn repair_salvages_a_restricted_punched_sst_with_a_corrupt_suffix() -> crate::Re
 
     let memfs = Arc::new(MemFs::new());
     let fs: Arc<dyn Fs> = memfs.clone();
-    let root = std::path::PathBuf::from("/db");
+    // Absolute so the MemFs directory keys match what `Writer::new` writes: the
+    // writer rewrites its output path through `std::path::absolute`, which on
+    // Windows prepends the current drive (`/db` -> `D:\db`). Building the root the
+    // same way keeps `create_dir_all` and the writer agreed on one namespace.
+    let root = std::path::absolute("/db")?;
     let tables = root.join("tables");
     fs.create_dir_all(&tables)?;
     let sst = tables.join("0");
@@ -1737,7 +1828,11 @@ fn repair_restricts_a_punched_sst_whose_sidecar_bound_overshoots_the_punch() -> 
 
     let memfs = Arc::new(MemFs::new());
     let fs: Arc<dyn Fs> = memfs.clone();
-    let root = std::path::PathBuf::from("/db");
+    // Absolute so the MemFs directory keys match what `Writer::new` writes: the
+    // writer rewrites its output path through `std::path::absolute`, which on
+    // Windows prepends the current drive (`/db` -> `D:\db`). Building the root the
+    // same way keeps `create_dir_all` and the writer agreed on one namespace.
+    let root = std::path::absolute("/db")?;
     let tables = root.join("tables");
     fs.create_dir_all(&tables)?;
 
@@ -1764,7 +1859,11 @@ fn repair_honors_a_valid_sidecar_over_an_unpunched_sst() -> crate::Result<()> {
 
     let memfs = Arc::new(MemFs::new());
     let fs: Arc<dyn Fs> = memfs.clone();
-    let root = std::path::PathBuf::from("/db");
+    // Absolute so the MemFs directory keys match what `Writer::new` writes: the
+    // writer rewrites its output path through `std::path::absolute`, which on
+    // Windows prepends the current drive (`/db` -> `D:\db`). Building the root the
+    // same way keeps `create_dir_all` and the writer agreed on one namespace.
+    let root = std::path::absolute("/db")?;
     let tables = root.join("tables");
     fs.create_dir_all(&tables)?;
     let sst = tables.join("0");
@@ -1859,7 +1958,11 @@ fn repair_restricts_a_punched_sst_with_no_sidecar() -> crate::Result<()> {
 
     let memfs = Arc::new(MemFs::new());
     let fs: Arc<dyn Fs> = memfs.clone();
-    let root = std::path::PathBuf::from("/db");
+    // Absolute so the MemFs directory keys match what `Writer::new` writes: the
+    // writer rewrites its output path through `std::path::absolute`, which on
+    // Windows prepends the current drive (`/db` -> `D:\db`). Building the root the
+    // same way keeps `create_dir_all` and the writer agreed on one namespace.
+    let root = std::path::absolute("/db")?;
     let tables = root.join("tables");
     fs.create_dir_all(&tables)?;
     // Punch the prefix but publish NO sidecar.
@@ -1881,7 +1984,11 @@ fn repair_restricts_a_punched_sst_with_a_corrupt_sidecar() -> crate::Result<()> 
 
     let memfs = Arc::new(MemFs::new());
     let fs: Arc<dyn Fs> = memfs.clone();
-    let root = std::path::PathBuf::from("/db");
+    // Absolute so the MemFs directory keys match what `Writer::new` writes: the
+    // writer rewrites its output path through `std::path::absolute`, which on
+    // Windows prepends the current drive (`/db` -> `D:\db`). Building the root the
+    // same way keeps `create_dir_all` and the writer agreed on one namespace.
+    let root = std::path::absolute("/db")?;
     let tables = root.join("tables");
     fs.create_dir_all(&tables)?;
     let sst = build_punched_prefix_sst(&memfs, &fs, &tables)?;
@@ -1918,7 +2025,11 @@ fn repair_restricts_a_punched_sst_with_a_mismatched_sidecar_id() -> crate::Resul
 
     let memfs = Arc::new(MemFs::new());
     let fs: Arc<dyn Fs> = memfs.clone();
-    let root = std::path::PathBuf::from("/db");
+    // Absolute so the MemFs directory keys match what `Writer::new` writes: the
+    // writer rewrites its output path through `std::path::absolute`, which on
+    // Windows prepends the current drive (`/db` -> `D:\db`). Building the root the
+    // same way keeps `create_dir_all` and the writer agreed on one namespace.
+    let root = std::path::absolute("/db")?;
     let tables = root.join("tables");
     fs.create_dir_all(&tables)?;
     let sst = build_punched_prefix_sst(&memfs, &fs, &tables)?;
@@ -1949,7 +2060,11 @@ fn repair_with_resurrection_keeps_a_punched_sst_unrestricted() -> crate::Result<
 
     let memfs = Arc::new(MemFs::new());
     let fs: Arc<dyn Fs> = memfs.clone();
-    let root = std::path::PathBuf::from("/db");
+    // Absolute so the MemFs directory keys match what `Writer::new` writes: the
+    // writer rewrites its output path through `std::path::absolute`, which on
+    // Windows prepends the current drive (`/db` -> `D:\db`). Building the root the
+    // same way keeps `create_dir_all` and the writer agreed on one namespace.
+    let root = std::path::absolute("/db")?;
     let tables = root.join("tables");
     fs.create_dir_all(&tables)?;
     // Punch `[0, punch(k00050))`, publish NO sidecar: no exact bound survives.
@@ -2009,7 +2124,11 @@ fn repair_propagates_a_transient_restrict_bound_read() -> crate::Result<()> {
 
     let memfs = Arc::new(MemFs::new());
     let membase: Arc<dyn Fs> = memfs.clone();
-    let root = std::path::PathBuf::from("/db");
+    // Absolute so the MemFs directory keys match what `Writer::new` writes: the
+    // writer rewrites its output path through `std::path::absolute`, which on
+    // Windows prepends the current drive (`/db` -> `D:\db`). Building the root the
+    // same way keeps `create_dir_all` and the writer agreed on one namespace.
+    let root = std::path::absolute("/db")?;
     let tables = root.join("tables");
     membase.create_dir_all(&tables)?;
     let sst = tables.join("0");
@@ -2068,7 +2187,11 @@ fn repair_restricts_a_punched_sst_on_a_persistent_sidecar_read() -> crate::Resul
 
     let memfs = Arc::new(MemFs::new());
     let membase: Arc<dyn Fs> = memfs.clone();
-    let root = std::path::PathBuf::from("/db");
+    // Absolute so the MemFs directory keys match what `Writer::new` writes: the
+    // writer rewrites its output path through `std::path::absolute`, which on
+    // Windows prepends the current drive (`/db` -> `D:\db`). Building the root the
+    // same way keeps `create_dir_all` and the writer agreed on one namespace.
+    let root = std::path::absolute("/db")?;
     let tables = root.join("tables");
     membase.create_dir_all(&tables)?;
     let sst = tables.join("0");

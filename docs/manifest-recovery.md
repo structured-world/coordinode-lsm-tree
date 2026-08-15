@@ -75,8 +75,10 @@ flowchart TD
 
     V0{Verify data blocks} -->|all clean| MASK0
     V0 -->|transient| PROP3[Propagate for retry]
-    V0 -->|some corrupt| VSALV[Recover readable blocks;<br/>drop the corrupt ones]
-    VSALV --> MASK0
+    V0 -->|some corrupt| VSALV
+    OPEN -->|recovery fails,<br/>blocks salvageable| VSALV
+    VSALV[Salvage: recover readable blocks;<br/>drop the corrupt ones] --> VRES[Re-restrict the output to the bound;<br/>from the restricted view or the sidecar;<br/>fail-closed unless resurrection is on]
+    VRES --> MASK0
 
     MASK0{Delete bitmap} -->|absent or authenticated| RECORD[Record into the manifest]
     MASK0 -->|content unauthenticated| MTR{transient?}
@@ -126,6 +128,27 @@ blocks, drops the corrupt ones, then reopens the result restricted to the bound
 and re-records its sidecar, so a later manifest-loss repair honors it. The
 readable part of the suffix survives; only the corrupt blocks are lost, and
 nothing below the bound is resurrected.
+
+**Salvage always re-restricts, on every path that reaches it.** Salvage rewrites
+its source as a fresh, *unpunched* table that re-emits the straddling block's
+sub-bound rows, so its output must be re-restricted to the bound or those rows
+resurrect. This is a single step every salvage funnels through, whether salvage
+was reached because block verification failed (the restriction is read from the
+already-restricted view) or because whole-file recovery failed before producing a
+table at all (the restriction is read straight from the `.restrict-bound`
+sidecar). With resurrection disabled both re-impose the bound; with it enabled
+both keep the whole readable region and clear the sidecar, since the unpunched
+replacement would otherwise be wrongly restricted on a later repair.
+
+**Only a committed restriction ever leaves a sidecar over an unpunched SST.**
+Because recovery honors a valid sidecar even when the punch has not (yet) zeroed
+the prefix, a sidecar that outlives its intended restriction would silently drop
+live keys. Tight-space compaction therefore treats the sidecar as part of the
+slice's atomic commit: it is published before the punch, but if the slice aborts
+before its version install commits, the rollback retracts every sidecar it
+published. The only unpunched-yet-valid sidecar recovery can encounter is the
+genuine crash window between a durable install and the punch that follows it,
+which is exactly the state honoring the bound is correct for.
 
 ## Delete-mask resolution
 
