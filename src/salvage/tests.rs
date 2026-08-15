@@ -53,9 +53,10 @@ fn salvage_blob_file_drops_the_whole_tail_after_a_resync() -> crate::Result<()> 
 
     let report = salvage_blob_file(&source, dest, &fs, 0, &default_comparator())?;
     // aaaa recovered; bbbb drops (header CRC) and arms the resync taint; cccc is
-    // the frame reached immediately by the byte scan (unproven boundary) and
-    // dddd is chained from cccc's equally-unproven length; BOTH drop. Only the
-    // frame BEFORE the rot survives.
+    // the first frame reached by the byte scan (unproven boundary). The taint is
+    // sticky, so the walk STOPS there and reports the whole surrendered tail
+    // (cccc and everything chained past it) as ONE drop. Only the frame BEFORE the
+    // rot survives.
     assert_eq!(
         report.records_salvaged, 1,
         "only the frame before the rot is provable; the whole tail after the resync drops: {report:?}",
@@ -71,10 +72,12 @@ fn salvage_blob_file_drops_the_whole_tail_after_a_resync() -> crate::Result<()> 
         report
             .dropped
             .iter()
-            .filter(|d| matches!(&d.reason, BlobDropReason::Corrupt(msg) if msg.contains("resync")))
+            .filter(
+                |d| matches!(&d.reason, BlobDropReason::Corrupt(msg) if msg.contains("surrendered"))
+            )
             .count(),
-        2,
-        "both post-resync frames (cccc and dddd chained from it) drop on their unprovable boundary: {report:?}",
+        1,
+        "the surrendered tail is recorded ONCE, not per tainted frame: {report:?}",
     );
 
     // The recovered copy carries only the single provable record.
@@ -7802,9 +7805,9 @@ fn salvage_blob_file_reports_an_offset_remap_for_every_salvaged_record() -> crat
 
     // Corrupt the SECOND record's value bytes (a checksum break): the scanner
     // re-syncs at the next magic. k2, reached by that byte scan through k1's
-    // damaged bytes, has an unprovable boundary and drops; k3, chained from
-    // k2's equally-unproven length, inherits the sticky taint and drops too. So
-    // only record 0 (before the corruption) survives.
+    // damaged bytes, has an unprovable boundary; the taint is sticky, so the walk
+    // STOPS there and reports the surrendered tail (k2, k3) as ONE drop. So only
+    // record 0 (before the corruption) survives.
     {
         let Some(&second) = source_offsets.get(1) else {
             panic!("second record offset");
@@ -7822,8 +7825,8 @@ fn salvage_blob_file_reports_an_offset_remap_for_every_salvaged_record() -> crat
     assert_eq!(report.records_salvaged, 1, "{report:?}");
     assert_eq!(
         report.dropped.len(),
-        3,
-        "the corrupt record + both unprovable post-resync frames drop: {report:?}"
+        2,
+        "the corrupt record + the surrendered tail (recorded once) drop: {report:?}"
     );
 
     // The remap covers exactly the salvaged records, keyed by their SOURCE
@@ -7931,15 +7934,14 @@ fn salvage_blob_file_drops_a_corrupt_record_and_keeps_the_rest() -> crate::Resul
     let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator())?;
     // The corrupt k1 drops on its checksum, and the scanner then RESYNCS to the
     // next magic. k2's frame is reached by that byte scan through k1's damaged
-    // bytes, so its boundary is UNPROVEN (the magic could be an original
-    // boundary or a nested frame inside k1's value). k3, chained from k2's
-    // equally-unproven length, inherits the sticky taint. Both drop, fail
-    // closed, rather than re-emitting a possibly-fabricated chain. Only k0,
-    // before the corruption, is provable.
+    // bytes, so its boundary is UNPROVEN. The taint is sticky, so the walk STOPS at
+    // k2 and reports the whole surrendered tail (k2 and k3 chained past it) as ONE
+    // drop, rather than re-emitting a possibly-fabricated chain. Only k0, before
+    // the corruption, is provable.
     assert_eq!(
         report.dropped.len(),
-        3,
-        "the corrupt record + both unprovable post-resync frames drop: {report:?}"
+        2,
+        "the corrupt record + the surrendered tail (recorded once) drop: {report:?}"
     );
     assert!(
         matches!(
@@ -7952,14 +7954,16 @@ fn salvage_blob_file_drops_a_corrupt_record_and_keeps_the_rest() -> crate::Resul
         report
             .dropped
             .iter()
-            .filter(|d| matches!(&d.reason, BlobDropReason::Corrupt(m) if m.contains("resync")))
+            .filter(
+                |d| matches!(&d.reason, BlobDropReason::Corrupt(m) if m.contains("surrendered"))
+            )
             .count(),
-        2,
-        "both frames after the resync report an unprovable boundary: {report:?}",
+        1,
+        "the surrendered tail after the resync is recorded ONCE: {report:?}",
     );
     assert_eq!(
         report.records_salvaged, 1,
-        "only k0 is recovered; k1 (corrupt), k2 and k3 (unprovable after the resync) are not"
+        "only k0 is recovered; k1 (corrupt) and the surrendered tail (k2, k3) are not"
     );
 
     // The salvaged file holds only k0: k1 (corrupt) and the whole tainted tail

@@ -2107,13 +2107,23 @@ pub fn salvage_blob_file(
                 // entries pointing inside the damaged region), which is worse
                 // than losing the tail (fail closed on unprovable provenance).
                 Ok(entry) if entry.resynced => {
+                    // The taint is STICKY: every frame from here to EOF inherits the
+                    // same unprovable boundary, so the whole tail is surrendered.
+                    // Record the loss ONCE and STOP the walk. Continuing would
+                    // re-drop each tainted frame (wasted work plus an allocation per
+                    // record) and, worse, keep reading the already-surrendered tail,
+                    // where a TRANSIENT read fault would reach the transient-error
+                    // arm and abort the whole salvage, discarding the valid prefix
+                    // output that needed none of those bytes.
+                    let _ = entry;
                     dropped.push(DroppedBlob {
                         reason: BlobDropReason::Corrupt(
-                            "frame reached by resync after a damaged frame; its boundary \
-                             cannot be proven original"
+                            "tail surrendered at the first resync: every frame past a \
+                             damaged frame has an unprovable boundary, dropped as one"
                                 .to_string(),
                         ),
                     });
+                    break;
                 }
                 // A frame whose CRCs are internally consistent but whose
                 // key_len is ZERO is malformed input (the writer's ingest
