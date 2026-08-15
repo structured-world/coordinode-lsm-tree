@@ -14,11 +14,13 @@
 //! to ~45s of wall-clock; on failure it prints the seed + iteration + corpus
 //! label + byte offset + bit so the exact case reproduces.
 
-#![expect(
-    clippy::unwrap_used,
-    clippy::indexing_slicing,
+#![expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "fuzz test")]
+// `allow`, not `expect`: whether a truncating cast fires depends on the target
+// pointer width (a `u64 as usize` truncates on 32-bit but not 64-bit), so an
+// `expect` would go unfulfilled on some entries of the cross-compile matrix.
+#![allow(
     clippy::cast_possible_truncation,
-    reason = "fuzz test"
+    reason = "fuzz test: intentional narrowing of RNG output"
 )]
 
 use crate::table::{Table, Writer};

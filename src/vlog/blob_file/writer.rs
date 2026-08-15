@@ -7,7 +7,7 @@ use crate::compression::CompressionProvider as _;
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
 
-use super::meta::Metadata;
+use super::meta::{META_VERSION, Metadata};
 use crate::io::BufWriter;
 #[cfg(not(feature = "std"))]
 use crate::io::Write;
@@ -417,7 +417,7 @@ impl Writer {
         // Write metadata
         let metadata = Metadata {
             id: self.blob_file_id,
-            version: 4,
+            version: META_VERSION,
             created_at: unix_timestamp().as_nanos(),
             item_count: self.item_count,
             total_compressed_bytes: self.written_blob_bytes,
