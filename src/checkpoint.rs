@@ -336,6 +336,25 @@ pub fn link_tables(
         // the number of files, so plain adds cannot overflow.
         bytes += written;
         count += 1;
+
+        // A tight-space-restricted table keeps its EXACT recovery bound only in a
+        // sibling `.restrict-bound` sidecar; copy it beside the SST so a checkpoint
+        // that later needs manifest repair recovers the restriction. Without it,
+        // repair of the backup finds a punched SST with no bound and conservatively
+        // discards the live suffix of its first readable block.
+        let src_sidecar = crate::restrict_bound::sidecar_path(&table.path);
+        if table.fs.exists(&src_sidecar)? {
+            let dst_sidecar = crate::restrict_bound::sidecar_path(&dst);
+            bytes += link_or_copy_cross_fs(
+                &table.fs,
+                &src_sidecar,
+                target_fs,
+                &dst_sidecar,
+                sync_mode,
+                use_reflink,
+            )
+            .map_err(crate::Error::from)?;
+        }
     }
     Ok((count, bytes))
 }
