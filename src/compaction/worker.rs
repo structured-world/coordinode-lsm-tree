@@ -1087,9 +1087,15 @@ fn run_tight_space_compaction(
                     // BEFORE the install never commits that restriction, so `rollback`
                     // retracts the published sidecar below, keeping the two states
                     // (indistinguishable on disk) from ever coexisting.
+                    // Register BEFORE the write: `restrict_bound::write` renames the
+                    // temp onto the live path and only THEN syncs the parent dir, so
+                    // a sync failure returns Err with the live sidecar already in
+                    // place. Rollback must retract it; `remove_restrict_sidecar` is
+                    // best-effort, so retracting a sidecar that was never created is
+                    // a harmless no-op.
+                    published_sidecars.push(view.clone());
                     view.write_restrict_sidecar(boundary, opts.config.sync_mode)
                         .map_err(|e| rollback(e, &published_sidecars))?;
-                    published_sidecars.push(view.clone());
                     let restricted = view
                         .reopen_restricted(boundary.clone())
                         .map_err(|e| rollback(e, &published_sidecars))?;
