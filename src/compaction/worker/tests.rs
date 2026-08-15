@@ -547,6 +547,94 @@ fn tight_space_rolls_back_finalized_outputs_when_the_sidecar_write_fails() -> cr
     Ok(())
 }
 
+/// When the tight-space loop publishes one input's `.restrict-bound` sidecar and
+/// then a LATER step in the same pre-install slice fails, the published sidecar
+/// must be RETRACTED, not left beside its still-unpunched input. The install never
+/// commits (so the punch never arms), and a later manifest rebuild honors a valid
+/// sidecar even over an unpunched SST under the default policy, so it would
+/// discard every key below an uncommitted boundary. Here the SECOND sidecar
+/// publish is
+/// faulted so the FIRST is already on disk; after the abort no `.restrict-bound`
+/// may survive.
+#[test]
+fn tight_space_retracts_published_sidecars_when_a_later_slice_step_fails() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let capfs = capfs::CapacityFs::new();
+    let fault = FaultFs::new(capfs.clone());
+    let injector = fault.injector();
+    let shared: Arc<dyn crate::fs::Fs> = Arc::new(fault);
+
+    let config = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_shared_fs(Arc::clone(&shared));
+    let tree = match config.open()? {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    // Two flushed inputs that BOTH straddle the tight-space boundary, so the slice
+    // loop publishes two sidecars: the first succeeds, the second is faulted.
+    for i in 0..TIGHT_SPACE_KEYS {
+        tree.insert(tight_space_key(i).as_bytes(), vec![0xCDu8; 64], i);
+    }
+    tree.flush_active_memtable(0)?;
+    for i in 0..TIGHT_SPACE_KEYS {
+        tree.insert(
+            tight_space_key(i).as_bytes(),
+            vec![0xEFu8; 64],
+            TIGHT_SPACE_KEYS + i,
+        );
+    }
+    tree.flush_active_memtable(0)?;
+    let used = tree.storage_stats()?.used_bytes;
+
+    let tables_dir = dir.path().join(crate::file::TABLES_FOLDER);
+    let sidecar_count = || -> usize {
+        std::fs::read_dir(&tables_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".restrict-bound"))
+            .count()
+    };
+
+    capfs.set_available_space(used / 4);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = true;
+    })?;
+    // Let the FIRST sidecar publish through; fault the SECOND one's temp create.
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
+            .on_path("restrict-bound")
+            .skip(1)
+            .once(),
+    );
+
+    let result = tree.major_compact(64 * 1024 * 1024, 0);
+    assert!(
+        matches!(&result, Err(crate::Error::Io(e)) if e.kind() == ErrorKind::Other),
+        "the tight-space compaction must abort with the injected 2nd-sidecar fault, \
+         got {result:?}",
+    );
+
+    // The first sidecar was published before the abort; the rollback must have
+    // retracted it. No `.restrict-bound` may linger over an uncommitted boundary.
+    assert_eq!(
+        sidecar_count(),
+        0,
+        "a published `.restrict-bound` sidecar was orphaned after the slice aborted \
+         pre-install, leaving an uncommitted boundary a later repair would honor",
+    );
+    Ok(())
+}
+
 /// A KV-separated tight-space compaction that RELOCATES a fragmented blob
 /// file in slices and crashes after the first slice must reopen consistently:
 /// the relocated entries (now in fresh compact files referenced by the

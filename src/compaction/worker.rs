@@ -1039,12 +1039,24 @@ fn run_tight_space_compaction(
             // the space until the next open's orphan sweep. Tight-space runs exactly
             // when free space is scarce, so an ENOSPC here would otherwise both abort
             // the reclaim and hold the bytes this slice just consumed.
-            let rollback = |e: crate::Error| -> crate::Error {
+            // Pre-install rollback. The slice's finalized outputs/blobs are still
+            // unreferenced (no version points at them), and any `.restrict-bound`
+            // this slice already published sits beside a still-UNPUNCHED input (the
+            // punch is armed only AFTER a successful install below). Both must be
+            // retracted on any failure before the install commits: the outputs so the
+            // scarce space is not pinned until the next orphan sweep, and the
+            // sidecars so a later manifest rebuild does not honor an uncommitted
+            // boundary against the unpunched input and drop its live prefix.
+            let mut published_sidecars: Vec<Table> = Vec::new();
+            let rollback = |e: crate::Error, published: &[Table]| -> crate::Error {
                 for t in &outputs {
                     t.mark_as_deleted();
                 }
                 for b in &blobs_for_cleanup {
                     b.mark_as_deleted();
+                }
+                for v in published {
+                    v.remove_restrict_sidecar(opts.config.sync_mode);
                 }
                 e
             };
@@ -1060,22 +1072,23 @@ fn run_tight_space_compaction(
                     // Publish the restriction bound to the input's `.restrict-bound`
                     // sidecar BEFORE the punch, so manifest repair can recover the
                     // exact bound. The sidecar is a SEPARATE file written through an
-                    // atomic `temp + rename`, so — unlike an in-place meta edit — the
+                    // atomic `temp + rename`, so (unlike an in-place meta edit) the
                     // SST bytes are never touched: its manifest whole-file checksum
                     // stays valid in every crash window, and there are no two mirrors
-                    // to diverge. A crash before the install below leaves the sidecar
-                    // present beside an unpunched, unmodified SST; repair only trusts
-                    // it once it independently confirms the prefix is punched, so the
-                    // stray sidecar is harmless (a re-run overwrites it atomically).
-                    // A crash AFTER the install but BEFORE the punch leaves a VALID
-                    // sidecar beside a still-unpunched SST. On a manifest rebuild that
-                    // state is indistinguishable from a pre-install stray, so repair
-                    // fails CLOSED (quarantine for manual recovery) rather than guess:
-                    // it never opens such an SST unrestricted, which would resurrect
-                    // the superseded prefix the punch was about to reclaim.
+                    // to diverge. A crash AFTER the install but BEFORE the punch leaves
+                    // a VALID sidecar beside a still-unpunched SST; that is the
+                    // committed-restriction-not-yet-reclaimed window, and repair
+                    // correctly honors the bound (restrict, dropping the prefix the
+                    // punch was about to reclaim) under the default policy. A failure
+                    // BEFORE the install never commits that restriction, so `rollback`
+                    // retracts the published sidecar below, keeping the two states
+                    // (indistinguishable on disk) from ever coexisting.
                     view.write_restrict_sidecar(boundary, opts.config.sync_mode)
-                        .map_err(rollback)?;
-                    let restricted = view.reopen_restricted(boundary.clone()).map_err(rollback)?;
+                        .map_err(|e| rollback(e, &published_sidecars))?;
+                    published_sidecars.push(view.clone());
+                    let restricted = view
+                        .reopen_restricted(boundary.clone())
+                        .map_err(|e| rollback(e, &published_sidecars))?;
                     restricted_pairs.push((view.id(), restricted.clone()));
                     next_views.push(restricted);
                 }
@@ -1105,13 +1118,11 @@ fn run_tight_space_compaction(
                 opts.encryption.clone(),
             );
             if let Err(e) = install {
-                for t in &outputs {
-                    t.mark_as_deleted();
-                }
-                for b in &blobs_for_cleanup {
-                    b.mark_as_deleted();
-                }
-                return Err(e);
+                // The install did not commit, so the punches below never arm: retract
+                // the outputs AND the published sidecars, exactly as the pre-install
+                // loop failures do, so no uncommitted bound survives on an unpunched
+                // input.
+                return Err(rollback(e, &published_sidecars));
             }
 
             // Arm each surviving prior SST view to punch its consumed prefix on

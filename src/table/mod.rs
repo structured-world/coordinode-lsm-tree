@@ -3329,6 +3329,16 @@ impl Table {
         )
     }
 
+    /// Best-effort removal of this table's `.restrict-bound` sidecar, undoing a
+    /// [`write_restrict_sidecar`](Self::write_restrict_sidecar). Used to retract a
+    /// bound a tight-space slice published but never committed (the slice aborted
+    /// before its version install), so a later manifest rebuild does not honor an
+    /// uncommitted boundary against the still-unpunched SST.
+    #[cfg(feature = "std")]
+    pub(crate) fn remove_restrict_sidecar(&self, sync_mode: crate::fs::SyncMode) {
+        crate::restrict_bound::remove(&*self.fs, &self.path, sync_mode);
+    }
+
     /// Reads one data block's RAW on-disk bytes and reports whether they are all
     /// zero — the signature of a hole-punched (reclaimed) block. Used to
     /// authenticate a restriction against physical punch evidence: a real punch
