@@ -1051,16 +1051,37 @@ fn run_tight_space_compaction(
             // scarce space is not pinned until the next orphan sweep, and the
             // sidecars so a later manifest rebuild does not honor an uncommitted
             // boundary against the unpunched input and drop its live prefix.
-            let mut published_sidecars: Vec<Table> = Vec::new();
-            let rollback = |e: crate::Error, published: &[Table]| -> crate::Error {
+            // Each entry is (input view, its PRIOR committed sidecar bound). On
+            // rollback the sidecar is restored to that prior value (or removed when
+            // there was none) DURABLY, not merely deleted: a later slice tightens an
+            // already-punched input's bound B1 -> B2, and deleting the sidecar would
+            // make manifest repair derive a conservative bound past B1, discarding
+            // the live rows in [B1, first-fully-live-block).
+            let mut published_sidecars: Vec<(Table, Option<alloc::vec::Vec<u8>>)> = Vec::new();
+            let rollback = |e: crate::Error,
+                            published: &[(Table, Option<alloc::vec::Vec<u8>>)]|
+             -> crate::Error {
                 for t in &outputs {
                     t.mark_as_deleted();
                 }
                 for b in &blobs_for_cleanup {
                     b.mark_as_deleted();
                 }
-                for v in published {
-                    v.remove_restrict_sidecar(opts.config.sync_mode);
+                for (v, prior) in published {
+                    // Durable + acknowledged: a retraction that does not land is
+                    // logged (not silently swallowed), since an uncommitted bound
+                    // surviving beside an unpunched input would let repair drop the
+                    // input's live prefix.
+                    if let Err(re) = v
+                        .restore_or_remove_restrict_sidecar(prior.as_deref(), opts.config.sync_mode)
+                    {
+                        log::error!(
+                            "tight-space rollback could not durably restore/retract the \
+                             restrict-bound sidecar for table {}: {re}; the next compaction \
+                             rewrites it",
+                            v.id(),
+                        );
+                    }
                 }
                 e
             };
@@ -1087,13 +1108,17 @@ fn run_tight_space_compaction(
                     // BEFORE the install never commits that restriction, so `rollback`
                     // retracts the published sidecar below, keeping the two states
                     // (indistinguishable on disk) from ever coexisting.
-                    // Register BEFORE the write: `restrict_bound::write` renames the
+                    // Capture the PRIOR committed bound BEFORE overwriting, and
+                    // register BEFORE the write: `restrict_bound::write` renames the
                     // temp onto the live path and only THEN syncs the parent dir, so
                     // a sync failure returns Err with the live sidecar already in
-                    // place. Rollback must retract it; `remove_restrict_sidecar` is
-                    // best-effort, so retracting a sidecar that was never created is
-                    // a harmless no-op.
-                    published_sidecars.push(view.clone());
+                    // place. Rollback must restore the prior (or retract when there
+                    // was none); restoring the same value, or retracting a sidecar
+                    // that was never created, is harmless.
+                    let prior_bound = view
+                        .read_restrict_sidecar_bound()
+                        .map_err(|e| rollback(e, &published_sidecars))?;
+                    published_sidecars.push((view.clone(), prior_bound));
                     view.write_restrict_sidecar(boundary, opts.config.sync_mode)
                         .map_err(|e| rollback(e, &published_sidecars))?;
                     let restricted = view

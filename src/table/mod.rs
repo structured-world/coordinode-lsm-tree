@@ -3329,14 +3329,51 @@ impl Table {
         )
     }
 
-    /// Best-effort removal of this table's `.restrict-bound` sidecar, undoing a
-    /// [`write_restrict_sidecar`](Self::write_restrict_sidecar). Used to retract a
-    /// bound a tight-space slice published but never committed (the slice aborted
-    /// before its version install), so a later manifest rebuild does not honor an
-    /// uncommitted boundary against the still-unpunched SST.
+    /// Reads this table's currently-published restriction bound, if a valid
+    /// sidecar for THIS table id exists. `None` when it is absent, corrupt, or
+    /// carries a different id. Captured BEFORE a slice overwrites the sidecar so a
+    /// rollback can restore the prior committed value.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a sidecar read failure (transient or persistent I/O).
     #[cfg(feature = "std")]
-    pub(crate) fn remove_restrict_sidecar(&self, sync_mode: crate::fs::SyncMode) {
-        crate::restrict_bound::remove(&*self.fs, &self.path, sync_mode);
+    pub(crate) fn read_restrict_sidecar_bound(&self) -> crate::Result<Option<alloc::vec::Vec<u8>>> {
+        match crate::restrict_bound::read(&*self.fs, &self.path, self.encryption.as_deref())? {
+            crate::restrict_bound::SidecarRead::Present(id, bound) if id == self.metadata.id => {
+                Ok(Some(bound))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Restores a previously-captured sidecar bound, or DURABLY removes the
+    /// sidecar when there was none. A rollback of an aborted tight-space slice
+    /// uses this to put each input's sidecar back to its last committed value (or
+    /// none), so a later manifest rebuild never honors the uncommitted bound the
+    /// slice wrote. The write and the removal are both durably synced.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a durable write or removal failure so the caller can
+    /// acknowledge (rather than silently ignore) a retraction that did not land.
+    #[cfg(feature = "std")]
+    pub(crate) fn restore_or_remove_restrict_sidecar(
+        &self,
+        prior: Option<&[u8]>,
+        sync_mode: crate::fs::SyncMode,
+    ) -> crate::Result<()> {
+        match prior {
+            Some(bound) => crate::restrict_bound::write(
+                &*self.fs,
+                &self.path,
+                self.encryption.as_deref(),
+                self.metadata.id,
+                bound,
+                sync_mode,
+            ),
+            None => crate::restrict_bound::remove_durable(&*self.fs, &self.path, sync_mode),
+        }
     }
 
     /// Reads one data block's RAW on-disk bytes and reports whether they are all
