@@ -261,7 +261,7 @@ inspection, or rollback to a known-good point.
   recovering "all rows live" would resurrect deleted rows — unless explicitly
   opted in (`SalvageOptions::allow_delete_resurrection`, `sst-dump salvage
   --allow-delete-resurrection`).
-- **`salvage::salvage_blob_file(src, dest, &fs, id, &comparator) -> BlobSalvageReport`**:
+- **`salvage::salvage_blob_file(src, dest, &fs, id, &comparator) -> crate::Result<BlobSalvageReport>`**:
   record-granular salvage of one blob (vlog) file. The `comparator` must be the
   SAME `SharedComparator` the source tree was written with (pass the tree's
   configured comparator, or `comparator::default_comparator()` for the default

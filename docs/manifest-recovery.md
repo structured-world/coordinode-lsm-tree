@@ -14,7 +14,11 @@ makes a deterministic choice governed by a single policy: whether to keep data
 that would otherwise be **resurrected**, i.e. made visible again after the
 tombstone or restriction that hid it was lost, or to drop it. That policy is the
 `allow_resurrection` flag; it defaults to *drop* (never resurrect), and it is the
-only knob a recovery ever exposes.
+only knob a recovery ever exposes. It is set through
+`Config::repair_with_resurrection(salvage, allow_resurrection)` (the plain
+`repair` and `repair_with_salvage` entry points default it to *drop*), and it
+forwards to `SalvageOptions::allow_delete_resurrection` for the delete-mask
+decision, so one flag governs both the restriction prefix and the delete mask.
 
 ## Invariants
 

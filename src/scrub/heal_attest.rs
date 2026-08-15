@@ -98,6 +98,11 @@ fn deserialize(plain: &[u8]) -> Option<(u8, u64, u128, u128)> {
 /// write, instead of being truncated in place and destroyed, which would leave
 /// a healed SST with a stale manifest digest and no valid attestation, forever
 /// unreconcilable.
+///
+/// The temp is ALWAYS fully synced with `sync_all`, regardless of
+/// [`Config::sync_mode`](crate::Config): the attestation is a crash-recovery
+/// anchor (recovery reconciles a healed table's digest through it), so it must be
+/// durable before the rename even when the tree runs at a relaxed sync mode.
 fn write_sidecar(
     fs: &dyn Fs,
     table_path: &Path,
