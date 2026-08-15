@@ -1770,17 +1770,17 @@ fn repair_salvages_a_restricted_punched_sst_with_a_corrupt_suffix() -> crate::Re
     Ok(())
 }
 
-/// A TRANSIENT fault while re-imposing the restriction on a salvaged output (here
-/// the re-restriction sidecar write) must restore the quarantined original and
-/// propagate for retry, never leave the unpunched, sidecar-less salvaged
-/// replacement in place: a later recovery would open THAT unrestricted and
-/// resurrect the sub-bound rows. The retry then recovers the table restricted.
-#[test]
-fn repair_restores_the_original_when_re_restriction_faults_transiently() -> crate::Result<()> {
-    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, FsOpenOptions, MemFs};
-    use crate::io::ErrorKind;
+/// Builds a punched, restricted SST at `tables/0` whose first LIVE (straddling)
+/// block is corrupt, the shape that drives repair through salvage and forces it to
+/// re-impose the restriction on the salvaged output. Returns the state-sharing
+/// `MemFs` and the absolute root. The re-restriction-fault tests below arm a fault
+/// on the sidecar write and assert the quarantined original is restored.
+#[cfg(feature = "std")]
+fn build_restricted_corrupt_sst()
+-> crate::Result<(std::sync::Arc<crate::fs::MemFs>, std::path::PathBuf)> {
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
     use crate::table::Writer;
-    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use crate::{InternalValue, ValueType};
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::Arc;
 
@@ -1817,13 +1817,29 @@ fn repair_restores_the_original_when_re_restriction_faults_transiently() -> crat
         f.write_all(&[0xFFu8])?;
         f.sync_all()?;
     }
+    Ok((memfs, root))
+}
 
-    // Fault the RE-RESTRICTION sidecar write (the SECOND `.restrict-bound` open;
-    // the first is repair reading the recorded bound) with a TRANSIENT error, so
-    // salvage succeeds but re-imposing the restriction faults mid-way.
+/// A fault (of the given kind) on the RE-RESTRICTION sidecar write (the SECOND
+/// `.restrict-bound` open; the first is repair reading the recorded bound) must
+/// restore the quarantined original and propagate, never leave the unpunched,
+/// sidecar-less salvaged replacement in place: a later recovery would open THAT
+/// unrestricted and resurrect the sub-bound rows. This must hold for a PERSISTENT
+/// failure (ENOSPC-class) as well as a transient one, since the retry cannot
+/// re-derive the bound from a fresh unpunched output.
+#[cfg(feature = "std")]
+fn assert_re_restriction_fault_restores_the_original(
+    fault_kind: crate::io::ErrorKind,
+) -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs};
+    use crate::{Config, SequenceNumberCounter};
+
+    let (memfs, root) = build_restricted_corrupt_sst()?;
+    let sst = root.join("tables").join("0");
+
     let fault = FaultFs::new(memfs.as_ref().clone());
     fault.injector().arm(
-        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Interrupted))
+        FaultRule::new(FaultOp::Open, Fault::Error(fault_kind))
             .on_path("restrict-bound")
             .skip(1)
             .once(),
@@ -1837,8 +1853,8 @@ fn repair_restores_the_original_when_re_restriction_faults_transiently() -> crat
     .with_fs(fault)
     .repair_with_salvage(true);
     assert!(
-        matches!(&result, Err(crate::Error::Io(e)) if e.kind() == ErrorKind::Interrupted),
-        "a transient re-restriction fault must propagate for retry, got {result:?}",
+        matches!(&result, Err(crate::Error::Io(e)) if e.kind() == fault_kind),
+        "the re-restriction fault must propagate, got {result:?}",
     );
 
     // The distinguishing evidence of the restore: NO stranded original is left in
@@ -1847,15 +1863,27 @@ fn repair_restores_the_original_when_re_restriction_faults_transiently() -> crat
     // copy no retry under `tables/` can ever reach.
     assert!(
         !memfs.exists(&root.join("repair-quarantine").join("0"))?,
-        "the transient fault must restore the original, leaving nothing in quarantine",
+        "the fault must restore the original, leaving nothing in quarantine",
     );
     assert!(
         memfs.exists(&sst)?,
         "the original SST is back at its table path after the restore",
     );
+    Ok(())
+}
+
+/// A TRANSIENT fault re-imposing the restriction on a salvaged output restores the
+/// quarantined original and propagates for retry. The retry then recovers the
+/// table restricted, with no sub-bound resurrection.
+#[test]
+fn repair_restores_the_original_when_re_restriction_faults_transiently() -> crate::Result<()> {
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+
+    assert_re_restriction_fault_restores_the_original(ErrorKind::Interrupted)?;
 
     // The retry (no fault) recovers the table restricted: no sub-bound resurrection.
-    use crate::AbstractTree;
+    let (memfs, root) = build_restricted_corrupt_sst()?;
     let report = Config::new(
         &root,
         SequenceNumberCounter::default(),
@@ -1879,6 +1907,18 @@ fn repair_restores_the_original_when_re_restriction_faults_transiently() -> crat
         "no sub-bound key resurrects after the retry",
     );
     Ok(())
+}
+
+/// The PERSISTENT counterpart: an ENOSPC-class (non-transient) fault re-imposing
+/// the restriction must ALSO restore the quarantined original, not only transient
+/// ones. Recovery cannot re-derive the bound from the fresh unpunched salvaged
+/// output, so leaving it in place would let a retry install it UNRESTRICTED and
+/// resurrect the sub-bound rows.
+#[test]
+fn repair_restores_the_original_when_re_restriction_faults_persistently() -> crate::Result<()> {
+    use crate::io::ErrorKind;
+
+    assert_re_restriction_fault_restores_the_original(ErrorKind::Other)
 }
 
 /// Asserts a punched SST at `tables/0` was recovered RESTRICTED to the exact

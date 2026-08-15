@@ -1007,12 +1007,14 @@ fn try_salvage_table(
 /// salvaged table is kept whole and any stale sidecar cleared, since a lingering
 /// sidecar would wrongly restrict the unpunched replacement on a later repair.
 ///
-/// A TRANSIENT failure re-imposing the restriction (sidecar write or restricted
-/// reopen) restores the quarantined original to `table_path` before propagating,
-/// mirroring the salvage-error path: otherwise the unpunched, sidecar-less
-/// salvaged replacement would be left in place, and a retry would recover it
-/// UNRESTRICTED and resurrect the sub-bound rows. A persistent failure propagates
-/// as-is (the retry would fault the same way).
+/// ANY failure re-imposing the restriction (sidecar write or restricted reopen)
+/// restores the quarantined original to `table_path` before propagating, mirroring
+/// the salvage-error path. Otherwise the unpunched, sidecar-less salvaged
+/// replacement would be left in place, and a retry would recover it UNRESTRICTED
+/// and resurrect the sub-bound rows. This holds for a PERSISTENT failure
+/// (an ENOSPC on the sidecar write) as much as a transient one: the retry cannot
+/// re-derive the bound from a fresh unpunched output, so the punched original must
+/// be back in place for it to re-salvage and re-restrict from.
 #[cfg(feature = "std")]
 fn restrict_salvaged_output(
     folder_fs: &dyn crate::fs::Fs,
@@ -1037,11 +1039,17 @@ fn restrict_salvaged_output(
             .and_then(|()| salvaged.reopen_restricted(bound));
             match restricted {
                 Ok(table) => Ok(table),
-                Err(e) if is_transient_io(&e) => {
+                Err(e) => {
+                    // Restore on EVERY failure, transient or persistent: the
+                    // salvaged replacement sits at `table_path` unpunched with no
+                    // valid sidecar, so a retry that finds it there recovers it
+                    // UNRESTRICTED and resurrects the sub-bound rows. Putting the
+                    // punched original back lets the retry re-salvage and
+                    // re-restrict from a known state (a `rename` needs no free
+                    // space, so it survives the ENOSPC that may have caused `e`).
                     restore_quarantined(folder_fs, quarantined, table_path, config.sync_mode)?;
                     Err(e)
                 }
-                Err(e) => Err(e),
             }
         }
         _ => {
