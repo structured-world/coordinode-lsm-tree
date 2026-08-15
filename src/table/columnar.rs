@@ -58,6 +58,7 @@
 //!   segment that carries the column returns it. Mixed old/new segments thus
 //!   coexist with no migration step.
 
+use crate::table::zone_map::ColumnStats;
 use crate::{Error, Result, Slice, ValueType, key::InternalKey, value::InternalValue};
 use alloc::vec::Vec;
 
@@ -449,6 +450,63 @@ impl ColumnBatch {
             .sum()
     }
 
+    /// Per-column zone-map statistics for this block: one [`ColumnStats`] entry
+    /// per [`TypeTag::Bytes`] column, in column order.
+    ///
+    /// A `Bytes` column's comparable encoding is its raw value bytes, so `min` /
+    /// `max` are the byte-wise minimum / maximum over the column's non-null rows
+    /// (an all-null column records an empty range and its null count).
+    /// Fixed-width columns are omitted: their comparable encoding is not yet
+    /// defined (they are not row-filterable either), and recording a raw-byte
+    /// min / max could mis-order them and let a block-skip drop matching rows.
+    /// Omitting them keeps
+    /// [`can_skip_block`](super::columnar_predicate::ColumnRangePredicate::can_skip_block)
+    /// conservative for those columns (no entry means the block is never
+    /// skipped on them).
+    ///
+    /// The table writer records these for every columnar block, and
+    /// `verify_zone_map` re-derives them from the decoded block to authenticate
+    /// the recorded section, so the two computations must stay identical.
+    #[must_use]
+    pub(crate) fn zone_stats(&self) -> Vec<ColumnStats> {
+        let rows = self.row_count;
+        let mut stats = Vec::new();
+        for col in &self.columns {
+            let TypeTag::Bytes = col.type_tag else {
+                continue;
+            };
+            let mut min: Option<&[u8]> = None;
+            let mut max: Option<&[u8]> = None;
+            // Bounded by `rows` (a u32), so the count never overflows.
+            let mut null_count: u32 = 0;
+            for i in 0..rows {
+                if !column_row_valid(col, i) {
+                    null_count += 1;
+                    continue;
+                }
+                let Ok(value) = bytes_column_row(&col.data, rows, i) else {
+                    continue;
+                };
+                if min.is_none_or(|m| value < m) {
+                    min = Some(value);
+                }
+                if max.is_none_or(|m| value > m) {
+                    max = Some(value);
+                }
+            }
+            stats.push(ColumnStats {
+                column_id: u32::from(col.column_id),
+                type_tag: TypeTag::Bytes.to_wire().0,
+                codec_id: 0,
+                null_count,
+                row_count: rows,
+                min: min.unwrap_or(&[]).to_vec(),
+                max: max.unwrap_or(&[]).to_vec(),
+            });
+        }
+        stats
+    }
+
     /// Appends `other`'s rows after this batch's, in place, so a sequence of
     /// small ingest batches can accumulate into one rowgroup before a block is
     /// written. The two batches must share the same columns (id + type) in the
@@ -757,6 +815,19 @@ fn build_bytes_column<'a>(rows: impl Iterator<Item = &'a [u8]>) -> Result<Vec<u8
     }
     offsets.extend_from_slice(&payload);
     Ok(offsets)
+}
+
+/// Whether row `i` of `col` is valid (non-null): a column with no validity
+/// bitmap has every row valid; otherwise a set bit (LSB-first) means valid.
+fn column_row_valid(col: &Column, i: u32) -> bool {
+    match &col.validity {
+        None => true,
+        Some(bits) => {
+            let idx = i as usize;
+            bits.get(idx / 8)
+                .is_some_and(|byte| byte & (1u8 << (idx % 8)) != 0)
+        }
+    }
 }
 
 /// Reads row `i` of a [`TypeTag::Bytes`] column body (offset table + payload),

@@ -44,7 +44,15 @@ fn drain_blobs<I: Iterator<Item = crate::Result<(ScanEntry, BlobFileId)>>>(
         let (entry, blob_file_id) = blob?;
 
         assert!(entry.key <= key, "vptr was not matched with blob");
-        record_consumed(blob_file_id, entry.frame_end);
+        // A RESYNCED entry's boundary is unproven (see `ScanEntry::resynced`):
+        // advancing the reclaim frontier to its `frame_end` could punch past —
+        // and then skip on resume — a later frame that is actually valid. Drop
+        // the tainted entry WITHOUT advancing the frontier, so a resumed scan
+        // re-reads from the last proven boundary (fail closed). The matched-vptr
+        // relocation path refuses a resynced frame outright for the same reason.
+        if !entry.resynced {
+            record_consumed(blob_file_id, entry.frame_end);
+        }
     }
 
     Ok(())
@@ -347,6 +355,14 @@ pub(super) fn install_merge(
 
     let tables_out = created_tables.len();
 
+    // Install the tree-wide deletion pause on every output BEFORE the version edit
+    // makes it visible. A flush registers this via `register_tables`; a compaction
+    // installs its outputs here, so without this an output's in-place heal would
+    // skip the checkpoint mutation window and could race a checkpoint hard-link.
+    for table in &created_tables {
+        table.install_deletion_pause(alloc::sync::Arc::clone(&opts.deletion_pause));
+    }
+
     // Globally-dead blob files are dropped once, from the install-time version.
     let current_version = super_version.latest_version();
     for blob_file in current_version.version.blob_files.iter() {
@@ -523,6 +539,19 @@ impl CompactionFlavour for RelocatingCompaction {
                     blob_entry.offset, indirection.vhandle.offset,
                     "matched blob has different offset than vptr",
                 );
+
+                // A RESYNCHRONIZED frame was reached by a byte-wise scan after
+                // damage: its boundary is unproven (the magic may sit inside a
+                // damaged record's user-controlled bytes, and every frame chained
+                // past it inherits that unanchored start). Relocating it would
+                // rewrite fabricated bytes as a genuine record. `salvage_blob_file`
+                // drops such frames; relocation must fail closed the same way.
+                if blob_entry.resynced {
+                    return Err(crate::Error::InvalidHeader(
+                        "resynchronized blob frame reached after damage; refusing to \
+                         relocate a record whose boundary cannot be proven original",
+                    ));
+                }
 
                 // Advance the consumed frontier past this relocated frame so the
                 // tight-space loop can punch / resume here once the slice installs.

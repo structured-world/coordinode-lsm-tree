@@ -52,20 +52,18 @@
 /// 2. If that layer's current value has shipped to crates.io,
 ///    add a new variant / constant instead of amending in place.
 /// 3. The OTHER layer's value stays unless its layer also changed.
+/// ## Supported versions
+///
+/// **V5 is the ONLY supported on-disk format.** The engine neither reads
+/// nor migrates pre-V5 layouts: there are no legacy decode paths, no
+/// upgrade tooling, and no backward-compat variations anywhere in the
+/// codebase. Discriminants 1–4 are reserved history — opening a tree that
+/// carries one fails with [`crate::Error::InvalidVersion`] at the manifest
+/// gate. The same single-format rule applies to every subsidiary format
+/// (blob frames, manifest layout): each has exactly one readable shape,
+/// the one the current writer emits.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum FormatVersion {
-    /// Version for 1.x.x releases
-    V1 = 1,
-
-    /// Version for 2.x.x releases
-    V2,
-
-    /// Version for 3.x.x releases
-    V3,
-
-    /// Version for range-tombstone SST semantics
-    V4,
-
     /// Two on-disk changes shipped together in this format version
     /// (V5 had not been released when both landed, so they collapse
     /// into the same version bump):
@@ -94,10 +92,10 @@ pub enum FormatVersion {
     ///    fails fast at block header decode rather than misreading the
     ///    new layout.
     ///
-    /// V3 / V4 ↔ V5 incompatibility is enforced primarily by the
+    /// Pre-V5 ↔ V5 incompatibility is enforced primarily by the
     /// manifest version gate at `Tree::open` (returns
     /// `InvalidVersion` for anything other than V5).
-    V5,
+    V5 = 5,
 }
 
 impl core::fmt::Display for FormatVersion {
@@ -109,10 +107,6 @@ impl core::fmt::Display for FormatVersion {
 impl From<FormatVersion> for u8 {
     fn from(value: FormatVersion) -> Self {
         match value {
-            FormatVersion::V1 => 1,
-            FormatVersion::V2 => 2,
-            FormatVersion::V3 => 3,
-            FormatVersion::V4 => 4,
             FormatVersion::V5 => 5,
         }
     }
@@ -121,12 +115,12 @@ impl From<FormatVersion> for u8 {
 impl TryFrom<u8> for FormatVersion {
     type Error = ();
 
+    /// Only the V5 discriminant decodes. Discriminants 1–4 named retired
+    /// formats no shipped reader supports; they fail here so the manifest
+    /// gate reports `InvalidVersion` instead of any code path pretending
+    /// a legacy layout is readable.
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            1 => Ok(Self::V1),
-            2 => Ok(Self::V2),
-            3 => Ok(Self::V3),
-            4 => Ok(Self::V4),
             5 => Ok(Self::V5),
             _ => Err(()),
         }

@@ -67,6 +67,17 @@ pub enum ErrorKind {
 }
 
 impl ErrorKind {
+    /// Whether this kind is an unambiguously TRANSIENT (retryable) I/O failure:
+    /// only [`Interrupted`](Self::Interrupted) (EINTR) and
+    /// [`WouldBlock`](Self::WouldBlock) (EAGAIN). Everything else — including the
+    /// ambiguous [`Other`](Self::Other), which real `EIO` and platform-specific
+    /// structural errors (e.g. a Windows negative-seek on a corrupt file) both
+    /// map to — is treated as persistent / structural. Shared so the repair and
+    /// integrity-verify paths classify I/O failures identically.
+    pub(crate) fn is_transient(self) -> bool {
+        matches!(self, Self::Interrupted | Self::WouldBlock)
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::AlreadyExists => "entity already exists",

@@ -387,6 +387,29 @@ impl AbstractTree for BlobTree {
         self.index.current_version()
     }
 
+    #[cfg(feature = "std")]
+    fn refresh_table_checksum(
+        &self,
+        table_id: crate::TableId,
+        checksum: crate::checksum::Checksum,
+        expected_restriction: Option<&crate::UserKey>,
+    ) -> crate::Result<bool> {
+        // Tables live in the index tree's version; blob files carry no
+        // manifest digest.
+        self.index
+            .refresh_table_checksum(table_id, checksum, expected_restriction)
+    }
+
+    fn sync_mode(&self) -> crate::fs::SyncMode {
+        // SSTs live in the index tree; its durability mode governs them.
+        self.index.sync_mode()
+    }
+
+    fn prefix_extractor(&self) -> Option<alloc::sync::Arc<dyn crate::prefix::PrefixExtractor>> {
+        // The prefix filter is built over the index tree's SST keys.
+        self.index.prefix_extractor()
+    }
+
     fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
         // Forward the index tree's compaction state (the default impl would
         // always report idle), and mark value bytes as NOT user values: large

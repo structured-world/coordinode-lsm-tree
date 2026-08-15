@@ -210,7 +210,7 @@ jobs:
         if: needs.changes.outputs.code == 'false'
         run: |
           echo "::notice::No code paths changed — skipping format + clippy. Required-check name still emitted as success."
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         if: needs.changes.outputs.code != 'false'
         with:
           persist-credentials: false
@@ -283,7 +283,7 @@ jobs:
         if: needs.changes.outputs.code != 'false' && needs.lint.result != 'success'
         run: |
           echo "::notice::Lint failed (result=${{ needs.lint.result }}) — skipping test work to avoid duplicate noise on an already-failed PR. Required-check name still emitted; fix the lint failure to unblock real test runs."
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         with:
           persist-credentials: false
@@ -327,6 +327,49 @@ jobs:
         working-directory: tools/sst-dump
         run: cargo nextest run
 
+  fuzz-heal:
+    # Reproducible single-byte-bitrot fuzzer over the SST read / heal path:
+    # flips one bit in a corpus of SSTs (varied block size, per-KV checksum,
+    # columnar, compression, encryption, Page-ECC) for a fixed ~45s budget and
+    # asserts the read path never panics and never returns a wrong value (a
+    # flipped block heals via ECC or fails its checksum, never silent corruption).
+    # `#[ignore]`d, so it is excluded from the normal `test` job and run here with
+    # `--run-ignored=only`. Ubuntu-only (the invariant is platform-independent);
+    # not a required check.
+    needs: [changes, lint]
+    if: ${{ needs.changes.outputs.code != 'false' && needs.lint.result == 'success' }}
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          prefix-key: ubuntu-cargo
+      - uses: taiki-e/install-action@1ef5c5f58e85d25baaaa1704478fdd6c2921f2b5  # nextest
+      - name: Run bitrot heal fuzzer
+        # Pin the reproducer directory explicitly so the test's dump location does
+        # not depend on the process working directory (robust if the crate ever
+        # moves into a workspace subdirectory). The dump step reads the same path.
+        env:
+          FUZZ_HEAL_REPRO_DIR: ${{ github.workspace }}
+        run: cargo nextest run --profile ci --all-features --run-ignored=only -E 'test(fuzz_heal_bitrot)'
+      - name: Dump reproducer on failure
+        if: failure()
+        # The corpus is not byte-deterministic (encrypted / timestamped SSTs), so
+        # the seed alone cannot replay a failure in those. The test writes the
+        # EXACT failing SST to `fuzz_heal_repro.sst`; surface it (base64) in the
+        # log so the case reproduces directly, no artifact upload needed.
+        env:
+          FUZZ_HEAL_REPRO_DIR: ${{ github.workspace }}
+        run: |
+          echo "=== fuzz_heal_repro.txt ==="
+          cat "$FUZZ_HEAL_REPRO_DIR/fuzz_heal_repro.txt" 2>/dev/null || echo "(no repro txt)"
+          echo "=== fuzz_heal_repro.sst (base64) ==="
+          base64 "$FUZZ_HEAL_REPRO_DIR/fuzz_heal_repro.sst" 2>/dev/null || echo "(no repro sst)"
+
   no-std-check:
     # Gates the `#![no_std]` + alloc engine path. The engine modules compile
     # unconditionally; only the std default trait implementations (the system
@@ -346,7 +389,7 @@ jobs:
     timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
@@ -429,7 +472,7 @@ jobs:
         target: ${{ fromJSON(needs['cross-matrix'].outputs.targets) }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
@@ -447,7 +490,7 @@ jobs:
     timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly

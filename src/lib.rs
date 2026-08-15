@@ -324,6 +324,11 @@ mod run_scanner;
 #[doc(hidden)]
 pub mod sfa;
 
+// Shared on-disk forgery helpers for corruption tests (std: reads/writes
+// real files through std::fs like the tests that consume it).
+#[cfg(all(test, feature = "std"))]
+pub(crate) mod test_forge;
+
 #[doc(hidden)]
 pub mod merge;
 
@@ -354,6 +359,13 @@ pub mod runtime_config;
 // std-only: scans table folders and rewrites the manifest via std::fs.
 #[cfg(feature = "std")]
 pub mod repair;
+
+// Tight-space restriction sidecar: `{id}.restrict-bound` records the exact
+// lower bound of a hole-punched SST next to it, so manifest repair recovers the
+// restriction without mutating (and thus invalidating the manifest checksum of)
+// the SST itself.
+#[cfg(feature = "std")]
+pub mod restrict_bound;
 
 // std-only: block-granular SST salvage; reads source blocks and writes a
 // recovered SST via std::fs (see also `crate::repair`, `crate::verify`).
@@ -437,6 +449,12 @@ pub use storage_stats::{
 
 mod version;
 mod vlog;
+
+// Reproducible single-byte-bitrot heal/read fuzzer. `#[ignore]`d, so it is
+// excluded from the normal suite and run as its own CI step; needs crate-internal
+// `Table` / `Writer` access, so it lives here rather than in `tests/`.
+#[cfg(all(test, feature = "std"))]
+mod fuzz_heal;
 
 /// User defined key (byte array)
 pub type UserKey = Slice;

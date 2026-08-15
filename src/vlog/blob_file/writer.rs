@@ -28,10 +28,11 @@ use std::io::Write;
 /// Enforced on the write path to prevent producing blobs that are
 /// unreasonably large. The reader applies its own copy of this limit.
 ///
-/// NOTE: Intentionally duplicated in `table::block` (as `u32`) and
-/// `vlog::blob_file::reader` rather than shared, because blocks and
-/// blobs are independent storage formats that may diverge in the future.
-const MAX_DECOMPRESSION_SIZE: usize = 256 * 1024 * 1024;
+/// The blob-format definition site: `reader` and `scanner` import this rather
+/// than duplicate it. Kept SEPARATE from `table::block`'s cap (a `u32`) on
+/// purpose, since blocks and blobs are independent storage formats that may
+/// diverge.
+pub(super) const MAX_DECOMPRESSION_SIZE: usize = 256 * 1024 * 1024;
 
 /// Returns `Err(DecompressedSizeTooLarge)` if `len > MAX_DECOMPRESSION_SIZE`.
 fn check_size_cap(len: usize) -> crate::Result<()> {
@@ -47,24 +48,25 @@ fn check_size_cap(len: usize) -> crate::Result<()> {
 // Note: these constants are `pub` for crate-internal use but the parent
 // `vlog` module is NOT exported from `lib.rs`, so they are not public API.
 
-/// V3 blob frame magic (no header checksum).
-pub const BLOB_HEADER_MAGIC_V3: &[u8] = b"BLOB";
+/// Blob frame magic. This is the ONLY readable frame shape: the engine
+/// supports exactly one on-disk format (see [`crate::FormatVersion`]) — a
+/// frame under any other magic (including the retired pre-V5 `b"BLOB"`
+/// layout without a header CRC) is corruption, not a compat case.
+pub const BLOB_HEADER_MAGIC: &[u8] = b"BLO4";
 
-/// V4 blob frame magic (includes header checksum).
-pub const BLOB_HEADER_MAGIC_V4: &[u8] = b"BLO4";
-
-/// V3 blob frame header length (38 bytes, no `header_crc`).
-pub const BLOB_HEADER_LEN_V3: usize = BLOB_HEADER_MAGIC_V3.len()
+/// Blob frame header length: 42 bytes, `header_crc` included. The fields sum to
+/// 42: 4 (magic), 16 (u128 checksum), 8 (seqno), 2 (key len), 4 (real val len),
+/// 4 (on-disk val len), 4 (header crc). Pinned by the reader tests
+/// (`assert_eq!(BLOB_HEADER_LEN, 42)`).
+pub const BLOB_HEADER_LEN: usize = BLOB_HEADER_MAGIC.len()
     + core::mem::size_of::<u128>() // Checksum
     + core::mem::size_of::<u64>() // SeqNo
     + core::mem::size_of::<u16>() // Key length
     + core::mem::size_of::<u32>() // Real value length
-    + core::mem::size_of::<u32>(); // On-disk value length
+    + core::mem::size_of::<u32>() // On-disk value length
+    + core::mem::size_of::<u32>(); // Header CRC
 
-/// V4 blob frame header length (42 bytes, includes `header_crc`).
-pub const BLOB_HEADER_LEN_V4: usize = BLOB_HEADER_LEN_V3 + core::mem::size_of::<u32>(); // Header CRC
-
-/// Compute V4 header CRC from header fields.
+/// Compute the frame header CRC from header fields.
 /// Returns a 4-byte truncated xxh3 hash.
 #[expect(
     clippy::cast_possible_truncation,
@@ -84,7 +86,7 @@ pub(super) fn compute_header_crc(
     hasher.digest() as u32
 }
 
-/// Validate V4 header CRC: recompute from header fields and compare
+/// Validate the frame header CRC: recompute from header fields and compare
 /// against the stored value.
 pub(super) fn validate_header_crc(
     seqno: u64,
@@ -164,10 +166,28 @@ impl Writer {
         let path = path.as_ref();
 
         let file = fs.open(path, &FsOpenOptions::new().write(true).create_new(true))?;
-        let writer = BufWriter::new(file);
-        let writer = ChecksummedWriter::new(writer);
-        let mut writer = crate::sfa::Writer::from_writer(writer);
-        writer.start("data")?;
+        // From here the file exists and is OURS (`create_new` proved it), so
+        // this constructor owns cleanup: an init failure below must not leak a
+        // partial file, and a CALLER must never remove `path` on a constructor
+        // error — an open failure above created nothing, so caller-side
+        // cleanup would race a concurrent creator and delete a file it does
+        // not own.
+        let mut writer =
+            crate::sfa::Writer::from_writer(ChecksummedWriter::new(BufWriter::new(file)));
+        if let Err(e) = writer.start("data") {
+            drop(writer);
+            // Best-effort cleanup of the partial file we own, but do not swallow
+            // a removal failure silently: log it with context so a leaked
+            // partial blob file is diagnosable. The original start error is still
+            // what the caller sees.
+            if let Err(remove_err) = fs.remove_file(path) {
+                log::warn!(
+                    "failed to remove partial blob file {} after a writer-init error: {remove_err}",
+                    path.display(),
+                );
+            }
+            return Err(e.into());
+        }
 
         Ok(Self {
             tree_id,
@@ -255,7 +275,7 @@ impl Writer {
 
             #[cfg(feature = "lz4")]
             CompressionType::Lz4 => {
-                let compressed = lz4_flex::compress(value);
+                let compressed = lz4_flex::block::compress(value);
                 check_size_cap(compressed.len())?;
                 alloc::borrow::Cow::Owned(compressed)
             }
@@ -303,9 +323,9 @@ impl Writer {
         self.uncompressed_bytes += u64::from(uncompressed_len);
 
         // NOTE:
-        // V4 BLOB HEADER LAYOUT
+        // BLOB HEADER LAYOUT
         //
-        // [MAGIC_BYTES; 4B]    - b"BLO4"
+        // [MAGIC_BYTES; 4B]    - BLOB_HEADER_MAGIC (b"BLO4")
         // [Checksum; 16B]      - xxh3_128(key + value + header_crc_le)
         // [Seqno; 8B]
         // [key len; 2B]
@@ -335,7 +355,7 @@ impl Writer {
         };
 
         // Write header
-        self.writer.write_all(BLOB_HEADER_MAGIC_V4)?;
+        self.writer.write_all(BLOB_HEADER_MAGIC)?;
 
         // Write data checksum
         self.writer.write_u128::<LittleEndian>(checksum)?;
@@ -359,7 +379,7 @@ impl Writer {
         self.writer.write_all(&value)?;
 
         // Update offset
-        self.offset += BLOB_HEADER_LEN_V4 as u64;
+        self.offset += BLOB_HEADER_LEN as u64;
         self.offset += key.len() as u64;
         self.offset += value.len() as u64;
 

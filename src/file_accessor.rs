@@ -41,6 +41,16 @@ impl FileAccessor {
         }
     }
 
+    /// Whether later accesses can be RETARGETED at a replacement inode:
+    /// the descriptor-table variant re-resolves the path after a cache
+    /// eviction, while a pinned FD is bound to its inode for the table's
+    /// lifetime (the in-place heal's unshare must refuse the detach then —
+    /// a rename would leave every later read on the dead inode).
+    #[must_use]
+    pub fn can_retarget(&self) -> bool {
+        matches!(self, Self::DescriptorTable { .. })
+    }
+
     /// Returns a table FD, opening via [`Fs`] on descriptor-table cache miss.
     ///
     /// Returns `(fd, None)` for pinned FDs (no cache involved),

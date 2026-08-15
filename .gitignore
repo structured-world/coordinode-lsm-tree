@@ -23,6 +23,10 @@ mutants*
 profile.json
 fuzz*/**/out*
 
+# The bitrot heal fuzzer dumps the exact failing SST here on a failure so the
+# case reproduces; a runtime artifact, never committed.
+fuzz_heal_repro.*
+
 old
 .claude/
 .forge/

@@ -2,9 +2,13 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
-// Format constants live in writer (the format definition site).
-// Extracting to a shared module is an upstream structural decision.
-use super::writer::{BLOB_HEADER_MAGIC_V3, BLOB_HEADER_MAGIC_V4, validate_header_crc};
+// Format constants live in writer (the blob-format definition site). The
+// scalar cap is shared from there; the scanner enforces it BEFORE allocating:
+// a CRC-valid fake header inside a damaged record's user-controlled bytes can
+// declare a near-`u32::MAX` length that still fits a large data section, and
+// without the cap the salvage walk would attempt a multi-gigabyte allocation
+// before the candidate's checksum rejection.
+use super::writer::{BLOB_HEADER_MAGIC, MAX_DECOMPRESSION_SIZE, validate_header_crc};
 use crate::fs::{Fs, FsFile, FsOpenOptions};
 use crate::io::BufReader;
 use crate::io::{LittleEndian, ReadBytesExt};
@@ -31,6 +35,19 @@ pub struct Scanner {
 
     /// Byte offset where the "data" section ends (from the SFA TOC).
     data_end: u64,
+
+    /// Set when [`resync_to_next_frame`](Self::resync_to_next_frame) lands on a
+    /// magic, and STICKY thereafter: every frame read once this is set is marked
+    /// `resynced`. The resync magic was found by a byte-wise search after a
+    /// damaged frame, so it may be an original boundary OR a checksum-valid
+    /// `BLO4` frame nested inside the damaged frame's user-controlled bytes; the
+    /// two are byte-for-byte indistinguishable. Crucially, a frame CHAINED past
+    /// the resync inherits that unproven anchor: its start comes from the resync
+    /// frame's own length, so a fabricated chain can plant one checksum-valid
+    /// frame after another. There is no independent anchor mid-stream to
+    /// re-establish trust, so the taint never lifts. Callers that must not
+    /// fabricate data (salvage) treat every `resynced` entry as untrusted.
+    resync_tainted: bool,
 }
 
 impl Scanner {
@@ -117,11 +134,65 @@ impl Scanner {
             inner: file_reader,
             is_terminated: false,
             data_end,
+            resync_tainted: false,
         })
     }
     // No `with_reader` constructor: Scanner is crate-private (parent
     // `vlog` module is not re-exported from lib.rs), so there are no
     // external callers. All internal usage goes through `new()` / `resume()`.
+}
+
+impl Scanner {
+    /// Repositions the reader at the next frame magic strictly AFTER
+    /// `frame_offset`, or at the data-section end when none remains. Used
+    /// after HEADER rot (bad magic, header-CRC mismatch), where the frame's
+    /// lengths cannot be trusted to locate the next frame — without the
+    /// forward magic scan one rotted header would cost every readable later
+    /// frame. A false match inside a value payload fails its own header CRC
+    /// or payload checksum and resynchronizes again, strictly forward.
+    fn resync_to_next_frame(&mut self, frame_offset: u64) -> crate::Result<()> {
+        const MAGIC_LEN: usize = BLOB_HEADER_MAGIC.len();
+
+        // Scan in chunks, overlapping by MAGIC_LEN - 1 bytes so a magic
+        // straddling two chunks is still found.
+        let mut buf = alloc::vec![0u8; 64 * 1024];
+        let mut pos = frame_offset + 1;
+        while pos < self.data_end {
+            self.inner.seek(SeekFrom::Start(pos))?;
+            // `#[allow]`, not `#[expect]`: this is a target-width-dependent lint
+            // (`u64 as usize`), so a target where Clippy proves the `min()` bound
+            // fits usize would leave an `#[expect]` unfulfilled under `-D warnings`.
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "min() bounds the window by the buffer length, which fits usize"
+            )]
+            let want = (self.data_end - pos).min(buf.len() as u64) as usize;
+            let Some(window) = buf.get_mut(..want) else {
+                break;
+            };
+            self.inner.read_exact(window)?;
+            if let Some(hit) = window
+                .windows(MAGIC_LEN)
+                .position(|w| w == BLOB_HEADER_MAGIC)
+            {
+                self.inner.seek(SeekFrom::Start(pos + hit as u64))?;
+                // The next frame read starts at a magic found by a byte scan,
+                // NOT at a boundary vouched for by a chained frame's length: its
+                // provenance is unproven, and so is every frame chained after it
+                // (see the field doc). Arm the sticky taint.
+                self.resync_tainted = true;
+                return Ok(());
+            }
+            if want < MAGIC_LEN {
+                break;
+            }
+            pos += (want - (MAGIC_LEN - 1)) as u64;
+        }
+        // No further frame: park at the section end so the next call
+        // terminates cleanly.
+        self.inner.seek(SeekFrom::Start(self.data_end))?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -137,6 +208,17 @@ pub struct ScanEntry {
     /// once an entry is consumed, `[data_start, frame_end)` is reclaimable and a
     /// resumed scan opens here.
     pub frame_end: u64,
+    /// Whether the scanner has RESYNCED at or before this frame. Set on the frame
+    /// reached immediately by the byte-wise resync AND on every frame after it:
+    /// once the stream resyncs, this frame's boundary is UNPROVEN, either because
+    /// it IS the resync frame (the magic may be an original boundary or a
+    /// checksum-valid `BLO4` frame nested inside the damaged frame's bytes) or
+    /// because it is chained from one whose length is equally unanchored. The
+    /// taint is STICKY to EOF: no independent anchor exists mid-stream to
+    /// re-establish trust. Salvage must NOT re-emit a resynced frame as a genuine
+    /// record (doing so would fabricate data), so it drops the whole tainted
+    /// tail (fail closed) rather than trust an unanchored candidate.
+    pub resynced: bool,
 }
 
 impl Iterator for Scanner {
@@ -147,6 +229,14 @@ impl Iterator for Scanner {
             return None;
         }
 
+        // Read the sticky resync taint for THIS frame. Once any prior call ended
+        // by resyncing to a magic, this frame's boundary is unproven: either it
+        // IS the resync frame or it is chained from one, and both anchors trace
+        // back to the same byte-scanned magic. The taint never clears: there is
+        // no independent anchor mid-stream to re-establish trust, so every frame
+        // to EOF stays tainted (fail closed).
+        let was_resynced = self.resync_tainted;
+
         let offset = fail_iter!(self.inner.stream_position());
 
         // Terminate when the read position reaches the end of the "data"
@@ -156,15 +246,35 @@ impl Iterator for Scanner {
             return None;
         }
 
-        let frame_is_v4;
+        // A frame header is a fixed BLOB_HEADER_LEN bytes. A magic found within
+        // fewer than that of the data-section end (e.g. a resync landing near
+        // EOF) would let the fixed-header reads below consume bytes from the
+        // FOLLOWING SFA section. Reject the incomplete tail here, before the
+        // first read: no whole frame can start this close to the boundary. (The
+        // span check further down still rejects a full-but-overrunning frame;
+        // this only stops the header read itself from crossing the section.)
+        if offset
+            .checked_add(super::writer::BLOB_HEADER_LEN as u64)
+            .is_none_or(|end| end > self.data_end)
+        {
+            self.is_terminated = true;
+            return Some(Err(crate::Error::InvalidHeader("Blob")));
+        }
 
         {
-            let mut buf = [0; BLOB_HEADER_MAGIC_V4.len()];
+            let mut buf = [0; BLOB_HEADER_MAGIC.len()];
             fail_iter!(self.inner.read_exact(&mut buf));
 
-            frame_is_v4 = buf == BLOB_HEADER_MAGIC_V4;
-            if !frame_is_v4 && buf != BLOB_HEADER_MAGIC_V3 {
-                self.is_terminated = true;
+            if buf != BLOB_HEADER_MAGIC {
+                // Header rot: the frame's lengths are unreadable, so the
+                // next frame cannot be located from this one. Resynchronize
+                // at the next frame magic so one rotted header does not
+                // cost every readable later frame (record-granular
+                // salvage); the frame itself is lost either way.
+                if let Err(e) = self.resync_to_next_frame(offset) {
+                    self.is_terminated = true;
+                    return Some(Err(e));
+                }
                 return Some(Err(crate::Error::InvalidHeader("Blob")));
             }
         }
@@ -178,31 +288,39 @@ impl Iterator for Scanner {
 
         let on_disk_val_len = fail_iter!(self.inner.read_u32::<LittleEndian>());
 
-        // V4: read and validate header CRC using shared validator.
-        // On CRC failure, terminate the scanner so subsequent next() calls
-        // don't read from a mid-frame stream position.
-        let stored_header_crc = if frame_is_v4 {
+        // Read and validate the header CRC. On a mismatch the consumed
+        // lengths are untrusted (any of them may be the rotted field), so
+        // resynchronize at the next frame magic instead of terminating —
+        // continuing from a length-derived position could desynchronize,
+        // and stopping would drop every readable later frame.
+        let stored_header_crc = {
             let crc = fail_iter!(self.inner.read_u32::<LittleEndian>());
             if let Err(e) = validate_header_crc(seqno, key_len, real_val_len, on_disk_val_len, crc)
             {
-                self.is_terminated = true;
+                if let Err(e2) = self.resync_to_next_frame(offset) {
+                    self.is_terminated = true;
+                    return Some(Err(e2));
+                }
                 return Some(Err(e));
             }
-            Some(crc)
-        } else {
-            None
+            crc
         };
 
         // Verify the declared frame payload fits within the data section
-        // before allocating buffers. Without this, a corrupted key_len or
-        // on_disk_val_len could cause a huge allocation or read past
-        // data_end into the TOC/trailer region.
+        // before allocating buffers. A declared payload that overruns the
+        // data section or the 256 MiB cap makes the span UNTRUSTWORTHY, so
+        // resynchronize at the next
+        // real frame regardless of how this position was reached. A resync
+        // candidate's magic may sit inside a damaged record's
+        // user-controlled bytes; a writer-chained frame's header CRC vouches
+        // for its lengths at parse time, but a re-stamped length that
+        // recomputes the header CRC passes that check and can declare past
+        // the section — terminating would then leave every intact later
+        // frame uninspected. Resync parks at the section end when no further
+        // magic exists, so a genuine truncation still terminates cleanly on
+        // the next call.
         {
-            let header_len = if frame_is_v4 {
-                super::writer::BLOB_HEADER_LEN_V4 as u64
-            } else {
-                super::writer::BLOB_HEADER_LEN_V3 as u64
-            };
+            let header_len = super::writer::BLOB_HEADER_LEN as u64;
             // `key_len` / `on_disk_val_len` come from the on-disk frame header and
             // may be corrupt. Use checked adds so a value that overflows u64 fails
             // loudly here (treated as "does not fit") instead of saturating to
@@ -211,8 +329,17 @@ impl Iterator for Scanner {
                 .checked_add(header_len)
                 .and_then(|x| x.checked_add(u64::from(key_len)))
                 .and_then(|x| x.checked_add(u64::from(on_disk_val_len)));
-            if frame_end.is_none_or(|end| end > self.data_end) {
-                self.is_terminated = true;
+            // Same 256 MiB value cap as the writer / ordinary reader,
+            // checked BEFORE the buffers below are allocated: no
+            // legitimate frame exceeds it, so an over-cap declared length
+            // is corruption regardless of whether it fits the section.
+            let over_cap = u64::from(real_val_len) > MAX_DECOMPRESSION_SIZE as u64
+                || u64::from(on_disk_val_len) > MAX_DECOMPRESSION_SIZE as u64;
+            if over_cap || frame_end.is_none_or(|end| end > self.data_end) {
+                if let Err(e) = self.resync_to_next_frame(offset) {
+                    self.is_terminated = true;
+                    return Some(Err(e));
+                }
                 return Some(Err(crate::Error::InvalidHeader("Blob")));
             }
         }
@@ -229,9 +356,7 @@ impl Iterator for Scanner {
                 let mut hasher = xxhash_rust::xxh3::Xxh3::default();
                 hasher.update(&key);
                 hasher.update(&value);
-                if let Some(hcrc) = stored_header_crc {
-                    hasher.update(&hcrc.to_le_bytes());
-                }
+                hasher.update(&stored_header_crc.to_le_bytes());
                 hasher.digest128()
             };
 
@@ -241,6 +366,22 @@ impl Iterator for Scanner {
                     self.blob_file_id,
                 );
 
+                // A checksum rejection means the DECLARED SPAN is not
+                // trustworthy, so resume the magic search strictly past this
+                // frame's start regardless of how the position was reached.
+                // A resync candidate's magic came from user-controlled value
+                // bytes (a CRC-valid fake header can declare an end past
+                // intact records); a WRITER-CHAINED frame's header CRC
+                // vouches for its lengths at parse time, but a re-stamped
+                // length that recomputes the header CRC passes that check
+                // and can consume one or more intact later frames before the
+                // payload checksum fails — trusting its declared end would
+                // then skip those frames without reporting the loss. Both
+                // resynchronize at the next real frame instead.
+                if let Err(e) = self.resync_to_next_frame(offset) {
+                    self.is_terminated = true;
+                    return Some(Err(e));
+                }
                 return Some(Err(crate::Error::ChecksumMismatch {
                     got: Checksum::from_raw(checksum),
                     expected: Checksum::from_raw(expected_checksum),
@@ -259,6 +400,7 @@ impl Iterator for Scanner {
             offset,
             uncompressed_len: real_val_len,
             frame_end,
+            resynced: was_resynced,
         }))
     }
 }

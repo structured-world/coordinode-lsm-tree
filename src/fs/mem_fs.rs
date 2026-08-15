@@ -509,6 +509,12 @@ impl FsFile for MemFile {
         })
     }
 
+    // MemFs has no inode concept ([`Fs::hard_link`] copies), so a file can
+    // never share its bytes with another name: the count is exactly 1.
+    fn hard_link_count(&self) -> io::Result<u64> {
+        Ok(1)
+    }
+
     fn set_len(&self, size: u64) -> io::Result<()> {
         if !self.writable {
             return Err(io::Error::other("set_len requires write access"));
@@ -971,6 +977,23 @@ impl Fs for MemFs {
         } else {
             Ok(capacity.saturating_sub(self.stored_bytes()))
         }
+    }
+
+    fn allocated_size(&self, path: &Path) -> io::Result<Option<u64>> {
+        let state = read_state(&self.state)?;
+        let Some(data) = state.files.get(path) else {
+            return Ok(None);
+        };
+        // Physically-backed bytes = logical length minus the bytes punched out of
+        // it (clipped to the current length), mirroring `stored_bytes`. A punched
+        // file reports `allocated < len`; a never-punched file reports `len`. The
+        // subtraction never underflows: `clipped_punched_len` clips to `len`.
+        let len = lock(data)?.len() as u64;
+        let punched = state
+            .punched
+            .get(path)
+            .map_or(0, |ranges| clipped_punched_len(ranges, len));
+        Ok(Some(len - punched))
     }
 
     fn sync_directory(&self, path: &Path) -> io::Result<()> {

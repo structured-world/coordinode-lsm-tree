@@ -734,6 +734,61 @@ impl Version {
         }
     }
 
+    /// Returns a version identical to this one except that the table with
+    /// `table_id` reports `checksum` as its full-file digest, or `None` when
+    /// the table is no longer part of this version (compacted away — nothing
+    /// to refresh). Used after an in-place heal rewrites a table's bytes: the
+    /// healed file's digest no longer matches the one captured at recovery,
+    /// and installing this version persists the refreshed digest to the
+    /// manifest via the version diff. Level / run structure is untouched
+    /// (same table, same key range — only the digest changes).
+    #[must_use]
+    pub(crate) fn with_refreshed_table_checksum(
+        &self,
+        table_id: TableId,
+        checksum: crate::checksum::Checksum,
+    ) -> Option<Self> {
+        if !self.iter_tables().any(|t| t.id() == table_id) {
+            return None;
+        }
+
+        let id = self.id + 1;
+
+        let mut levels = vec![];
+
+        for level in &self.levels {
+            let runs = level
+                .runs
+                .iter()
+                .map(|run| {
+                    if run.iter().any(|t| t.id() == table_id) {
+                        let mut run: Run<_> = run.deref().clone();
+                        for t in run.inner_mut().iter_mut() {
+                            if t.id() == table_id {
+                                *t = t.with_refreshed_checksum(checksum);
+                            }
+                        }
+                        Arc::new(run)
+                    } else {
+                        run.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            levels.push(Level::from_runs(runs));
+        }
+
+        Some(Self {
+            inner: Arc::new(VersionInner {
+                id,
+                tree_type: self.tree_type,
+                levels,
+                blob_files: self.blob_files.clone(),
+                gc_stats: self.gc_stats.clone(),
+            }),
+        })
+    }
+
     /// Tight-space slice install for one or more inputs: replaces each
     /// `(id, restricted view)` in `restricted` with its clamped view, drops the
     /// fully-consumed inputs in `removed_ids`, and adds the slice `outputs` as a

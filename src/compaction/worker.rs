@@ -80,6 +80,13 @@ pub struct Options {
 
     pub compaction_state: Arc<Mutex<CompactionState>>,
 
+    /// The tree-wide deletion pause, installed on every compaction-produced table
+    /// before it becomes visible. A flush registers it via `register_tables`, but
+    /// compaction installs its outputs directly (`install_merge` / tight-space),
+    /// so it must be threaded here — without it a Page-ECC output's in-place heal
+    /// skips the checkpoint mutation window and can race a checkpoint hard-link.
+    pub deletion_pause: Arc<crate::deletion_pause::DeletionPause>,
+
     /// Shared handle to the live runtime config. Compaction loads
     /// a fresh snapshot via [`crate::runtime_config::handle::RuntimeConfigHandle::load_full`]
     /// each time it writes the manifest, so toggles applied via
@@ -117,6 +124,7 @@ impl Options {
             mvcc_gc_watermark: 0,
 
             compaction_state: tree.compaction_state.clone(),
+            deletion_pause: tree.deletion_pause.clone(),
             runtime_config: tree.runtime_config.clone(),
             encryption: tree.config.encryption.clone(),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::new(
@@ -942,6 +950,13 @@ fn run_tight_space_compaction(
             drop(version);
 
             let outputs: Vec<Table> = produced.created_tables().to_vec();
+            // Install the tree-wide deletion pause on each slice output before the
+            // version edit makes it visible (mirrors `install_merge` — a compaction
+            // output that skipped it could race a checkpoint hard-link on a later
+            // in-place heal).
+            for table in &outputs {
+                table.install_deletion_pause(Arc::clone(&opts.deletion_pause));
+            }
             // KV-separation: blob files this slice relocated live entries into,
             // plus the GC diff of entries it dropped.
             let mut new_blobs: Vec<BlobFile> = produced.created_blob_files().to_vec();
@@ -977,9 +992,62 @@ fn run_tight_space_compaction(
 
             let blobs_for_cleanup = new_blobs.clone();
 
+            // Serialize each surviving input's suffix-digest capture (inside
+            // `reopen_restricted` below) and this slice's manifest install
+            // against a concurrent in-place heal on the same table identity. A
+            // patrol that heals a suffix block BETWEEN the digest read and the
+            // version edit would bind the restricted manifest to a pre-heal
+            // suffix digest; the patrol then sees the restriction change and
+            // skips its whole-file refresh, and its attestation binds whole-file
+            // (not suffix) digests, so once the prefix is punched the mismatch is
+            // permanently unattributable. Hold each restricted input's heal lock
+            // across the reopen AND the `upgrade_version` below (released when
+            // these guards drop at the end of this slice iteration). Only inputs
+            // that extend past the boundary (`max >= boundary`) are re-opened, so
+            // only those are locked. The patrol holds at most one table's heal
+            // lock at a time, so acquiring several here cannot deadlock it.
+            //
+            // Lock-order note: this path takes `compaction_state` (held from
+            // `do_compaction`) BEFORE these heal locks, while the patrol reconcile
+            // takes a heal lock and then `compaction_state` inside
+            // `refresh_table_checksum`. To keep that inversion from deadlocking,
+            // the patrol side `try_lock`s `compaction_state` and skips its refresh
+            // on contention rather than blocking — so it never waits on
+            // `compaction_state` while holding a heal lock this loop wants.
+            #[cfg(feature = "page_ecc")]
+            let heal_locks: Vec<Arc<parking_lot::Mutex<()>>> = current_views
+                .iter()
+                .filter(|v| {
+                    comparator.compare(v.metadata.key_range.max(), boundary)
+                        != core::cmp::Ordering::Less
+                })
+                .map(Table::heal_lock_arc)
+                .collect();
+            #[cfg(feature = "page_ecc")]
+            let _heal_guards: Vec<parking_lot::MutexGuard<'_, ()>> =
+                heal_locks.iter().map(|l| l.lock()).collect();
+
             // Classify each input at this boundary: restrict (extends past it) or
             // remove (fully consumed by this slice). Re-open restricted views as
             // distinct Inners so a prior view drops and punches independently.
+            //
+            // `run_subcompaction` above already finalized this slice's output SSTs
+            // and blob files, but the install below is what references them. A
+            // failure between here and the install (a sidecar write or a restricted
+            // reopen) returns before any version points at those outputs, so, like
+            // the install error path below, roll them back now instead of pinning
+            // the space until the next open's orphan sweep. Tight-space runs exactly
+            // when free space is scarce, so an ENOSPC here would otherwise both abort
+            // the reclaim and hold the bytes this slice just consumed.
+            let rollback = |e: crate::Error| -> crate::Error {
+                for t in &outputs {
+                    t.mark_as_deleted();
+                }
+                for b in &blobs_for_cleanup {
+                    b.mark_as_deleted();
+                }
+                e
+            };
             let mut restricted_pairs: Vec<(TableId, Table)> = Vec::new();
             let mut removed_ids: Vec<TableId> = Vec::new();
             let mut next_views: Vec<Table> = Vec::new();
@@ -989,7 +1057,25 @@ fn run_tight_space_compaction(
                 {
                     removed_ids.push(view.id());
                 } else {
-                    let restricted = view.reopen_restricted(boundary.clone())?;
+                    // Publish the restriction bound to the input's `.restrict-bound`
+                    // sidecar BEFORE the punch, so manifest repair can recover the
+                    // exact bound. The sidecar is a SEPARATE file written through an
+                    // atomic `temp + rename`, so — unlike an in-place meta edit — the
+                    // SST bytes are never touched: its manifest whole-file checksum
+                    // stays valid in every crash window, and there are no two mirrors
+                    // to diverge. A crash before the install below leaves the sidecar
+                    // present beside an unpunched, unmodified SST; repair only trusts
+                    // it once it independently confirms the prefix is punched, so the
+                    // stray sidecar is harmless (a re-run overwrites it atomically).
+                    // A crash AFTER the install but BEFORE the punch leaves a VALID
+                    // sidecar beside a still-unpunched SST. On a manifest rebuild that
+                    // state is indistinguishable from a pre-install stray, so repair
+                    // fails CLOSED (quarantine for manual recovery) rather than guess:
+                    // it never opens such an SST unrestricted, which would resurrect
+                    // the superseded prefix the punch was about to reclaim.
+                    view.write_restrict_sidecar(boundary, opts.config.sync_mode)
+                        .map_err(rollback)?;
+                    let restricted = view.reopen_restricted(boundary.clone()).map_err(rollback)?;
                     restricted_pairs.push((view.id(), restricted.clone()));
                     next_views.push(restricted);
                 }

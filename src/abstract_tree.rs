@@ -102,6 +102,56 @@ pub trait AbstractTree: sealed::Sealed {
     #[doc(hidden)]
     fn current_version(&self) -> Version;
 
+    /// Records that the table with `table_id` now has the digest `checksum`,
+    /// persisting it to the manifest through a version upgrade.
+    ///
+    /// Called after an in-place heal rewrites a table's bytes: the healed
+    /// file's digest no longer matches the one captured at recovery, and
+    /// without the refresh a later [`verify`](crate::verify) pass (or a
+    /// repair) would flag the healed file as corrupted against the stale
+    /// manifest digest. A no-op when the table is no longer part of the
+    /// current version (compacted away while the heal ran — the old file is
+    /// on its way out).
+    ///
+    /// `expected_restriction` is the tight-space restriction bound the CALLER
+    /// computed `checksum` for (its captured view's [`restrict_lower_bound`]).
+    /// This method holds the install lock, so it re-checks it against the CURRENT
+    /// view under that lock and refuses the install (a no-op) if a compaction
+    /// swapped the view to a different restriction meanwhile: a whole-file digest
+    /// installed into a suffix-only restricted manifest (or vice versa) could
+    /// never match the punched file.
+    ///
+    /// Returns `Ok(true)` when the digest was installed, and `Ok(false)` when the
+    /// refresh was a no-op (the table was compacted away, or its restriction no
+    /// longer matches `expected_restriction`). The caller uses this to decide
+    /// whether to clear the heal attestation: a no-op leaves the manifest digest
+    /// unchanged, so the marker must be KEPT for the next patrol to reconcile.
+    ///
+    /// [`restrict_lower_bound`]: crate::table::Table::restrict_lower_bound
+    #[cfg(feature = "std")]
+    #[doc(hidden)]
+    fn refresh_table_checksum(
+        &self,
+        table_id: TableId,
+        checksum: crate::checksum::Checksum,
+        expected_restriction: Option<&crate::UserKey>,
+    ) -> crate::Result<bool>;
+
+    /// The tree's configured durability mode
+    /// ([`Config::sync_mode`](crate::config::Config::sync_mode)). Maintenance
+    /// paths that write outside the flush pipeline (the in-place heal) read
+    /// it here so their syncs honor the same durability the tree's own
+    /// writes use.
+    #[doc(hidden)]
+    fn sync_mode(&self) -> crate::fs::SyncMode;
+
+    /// The tree's configured prefix extractor, or `None` when it indexes no
+    /// prefixes. The patrol scrub's filter cross-check reads it here so it
+    /// can verify a rebuilt full filter carries the source's prefix hashes,
+    /// not just its complete-key hashes.
+    #[doc(hidden)]
+    fn prefix_extractor(&self) -> Option<alloc::sync::Arc<dyn crate::prefix::PrefixExtractor>>;
+
     /// Returns a read-only snapshot of the tree's on-disk storage footprint:
     /// total used bytes, entry count, the average shape of a stored entry
     /// (average key / value bytes), and an estimate of how many more
