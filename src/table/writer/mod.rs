@@ -2107,6 +2107,10 @@ impl Writer {
         // reader's "count > 0 requires a section" cross-check would misfire.
         let writes_delete_bitmap =
             !self.delete_bitmap.is_empty() && self.delete_strategy.writes_bitmap();
+        // Encode ONCE and reuse the bytes for both the section content and the
+        // `delete_bitmap_hash` below, so the persisted hash provably covers the
+        // exact bytes written (and the encode does not run twice per finish).
+        let delete_bitmap_bytes = writes_delete_bitmap.then(|| self.delete_bitmap.encode());
         if writes_delete_bitmap {
             // Co-write invariant: the positional mask resolves each block's start
             // row from the zone map, and recovery rejects a delete-bitmap SST that
@@ -2120,7 +2124,7 @@ impl Writer {
             self.file_writer.start("delete_bitmap")?;
             self.block_buffer.clear();
             self.block_buffer
-                .extend_from_slice(&self.delete_bitmap.encode());
+                .extend_from_slice(delete_bitmap_bytes.as_deref().unwrap_or_default());
             Block::write_into(
                 &mut self.file_writer,
                 &self.block_buffer,
@@ -2328,7 +2332,7 @@ impl Writer {
             // is itself checksum- and mirror-protected, so this authenticates the
             // section content transitively.
             delete_bitmap_hash: if writes_delete_bitmap {
-                crate::hash::hash128(&self.delete_bitmap.encode())
+                crate::hash::hash128(delete_bitmap_bytes.as_deref().unwrap_or_default())
             } else {
                 0
             },
