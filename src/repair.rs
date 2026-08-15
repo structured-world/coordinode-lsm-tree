@@ -994,6 +994,37 @@ fn try_salvage_table(
     Ok(Some(table))
 }
 
+/// Whether the source SST's first data block reads as all zeros, the signature of
+/// a hole-punched prefix. Probed at offset 0 (the `data` section is written first)
+/// over a small window that stays WITHIN the first block, so even a punch of only
+/// the first block is detected; a real data block's opening bytes (its first
+/// entry's key-length varint and key) are never all zero, so an unpunched SST can
+/// never false-positive.
+///
+/// Used by the recovery-failure salvage arm to fail closed on a PUNCHED source
+/// whose bound is unrecoverable (missing / corrupt sidecar and no `Table` to
+/// derive from): salvaging it into an unrestricted output would resurrect the
+/// straddling block's sub-bound rows.
+///
+/// # Errors
+///
+/// Propagates the open / read failure.
+#[cfg(feature = "std")]
+fn source_prefix_is_punched(
+    fs: &dyn crate::fs::Fs,
+    table_path: &std::path::Path,
+) -> crate::Result<bool> {
+    const PROBE: usize = 64;
+    let file = fs.open(table_path, &crate::fs::FsOpenOptions::new().read(true))?;
+    let len = crate::fs::FsFile::metadata(&*file)?.len;
+    if len == 0 {
+        return Ok(false);
+    }
+    let n = usize::try_from(len).unwrap_or(PROBE).min(PROBE);
+    let bytes = crate::file::read_exact(&*file, 0, n)?;
+    Ok(bytes.iter().all(|&b| b == 0))
+}
+
 /// Re-imposes a tight-space restriction on a SALVAGED replacement SST, the single
 /// point every salvage output funnels through so the restriction can never be
 /// dropped on one path and kept on another.
@@ -1781,6 +1812,46 @@ fn repair_tree(
                         Err(read_err) if is_transient_io(&read_err) => return Err(read_err),
                         Ok(_) | Err(_) => None,
                     };
+                    // A PUNCHED source with no trustworthy bound (missing / corrupt
+                    // sidecar) cannot be salvaged into an UNRESTRICTED output:
+                    // recovery produced no `Table` to derive a geometry bound from,
+                    // and salvage drops the zeroed prefix but re-emits the straddling
+                    // block's sub-bound rows, which would resurrect with nothing to
+                    // restrict them. Fail closed: set it aside. An UNPUNCHED source
+                    // (the common corrupt-table case) has no zeroed prefix and
+                    // salvages normally. Resurrection-on skips the guard, accepting
+                    // the re-exposure.
+                    if restrict_bound.is_none()
+                        && !allow_resurrection
+                        && source_prefix_is_punched(&*folder_fs, &table_path)?
+                    {
+                        match quarantine_file(
+                            &*folder_fs,
+                            &table_base_folder,
+                            &table_path,
+                            &file_name,
+                            config.sync_mode,
+                        ) {
+                            Ok(dest) => {
+                                crate::restrict_bound::remove(
+                                    &*folder_fs,
+                                    &table_path,
+                                    config.sync_mode,
+                                );
+                                unreadable_files.push((
+                                    table_path,
+                                    format!(
+                                        "punched SST with no recoverable restriction bound \
+                                         (missing / corrupt sidecar and failed recovery); set \
+                                         aside to {}",
+                                        dest.display()
+                                    ),
+                                ));
+                            }
+                            Err(e) => return Err(e),
+                        }
+                        continue;
+                    }
                     // Whole-file recovery failed structurally; try block-level
                     // salvage: the corrupt original is quarantined and a fresh SST
                     // holding its recoverable blocks is written in its place. A

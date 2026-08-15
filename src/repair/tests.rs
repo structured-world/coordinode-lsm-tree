@@ -1921,6 +1921,81 @@ fn repair_restores_the_original_when_re_restriction_faults_persistently() -> cra
     assert_re_restriction_fault_restores_the_original(ErrorKind::Other)
 }
 
+/// A PUNCHED SST with no trustworthy bound (missing sidecar) that ALSO fails
+/// whole-file recovery must be set aside, NOT block-salvaged into an unrestricted
+/// output: recovery leaves no `Table` to derive a geometry bound from, and salvage
+/// re-emits the straddling block's sub-bound rows with nothing to restrict them.
+/// Fail closed on the ambiguity.
+#[test]
+fn repair_sets_aside_a_punched_sidecarless_sst_that_fails_recovery() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+        for i in 0..256u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                u64::from(i) + 1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+    // Punch the consumed prefix (zeroes block 0) WITHOUT recording a sidecar. The
+    // tail (meta/index) stays intact, so block salvage still succeeds; only the
+    // whole-file recovery is made to fail below.
+    let punch_offset = recover_sst(sst.clone(), &fs)?.punch_offset_for(b"k00130")?;
+    memfs.punch_hole(&sst, 0, punch_offset)?;
+
+    // A PERSISTENT fault on the FIRST streaming read (the preliminary whole-file
+    // hash) fails whole-file recovery and routes repair to the salvage arm, while
+    // salvage (reading the quarantined copy) and the punch probe run unfaulted. So
+    // salvage WOULD succeed and, without the fail-closed guard, install the
+    // unpunched output UNRESTRICTED, resurrecting the straddling block's sub-bound
+    // rows. The guard sets it aside instead.
+    let fault = FaultFs::new(memfs.as_ref().clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .once(),
+    );
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.recovered, 0,
+        "a punched sidecar-less SST that fails recovery is set aside, not salvaged \
+         into an unrestricted output: {report:?}",
+    );
+    assert_eq!(report.unreadable, 1, "{:?}", report.unreadable_files);
+    assert!(
+        report
+            .unreadable_files
+            .first()
+            .is_some_and(|(_, reason)| reason.contains("no recoverable restriction bound")),
+        "the reason names the unrecoverable punched bound: {:?}",
+        report.unreadable_files,
+    );
+    Ok(())
+}
+
 /// Asserts a punched SST at `tables/0` was recovered RESTRICTED to the exact
 /// sidecar `bound` by default repair (resurrection off): the table joins the
 /// manifest, nothing is set aside, and a key is served IFF it is at or above the
