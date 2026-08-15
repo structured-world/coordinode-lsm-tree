@@ -40,12 +40,13 @@ fn blob_scanner() -> crate::Result<()> {
         let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
 
         for key in keys {
-            assert_eq!(
-                (Slice::from(key), Slice::from(key.repeat(100))),
-                scanner
-                    .next()
-                    .map(|result| result.map(|entry| { (entry.key, entry.value) }))
-                    .unwrap()?,
+            let entry = scanner.next().unwrap()?;
+            assert_eq!(entry.key, Slice::from(key));
+            assert_eq!(entry.value, Slice::from(key.repeat(100)));
+            assert!(
+                !entry.resynced,
+                "a cleanly writer-chained frame is never tainted; an \
+                 always-resynced implementation would fail here",
             );
         }
 
@@ -229,7 +230,7 @@ fn blob_scanner_rejects_retired_blob_magic_frame() -> crate::Result<()> {
         sfa_writer.start("meta")?;
         let metadata = crate::vlog::blob_file::meta::Metadata {
             id: 0,
-            version: 4,
+            version: crate::vlog::blob_file::meta::META_VERSION,
             created_at: 0,
             item_count: 1,
             total_compressed_bytes: value.len() as u64,
@@ -293,7 +294,7 @@ fn blob_scanner_rejects_oversized_on_disk_len() -> crate::Result<()> {
         sfa_writer.start("meta")?;
         let metadata = crate::vlog::blob_file::meta::Metadata {
             id: 0,
-            version: 4,
+            version: crate::vlog::blob_file::meta::META_VERSION,
             created_at: 0,
             item_count: 1,
             total_compressed_bytes: 2,
@@ -348,7 +349,7 @@ fn blob_scanner_rejects_a_partial_header_at_the_section_boundary() -> crate::Res
         sfa_writer.start("meta")?;
         let metadata = crate::vlog::blob_file::meta::Metadata {
             id: 0,
-            version: 4,
+            version: crate::vlog::blob_file::meta::META_VERSION,
             created_at: 0,
             item_count: 0,
             total_compressed_bytes: 0,
@@ -595,11 +596,20 @@ fn blob_scanner_resyncs_again_when_a_candidate_frame_fails_its_checksum() -> cra
         "frame 2 is recovered, not skipped by the fake declared end",
     );
     assert_eq!(third.value, Slice::from(&b"second_value"[..]));
+    assert!(
+        third.resynced,
+        "the first frame recovered after a resync is tainted",
+    );
     let Some(fourth) = scanner.next() else {
         panic!("frame 3 follows");
     };
     let fourth = fourth?;
     assert_eq!(fourth.key, Slice::from(&b"ccc"[..]));
+    assert!(
+        fourth.resynced,
+        "the taint is STICKY: every frame chained after a resync stays untrusted \
+         through EOF, since its boundary was re-established by search",
+    );
     assert!(scanner.next().is_none());
     Ok(())
 }

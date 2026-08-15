@@ -19,6 +19,29 @@ fn write_then_read_roundtrips_the_bound() {
     }
 }
 
+/// The sidecar carries the table id in its own payload, so `read` returns the
+/// STORED id verbatim, not one inferred from the file name. A foreign id (distinct
+/// from the SST's numeric name) must round-trip, so repair's `id == table_id`
+/// cross-check (which tells a sidecar for THIS table apart from a stale one left
+/// behind by a reused id) compares against the true stored id.
+#[test]
+fn write_then_read_roundtrips_a_foreign_table_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let sst = dir.path().join("7");
+    let foreign_id = 0xDEAD_BEEF_u64;
+    write(&StdFs, &sst, None, foreign_id, b"k00130", SyncMode::Normal).unwrap();
+    match read(&StdFs, &sst, None).unwrap() {
+        SidecarRead::Present(id, bound) => {
+            assert_eq!(
+                id, foreign_id,
+                "the stored id round-trips, not the file name"
+            );
+            assert_eq!(bound, b"k00130");
+        }
+        _ => panic!("expected Present"),
+    }
+}
+
 /// An absent sidecar reads as `Missing` (the SST is unrestricted), never an error.
 #[test]
 fn absent_sidecar_reads_missing() {

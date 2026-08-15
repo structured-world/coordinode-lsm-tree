@@ -94,7 +94,7 @@ fn test_blob_file_meta_missing_field_returns_err() {
 fn test_blob_file_meta_corrupted_trailer_returns_err() {
     let meta = Metadata {
         id: 0,
-        version: 4,
+        version: META_VERSION,
         created_at: 1_234_567_890,
         compression: CompressionType::None,
         item_count: 100,
@@ -132,7 +132,7 @@ fn test_blob_file_meta_corrupted_trailer_returns_err() {
 fn test_blob_file_meta_roundtrip() {
     let meta = Metadata {
         id: 0,
-        version: 4,
+        version: META_VERSION,
         created_at: 1_234_567_890,
         compression: CompressionType::None,
         item_count: 100,

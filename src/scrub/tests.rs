@@ -51,13 +51,29 @@ fn report_merge_sums_every_counter_and_concatenates_errors() {
 }
 
 #[test]
-fn report_is_ok_only_when_no_uncorrectable_blocks() {
+fn report_is_ok_only_when_no_uncorrectable_blocks_and_no_errors() {
     let mut report = PatrolScrubReport::default();
     assert!(report.is_ok(), "a fresh empty report is ok");
     report.corrections_applied = 5;
     assert!(report.is_ok(), "corrected blocks do not make a scrub fail");
     report.uncorrectable_blocks = 1;
     assert!(!report.is_ok(), "an uncorrectable block fails the scrub");
+
+    // A recorded error alone (zero uncorrectable blocks) also fails the scrub: a
+    // verification or I/O error left the scrub unable to vouch for the data, so
+    // `is_ok` must require BOTH conditions, not just the uncorrectable count.
+    let mut with_error = PatrolScrubReport::default();
+    with_error.errors.push(ScrubError::UncorrectableBlock {
+        table_id: 7,
+        path: "/x".into(),
+        block_offset: 42,
+        reason: "boom".into(),
+    });
+    assert_eq!(with_error.uncorrectable_blocks, 0);
+    assert!(
+        !with_error.is_ok(),
+        "a recorded error fails the scrub even with zero uncorrectable blocks",
+    );
 }
 
 #[test]
@@ -306,6 +322,7 @@ fn heal_scrub_does_not_restamp_over_forged_blob_link_accounting() -> crate::Resu
 /// detector (no parity, no footers), and restamping the manifest digest
 /// would erase the only record of it. It also spares every ordinary SST
 /// the full-file digest read.
+#[cfg(feature = "page_ecc")]
 #[test]
 fn heal_scrub_does_not_reconcile_a_non_ecc_table() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;

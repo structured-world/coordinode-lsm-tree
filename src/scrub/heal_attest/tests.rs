@@ -1,6 +1,6 @@
 #![expect(clippy::unwrap_used, reason = "test asserts on known-present values")]
 
-use super::{AttestResult, attest_path, attests, remove, write, write_in_progress};
+use super::{AttestResult, attest_path, attests, attests_post, remove, write, write_in_progress};
 use crate::Checksum;
 use crate::fs::{Fs, StdFs};
 use std::sync::Arc;
@@ -53,7 +53,7 @@ fn attests_rejects_a_mismatched_digest_or_id() {
 }
 
 #[test]
-fn attests_is_false_without_a_sidecar() {
+fn attests_returns_absent_without_a_sidecar() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("7");
     let fs: Arc<dyn Fs> = Arc::new(StdFs);
@@ -149,6 +149,80 @@ fn attests_is_inconclusive_when_the_sidecar_metadata_read_fails() {
             AttestResult::Inconclusive
         ),
         "a metadata probe failure is inconclusive, not attesting",
+    );
+}
+
+/// `attests_post` matches on the recorded POST digest (and id) alone, ignoring the
+/// recorded PRE: a marker written with any pre attests as long as the post equals
+/// the file's current digest.
+#[test]
+fn attests_post_attests_on_a_matching_post_regardless_of_pre() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("7");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // Written with pre=100; `attests_post` never looks at pre.
+    write(&*fs, &path, None, 7, ck(100), ck(200)).unwrap();
+    assert!(
+        matches!(
+            attests_post(&*fs, &path, None, 7, ck(200)),
+            AttestResult::Attests
+        ),
+        "a matching post attests independent of the recorded pre",
+    );
+}
+
+/// A present marker whose post (or id) does not match, and an absent marker, are
+/// both conclusively non-attesting: `Absent`, safe to clear.
+#[test]
+fn attests_post_returns_absent_on_a_nonmatching_post_or_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("7");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    write(&*fs, &path, None, 7, ck(100), ck(200)).unwrap();
+    // Wrong post: the file is not the attested healed version.
+    assert!(matches!(
+        attests_post(&*fs, &path, None, 7, ck(999)),
+        AttestResult::Absent
+    ));
+    // Wrong id: the marker belongs to another table identity.
+    assert!(matches!(
+        attests_post(&*fs, &path, None, 8, ck(200)),
+        AttestResult::Absent
+    ));
+    // No marker at all.
+    remove(&*fs, &path);
+    assert!(matches!(
+        attests_post(&*fs, &path, None, 7, ck(200)),
+        AttestResult::Absent
+    ));
+}
+
+/// A metadata-probe failure on the marker is fail-closed `Inconclusive`: the
+/// caller must preserve the marker and retry, never mistake it for a clean
+/// non-attesting read.
+#[test]
+fn attests_post_is_inconclusive_when_the_metadata_read_fails() {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("7");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    write(&*fs, &path, None, 7, ck(100), ck(200)).unwrap();
+    injector.arm(
+        FaultRule::new(FaultOp::Metadata, Fault::Error(ErrorKind::Other)).on_path(".heal-attest"),
+    );
+    assert!(
+        matches!(
+            attests_post(&*fs, &path, None, 7, ck(200)),
+            AttestResult::Inconclusive
+        ),
+        "a metadata probe failure is inconclusive, not non-attesting",
     );
 }
 

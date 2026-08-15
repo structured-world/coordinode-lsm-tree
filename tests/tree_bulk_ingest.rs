@@ -225,6 +225,19 @@ fn repair_quarantines_a_bulk_ingested_table() -> lsm_tree::Result<()> {
         ingestion.finish()?;
     }
 
+    // The ingested SST on disk before repair. Quarantine must MOVE it out of
+    // tables/ (not merely omit it from the rebuilt manifest), or the next open's
+    // orphan cleanup would delete the only copy of the preserved original.
+    let ingested_sst = std::fs::read_dir(folder.path().join("tables"))?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .expect("the ingest produced a numerically-named SST file");
+
     // The ingest allocated a nonzero global_seqno (a manifest-only offset the
     // SST does not carry), so repair cannot reconstruct it.
     assert!(
@@ -246,6 +259,11 @@ fn repair_quarantines_a_bulk_ingested_table() -> lsm_tree::Result<()> {
         report.unreadable_files[0].1.contains("sequence offset"),
         "the reason names the unrecoverable ingest offset: {:?}",
         report.unreadable_files,
+    );
+    assert!(
+        !ingested_sst.exists(),
+        "the quarantined SST must be moved out of tables/ ({}), not left in place",
+        ingested_sst.display(),
     );
 
     Ok(())

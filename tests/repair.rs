@@ -628,20 +628,32 @@ fn sorted_sst_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// (data is written first; index / filter / meta live at the tail), so the SST
 /// still opens but one data block fails its checksum.
 fn corrupt_data_region(path: &std::path::Path) -> std::io::Result<()> {
+    // Locate the `data` section through the SFA trailer TOC rather than assuming
+    // it begins at offset 0: a byte a fixed depth into the section's payload is
+    // stable against tail growth (the index / filter / meta / trailer that follow
+    // can change size, e.g. a new meta key) AND correct even if the data section
+    // ever stops being written first.
+    const DEPTH: u64 = 512;
+    let pos = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = lsm_tree::sfa::Reader::from_reader(&mut f)
+            .map_err(|e| std::io::Error::other(format!("read SFA TOC: {e}")))?;
+        let entry = reader
+            .toc()
+            .iter()
+            .find(|e| e.name() == b"data")
+            .expect("the SST carries a data section");
+        assert!(
+            entry.len() > DEPTH,
+            "data section (len {}) is too small to corrupt a block at depth {DEPTH}",
+            entry.len(),
+        );
+        usize::try_from(entry.pos() + DEPTH).expect("position fits usize")
+    };
     let mut bytes = std::fs::read(path)?;
-    // The SFA `data` section is written first, so the first data block starts at
-    // offset 0. Corrupt a byte well inside it (past any block header, deep in the
-    // payload). A FIXED front offset is stable against tail growth: the index /
-    // filter / meta / trailer that follow the data can change size (e.g. a new
-    // meta key) without moving this target, unlike a `len / N` fraction that
-    // could drift across a block boundary and miss the data region entirely.
-    const AT: usize = 512;
-    assert!(
-        bytes.len() > AT,
-        "SST ({} bytes) is too small to corrupt a data block at offset {AT}",
-        bytes.len(),
-    );
-    bytes[AT] ^= 0xFF;
+    *bytes
+        .get_mut(pos)
+        .expect("corruption offset within the SST") ^= 0xFF;
     std::fs::write(path, &bytes)
 }
 
@@ -895,8 +907,10 @@ fn repair_with_salvage_correctable_ecc_fault_in_encrypted_sst_is_rewritten() -> 
 
     let dir = lsm_tree::get_tmp_folder();
     let provider = || Arc::new(Aes256GcmProvider::new(&[0x6B; 32]));
-    {
-        let tree = Config::new(
+    // Shared encrypted Page-ECC config: the initial open, the salvage repair, and
+    // the final reopen must all bind the SAME encryption provider and ECC scheme.
+    let cfg = || {
+        Config::new(
             dir.path(),
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
@@ -907,7 +921,9 @@ fn repair_with_salvage_correctable_ecc_fault_in_encrypted_sst_is_rewritten() -> 
             data_shards: 4,
             parity_shards: 2,
         })
-        .open()?;
+    };
+    {
+        let tree = cfg().open()?;
         for i in 0..500 {
             tree.insert(key(i), format!("v-{i}"), i);
         }
@@ -926,18 +942,7 @@ fn repair_with_salvage_correctable_ecc_fault_in_encrypted_sst_is_rewritten() -> 
 
     nuke_manifest(dir.path())?;
 
-    let report = Config::new(
-        dir.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .with_encryption(Some(provider()))
-    .page_ecc(true)
-    .ecc_scheme(EccScheme::ReedSolomon {
-        data_shards: 4,
-        parity_shards: 2,
-    })
-    .repair_with_salvage(true)?;
+    let report = cfg().repair_with_salvage(true)?;
     assert_eq!(
         report.salvaged, 1,
         "a persistent correctable fault drives the table through salvage: {:?}",
@@ -949,18 +954,7 @@ fn repair_with_salvage_correctable_ecc_fault_in_encrypted_sst_is_rewritten() -> 
     );
 
     // The tree reopens and every key reads back from the clean rewrite.
-    let tree = Config::new(
-        dir.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .with_encryption(Some(provider()))
-    .page_ecc(true)
-    .ecc_scheme(EccScheme::ReedSolomon {
-        data_shards: 4,
-        parity_shards: 2,
-    })
-    .open()?;
+    let tree = cfg().open()?;
     for i in 0..500 {
         assert!(
             tree.get(key(i), MAX_SEQNO)?.is_some(),
@@ -1305,7 +1299,7 @@ fn repair_prefers_an_intact_duplicate_over_a_lossy_salvage() -> lsm_tree::Result
     use lsm_tree::fs::StdFs;
     use std::sync::Arc;
 
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
     let primary = dir.path().join("primary");
     let cold = dir.path().join("cold");
     std::fs::create_dir_all(primary.join("tables"))?;
@@ -1368,7 +1362,7 @@ fn repair_quarantines_a_duplicate_table_file() -> lsm_tree::Result<()> {
     use lsm_tree::fs::StdFs;
     use std::sync::Arc;
 
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
     let primary = dir.path().join("primary");
     let cold = dir.path().join("cold");
     std::fs::create_dir_all(primary.join("tables"))?;
@@ -1439,7 +1433,7 @@ fn repair_does_not_quarantine_an_aliased_copy_of_the_kept_sst() -> lsm_tree::Res
     use lsm_tree::fs::StdFs;
     use std::sync::Arc;
 
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
     let primary = dir.path().join("primary");
     std::fs::create_dir_all(primary.join("tables"))?;
     // `cold` is a SYMLINK to `primary`: both configured folders resolve to the
