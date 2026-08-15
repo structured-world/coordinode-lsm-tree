@@ -98,6 +98,13 @@ impl Table {
             };
             for entry in reader.toc().iter() {
                 let name = entry.name();
+                if name == b"delete_bitmap" {
+                    // The relocated table's delete bitmap is injected fresh below;
+                    // copying the source section too would leave two `delete_bitmap`
+                    // entries in the TOC, so section lookup could reject the SST or
+                    // select the stale copy while the metadata describes the new one.
+                    continue;
+                }
                 writer.start(name)?;
                 if name == b"meta_mid" || name == b"meta" {
                     // Re-encoded copy (new id), not the source bytes. Non-encrypted

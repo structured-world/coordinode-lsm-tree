@@ -1006,27 +1006,43 @@ fn try_salvage_table(
 /// reopened restricted. Otherwise (resurrection on, or no recoverable bound) the
 /// salvaged table is kept whole and any stale sidecar cleared, since a lingering
 /// sidecar would wrongly restrict the unpunched replacement on a later repair.
+///
+/// A TRANSIENT failure re-imposing the restriction (sidecar write or restricted
+/// reopen) restores the quarantined original to `table_path` before propagating,
+/// mirroring the salvage-error path: otherwise the unpunched, sidecar-less
+/// salvaged replacement would be left in place, and a retry would recover it
+/// UNRESTRICTED and resurrect the sub-bound rows. A persistent failure propagates
+/// as-is (the retry would fault the same way).
 #[cfg(feature = "std")]
 fn restrict_salvaged_output(
     folder_fs: &dyn crate::fs::Fs,
     config: &Config,
     table_path: &std::path::Path,
-    table_id: TableId,
+    quarantined: &std::path::Path,
     salvaged: Table,
     restrict_bound: Option<crate::UserKey>,
     allow_resurrection: bool,
 ) -> crate::Result<Table> {
     match restrict_bound {
         Some(bound) if !allow_resurrection => {
-            crate::restrict_bound::write(
+            let table_id = salvaged.metadata.id;
+            let restricted = crate::restrict_bound::write(
                 folder_fs,
                 table_path,
                 config.encryption.as_deref(),
                 table_id,
                 &bound,
                 config.sync_mode,
-            )?;
-            salvaged.reopen_restricted(bound)
+            )
+            .and_then(|()| salvaged.reopen_restricted(bound));
+            match restricted {
+                Ok(table) => Ok(table),
+                Err(e) if is_transient_io(&e) => {
+                    restore_quarantined(folder_fs, quarantined, table_path, config.sync_mode)?;
+                    Err(e)
+                }
+                Err(e) => Err(e),
+            }
         }
         _ => {
             crate::restrict_bound::remove(folder_fs, table_path, config.sync_mode);
@@ -1652,7 +1668,7 @@ fn repair_tree(
                                         &*folder_fs,
                                         config,
                                         &table_path,
-                                        table_id,
+                                        &quarantined,
                                         salvaged,
                                         restrict_bound.clone(),
                                         allow_resurrection,
@@ -1786,7 +1802,7 @@ fn repair_tree(
                                 &*folder_fs,
                                 config,
                                 &table_path,
-                                table_id,
+                                &quarantined,
                                 salvaged,
                                 restrict_bound,
                                 allow_resurrection,

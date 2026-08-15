@@ -722,12 +722,26 @@ impl Writer {
         } else {
             None
         };
+        // A restart interval MUST be > 0 (the setters assert it). A forged or
+        // corrupt source meta can carry 0; salvage must not panic on it, so a
+        // zero falls back to this writer's own default instead of the setter's
+        // assertion.
+        let data_restart_interval = if meta.data_block_restart_interval > 0 {
+            meta.data_block_restart_interval
+        } else {
+            self.data_block_restart_interval
+        };
+        let index_restart_interval = if meta.index_block_restart_interval > 0 {
+            meta.index_block_restart_interval
+        } else {
+            self.index_block_restart_interval
+        };
         let writer = self
             .use_data_block_compression(meta.data_block_compression)
             .use_index_block_compression(meta.index_block_compression)
             .use_ecc(effective_ecc)
-            .use_data_block_restart_interval(meta.data_block_restart_interval)
-            .use_index_block_restart_interval(meta.index_block_restart_interval)
+            .use_data_block_restart_interval(data_restart_interval)
+            .use_index_block_restart_interval(index_restart_interval)
             // A columnar source re-emits as columnar (the writer transposes the
             // recovered rows back into PAX blocks), rather than degrading to a
             // row-major copy.

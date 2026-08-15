@@ -1770,6 +1770,117 @@ fn repair_salvages_a_restricted_punched_sst_with_a_corrupt_suffix() -> crate::Re
     Ok(())
 }
 
+/// A TRANSIENT fault while re-imposing the restriction on a salvaged output (here
+/// the re-restriction sidecar write) must restore the quarantined original and
+/// propagate for retry, never leave the unpunched, sidecar-less salvaged
+/// replacement in place: a later recovery would open THAT unrestricted and
+/// resurrect the sub-bound rows. The retry then recovers the table restricted.
+#[test]
+fn repair_restores_the_original_when_re_restriction_faults_transiently() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, FsOpenOptions, MemFs};
+    use crate::io::ErrorKind;
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+        for i in 0..256u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                u64::from(i) + 1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+    let bound = b"k00130".to_vec();
+    let punch_offset = {
+        let table = recover_sst(sst.clone(), &fs)?;
+        crate::restrict_bound::write(&*fs, &sst, None, 0, &bound, crate::fs::SyncMode::Normal)?;
+        let off = table.punch_offset_for(&bound)?;
+        memfs.punch_hole(&sst, 0, off)?;
+        off
+    };
+    {
+        let mut f = fs.open(&sst, &FsOpenOptions::new().write(true))?;
+        f.seek(SeekFrom::Start(punch_offset + 20))?;
+        f.write_all(&[0xFFu8])?;
+        f.sync_all()?;
+    }
+
+    // Fault the RE-RESTRICTION sidecar write (the SECOND `.restrict-bound` open;
+    // the first is repair reading the recorded bound) with a TRANSIENT error, so
+    // salvage succeeds but re-imposing the restriction faults mid-way.
+    let fault = FaultFs::new(memfs.as_ref().clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Interrupted))
+            .on_path("restrict-bound")
+            .skip(1)
+            .once(),
+    );
+
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair_with_salvage(true);
+    assert!(
+        matches!(&result, Err(crate::Error::Io(e)) if e.kind() == ErrorKind::Interrupted),
+        "a transient re-restriction fault must propagate for retry, got {result:?}",
+    );
+
+    // The distinguishing evidence of the restore: NO stranded original is left in
+    // quarantine. Without the restore the salvaged replacement stays at the table
+    // path and the punched original is orphaned in `repair-quarantine/0` forever, a
+    // copy no retry under `tables/` can ever reach.
+    assert!(
+        !memfs.exists(&root.join("repair-quarantine").join("0"))?,
+        "the transient fault must restore the original, leaving nothing in quarantine",
+    );
+    assert!(
+        memfs.exists(&sst)?,
+        "the original SST is back at its table path after the restore",
+    );
+
+    // The retry (no fault) recovers the table restricted: no sub-bound resurrection.
+    use crate::AbstractTree;
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.recovered, 1,
+        "the retry recovers the table: {report:?}"
+    );
+    let tree = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .open()?;
+    assert!(
+        tree.get(b"k00000", crate::MAX_SEQNO)?.is_none(),
+        "no sub-bound key resurrects after the retry",
+    );
+    Ok(())
+}
+
 /// Asserts a punched SST at `tables/0` was recovered RESTRICTED to the exact
 /// sidecar `bound` by default repair (resurrection off): the table joins the
 /// manifest, nothing is set aside, and a key is served IFF it is at or above the

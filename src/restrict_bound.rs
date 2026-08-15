@@ -23,11 +23,15 @@
 //! so an offline attacker without the key cannot forge a bound `decrypt` accepts.
 //! For an UNENCRYPTED table the payload carries an XXH3-128 checksum that detects
 //! corruption; forging a *valid* sidecar needs the same directory write access
-//! that could tamper with the SST or manifest directly. Either way, repair does
-//! not trust the bound on the sidecar alone: it independently verifies that the
-//! prefix below the bound is ACTUALLY hole-punched (reads as zeros) before
-//! applying the restriction, so a bound with no physical punch behind it — a
-//! forgery, or a stale sidecar on an unpunched file — is rejected.
+//! that could tamper with the SST or manifest directly, so it opens no new attack
+//! surface. Repair uses the physical punch to grade the bound, not to gate it:
+//! when the prefix below a valid bound reads as fully hole-punched the bound is
+//! exact; when it does NOT (the crash window between a durable install and the
+//! punch that follows it, or a stale sidecar over a never-restricted file) the two
+//! are indistinguishable on disk, so recovery follows the resurrection policy. By
+//! default it HONORS the bound (restricting, dropping the ambiguous prefix, which
+//! never resurrects a superseded row); with `allow_resurrection` it keeps the
+//! whole table. See `docs/manifest-recovery.md`.
 
 use crate::encryption::EncryptionProvider;
 use crate::fs::{Fs, FsOpenOptions, SyncMode};
@@ -114,6 +118,15 @@ pub fn write(
     bound: &[u8],
     sync_mode: SyncMode,
 ) -> crate::Result<()> {
+    // A bound is a user key, at most `u16::MAX` bytes. `read` rejects a sidecar
+    // whose payload exceeds that limit as corrupt, so reject an oversized bound
+    // HERE rather than publishing a sidecar a later repair would read as corrupt,
+    // silently dropping the restriction and resurrecting the punched prefix.
+    if bound.len() > u16::MAX as usize {
+        return Err(crate::Error::InvalidHeader(
+            "restriction bound exceeds the maximum key length",
+        ));
+    }
     let plain = serialize(table_id, bound);
     let content = match encryption {
         Some(enc) => enc.encrypt(&plain)?,

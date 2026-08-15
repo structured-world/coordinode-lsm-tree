@@ -960,6 +960,12 @@ fn run_tight_space_compaction(
             // KV-separation: blob files this slice relocated live entries into,
             // plus the GC diff of entries it dropped.
             let mut new_blobs: Vec<BlobFile> = produced.created_blob_files().to_vec();
+            // Capture the rollback set NOW, before the reopened stale views are
+            // pushed onto `new_blobs` below: `mark_as_deleted` on a reopened view
+            // unlinks its SHARED path (the still-live stale blob the current version
+            // references), so a rollback must delete only the genuinely-new blob
+            // files this slice created, never the reopened views.
+            let blobs_for_cleanup = new_blobs.clone();
             let frag = produced.blob_frag_map().clone();
             let gc_diff = if frag.is_empty() { None } else { Some(frag) };
 
@@ -989,8 +995,6 @@ fn run_tight_space_compaction(
                     }
                 }
             }
-
-            let blobs_for_cleanup = new_blobs.clone();
 
             // Serialize each surviving input's suffix-digest capture (inside
             // `reopen_restricted` below) and this slice's manifest install
