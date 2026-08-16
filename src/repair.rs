@@ -1071,6 +1071,15 @@ fn restrict_salvaged_output(
             match restricted {
                 Ok(table) => Ok(table),
                 Err(e) => {
+                    // Drop the salvaged handle's open file BEFORE restoring. The
+                    // restore renames the quarantined original back over
+                    // `table_path`, and a backend that rejects replacing an OPEN
+                    // destination (Windows; the deletion path closes handles for
+                    // this same reason) would fail the rename while `salvaged` still
+                    // holds `table_path` open. A failed restore leaves the unpunched
+                    // salvaged SST in place with no bound, so the next repair would
+                    // recover it UNRESTRICTED and resurrect the sub-bound rows.
+                    drop(salvaged);
                     // Restore on EVERY failure, transient or persistent: the
                     // salvaged replacement sits at `table_path` unpunched with no
                     // valid sidecar, so a retry that finds it there recovers it
