@@ -611,6 +611,10 @@ fn merge_report(dst: &mut BlockVerifyReport, src: BlockVerifyReport) {
     dst.blocks_scanned += src.blocks_scanned;
     dst.errors.extend(src.errors);
     dst.warnings.extend(src.warnings);
+    // An incomplete partial (an SST whose sections were skipped unwalked) taints
+    // the whole merged report: once ANY table could not be fully scanned, the
+    // aggregate `is_ok()` must not claim a clean verdict.
+    dst.incomplete |= src.incomplete;
 }
 
 /// Scans one SST and returns a partial report (`sst_files_scanned == 1`).

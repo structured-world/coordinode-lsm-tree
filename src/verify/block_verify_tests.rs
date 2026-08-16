@@ -674,6 +674,56 @@ fn verify_sst_file_reports_incomplete_when_ecc_is_unrecognized_in_both_mirrors()
     );
 }
 
+/// Tree-level regression for the merged report: `verify_block_checksums` folds
+/// each per-SST partial report through `merge_report`. An SST with an
+/// unrecognized ECC descriptor produces an INCOMPLETE partial (its data blocks
+/// were skipped unwalked), so the merged whole-tree report must stay incomplete
+/// and `is_ok()` false. If the merge drops the `incomplete` flag, the final
+/// report reverts to `false` and falsely reports OK with no other errors.
+#[cfg(feature = "std")]
+#[test]
+fn verify_block_checksums_stays_incomplete_when_one_sst_has_unrecognized_ecc() {
+    let dir = tempfile::tempdir().unwrap();
+    populate_tree(dir.path(), 200);
+
+    // Sanity: intact tree verifies clean.
+    let tree = reopen_tree(dir.path());
+    let report = verify_block_checksums(&tree);
+    assert!(
+        report.is_ok(),
+        "intact tree must be clean: {:?}",
+        report.errors
+    );
+    drop(tree);
+
+    // Forge the first SST's ECC descriptor (both mirrors) to an unknown kind:
+    // its data-block sections become unwalkable, so its per-SST scan is
+    // incomplete. The whole-tree fold must PRESERVE that incompleteness.
+    let sst_path = pick_first_sst_path(dir.path());
+    crate::test_forge::forge_meta_value_both_mirrors(
+        &sst_path,
+        b"descriptor#page_ecc",
+        &[9, 0, 0, 0],
+    )
+    .unwrap();
+
+    let tree = reopen_tree(dir.path());
+    let report = verify_block_checksums(&tree);
+    assert!(
+        report.errors.is_empty(),
+        "no corruption, only an unwalkable ECC scheme: {:?}",
+        report.errors,
+    );
+    assert!(
+        report.incomplete,
+        "the merged report must inherit the incomplete flag from the skipped SST",
+    );
+    assert!(
+        !report.is_ok(),
+        "a merged report that skipped a whole SST's data blocks must not report OK",
+    );
+}
+
 /// A TOC entry RENAMED to a duplicate recognized name — `range_tombstones`
 /// renamed to a second `data`, its block header re-stamped with the `Data`
 /// role — preserves the tiling AND passes the recognized-role walk, yet the
