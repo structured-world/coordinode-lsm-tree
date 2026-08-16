@@ -409,14 +409,15 @@ fn restricted_view_passes_every_reconcile_gate() -> crate::Result<()> {
 }
 
 /// Detaching a tight-space-restricted SST for an in-place heal (it was hard-linked
-/// into a checkpoint) must PRESERVE its punched `[0, punch)` hole in the copy, not
-/// materialize the zeros. Materializing would re-allocate the reclaimed prefix and
-/// could ENOSPC the heal or permanently consume the space the punch reclaimed. The
-/// copy re-punches its prefix, so the reclaim counter grows by exactly `punch`;
-/// before the fix the detach streamed the whole logical length and punched nothing.
+/// into a checkpoint) must reproduce the source BYTE-FOR-BYTE. The detach punches
+/// only the reclaimed DATA-block extents below the frontier — the exact set
+/// `Inner::drop` reclaims (the block index yields only data-block handles) — and
+/// copies everything else, so any live index / filter block interleaved below the
+/// frontier is preserved rather than zeroed by a wholesale `[0, punch)` punch. This
+/// guards the scatter-copy against dropping or mis-placing a live block.
 #[cfg(feature = "page_ecc")]
 #[test]
-fn unshare_for_heal_preserves_the_punched_hole() -> crate::Result<()> {
+fn unshare_for_heal_reproduces_the_source_faithfully() -> crate::Result<()> {
     use crate::fs::{Fs, FsOpenOptions, SyncMode};
 
     let dir = tempfile::tempdir()?;
@@ -435,24 +436,49 @@ fn unshare_for_heal_preserves_the_punched_hole() -> crate::Result<()> {
     else {
         panic!("the punched input must reopen as a restricted table");
     };
-    let punch = restricted.punch_offset()?;
-    assert!(punch > 0, "the restricted table has a punched prefix");
+    assert!(
+        restricted.punch_offset()? > 0,
+        "the restricted table has a punched prefix",
+    );
 
-    // Detach the restricted view into a fresh copy, exactly as the in-place heal
-    // does when the inode is shared with a checkpoint link.
-    let shared: Arc<dyn Fs> = Arc::new(fs.clone());
+    let shared: Arc<dyn Fs> = Arc::new(fs);
+    let read_all = |path: &std::path::Path| -> crate::Result<alloc::vec::Vec<u8>> {
+        let f = shared.open(path, &FsOpenOptions::new().read(true))?;
+        let len = usize::try_from(f.metadata()?.len).unwrap_or(usize::MAX);
+        let mut buf = alloc::vec![0u8; len];
+        let mut off = 0usize;
+        while off < len {
+            let got = f.read_at(
+                buf.get_mut(off..).unwrap_or(&mut []),
+                u64::try_from(off).unwrap_or(u64::MAX),
+            )?;
+            if got == 0 {
+                break;
+            }
+            off += got;
+        }
+        Ok(buf)
+    };
+
+    // Snapshot the source before the detach. It is a real punched restricted table:
+    // its bytes hold BOTH punched data blocks (zeros) and live blocks (non-zero).
+    let src = read_all(&restricted.path)?;
+    assert!(src.contains(&0), "the source has punched data blocks");
+    assert!(src.iter().any(|&b| b != 0), "the source has live blocks");
+
+    // Detach into a fresh copy, exactly as the in-place heal does for a
+    // checkpoint-shared inode.
     let source = shared.open(&restricted.path, &FsOpenOptions::new().read(true))?;
-    let before = fs.punched_bytes();
     let _copy = match restricted.unshare_for_heal(source.as_ref(), SyncMode::Normal) {
         Ok(copy) => copy,
         Err(e) => panic!("unshare_for_heal must succeed on a restricted table: {e}"),
     };
-    let after = fs.punched_bytes();
 
+    // The copy the rename published must be byte-identical to the source.
+    let copy = read_all(&restricted.path)?;
     assert_eq!(
-        after - before,
-        punch,
-        "the detached heal copy must re-punch its reclaimed prefix, not materialize it",
+        copy, src,
+        "the detached heal copy must reproduce the source byte-for-byte",
     );
     Ok(())
 }

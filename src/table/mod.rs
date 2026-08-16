@@ -1434,13 +1434,17 @@ impl Table {
             .map_err(|e| alloc::format!("metadata: {e}"))?
             .len;
 
-        // A tight-space-restricted view's `[0, punch)` prefix is a hole (reads as
-        // zeros). Recreate it as a hole in the heal copy instead of materializing its
-        // zeros: on the near-full disk tight-space runs on, streaming the whole
-        // logical length would re-allocate the reclaimed prefix and could either
-        // ENOSPC the heal or permanently consume the space the punch reclaimed.
-        // `punch` is `0` for a normal (unrestricted) table, so its copy is
-        // byte-for-byte as before.
+        // A tight-space-restricted view has reclaimed the DATA blocks below its
+        // frontier, but NOT the whole `[0, punch)` span: live index / filter blocks
+        // are interleaved among those data blocks (partitioned index / filter) and
+        // the reopen path reads them, so `Inner::drop` punches each data block
+        // INDIVIDUALLY and leaves the metadata blocks intact. Reproduce that exact
+        // hole pattern in the heal copy — copy the live blocks, leave the reclaimed
+        // data-block extents as holes — instead of materializing the zeros (which
+        // would re-allocate the reclaimed space, an ENOSPC risk on the near-full disk
+        // tight-space runs on) OR zeroing the whole prefix (which would corrupt the
+        // interleaved metadata). `punch` is `0` for a normal (unrestricted) table, so
+        // its copy is byte-for-byte as before.
         let punch = self
             .punch_offset()
             .map_err(|e| alloc::format!("punch offset: {e}"))?;
@@ -1457,49 +1461,77 @@ impl Table {
 
         // Any failure past this point must take the copy with it (see above).
         let mut copy = || -> Result<(), alloc::string::String> {
-            let mut buf = alloc::vec![0u8; 1 << 20];
-            // Establish the full size and skip the punched prefix so it stays a hole;
-            // only the live suffix `[punch, len)` is streamed.
-            let mut off = if sparse {
+            // The reclaimed DATA-block extents below the frontier — exactly what
+            // tight-space punched (via `Inner::drop`). The block index yields ONLY
+            // data-block handles, so live index / filter blocks interleaved below the
+            // frontier are NOT in this set and stay in the copied complement.
+            let mut holes: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+            if sparse {
+                use crate::table::block_index::BlockIndex;
+                for handle in self.block_index.iter() {
+                    let handle = handle.map_err(|e| alloc::format!("block index iter: {e}"))?;
+                    let block_off = handle.offset().0;
+                    if block_off < punch {
+                        holes.push((block_off, u64::from(handle.size())));
+                    }
+                }
+                holes.sort_unstable();
+                // Establish the full size so the un-written data-block extents stay
+                // sparse holes.
                 tmp.set_len(len)
                     .map_err(|e| alloc::format!("set heal copy length: {e}"))?;
-                tmp.seek(SeekFrom::Start(punch))
-                    .map_err(|e| alloc::format!("seek heal copy to suffix: {e}"))?;
-                punch
-            } else {
-                0
-            };
-            while off < len {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "the u64 min() is taken first, so the value is bounded by buf.len()"
-                )]
-                let want = (len - off).min(buf.len() as u64) as usize;
-                let Some(chunk) = buf.get_mut(..want) else {
-                    return Err(alloc::string::String::from("chunk within buffer"));
-                };
-                let n = source
-                    .read_at(chunk, off)
-                    .map_err(|e| alloc::format!("read source at {off}: {e}"))?;
-                if n < want {
-                    // Fill-or-EOF contract: a short read here means the file
-                    // shrank underneath us — abort rather than install a
-                    // truncated copy.
-                    return Err(alloc::format!(
-                        "short read at {off}: got {n} of {want} bytes"
-                    ));
-                }
-                tmp.write_all(chunk)
-                    .map_err(|e| alloc::format!("write heal copy at {off}: {e}"))?;
-                off += want as u64;
             }
-            if sparse {
-                // Deallocate the prefix even on a filesystem whose `set_len`
-                // zero-allocates rather than leaving a hole, so the reclaimed space
-                // is not silently re-consumed by the heal copy.
+
+            // Live ranges to stream = the complement of the data-block holes across
+            // `[0, len)`. With no holes (a normal table) this is the whole file.
+            let mut live: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+            let mut cursor = 0u64;
+            for &(h_off, h_len) in &holes {
+                if h_off > cursor {
+                    live.push((cursor, h_off));
+                }
+                cursor = cursor.max(h_off + h_len);
+            }
+            if cursor < len {
+                live.push((cursor, len));
+            }
+
+            let mut buf = alloc::vec![0u8; 1 << 20];
+            for &(start, end) in &live {
+                tmp.seek(SeekFrom::Start(start))
+                    .map_err(|e| alloc::format!("seek heal copy to {start}: {e}"))?;
+                let mut off = start;
+                while off < end {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "the u64 min() is taken first, so the value is bounded by buf.len()"
+                    )]
+                    let want = (end - off).min(buf.len() as u64) as usize;
+                    let Some(chunk) = buf.get_mut(..want) else {
+                        return Err(alloc::string::String::from("chunk within buffer"));
+                    };
+                    let n = source
+                        .read_at(chunk, off)
+                        .map_err(|e| alloc::format!("read source at {off}: {e}"))?;
+                    if n < want {
+                        // Fill-or-EOF contract: a short read here means the file
+                        // shrank underneath us — abort rather than install a
+                        // truncated copy.
+                        return Err(alloc::format!(
+                            "short read at {off}: got {n} of {want} bytes"
+                        ));
+                    }
+                    tmp.write_all(chunk)
+                        .map_err(|e| alloc::format!("write heal copy at {off}: {e}"))?;
+                    off += want as u64;
+                }
+            }
+            // Deallocate the data-block holes even where `set_len` zero-allocated, so
+            // the reclaimed space is not silently re-consumed by the heal copy.
+            for &(h_off, h_len) in &holes {
                 self.fs
-                    .punch_hole(&tmp_path, 0, punch)
-                    .map_err(|e| alloc::format!("punch heal copy prefix: {e}"))?;
+                    .punch_hole(&tmp_path, h_off, h_len)
+                    .map_err(|e| alloc::format!("punch heal copy data block at {h_off}: {e}"))?;
             }
             // sync_all, not sync_data: the copy is a NEW file, its size must
             // be durable before the rename publishes it. Mode-aware: the
