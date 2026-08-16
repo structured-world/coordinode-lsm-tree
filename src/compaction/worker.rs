@@ -1132,7 +1132,20 @@ fn run_tight_space_compaction(
                     view.mark_as_deleted();
                 } else {
                     match view.write_restrict_sidecar(boundary, opts.config.sync_mode) {
-                        Ok(()) => view.mark_punch_on_drop(view.punch_offset_for(boundary)?),
+                        Ok(()) => match view.punch_offset_for(boundary) {
+                            Ok(off) => view.mark_punch_on_drop(off),
+                            // Post-commit, so a punch-offset lookup failure is non-fatal,
+                            // exactly like the sidecar-write failure below: the restriction
+                            // is already durable (manifest + sidecar), so leave the input
+                            // unpunched and let a later compaction reclaim it. Propagating
+                            // `?` here would abort an already-committed slice.
+                            Err(e) => log::error!(
+                                "tight-space could not resolve the punch offset for table \
+                                 {} after committing its restriction: {e}; leaving the input \
+                                 unpunched, a later compaction reclaims it",
+                                view.id(),
+                            ),
+                        },
                         Err(e) => log::error!(
                             "tight-space could not write the restrict-bound sidecar for \
                              table {} after committing its restriction: {e}; leaving the \

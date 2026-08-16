@@ -486,17 +486,16 @@ fn tight_space_sidecar_write_fault_is_nonfatal_and_recovers() -> crate::Result<(
     let used = tree.storage_stats()?.used_bytes;
 
     // Leave only a quarter of the footprint free so a full rewrite cannot fit and
-    // the compaction takes the tight-space slice-and-punch path, then fail the
-    // FIRST `.restrict-bound` sidecar write (post-commit under commit-then-mark).
+    // the compaction takes the tight-space slice-and-punch path, then fail EVERY
+    // `.restrict-bound` sidecar write (post-commit under commit-then-mark) so no
+    // restricted input is punched.
     capfs.set_available_space(used / 4);
     tree.update_runtime_config(|c| {
         c.storage_admission_check = true;
         c.tight_space_compaction = true;
     })?;
     injector.arm(
-        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
-            .on_path("restrict-bound")
-            .once(),
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other)).on_path("restrict-bound"),
     );
 
     // The sidecar fault is post-commit, so the compaction SUCCEEDS (it does not
@@ -512,6 +511,15 @@ fn tight_space_sidecar_write_fault_is_nonfatal_and_recovers() -> crate::Result<(
         result.action,
         crate::compaction::CompactionAction::Merged,
         "tight-space must have engaged and merged, got {result:?}",
+    );
+    // Every restricted input whose sidecar write faulted must stay UNPUNCHED: a
+    // punched prefix with no sidecar would force a later repair to derive a
+    // conservative bound and drop up to one live block. With every sidecar write
+    // faulted, no input is punched at all.
+    assert_eq!(
+        capfs.punched_bytes(),
+        0,
+        "an input whose restrict-bound sidecar failed to land must stay unpunched",
     );
 
     // Correctness: reopen and read every key at its latest value. The manifest
