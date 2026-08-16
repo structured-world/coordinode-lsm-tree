@@ -280,6 +280,16 @@ impl Drop for Inner {
             #[cfg(feature = "std")]
             crate::scrub::heal_attest::remove(&*self.fs, &self.path);
 
+            // Reclaim any `.restrict-bound` sidecar the same way: a retired table's
+            // tight-space restriction bound is dead weight, and left behind it would
+            // linger as an orphan (swept by the recovery scan, but a leak until
+            // then). Best-effort; done before the deferred / background unlink paths
+            // return so every deletion route reclaims it. A concurrent checkpoint has
+            // already linked its OWN copy of the sidecar, so removing this original is
+            // safe even on the deferred-deletion (checkpoint-active) branch below.
+            #[cfg(feature = "std")]
+            crate::restrict_bound::remove(&*self.fs, &self.path, crate::fs::SyncMode::Normal);
+
             // Move the accessor and block index out so all file handles
             // (including clones held by the block index) are closed before
             // attempting deletion. On Windows, remove_file fails while any

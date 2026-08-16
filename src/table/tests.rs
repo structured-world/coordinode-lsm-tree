@@ -4581,6 +4581,44 @@ fn recover_test_table_with_id(
     )
 }
 
+/// A retired table reclaims its `.restrict-bound` sidecar on drop, so a
+/// tight-space-restricted SST that is later compacted away does not leak an
+/// orphan sidecar beside its deleted file (the recovery scan would eventually
+/// sweep it, but leaving it is a leak until then).
+#[test]
+fn dropping_a_deleted_table_removes_its_restrict_bound_sidecar() -> crate::Result<()> {
+    use crate::fs::Fs;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("0");
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    writer.write(crate::InternalValue::from_components(
+        b"k",
+        b"v",
+        1,
+        crate::ValueType::Value,
+    ))?;
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    // Publish a restrict-bound sidecar beside the SST, as a tight-space slice would.
+    let fs = StdFs;
+    crate::restrict_bound::write(&fs, &file, None, 0, b"k", crate::fs::SyncMode::Normal)?;
+    let sidecar = crate::restrict_bound::sidecar_path(&file);
+    assert!(fs.exists(&sidecar)?, "sidecar present before retirement");
+
+    // Retire the table and drop its last handle.
+    let table = recover_test_table(&file, checksum)?;
+    table.mark_as_deleted();
+    drop(table);
+
+    assert!(
+        !fs.exists(&sidecar)?,
+        "retiring the table must reclaim its restrict-bound sidecar, not leak it",
+    );
+    Ok(())
+}
+
 #[test]
 fn delete_bitmap_section_round_trips() -> crate::Result<()> {
     let dir = tempdir()?;
