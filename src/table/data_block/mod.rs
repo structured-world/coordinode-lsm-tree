@@ -982,6 +982,24 @@ impl DataBlock {
         )
     }
 
+    /// The user key of the block's FIRST (lowest) entry, or `None` when the block
+    /// decodes to no entries. Repair uses it to derive a resurrection-mode
+    /// restriction that keeps the whole first readable (straddling) block.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a block-decode failure from [`try_iter`](Self::try_iter).
+    #[cfg(feature = "std")]
+    pub(crate) fn first_user_key(
+        &self,
+        comparator: crate::comparator::SharedComparator,
+    ) -> crate::Result<Option<crate::UserKey>> {
+        match self.try_iter(comparator)?.next() {
+            Some(item) => Ok(Some(item.materialize(&self.inner.data).key.user_key)),
+            None => Ok(None),
+        }
+    }
+
     /// Validates the binary index against the sequentially derived restart
     /// heads (see [`Decoder::verify_binary_index`]): the sequential decode
     /// never reads the pointers, so a forged pointer passes every

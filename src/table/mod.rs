@@ -3509,6 +3509,35 @@ impl Table {
         Ok(None)
     }
 
+    /// The GREEDY counterpart of [`derive_restriction_bound`](Self::derive_restriction_bound)
+    /// for RESURRECTION mode: returns the FIRST (lowest) key of the first readable
+    /// block, so restricting to it keeps the WHOLE straddling block — resurrecting
+    /// its sub-bound keys — while still excluding the punched (zeroed) blocks below
+    /// it. Returning the punched table UNRESTRICTED instead would route a read to a
+    /// zeroed, physically-missing block and fail after a supposedly successful
+    /// repair. Wholly-empty readable blocks (e.g. a columnar block fully masked by
+    /// its delete bitmap) are skipped. `None` when every block is zeroed or empty.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a block-index, positioned-read, or block-decode failure.
+    #[cfg(feature = "std")]
+    pub(crate) fn derive_resurrection_bound(&self) -> crate::Result<Option<UserKey>> {
+        for handle in self.block_index.iter() {
+            let handle = handle?;
+            let bh = BlockHandle::new(handle.offset(), handle.size());
+            if self.block_is_zeroed(&bh)? {
+                continue;
+            }
+            if let Some(db) = self.load_data_block(&bh)?
+                && let Some(first) = db.first_user_key(self.comparator.clone())?
+            {
+                return Ok(Some(first));
+            }
+        }
+        Ok(None)
+    }
+
     /// Cross-checks the recorded `locator` section against the ACTUAL
     /// key → newest-version-block mapping derived from decoding every data
     /// block. A checksum- and parity-consistent forged locator is accepted by

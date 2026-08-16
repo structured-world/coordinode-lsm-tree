@@ -2398,6 +2398,63 @@ fn repair_with_resurrection_keeps_a_punched_sst_unrestricted() -> crate::Result<
     Ok(())
 }
 
+/// A punched SST with no trustworthy sidecar, recovered with resurrection ON but
+/// salvage OFF, must NOT be opened unrestricted: its reclaimed prefix is zeroed
+/// block frames, so a read routed to one of them would fail with block corruption
+/// after a supposedly successful repair. Resurrection restricts to the first
+/// readable block's key (keeping the whole straddling block), so a read below the
+/// frontier misses cleanly while the live suffix is served.
+#[test]
+fn repair_with_resurrection_but_no_salvage_does_not_expose_punched_blocks() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    // Absolute so the MemFs directory keys match what `Writer::new` writes (see the
+    // sibling tests for the Windows drive-relative rationale).
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    // Punch `[0, punch(k00050))`, publish NO sidecar: no exact bound survives.
+    let _sst = build_punched_prefix_sst(&memfs, &fs, &tables)?;
+
+    // salvage OFF (no rewrite to drop the zeroed blocks), resurrection ON.
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .repair_with_resurrection(false, true)?;
+    assert_eq!(
+        report.recovered, 1,
+        "the punched SST is recovered: {report:?}"
+    );
+    assert_eq!(report.unreadable, 0, "{:?}", report.unreadable_files);
+
+    let tree = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .open()?;
+    // A read in the punched prefix must MISS cleanly. Unrestricted, this get would
+    // route to a zeroed block and error (the `?` would propagate it, failing the
+    // test) — the restriction makes it miss below the frontier instead.
+    assert!(
+        tree.get(b"k00000", crate::MAX_SEQNO)?.is_none(),
+        "a key in the punched prefix must miss cleanly, not error on a zeroed block",
+    );
+    assert!(
+        tree.get(b"k00255", crate::MAX_SEQNO)?.is_some(),
+        "the live suffix must be served",
+    );
+    Ok(())
+}
+
 /// Repair must PROPAGATE a transient `.restrict-bound` sidecar read on a punched
 /// SST, not silently open it unrestricted (which would expose the zeroed prefix).
 /// A one-shot `Interrupted` opening the sidecar is retryable, so `read` returns an

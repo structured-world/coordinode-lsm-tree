@@ -1560,21 +1560,27 @@ fn repair_tree(
 
                 // No trustworthy exact bound. An unpunched table never carried a
                 // restriction, so it opens unrestricted. A punched table lost its
-                // exact bound: with resurrection on, keep the whole readable region
-                // (salvage drops the zeroed prefix blocks); otherwise DERIVE a
-                // conservative bound from the punch geometry, which keeps the live
-                // suffix and never resurrects a superseded key. Only a fully-punched
-                // SST with no live data is set aside, losing nothing the flag could
-                // have kept.
+                // exact bound and is derived from the punch geometry: with
+                // resurrection on, restrict to the first readable block's FIRST key,
+                // keeping the whole ambiguous straddling block (its sub-bound keys
+                // resurrected); otherwise restrict to the first fully-live block's END
+                // key, dropping the straddling block and never resurrecting a
+                // superseded key. Either bound EXCLUDES the punched (zeroed) blocks
+                // below it, so no read is ever routed to a physically-missing block —
+                // returning the table unrestricted would fail on the first such read.
+                // Only a fully-punched SST with no live data is set aside, losing
+                // nothing the flag could have kept.
                 match table.first_data_block_is_punched() {
                     Ok(false) => break 'restrict Ok(table),
                     Err(e) => break 'restrict Err(e),
                     Ok(true) => {
-                        if allow_resurrection {
-                            break 'restrict Ok(table);
-                        }
-                        match table.derive_restriction_bound() {
-                            Ok(Some(derived)) => break 'restrict table.reopen_restricted(derived),
+                        let derived = if allow_resurrection {
+                            table.derive_resurrection_bound()
+                        } else {
+                            table.derive_restriction_bound()
+                        };
+                        match derived {
+                            Ok(Some(bound)) => break 'restrict table.reopen_restricted(bound),
                             Err(e) => break 'restrict Err(e),
                             Ok(None) => {
                                 drop(table);
