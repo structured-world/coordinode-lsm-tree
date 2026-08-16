@@ -665,6 +665,30 @@ fn repair_with_salvage_quarantines_a_bulk_ingested_sst_that_fails_recovery() -> 
         "the bulk-ingested SST is reported unreadable: {:?}",
         report.unreadable_files,
     );
+
+    // The rejected salvage replacement must be QUARANTINED, not removed-and-forgotten:
+    // a discarded removal error would leave it as a numeric orphan in `tables/` that
+    // blocks the next open. `repair-quarantine/` therefore holds BOTH the corrupt
+    // original (set aside by the caller) AND the rejected replacement.
+    let quarantine = dir.path().join("repair-quarantine");
+    let quarantined: usize = std::fs::read_dir(&quarantine)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .count();
+    assert_eq!(
+        quarantined, 2,
+        "both the corrupt original and the rejected salvage replacement must be \
+         quarantined (found {quarantined})",
+    );
+    // No numeric SST may linger in `tables/` to orphan the next open.
+    let orphans: usize = std::fs::read_dir(dir.path().join("tables"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().parse::<u64>().is_ok())
+        .count();
+    assert_eq!(orphans, 0, "no rejected replacement may linger in tables/");
     Ok(())
 }
 

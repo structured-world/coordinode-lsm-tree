@@ -988,7 +988,20 @@ fn try_salvage_table(
         table.max_local_seqno(),
     ) {
         drop(table);
-        let _ = fs.remove_file(table_path);
+        // QUARANTINE the rejected replacement, don't try-and-forget its removal. A
+        // discarded `remove_file` error would leave the freshly-written numeric SST
+        // in `tables/`; repair would still install a manifest that omits it and
+        // report success, but the next open classifies it as an orphan and fails on
+        // the SAME persistent deletion, so the "repaired" tree cannot reopen. Moving
+        // it out of `tables/` makes it a non-orphan. A quarantine failure propagates:
+        // it is post-quarantine of the ORIGINAL (safely preserved), so the caller
+        // records it as unreadable rather than aborting.
+        let base = table_path.parent().ok_or(crate::Error::Unrecoverable)?;
+        let name = table_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or(crate::Error::Unrecoverable)?;
+        quarantine_file(&**fs, base, table_path, name, config.sync_mode)?;
         return Ok(None);
     }
     Ok(Some(table))
