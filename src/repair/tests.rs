@@ -2071,6 +2071,56 @@ fn quarantine_moves_the_restriction_sidecar_with_the_sst() -> crate::Result<()> 
     Ok(())
 }
 
+/// A failure while moving the companion sidecar (after the SST itself already
+/// moved into `repair-quarantine/`) must roll the SST back under `tables/`:
+/// propagating with the table stranded in quarantine means the retried repair no
+/// longer discovers it and installs a manifest that omits it — permanent loss
+/// from a one-shot rename fault. The rollback leaves both files exactly where a
+/// retry can find and re-quarantine them.
+#[test]
+fn quarantine_rolls_back_the_sst_when_the_sidecar_move_fails() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, SyncMode};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    std::fs::write(&sst, b"sst bytes")?;
+
+    let fs = FaultFs::new(StdFs);
+    crate::restrict_bound::write(&fs, &sst, None, 0, b"k00050", SyncMode::Normal)?;
+    let src_sidecar = crate::restrict_bound::sidecar_path(&sst);
+    assert!(fs.exists(&src_sidecar)?, "precondition: sidecar written");
+
+    // Fault the SIDECAR's rename only: `Rename` matches the destination path,
+    // and only the sidecar's destination contains "restrict-bound" (the SST
+    // moves to a bare numeric name). The SST rename has succeeded by then.
+    fs.injector().arm(
+        FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::Interrupted))
+            .on_path("restrict-bound"),
+    );
+
+    assert!(
+        quarantine_file(&fs, &tables, &sst, "0", SyncMode::Normal).is_err(),
+        "the sidecar rename fault must surface",
+    );
+    assert!(
+        fs.exists(&sst)?,
+        "the SST must be rolled back under tables/ so a retry rediscovers it",
+    );
+    assert!(
+        fs.exists(&src_sidecar)?,
+        "the sidecar must stay beside the SST under tables/",
+    );
+    let quarantine = dir.path().join("repair-quarantine");
+    assert!(
+        !fs.exists(&quarantine.join("0"))?,
+        "no stranded SST may be left in repair-quarantine/",
+    );
+    Ok(())
+}
+
 /// Asserts a punched SST at `tables/0` was recovered RESTRICTED to the exact
 /// sidecar `bound` by default repair (resurrection off): the table joins the
 /// manifest, nothing is set aside, and a key is served IFF it is at or above the

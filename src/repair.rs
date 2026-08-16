@@ -257,52 +257,51 @@ fn quarantine_file(
         candidate
     };
     fs.rename(src, &dest)?;
-    // A restricted SST carries its exact recovery bound in a sibling
-    // `.restrict-bound` sidecar. Move it WITH the table: left behind in `tables/`,
-    // the next open's orphan sweep (the rebuilt manifest no longer names this id)
-    // deletes it, permanently stranding the quarantined punched file from its exact
-    // bound. Absent for unrestricted tables and for non-table quarantines (a
-    // rejected salvage replacement, a foreign file) — a no-op there. Both sidecar
-    // and SST live in the same two directories, so the syncs below cover both.
+    // Everything after the first rename runs inside one fallible span so ANY
+    // failure — the sidecar's existence probe, the sidecar's rename, or the
+    // durability syncs — rolls the SST (and the sidecar, when it moved) back
+    // under `tables/`. Propagating with the table stranded in quarantine would
+    // mean the retried repair no longer discovers it and installs a manifest
+    // that omits it; a sync failure additionally means the move is not durably
+    // committed, so a later power loss could resurrect the source as an orphan
+    // the next open deletes. The rollback leaves both files exactly where a
+    // retry can find and re-quarantine them durably.
+    //
+    // Sidecar: a restricted SST carries its exact recovery bound in a sibling
+    // `.restrict-bound` file. Move it WITH the table: left behind in `tables/`,
+    // the next open's orphan sweep (the rebuilt manifest no longer names this
+    // id) deletes it, permanently stranding the quarantined punched file from
+    // its exact bound. Absent for unrestricted tables and for non-table
+    // quarantines (a rejected salvage replacement, a foreign file), a no-op
+    // there. Both sidecar and SST live in the same two directories, so the two
+    // syncs cover both.
+    //
+    // Sync ordering: a rename is durable only once BOTH affected directory
+    // entries are on disk. Sync the DESTINATION (quarantine) directory FIRST,
+    // then the source: if the source's deletion were made durable first, a
+    // power loss before the quarantine entry is durable would leave NEITHER
+    // name after reboot, destroying the only preserved original. This is the
+    // same ordering `restore_quarantined` uses for the inverse move.
     let src_sidecar = crate::restrict_bound::sidecar_path(src);
     let dest_sidecar = crate::restrict_bound::sidecar_path(&dest);
-    let moved_sidecar = if fs.exists(&src_sidecar)? {
-        fs.rename(&src_sidecar, &dest_sidecar)?;
-        true
-    } else {
-        false
-    };
-    // A rename is durable only once BOTH affected directory entries are on
-    // disk: the destination gains the file and the source loses it. Without
-    // syncing both, a power loss after repair returns can drop the destination
-    // entry or restore the source under `tables/`, and the next open's orphan
-    // cleanup then deletes the only copy set aside for inspection.
-    // Sync the DESTINATION (quarantine) directory FIRST, then the source. If the
-    // source's deletion were made durable first, a power loss before the
-    // quarantine entry is durable would leave NEITHER name after reboot,
-    // destroying the only preserved original. Making the new name durable before
-    // the old one's removal is the same ordering `restore_quarantined` uses for
-    // the inverse move.
-    let sync_result = (|| -> crate::Result<()> {
+    let commit_result = (|| -> crate::Result<()> {
+        if fs.exists(&src_sidecar)? {
+            fs.rename(&src_sidecar, &dest_sidecar)?;
+        }
         fs.sync_directory_with(&quarantine_dir, sync_mode)?;
         if let Some(src_dir) = src.parent() {
             fs.sync_directory_with(src_dir, sync_mode)?;
         }
         Ok(())
     })();
-    // A sync failure means the move is NOT durably committed. Returning with the
-    // source still in quarantine lets a retry (which no longer finds it under
-    // `tables/`) rebuild a manifest that omits it; a later power loss then rolls
-    // the un-synced rename back, resurrecting the source as an orphan the next
-    // open deletes, losing the only recovery copy. Roll the rename back so the
-    // source stays where a retry can still find and re-quarantine it durably.
-    if let Err(e) = sync_result {
-        // Best-effort: undo BOTH moves and re-sync. A rollback that itself fails
-        // leaves nothing more we can safely do here; surface the original error.
+    if let Err(e) = commit_result {
+        // Best-effort: undo BOTH moves and re-sync. The sidecar rollback is
+        // unconditional — a no-op rename failure (the sidecar never moved, or
+        // never existed) is harmless and ignored like the rest. A rollback that
+        // itself fails leaves nothing more we can safely do here; surface the
+        // original error.
         let _ = fs.rename(&dest, src);
-        if moved_sidecar {
-            let _ = fs.rename(&dest_sidecar, &src_sidecar);
-        }
+        let _ = fs.rename(&dest_sidecar, &src_sidecar);
         if let Some(src_dir) = src.parent() {
             let _ = fs.sync_directory_with(src_dir, sync_mode);
         }
