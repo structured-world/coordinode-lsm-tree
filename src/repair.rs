@@ -923,6 +923,22 @@ fn verify_keep_decision(
     )
 }
 
+/// Outcome of [`try_salvage_table`].
+enum SalvageOutcome {
+    /// A clean replacement was written and reopened, ready to install.
+    Salvaged(Table),
+    /// Nothing was recoverable, or the replacement was rejected (an
+    /// unreconstructible bulk-ingest offset); the caller records the table
+    /// unreadable. The original stays quarantined for inspection.
+    Unusable,
+    /// The `reject_punched_without_bound` guard fired: a salvage-dropped data
+    /// extent of the source reads as zeros (the hole-punch signature), so the
+    /// source lost data to a punch whose bound is unrecoverable. The
+    /// unrestricted replacement was rejected and quarantined — installing it
+    /// would resurrect the reclaimed region's superseded rows.
+    PunchedBoundLost,
+}
+
 fn try_salvage_table(
     config: &Config,
     fs: &Arc<dyn crate::fs::Fs>,
@@ -936,7 +952,17 @@ fn try_salvage_table(
     quarantined: &std::path::Path,
     table_path: &std::path::Path,
     table_id: TableId,
-) -> crate::Result<Option<Table>> {
+    // Fail closed when the salvage walk reveals the source was PUNCHED (a
+    // dropped data extent reads as zeros) — set by the recovery-failure arm
+    // when it has no recoverable restriction bound and resurrection is off.
+    // The pre-salvage first-bytes probe catches a punched FIRST block cheaply,
+    // but a partial punch (the punch-on-drop reclaim continues past an
+    // individual `punch_hole` failure) can leave the first block intact while
+    // later prefix blocks are zeroed; only the walk sees those. The
+    // verification arm passes `false`: it derives the bound from its restricted
+    // view, so its salvage output is re-restricted, never ambiguous.
+    reject_punched_without_bound: bool,
+) -> crate::Result<SalvageOutcome> {
     // Salvage under the tree's configured comparator + crypto/dictionary context
     // so the rewritten SST opens, orders, and decrypts / decompresses consistently
     // with the rest of the tree on reopen (the reopen below uses the same
@@ -973,7 +999,7 @@ fn try_salvage_table(
         },
     )?;
     if report.salvaged_path.is_none() {
-        return Ok(None);
+        return Ok(SalvageOutcome::Unusable);
     }
     if !report.dropped.is_empty() {
         log::warn!(
@@ -981,6 +1007,23 @@ fn try_salvage_table(
             report.blocks_salvaged,
             report.dropped.len(),
         );
+    }
+    if reject_punched_without_bound
+        && dropped_data_extent_is_zeroed(&**fs, quarantined, &report.dropped)?
+    {
+        // The source was punched but its bound is unrecoverable: the salvaged
+        // replacement re-emits every intact block — including consumed,
+        // superseded blocks a partial punch left inside the reclaimed prefix —
+        // with nothing to restrict them. Reject it: quarantine the fresh copy
+        // (see the bulk-ingest rejection below for why a plain remove is not
+        // enough) and let the caller set the table aside.
+        let base = table_path.parent().ok_or(crate::Error::Unrecoverable)?;
+        let name = table_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or(crate::Error::Unrecoverable)?;
+        quarantine_file(&**fs, base, table_path, name, config.sync_mode)?;
+        return Ok(SalvageOutcome::PunchedBoundLost);
     }
 
     // Reopen the freshly-written (clean) salvaged SST so it joins the rebuilt
@@ -1030,9 +1073,45 @@ fn try_salvage_table(
             .and_then(|n| n.to_str())
             .ok_or(crate::Error::Unrecoverable)?;
         quarantine_file(&**fs, base, table_path, name, config.sync_mode)?;
-        return Ok(None);
+        return Ok(SalvageOutcome::Unusable);
     }
-    Ok(Some(table))
+    Ok(SalvageOutcome::Salvaged(table))
+}
+
+/// Whether any salvage-dropped DATA extent of `source` opens with an all-zero
+/// window — the hole-punch signature. A real data block's opening bytes (its
+/// header and first entry) are never all zero, so a dropped extent that reads as
+/// zeros was physically reclaimed, not merely corrupted. Probing only the
+/// DROPPED extents keeps legitimate zero runs inside intact (checksum-clean)
+/// blocks from false-positiving.
+///
+/// # Errors
+///
+/// Propagates the open / read failure (a transient one aborts the repair for a
+/// retry, exactly like the other salvage-path reads).
+#[cfg(feature = "std")]
+fn dropped_data_extent_is_zeroed(
+    fs: &dyn crate::fs::Fs,
+    source: &std::path::Path,
+    dropped: &[crate::salvage::DroppedBlock],
+) -> crate::Result<bool> {
+    const PROBE: usize = 64;
+    if dropped.is_empty() {
+        return Ok(false);
+    }
+    let file = fs.open(source, &crate::fs::FsOpenOptions::new().read(true))?;
+    let len = crate::fs::FsFile::metadata(&*file)?.len;
+    for d in &*dropped {
+        if d.section != b"data" || d.offset >= len {
+            continue;
+        }
+        let n = usize::try_from(len - d.offset).unwrap_or(PROBE).min(PROBE);
+        let bytes = crate::file::read_exact(&*file, d.offset, n)?;
+        if bytes.iter().all(|&b| b == 0) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether the source SST's first data block reads as all zeros, the signature of
@@ -1046,6 +1125,12 @@ fn try_salvage_table(
 /// whose bound is unrecoverable (missing / corrupt sidecar and no `Table` to
 /// derive from): salvaging it into an unrestricted output would resurrect the
 /// straddling block's sub-bound rows.
+///
+/// This is the CHEAP pre-salvage fast path only: a PARTIAL punch (the
+/// punch-on-drop reclaim continues past an individual `punch_hole` failure) can
+/// leave the first block intact while later prefix blocks are zeroed, which this
+/// probe cannot see. [`dropped_data_extent_is_zeroed`] closes that gap after the
+/// salvage walk, whose dropped extents expose every zeroed block.
 ///
 /// # Errors
 ///
@@ -1601,16 +1686,19 @@ fn repair_tree(
                 // No trustworthy exact bound. An unpunched table never carried a
                 // restriction, so it opens unrestricted. A punched table lost its
                 // exact bound and is derived from the punch geometry: with
-                // resurrection on, restrict to the first readable block's FIRST key,
-                // keeping the whole ambiguous straddling block (its sub-bound keys
-                // resurrected); otherwise restrict to the first fully-live block's END
-                // key, dropping the straddling block and never resurrecting a
-                // superseded key. Either bound EXCLUDES the punched (zeroed) blocks
-                // below it, so no read is ever routed to a physically-missing block —
-                // returning the table unrestricted would fail on the first such read.
-                // Only a fully-punched SST with no live data is set aside, losing
-                // nothing the flag could have kept.
-                match table.first_data_block_is_punched() {
+                // resurrection on, restrict to the FIRST key of the first readable
+                // block past the punched region, keeping the whole ambiguous
+                // straddling block (its sub-bound keys resurrected); otherwise
+                // restrict to that block's END key, dropping the straddling block
+                // and never resurrecting a superseded key. Either bound EXCLUDES
+                // every punched (zeroed) block below it — including intact blocks a
+                // PARTIAL punch left interleaved inside the reclaimed prefix, which
+                // is why the probe inspects every data block, not just the first —
+                // so no read is ever routed to a physically-missing block; returning
+                // the table unrestricted would fail on the first such read. Only a
+                // fully-punched SST with no live data is set aside, losing nothing
+                // the flag could have kept.
+                match table.has_punched_data_block() {
                     Ok(false) => break 'restrict Ok(table),
                     Err(e) => break 'restrict Err(e),
                     Ok(true) => {
@@ -1748,8 +1836,12 @@ fn repair_tree(
                                 &quarantined,
                                 &table_path,
                                 table_id,
+                                // The bound (when any) comes from the restricted
+                                // view and is re-imposed below, so a punched
+                                // source is never ambiguous on this arm.
+                                false,
                             ) {
-                                Ok(Some(salvaged)) => {
+                                Ok(SalvageOutcome::Salvaged(salvaged)) => {
                                     // Re-impose the tight-space restriction on the
                                     // salvaged output (fail-closed unless resurrection
                                     // is on), the shared path both salvage arms use.
@@ -1775,7 +1867,7 @@ fn repair_tree(
                                         config.sync_mode,
                                     )?;
                                 }
-                                Ok(None) => {
+                                Ok(SalvageOutcome::Unusable | SalvageOutcome::PunchedBoundLost) => {
                                     unreadable_files.push((
                                         table_path,
                                         "verify found corrupt blocks; nothing salvageable"
@@ -1915,6 +2007,13 @@ fn repair_tree(
                         &file_name,
                         config.sync_mode,
                     )?;
+                    // Fail closed when the salvage walk reveals a punched source
+                    // with no recoverable bound: the pre-salvage first-bytes
+                    // probe above catches a punched FIRST block, but a partial
+                    // punch can leave that block intact while later prefix
+                    // blocks are zeroed — only the walk's dropped extents expose
+                    // those.
+                    let reject_punched = restrict_bound.is_none() && !allow_resurrection;
                     match try_salvage_table(
                         config,
                         &folder_fs,
@@ -1922,8 +2021,9 @@ fn repair_tree(
                         &quarantined,
                         &table_path,
                         table_id,
+                        reject_punched,
                     ) {
-                        Ok(Some(salvaged)) => {
+                        Ok(SalvageOutcome::Salvaged(salvaged)) => {
                             // Re-impose the tight-space restriction on the salvaged
                             // output (fail-closed unless resurrection is on), the
                             // shared path both salvage arms use.
@@ -1949,11 +2049,21 @@ fn repair_tree(
                                 config.sync_mode,
                             )?;
                         }
-                        Ok(None) => {
+                        Ok(SalvageOutcome::Unusable) => {
                             unreadable_files.push((
                                 table_path,
                                 format!(
                                     "unrecoverable ({e}); original quarantined, nothing salvageable"
+                                ),
+                            ));
+                        }
+                        Ok(SalvageOutcome::PunchedBoundLost) => {
+                            unreadable_files.push((
+                                table_path,
+                                format!(
+                                    "punched SST with no recoverable restriction bound \
+                                     (missing / corrupt sidecar and failed recovery, punched \
+                                     extents found during salvage); set aside ({e})"
                                 ),
                             ));
                         }

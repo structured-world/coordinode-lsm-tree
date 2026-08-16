@@ -1650,6 +1650,205 @@ fn build_punched_prefix_sst(
     Ok(sst)
 }
 
+/// Builds a multi-block SST at `tables/0`, then PARTIALLY punches its consumed
+/// prefix `[0, punch(k00050))`: every prefix data block EXCEPT THE FIRST is
+/// zeroed, modeling a punch-on-drop reclaim whose first `punch_hole` failed (the
+/// reclaim logs and continues per block). The first block stays intact while
+/// later prefix blocks read as zeros — the state a first-block-only punch probe
+/// misreads as "unpunched". No sidecar is published. Returns the SST path.
+fn build_partially_punched_prefix_sst(
+    memfs: &std::sync::Arc<crate::fs::MemFs>,
+    fs: &std::sync::Arc<dyn crate::fs::Fs>,
+    tables: &std::path::Path,
+) -> crate::Result<std::path::PathBuf> {
+    use crate::fs::Fs;
+    use crate::table::block_index::BlockIndex;
+    let sst = tables.join("0");
+    write_multiblock_sst(&sst, fs)?;
+    let table = recover_sst(sst.clone(), fs)?;
+    let committed = table.punch_offset_for(b"k00050")?;
+    let mut punched = 0u32;
+    for handle in table.block_index.iter() {
+        let handle = handle?;
+        let off = handle.offset().0;
+        if off > 0 && off < committed {
+            memfs.punch_hole(&sst, off, u64::from(handle.size()))?;
+            punched += 1;
+        }
+    }
+    assert!(
+        punched >= 2,
+        "precondition: the consumed prefix spans several blocks past the first",
+    );
+    Ok(sst)
+}
+
+/// A PARTIALLY punched SST (intact first block, zeroed later prefix blocks) with
+/// no trustworthy sidecar must still be recovered RESTRICTED: an intact first
+/// block is NOT proof the SST is unpunched. A first-block-only probe would
+/// recover it unrestricted, and the salvage pass would then re-emit the
+/// intact-but-superseded first block's rows with nothing to restrict them —
+/// resurrecting keys the committed compaction output already superseded.
+#[test]
+fn repair_restricts_a_partially_punched_sst_with_an_intact_first_block() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    build_partially_punched_prefix_sst(&memfs, &fs, &tables)?;
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.recovered, 1,
+        "the partially punched SST is recovered restricted: {report:?}",
+    );
+    assert_eq!(report.unreadable, 0, "{:?}", report.unreadable_files);
+
+    let tree = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .open()?;
+    for i in 0..256u32 {
+        let key = format!("k{i:05}").into_bytes();
+        let served = tree.get(&key, crate::MAX_SEQNO)?.is_some();
+        assert!(
+            !served || key.as_slice() >= b"k00050".as_slice(),
+            "key {key:?} below the committed bound must not resurrect",
+        );
+    }
+    assert!(
+        tree.get(b"k00200", crate::MAX_SEQNO)?.is_some(),
+        "the live suffix must be served",
+    );
+    Ok(())
+}
+
+/// The RESURRECTION counterpart with salvage OFF: a partially punched SST
+/// (intact first block, zeroed later prefix blocks, no sidecar) must be
+/// restricted PAST the last zeroed block. Unrestricted, a read in the zeroed
+/// region would error after a supposedly successful repair; a bound anchored at
+/// the intact FIRST block would leave the zeroed blocks inside the served view
+/// with the same effect.
+#[test]
+fn resurrection_restricts_a_partially_punched_sst_past_the_zeroed_blocks() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    build_partially_punched_prefix_sst(&memfs, &fs, &tables)?;
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .repair_with_resurrection(false, true)?;
+    assert_eq!(report.recovered, 1, "{report:?}");
+    assert_eq!(report.unreadable, 0, "{:?}", report.unreadable_files);
+
+    let tree = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .open()?;
+    // A key in a ZEROED prefix block must miss CLEANLY: unrestricted (or
+    // restricted only to the intact first block's key) this get would route to
+    // a zeroed block and error, failing the test through the `?`.
+    assert!(
+        tree.get(b"k00020", crate::MAX_SEQNO)?.is_none(),
+        "a key in a zeroed block must miss cleanly, not error",
+    );
+    // The intact first block is below the punched region: a single lower bound
+    // cannot keep it while excluding the zeroed blocks above it, and its rows
+    // are superseded by the committed output anyway.
+    assert!(
+        tree.get(b"k00000", crate::MAX_SEQNO)?.is_none(),
+        "the intact-but-superseded first block must not be served",
+    );
+    assert!(
+        tree.get(b"k00255", crate::MAX_SEQNO)?.is_some(),
+        "the live suffix must be served",
+    );
+    Ok(())
+}
+
+/// The recovery-FAILURE counterpart: a partially punched, sidecar-less SST that
+/// also fails whole-file recovery must be set aside, not block-salvaged into an
+/// unrestricted output. The cheap pre-salvage probe reads only the FIRST bytes
+/// and cannot see a punch that left the first block intact; the salvage walk's
+/// dropped all-zero extents must catch it instead.
+#[test]
+fn repair_sets_aside_a_partially_punched_sidecarless_sst_that_fails_recovery() -> crate::Result<()>
+{
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    build_partially_punched_prefix_sst(&memfs, &fs, &tables)?;
+
+    // A PERSISTENT fault on the FIRST streaming read (the preliminary whole-file
+    // hash) fails whole-file recovery and routes repair to the salvage arm; the
+    // salvage itself (reading the quarantined copy) runs unfaulted and WOULD
+    // succeed, resurrecting the intact-but-superseded first block unrestricted.
+    let fault = FaultFs::new(memfs.as_ref().clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .once(),
+    );
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.recovered, 0,
+        "a partially punched sidecar-less SST that fails recovery is set aside, \
+         not salvaged into an unrestricted output: {report:?}",
+    );
+    assert_eq!(report.unreadable, 1, "{:?}", report.unreadable_files);
+    assert!(
+        report
+            .unreadable_files
+            .first()
+            .is_some_and(|(_, reason)| reason.contains("punched extents found during salvage")),
+        "the reason names the punched extents the walk found: {:?}",
+        report.unreadable_files,
+    );
+    Ok(())
+}
+
 /// Writing the `.restrict-bound` sidecar must NEVER mutate the SST — that is the
 /// point of a separate file: the manifest's whole-file checksum for the SST stays
 /// valid across the write, so a crash between the sidecar write and the manifest

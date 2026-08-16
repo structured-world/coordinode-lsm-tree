@@ -3435,105 +3435,145 @@ impl Table {
         )
     }
 
-    /// Reads one data block's RAW on-disk bytes and reports whether they are all
-    /// zero — the signature of a hole-punched (reclaimed) block. Used to
-    /// authenticate a restriction against physical punch evidence: a real punch
-    /// zeroes the reclaimed prefix, so a genuinely restricted table's below-bound
-    /// blocks read as zeros while a forged / stale sidecar over an unpunched file
-    /// finds intact data there.
+    /// Reads one data block's RAW on-disk bytes through `file` and reports
+    /// whether they are all zero — the signature of a hole-punched (reclaimed)
+    /// block. A short all-zero prefix alone is NOT proof (a corrupt block could
+    /// begin with zeros), so a zero opening window falls through to a full-extent
+    /// read; a nonzero window proves the block intact without reading the rest
+    /// (a real block's header and first entry bytes are never all zero).
     ///
     /// # Errors
     ///
     /// Propagates the positioned read failure.
     #[cfg(feature = "std")]
-    fn block_is_zeroed(&self, block_handle: &BlockHandle) -> crate::Result<bool> {
-        let file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
-        let bytes = crate::file::read_exact(
-            &*file,
-            block_handle.offset().0,
-            block_handle.size() as usize,
-        )?;
+    fn block_is_zeroed_in(
+        file: &dyn crate::fs::FsFile,
+        block_handle: &BlockHandle,
+    ) -> crate::Result<bool> {
+        const WINDOW: usize = 64;
+        let size = block_handle.size() as usize;
+        let window = size.min(WINDOW);
+        let head = crate::file::read_exact(file, block_handle.offset().0, window)?;
+        if head.iter().any(|&b| b != 0) {
+            return Ok(false);
+        }
+        if size <= window {
+            return Ok(true);
+        }
+        let bytes = crate::file::read_exact(file, block_handle.offset().0, size)?;
         Ok(bytes.iter().all(|&b| b == 0))
     }
 
-    /// Whether this table's FIRST data block is hole-punched (reads as zeros).
-    /// A tight-space punch always reclaims a `[0, punch_offset)` prefix that
-    /// includes the first data block, so this is the punch test for the case
-    /// where the sidecar bound itself could not be read: a zeroed first block
-    /// means the SST is genuinely punched (bound lost → quarantine), while an
-    /// intact first block means an unpunched file carrying a spurious sidecar.
+    /// Whether ANY of this table's data blocks is hole-punched (reads as zeros).
+    /// This is the punch test for the case where the sidecar bound itself could
+    /// not be read: a zeroed data block means the SST genuinely lost data to a
+    /// punch (bound lost → derive one from the geometry), while a fully intact
+    /// data section means an unpunched file. EVERY block is inspected, not just
+    /// the first: the punch-on-drop reclaim continues past an individual
+    /// `punch_hole` failure, so a partially-punched SST can keep its first block
+    /// intact while later prefix blocks are zeroed — a first-block-only probe
+    /// would misread that file as unpunched and recover it unrestricted, routing
+    /// later reads into the zeroed blocks.
     ///
     /// # Errors
     ///
     /// Propagates a block-index or positioned-read failure.
     #[cfg(feature = "std")]
-    pub(crate) fn first_data_block_is_punched(&self) -> crate::Result<bool> {
-        match self.block_index.iter().next() {
-            Some(handle) => {
-                let handle = handle?;
-                self.block_is_zeroed(&BlockHandle::new(handle.offset(), handle.size()))
+    pub(crate) fn has_punched_data_block(&self) -> crate::Result<bool> {
+        let file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
+        for handle in self.block_index.iter() {
+            let handle = handle?;
+            if Self::block_is_zeroed_in(&*file, &BlockHandle::new(handle.offset(), handle.size()))?
+            {
+                return Ok(true);
             }
-            None => Ok(false),
         }
+        Ok(false)
     }
 
     /// The conservative restriction bound derived from the PHYSICAL punch alone,
     /// for a punched SST whose exact `.restrict-bound` sidecar is not trustworthy
     /// (lost / corrupt / unbacked) and whose manifest restriction is also gone.
     ///
-    /// Walks the data blocks in key order and returns the END key of the FIRST
-    /// block that does NOT read as zeros. Restricting to that key drops the
-    /// punched (zeroed) prefix AND the first readable block, which may STRADDLE
-    /// the true (mid-block) bound: since the end key is that block's maximum, it
-    /// is at or above the true bound, so every served key is live and NO
-    /// superseded key is resurrected. The cost is at most that one block's live
-    /// suffix, which is exactly the trade the resurrection flag governs; the
-    /// resurrection path keeps the whole readable region instead.
+    /// Walks the data blocks in key order and returns the END key of the first
+    /// block AFTER the LAST block that reads as zeros. Restricting to that key
+    /// drops the whole punched region AND the first readable block after it,
+    /// which may STRADDLE the true (mid-block) bound: since the end key is that
+    /// block's maximum, it is at or above the true bound, so every served key is
+    /// live and NO superseded key is resurrected. The cost is at most that one
+    /// block's live suffix, which is exactly the trade the resurrection flag
+    /// governs; the resurrection path keeps the whole readable region instead.
     ///
-    /// `None` when EVERY block reads as zeros: no live data survives the punch, so
-    /// the caller excludes the table (no recoverable live data to lose).
+    /// The bound is anchored PAST THE LAST zeroed block, not at the first
+    /// readable one: the punch-on-drop reclaim continues past an individual
+    /// `punch_hole` failure, so a partially-punched SST can interleave intact
+    /// (but consumed, superseded) blocks with zeroed ones inside the reclaimed
+    /// prefix. Anchoring at the first readable block would place zeroed blocks
+    /// ABOVE the bound — inside the served view — and route reads into
+    /// physically-missing data. Everything below the last zeroed block was
+    /// within the punch's intent and is superseded by the committed output, so
+    /// dropping the intact stragglers loses nothing live.
+    ///
+    /// `None` when no readable block follows the last zeroed one: no live data
+    /// survives the punch, so the caller excludes the table (no recoverable live
+    /// data to lose).
     ///
     /// # Errors
     ///
     /// Propagates a block-index or positioned-read failure.
     #[cfg(feature = "std")]
     pub(crate) fn derive_restriction_bound(&self) -> crate::Result<Option<UserKey>> {
+        let file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
+        let mut candidate: Option<UserKey> = None;
         for handle in self.block_index.iter() {
             let handle = handle?;
-            if !self.block_is_zeroed(&BlockHandle::new(handle.offset(), handle.size()))? {
-                return Ok(Some(handle.end_key().clone()));
+            if Self::block_is_zeroed_in(&*file, &BlockHandle::new(handle.offset(), handle.size()))?
+            {
+                // A later zeroed block invalidates any earlier candidate: the
+                // bound must clear the WHOLE punched region.
+                candidate = None;
+            } else if candidate.is_none() {
+                candidate = Some(handle.end_key().clone());
             }
         }
-        Ok(None)
+        Ok(candidate)
     }
 
     /// The GREEDY counterpart of [`derive_restriction_bound`](Self::derive_restriction_bound)
-    /// for RESURRECTION mode: returns the FIRST (lowest) key of the first readable
-    /// block, so restricting to it keeps the WHOLE straddling block — resurrecting
-    /// its sub-bound keys — while still excluding the punched (zeroed) blocks below
-    /// it. Returning the punched table UNRESTRICTED instead would route a read to a
-    /// zeroed, physically-missing block and fail after a supposedly successful
-    /// repair. Wholly-empty readable blocks (e.g. a columnar block fully masked by
-    /// its delete bitmap) are skipped. `None` when every block is zeroed or empty.
+    /// for RESURRECTION mode: returns the FIRST (lowest) key of the first
+    /// readable block after the LAST zeroed one, so restricting to it keeps the
+    /// WHOLE straddling block — resurrecting its sub-bound keys — while still
+    /// excluding every punched (zeroed) block below it. Returning the punched
+    /// table UNRESTRICTED instead would route a read to a zeroed,
+    /// physically-missing block and fail after a supposedly successful repair;
+    /// anchoring before the last zeroed block (a partial punch can leave intact
+    /// blocks interleaved with zeroed ones) would do the same. Wholly-empty
+    /// readable blocks (e.g. a columnar block fully masked by its delete bitmap)
+    /// are skipped. `None` when no readable non-empty block follows the last
+    /// zeroed one.
     ///
     /// # Errors
     ///
     /// Propagates a block-index, positioned-read, or block-decode failure.
     #[cfg(feature = "std")]
     pub(crate) fn derive_resurrection_bound(&self) -> crate::Result<Option<UserKey>> {
+        let file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
+        let mut candidate: Option<UserKey> = None;
         for handle in self.block_index.iter() {
             let handle = handle?;
             let bh = BlockHandle::new(handle.offset(), handle.size());
-            if self.block_is_zeroed(&bh)? {
+            if Self::block_is_zeroed_in(&*file, &bh)? {
+                candidate = None;
                 continue;
             }
-            if let Some(db) = self.load_data_block(&bh)?
+            if candidate.is_none()
+                && let Some(db) = self.load_data_block(&bh)?
                 && let Some(first) = db.first_user_key(self.comparator.clone())?
             {
-                return Ok(Some(first));
+                candidate = Some(first);
             }
         }
-        Ok(None)
+        Ok(candidate)
     }
 
     /// Cross-checks the recorded `locator` section against the ACTUAL
