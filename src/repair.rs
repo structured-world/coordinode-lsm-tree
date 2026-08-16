@@ -1555,20 +1555,20 @@ fn repair_tree(
                 // A valid sidecar always denotes a COMMITTED restriction: tight-space
                 // writes it STRICTLY AFTER the slice's version install commits (see
                 // `Table::write_restrict_sidecar` and `docs/manifest-recovery.md`), so
-                // an aborted slice never leaves one. Honor its exact bound whether or
-                // not the punch has run: if the prefix is not yet punched (the crash
-                // window between the durable commit and the punch, or a punch deferred
-                // by a live reader), the committed output already covers the dropped
-                // prefix, so honoring resurrects nothing and the flag has no bearing.
-                // A transient punch probe still propagates for retry; a persistent one
-                // only means the bound is not proven EXACT, so it falls through to the
-                // punch-geometry path. The live suffix is always kept.
+                // an aborted slice never leaves one. Honor its exact bound DIRECTLY,
+                // without probing the below-bound prefix: whether or not the punch has
+                // run, reopening at the bound is correct. If the prefix is not yet
+                // punched (the crash window between the durable commit and the punch,
+                // or a punch deferred by a live reader), the committed output already
+                // covers the dropped prefix, so honoring resurrects nothing; if it is
+                // punched, the reopened view digests only the live suffix. Reading the
+                // dead prefix to decide is not just unnecessary — a persistently
+                // unreadable sector there would otherwise discard the exact bound and,
+                // with salvage off, quarantine the whole table despite its intact live
+                // suffix. `reopen_restricted` reads only from the punch offset up, so a
+                // genuinely unreadable SUFFIX still surfaces its error there.
                 if let Some(bound) = &sidecar_bound {
-                    match table.prefix_is_punched(bound) {
-                        Ok(true | false) => break 'restrict table.reopen_restricted(bound.clone()),
-                        Err(e) if is_transient_io(&e) => break 'restrict Err(e),
-                        Err(_) => {}
-                    }
+                    break 'restrict table.reopen_restricted(bound.clone());
                 }
 
                 // No trustworthy exact bound. An unpunched table never carried a

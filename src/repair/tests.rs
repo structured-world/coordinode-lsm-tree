@@ -2629,6 +2629,74 @@ fn repair_restricts_a_punched_sst_on_a_persistent_sidecar_read() -> crate::Resul
     Ok(())
 }
 
+/// A VALID post-commit sidecar is proof enough of a committed restriction: repair
+/// must honor its exact bound WITHOUT first probing the already-dead below-bound
+/// prefix. A persistently-unreadable sector in a punched (dead) prefix block must
+/// not cost the intact live suffix. Here the sidecar bound `k00050` is valid, the
+/// prefix is punched, and the first (dead) data block's positioned read faults
+/// persistently. With salvage OFF (the default), reopening straight at the bound
+/// recovers the readable suffix; probing the dead prefix first would discard the
+/// exact bound and quarantine the whole table.
+#[test]
+fn repair_honors_a_valid_sidecar_despite_a_persistent_dead_prefix_read() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    // Absolute so the MemFs directory keys match what `Writer::new` writes (it
+    // rewrites through `std::path::absolute`, prepending the drive on Windows).
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+
+    // Punch `[0, punch(k00050))` and publish a VALID sidecar bound at k00050.
+    let sst = build_punched_prefix_sst(&memfs, &fs, &tables)?;
+    crate::restrict_bound::write(&*fs, &sst, None, 0, b"k00050", crate::fs::SyncMode::Normal)?;
+
+    // Fault the FIRST data block's positioned read (offset 0, a dead below-bound
+    // block) with a PERSISTENT kind. Only the dead-prefix probe and geometry
+    // fallback read offset 0; the suffix digest reads strictly above the punch.
+    let fault = FaultFs::new(memfs.as_ref().clone());
+    fault
+        .injector()
+        .arm(FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other)).at_offset(0));
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair_with_salvage(false)?;
+    assert_eq!(
+        report.recovered, 1,
+        "a valid sidecar must be honored despite an unreadable dead prefix, not \
+         quarantined: {report:?}",
+    );
+    assert_eq!(report.unreadable, 0, "{:?}", report.unreadable_files);
+
+    let tree = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .open()?;
+    for i in 0..256u32 {
+        let key = format!("k{i:05}").into_bytes();
+        let served = tree.get(&key, crate::MAX_SEQNO)?.is_some();
+        assert_eq!(
+            served,
+            key.as_slice() >= b"k00050".as_slice(),
+            "key {key:?} served={served}; expected served == (key >= k00050)",
+        );
+    }
+    Ok(())
+}
+
 /// A file whose name only LOOKS like a heal-temp — `{id}.healtmp-{non-numeric}`
 /// (e.g. `5.healtmp-backup`) — must NOT be skipped as an owned artifact: recovery
 /// owns only `{id}.healtmp-{numeric}`, so leaving it in place makes the next
