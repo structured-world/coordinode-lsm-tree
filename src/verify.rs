@@ -534,15 +534,27 @@ pub struct BlockVerifyReport {
     /// some tables (unrecognized scheme — recompaction recommended). Distinct
     /// from `errors`: warnings do NOT make [`Self::is_ok`] false.
     pub warnings: Vec<BlockVerifyWarning>,
+    /// Set when the scan could NOT walk some SST-block sections — an unrecognized
+    /// ECC descriptor makes those blocks' parity-trailer length underivable, so
+    /// the walk skips them (including the DATA blocks) entirely. A report with no
+    /// errors but this flag set has verified LESS than the whole file, so it is
+    /// NOT a clean verdict: [`Self::is_ok`] returns `false`. (The data may still
+    /// be readable through the live point-read path, which frames blocks by
+    /// `data_length`; recompaction re-stamps the SST under a supported scheme.)
+    pub incomplete: bool,
 }
 
 impl BlockVerifyReport {
-    /// `true` if every block in every SST verified clean. Warnings (e.g. an
-    /// unrecognized ECC scheme whose data still checksum-verified) do NOT
-    /// make this false — only real corruption (`errors`) does.
+    /// `true` only if every SST section was walked AND every block verified
+    /// clean. A parity-unverifiable WARNING (whose blocks were still walked and
+    /// payload-checksummed) does not make this false, but a real error
+    /// (`errors`) or an INCOMPLETE walk that skipped sections
+    /// ([`Self::incomplete`], e.g. an unrecognized ECC descriptor) does — a
+    /// skipped section was never verified, so reporting it clean would be a false
+    /// success.
     #[must_use]
     pub fn is_ok(&self) -> bool {
-        self.errors.is_empty()
+        self.errors.is_empty() && !self.incomplete
     }
 
     /// `true` if the scrub produced any non-fatal warning.
@@ -634,6 +646,10 @@ fn scan_one_table(table: &crate::table::Table) -> BlockVerifyReport {
             table_id,
             path: path.to_path_buf(),
         });
+        // The block walk will skip every non-self-describing section (the data
+        // blocks included), so the scan is incomplete: a clean report here would
+        // falsely claim the data verified.
+        report.incomplete = true;
     }
 
     // A recognized scheme on a build WITHOUT the ECC codecs: trailers are
@@ -989,6 +1005,10 @@ pub(crate) fn verify_sst_file_with_context(
                 table_id,
                 path: path.to_path_buf(),
             });
+            // The walk below skips the non-self-describing sections (data blocks
+            // included), so the scan is incomplete: a clean report would falsely
+            // claim the data verified.
+            report.incomplete = true;
             ecc_unrecognized = true;
             None
         }

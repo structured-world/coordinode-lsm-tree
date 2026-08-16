@@ -620,6 +620,60 @@ fn verify_sst_file_flags_diverging_mirrors_behind_an_unrecognized_ecc() {
     );
 }
 
+/// A table whose BOTH meta mirrors advertise an UNRECOGNIZED ECC descriptor (they
+/// agree, so no divergence) cannot have its ECC-bearing SST sections walked: the
+/// parity-trailer length is underivable, so the block walk SKIPS the data blocks
+/// entirely. The scan verified NOTHING about the data, so the report must be
+/// INCOMPLETE and `is_ok()` must be false — a clean verdict would falsely claim
+/// the data verified. The unrecognized-ECC warning is still recorded.
+#[test]
+fn verify_sst_file_reports_incomplete_when_ecc_is_unrecognized_in_both_mirrors() {
+    let dir = tempfile::tempdir().unwrap();
+    populate_tree(dir.path(), 200);
+    let sst_path = pick_first_sst_path(dir.path());
+
+    // Sanity: intact file verifies clean.
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        report.is_ok(),
+        "intact SST must be clean: {:?}",
+        report.errors
+    );
+
+    // Forge BOTH mirrors' ECC descriptor to an unknown kind: the two agree (no
+    // mirror divergence), but neither can be applied, so the walk skips the SST
+    // block sections.
+    crate::test_forge::forge_meta_value_both_mirrors(
+        &sst_path,
+        b"descriptor#page_ecc",
+        &[9, 0, 0, 0],
+    )
+    .unwrap();
+
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        report.errors.is_empty(),
+        "no corruption, only an unwalkable ECC scheme: {:?}",
+        report.errors,
+    );
+    assert!(
+        report.incomplete,
+        "the walk skipped the data blocks, so the scan is incomplete",
+    );
+    assert!(
+        !report.is_ok(),
+        "an incomplete scan (data blocks never verified) must not report OK",
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| matches!(w, crate::verify::BlockVerifyWarning::UnrecognizedEcc { .. })),
+        "the unrecognized-ECC warning must still be recorded: {:?}",
+        report.warnings,
+    );
+}
+
 /// A TOC entry RENAMED to a duplicate recognized name — `range_tombstones`
 /// renamed to a second `data`, its block header re-stamped with the `Data`
 /// role — preserves the tiling AND passes the recognized-role walk, yet the
