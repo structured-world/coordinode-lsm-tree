@@ -6587,14 +6587,18 @@ impl Table {
             };
             match load() {
                 Ok(idx) => Some(idx),
-                // A TRANSIENT read propagates so repair retries — degrading it
-                // into the rebuildable-section quarantine would turn a one-shot
-                // I/O failure into a permanent drop of the whole (healthy) table.
-                Err(e @ crate::Error::Io(_)) => return Err(e),
+                // Only a TRANSIENT read propagates so repair retries; a PERSISTENT
+                // I/O failure (bad sector, truncation) degrades under salvage like
+                // the seqno-bounds / zone-map / delete-bitmap / locator loaders —
+                // turning a one-shot failure into a permanent drop of the whole
+                // (recoverable) table would be wrong.
+                Err(crate::Error::Io(e)) if e.kind().is_transient() => {
+                    return Err(crate::Error::Io(e));
+                }
                 // Salvage never consults the source's filter — the
                 // destination writer rebuilds it from the recovered keys —
-                // so a STRUCTURALLY unreadable filter index must not cost the
-                // recoverable data (a live open still fails closed).
+                // so a STRUCTURALLY or PERSISTENTLY unreadable filter index must not
+                // cost the recoverable data (a live open still fails closed).
                 Err(e) if salvage => {
                     log::warn!(
                         "filter index for table {:?} is unreadable ({e}); salvaging \

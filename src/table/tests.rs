@@ -5389,3 +5389,104 @@ fn recover_salvage_propagates_a_transient_locator_read() -> crate::Result<()> {
     );
     Ok(())
 }
+
+/// A PERSISTENT (non-retryable) filter-index read during a SALVAGE open must
+/// DEGRADE the rebuildable section, not propagate — the destination writer
+/// re-derives the filter from the recovered keys, so a bad sector under the
+/// partitioned filter's top-level index must not cost the whole recoverable
+/// table. Only a TRANSIENT read propagates (repair retries). Mirrors the
+/// seqno-bounds / zone-map / delete-bitmap / locator loaders.
+#[test]
+fn recover_salvage_degrades_a_persistent_filter_index_read() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let sst = dir.path().join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?
+            .use_data_block_size(128)
+            .use_partitioned_filter();
+        for i in 0..256u32 {
+            w.write(crate::InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                u64::from(i) + 1,
+                crate::ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Resolve the partitioned filter's top-level-index (`filter_tli`) byte offset
+    // from a clean (Live) open.
+    let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &sst)?);
+    let tli_offset = {
+        let live = Table::recover(
+            sst.clone(),
+            checksum,
+            0,
+            0,
+            0,
+            Arc::new(Cache::with_capacity_bytes(1 << 20)),
+            Some(Arc::new(DescriptorTable::new(8))),
+            Arc::clone(&fs),
+            false,
+            false,
+            None,
+            #[cfg(zstd_any)]
+            None,
+            crate::comparator::default_comparator(),
+            #[cfg(feature = "metrics")]
+            Arc::new(Metrics::default()),
+        )?;
+        live.regions
+            .filter_tli
+            .expect("the partitioned-filter SST carries a filter_tli section")
+            .offset()
+            .0
+    };
+
+    // Fault the positioned read at the filter-index offset with a PERSISTENT
+    // (non-retryable) kind.
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    injector.arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other))
+            .at_offset(tli_offset)
+            .once(),
+    );
+    let faulted: Arc<dyn crate::fs::Fs> = Arc::new(fault);
+
+    let result = Table::recover_inner(
+        sst,
+        checksum,
+        0,
+        0,
+        0,
+        Arc::new(Cache::with_capacity_bytes(1 << 20)),
+        Some(Arc::new(DescriptorTable::new(8))),
+        Arc::clone(&faulted),
+        false,
+        false,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        crate::comparator::default_comparator(),
+        #[cfg(feature = "metrics")]
+        Arc::new(Metrics::default()),
+        RecoveryMode::Salvage {
+            expected_id: None,
+            prefer_mid_meta: false,
+        },
+    );
+    injector.clear();
+
+    assert!(
+        result.is_ok(),
+        "a persistent filter-index read in salvage mode must degrade the rebuildable \
+         section and recover the table, not propagate and quarantine it: {result:?}",
+    );
+    Ok(())
+}
