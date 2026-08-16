@@ -756,6 +756,93 @@ fn reopen_restricted_yields_a_distinct_clamped_view() -> crate::Result<()> {
     )
 }
 
+/// A restricted view must still cross-check its `linked_blob_files` section: the
+/// section carries no checksum, so a same-size rot that under-counts (or drops) a
+/// blob id the READABLE SUFFIX still references passes the block walk, and blob GC
+/// could then retire a file the suffix addresses. The whole-table aggregate can't
+/// be matched exactly once the prefix is punched, but every id/count the suffix
+/// derives must be COVERED BY the recorded aggregate. Here id 9 (referenced by the
+/// suffix key `key00009`) is recorded with a too-small byte total, so both the
+/// unrestricted exact check and the restricted containment check must reject it.
+#[cfg(feature = "std")]
+#[test]
+fn verify_blob_links_rejects_an_undercounted_suffix_id_on_a_restricted_view() -> crate::Result<()> {
+    use crate::blob_tree::handle::BlobIndirection;
+    use crate::cache::Cache;
+    use crate::coding::Encode;
+    use crate::table::Writer;
+    use crate::vlog::ValueHandle;
+    use crate::{InternalValue, ValueType};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("0");
+
+    // Ten indirections (ids 0..10), each 1000 logical / 500 on-disk bytes. The
+    // recorded section matches every id EXCEPT id 9, whose byte total is forged
+    // small — the bit-flip a checksum-less section cannot otherwise catch.
+    let checksum = {
+        let mut w = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_data_block_size(128);
+        for i in 0u64..10 {
+            let value = BlobIndirection {
+                size: 1000,
+                vhandle: ValueHandle {
+                    blob_file_id: i,
+                    on_disk_size: 500,
+                    offset: 0,
+                },
+            }
+            .encode_into_vec();
+            w.write(InternalValue::from_components(
+                format!("key{i:05}").into_bytes(),
+                value,
+                i + 1,
+                ValueType::Indirection,
+            ))?;
+        }
+        for i in 0u64..10 {
+            let bytes = if i == 9 { 1 } else { 1000 };
+            w.link_blob_file(i, 1, bytes, 500);
+        }
+        w.finish()?.expect("the SST is non-empty").1
+    };
+
+    let recover = || -> crate::Result<Table> {
+        Table::recover(
+            file.clone(),
+            checksum,
+            0,
+            0,
+            0,
+            Arc::new(Cache::with_capacity_bytes(1_000_000)),
+            Some(Arc::new(DescriptorTable::new(10))),
+            Arc::new(StdFs),
+            false,
+            false,
+            None,
+            #[cfg(zstd_any)]
+            None,
+            crate::comparator::default_comparator(),
+            #[cfg(feature = "metrics")]
+            Arc::new(crate::metrics::Metrics::default()),
+        )
+    };
+
+    // Baseline: the unrestricted exact check already rejects the bad section.
+    assert!(
+        recover()?.verify_blob_links().is_err(),
+        "the unrestricted exact check must reject the under-counted id",
+    );
+
+    // The restricted view clamped to key00005 still references id 9 in its live
+    // suffix, so the containment check must reject the under-count too.
+    let restricted = recover()?.reopen_restricted(crate::UserKey::from(&b"key00005"[..]))?;
+    assert!(
+        restricted.verify_blob_links().is_err(),
+        "the restricted containment check must reject a suffix id the section under-counts",
+    );
+    Ok(())
+}
+
 /// `reopen_restricted` creates a DISTINCT `Inner` for the same table, so it must
 /// PROPAGATE the tree-installed shared gates onto it: the checkpoint deletion
 /// pause and the heal lock. Without them a restricted view skips the checkpoint

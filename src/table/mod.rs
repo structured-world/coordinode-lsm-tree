@@ -2607,17 +2607,18 @@ impl Table {
         use crate::coding::Decode;
         use alloc::collections::BTreeMap;
 
-        // A restricted view cannot be blob-link-cross-checked: the recorded
-        // `linked_blob_files` section aggregates the WHOLE table's indirections
-        // (per-blob-id counts, not per-block), but its punched prefix is
-        // unscannable, so the derived accounting can only cover the live suffix
-        // and would never match. This gate exists to stop a heal from laundering
-        // a re-stamped section, but an in-place heal rewrites DATA blocks only
-        // (it never touches `linked_blob_files`), so skipping it here forfeits no
-        // heal-attribution guarantee for a restricted table.
-        if self.restrict_lower_bound().is_some() {
-            return Ok(());
-        }
+        // A restricted view's punched prefix is unscannable, so its derived
+        // accounting can only cover the LIVE SUFFIX; the recorded section
+        // aggregates the WHOLE table. An EXACT match is therefore impossible, but
+        // skipping the check entirely lets a same-size bit flip in the
+        // (checksum-less) section drop or forge a blob id the readable suffix
+        // still addresses, after which blob GC can retire a file the suffix points
+        // into. So a restricted view runs a CONTAINMENT check instead (see the
+        // final comparison below): every id/count the suffix derives must be
+        // COVERED BY the recorded aggregate. (This is orthogonal to the
+        // heal-attribution the unrestricted exact check also provides: an in-place
+        // heal rewrites DATA blocks only, never `linked_blob_files`.)
+        let restricted = self.restrict_lower_bound().is_some();
 
         // Derive the indirection accounting FIRST, even when the section is
         // absent: a table that still carries `ValueHandle` indirections but
@@ -2675,6 +2676,29 @@ impl Table {
                     "linked_blob_files carries duplicate records for one blob id",
                 ));
             }
+        }
+        if restricted {
+            // Containment: the recorded aggregate covers the WHOLE table, so each
+            // id the live suffix references must appear with a count/byte total at
+            // least as large as the suffix's own. A suffix-referenced id missing
+            // from the section, or recorded below the suffix's derived total,
+            // means the section dropped or under-counted a live reference — reject
+            // so blob GC cannot retire a file the suffix still addresses.
+            for (id, derived_counts) in &derived {
+                match recorded_map.get(id) {
+                    Some(rec)
+                        if rec.0 >= derived_counts.0
+                            && rec.1 >= derived_counts.1
+                            && rec.2 >= derived_counts.2 => {}
+                    _ => {
+                        return Err(crate::Error::InvalidHeader(
+                            "linked_blob_files omits or under-counts a blob id the \
+                             restricted suffix still references",
+                        ));
+                    }
+                }
+            }
+            return Ok(());
         }
         if derived != recorded_map {
             return Err(crate::Error::InvalidHeader(
