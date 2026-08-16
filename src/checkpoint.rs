@@ -337,23 +337,28 @@ pub fn link_tables(
         bytes += written;
         count += 1;
 
-        // A tight-space-restricted table keeps its EXACT recovery bound only in a
-        // sibling `.restrict-bound` sidecar; copy it beside the SST so a checkpoint
-        // that later needs manifest repair recovers the restriction. Without it,
-        // repair of the backup finds a punched SST with no bound and conservatively
-        // discards the live suffix of its first readable block.
-        let src_sidecar = crate::restrict_bound::sidecar_path(&table.path);
-        if table.fs.exists(&src_sidecar)? {
+        // A tight-space-restricted table keeps its EXACT recovery bound so a
+        // checkpoint that later needs manifest repair recovers the restriction;
+        // without it, repair of the backup finds a punched SST with no bound and
+        // conservatively discards the live suffix of its first readable block. Take
+        // the bound from the CAPTURED version view (`restrict_lower_bound`), not by
+        // re-reading the live `.restrict-bound` sidecar file: a concurrent
+        // tight-space compaction can be overwriting that sidecar (tightening the
+        // same SST id's bound) while we copy it, so a file read would race the
+        // snapshot. The captured view's bound is consistent with the SST bytes just
+        // linked, so write the checkpoint's own sidecar from it. An unrestricted
+        // table carries no bound and needs no sidecar.
+        if let Some(bound) = table.restrict_lower_bound() {
             let dst_sidecar = crate::restrict_bound::sidecar_path(&dst);
-            bytes += link_or_copy_cross_fs(
-                &table.fs,
-                &src_sidecar,
-                target_fs,
-                &dst_sidecar,
+            crate::restrict_bound::write(
+                target_fs.as_ref(),
+                &dst,
+                table.encryption.as_deref(),
+                table.id(),
+                bound,
                 sync_mode,
-                use_reflink,
-            )
-            .map_err(crate::Error::from)?;
+            )?;
+            bytes += target_fs.metadata(&dst_sidecar)?.len;
         }
     }
     Ok((count, bytes))
@@ -865,5 +870,5 @@ pub fn run_checkpoint<T: AbstractTree>(
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason = "test code")]
+#[expect(clippy::unwrap_used, clippy::expect_used, reason = "test code")]
 mod tests;
