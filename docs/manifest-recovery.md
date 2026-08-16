@@ -58,8 +58,7 @@ flowchart TD
     OPEN -->|opened| R0
 
     R0{Restriction bound} -->|transient sidecar read| PROP2[Propagate for retry]
-    R0 -->|sidecar valid, prefix fully punched| REXACT[Bound = exact sidecar bound]
-    R0 -->|sidecar valid, prefix NOT punched| RHONOR[Committed restriction;<br/>restrict to the bound]
+    R0 -->|sidecar valid| REXACT[Bound = exact sidecar bound;<br/>no prefix probe]
     R0 -->|no trustworthy sidecar| RNB{Prefix punched?}
 
     RNB -->|no| RHEALTHY[Healthy table: unrestricted]
@@ -68,7 +67,6 @@ flowchart TD
     RDER -->|yes| RGREEDY[Bound = first readable block;<br/>keep the straddling block]
 
     REXACT --> REOPEN[Reopen restricted;<br/>live suffix always kept]
-    RHONOR --> REOPEN
     RCONS --> REOPEN
     RGREEDY --> REOPEN
     RHEALTHY --> V0
@@ -100,19 +98,17 @@ key, recorded in a small `.restrict-bound` sidecar beside the SST. Recovery's jo
 is to reconstruct that restricted view even when the sidecar is not trustworthy.
 
 A valid sidecar always denotes a *committed* restriction (see *A sidecar proves a
-committed restriction* below), so the punch only refines how exactly the bound is
-known. Three cases arise.
+committed restriction* below). Two cases arise.
 
-**The sidecar is valid and the whole prefix below its bound reads as zeros.** The
-bound is proven and used exactly. This is the common, unambiguous case.
-
-**The sidecar is valid but the prefix is not fully punched.** This is the crash
-window between a compaction durably installing (and marking) the restriction and
-the punch that was to follow it. The restriction is committed, so recovery honors
-the bound unconditionally — it restricts to the bound and drops the prefix, which
-the installed output already covers. The flag has no bearing here: honoring a
-committed bound resurrects nothing (the dropped prefix is superseded by the
-output), and the punch's absence costs only unreclaimed space, not correctness.
+**The sidecar is valid.** Its bound is honored directly, without reading the
+prefix below it. Whether the punch has run makes no difference: if the prefix is
+already punched, the reopened view digests only the live suffix; if it is not
+(the crash window between the durable commit and the punch, or a punch deferred
+by a live reader), the installed output already covers the dropped prefix, so
+honoring resurrects nothing and the punch's absence costs only unreclaimed
+space, not correctness. Probing the dead prefix would add nothing, since both
+probe outcomes honor the same bound; worse, a persistently unreadable sector in
+an already-dead block would spuriously discard the exact bound.
 
 **There is no trustworthy sidecar but the SST is punched.** The bound is not
 known exactly, but the punch geometry bounds it: the live data begins at the

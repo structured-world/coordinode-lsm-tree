@@ -1556,10 +1556,9 @@ fn repair_tree(
             // `.restrict-bound` sidecar beside the SST. A rebuilt manifest must
             // re-apply that restriction, or later reads and compactions traverse the
             // punched blocks and fail. The bound comes from the sidecar (the SST
-            // itself is never mutated, so its whole-file checksum stays valid); it
-            // is trusted ONLY after independently confirming the prefix below it is
-            // actually punched (reads as zeros), so a forged or stale sidecar over
-            // an unpunched file cannot hide healthy keys.
+            // itself is never mutated, so its whole-file checksum stays valid);
+            // written strictly post-commit, a valid sidecar is itself proof of a
+            // committed restriction, so its bound is honored directly (see below).
             let recovered = 'restrict: {
                 let Ok(table) = recovered else {
                     break 'restrict recovered;
