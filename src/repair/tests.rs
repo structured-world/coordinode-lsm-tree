@@ -2030,8 +2030,7 @@ fn quarantine_moves_the_restriction_sidecar_with_the_sst() -> crate::Result<()> 
     use crate::fs::{Fs, MemFs, SyncMode};
     use std::sync::Arc;
 
-    let memfs = Arc::new(MemFs::new());
-    let fs: Arc<dyn Fs> = memfs.clone();
+    let fs: Arc<dyn Fs> = Arc::new(MemFs::new());
     let root = std::path::absolute("/db")?;
     let tables = root.join("tables");
     fs.create_dir_all(&tables)?;
