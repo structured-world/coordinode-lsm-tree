@@ -257,6 +257,21 @@ fn quarantine_file(
         candidate
     };
     fs.rename(src, &dest)?;
+    // A restricted SST carries its exact recovery bound in a sibling
+    // `.restrict-bound` sidecar. Move it WITH the table: left behind in `tables/`,
+    // the next open's orphan sweep (the rebuilt manifest no longer names this id)
+    // deletes it, permanently stranding the quarantined punched file from its exact
+    // bound. Absent for unrestricted tables and for non-table quarantines (a
+    // rejected salvage replacement, a foreign file) — a no-op there. Both sidecar
+    // and SST live in the same two directories, so the syncs below cover both.
+    let src_sidecar = crate::restrict_bound::sidecar_path(src);
+    let dest_sidecar = crate::restrict_bound::sidecar_path(&dest);
+    let moved_sidecar = if fs.exists(&src_sidecar)? {
+        fs.rename(&src_sidecar, &dest_sidecar)?;
+        true
+    } else {
+        false
+    };
     // A rename is durable only once BOTH affected directory entries are on
     // disk: the destination gains the file and the source loses it. Without
     // syncing both, a power loss after repair returns can drop the destination
@@ -282,9 +297,12 @@ fn quarantine_file(
     // open deletes, losing the only recovery copy. Roll the rename back so the
     // source stays where a retry can still find and re-quarantine it durably.
     if let Err(e) = sync_result {
-        // Best-effort: undo the move and re-sync. A rollback that itself fails
+        // Best-effort: undo BOTH moves and re-sync. A rollback that itself fails
         // leaves nothing more we can safely do here; surface the original error.
         let _ = fs.rename(&dest, src);
+        if moved_sidecar {
+            let _ = fs.rename(&dest_sidecar, &src_sidecar);
+        }
         if let Some(src_dir) = src.parent() {
             let _ = fs.sync_directory_with(src_dir, sync_mode);
         }
@@ -308,6 +326,17 @@ fn restore_quarantined(
     sync_mode: crate::fs::SyncMode,
 ) -> crate::Result<()> {
     fs.rename(quarantined, table_path)?;
+    // Restore the companion `.restrict-bound` sidecar too, mirroring the move
+    // `quarantine_file` made: a restored SST without its exact bound would fall
+    // back to a conservative punch-geometry bound on the next open. Both files
+    // share the same two directories, so the syncs below cover both.
+    let quarantined_sidecar = crate::restrict_bound::sidecar_path(quarantined);
+    if fs.exists(&quarantined_sidecar)? {
+        fs.rename(
+            &quarantined_sidecar,
+            &crate::restrict_bound::sidecar_path(table_path),
+        )?;
+    }
     if let Some(dst_dir) = table_path.parent() {
         fs.sync_directory_with(dst_dir, sync_mode)?;
     }

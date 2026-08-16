@@ -2020,6 +2020,58 @@ fn repair_sets_aside_a_punched_sidecarless_sst_that_fails_recovery() -> crate::R
     Ok(())
 }
 
+/// Quarantining a RESTRICTED SST must carry its `.restrict-bound` sidecar along:
+/// left behind in `tables/`, the next open's orphan sweep (the rebuilt manifest no
+/// longer names the id) deletes it, permanently stranding the quarantined punched
+/// file from its exact recovery boundary. `restore_quarantined` moves it back the
+/// same way.
+#[test]
+fn quarantine_moves_the_restriction_sidecar_with_the_sst() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs, SyncMode};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    write_multiblock_sst(&sst, &fs)?;
+    crate::restrict_bound::write(&*fs, &sst, None, 0, b"k00050", SyncMode::Normal)?;
+
+    let src_sidecar = crate::restrict_bound::sidecar_path(&sst);
+    assert!(
+        fs.exists(&src_sidecar)?,
+        "precondition: the sidecar was written"
+    );
+
+    // Quarantine the SST; its sidecar must follow it out of `tables/`.
+    let dest = super::quarantine_file(&*fs, &tables, &sst, "0", SyncMode::Normal)?;
+    let dest_sidecar = crate::restrict_bound::sidecar_path(&dest);
+    assert!(
+        fs.exists(&dest_sidecar)?,
+        "the sidecar must move into repair-quarantine/ next to its SST",
+    );
+    assert!(
+        !fs.exists(&src_sidecar)?,
+        "no orphaned sidecar may be left in tables/ for the orphan sweep to delete",
+    );
+    assert!(!fs.exists(&sst)?, "the SST itself moved out of tables/");
+
+    // Restoring the original brings the sidecar back with it.
+    super::restore_quarantined(&*fs, &dest, &sst, SyncMode::Normal)?;
+    assert!(fs.exists(&sst)?, "the SST is restored to tables/");
+    assert!(
+        fs.exists(&src_sidecar)?,
+        "the sidecar is restored alongside the SST",
+    );
+    assert!(
+        !fs.exists(&dest_sidecar)?,
+        "no sidecar may be left orphaned in repair-quarantine/ after restore",
+    );
+    Ok(())
+}
+
 /// Asserts a punched SST at `tables/0` was recovered RESTRICTED to the exact
 /// sidecar `bound` by default repair (resurrection off): the table joins the
 /// manifest, nothing is set aside, and a key is served IFF it is at or above the
