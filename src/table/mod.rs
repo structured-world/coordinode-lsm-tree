@@ -1420,12 +1420,12 @@ impl Table {
     /// parse as a table id, so an abandoned artifact must never outlive the
     /// heal (recovery still sweeps `*.healtmp-*` left by a hard crash).
     #[cfg(feature = "page_ecc")]
-    fn unshare_for_heal(
+    pub(crate) fn unshare_for_heal(
         &self,
         source: &dyn crate::fs::FsFile,
         sync_mode: crate::fs::SyncMode,
     ) -> Result<Box<dyn crate::fs::FsFile>, alloc::string::String> {
-        use std::io::Write;
+        use std::io::{Seek, SeekFrom, Write};
 
         static HEAL_TMP_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -1433,6 +1433,18 @@ impl Table {
             .metadata()
             .map_err(|e| alloc::format!("metadata: {e}"))?
             .len;
+
+        // A tight-space-restricted view's `[0, punch)` prefix is a hole (reads as
+        // zeros). Recreate it as a hole in the heal copy instead of materializing its
+        // zeros: on the near-full disk tight-space runs on, streaming the whole
+        // logical length would re-allocate the reclaimed prefix and could either
+        // ENOSPC the heal or permanently consume the space the punch reclaimed.
+        // `punch` is `0` for a normal (unrestricted) table, so its copy is
+        // byte-for-byte as before.
+        let punch = self
+            .punch_offset()
+            .map_err(|e| alloc::format!("punch offset: {e}"))?;
+        let sparse = punch > 0 && self.fs.capabilities(&self.path).punch_hole;
         let seq = HEAL_TMP_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let tmp_path = self.path.with_extension(alloc::format!("healtmp-{seq}"));
         let mut tmp = self
@@ -1446,7 +1458,17 @@ impl Table {
         // Any failure past this point must take the copy with it (see above).
         let mut copy = || -> Result<(), alloc::string::String> {
             let mut buf = alloc::vec![0u8; 1 << 20];
-            let mut off = 0u64;
+            // Establish the full size and skip the punched prefix so it stays a hole;
+            // only the live suffix `[punch, len)` is streamed.
+            let mut off = if sparse {
+                tmp.set_len(len)
+                    .map_err(|e| alloc::format!("set heal copy length: {e}"))?;
+                tmp.seek(SeekFrom::Start(punch))
+                    .map_err(|e| alloc::format!("seek heal copy to suffix: {e}"))?;
+                punch
+            } else {
+                0
+            };
             while off < len {
                 #[expect(
                     clippy::cast_possible_truncation,
@@ -1470,6 +1492,14 @@ impl Table {
                 tmp.write_all(chunk)
                     .map_err(|e| alloc::format!("write heal copy at {off}: {e}"))?;
                 off += want as u64;
+            }
+            if sparse {
+                // Deallocate the prefix even on a filesystem whose `set_len`
+                // zero-allocates rather than leaving a hole, so the reclaimed space
+                // is not silently re-consumed by the heal copy.
+                self.fs
+                    .punch_hole(&tmp_path, 0, punch)
+                    .map_err(|e| alloc::format!("punch heal copy prefix: {e}"))?;
             }
             // sync_all, not sync_data: the copy is a NEW file, its size must
             // be durable before the rename publishes it. Mode-aware: the

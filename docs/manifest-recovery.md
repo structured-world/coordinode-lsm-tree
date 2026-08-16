@@ -156,8 +156,14 @@ sidecar present means the restriction is committed, so honoring its bound drops
 only prefix the installed output already covers; and a slice that committed but
 crashed before writing its sidecar leaves an unpunched input with no sidecar,
 which recovers unrestricted while the committed output shadows the redundant
-prefix by sequence number (the input's own tombstones intact, so nothing
-resurrects).
+prefix by sequence number. That shadowing is total because a tight-space slice
+output is a **superset** of its consumed inputs — the slice merge runs without
+bottommost GC (no tombstone drop, no seqno zeroing), so the output retains every
+record, including a tombstone whose deleted key also lived in this survivor's
+prefix but whose tombstone-bearing sibling was fully consumed. Ordinary last-level
+GC would have dropped that tombstone and re-exposed the key; retaining it keeps
+the unrestricted survivor's prefix fully shadowed, so nothing resurrects. Space is
+reclaimed by the hole punch, and a later normal compaction does the deferred GC.
 
 ## Delete-mask resolution
 

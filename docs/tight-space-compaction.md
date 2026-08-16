@@ -86,10 +86,16 @@ windows are both safe:
   installed output covers the dropped prefix); the punch is pure reclaim and its
   absence loses nothing.
 - *Committed, crash before the sidecar is written.* No sidecar and an unpunched
-  input, so recovery keeps the whole input unrestricted. The committed output
-  shadows it by sequence number, and the input's own tombstones are still intact,
-  so nothing is resurrected and nothing is lost — only the redundant prefix waits
-  for a later compaction to reclaim it.
+  input, so recovery keeps the whole input unrestricted. This is safe because a
+  slice output is a **superset** of its consumed inputs: tight-space slices run
+  their merges *without bottommost GC* (no tombstone drop, no seqno zeroing, no
+  range-tombstone application), even when the destination is the last level. So
+  the committed output shadows the unrestricted input's prefix by sequence number
+  for every key — including keys whose tombstone lived in a *different*,
+  fully-consumed input, which ordinary last-level GC would have dropped along with
+  the rows it covered. Nothing is resurrected and nothing is lost; only the
+  redundant prefix waits for a later compaction to reclaim it. Space is still
+  reclaimed here via the hole punch (GC is deferred to a later normal compaction).
 
 Either way, reopening a partially-rewritten tree yields a consistent state with
 every key readable, and a later compaction continues the work. The recovery rules
@@ -141,6 +147,11 @@ file).
   intended trade-off for an emergency, opt-in path.
 - **Correctness**: identical to an ordinary merge. Every key is preserved, the
   latest version wins, and the result round-trips through a reopen.
+- **GC is deferred, not performed here.** Slice merges run without bottommost GC
+  (tombstones and superseded versions are retained) so every output is a superset
+  that stays crash-safe under manifest repair (see *Crash safety*). Tight-space
+  reclaims space through the hole punch; a later normal last-level compaction does
+  the tombstone / seqno GC.
 
 ## Configuration
 

@@ -889,7 +889,18 @@ fn run_tight_space_compaction(
         .hide(payload.table_ids.iter().copied());
 
     let dst_lvl: usize = payload.canonical_level.into();
-    let is_last_level = payload.dest_level == opts.config.level_count - 1;
+    // Tight-space slice merges run WITHOUT bottommost GC (tombstone drop, seqno
+    // zeroing, range-tombstone application) even when the destination IS the last
+    // level. A slice restricts a surviving input and hides its consumed prefix; if a
+    // fully-consumed sibling carried the tombstone for a key that also lives in that
+    // prefix, last-level GC would drop the tombstone from the output. A crash window
+    // that leaves the survivor unrestricted (sidecar not yet written, prefix not yet
+    // punched) would then let manifest repair re-expose the deleted rows. Retaining
+    // every record makes the slice output a SUPERSET that shadows any surviving
+    // prefix in every crash window; a later normal last-level compaction reclaims
+    // the deferred GC. Space is still reclaimed here via the hole punch, which is
+    // what tight-space is for.
+    let bottommost_gc = false;
     let blobs_folder = opts.config.path.join(BLOBS_FOLDER);
     // Canonicalize range tombstones across all inputs (a boundary-spanning RT is
     // otherwise copied into every slice output).
@@ -943,7 +954,7 @@ fn run_tight_space_compaction(
                 &rts,
                 (lower.clone(), Bound::Excluded(boundary.clone())),
                 dst_lvl,
-                is_last_level,
+                bottommost_gc,
                 &blobs_folder,
                 reloc,
             )?;
@@ -1215,7 +1226,7 @@ fn run_tight_space_compaction(
             &rts,
             (lower.clone(), Bound::Unbounded),
             dst_lvl,
-            is_last_level,
+            bottommost_gc,
             &blobs_folder,
             tail_reloc,
         )?;

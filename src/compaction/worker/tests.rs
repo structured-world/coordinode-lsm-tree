@@ -408,6 +408,55 @@ fn restricted_view_passes_every_reconcile_gate() -> crate::Result<()> {
     Ok(())
 }
 
+/// Detaching a tight-space-restricted SST for an in-place heal (it was hard-linked
+/// into a checkpoint) must PRESERVE its punched `[0, punch)` hole in the copy, not
+/// materialize the zeros. Materializing would re-allocate the reclaimed prefix and
+/// could ENOSPC the heal or permanently consume the space the punch reclaimed. The
+/// copy re-punches its prefix, so the reclaim counter grows by exactly `punch`;
+/// before the fix the detach streamed the whole logical length and punched nothing.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn unshare_for_heal_preserves_the_punched_hole() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, SyncMode};
+
+    let dir = tempfile::tempdir()?;
+    let fs = capfs::CapacityFs::new();
+    let reopened = tight_space_crash_and_reopen(
+        dir.path(),
+        Arc::new(fs.clone()),
+        |used| fs.set_available_space(used / 4),
+        || fs.punched_bytes(),
+    )?;
+
+    let version = reopened.current_version();
+    let Some(restricted) = version
+        .iter_tables()
+        .find(|t| t.restrict_lower_bound().is_some())
+    else {
+        panic!("the punched input must reopen as a restricted table");
+    };
+    let punch = restricted.punch_offset()?;
+    assert!(punch > 0, "the restricted table has a punched prefix");
+
+    // Detach the restricted view into a fresh copy, exactly as the in-place heal
+    // does when the inode is shared with a checkpoint link.
+    let shared: Arc<dyn Fs> = Arc::new(fs.clone());
+    let source = shared.open(&restricted.path, &FsOpenOptions::new().read(true))?;
+    let before = fs.punched_bytes();
+    let _copy = match restricted.unshare_for_heal(source.as_ref(), SyncMode::Normal) {
+        Ok(copy) => copy,
+        Err(e) => panic!("unshare_for_heal must succeed on a restricted table: {e}"),
+    };
+    let after = fs.punched_bytes();
+
+    assert_eq!(
+        after - before,
+        punch,
+        "the detached heal copy must re-punch its reclaimed prefix, not materialize it",
+    );
+    Ok(())
+}
+
 /// A REAL tight-space compaction must record its punched input's exact bound in a
 /// `.restrict-bound` sidecar before punching, WITHOUT touching the SST. That
 /// sidecar bound must equal the manifest's restriction lower bound — the invariant
@@ -650,6 +699,119 @@ fn tight_space_install_failure_rolls_back_outputs_and_leaves_no_sidecar() -> cra
         0,
         "an install failure must leave no `.restrict-bound` sidecar (it is written \
          only after the install commits)",
+    );
+    Ok(())
+}
+
+/// A tight-space slice must NOT garbage-collect a tombstone whose deleted key also
+/// lives in a SURVIVING (restricted) input's consumed prefix. If it did, a crash
+/// window that leaves the survivor unrestricted (sidecar not written, prefix not
+/// punched) would let manifest repair — which rebuilds from `tables/` and treats
+/// the survivor as a full table — re-expose the deleted key: the tombstone-bearing
+/// sibling was fully consumed and, with bottommost GC, the compacted output dropped
+/// BOTH records. Tight-space slice outputs keep every record (GC is deferred to a
+/// later normal compaction), so the output still shadows the survivor's prefix and
+/// the deleted key stays deleted.
+#[test]
+fn tight_space_slice_retains_a_tombstone_for_an_unrestricted_repair_survivor() -> crate::Result<()>
+{
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+    use core::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir()?;
+    let capfs = capfs::CapacityFs::new();
+    let fault = FaultFs::new(capfs.clone());
+    let injector = fault.injector();
+    let shared: Arc<dyn crate::fs::Fs> = Arc::new(fault);
+
+    let config = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_shared_fs(Arc::clone(&shared));
+    let failpoint = config.fail_tight_after_first_slice.clone();
+    let tree = match config.open()? {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+
+    // Input B: every key as a live value — the broad input that survives the first
+    // slice (restricted), with the deleted key in its consumed prefix.
+    for i in 0..TIGHT_SPACE_KEYS {
+        tree.insert(tight_space_key(i).as_bytes(), vec![0xCDu8; 64], i);
+    }
+    tree.flush_active_memtable(0)?;
+    // Input T: a tombstone for the FIRST key (smallest, so it lands in the first
+    // slice's consumed prefix and T is fully consumed). Newer than B's value.
+    let deleted = tight_space_key(0);
+    tree.remove(deleted.as_bytes(), TIGHT_SPACE_KEYS);
+    tree.flush_active_memtable(0)?;
+    let used = tree.storage_stats()?.used_bytes;
+
+    capfs.set_available_space(used / 4);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = true;
+    })?;
+    // Fault EVERY restrict-bound sidecar write so the surviving input is left with no
+    // sidecar and unpunched, then crash right after the first slice installs so the
+    // survivor is not consumed by the tail. Together: a committed restriction with no
+    // recoverable bound over a still-full input — exactly #40's window.
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other)).on_path("restrict-bound"),
+    );
+    failpoint.store(true, Ordering::SeqCst);
+
+    // A watermark above every live seqno so bottommost GC would (without the fix)
+    // drop the consumed tombstone.
+    assert!(
+        tree.major_compact(64 * 1024 * 1024, TIGHT_SPACE_KEYS + 1)
+            .is_err(),
+        "the crash failpoint must abort the tight-space compaction",
+    );
+    assert!(
+        !failpoint.load(Ordering::SeqCst),
+        "the failpoint must have fired after the first slice",
+    );
+    assert_eq!(
+        capfs.punched_bytes(),
+        0,
+        "the faulted-sidecar survivor must be left unpunched",
+    );
+
+    // Rebuild the manifest from `tables/`: the survivor has no sidecar and is
+    // unpunched, so repair recovers it UNRESTRICTED. Clear the fault first so the
+    // rebuild's own I/O is not faulted.
+    injector.clear();
+    drop(tree);
+    Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::clone(&shared))
+    .repair_with_salvage(true)?;
+
+    let reopened = match Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(shared)
+    .open()?
+    {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    assert!(
+        reopened
+            .get(deleted.as_bytes(), crate::MAX_SEQNO)?
+            .is_none(),
+        "a tombstone consumed by a tight-space slice must not be GC'd away, or manifest \
+         repair of the unrestricted survivor resurrects the deleted key",
     );
     Ok(())
 }
