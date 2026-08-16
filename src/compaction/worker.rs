@@ -1044,44 +1044,20 @@ fn run_tight_space_compaction(
             // when free space is scarce, so an ENOSPC here would otherwise both abort
             // the reclaim and hold the bytes this slice just consumed.
             // Pre-install rollback. The slice's finalized outputs/blobs are still
-            // unreferenced (no version points at them), and any `.restrict-bound`
-            // this slice already published sits beside a still-UNPUNCHED input (the
-            // punch is armed only AFTER a successful install below). Both must be
-            // retracted on any failure before the install commits: the outputs so the
-            // scarce space is not pinned until the next orphan sweep, and the
-            // sidecars so a later manifest rebuild does not honor an uncommitted
-            // boundary against the unpunched input and drop its live prefix.
-            // Each entry is (input view, its PRIOR committed sidecar bound). On
-            // rollback the sidecar is restored to that prior value (or removed when
-            // there was none) DURABLY, not merely deleted: a later slice tightens an
-            // already-punched input's bound B1 -> B2, and deleting the sidecar would
-            // make manifest repair derive a conservative bound past B1, discarding
-            // the live rows in [B1, first-fully-live-block).
-            let mut published_sidecars: Vec<(Table, Option<alloc::vec::Vec<u8>>)> = Vec::new();
-            let rollback = |e: crate::Error,
-                            published: &[(Table, Option<alloc::vec::Vec<u8>>)]|
-             -> crate::Error {
+            // unreferenced (no version points at them), so on any failure before the
+            // install commits they must be retracted or the scarce space stays pinned
+            // until the next orphan sweep. No `.restrict-bound` sidecar is touched
+            // here: the sidecar write is STRICTLY POST-COMMIT (the mark step below the
+            // install), so an aborted slice never publishes one and there is nothing
+            // to retract. That ordering is the crash-safety invariant — a sidecar on
+            // disk always denotes a committed restriction (see the mark step and
+            // `docs/manifest-recovery.md`).
+            let rollback = |e: crate::Error| -> crate::Error {
                 for t in &outputs {
                     t.mark_as_deleted();
                 }
                 for b in &blobs_for_cleanup {
                     b.mark_as_deleted();
-                }
-                for (v, prior) in published {
-                    // Durable + acknowledged: a retraction that does not land is
-                    // logged (not silently swallowed), since an uncommitted bound
-                    // surviving beside an unpunched input would let repair drop the
-                    // input's live prefix.
-                    if let Err(re) = v
-                        .restore_or_remove_restrict_sidecar(prior.as_deref(), opts.config.sync_mode)
-                    {
-                        log::error!(
-                            "tight-space rollback could not durably restore/retract the \
-                             restrict-bound sidecar for table {}: {re}; the next compaction \
-                             rewrites it",
-                            v.id(),
-                        );
-                    }
                 }
                 e
             };
@@ -1094,36 +1070,13 @@ fn run_tight_space_compaction(
                 {
                     removed_ids.push(view.id());
                 } else {
-                    // Publish the restriction bound to the input's `.restrict-bound`
-                    // sidecar BEFORE the punch, so manifest repair can recover the
-                    // exact bound. The sidecar is a SEPARATE file written through an
-                    // atomic `temp + rename`, so (unlike an in-place meta edit) the
-                    // SST bytes are never touched: its manifest whole-file checksum
-                    // stays valid in every crash window, and there are no two mirrors
-                    // to diverge. A crash AFTER the install but BEFORE the punch leaves
-                    // a VALID sidecar beside a still-unpunched SST; that is the
-                    // committed-restriction-not-yet-reclaimed window, and repair
-                    // correctly honors the bound (restrict, dropping the prefix the
-                    // punch was about to reclaim) under the default policy. A failure
-                    // BEFORE the install never commits that restriction, so `rollback`
-                    // retracts the published sidecar below, keeping the two states
-                    // (indistinguishable on disk) from ever coexisting.
-                    // Capture the PRIOR committed bound BEFORE overwriting, and
-                    // register BEFORE the write: `restrict_bound::write` renames the
-                    // temp onto the live path and only THEN syncs the parent dir, so
-                    // a sync failure returns Err with the live sidecar already in
-                    // place. Rollback must restore the prior (or retract when there
-                    // was none); restoring the same value, or retracting a sidecar
-                    // that was never created, is harmless.
-                    let prior_bound = view
-                        .read_restrict_sidecar_bound()
-                        .map_err(|e| rollback(e, &published_sidecars))?;
-                    published_sidecars.push((view.clone(), prior_bound));
-                    view.write_restrict_sidecar(boundary, opts.config.sync_mode)
-                        .map_err(|e| rollback(e, &published_sidecars))?;
-                    let restricted = view
-                        .reopen_restricted(boundary.clone())
-                        .map_err(|e| rollback(e, &published_sidecars))?;
+                    // Open the restricted view over the same physical SST. This is an
+                    // IN-MEMORY reopen (it reads the live suffix digest but writes
+                    // nothing to disk), so a failure here commits nothing and just
+                    // rolls back the finalized outputs. The `.restrict-bound` sidecar
+                    // that records this view's exact bound is written only AFTER the
+                    // install commits (the mark step below), never here.
+                    let restricted = view.reopen_restricted(boundary.clone()).map_err(rollback)?;
                     restricted_pairs.push((view.id(), restricted.clone()));
                     next_views.push(restricted);
                 }
@@ -1153,20 +1106,40 @@ fn run_tight_space_compaction(
                 opts.encryption.clone(),
             );
             if let Err(e) = install {
-                // The install did not commit, so the punches below never arm: retract
-                // the outputs AND the published sidecars, exactly as the pre-install
-                // loop failures do, so no uncommitted bound survives on an unpunched
-                // input.
-                return Err(rollback(e, &published_sidecars));
+                // The install did not commit, so no sidecar was written (the mark
+                // step below is strictly post-commit) and the punches never arm:
+                // retract only the finalized-but-unreferenced outputs so the scarce
+                // space is freed now instead of at the next orphan sweep.
+                return Err(rollback(e));
             }
 
-            // Arm each surviving prior SST view to punch its consumed prefix on
-            // drop; a fully-consumed input is deleted outright (data is in outputs).
+            // Mark, then punch. The install committed, so now record each restricted
+            // input's exact bound to its `.restrict-bound` sidecar — STRICTLY AFTER
+            // the commit, so a sidecar on disk always denotes a committed restriction
+            // (manifest repair honors it without a commit protocol). Then arm the
+            // prefix punch. A fully-consumed input is deleted outright (its data is in
+            // the outputs).
+            //
+            // A sidecar write that fails HERE is not fatal: the restriction is already
+            // durable in the manifest. Log it and leave that input UNPUNCHED, so a
+            // later manifest-loss repair sees no-sidecar + unpunched and keeps the
+            // whole input (the committed output shadows the redundant prefix, its own
+            // tombstones intact, so nothing resurrects). Punching an input whose
+            // sidecar did not land would instead force repair to derive a conservative
+            // bound and drop up to one live block — so never punch without the sidecar.
             for view in &current_views {
                 if removed_ids.contains(&view.id()) {
                     view.mark_as_deleted();
                 } else {
-                    view.mark_punch_on_drop(view.punch_offset_for(boundary)?);
+                    match view.write_restrict_sidecar(boundary, opts.config.sync_mode) {
+                        Ok(()) => view.mark_punch_on_drop(view.punch_offset_for(boundary)?),
+                        Err(e) => log::error!(
+                            "tight-space could not write the restrict-bound sidecar for \
+                             table {} after committing its restriction: {e}; leaving the \
+                             input unpunched, a later compaction rewrites it",
+                            view.id(),
+                        ),
+                    }
                 }
             }
             // Arm each re-opened stale blob file's prior view to punch its

@@ -246,30 +246,6 @@ pub fn remove(fs: &dyn Fs, table_path: &Path, sync_mode: SyncMode) {
     }
 }
 
-/// Durable removal: unlinks the sidecar and syncs the parent, propagating any
-/// failure.
-///
-/// Unlike [`remove`] (best-effort), a rollback that must KNOW the retraction
-/// landed uses this, so an uncommitted bound cannot silently survive to mislead a
-/// later manifest rebuild. An already-absent sidecar is a success (a no-op).
-///
-/// # Errors
-///
-/// Propagates the unlink failure (other than not-found) or the directory-sync
-/// failure.
-pub fn remove_durable(fs: &dyn Fs, table_path: &Path, sync_mode: SyncMode) -> crate::Result<()> {
-    let path = sidecar_path(table_path);
-    match fs.remove_file(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    }
-    if let Some(parent) = path.parent() {
-        fs.sync_directory_with(parent, sync_mode)?;
-    }
-    Ok(())
-}
-
 /// True when a `.restrict-bound` sidecar exists beside `table_path`.
 ///
 /// # Errors

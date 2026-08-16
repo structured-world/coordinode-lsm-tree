@@ -3306,9 +3306,13 @@ impl Table {
     /// Publishes this table's tight-space restriction lower bound to its
     /// `.restrict-bound` sidecar, so manifest repair recovers the exact bound
     /// WITHOUT the SST itself being mutated (which would invalidate the whole-file
-    /// checksum the manifest still holds for it). MUST be called — and returned —
-    /// BEFORE the prefix is hole-punched; the atomic `temp + rename` write leaves
-    /// the sidecar fully present or absent across a crash, beside an untouched SST.
+    /// checksum the manifest still holds for it). MUST be called STRICTLY AFTER the
+    /// slice's version install commits and BEFORE the prefix is hole-punched: the
+    /// post-commit ordering makes a sidecar on disk always denote a committed
+    /// restriction (so repair honors it without a commit protocol), and writing it
+    /// before the punch gives every punched input a recoverable exact bound. The
+    /// atomic `temp + rename` write leaves the sidecar fully present or absent
+    /// across a crash, beside an untouched SST.
     ///
     /// # Errors
     ///
@@ -3327,53 +3331,6 @@ impl Table {
             bound,
             sync_mode,
         )
-    }
-
-    /// Reads this table's currently-published restriction bound, if a valid
-    /// sidecar for THIS table id exists. `None` when it is absent, corrupt, or
-    /// carries a different id. Captured BEFORE a slice overwrites the sidecar so a
-    /// rollback can restore the prior committed value.
-    ///
-    /// # Errors
-    ///
-    /// Propagates a sidecar read failure (transient or persistent I/O).
-    #[cfg(feature = "std")]
-    pub(crate) fn read_restrict_sidecar_bound(&self) -> crate::Result<Option<alloc::vec::Vec<u8>>> {
-        match crate::restrict_bound::read(&*self.fs, &self.path, self.encryption.as_deref())? {
-            crate::restrict_bound::SidecarRead::Present(id, bound) if id == self.metadata.id => {
-                Ok(Some(bound))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    /// Restores a previously-captured sidecar bound, or DURABLY removes the
-    /// sidecar when there was none. A rollback of an aborted tight-space slice
-    /// uses this to put each input's sidecar back to its last committed value (or
-    /// none), so a later manifest rebuild never honors the uncommitted bound the
-    /// slice wrote. The write and the removal are both durably synced.
-    ///
-    /// # Errors
-    ///
-    /// Propagates a durable write or removal failure so the caller can
-    /// acknowledge (rather than silently ignore) a retraction that did not land.
-    #[cfg(feature = "std")]
-    pub(crate) fn restore_or_remove_restrict_sidecar(
-        &self,
-        prior: Option<&[u8]>,
-        sync_mode: crate::fs::SyncMode,
-    ) -> crate::Result<()> {
-        match prior {
-            Some(bound) => crate::restrict_bound::write(
-                &*self.fs,
-                &self.path,
-                self.encryption.as_deref(),
-                self.metadata.id,
-                bound,
-                sync_mode,
-            ),
-            None => crate::restrict_bound::remove_durable(&*self.fs, &self.path, sync_mode),
-        }
     }
 
     /// Reads one data block's RAW on-disk bytes and reports whether they are all

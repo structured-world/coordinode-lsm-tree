@@ -450,16 +450,15 @@ fn tight_space_writes_a_restrict_bound_sidecar_matching_the_manifest_bound() -> 
     Ok(())
 }
 
-/// `run_subcompaction` finalizes a slice's output SSTs before the tight-space loop
-/// publishes each surviving input's `.restrict-bound` sidecar. If that sidecar
-/// write fails (an `ENOSPC` is the likely cause, since tight-space runs precisely
-/// when free space is scarce), the install never references those finalized
-/// outputs. They must be rolled back at once (marked deleted, so their blocks free
-/// on drop), not left to pin the space the slice just consumed until the next
-/// open's orphan sweep. A fault on the FIRST sidecar write must leave NO full-size
-/// orphan output behind.
+/// The `.restrict-bound` sidecar is written STRICTLY AFTER the slice's version
+/// install commits, so a fault on that (post-commit) write is NOT fatal: the
+/// restriction is already durable in the manifest. The slice logs the failure and
+/// leaves that input UNPUNCHED (never punching an input whose sidecar did not
+/// land, which would force a later repair to derive a conservative bound and drop
+/// a live block), so the compaction still SUCCEEDS and a reopen reads every key at
+/// its latest value — no data loss, no resurrection.
 #[test]
-fn tight_space_rolls_back_finalized_outputs_when_the_sidecar_write_fails() -> crate::Result<()> {
+fn tight_space_sidecar_write_fault_is_nonfatal_and_recovers() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
     use crate::io::ErrorKind;
 
@@ -486,7 +485,96 @@ fn tight_space_rolls_back_finalized_outputs_when_the_sidecar_write_fails() -> cr
     tree.flush_active_memtable(0)?;
     let used = tree.storage_stats()?.used_bytes;
 
-    // The all-digit table files on disk BEFORE the compaction (the flushed inputs).
+    // Leave only a quarter of the footprint free so a full rewrite cannot fit and
+    // the compaction takes the tight-space slice-and-punch path, then fail the
+    // FIRST `.restrict-bound` sidecar write (post-commit under commit-then-mark).
+    capfs.set_available_space(used / 4);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = true;
+    })?;
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
+            .on_path("restrict-bound")
+            .once(),
+    );
+
+    // The sidecar fault is post-commit, so the compaction SUCCEEDS (it does not
+    // roll back a committed slice). Space is quartered, so a normal rewrite cannot
+    // fit — a `Merged` action proves the tight-space slice-and-punch path engaged
+    // (a plain merge would have been skipped for lack of headroom, never reaching
+    // the faulted `.restrict-bound` write).
+    let result = match tree.major_compact(64 * 1024 * 1024, 0) {
+        Ok(r) => r,
+        Err(e) => panic!("a post-commit sidecar-write fault must not fail the compaction: {e:?}"),
+    };
+    assert_eq!(
+        result.action,
+        crate::compaction::CompactionAction::Merged,
+        "tight-space must have engaged and merged, got {result:?}",
+    );
+
+    // Correctness: reopen and read every key at its latest value. The manifest
+    // committed the restriction, so the unpunched-and-sidecarless input's redundant
+    // prefix is routed to the installed output — nothing is lost or resurrected.
+    drop(tree);
+    let reopened = match Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::clone(&shared))
+    .open()?
+    {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    for i in 0..TIGHT_SPACE_KEYS {
+        let got = reopened.get(tight_space_key(i).as_bytes(), crate::MAX_SEQNO)?;
+        assert_eq!(
+            got.as_deref(),
+            Some(&[0xCDu8; 64][..]),
+            "key {i} must read its latest value after the sidecar-fault reopen",
+        );
+    }
+    Ok(())
+}
+
+/// The `.restrict-bound` sidecar is written STRICTLY AFTER the version install
+/// commits, so an install FAILURE leaves NO sidecar (nothing to retract) and the
+/// slice's finalized outputs must be rolled back at once (marked deleted, so their
+/// blocks free on drop) rather than orphaned to pin the scarce space until the
+/// next open's sweep. Faulting the edit-log append (the install's durable commit)
+/// must abort with that fault, leave no full-size orphan output, and leave no
+/// `.restrict-bound` sidecar behind.
+#[test]
+fn tight_space_install_failure_rolls_back_outputs_and_leaves_no_sidecar() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let capfs = capfs::CapacityFs::new();
+    let fault = FaultFs::new(capfs.clone());
+    let injector = fault.injector();
+    let shared: Arc<dyn crate::fs::Fs> = Arc::new(fault);
+
+    let config = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_shared_fs(Arc::clone(&shared));
+    let tree = match config.open()? {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    for i in 0..TIGHT_SPACE_KEYS {
+        tree.insert(tight_space_key(i).as_bytes(), vec![0xCDu8; 64], i);
+    }
+    tree.flush_active_memtable(0)?;
+    let used = tree.storage_stats()?.used_bytes;
+
     let tables_dir = dir.path().join(crate::file::TABLES_FOLDER);
     let numeric_files = || -> Vec<(std::ffi::OsString, u64)> {
         std::fs::read_dir(&tables_dir)
@@ -508,93 +596,6 @@ fn tight_space_rolls_back_finalized_outputs_when_the_sidecar_write_fails() -> cr
         !inputs.is_empty(),
         "the flush produced at least one input SST"
     );
-
-    // Leave only a quarter of the footprint free so a full rewrite cannot fit and
-    // the compaction takes the tight-space slice-and-punch path, then fail the
-    // FIRST `.restrict-bound` sidecar publish (its temp create).
-    capfs.set_available_space(used / 4);
-    tree.update_runtime_config(|c| {
-        c.storage_admission_check = true;
-        c.tight_space_compaction = true;
-    })?;
-    injector.arm(
-        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
-            .on_path("restrict-bound")
-            .once(),
-    );
-
-    // Pin the abort to the INJECTED fault: a bare `is_err()` would also pass if
-    // the tight-space path stopped engaging or the admission gate refused the
-    // compaction before any output was finalized, silently not exercising the
-    // rollback this test is named for.
-    let result = tree.major_compact(64 * 1024 * 1024, 0);
-    assert!(
-        matches!(&result, Err(crate::Error::Io(e)) if e.kind() == ErrorKind::Other),
-        "the tight-space compaction must abort with the injected sidecar-write fault, \
-         got {result:?}",
-    );
-
-    // No NEW full-size table file may survive: the aborted slice's finalized
-    // outputs were rolled back, not orphaned. Without the rollback a full-size
-    // output lingers under a fresh id, pinning the space the slice consumed.
-    for (name, len) in numeric_files() {
-        assert!(
-            len == 0 || inputs.contains(&name),
-            "a finalized slice output ({name:?}, {len} bytes) was orphaned instead of \
-             rolled back after the sidecar write failed",
-        );
-    }
-    Ok(())
-}
-
-/// When the tight-space loop publishes one input's `.restrict-bound` sidecar and
-/// then a LATER step in the same pre-install slice fails, the published sidecar
-/// must be RETRACTED, not left beside its still-unpunched input. The install never
-/// commits (so the punch never arms), and a later manifest rebuild honors a valid
-/// sidecar even over an unpunched SST under the default policy, so it would
-/// discard every key below an uncommitted boundary. Here the SECOND sidecar
-/// publish is
-/// faulted so the FIRST is already on disk; after the abort no `.restrict-bound`
-/// may survive.
-#[test]
-fn tight_space_retracts_published_sidecars_when_a_later_slice_step_fails() -> crate::Result<()> {
-    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
-    use crate::io::ErrorKind;
-
-    let dir = tempfile::tempdir()?;
-    let capfs = capfs::CapacityFs::new();
-    let fault = FaultFs::new(capfs.clone());
-    let injector = fault.injector();
-    let shared: Arc<dyn crate::fs::Fs> = Arc::new(fault);
-
-    let config = Config::new(
-        dir.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .data_block_size_policy(BlockSizePolicy::all(512))
-    .with_shared_fs(Arc::clone(&shared));
-    let tree = match config.open()? {
-        crate::AnyTree::Standard(t) => t,
-        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
-    };
-    // Two flushed inputs that BOTH straddle the tight-space boundary, so the slice
-    // loop publishes two sidecars: the first succeeds, the second is faulted.
-    for i in 0..TIGHT_SPACE_KEYS {
-        tree.insert(tight_space_key(i).as_bytes(), vec![0xCDu8; 64], i);
-    }
-    tree.flush_active_memtable(0)?;
-    for i in 0..TIGHT_SPACE_KEYS {
-        tree.insert(
-            tight_space_key(i).as_bytes(),
-            vec![0xEFu8; 64],
-            TIGHT_SPACE_KEYS + i,
-        );
-    }
-    tree.flush_active_memtable(0)?;
-    let used = tree.storage_stats()?.used_bytes;
-
-    let tables_dir = dir.path().join(crate::file::TABLES_FOLDER);
     let sidecar_count = || -> usize {
         std::fs::read_dir(&tables_dir)
             .into_iter()
@@ -609,28 +610,38 @@ fn tight_space_retracts_published_sidecars_when_a_later_slice_step_fails() -> cr
         c.storage_admission_check = true;
         c.tight_space_compaction = true;
     })?;
-    // Let the FIRST sidecar publish through; fault the SECOND one's temp create.
+    // Fault the slice's version install: the edit-log append is its durable commit.
     injector.arm(
-        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
-            .on_path("restrict-bound")
-            .skip(1)
+        FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::Other))
+            .on_path("edits")
             .once(),
     );
 
+    // Pin the abort to the INJECTED fault: a bare `is_err()` would also pass if the
+    // tight-space path stopped engaging or the admission gate refused the compaction
+    // before any output was finalized, silently not exercising the rollback.
     let result = tree.major_compact(64 * 1024 * 1024, 0);
     assert!(
         matches!(&result, Err(crate::Error::Io(e)) if e.kind() == ErrorKind::Other),
-        "the tight-space compaction must abort with the injected 2nd-sidecar fault, \
-         got {result:?}",
+        "the tight-space compaction must abort with the injected install fault, got {result:?}",
     );
 
-    // The first sidecar was published before the abort; the rollback must have
-    // retracted it. No `.restrict-bound` may linger over an uncommitted boundary.
+    // No NEW full-size table file may survive: the aborted slice's finalized outputs
+    // were rolled back, not orphaned, so the scarce space is freed at once.
+    for (name, len) in numeric_files() {
+        assert!(
+            len == 0 || inputs.contains(&name),
+            "a finalized slice output ({name:?}, {len} bytes) was orphaned instead of \
+             rolled back after the install failed",
+        );
+    }
+    // The sidecar write is post-install, so an install failure leaves none behind:
+    // there is no uncommitted boundary a later repair could honor.
     assert_eq!(
         sidecar_count(),
         0,
-        "a published `.restrict-bound` sidecar was orphaned after the slice aborted \
-         pre-install, leaving an uncommitted boundary a later repair would honor",
+        "an install failure must leave no `.restrict-bound` sidecar (it is written \
+         only after the install commits)",
     );
     Ok(())
 }

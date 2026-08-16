@@ -59,11 +59,9 @@ flowchart TD
 
     R0{Restriction bound} -->|transient sidecar read| PROP2[Propagate for retry]
     R0 -->|sidecar valid, prefix fully punched| REXACT[Bound = exact sidecar bound]
-    R0 -->|sidecar valid, prefix NOT punched| RUNP{allow_resurrection?}
+    R0 -->|sidecar valid, prefix NOT punched| RHONOR[Committed restriction;<br/>restrict to the bound]
     R0 -->|no trustworthy sidecar| RNB{Prefix punched?}
 
-    RUNP -->|no| RHONOR[Restrict to the bound;<br/>drop the prefix]
-    RUNP -->|yes| RUNREST[Unrestricted: keep the prefix]
     RNB -->|no| RHEALTHY[Healthy table: unrestricted]
     RNB -->|yes| RDER{allow_resurrection?}
     RDER -->|no| RCONS[Bound = first fully-live block;<br/>drop the straddling block]
@@ -73,7 +71,6 @@ flowchart TD
     RHONOR --> REOPEN
     RCONS --> REOPEN
     RGREEDY --> REOPEN
-    RUNREST --> V0
     RHEALTHY --> V0
     REOPEN --> V0
 
@@ -102,17 +99,20 @@ surviving view is *restricted* to keys at or above a bound. The exact bound is a
 key, recorded in a small `.restrict-bound` sidecar beside the SST. Recovery's job
 is to reconstruct that restricted view even when the sidecar is not trustworthy.
 
-The physical punch is the bound's authenticator. Three cases arise.
+A valid sidecar always denotes a *committed* restriction (see *A sidecar proves a
+committed restriction* below), so the punch only refines how exactly the bound is
+known. Three cases arise.
 
 **The sidecar is valid and the whole prefix below its bound reads as zeros.** The
 bound is proven and used exactly. This is the common, unambiguous case.
 
 **The sidecar is valid but the prefix is not fully punched.** This is the crash
-window between a compaction durably installing the restriction and the punch that
-was to follow it, or a stale sidecar over a table that was never restricted. The
-two are indistinguishable from disk, so the flag decides: by default honor the
-bound (restrict, dropping the prefix); with resurrection enabled, keep the whole
-table.
+window between a compaction durably installing (and marking) the restriction and
+the punch that was to follow it. The restriction is committed, so recovery honors
+the bound unconditionally — it restricts to the bound and drops the prefix, which
+the installed output already covers. The flag has no bearing here: honoring a
+committed bound resurrects nothing (the dropped prefix is superseded by the
+output), and the punch's absence costs only unreclaimed space, not correctness.
 
 **There is no trustworthy sidecar but the SST is punched.** The bound is not
 known exactly, but the punch geometry bounds it: the live data begins at the
@@ -144,15 +144,20 @@ sidecar). With resurrection disabled both re-impose the bound; with it enabled
 both keep the whole readable region and clear the sidecar, since the unpunched
 replacement would otherwise be wrongly restricted on a later repair.
 
-**Only a committed restriction ever leaves a sidecar over an unpunched SST.**
-Because recovery honors a valid sidecar even when the punch has not (yet) zeroed
-the prefix, a sidecar that outlives its intended restriction would silently drop
-live keys. Tight-space compaction therefore treats the sidecar as part of the
-slice's atomic commit: it is published before the punch, but if the slice aborts
-before its version install commits, the rollback retracts every sidecar it
-published. The only unpunched-yet-valid sidecar recovery can encounter is the
-genuine crash window between a durable install and the punch that follows it,
-which is exactly the state honoring the bound is correct for.
+**A sidecar proves a committed restriction.** Recovery honors a valid sidecar
+even when the punch has not (yet) zeroed the prefix, so a sidecar that outlived an
+*uncommitted* restriction would silently drop live keys. Tight-space compaction
+rules that state out by ordering: the sidecar is written *strictly after* the
+slice's version install commits, so its mere existence proves the restriction is
+durable. An aborted slice crashes or returns before the install and so never
+reaches the sidecar write — there is no uncommitted sidecar to leave behind, and
+no rollback that must retract one. Only two on-disk states remain, both safe: a
+sidecar present means the restriction is committed, so honoring its bound drops
+only prefix the installed output already covers; and a slice that committed but
+crashed before writing its sidecar leaves an unpunched input with no sidecar,
+which recovers unrestricted while the committed output shadows the redundant
+prefix by sequence number (the input's own tombstones intact, so nothing
+resurrects).
 
 ## Delete-mask resolution
 

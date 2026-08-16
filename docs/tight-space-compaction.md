@@ -41,8 +41,15 @@ slice `[lower, boundary)`:
    fsync it.
 2. **Install** one atomic, durable version edit that adds the output and either
    restricts each input that extends past the boundary to `[boundary, hi)` or
-   drops an input the slice fully consumed.
-3. **Punch** the consumed data blocks of each restricted input (the bytes below
+   drops an input the slice fully consumed. This edit is the slice's commit
+   point: nothing before it is durable, everything after it is.
+3. **Mark** each restricted input's exact bound in a small sibling
+   `.restrict-bound` sidecar, written *strictly after* the install commits. The
+   sidecar is the only record of the exact bound that survives a lost manifest,
+   so a later rebuild from `tables/` can reconstruct the restricted view. Writing
+   it after the commit makes its existence prove the restriction is committed
+   (see *Crash safety*).
+4. **Punch** the consumed data blocks of each restricted input (the bytes below
    the boundary), reclaiming their space while leaving the file in place for the
    restricted view that still serves the suffix.
 
@@ -58,12 +65,35 @@ The final slice merges the remainder and removes the inputs outright.
 ## Crash safety
 
 Each slice is one durable version edit, so a crash mid-rewrite is always
-recoverable: the manifest carries each input's persisted key-range restriction,
-and recovery rebuilds the restricted view. A crash before a slice's edit leaves
-an orphan output (swept on recovery) and an intact input; a crash after it leaves
-the restriction recorded, so the punched prefix is already routed to the
-installed output. Reopening a partially-rewritten tree yields a consistent state
-with every key readable, and a later compaction continues the work.
+recoverable, and recovery works from either of two sources.
+
+**Manifest intact.** The version edit carries each input's persisted key-range
+restriction, so normal recovery rebuilds the restricted view directly. A crash
+before a slice's edit leaves an orphan output (swept on recovery) and an intact
+input; a crash after it leaves the restriction recorded, so the consumed prefix
+is already routed to the installed output.
+
+**Manifest lost.** When the manifest is gone, recovery rebuilds it from the SST
+files under `tables/` and cannot consult any commit state, so it needs an on-disk
+record of each restriction. That is the `.restrict-bound` sidecar, and the order
+in step 3 is what makes it trustworthy: because the sidecar is written *strictly
+after* the version install commits, **a sidecar on disk proves its restriction is
+committed.** An aborted or crashed slice can never leave an uncommitted sidecar
+behind, so there is no rollback that must chase one down. The two remaining crash
+windows are both safe:
+
+- *Committed, sidecar written, not yet punched.* Recovery honors the bound (the
+  installed output covers the dropped prefix); the punch is pure reclaim and its
+  absence loses nothing.
+- *Committed, crash before the sidecar is written.* No sidecar and an unpunched
+  input, so recovery keeps the whole input unrestricted. The committed output
+  shadows it by sequence number, and the input's own tombstones are still intact,
+  so nothing is resurrected and nothing is lost — only the redundant prefix waits
+  for a later compaction to reclaim it.
+
+Either way, reopening a partially-rewritten tree yields a consistent state with
+every key readable, and a later compaction continues the work. The recovery rules
+are specified in `docs/manifest-recovery.md`.
 
 ## KV-separated trees
 

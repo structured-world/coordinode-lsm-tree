@@ -2070,14 +2070,24 @@ fn repair_restricts_a_punched_sst_whose_sidecar_bound_overshoots_the_punch() -> 
     assert_recovered_restricted_to(&memfs, &root, b"k00130")
 }
 
-/// A VALID `.restrict-bound` sidecar for this id over an UNPUNCHED SST is
-/// ambiguous: it is EITHER a committed restriction whose punch had not yet run
-/// when the process crashed (the manifest install is durable before the punch),
-/// OR a forged / stale sidecar over a healthy table. With resurrection off,
-/// repair honors the recorded bound: it restricts to it, dropping the prefix
-/// rather than resurrecting a superseded sub-bound row. The live suffix is kept.
+/// A VALID `.restrict-bound` sidecar for this id over an UNPUNCHED SST denotes a
+/// COMMITTED restriction whose punch had not yet run: tight-space writes the
+/// sidecar STRICTLY AFTER the slice's version install commits, so an aborted
+/// slice never leaves one. Repair honors the recorded bound, restricting to it
+/// and dropping the prefix (the committed output covers it) rather than
+/// resurrecting a superseded sub-bound row. The live suffix is kept.
 #[test]
 fn repair_honors_a_valid_sidecar_over_an_unpunched_sst() -> crate::Result<()> {
+    let (memfs, root) = build_unpunched_sidecar_sst(b"k00130")?;
+    assert_recovered_restricted_to(&memfs, &root, b"k00130")
+}
+
+/// Builds `tables/0`: a multi-block SST with a VALID `.restrict-bound` sidecar
+/// for its own id at `bound`, but NO physical punch — the post-install /
+/// pre-punch crash state. Returns the `MemFs` and its absolute root.
+fn build_unpunched_sidecar_sst(
+    bound: &[u8],
+) -> crate::Result<(std::sync::Arc<crate::fs::MemFs>, std::path::PathBuf)> {
     use crate::fs::{Fs, MemFs};
     use crate::table::Writer;
     use crate::{InternalValue, ValueType};
@@ -2094,9 +2104,6 @@ fn repair_honors_a_valid_sidecar_over_an_unpunched_sst() -> crate::Result<()> {
     fs.create_dir_all(&tables)?;
     let sst = tables.join("0");
 
-    // A multi-block SST with a VALID sidecar bound for its own id, but NO physical
-    // punch (the post-install / pre-punch crash state, indistinguishable from a
-    // forged sidecar).
     {
         let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
         for i in 0..256u32 {
@@ -2109,9 +2116,64 @@ fn repair_honors_a_valid_sidecar_over_an_unpunched_sst() -> crate::Result<()> {
         }
         assert!(w.finish()?.is_some(), "the SST is non-empty");
     }
-    crate::restrict_bound::write(&*fs, &sst, None, 0, b"k00130", crate::fs::SyncMode::Normal)?;
+    crate::restrict_bound::write(&*fs, &sst, None, 0, bound, crate::fs::SyncMode::Normal)?;
 
-    assert_recovered_restricted_to(&memfs, &root, b"k00130")
+    Ok((memfs, root))
+}
+
+/// A committed restriction is honored REGARDLESS of the resurrection flag. Because
+/// a valid sidecar over an unpunched SST is provably committed (written strictly
+/// after the install), enabling resurrection does NOT reopen the whole table: the
+/// flag governs LOST tombstones / restrictions, and this restriction is neither
+/// lost nor ambiguous. Repair still restricts to the recorded bound, so no
+/// superseded sub-bound row is served. Under the pre-`commit-then-mark` ordering
+/// the sidecar could outlive an uncommitted restriction, so resurrection kept the
+/// whole table (serving `k00000`); this test pins the committed-honor behaviour.
+#[test]
+fn repair_with_resurrection_honors_a_committed_unpunched_sidecar() -> crate::Result<()> {
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+
+    let (memfs, root) = build_unpunched_sidecar_sst(b"k00130")?;
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .repair_with_resurrection(true, true)?;
+    assert_eq!(
+        report.recovered, 1,
+        "the committed restriction is recovered restricted, not set aside: {report:?}",
+    );
+    assert_eq!(report.unreadable, 0, "{:?}", report.unreadable_files);
+
+    let tree = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .open()?;
+    // The bound is honored even with resurrection ON: keys below it stay dropped,
+    // the live suffix at/above it is served.
+    assert!(
+        tree.get(b"k00000", crate::MAX_SEQNO)?.is_none(),
+        "a committed restriction must not be reopened whole by the resurrection flag",
+    );
+    assert!(
+        tree.get(b"k00129", crate::MAX_SEQNO)?.is_none(),
+        "the row just below the bound stays dropped",
+    );
+    assert!(
+        tree.get(b"k00130", crate::MAX_SEQNO)?.is_some(),
+        "the bound key is served",
+    );
+    assert!(
+        tree.get(b"k00255", crate::MAX_SEQNO)?.is_some(),
+        "the live suffix is served",
+    );
+    Ok(())
 }
 
 /// Asserts a punched SST at `tables/0` under `memfs` was recovered RESTRICTED by

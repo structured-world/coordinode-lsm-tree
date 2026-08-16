@@ -1530,25 +1530,20 @@ fn repair_tree(
                     Ok(_) | Err(_) => None,
                 };
 
-                // A sidecar bound whose whole prefix reads as zeros is exact and
-                // authoritative. If the punch does not fully back it (a completely
-                // unpunched SST from a crash between the durable install and the
-                // punch, or a bound that overshoots the punched extent), the bound is
-                // INTENDED but unconfirmed: with resurrection on, keep the whole
-                // table; otherwise honor the bound, restricting to it and dropping the
-                // ambiguous prefix. A transient punch-probe propagates; a persistent
-                // one makes the bound untrustworthy and falls through to the
+                // A valid sidecar always denotes a COMMITTED restriction: tight-space
+                // writes it STRICTLY AFTER the slice's version install commits (see
+                // `Table::write_restrict_sidecar` and `docs/manifest-recovery.md`), so
+                // an aborted slice never leaves one. Honor its exact bound whether or
+                // not the punch has run: if the prefix is not yet punched (the crash
+                // window between the durable commit and the punch, or a punch deferred
+                // by a live reader), the committed output already covers the dropped
+                // prefix, so honoring resurrects nothing and the flag has no bearing.
+                // A transient punch probe still propagates for retry; a persistent one
+                // only means the bound is not proven EXACT, so it falls through to the
                 // punch-geometry path. The live suffix is always kept.
                 if let Some(bound) = &sidecar_bound {
                     match table.prefix_is_punched(bound) {
-                        Ok(true) => break 'restrict table.reopen_restricted(bound.clone()),
-                        Ok(false) => {
-                            break 'restrict if allow_resurrection {
-                                Ok(table)
-                            } else {
-                                table.reopen_restricted(bound.clone())
-                            };
-                        }
+                        Ok(true | false) => break 'restrict table.reopen_restricted(bound.clone()),
                         Err(e) if is_transient_io(&e) => break 'restrict Err(e),
                         Err(_) => {}
                     }
