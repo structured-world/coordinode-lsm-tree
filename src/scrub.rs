@@ -390,22 +390,39 @@ fn scan_and_reconcile(
                 .map(|p| p.enter_mutation_window())
         })
         .flatten();
-    // The CURRENT manifest digest for this table, read under the heal lock:
-    // a concurrent patrol may have refreshed the manifest after this
+    // The CURRENT view of this table, resolved under the heal lock: a
+    // concurrent patrol may have refreshed the manifest — or a tight-space
+    // compaction may have installed a RESTRICTED same-id view — after this
     // caller's table view was captured, and both the attribution probe and
     // the reconciliation must judge against what the manifest says NOW.
-    // Fall back to the captured view's snapshot when the table has already
-    // been compacted away (nothing left to attribute against).
-    let manifest_checksum = tree
+    // `None` when the table has already been compacted away; the captured
+    // view and its snapshot digest then stand in (nothing left to attribute
+    // against).
+    let current = tree
         .current_version()
         .iter_tables()
         .find(|t| t.id() == table.id())
+        .cloned();
+    // When the current view's RESTRICTION differs from the captured one, the
+    // captured view is stale: its file region (and so its pre-heal digest)
+    // can never match the current manifest digest, which covers a different
+    // region. Scanning the stale view would trip the divergent-heal guard
+    // before the block walk and return a clean report with a known fault
+    // untouched. Scan the CURRENT view instead — the heal lock held above is
+    // SHARED across same-id views (`reopen_restricted` carries it forward),
+    // so the serialization still covers the substituted view.
+    let scan_table: &crate::table::Table = match &current {
+        Some(cur) if cur.restrict_lower_bound() != table.restrict_lower_bound() => cur,
+        _ => table,
+    };
+    let manifest_checksum = current
+        .as_ref()
         .map_or_else(|| table.checksum(), crate::table::Table::checksum);
     let (mut partial, heal_attributable) =
-        scan_one(table, options, tree.sync_mode(), manifest_checksum);
+        scan_one(scan_table, options, tree.sync_mode(), manifest_checksum);
     if heals
         && wants_checksum_refresh(&partial)
-        && let Some(finding) = refresh_healed_checksum(tree, table, heal_attributable)
+        && let Some(finding) = refresh_healed_checksum(tree, scan_table, heal_attributable)
     {
         partial.errors.push(finding);
     }

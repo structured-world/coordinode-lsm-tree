@@ -1152,6 +1152,99 @@ fn heal_skips_blocks_below_the_restriction_bound() -> crate::Result<()> {
     Ok(())
 }
 
+/// A patrol whose CAPTURED table view went stale — tight-space compaction
+/// installed a RESTRICTED same-id view (whose manifest digest covers only the
+/// live suffix) after the capture — must scan the CURRENT view, not the captured
+/// one. Scanning the captured whole-file view against the current suffix
+/// checksum makes the pre-heal digest probe fail unconditionally, so the
+/// divergent-heal guard returns a default CLEAN report before the block walk:
+/// the patrol claims `is_ok()` with zero blocks healed while the known
+/// correctable fault stays on disk.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn heal_scans_the_current_view_when_the_captured_one_went_stale() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _first_block) = write_ecc_sst(dir.path());
+
+    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(crate::fs::StdFs));
+    // Capture the UNRESTRICTED view, as a patrol does before its scan.
+    let captured = {
+        let binding = tree.version_history.read().latest_version();
+        binding
+            .version
+            .iter_tables()
+            .next()
+            .expect("flush produced one table")
+            .clone()
+    };
+
+    // A tight-space slice installs a RESTRICTED same-id view after the capture;
+    // `with_tight_slice` is the worker's install transform. The restricted
+    // view's manifest digest covers only the live suffix.
+    let restricted = captured.reopen_restricted(crate::UserKey::from(b"key-001000".as_slice()))?;
+    tree.version_history.write().upgrade_version(
+        &tree.config.path,
+        |current| {
+            let mut copy = current.clone();
+            let ctx = crate::version::TransformContext::new(tree.config.comparator.as_ref());
+            copy.version = copy.version.with_tight_slice(
+                &[(captured.id(), restricted.clone())],
+                &[],
+                &[],
+                vec![],
+                None,
+                0,
+                &ctx,
+            );
+            Ok(copy)
+        },
+        &tree.config.seqno,
+        &tree.config.visible_seqno,
+        &*tree.config.fs,
+        tree.runtime_config.load_full(),
+        tree.config.encryption.clone(),
+    )?;
+
+    // Rot one payload byte (RS-correctable) in the LAST data block — well above
+    // the restriction bound, squarely inside the live suffix the current view
+    // serves. The rot lands AFTER the restricted digest was captured, so the
+    // heal is plainly restorative for the current view.
+    let last_block = {
+        let mut last = None;
+        for handle in restricted.block_index.iter() {
+            let handle = handle?;
+            last = Some(crate::table::BlockHandle::new(
+                handle.offset(),
+                handle.size(),
+            ));
+        }
+        last.expect("table has data blocks")
+    };
+    let corrupt_pos = last_block.offset().0 as usize + Header::MIN_LEN + 3;
+    let mut bytes = std::fs::read(&sst_path)?;
+    let Some(slot) = bytes.get_mut(corrupt_pos) else {
+        panic!("corrupt_pos in range for the SST bytes");
+    };
+    *slot ^= 0x80;
+    std::fs::write(&sst_path, &bytes)?;
+
+    // Scan through the STALE captured view. The restriction mismatch must make
+    // the scan target the CURRENT view; a scan of the captured one would trip
+    // the divergent-heal guard and report clean with the fault untouched.
+    let report = super::scan_and_reconcile(
+        &tree,
+        &captured,
+        &PatrolScrubOptions::default().heal_in_place(true),
+    );
+    assert!(
+        report.blocks_healed_in_place >= 1,
+        "the known correctable fault must be healed through the current view, \
+         not silently skipped by the divergent-heal guard: {report:?}",
+    );
+    assert!(report.is_ok(), "{report:?}");
+    Ok(())
+}
+
 /// A corrected block whose heal RE-READ fails (transient I/O on the second,
 /// persist-side read) is a finding: the correction cannot be written back, so
 /// the block is reported uncorrectable rather than silently skipped.
