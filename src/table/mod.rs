@@ -2629,15 +2629,31 @@ impl Table {
         // (len, bytes, on_disk_bytes) per blob id, accumulated exactly the
         // way the writer folds them from indirections.
         let mut derived: BTreeMap<crate::vlog::BlobFileId, (usize, u64, u64)> = BTreeMap::new();
-        for kv in self.scan()? {
-            let kv = kv?;
-            if kv.key.value_type == crate::ValueType::Indirection {
-                let mut cursor = &kv.value[..];
-                let ind = crate::blob_tree::handle::BlobIndirection::decode_from(&mut cursor)?;
-                let slot = derived.entry(ind.vhandle.blob_file_id).or_insert((0, 0, 0));
-                slot.0 += 1;
-                slot.1 += u64::from(ind.size);
-                slot.2 += u64::from(ind.vhandle.on_disk_size);
+        {
+            let mut accumulate = |kv: InternalValue| -> crate::Result<()> {
+                if kv.key.value_type == crate::ValueType::Indirection {
+                    let mut cursor = &kv.value[..];
+                    let ind = crate::blob_tree::handle::BlobIndirection::decode_from(&mut cursor)?;
+                    let slot = derived.entry(ind.vhandle.blob_file_id).or_insert((0, 0, 0));
+                    slot.0 += 1;
+                    slot.1 += u64::from(ind.size);
+                    slot.2 += u64::from(ind.vhandle.on_disk_size);
+                }
+                Ok(())
+            };
+            // A restricted view's `[0, punch)` prefix is hole-punched and reads as
+            // zeros: `range` raises its lower bound to the restriction so it never
+            // loads a punched block, whereas `scan` walks every physical block from
+            // offset 0 (and would fail decoding a zeroed one). Derive from the live
+            // region accordingly; the restricted derive covers only the live suffix.
+            if restricted {
+                for kv in self.range(..) {
+                    accumulate(kv?)?;
+                }
+            } else {
+                for kv in self.scan()? {
+                    accumulate(kv?)?;
+                }
             }
         }
         let Some(recorded) = self.list_blob_file_references()? else {
