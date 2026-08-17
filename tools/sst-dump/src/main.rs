@@ -17,7 +17,7 @@ use lsm_tree::inspect::{
     read_filter_stats, read_table_properties, read_top_level_index_entries,
 };
 use lsm_tree::table::block::Header;
-use lsm_tree::verify::{BlockVerifyError, verify_sst_file};
+use lsm_tree::verify::{BlockVerifyError, BlockVerifyWarning, verify_sst_file};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -428,10 +428,41 @@ fn run_verify(path: &std::path::Path, verbose: bool) -> ExitCode {
     println!("file:           {}", path.display());
     println!("blocks scanned: {}", report.blocks_scanned);
     println!("errors:         {}", report.errors.len());
+    println!("warnings:       {}", report.warnings.len());
+    // Warnings are non-fatal but must never be silent: each one names a
+    // surface the walk could NOT fully check, and a consumer treating a bare
+    // "OK" as "everything verified" would be misled.
+    for warning in &report.warnings {
+        match warning {
+            BlockVerifyWarning::UnrecognizedEcc { table_id, path } => println!(
+                "  [warning] UnrecognizedEcc: table {table_id} at {}: ECC descriptor \
+                 not recognized by this build; ECC verification skipped",
+                path.display(),
+            ),
+            BlockVerifyWarning::ParityUnverifiable { table_id, path } => println!(
+                "  [warning] ParityUnverifiable: table {table_id} at {}: recognized \
+                 ECC scheme but this build carries no ECC codecs; parity not verified",
+                path.display(),
+            ),
+            // `BlockVerifyWarning` is `#[non_exhaustive]` upstream; surface
+            // future variants through their Debug form rather than dropping
+            // them.
+            other => println!("  [warning] {other:?}"),
+        }
+    }
 
     if report.is_ok() {
         println!("status:         OK");
         return ExitCode::SUCCESS;
+    }
+
+    // No per-block errors, yet not OK: a whole section was skipped unwalked
+    // (an unrecognized ECC descriptor forced the walk past its data blocks).
+    // That is not proof of corruption, but it is not a verified file either —
+    // report it as its own non-success verdict.
+    if report.errors.is_empty() && report.incomplete {
+        println!("status:         INCOMPLETE (a section was skipped unverified)");
+        return ExitCode::FAILURE;
     }
 
     println!("status:         CORRUPT");
