@@ -271,6 +271,27 @@ pub(crate) type VerbatimCopy = (
     alloc::vec::Vec<u32>,
 );
 
+/// Outcome of [`Table::derive_restriction_bound`] — the CONSERVATIVE
+/// punch-geometry classification for a punched SST whose exact
+/// `.restrict-bound` sidecar is not trustworthy.
+#[cfg(feature = "std")]
+pub(crate) enum DerivedRestriction {
+    /// The zeroed blocks form a CLEAN prefix (a fully successful punch):
+    /// restrict to this bound — the first readable block's end key — and no
+    /// superseded key resurrects, at the cost of at most that one straddling
+    /// block's live suffix.
+    Bound(UserKey),
+    /// Every data block reads as zeros: no live data survives the punch; the
+    /// caller excludes the table.
+    NoLiveData,
+    /// A readable block sits BELOW a zeroed one — positive evidence of failed
+    /// `punch_hole` calls, after which no geometry bound can separate
+    /// intact-but-consumed blocks from live ones. The caller sets the table
+    /// aside (resurrection mode derives greedily instead, accepting the
+    /// re-exposure by contract).
+    IrregularPunch,
+}
+
 impl Table {
     #[must_use]
     pub fn global_seqno(&self) -> SeqNo {
@@ -3498,48 +3519,63 @@ impl Table {
     /// for a punched SST whose exact `.restrict-bound` sidecar is not trustworthy
     /// (lost / corrupt / unbacked) and whose manifest restriction is also gone.
     ///
-    /// Walks the data blocks in key order and returns the END key of the first
-    /// block AFTER the LAST block that reads as zeros. Restricting to that key
-    /// drops the whole punched region AND the first readable block after it,
-    /// which may STRADDLE the true (mid-block) bound: since the end key is that
-    /// block's maximum, it is at or above the true bound, so every served key is
-    /// live and NO superseded key is resurrected. The cost is at most that one
-    /// block's live suffix, which is exactly the trade the resurrection flag
-    /// governs; the resurrection path keeps the whole readable region instead.
+    /// Walks the data blocks in key order and classifies the punch geometry.
     ///
-    /// The bound is anchored PAST THE LAST zeroed block, not at the first
-    /// readable one: the punch-on-drop reclaim continues past an individual
-    /// `punch_hole` failure, so a partially-punched SST can interleave intact
-    /// (but consumed, superseded) blocks with zeroed ones inside the reclaimed
-    /// prefix. Anchoring at the first readable block would place zeroed blocks
-    /// ABOVE the bound — inside the served view — and route reads into
-    /// physically-missing data. Everything below the last zeroed block was
-    /// within the punch's intent and is superseded by the committed output, so
-    /// dropping the intact stragglers loses nothing live.
+    /// A CLEAN zeroed prefix (every zeroed block precedes every readable one,
+    /// starting at the first data block — the pattern a fully successful
+    /// punch-on-drop reclaim leaves) yields
+    /// [`DerivedRestriction::Bound`]: the END key of the first readable block.
+    /// Restricting to that key drops the punched prefix AND the first readable
+    /// block, which may STRADDLE the true (mid-block) bound: since the end key
+    /// is that block's maximum, it is at or above the true bound, so every
+    /// served key is live and NO superseded key is resurrected. The cost is at
+    /// most that one block's live suffix, which is exactly the trade the
+    /// resurrection flag governs; the resurrection path keeps the whole
+    /// readable region instead.
     ///
-    /// `None` when no readable block follows the last zeroed one: no live data
-    /// survives the punch, so the caller excludes the table (no recoverable live
-    /// data to lose).
+    /// An IRREGULAR pattern — any readable block BELOW a zeroed one — is
+    /// positive evidence that individual `punch_hole` calls failed mid-reclaim
+    /// (the reclaim logs and continues per block). Then ANY readable block may
+    /// equally be an intact-but-consumed block whose punch also failed, and no
+    /// geometry bound can separate consumed from live: anchoring anywhere
+    /// either resurrects superseded rows or discards live ones. That is
+    /// [`DerivedRestriction::IrregularPunch`] — the caller sets the table
+    /// aside (the resurrection path, which accepts re-exposure by contract,
+    /// still derives greedily instead). The residual blind spot is punch
+    /// failures confined STRICTLY to the blocks after a clean zeroed run:
+    /// those are indistinguishable from a live suffix by construction, so a
+    /// clean prefix is accepted at the classical straddle cost.
+    ///
+    /// [`DerivedRestriction::NoLiveData`] when EVERY block reads as zeros: no
+    /// live data survives the punch, so the caller excludes the table (no
+    /// recoverable live data to lose).
     ///
     /// # Errors
     ///
     /// Propagates a block-index or positioned-read failure.
     #[cfg(feature = "std")]
-    pub(crate) fn derive_restriction_bound(&self) -> crate::Result<Option<UserKey>> {
+    pub(crate) fn derive_restriction_bound(&self) -> crate::Result<DerivedRestriction> {
         let file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
         let mut candidate: Option<UserKey> = None;
+        let mut seen_readable = false;
         for handle in self.block_index.iter() {
             let handle = handle?;
             if Self::block_is_zeroed_in(&*file, &BlockHandle::new(handle.offset(), handle.size()))?
             {
-                // A later zeroed block invalidates any earlier candidate: the
-                // bound must clear the WHOLE punched region.
-                candidate = None;
-            } else if candidate.is_none() {
-                candidate = Some(handle.end_key().clone());
+                if seen_readable {
+                    return Ok(DerivedRestriction::IrregularPunch);
+                }
+            } else {
+                seen_readable = true;
+                if candidate.is_none() {
+                    candidate = Some(handle.end_key().clone());
+                }
             }
         }
-        Ok(candidate)
+        Ok(match candidate {
+            Some(bound) => DerivedRestriction::Bound(bound),
+            None => DerivedRestriction::NoLiveData,
+        })
     }
 
     /// The GREEDY counterpart of [`derive_restriction_bound`](Self::derive_restriction_bound)

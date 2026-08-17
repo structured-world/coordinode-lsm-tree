@@ -1683,16 +1683,18 @@ fn build_partially_punched_prefix_sst(
     Ok(sst)
 }
 
-/// A PARTIALLY punched SST (intact first block, zeroed later prefix blocks) with
-/// no trustworthy sidecar must still be recovered RESTRICTED: an intact first
-/// block is NOT proof the SST is unpunched. A first-block-only probe would
-/// recover it unrestricted, and the salvage pass would then re-emit the
-/// intact-but-superseded first block's rows with nothing to restrict them —
-/// resurrecting keys the committed compaction output already superseded.
+/// A PARTIALLY punched SST (intact first block, zeroed later prefix blocks)
+/// with no trustworthy sidecar must be SET ASIDE under default repair
+/// (resurrection off): the interleaved intact block is positive evidence that
+/// `punch_hole` failed mid-reclaim, and then ANY readable block above the last
+/// hole may equally be an intact-but-consumed block whose punch also failed —
+/// no geometry bound can separate consumed from live, so restricting to one
+/// would resurrect superseded rows. Only a CLEAN zeroed prefix (no intact
+/// block below a zeroed one) supports the classical geometry bound.
 #[test]
-fn repair_restricts_a_partially_punched_sst_with_an_intact_first_block() -> crate::Result<()> {
+fn repair_sets_aside_a_partially_punched_sst_without_a_trustworthy_bound() -> crate::Result<()> {
     use crate::fs::{Fs, MemFs};
-    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use crate::{Config, SequenceNumberCounter};
     use std::sync::Arc;
 
     let memfs = Arc::new(MemFs::new());
@@ -1710,29 +1712,18 @@ fn repair_restricts_a_partially_punched_sst_with_an_intact_first_block() -> crat
     .with_fs(memfs.as_ref().clone())
     .repair_with_salvage(true)?;
     assert_eq!(
-        report.recovered, 1,
-        "the partially punched SST is recovered restricted: {report:?}",
+        report.recovered, 0,
+        "an irregularly punched SST with no exact bound must be set aside, not \
+         restricted to a guessed bound that resurrects consumed rows: {report:?}",
     );
-    assert_eq!(report.unreadable, 0, "{:?}", report.unreadable_files);
-
-    let tree = Config::new(
-        &root,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .with_fs(memfs.as_ref().clone())
-    .open()?;
-    for i in 0..256u32 {
-        let key = format!("k{i:05}").into_bytes();
-        let served = tree.get(&key, crate::MAX_SEQNO)?.is_some();
-        assert!(
-            !served || key.as_slice() >= b"k00050".as_slice(),
-            "key {key:?} below the committed bound must not resurrect",
-        );
-    }
+    assert_eq!(report.unreadable, 1, "{:?}", report.unreadable_files);
     assert!(
-        tree.get(b"k00200", crate::MAX_SEQNO)?.is_some(),
-        "the live suffix must be served",
+        report
+            .unreadable_files
+            .first()
+            .is_some_and(|(_, reason)| reason.contains("punch failures")),
+        "the reason names the failed punches that made the bound unknowable: {:?}",
+        report.unreadable_files,
     );
     Ok(())
 }

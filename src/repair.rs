@@ -1747,32 +1747,54 @@ fn repair_tree(
 
                 // No trustworthy exact bound. An unpunched table never carried a
                 // restriction, so it opens unrestricted. A punched table lost its
-                // exact bound and is derived from the punch geometry: with
-                // resurrection on, restrict to the FIRST key of the first readable
-                // block past the punched region, keeping the whole ambiguous
-                // straddling block (its sub-bound keys resurrected); otherwise
-                // restrict to that block's END key, dropping the straddling block
-                // and never resurrecting a superseded key. Either bound EXCLUDES
-                // every punched (zeroed) block below it — including intact blocks a
-                // PARTIAL punch left interleaved inside the reclaimed prefix, which
-                // is why the probe inspects every data block, not just the first —
-                // so no read is ever routed to a physically-missing block; returning
-                // the table unrestricted would fail on the first such read. Only a
-                // fully-punched SST with no live data is set aside, losing nothing
-                // the flag could have kept.
+                // exact bound and falls to the punch geometry: with resurrection
+                // on, restrict to the FIRST key of the first readable block past
+                // the punched region, keeping the whole ambiguous readable region
+                // (its consumed rows resurrected, as the flag contracts). With
+                // resurrection OFF the geometry is trusted only when the zeroed
+                // blocks form a CLEAN prefix — the pattern of a fully successful
+                // punch — and the bound is that prefix's straddling block's END
+                // key, never resurrecting a superseded key. An IRREGULAR pattern
+                // (a readable block below a zeroed one) is positive evidence of
+                // failed punches, after which no geometry bound can separate
+                // intact-but-consumed blocks from live ones: the table is set
+                // aside (see `DerivedRestriction::IrregularPunch`), matching the
+                // recovery-failure arm's fail-closed guard for the same state. A
+                // fully-punched SST with no live data is set aside too, losing
+                // nothing the flag could have kept.
                 match table.has_punched_data_block() {
                     Ok(false) => break 'restrict Ok(table),
                     Err(e) => break 'restrict Err(e),
                     Ok(true) => {
+                        use crate::table::DerivedRestriction;
                         let derived = if allow_resurrection {
-                            table.derive_resurrection_bound()
+                            match table.derive_resurrection_bound() {
+                                Ok(Some(bound)) => Ok(DerivedRestriction::Bound(bound)),
+                                Ok(None) => Ok(DerivedRestriction::NoLiveData),
+                                Err(e) => Err(e),
+                            }
                         } else {
                             table.derive_restriction_bound()
                         };
                         match derived {
-                            Ok(Some(bound)) => break 'restrict table.reopen_restricted(bound),
+                            Ok(DerivedRestriction::Bound(bound)) => {
+                                break 'restrict table.reopen_restricted(bound);
+                            }
                             Err(e) => break 'restrict Err(e),
-                            Ok(None) => {
+                            Ok(
+                                reason @ (DerivedRestriction::NoLiveData
+                                | DerivedRestriction::IrregularPunch),
+                            ) => {
+                                let reason = match reason {
+                                    DerivedRestriction::NoLiveData => {
+                                        "fully hole-punched SST with no live data"
+                                    }
+                                    _ => {
+                                        "partially punched SST with punch failures and no \
+                                         trustworthy bound; the consumed/live boundary is \
+                                         unknowable (resurrection keeps the readable region)"
+                                    }
+                                };
                                 drop(table);
                                 crate::restrict_bound::remove(
                                     &*folder_fs,
@@ -1788,11 +1810,7 @@ fn repair_tree(
                                 ) {
                                     Ok(dest) => unreadable_files.push((
                                         table_path,
-                                        format!(
-                                            "fully hole-punched SST with no live data; \
-                                             set aside at {}",
-                                            dest.display()
-                                        ),
+                                        format!("{reason}; set aside at {}", dest.display()),
                                     )),
                                     Err(e) => return Err(e),
                                 }

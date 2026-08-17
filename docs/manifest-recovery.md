@@ -63,8 +63,10 @@ flowchart TD
 
     RNB -->|no| RHEALTHY[Healthy table: unrestricted]
     RNB -->|yes| RDER{allow_resurrection?}
-    RDER -->|no| RCONS[Bound = first fully-live block;<br/>drop the straddling block]
-    RDER -->|yes| RGREEDY[Bound = first readable block;<br/>keep the straddling block]
+    RDER -->|no| RPAT{Zeroed blocks form<br/>a clean prefix?}
+    RPAT -->|yes| RCONS[Bound = first readable block's end;<br/>drop the straddling block]
+    RPAT -->|no| RIRR[Exclude: punch failures made<br/>the bound unknowable]
+    RDER -->|yes| RGREEDY[Bound = first readable block<br/>past the last hole;<br/>keep the readable region]
 
     REXACT --> REOPEN[Reopen restricted;<br/>live suffix always kept]
     RCONS --> REOPEN
@@ -111,23 +113,39 @@ probe outcomes honor the same bound; worse, a persistently unreadable sector in
 an already-dead block would spuriously discard the exact bound.
 
 **There is no trustworthy sidecar but the SST is punched.** The bound is not
-known exactly, but the punch geometry bounds it: the live data begins at the
-first block that does not read as zeros. Because the bound is a key and the punch
-is block-aligned, that first readable block may *straddle* the bound, holding
-both superseded keys below it and live keys at or above it. With resurrection
-disabled, recovery restricts to the first *fully*-live block, dropping the
-straddling block: this can lose up to one block of live suffix, but it never
-resurrects a superseded key, which is exactly the trade the flag governs.
-Enabling resurrection keeps the straddling block (and its superseded keys) so no
-live data is lost.
+known exactly; whether the punch geometry can stand in for it depends on the
+punch *pattern*. When the zeroed blocks form a *clean prefix* (every zeroed
+block precedes every readable one, the pattern of a fully successful reclaim),
+the live data begins at the first readable block. Because the bound is a key and
+the punch is block-aligned, that block may *straddle* the bound, holding both
+superseded keys below it and live keys at or above it. With resurrection
+disabled, recovery restricts to that block's end key, dropping the straddling
+block: this can lose up to one block of live suffix, but it never resurrects a
+superseded key, which is exactly the trade the flag governs.
 
-In every case the table is recovered restricted; its live suffix is never thrown
-away to avoid the ambiguous prefix. This holds even when the live suffix is
-*itself* corrupt (a rare double failure): recovery salvages the suffix's readable
-blocks, drops the corrupt ones, then reopens the result restricted to the bound
-and re-records its sidecar, so a later manifest-loss repair honors it. The
-readable part of the suffix survives; only the corrupt blocks are lost, and
-nothing below the bound is resurrected.
+An *irregular* pattern — a readable block below a zeroed one — is positive
+evidence that individual punch calls failed mid-reclaim (the reclaim continues
+past per-block failures). Any readable block may then equally be an
+intact-but-consumed block whose punch also failed, so no geometry bound can
+separate consumed data from live: anchoring anywhere either resurrects
+superseded rows or discards live ones. With resurrection disabled such a table
+is *set aside* (its bound is genuinely unrecoverable); enabling resurrection
+keeps the whole readable region past the last hole, accepting the re-exposure
+by contract. The residual blind spot is punch failures confined strictly to the
+blocks after a clean zeroed run, indistinguishable from a live suffix by
+construction; a clean prefix is therefore accepted at the classical
+straddling-block cost.
+
+Whenever a bound is known or derivable, the table is recovered restricted; its
+live suffix is never thrown away to avoid the ambiguous prefix. This holds even
+when the live suffix is *itself* corrupt (a rare double failure): recovery
+salvages the suffix's readable blocks, drops the corrupt ones, then reopens the
+result restricted to the bound and re-records its sidecar, so a later
+manifest-loss repair honors it. The readable part of the suffix survives; only
+the corrupt blocks are lost, and nothing below the bound is resurrected. Only
+the irregular-punch state above — where no live suffix can even be delimited —
+sets a table aside, and the resurrection flag still recovers its readable
+region.
 
 **Salvage always re-restricts, on every path that reaches it.** Salvage rewrites
 its source as a fresh, *unpunched* table that re-emits the straddling block's
