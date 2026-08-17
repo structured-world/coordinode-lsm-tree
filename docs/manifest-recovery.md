@@ -124,11 +124,12 @@ block: this can lose up to one block of live suffix, but it never resurrects a
 superseded key, which is exactly the trade the flag governs.
 
 An *irregular* pattern — a readable block below a zeroed one — is positive
-evidence that individual punch calls failed mid-reclaim (the reclaim continues
-past per-block failures). Any readable block may then equally be an
-intact-but-consumed block whose punch also failed, so no geometry bound can
-separate consumed data from live: anchoring anywhere either resurrects
-superseded rows or discards live ones. With resurrection disabled such a table
+evidence the reclaim did not finish: the top-down pass punched its
+higher-offset blocks and then hit a failure (or a crash) before reaching the
+lower ones. Any readable block may then equally be an intact-but-consumed
+block the pass never reached, so no geometry bound can separate consumed data
+from live: anchoring anywhere either resurrects superseded rows or discards
+live ones. With resurrection disabled such a table
 is *set aside* (its bound is genuinely unrecoverable); enabling resurrection
 keeps the whole readable region past the last hole, accepting the re-exposure
 by contract. The reclaim itself punches top-down and stops at the first
