@@ -30,7 +30,10 @@ pub mod util;
 pub mod writer;
 pub(crate) mod zone_map;
 
-#[cfg(test)]
+// std-gated like the sibling test modules: the tests drive real files through
+// `StdFs` and the std-only `restrict_bound` sidecar API, so a no-std test
+// build must skip the whole module.
+#[cfg(all(test, feature = "std"))]
 #[allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
