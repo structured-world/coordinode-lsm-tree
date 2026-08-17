@@ -94,8 +94,9 @@ windows are both safe:
   for every key — including keys whose tombstone lived in a *different*,
   fully-consumed input, which ordinary last-level GC would have dropped along with
   the rows it covered. Nothing is resurrected and nothing is lost; only the
-  redundant prefix waits for a later compaction to reclaim it. Space is still
-  reclaimed here via the hole punch (GC is deferred to a later normal compaction).
+  redundant prefix waits for a later compaction to reclaim it. No punch was armed
+  in this window (the punch follows the sidecar write), so this slice reclaims
+  nothing from that input; a later compaction reclaims it.
 
 Either way, reopening a partially-rewritten tree yields a consistent state with
 every key readable, and a later compaction continues the work. The recovery rules
