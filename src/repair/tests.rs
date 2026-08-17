@@ -1840,6 +1840,220 @@ fn repair_sets_aside_a_partially_punched_sidecarless_sst_that_fails_recovery() -
     Ok(())
 }
 
+/// A flag-dependent set-aside must keep the resurrection knob TWO-WAY: a
+/// default (resurrection-off) repair sets an irregularly punched SST aside
+/// because its bound is unknowable, but a later resurrection repair must
+/// reclaim it from quarantine automatically — no manual file move — and
+/// recover its readable region greedily. Unrelated quarantined files (which
+/// carry no resurrectable marker) are never reclaimed.
+#[test]
+fn resurrection_reclaims_an_irregularly_punched_set_aside() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    build_partially_punched_prefix_sst(&memfs, &fs, &tables)?;
+
+    // Default repair: the irregular punch makes the bound unknowable → set aside.
+    let first = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .repair_with_salvage(true)?;
+    assert_eq!(first.recovered, 0, "{first:?}");
+    assert_eq!(first.unreadable, 1, "{:?}", first.unreadable_files);
+
+    // Unrelated quarantine content without a marker must survive the reclaim.
+    let quarantine = root.join("repair-quarantine");
+    let junk = quarantine.join("junk-name");
+    {
+        use std::io::Write;
+        let mut f = fs.open(
+            &junk,
+            &crate::fs::FsOpenOptions::new().write(true).create(true),
+        )?;
+        f.write_all(b"not a table")?;
+    }
+
+    // Resurrection repair: the marked set-aside is reclaimed and recovered
+    // greedily, with no manual step in between.
+    let second = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .repair_with_resurrection(false, true)?;
+    assert_eq!(
+        second.recovered, 1,
+        "the resurrection repair must reclaim the marked set-aside: {second:?}",
+    );
+    assert_eq!(second.unreadable, 0, "{:?}", second.unreadable_files);
+
+    let tree = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .open()?;
+    assert!(
+        tree.get(b"k00020", crate::MAX_SEQNO)?.is_none(),
+        "a key in a zeroed block still misses cleanly",
+    );
+    assert!(
+        tree.get(b"k00255", crate::MAX_SEQNO)?.is_some(),
+        "the readable region is served under resurrection",
+    );
+    drop(tree);
+
+    assert!(
+        !fs.exists(&quarantine.join("0"))?,
+        "the reclaimed SST must leave quarantine",
+    );
+    assert!(
+        !fs.exists(&quarantine.join("0.resurrectable"))?,
+        "the marker is consumed by the reclaim",
+    );
+    assert!(
+        fs.exists(&junk)?,
+        "unmarked quarantine content is never reclaimed",
+    );
+    Ok(())
+}
+
+/// The pre-salvage first-bytes guard's set-aside (a FULLY punched, sidecar-less
+/// SST that fails whole-file recovery) is two-way as well: default repair sets
+/// it aside marked, and a later resurrection repair reclaims and recovers its
+/// readable region.
+#[test]
+fn resurrection_reclaims_a_fully_punched_set_aside() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    write_multiblock_sst(&sst, &fs)?;
+    let punch = recover_sst(sst.clone(), &fs)?.punch_offset_for(b"k00130")?;
+    memfs.punch_hole(&sst, 0, punch)?;
+
+    let fault = FaultFs::new(memfs.as_ref().clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .once(),
+    );
+    let first = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair_with_salvage(true)?;
+    assert_eq!(first.recovered, 0, "{first:?}");
+
+    let second = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .repair_with_resurrection(true, true)?;
+    assert_eq!(
+        second.recovered, 1,
+        "the resurrection repair must reclaim the marked set-aside: {second:?}",
+    );
+
+    let tree = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .open()?;
+    assert!(
+        tree.get(b"k00255", crate::MAX_SEQNO)?.is_some(),
+        "the readable region is served under resurrection",
+    );
+    Ok(())
+}
+
+/// The recovery-failure arm's flag-dependent set-asides are two-way too: a
+/// partially punched, sidecar-less SST whose whole-file recovery also failed is
+/// set aside by default repair, and a later resurrection repair reclaims and
+/// recovers it (the transient recovery fault is gone on the re-run).
+#[test]
+fn resurrection_reclaims_a_punched_set_aside_from_the_salvage_arm() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    build_partially_punched_prefix_sst(&memfs, &fs, &tables)?;
+
+    // One-shot read fault fails the whole-file hash → recovery-failure arm →
+    // salvage detects the punched dropped extents → set aside (bound lost).
+    let fault = FaultFs::new(memfs.as_ref().clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .once(),
+    );
+    let first = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair_with_salvage(true)?;
+    assert_eq!(first.recovered, 0, "{first:?}");
+
+    // Resurrection repair on the clean fs reclaims the marked original and
+    // recovers its readable region.
+    let second = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .repair_with_resurrection(true, true)?;
+    assert_eq!(
+        second.recovered, 1,
+        "the resurrection repair must reclaim the marked set-aside: {second:?}",
+    );
+
+    let tree = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .open()?;
+    assert!(
+        tree.get(b"k00255", crate::MAX_SEQNO)?.is_some(),
+        "the readable region is served under resurrection",
+    );
+    Ok(())
+}
+
 /// Writing the `.restrict-bound` sidecar must NEVER mutate the SST — that is the
 /// point of a separate file: the manifest's whole-file checksum for the SST stays
 /// valid across the write, so a crash between the sidecar write and the manifest

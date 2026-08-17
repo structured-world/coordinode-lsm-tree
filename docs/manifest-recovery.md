@@ -65,7 +65,7 @@ flowchart TD
     RNB -->|yes| RDER{allow_resurrection?}
     RDER -->|no| RPAT{Zeroed blocks form<br/>a clean prefix?}
     RPAT -->|yes| RCONS[Bound = first readable block's end;<br/>drop the straddling block]
-    RPAT -->|no| RIRR[Exclude: punch failures made<br/>the bound unknowable]
+    RPAT -->|no| RIRR[Set aside, marked resurrectable:<br/>punch failures made the bound unknowable]
     RDER -->|yes| RGREEDY[Bound = first readable block<br/>past the last hole;<br/>keep the readable region]
 
     REXACT --> REOPEN[Reopen restricted;<br/>live suffix always kept]
@@ -135,6 +135,17 @@ by contract. The residual blind spot is punch failures confined strictly to the
 blocks after a clean zeroed run, indistinguishable from a live suffix by
 construction; a clean prefix is therefore accepted at the classical
 straddling-block cost.
+
+**Flag-dependent set-asides stay reclaimable — the knob is two-way.** Every
+set-aside whose *only* cause is the disabled resurrection flag (an irregular
+punch, or a punched sidecar-less source whose whole-file recovery also failed)
+is written with a `.resurrectable` marker beside it in the quarantine
+directory. A later repair run *with* resurrection first returns every marked
+file to the tables folder and then recovers it through the normal scan, so
+switching the flag never requires a manual file move in either direction.
+Unmarked quarantine content — duplicates, corrupt files, bulk-ingest rejects,
+salvage byproducts — is never reclaimed: those exclusions do not depend on the
+flag.
 
 Whenever a bound is known or derivable, the table is recovered restricted; its
 live suffix is never thrown away to avoid the ambiguous prefix. This holds even

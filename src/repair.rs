@@ -311,6 +311,120 @@ fn quarantine_file(
     Ok(dest)
 }
 
+/// Marker path naming WHY a quarantined file was set aside: its restriction
+/// bound was unrecoverable at `resurrection = off`. A resurrection repair
+/// reclaims marked files back into `tables/` (see [`reclaim_resurrectable`]),
+/// keeping the resurrection knob two-way — no manual file move between a
+/// default repair and a resurrection re-run. The marker is NEVER written for
+/// flag-independent quarantines (duplicates, corrupt files, bulk-ingest
+/// rejects, salvage byproducts), so a reclaim can never resurrect those.
+fn resurrectable_marker_path(quarantined: &std::path::Path) -> PathBuf {
+    let mut name = quarantined.file_name().unwrap_or_default().to_os_string();
+    name.push(".resurrectable");
+    quarantined.with_file_name(name)
+}
+
+/// Durably writes the resurrectable marker beside a freshly quarantined file.
+/// The CALLER must treat a failure as "the set-aside did not commit": roll the
+/// quarantine move back (restore the file to `tables/`) and propagate, so a
+/// retry re-runs the whole classification instead of leaving an UNMARKED
+/// set-aside that a resurrection repair could never reclaim.
+fn mark_resurrectable(
+    fs: &dyn crate::fs::Fs,
+    quarantined: &std::path::Path,
+    sync_mode: crate::fs::SyncMode,
+) -> crate::Result<()> {
+    use std::io::Write;
+    let marker = resurrectable_marker_path(quarantined);
+    let mut file = fs.open(
+        &marker,
+        &crate::fs::FsOpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true),
+    )?;
+    file.write_all(b"resurrectable")?;
+    file.flush()?;
+    crate::fs::FsFile::sync_all_with(&*file, sync_mode)?;
+    drop(file);
+    if let Some(dir) = marker.parent() {
+        fs.sync_directory_with(dir, sync_mode)?;
+    }
+    Ok(())
+}
+
+/// Returns marked resurrectable set-asides from `repair-quarantine/` to
+/// `tables/`, so a resurrection repair recovers them like any other punched
+/// file — the flag's two-way half (the marker is written by the flag-dependent
+/// set-aside sites). Only files bearing a `.resurrectable` marker move; the
+/// marker is consumed by the move. A collision-suffixed quarantine name
+/// (`{id}.N`) reclaims to its plain `{id}`; an occupied target skips the file
+/// (kept marked for a later run) rather than clobbering. Crash-safe by
+/// idempotence: a file either still sits marked in quarantine (retried next
+/// run) or already sits in `tables/` (recovered normally; its stale marker is
+/// swept here).
+#[cfg(feature = "std")]
+fn reclaim_resurrectable(
+    fs: &dyn crate::fs::Fs,
+    table_base_folder: &std::path::Path,
+    sync_mode: crate::fs::SyncMode,
+) -> crate::Result<()> {
+    let quarantine_dir = table_base_folder
+        .parent()
+        .unwrap_or(table_base_folder)
+        .join("repair-quarantine");
+    if !fs.exists(&quarantine_dir)? {
+        return Ok(());
+    }
+    for entry in fs.read_dir(&quarantine_dir)? {
+        let Some(data_name) = entry.file_name.strip_suffix(".resurrectable") else {
+            continue;
+        };
+        let marker = quarantine_dir.join(&entry.file_name);
+        let data = quarantine_dir.join(data_name);
+        if !fs.exists(&data)? {
+            // A crash between a previous reclaim's move and its marker removal:
+            // the file already went back and was recovered; sweep the leftover.
+            let _ = fs.remove_file(&marker);
+            continue;
+        }
+        // A collision-suffixed quarantine name ({id}.N) reclaims to plain {id}.
+        let id_part = data_name.split('.').next().unwrap_or(data_name);
+        if id_part.parse::<TableId>().is_err() {
+            continue;
+        }
+        let target = table_base_folder.join(id_part);
+        if fs.exists(&target)? {
+            log::warn!(
+                "not reclaiming {}: {} is already occupied; kept marked for a later run",
+                data.display(),
+                target.display(),
+            );
+            continue;
+        }
+        fs.rename(&data, &target)?;
+        // Bring a companion sidecar back too (present only when a corrupt-but-
+        // existing sidecar traveled with the quarantine move; a corrupt sidecar
+        // is ignored by recovery, so this is harmless bookkeeping).
+        let data_sidecar = crate::restrict_bound::sidecar_path(&data);
+        if fs.exists(&data_sidecar)? {
+            let _ = fs.rename(&data_sidecar, &crate::restrict_bound::sidecar_path(&target));
+        }
+        let _ = fs.remove_file(&marker);
+        // Destination first, then source: the same crash ordering the
+        // quarantine / restore moves use — the reclaimed name must be durable
+        // before its quarantine entry's removal is.
+        fs.sync_directory_with(table_base_folder, sync_mode)?;
+        fs.sync_directory_with(&quarantine_dir, sync_mode)?;
+        log::info!(
+            "reclaimed resurrectable set-aside {} -> {}",
+            data.display(),
+            target.display(),
+        );
+    }
+    Ok(())
+}
+
 /// Moves a quarantined original back to its `table_path`, durably. The inverse of
 /// [`quarantine_file`], used when a TRANSIENT salvage failure must not strand the
 /// only copy in quarantine (which a retry, no longer finding it under `tables/`,
@@ -1514,6 +1628,14 @@ fn repair_tree(
             continue;
         }
 
+        // The two-way half of the resurrection knob: a prior default repair may
+        // have set punched-boundless files aside with a resurrectable marker;
+        // a resurrection repair returns them to `tables/` FIRST so the scan
+        // below recovers them greedily like any other punched file.
+        if allow_resurrection {
+            reclaim_resurrectable(&*folder_fs, &table_base_folder, config.sync_mode)?;
+        }
+
         'dirent: for dirent in folder_fs.read_dir(&table_base_folder)? {
             let crate::fs::FsDirEntry {
                 path: table_path,
@@ -1785,6 +1907,12 @@ fn repair_tree(
                                 reason @ (DerivedRestriction::NoLiveData
                                 | DerivedRestriction::IrregularPunch),
                             ) => {
+                                // FLAG-DEPENDENT set-aside: resurrection would
+                                // have kept the readable region, so mark it
+                                // reclaimable — a NoLiveData table has nothing
+                                // either flag could keep, so it stays unmarked.
+                                let resurrectable =
+                                    matches!(reason, DerivedRestriction::IrregularPunch);
                                 let reason = match reason {
                                     DerivedRestriction::NoLiveData => {
                                         "fully hole-punched SST with no live data"
@@ -1792,7 +1920,8 @@ fn repair_tree(
                                     _ => {
                                         "partially punched SST with punch failures and no \
                                          trustworthy bound; the consumed/live boundary is \
-                                         unknowable (resurrection keeps the readable region)"
+                                         unknowable (a resurrection repair reclaims it and \
+                                         keeps the readable region)"
                                     }
                                 };
                                 drop(table);
@@ -1808,10 +1937,31 @@ fn repair_tree(
                                     &file_name,
                                     config.sync_mode,
                                 ) {
-                                    Ok(dest) => unreadable_files.push((
-                                        table_path,
-                                        format!("{reason}; set aside at {}", dest.display()),
-                                    )),
+                                    Ok(dest) => {
+                                        // An unmarked flag-dependent set-aside
+                                        // could never be reclaimed: on marker
+                                        // failure, undo the set-aside so a
+                                        // retry re-runs the classification.
+                                        if resurrectable
+                                            && let Err(e) = mark_resurrectable(
+                                                &*folder_fs,
+                                                &dest,
+                                                config.sync_mode,
+                                            )
+                                        {
+                                            restore_quarantined(
+                                                &*folder_fs,
+                                                &dest,
+                                                &table_path,
+                                                config.sync_mode,
+                                            )?;
+                                            return Err(e);
+                                        }
+                                        unreadable_files.push((
+                                            table_path,
+                                            format!("{reason}; set aside at {}", dest.display()),
+                                        ));
+                                    }
                                     Err(e) => return Err(e),
                                 }
                                 continue 'dirent;
@@ -2055,6 +2205,22 @@ fn repair_tree(
                             config.sync_mode,
                         ) {
                             Ok(dest) => {
+                                // FLAG-DEPENDENT set-aside: mark it so a
+                                // resurrection repair reclaims and salvages it.
+                                // On marker failure, undo the set-aside so a
+                                // retry re-runs the classification instead of
+                                // leaving an unreclaimable file.
+                                if let Err(e) =
+                                    mark_resurrectable(&*folder_fs, &dest, config.sync_mode)
+                                {
+                                    restore_quarantined(
+                                        &*folder_fs,
+                                        &dest,
+                                        &table_path,
+                                        config.sync_mode,
+                                    )?;
+                                    return Err(e);
+                                }
                                 crate::restrict_bound::remove(
                                     &*folder_fs,
                                     &table_path,
@@ -2065,7 +2231,7 @@ fn repair_tree(
                                     format!(
                                         "punched SST with no recoverable restriction bound \
                                          (missing / corrupt sidecar and failed recovery); set \
-                                         aside to {}",
+                                         aside to {} (a resurrection repair reclaims it)",
                                         dest.display()
                                     ),
                                 ));
@@ -2138,12 +2304,30 @@ fn repair_tree(
                             ));
                         }
                         Ok(SalvageOutcome::PunchedBoundLost) => {
+                            // FLAG-DEPENDENT set-aside: mark the quarantined
+                            // ORIGINAL (the punched source; the rejected
+                            // salvage byproduct stays unmarked) so a
+                            // resurrection repair reclaims and re-salvages it.
+                            // On marker failure, undo the set-aside so a retry
+                            // re-runs the classification.
+                            if let Err(marker_err) =
+                                mark_resurrectable(&*folder_fs, &quarantined, config.sync_mode)
+                            {
+                                restore_quarantined(
+                                    &*folder_fs,
+                                    &quarantined,
+                                    &table_path,
+                                    config.sync_mode,
+                                )?;
+                                return Err(marker_err);
+                            }
                             unreadable_files.push((
                                 table_path,
                                 format!(
                                     "punched SST with no recoverable restriction bound \
                                      (missing / corrupt sidecar and failed recovery, punched \
-                                     extents found during salvage); set aside ({e})"
+                                     extents found during salvage); set aside ({e}); a \
+                                     resurrection repair reclaims it"
                                 ),
                             ));
                         }
