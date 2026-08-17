@@ -1518,13 +1518,18 @@ fn scan_sst_blocks(
         // failure is at the section-catalogue layer, not inside any
         // individual block.
         let Some(end) = entry.pos().checked_add(entry.len()) else {
+            // Report the DECLARED TOC offset, not the walk start: the overflow
+            // is computed from `entry.pos()`, and for a restricted `data`
+            // section `start` is the live frontier — a different number, which
+            // would send repair and forensic readers to the wrong entry.
+            let declared = entry.pos();
             errors.push(BlockVerifyError::TocCorrupted {
                 table_id,
                 path: path.to_path_buf(),
                 section_name: entry.name().to_vec(),
-                section_offset: start,
+                section_offset: declared,
                 reason: format!(
-                    "section length {} overflows u64 when added to start offset {start}",
+                    "section length {} overflows u64 when added to start offset {declared}",
                     entry.len(),
                 ),
             });
