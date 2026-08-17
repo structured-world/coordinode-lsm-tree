@@ -2040,6 +2040,52 @@ fn resurrection_reclaims_an_irregularly_punched_set_aside() -> crate::Result<()>
     Ok(())
 }
 
+/// The standalone out-of-band verify must not condemn a healthy restricted
+/// punched SST: with a valid colocated sidecar attesting the committed
+/// restriction, the leading zeroed (punched) region is the reclaimed prefix
+/// and the walk starts at the live frontier, verifying the suffix clean.
+/// WITHOUT the sidecar the zeros stay part of the walk and flag loudly:
+/// zeroed-out data on an unrestricted table is destruction, not reclaim.
+#[test]
+fn verify_sst_file_honors_a_restricted_punched_prefix() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs, SyncMode};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    write_multiblock_sst(&sst, &fs)?;
+    crate::restrict_bound::write(&*fs, &sst, None, 0, b"k00130", SyncMode::Normal)?;
+    let punch = recover_sst(sst.clone(), &fs)?.punch_offset_for(b"k00130")?;
+    memfs.punch_hole(&sst, 0, punch)?;
+
+    let report = crate::verify::verify_sst_file_with_fs(&*fs, &sst);
+    assert!(
+        report.is_ok(),
+        "a healthy restricted punched SST must verify clean through the \
+         out-of-band walk: errors {:?}, warnings {:?}",
+        report.errors,
+        report.warnings,
+    );
+    assert!(
+        report.blocks_scanned > 0,
+        "the live suffix must actually be walked: {report:?}",
+    );
+
+    // Without the attesting sidecar the zeroed region must flag loudly.
+    crate::restrict_bound::remove(&*fs, &sst, SyncMode::Normal);
+    let report = crate::verify::verify_sst_file_with_fs(&*fs, &sst);
+    assert!(
+        !report.is_ok(),
+        "leading zeros without a restriction sidecar are destroyed data and \
+         must fail verification: {report:?}",
+    );
+    Ok(())
+}
+
 /// A reclaim whose post-rename step fails must not leave the SST in `tables/`
 /// unreferenced: the previously installed manifest omits it, so a caller that
 /// responds to the failed repair by simply REOPENING the tree lets orphan

@@ -953,6 +953,14 @@ pub(crate) fn verify_sst_file_with_context(
     data_start: u64,
 ) -> BlockVerifyReport {
     let table_id = known_table_id.unwrap_or(0);
+    // A caller-known punch offset wins; with none, derive the live frontier of
+    // a possibly-RESTRICTED SST from its colocated sidecar so a standalone
+    // walk does not condemn the intentionally punched prefix as corruption.
+    let data_start = if data_start == 0 {
+        restricted_data_start(fs, path, encryption, known_table_id)
+    } else {
+        data_start
+    };
     let mut report = BlockVerifyReport {
         sst_files_scanned: 1,
         ..BlockVerifyReport::default()
@@ -1242,6 +1250,59 @@ fn read_ecc_params_out_of_band(
 /// Result of [`read_ecc_params_out_of_band`]: the arbitrated ECC state plus
 /// whether the two FULLY-decoded meta mirrors disagree in any field.
 #[cfg(feature = "std")]
+/// The data-walk start offset for a possibly-RESTRICTED SST verified
+/// out-of-band with no caller-known punch offset. A valid colocated
+/// `.restrict-bound` sidecar proves a committed tight-space restriction (it is
+/// written strictly after the slice's install commits), so the SST's leading
+/// all-zero region is its intentionally hole-punched consumed prefix: the walk
+/// starts at the first nonzero byte, a block boundary, since whole data blocks
+/// are punched. Without the sidecar the derive returns `0` and leading zeros
+/// stay part of the walk, flagging loudly — zeroed-out data on an unrestricted
+/// table is destruction, not reclaim.
+///
+/// `known_table_id`: when the caller knows the durable id, a sidecar recorded
+/// for a DIFFERENT id is ignored (a stale or foreign sidecar must not silence
+/// zeroed blocks of an unrelated table). A standalone tool has no id source,
+/// so a decodable colocated sidecar is accepted as-is there.
+///
+/// Best-effort: any probe or read failure falls back to `0` (the loud
+/// default). An ENCRYPTED sidecar with no provider reads as corrupt and also
+/// falls back — encrypted restricted SSTs need the provider-carrying path.
+#[cfg(feature = "std")]
+fn restricted_data_start(
+    fs: &dyn crate::fs::Fs,
+    path: &std::path::Path,
+    encryption: Option<&dyn crate::encryption::EncryptionProvider>,
+    known_table_id: Option<crate::TableId>,
+) -> u64 {
+    match crate::restrict_bound::read(fs, path, encryption) {
+        Ok(crate::restrict_bound::SidecarRead::Present(sidecar_id, _))
+            if known_table_id.is_none_or(|id| id == sidecar_id) => {}
+        _ => return 0,
+    }
+    let Ok(file) = fs.open(path, &crate::fs::FsOpenOptions::new().read(true)) else {
+        return 0;
+    };
+    let Ok(meta) = crate::fs::FsFile::metadata(&*file) else {
+        return 0;
+    };
+    let len = meta.len;
+    const CHUNK: u64 = 64 * 1024;
+    let mut offset = 0u64;
+    while offset < len {
+        #[allow(clippy::cast_possible_truncation, reason = "bounded by CHUNK")]
+        let n = CHUNK.min(len - offset) as usize;
+        let Ok(bytes) = crate::file::read_exact(&*file, offset, n) else {
+            return 0;
+        };
+        if let Some(i) = bytes.iter().position(|&b| b != 0) {
+            return offset + i as u64;
+        }
+        offset += n as u64;
+    }
+    0
+}
+
 struct EccProbe {
     ecc: Option<ScrubEcc>,
     mirrors_diverge: bool,
