@@ -680,11 +680,14 @@ fn verify_sst_file_reports_incomplete_when_ecc_is_unrecognized_in_both_mirrors()
 /// were skipped unwalked), so the merged whole-tree report must stay incomplete
 /// and `is_ok()` false. If the merge drops the `incomplete` flag, the final
 /// report reverts to `false` and falsely reports OK with no other errors.
+/// SEVERAL SSTs, only one forged: the clean partials folded after the
+/// incomplete one would launder the flag under an OVERWRITING (rather than
+/// OR-ing) merge, so the multi-SST shape pins the accumulation itself.
 #[cfg(feature = "std")]
 #[test]
 fn verify_block_checksums_stays_incomplete_when_one_sst_has_unrecognized_ecc() {
     let dir = tempfile::tempdir().unwrap();
-    populate_tree(dir.path(), 200);
+    populate_multi_sst(dir.path(), 3, 200);
 
     // Sanity: intact tree verifies clean.
     let tree = reopen_tree(dir.path());
