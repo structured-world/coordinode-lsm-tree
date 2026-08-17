@@ -436,6 +436,7 @@ fn restore_quarantined(
     fs: &dyn crate::fs::Fs,
     quarantined: &std::path::Path,
     table_path: &std::path::Path,
+    encryption: Option<&dyn crate::encryption::EncryptionProvider>,
     sync_mode: crate::fs::SyncMode,
 ) -> crate::Result<()> {
     // Capture the companion sidecar's RAW bytes BEFORE anything moves: if the
@@ -444,12 +445,18 @@ fn restore_quarantined(
     // never stranded in quarantine (where the retried repair — which scans only
     // `tables/` — would silently degrade the restored SST to the lossy
     // geometry fallback). A TRANSIENT probe / read failure propagates while
-    // nothing has moved yet; a PERSISTENT one leaves no rescue copy, but the
+    // nothing has moved yet; a PERSISTENT one — or a file larger than any
+    // VALID sidecar encoding (an attacker-padded / corrupt file must not be
+    // trusted into a full-size allocation) — leaves no rescue copy, but the
     // direct rename below (which never reads the content) may still succeed.
     let quarantined_sidecar = crate::restrict_bound::sidecar_path(quarantined);
     let sidecar_state: Option<(bool, Option<Vec<u8>>)> = if fs.exists(&quarantined_sidecar)? {
-        match read_raw_file(fs, &quarantined_sidecar) {
-            Ok(bytes) => Some((true, Some(bytes))),
+        match read_raw_file(
+            fs,
+            &quarantined_sidecar,
+            crate::restrict_bound::max_encoded_len(encryption),
+        ) {
+            Ok(bytes) => Some((true, bytes)),
             Err(e) if is_transient_io(&e) => return Err(e),
             Err(_) => Some((true, None)),
         }
@@ -511,14 +518,24 @@ fn restore_quarantined(
     Ok(())
 }
 
-/// Reads a small file's complete contents. Used to capture sidecar bytes before
-/// a restore move so they can be re-published if the direct rename fails.
+/// Reads a small file's complete contents, or `None` when the file exceeds
+/// `max_len` — the reported length is untrusted input, so it is validated
+/// BEFORE sizing the allocation. Used to capture sidecar bytes before a restore
+/// move so they can be re-published if the direct rename fails; an oversized
+/// file cannot be a valid sidecar and is not worth rescuing.
 #[cfg(feature = "std")]
-fn read_raw_file(fs: &dyn crate::fs::Fs, path: &std::path::Path) -> crate::Result<Vec<u8>> {
+fn read_raw_file(
+    fs: &dyn crate::fs::Fs,
+    path: &std::path::Path,
+    max_len: u64,
+) -> crate::Result<Option<Vec<u8>>> {
     let file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
     let len = crate::fs::FsFile::metadata(&*file)?.len;
+    if len > max_len {
+        return Ok(None);
+    }
     let n = usize::try_from(len).map_err(|_| crate::Error::Unrecoverable)?;
-    Ok(crate::file::read_exact(&*file, 0, n)?.to_vec())
+    Ok(Some(crate::file::read_exact(&*file, 0, n)?.to_vec()))
 }
 
 /// Whether an error is an UNAMBIGUOUSLY TRANSIENT (retryable) I/O failure, as
@@ -1389,7 +1406,13 @@ fn restrict_salvaged_output(
                     // punched original back lets the retry re-salvage and
                     // re-restrict from a known state (a `rename` needs no free
                     // space, so it survives the ENOSPC that may have caused `e`).
-                    restore_quarantined(folder_fs, quarantined, table_path, config.sync_mode)?;
+                    restore_quarantined(
+                        folder_fs,
+                        quarantined,
+                        table_path,
+                        config.encryption.as_deref(),
+                        config.sync_mode,
+                    )?;
                     Err(e)
                 }
             }
@@ -1953,6 +1976,7 @@ fn repair_tree(
                                                 &*folder_fs,
                                                 &dest,
                                                 &table_path,
+                                                config.encryption.as_deref(),
                                                 config.sync_mode,
                                             )?;
                                             return Err(e);
@@ -2119,6 +2143,7 @@ fn repair_tree(
                                             &*folder_fs,
                                             &quarantined,
                                             &table_path,
+                                            config.encryption.as_deref(),
                                             config.sync_mode,
                                         )?;
                                         return Err(salvage_err);
@@ -2217,6 +2242,7 @@ fn repair_tree(
                                         &*folder_fs,
                                         &dest,
                                         &table_path,
+                                        config.encryption.as_deref(),
                                         config.sync_mode,
                                     )?;
                                     return Err(e);
@@ -2317,6 +2343,7 @@ fn repair_tree(
                                     &*folder_fs,
                                     &quarantined,
                                     &table_path,
+                                    config.encryption.as_deref(),
                                     config.sync_mode,
                                 )?;
                                 return Err(marker_err);
@@ -2340,6 +2367,7 @@ fn repair_tree(
                                     &*folder_fs,
                                     &quarantined,
                                     &table_path,
+                                    config.encryption.as_deref(),
                                     config.sync_mode,
                                 )?;
                                 return Err(salvage_err);

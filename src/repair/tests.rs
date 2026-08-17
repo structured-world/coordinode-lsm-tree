@@ -1840,6 +1840,52 @@ fn repair_sets_aside_a_partially_punched_sidecarless_sst_that_fails_recovery() -
     Ok(())
 }
 
+/// The restore's raw sidecar capture must apply the same size cap
+/// `restrict_bound::read` enforces: an attacker-padded or corrupt oversized
+/// sidecar must be classified unreadable (no rescue copy), not trusted into a
+/// full-size allocation and re-published verbatim by the rename fallback.
+#[test]
+fn restore_does_not_republish_an_oversized_sidecar() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, SyncMode};
+    use crate::io::ErrorKind;
+    use std::io::Write;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    std::fs::write(&sst, b"sst bytes")?;
+
+    let fs = FaultFs::new(StdFs);
+    // An oversized "sidecar": larger than any valid header + max key + checksum
+    // (+ encryption overhead) encoding.
+    let sidecar = crate::restrict_bound::sidecar_path(&sst);
+    {
+        let mut f = fs.open(
+            &sidecar,
+            &crate::fs::FsOpenOptions::new().write(true).create(true),
+        )?;
+        f.write_all(&vec![0x42u8; (usize::from(u16::MAX)) * 2])?;
+    }
+    let dest = super::quarantine_file(&fs, &tables, &sst, "0", SyncMode::Normal)?;
+
+    // Fault the direct sidecar rename on the way back: with no rescue copy
+    // captured (oversized = unreadable), the restore must complete WITHOUT
+    // re-publishing the junk at the destination.
+    fs.injector().arm(
+        FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::Other))
+            .on_path("restrict-bound")
+            .once(),
+    );
+    super::restore_quarantined(&fs, &dest, &sst, None, SyncMode::Normal)?;
+    assert!(fs.exists(&sst)?, "the SST is restored to tables/");
+    assert!(
+        !fs.exists(&crate::restrict_bound::sidecar_path(&sst))?,
+        "an oversized (corrupt) sidecar must not be re-published beside the SST",
+    );
+    Ok(())
+}
+
 /// A flag-dependent set-aside must keep the resurrection knob TWO-WAY: a
 /// default (resurrection-off) repair sets an irregularly punched SST aside
 /// because its bound is unknowable, but a later resurrection repair must
@@ -2462,7 +2508,7 @@ fn quarantine_moves_the_restriction_sidecar_with_the_sst() -> crate::Result<()> 
     assert!(!fs.exists(&sst)?, "the SST itself moved out of tables/");
 
     // Restoring the original brings the sidecar back with it.
-    super::restore_quarantined(&*fs, &dest, &sst, SyncMode::Normal)?;
+    super::restore_quarantined(&*fs, &dest, &sst, None, SyncMode::Normal)?;
     assert!(fs.exists(&sst)?, "the SST is restored to tables/");
     assert!(
         fs.exists(&src_sidecar)?,
@@ -2562,7 +2608,7 @@ fn restore_republishes_the_sidecar_when_its_rename_fails() -> crate::Result<()> 
             .once(),
     );
 
-    super::restore_quarantined(&fs, &dest, &sst, SyncMode::Normal)?;
+    super::restore_quarantined(&fs, &dest, &sst, None, SyncMode::Normal)?;
     assert!(fs.exists(&sst)?, "the SST is restored to tables/");
     let src_sidecar = crate::restrict_bound::sidecar_path(&sst);
     assert!(

@@ -178,6 +178,19 @@ pub(crate) fn publish_raw(
     publish
 }
 
+/// The largest on-disk size a VALID sidecar can have: header + bound + checksum
+/// (plaintext), plus the provider's AEAD overhead when encrypted. A user key is
+/// at most `u16::MAX` bytes (the writer's key-size limit). Everything that
+/// reads sidecar bytes — [`read`] and the repair restore's raw rescue capture —
+/// rejects anything larger BEFORE allocating, so a corrupt / attacker-padded
+/// sidecar cannot force a huge allocation.
+pub(crate) fn max_encoded_len(encryption: Option<&dyn EncryptionProvider>) -> u64 {
+    HEADER_LEN as u64
+        + u64::from(u16::MAX)
+        + CHECKSUM_LEN as u64
+        + u64::from(encryption.map_or(0, EncryptionProvider::max_overhead))
+}
+
 /// Outcome of reading the sidecar.
 ///
 /// A genuine I/O failure (open other than not-found, or a read failure) is
@@ -215,14 +228,7 @@ pub fn read(
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(SidecarRead::Missing),
         Err(e) => return Err(crate::Error::from(e)),
     };
-    // Bound the read: a valid sidecar is header + bound + checksum (plaintext) or
-    // that plus the provider's AEAD overhead. A user key is at most `u16::MAX`
-    // bytes (the writer's key-size limit); reject anything larger BEFORE reading,
-    // so a corrupt / attacker-padded sidecar cannot force a huge allocation.
-    let max_len = HEADER_LEN as u64
-        + u64::from(u16::MAX)
-        + CHECKSUM_LEN as u64
-        + u64::from(encryption.map_or(0, EncryptionProvider::max_overhead));
+    let max_len = max_encoded_len(encryption);
     if file.metadata()?.len > max_len {
         return Ok(SidecarRead::Corrupt);
     }
