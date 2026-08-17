@@ -1871,7 +1871,7 @@ fn punch_failures_leave_a_classifiable_pattern() -> crate::Result<()> {
     // pattern). Bottom-up with continue-past-failures it would zero the two
     // LOWEST blocks and leave trailing consumed blocks that read as a clean
     // zeroed prefix plus a plausible live suffix.
-    let table = recover_sst(sst.clone(), &fs)?;
+    let table = recover_sst(sst, &fs)?;
     let committed = table.punch_offset_for(b"k00130")?;
     table.mark_punch_on_drop(committed);
     injector.arm(FaultRule::new(FaultOp::PunchHole, Fault::Error(ErrorKind::Other)).skip(2));
