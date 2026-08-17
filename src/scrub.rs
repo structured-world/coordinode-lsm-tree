@@ -992,8 +992,9 @@ fn refresh_healed_checksum(
     // restriction after the pre-window check below (closing that TOCTOU: `fresh`
     // describes the captured region and must not be recorded against a view of a
     // different restriction).
+    use crate::abstract_tree::ChecksumRefreshOutcome;
     match tree.refresh_table_checksum(table.id(), fresh, table.restrict_lower_bound()) {
-        Ok(true) => {
+        Ok(ChecksumRefreshOutcome::Refreshed) => {
             // The manifest now holds a legitimate digest; the attestation that
             // may have authorized this reconciliation has served its purpose.
             heal_attest::remove(&*table.fs, &table.path);
@@ -1003,7 +1004,19 @@ fn refresh_healed_checksum(
         // the digest inapplicable to the current view. The manifest digest is
         // unchanged, so KEEP the marker — the next patrol reconciles the current
         // view through it rather than losing the only attribution.
-        Ok(false) => None,
+        Ok(ChecksumRefreshOutcome::Stale) => None,
+        // The install lock was held by a concurrent compaction. The healed
+        // bytes are durable while the manifest digest stays stale and the
+        // attestation stays pending: a clean report would mislead a later
+        // integrity check (mismatch) or a checkpoint (abort on the pending
+        // reconcile). Surface a finding; the kept marker lets the next patrol
+        // retry once the compaction releases the state.
+        Ok(ChecksumRefreshOutcome::Contended) => finding(
+            "the manifest install lock was held by a concurrent compaction; the \
+             healed bytes are durable but the manifest digest is stale until a \
+             later patrol reconciles the kept attestation"
+                .to_string(),
+        ),
         Err(e) => finding(e.to_string()),
     }
 }

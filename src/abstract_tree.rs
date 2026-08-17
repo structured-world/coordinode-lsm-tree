@@ -71,6 +71,26 @@ pub mod sealed {
     pub trait Sealed {}
 }
 
+/// Outcome of [`AbstractTree::refresh_table_checksum`].
+#[cfg(feature = "std")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksumRefreshOutcome {
+    /// The digest was installed into the manifest.
+    Refreshed,
+    /// Legitimate no-op: the table was compacted away, or its restriction no
+    /// longer matches the one the digest was computed for; the current view
+    /// carries its own (compaction-installed) digest for the next patrol to
+    /// reconcile.
+    Stale,
+    /// The install lock was held by a concurrent compaction (blocking on it
+    /// would invert the heal-lock / compaction-state order and deadlock). The
+    /// manifest digest stays stale against durable healed bytes: the caller
+    /// must surface this as a finding, keep the attestation, and let a later
+    /// patrol retry.
+    Contended,
+}
+
 /// Generic Tree API
 #[enum_dispatch::enum_dispatch]
 pub trait AbstractTree: sealed::Sealed {
@@ -121,11 +141,16 @@ pub trait AbstractTree: sealed::Sealed {
     /// installed into a suffix-only restricted manifest (or vice versa) could
     /// never match the punched file.
     ///
-    /// Returns `Ok(true)` when the digest was installed, and `Ok(false)` when the
-    /// refresh was a no-op (the table was compacted away, or its restriction no
-    /// longer matches `expected_restriction`). The caller uses this to decide
-    /// whether to clear the heal attestation: a no-op leaves the manifest digest
-    /// unchanged, so the marker must be KEPT for the next patrol to reconcile.
+    /// Returns [`ChecksumRefreshOutcome::Refreshed`] when the digest was
+    /// installed, [`ChecksumRefreshOutcome::Stale`] on a legitimate no-op (the
+    /// table was compacted away, or its restriction no longer matches
+    /// `expected_restriction` — the current view carries its own digest), and
+    /// [`ChecksumRefreshOutcome::Contended`] when the install lock was held by
+    /// a concurrent compaction. The caller uses this to decide whether to clear
+    /// the heal attestation (only `Refreshed` may) and whether the pass stayed
+    /// clean: a contended skip leaves the manifest digest stale against durable
+    /// healed bytes, which must surface as a finding rather than a clean
+    /// report.
     ///
     /// [`restrict_lower_bound`]: crate::table::Table::restrict_lower_bound
     #[cfg(feature = "std")]
@@ -135,7 +160,7 @@ pub trait AbstractTree: sealed::Sealed {
         table_id: TableId,
         checksum: crate::checksum::Checksum,
         expected_restriction: Option<&crate::UserKey>,
-    ) -> crate::Result<bool>;
+    ) -> crate::Result<ChecksumRefreshOutcome>;
 
     /// The tree's configured durability mode
     /// ([`Config::sync_mode`](crate::config::Config::sync_mode)). Maintenance

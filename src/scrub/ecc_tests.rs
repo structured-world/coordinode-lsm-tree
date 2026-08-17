@@ -1152,6 +1152,51 @@ fn heal_skips_blocks_below_the_restriction_bound() -> crate::Result<()> {
     Ok(())
 }
 
+/// A heal whose manifest-digest refresh loses the compaction-state `try_lock`
+/// (a concurrent compaction is mid-install; blocking would invert the
+/// heal-lock / compaction-state order and deadlock) must NOT report a clean
+/// pass: the healed bytes are durable but the manifest digest stays stale and
+/// the attestation stays pending, so a later integrity check flags the mismatch
+/// and a checkpoint can abort despite the "clean" scrub. The contention must
+/// surface as a `ChecksumRefreshFailed` finding; the marker is kept for the
+/// next patrol to reconcile.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn heal_reports_a_contended_checksum_refresh_as_a_finding() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_single_block_ecc_sst(dir.path());
+
+    // Attributable trailer-rebuild heal (payload stays checksum-clean): the
+    // manifest digest covers the CURRENT (rotted) bytes, so the heal changes
+    // them and the reconcile must install a refreshed digest.
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
+    rebuild_manifest_over_current_bytes(dir.path())?;
+
+    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(crate::fs::StdFs));
+    // Hold the compaction state across the scrub, as a long-running concurrent
+    // compaction would: the reconcile's `try_lock` then loses.
+    let _compaction_guard = tree.compaction_state.lock();
+
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert_eq!(
+        report.blocks_healed_in_place, 1,
+        "the heal itself lands; only the digest install is contended: {report:?}",
+    );
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, ScrubError::ChecksumRefreshFailed { .. })),
+        "install-lock contention must surface as a finding, not a clean pass: {report:?}",
+    );
+    assert!(!report.is_ok(), "{report:?}");
+    assert!(
+        heal_attest_path(&sst_path).exists(),
+        "the marker is kept for the next patrol to reconcile",
+    );
+    Ok(())
+}
+
 /// A patrol whose CAPTURED table view went stale — tight-space compaction
 /// installed a RESTRICTED same-id view (whose manifest digest covers only the
 /// live suffix) after the capture — must scan the CURRENT view, not the captured

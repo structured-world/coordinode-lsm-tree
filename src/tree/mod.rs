@@ -419,7 +419,8 @@ impl AbstractTree for Tree {
         table_id: TableId,
         checksum: crate::checksum::Checksum,
         expected_restriction: Option<&crate::UserKey>,
-    ) -> crate::Result<bool> {
+    ) -> crate::Result<crate::abstract_tree::ChecksumRefreshOutcome> {
+        use crate::abstract_tree::ChecksumRefreshOutcome;
         // Same lock order as flush / compaction version installs: compaction
         // state first, then the version history write lock. But the caller (the
         // patrol reconcile) holds this table's HEAL LOCK across this call, and a
@@ -428,12 +429,14 @@ impl AbstractTree for Tree {
         // order (heal_lock -> compaction_state on this path vs
         // compaction_state -> heal_lock on the compaction path) and deadlock
         // permanently. `try_lock` instead: a failed acquire means a compaction is
-        // mid-install, so skip this refresh (`Ok(false)`) — the caller keeps the
-        // attestation and the next patrol retries once the compaction releases the
-        // state. Correctness is unchanged: the manifest digest is simply left for
-        // the next pass, exactly as the restriction-mismatch no-op below does.
+        // mid-install, so skip this refresh — but report the skip as CONTENDED,
+        // not as a benign no-op: the healed bytes are durable while the manifest
+        // digest stays stale, so a "clean" report would mislead a later
+        // integrity check / checkpoint. The caller keeps the attestation and
+        // surfaces a finding; the next patrol retries once the compaction
+        // releases the state.
         let Some(mut _compaction_state) = self.compaction_state.try_lock() else {
-            return Ok(false);
+            return Ok(ChecksumRefreshOutcome::Contended);
         };
         let mut version_lock = self.version_history.write();
 
@@ -455,7 +458,7 @@ impl AbstractTree for Tree {
         if !restriction_matches {
             // No-op: the manifest digest is unchanged, so the caller must keep the
             // attestation for the next patrol.
-            return Ok(false);
+            return Ok(ChecksumRefreshOutcome::Stale);
         }
 
         version_lock
@@ -477,7 +480,7 @@ impl AbstractTree for Tree {
                 self.0.runtime_config.load_full(),
                 self.0.config.encryption.clone(),
             )
-            .map(|()| true)
+            .map(|()| ChecksumRefreshOutcome::Refreshed)
     }
 
     fn sync_mode(&self) -> crate::fs::SyncMode {

@@ -124,15 +124,18 @@ fn patrol_scrub_empty_tree_scans_nothing() {
 /// then acquires that heal lock. Blocking on `compaction_state` here would
 /// invert the lock order (`heal_lock` -> `compaction_state` on the patrol path
 /// vs `compaction_state` -> `heal_lock` on the compaction path) and deadlock.
-/// The refresh must instead SKIP (`Ok(false)`) when `compaction_state` is
-/// contended.
+/// The refresh must instead SKIP — reporting the skip as
+/// [`ChecksumRefreshOutcome::Contended`], distinct from a benign no-op — when
+/// `compaction_state` is contended.
 ///
 /// Deterministic without threads: `parking_lot`'s non-reentrant `try_lock` fails
-/// even for the holding thread, so the pre-fix blocking `lock()` would
-/// self-deadlock this very test (a hang), and the fixed `try_lock` returns
-/// `Ok(false)`.
+/// even for the holding thread, so a blocking `lock()` would self-deadlock this
+/// very test (a hang), and the `try_lock` skip returns `Contended`.
+///
+/// [`ChecksumRefreshOutcome::Contended`]: crate::abstract_tree::ChecksumRefreshOutcome::Contended
 #[test]
 fn refresh_table_checksum_skips_when_compaction_state_is_contended() {
+    use crate::abstract_tree::ChecksumRefreshOutcome;
     let dir = tempfile::tempdir().expect("tempdir");
     let AnyTree::Standard(tree) = standard_tree(dir.path()) else {
         unreachable!("standard tree configured");
@@ -157,10 +160,10 @@ fn refresh_table_checksum_skips_when_compaction_state_is_contended() {
     let result = tree.refresh_table_checksum(id, checksum, None);
     drop(held);
     assert!(
-        matches!(result, Ok(false)),
-        "refresh must skip (not block) when compaction_state is contended, and the \
-         table exists so the skip is attributable to the contention rather than a \
-         missing table: {result:?}",
+        matches!(result, Ok(ChecksumRefreshOutcome::Contended)),
+        "refresh must skip (not block) when compaction_state is contended, and \
+         report the skip as Contended — the table exists, so a Stale here would \
+         mask the contention as a benign no-op: {result:?}",
     );
 }
 
