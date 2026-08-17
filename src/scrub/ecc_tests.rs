@@ -3279,6 +3279,79 @@ fn abort_checkpoint_ignores_an_obsolete_marker_but_aborts_on_a_stale_digest() ->
     Ok(())
 }
 
+/// A checkpoint must not hold the link window's write half while its flush
+/// blocks on `compaction_state`: with Page ECC that closes a three-way cycle —
+/// a tight-space compaction holds `compaction_state` while waiting for a
+/// table's heal lock, and a heal patrol holds that heal lock while waiting for
+/// the link window's read half. Orchestrates all three parties (the test
+/// thread stands in for the compaction, holding `compaction_state` and then
+/// wanting the heal lock) and asserts every one completes; pre-fix the trio
+/// deadlocks and the test hangs into the harness timeout.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn checkpoint_flush_does_not_deadlock_with_patrol_and_compaction() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir()?;
+    write_ecc_sst(dir.path());
+    let tree = Arc::new(open_ecc_tree_on(dir.path(), Arc::new(crate::fs::StdFs)));
+
+    // Data in the active memtable, so the checkpoint's flush genuinely
+    // installs a version (an empty flush never reaches `compaction_state`).
+    tree.insert("pending-row", "v", 5_000);
+
+    let table = {
+        let binding = tree.version_history.read().latest_version();
+        binding
+            .version
+            .iter_tables()
+            .next()
+            .expect("flush produced one table")
+            .clone()
+    };
+
+    // Party 1 (this thread, standing in for a mid-install compaction): hold
+    // `compaction_state` for the whole orchestration.
+    let state_guard = tree.compaction_state.lock();
+
+    // Party 2: the checkpoint. Its flush blocks on `compaction_state` (held
+    // above). Pre-fix it blocked there while HOLDING the link window's write
+    // half; the fix flushes before taking the window.
+    let checkpoint = {
+        let tree = Arc::clone(&tree);
+        let dst = dir.path().join("checkpoint");
+        std::thread::spawn(move || tree.create_checkpoint(&dst))
+    };
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Party 3: a heal patrol. It takes the table's heal lock and then enters
+    // the mutation window (the link window's read half) — pre-fix it blocked
+    // there while holding the heal lock.
+    let patrol = {
+        let tree = Arc::clone(&tree);
+        std::thread::spawn(move || {
+            patrol_scrub(&*tree, &PatrolScrubOptions::default().heal_in_place(true))
+        })
+    };
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Party 1 now wants the heal lock, exactly like the tight-space slice loop
+    // does while holding `compaction_state`. Pre-fix: the patrol holds it and
+    // waits for the link window the checkpoint holds while the checkpoint
+    // waits for our `compaction_state` — the cycle hangs all three.
+    drop(table.heal_lock_arc().lock());
+    drop(state_guard);
+
+    let report = patrol.join().expect("patrol thread must not panic");
+    assert!(report.is_ok(), "{report:?}");
+    checkpoint
+        .join()
+        .expect("checkpoint thread must not panic")?;
+    Ok(())
+}
+
 /// A checkpoint taken while a table carries a PENDING heal attestation (healed
 /// bytes on disk, the live version still recording the pre-heal digest, and the
 /// `.heal-attest` sidecar which the checkpoint does NOT copy) must not capture
@@ -3286,6 +3359,7 @@ fn abort_checkpoint_ignores_an_obsolete_marker_but_aborts_on_a_stale_digest() ->
 /// verification forever with no marker to reconcile. The checkpoint reconciles
 /// pending heals BEFORE snapshotting, so the captured version is self-consistent
 /// (healed bytes under a refreshed digest).
+#[cfg(feature = "page_ecc")]
 #[test]
 fn checkpoint_reconciles_a_pending_heal_before_snapshotting() -> crate::Result<()> {
     use crate::AbstractTree;
