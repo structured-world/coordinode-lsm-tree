@@ -2151,6 +2151,48 @@ fn verify_sst_file_honors_a_restricted_punched_prefix() -> crate::Result<()> {
     Ok(())
 }
 
+/// Two same-id copies living in DIFFERENT filesystem namespaces are distinct
+/// files even when their paths spell the same string: canonicalizing both
+/// through the host filesystem would call them aliases and skip quarantining
+/// the loser, leaving a same-id leftover that a later reopen can resolve
+/// against the kept copy's manifest checksum. The alias test must therefore
+/// compare backend identity too, and treat "no shared-namespace guarantee"
+/// (`backend_id() == None`) as distinct.
+#[test]
+fn same_physical_file_requires_a_shared_namespace() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs, StdFs};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let real = dir.path().join("0");
+    std::fs::write(&real, b"real bytes")?;
+
+    let memfs: Arc<dyn Fs> = Arc::new(MemFs::new());
+    let stdfs: Arc<dyn Fs> = Arc::new(StdFs);
+    // A MemFs file at the very path that also exists on the host filesystem.
+    if let Some(parent) = real.parent() {
+        memfs.create_dir_all(parent)?;
+    }
+    {
+        use std::io::Write;
+        let mut f = memfs.open(
+            &real,
+            &crate::fs::FsOpenOptions::new().write(true).create(true),
+        )?;
+        f.write_all(b"virtual bytes")?;
+    }
+
+    assert!(
+        !super::same_physical_file(&*memfs, &real, &*stdfs, &real),
+        "same path spelling in DIFFERENT namespaces is not an alias",
+    );
+    assert!(
+        super::same_physical_file(&*stdfs, &real, &*stdfs, &real),
+        "the same host path through one namespace IS an alias",
+    );
+    Ok(())
+}
+
 /// A zero run INSIDE a live value must never move the frontier: the derive
 /// anchors only on a run whose end is a VALIDATED block header (magic +
 /// header checksum), so a value carrying `Header::MIN_LEN` zeros — perfectly

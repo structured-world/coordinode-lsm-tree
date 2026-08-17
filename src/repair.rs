@@ -667,11 +667,31 @@ fn keep_best_candidate(
 /// through an alias is never quarantined as a "duplicate" (which would move the
 /// kept copy and orphan the manifest entry).
 ///
-/// Canonicalization that fails on EITHER path (e.g. a virtual `MemFs` path with no
-/// OS presence) conservatively returns `false` — treat the paths as distinct — so
-/// a genuine duplicate is still quarantined; a virtual filesystem has no aliases.
+/// The two candidates must live in the SAME filesystem namespace for a path
+/// comparison to mean anything: a virtual (`MemFs`) table can sit at a path that
+/// also exists on the host filesystem, and canonicalizing both spellings through
+/// the host would call those distinct files aliases — the loser would then escape
+/// quarantine and a later reopen could resolve that leftover against the kept
+/// copy's manifest checksum. Backends advertise namespace identity through
+/// [`Fs::backend_id`](crate::fs::Fs::backend_id), whose `None` means "no shared
+/// namespace guarantee" and is therefore treated as DISTINCT.
+///
+/// Canonicalization that fails on EITHER path (e.g. a virtual path with no OS
+/// presence) conservatively returns `false` too — treat the paths as distinct —
+/// so a genuine duplicate is still quarantined.
 #[cfg(feature = "std")]
-fn same_physical_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+fn same_physical_file(
+    fs_a: &dyn crate::fs::Fs,
+    a: &std::path::Path,
+    fs_b: &dyn crate::fs::Fs,
+    b: &std::path::Path,
+) -> bool {
+    match (fs_a.backend_id(), fs_b.backend_id()) {
+        (Some(id_a), Some(id_b)) if id_a == id_b => {}
+        // Different backends, or a backend that gives no namespace guarantee:
+        // path spellings are not comparable, so never alias them.
+        _ => return false,
+    }
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(ca), Ok(cb)) => ca == cb,
         _ => false,
@@ -744,7 +764,7 @@ fn record_best(
         // entry. Drop the loser's handle in place instead of quarantining.
         let is_alias = map
             .get(&id)
-            .is_some_and(|kept| same_physical_file(&loser.path, &kept.path));
+            .is_some_and(|kept| same_physical_file(&*loser.fs, &loser.path, &*kept.fs, &kept.path));
         if !is_alias {
             quarantine_duplicate(loser, unreadable_files, sync_mode)?;
         }
@@ -1807,7 +1827,7 @@ fn repair_tree(
                 // is the SAME file, not a genuine duplicate. Quarantining it would
                 // MOVE the kept copy and leave the manifest referencing a missing
                 // SST, so skip it IN PLACE.
-                if same_physical_file(&table_path, &existing.path) {
+                if same_physical_file(&*folder_fs, &table_path, &*existing.fs, &existing.path) {
                     continue;
                 }
                 // A genuine duplicate: quarantine it out of `tables/` so recovery
