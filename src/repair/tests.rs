@@ -2151,6 +2151,58 @@ fn verify_sst_file_honors_a_restricted_punched_prefix() -> crate::Result<()> {
     Ok(())
 }
 
+/// A zero run INSIDE a live value must never move the frontier: the derive
+/// anchors only on a run whose end is a VALIDATED block header (magic +
+/// header checksum), so a value carrying `Header::MIN_LEN` zeros — perfectly
+/// legal payload — cannot make the walk start mid-frame and condemn (or
+/// silently skip part of) a healthy SST.
+#[test]
+fn verify_sst_file_ignores_zero_runs_inside_live_values() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs, SyncMode};
+    use crate::table::Writer;
+    use crate::{InternalValue, ValueType};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+
+    // Values are long all-zero byte strings — legal payload that contains far
+    // more than `Header::MIN_LEN` consecutive zeros. No punch anywhere.
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+        for i in 0..64u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                vec![0u8; 256],
+                u64::from(i) + 1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+    // A sidecar makes the derive eligible: without it the derive short-circuits
+    // and the zero runs could not move the frontier anyway.
+    crate::restrict_bound::write(&*fs, &sst, None, 0, b"k00010", SyncMode::Normal)?;
+
+    let report = crate::verify::verify_sst_file_with_fs(&*fs, &sst);
+    assert!(
+        report.is_ok(),
+        "zero-filled VALUES are legal payload and must not move the frontier: \
+         errors {:?}, warnings {:?}",
+        report.errors,
+        report.warnings,
+    );
+    assert!(
+        report.blocks_scanned > 0,
+        "every live block must still be walked: {report:?}",
+    );
+    Ok(())
+}
+
 /// The frontier derive must clear the LAST punched extent, not stop at the
 /// first nonzero byte: the reclaim punches top-down and stops at its first
 /// failure, so a partial reclaim leaves intact consumed blocks BELOW the holes

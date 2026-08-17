@@ -1277,8 +1277,10 @@ fn restricted_data_start(
     encryption: Option<&dyn crate::encryption::EncryptionProvider>,
     known_table_id: Option<crate::TableId>,
 ) -> u64 {
-    // A zero run at least a block header long cannot come from one intact
-    // framed block, so it marks a punched (reclaimed) block.
+    // A candidate frontier is only accepted when the byte right after a zero
+    // run DECODES as a block header (magic + its own checksum). A zero run
+    // inside a live value — legal payload — is not followed by a header, so it
+    // can never move the frontier into the middle of a frame.
     const MIN_RUN: u64 = crate::table::block::Header::MIN_LEN as u64;
     match crate::restrict_bound::read(fs, path, encryption) {
         Ok(crate::restrict_bound::SidecarRead::Present(sidecar_id, _))
@@ -1321,18 +1323,36 @@ fn restricted_data_start(
         };
         for (i, &b) in bytes.iter().enumerate() {
             if b == 0 {
-                run += 1;
-                if run >= MIN_RUN {
-                    frontier = offset + i as u64 + 1;
-                }
-            } else {
-                run = 0;
+                run = run.saturating_add(1);
+                continue;
             }
+            // A run ENDS here. Accept it as a reclaimed region only when it is
+            // at least a block long AND this position decodes as a real block
+            // header — the boundary proof that separates a punched block from
+            // a zero run inside a live value's payload.
+            let candidate = offset + i as u64;
+            if run >= MIN_RUN && block_header_decodes_at(&*file, candidate) {
+                frontier = candidate;
+            }
+            run = 0;
         }
         offset += want as u64;
     }
-    // `data_pos` means no punched run was found: nothing to skip.
+    // `data_pos` means no validated punched run was found: nothing to skip.
     if frontier == data_pos { 0 } else { frontier }
+}
+
+/// Whether `offset` holds a decodable block header (magic matches and the
+/// header's own checksum verifies). Proves a candidate frontier lands on a
+/// real block boundary rather than inside a live value's payload.
+#[cfg(feature = "std")]
+fn block_header_decodes_at(file: &dyn crate::fs::FsFile, offset: u64) -> bool {
+    use crate::coding::Decode;
+    let Ok(bytes) = crate::file::read_exact(file, offset, crate::table::block::Header::MAX_LEN)
+    else {
+        return false;
+    };
+    crate::table::block::Header::decode_from(&mut &bytes[..]).is_ok()
 }
 
 /// Result of [`read_ecc_params_out_of_band`]: the arbitrated ECC state plus
