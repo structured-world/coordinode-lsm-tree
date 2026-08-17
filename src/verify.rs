@@ -1249,16 +1249,18 @@ fn read_ecc_params_out_of_band(
 
 /// Result of [`read_ecc_params_out_of_band`]: the arbitrated ECC state plus
 /// whether the two FULLY-decoded meta mirrors disagree in any field.
-#[cfg(feature = "std")]
 /// The data-walk start offset for a possibly-RESTRICTED SST verified
 /// out-of-band with no caller-known punch offset. A valid colocated
 /// `.restrict-bound` sidecar proves a committed tight-space restriction (it is
-/// written strictly after the slice's install commits), so the SST's leading
-/// all-zero region is its intentionally hole-punched consumed prefix: the walk
-/// starts at the first nonzero byte, a block boundary, since whole data blocks
-/// are punched. Without the sidecar the derive returns `0` and leading zeros
-/// stay part of the walk, flagging loudly — zeroed-out data on an unrestricted
-/// table is destruction, not reclaim.
+/// written strictly after the slice's install commits), so an all-zero run
+/// inside the data section is an intentionally hole-punched consumed block.
+/// The walk starts past the LAST such run — not at the first nonzero byte:
+/// the reclaim punches top-down and stops at its first failure, so a partial
+/// reclaim leaves intact consumed blocks BELOW the holes it did punch, and
+/// anchoring at the first nonzero byte would put those holes back inside the
+/// walk and condemn a healthy SST. Without the sidecar the derive returns `0`
+/// and every zero stays part of the walk, flagging loudly — zeroed-out data on
+/// an unrestricted table is destruction, not reclaim.
 ///
 /// `known_table_id`: when the caller knows the durable id, a sidecar recorded
 /// for a DIFFERENT id is ignored (a stale or foreign sidecar must not silence
@@ -1275,32 +1277,62 @@ fn restricted_data_start(
     encryption: Option<&dyn crate::encryption::EncryptionProvider>,
     known_table_id: Option<crate::TableId>,
 ) -> u64 {
+    // A zero run at least a block header long cannot come from one intact
+    // framed block, so it marks a punched (reclaimed) block.
+    const MIN_RUN: u64 = crate::table::block::Header::MIN_LEN as u64;
     match crate::restrict_bound::read(fs, path, encryption) {
         Ok(crate::restrict_bound::SidecarRead::Present(sidecar_id, _))
             if known_table_id.is_none_or(|id| id == sidecar_id) => {}
         _ => return 0,
     }
-    let Ok(file) = fs.open(path, &crate::fs::FsOpenOptions::new().read(true)) else {
+    let Ok(mut file) = fs.open(path, &crate::fs::FsOpenOptions::new().read(true)) else {
         return 0;
     };
     let Ok(meta) = crate::fs::FsFile::metadata(&*file) else {
         return 0;
     };
-    let len = meta.len;
-    const CHUNK: u64 = 64 * 1024;
-    let mut offset = 0u64;
-    while offset < len {
-        #[allow(clippy::cast_possible_truncation, reason = "bounded by CHUNK")]
-        let n = CHUNK.min(len - offset) as usize;
-        let Ok(bytes) = crate::file::read_exact(&*file, offset, n) else {
+    let file_len = meta.len;
+    // Scan only the DATA section: other sections legitimately contain long
+    // zero stretches (padding, sparse index entries) that must not move the
+    // data frontier. Without a readable TOC there is no section to scan.
+    let Ok(reader) = crate::sfa::Reader::from_reader(&mut file) else {
+        return 0;
+    };
+    let Some((data_pos, data_len)) = reader
+        .toc()
+        .iter()
+        .find(|e| e.name() == b"data")
+        .map(|e| (e.pos(), e.len()))
+    else {
+        return 0;
+    };
+    let data_end = data_pos.saturating_add(data_len).min(file_len);
+    const CHUNK: usize = 64 * 1024;
+    let mut offset = data_pos;
+    let mut run: u64 = 0;
+    // End offset of the last zero run long enough to be a punched block.
+    let mut frontier = data_pos;
+    while offset < data_end {
+        let want = usize::try_from(data_end - offset)
+            .unwrap_or(CHUNK)
+            .min(CHUNK);
+        let Ok(bytes) = crate::file::read_exact(&*file, offset, want) else {
             return 0;
         };
-        if let Some(i) = bytes.iter().position(|&b| b != 0) {
-            return offset + i as u64;
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == 0 {
+                run += 1;
+                if run >= MIN_RUN {
+                    frontier = offset + i as u64 + 1;
+                }
+            } else {
+                run = 0;
+            }
         }
-        offset += n as u64;
+        offset += want as u64;
     }
-    0
+    // `data_pos` means no punched run was found: nothing to skip.
+    if frontier == data_pos { 0 } else { frontier }
 }
 
 /// Result of [`read_ecc_params_out_of_band`]: the arbitrated ECC state plus

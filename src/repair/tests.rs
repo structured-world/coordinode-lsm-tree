@@ -2147,6 +2147,61 @@ fn verify_sst_file_honors_a_restricted_punched_prefix() -> crate::Result<()> {
     Ok(())
 }
 
+/// The frontier derive must clear the LAST punched extent, not stop at the
+/// first nonzero byte: the reclaim punches top-down and stops at its first
+/// failure, so a partial reclaim leaves intact consumed blocks BELOW the holes
+/// it did punch. Anchoring at the first nonzero byte would put those holes
+/// back inside the walk and condemn a healthy sidecar-backed SST as corrupt.
+#[test]
+fn verify_sst_file_clears_partial_top_down_holes() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs, SyncMode};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    write_multiblock_sst(&sst, &fs)?;
+    crate::restrict_bound::write(&*fs, &sst, None, 0, b"k00130", SyncMode::Normal)?;
+
+    // A PARTIAL top-down reclaim: punch the consumed blocks nearest the bound
+    // and leave the lowest ones intact (the shape a failed / crashed reclaim
+    // leaves, since the pass stops at its first failure).
+    let table = recover_sst(sst.clone(), &fs)?;
+    let committed = table.punch_offset_for(b"k00130")?;
+    let mut consumed = Vec::new();
+    {
+        use crate::table::block_index::BlockIndex;
+        for handle in table.block_index.iter() {
+            let handle = handle?;
+            if handle.offset().0 < committed {
+                consumed.push((handle.offset().0, handle.size()));
+            }
+        }
+    }
+    assert!(consumed.len() >= 3, "fixture needs several consumed blocks");
+    drop(table);
+    for &(off, size) in consumed.iter().skip(1) {
+        memfs.punch_hole(&sst, off, u64::from(size))?;
+    }
+
+    let report = crate::verify::verify_sst_file_with_fs(&*fs, &sst);
+    assert!(
+        report.is_ok(),
+        "a partially reclaimed sidecar-backed SST must verify clean: errors \
+         {:?}, warnings {:?}",
+        report.errors,
+        report.warnings,
+    );
+    assert!(
+        report.blocks_scanned > 0,
+        "the live suffix must still be walked: {report:?}",
+    );
+    Ok(())
+}
+
 /// A reclaim whose post-rename step fails must not leave the SST in `tables/`
 /// unreferenced: the previously installed manifest omits it, so a caller that
 /// responds to the failed repair by simply REOPENING the tree lets orphan
