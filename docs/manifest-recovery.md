@@ -131,10 +131,15 @@ separate consumed data from live: anchoring anywhere either resurrects
 superseded rows or discards live ones. With resurrection disabled such a table
 is *set aside* (its bound is genuinely unrecoverable); enabling resurrection
 keeps the whole readable region past the last hole, accepting the re-exposure
-by contract. The residual blind spot is punch failures confined strictly to the
-blocks after a clean zeroed run, indistinguishable from a live suffix by
-construction; a clean prefix is therefore accepted at the classical
-straddling-block cost.
+by contract. The reclaim itself punches top-down and stops at the first
+failure, so any failure (or crash mid-reclaim) leaves intact blocks strictly
+below the zeroed ones — always the detectable irregular pattern, never
+intact-but-consumed blocks masquerading as a live suffix above a clean prefix.
+The only invisible case left is a reclaim whose very first punch failed: it
+leaves no hole at all, indistinguishable from an unpunched table by
+construction (no scheme can detect zero evidence), and the committed slice
+output shadows that unrestricted survivor until a later compaction rewrites
+it.
 
 **Flag-dependent set-asides stay reclaimable — the knob is two-way.** Every
 set-aside whose *only* cause is the disabled resurrection flag (an irregular

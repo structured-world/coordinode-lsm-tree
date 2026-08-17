@@ -1840,6 +1840,71 @@ fn repair_sets_aside_a_partially_punched_sidecarless_sst_that_fails_recovery() -
     Ok(())
 }
 
+/// The punch-on-drop reclaim must leave a CLASSIFIABLE hole pattern when
+/// individual `punch_hole` calls fail: punching top-down and STOPPING at the
+/// first failure guarantees any failure (or crash) leaves intact blocks BELOW
+/// the zeroed ones — the irregular signature default repair sets aside. The
+/// old bottom-up continue-past-failures order left trailing intact-but-consumed
+/// blocks ABOVE a clean zeroed prefix, indistinguishable from a live suffix, so
+/// a sidecar-less repair restricted to a bound that resurrected their
+/// superseded rows.
+#[test]
+fn punch_failures_leave_a_classifiable_pattern() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let faultfs = FaultFs::new(memfs.as_ref().clone());
+    let injector = faultfs.injector();
+    let fs: Arc<dyn Fs> = Arc::new(faultfs);
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    write_multiblock_sst(&sst, &fs)?;
+
+    // Arm a PERSISTENT punch fault that lets the first two attempts through:
+    // top-down with stop-on-first-failure this zeroes only the top two consumed
+    // blocks and leaves everything below intact (an irregular, classifiable
+    // pattern). Bottom-up with continue-past-failures it would zero the two
+    // LOWEST blocks and leave trailing consumed blocks that read as a clean
+    // zeroed prefix plus a plausible live suffix.
+    let table = recover_sst(sst.clone(), &fs)?;
+    let committed = table.punch_offset_for(b"k00130")?;
+    table.mark_punch_on_drop(committed);
+    injector.arm(FaultRule::new(FaultOp::PunchHole, Fault::Error(ErrorKind::Other)).skip(2));
+    drop(table);
+    injector.clear();
+
+    // Default repair with NO sidecar must classify the pattern as an irregular
+    // punch and set the table aside — never restrict to a bound that serves the
+    // intact-but-consumed blocks the failed punches left behind.
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.recovered, 0,
+        "a punch-failure pattern must be set aside, not restricted to a bound \
+         that resurrects the unpunched consumed blocks: {report:?}",
+    );
+    assert_eq!(report.unreadable, 1, "{:?}", report.unreadable_files);
+    assert!(
+        report
+            .unreadable_files
+            .first()
+            .is_some_and(|(_, reason)| reason.contains("punch failures")),
+        "{:?}",
+        report.unreadable_files,
+    );
+    Ok(())
+}
+
 /// The restore's raw sidecar capture must apply the same size cap
 /// `restrict_bound::read` enforces: an attacker-padded or corrupt oversized
 /// sidecar must be classified unreadable (no rescue copy), not trusted into a

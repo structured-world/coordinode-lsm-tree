@@ -3541,10 +3541,11 @@ impl Table {
     /// either resurrects superseded rows or discards live ones. That is
     /// [`DerivedRestriction::IrregularPunch`] — the caller sets the table
     /// aside (the resurrection path, which accepts re-exposure by contract,
-    /// still derives greedily instead). The residual blind spot is punch
-    /// failures confined STRICTLY to the blocks after a clean zeroed run:
-    /// those are indistinguishable from a live suffix by construction, so a
-    /// clean prefix is accepted at the classical straddle cost.
+    /// still derives greedily instead). The punch-on-drop reclaim punches
+    /// top-down and stops at its first failure precisely so any failure lands
+    /// in the DETECTABLE irregular class; the only invisible case is a reclaim
+    /// whose very first punch failed (no hole at all — zero evidence), which
+    /// reads as an unpunched table here.
     ///
     /// [`DerivedRestriction::NoLiveData`] when EVERY block reads as zeros: no
     /// live data survives the punch, so the caller excludes the table (no

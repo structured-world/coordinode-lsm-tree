@@ -375,11 +375,25 @@ impl Drop for Inner {
             // span punch would zero a section the SST needs. The block index
             // yields only data-block handles, so iterating it punches exactly the
             // reclaimable data and never an index / filter / footer region.
+            //
+            // Punch TOP-DOWN (highest reclaimable block first) and STOP at the
+            // first failure. This keeps the resulting hole pattern CLASSIFIABLE
+            // for a sidecar-less manifest repair: any failure (or crash) leaves
+            // intact blocks strictly BELOW the zeroed ones — the irregular
+            // signature repair fails closed on — while a fully successful pass
+            // leaves the clean zeroed prefix the classical geometry bound is
+            // sound for. Bottom-up with continue-past-failures could instead
+            // leave intact-but-consumed blocks ABOVE a clean zeroed prefix,
+            // indistinguishable from a live suffix, and a sidecar-less repair
+            // would then restrict to a bound that resurrects their superseded
+            // rows. Stopping reclaims less space on a failure, but reclaim is
+            // best-effort; classification soundness is not.
             let off = self
                 .punch_on_drop
                 .load(core::sync::atomic::Ordering::Acquire);
             if off != u64::MAX {
                 use crate::table::block_index::BlockIndex;
+                let mut reclaimable: alloc::vec::Vec<(u64, u32)> = alloc::vec::Vec::new();
                 for handle in self.block_index.iter() {
                     // Log why reclaim stopped instead of silently swallowing the
                     // block-index read error (this is an integrity-sensitive path).
@@ -390,19 +404,22 @@ impl Drop for Inner {
                                 "Failed to iterate block index while punching table {global_id:?} at {:?}: {e:?}",
                                 self.path,
                             );
-                            break;
+                            return;
                         }
                     };
                     let block_off = handle.offset().0;
-                    if block_off < off
-                        && let Err(e) =
-                            self.fs
-                                .punch_hole(&self.path, block_off, u64::from(handle.size()))
-                    {
+                    if block_off < off {
+                        reclaimable.push((block_off, handle.size()));
+                    }
+                }
+                for (block_off, size) in reclaimable.into_iter().rev() {
+                    if let Err(e) = self.fs.punch_hole(&self.path, block_off, u64::from(size)) {
                         log::warn!(
-                            "Failed to punch tight-space data block at {block_off} of table {global_id:?} at {:?}: {e:?}",
+                            "Failed to punch tight-space data block at {block_off} of table {global_id:?} at {:?}; \
+                             stopping the reclaim to keep the hole pattern classifiable: {e:?}",
                             self.path,
                         );
+                        break;
                     }
                 }
             }

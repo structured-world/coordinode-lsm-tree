@@ -100,6 +100,10 @@ pub enum FaultOp {
     /// uses to detect a hole-punched SST. Failing it exercises the fail-closed
     /// path (a probe error must not be read as "unpunched").
     AllocatedSize,
+    /// [`Fs::punch_hole`] — the tight-space per-block prefix reclaim. Failing
+    /// it exercises the partial-punch geometry recovery (the reclaim stops at
+    /// the first failed punch so the resulting hole pattern stays classifiable).
+    PunchHole,
 }
 
 /// What a matched [`FaultRule`] does to the operation.
@@ -498,6 +502,9 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn punch_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<()> {
+        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::PunchHole, Some(path)) {
+            return Err(fault_error(kind, FaultOp::PunchHole));
+        }
         self.inner.punch_hole(path, offset, len)
     }
 
