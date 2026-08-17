@@ -2073,7 +2073,11 @@ fn salvage_guard_finds_punched_blocks_deep_in_a_surrendered_extent() -> crate::R
         }
     }
     assert!(handles.len() >= 4, "fixture needs several data blocks");
-    let (mid_off, mid_size) = handles[handles.len() / 2];
+    let (Some(&(mid_off, mid_size)), Some(&(first_off, _))) =
+        (handles.get(handles.len() / 2), handles.first())
+    else {
+        panic!("fixture has >= 4 data blocks, so both lookups resolve");
+    };
     drop(table);
     memfs.punch_hole(&sst, mid_off, u64::from(mid_size))?;
 
@@ -2081,7 +2085,7 @@ fn salvage_guard_finds_punched_blocks_deep_in_a_surrendered_extent() -> crate::R
     // byte (the shape `salvage_attempt` produces after a broken chain): the
     // opening window is intact data, the punched block is deeper in.
     let dropped = vec![crate::salvage::DroppedBlock {
-        offset: handles[0].0,
+        offset: first_off,
         section: b"data".to_vec(),
         reason: crate::salvage::DropReason::HeaderCorrupted("surrendered tail".to_owned()),
         key_range: None,
