@@ -5570,10 +5570,19 @@ fn recover_salvage_degrades_a_persistent_filter_index_read() -> crate::Result<()
     );
     injector.clear();
 
+    let recovered = match result {
+        Ok(table) => table,
+        Err(e) => panic!(
+            "a persistent filter-index read in salvage mode must degrade the rebuildable \
+             section and recover the table, not propagate and quarantine it: {e:?}",
+        ),
+    };
+    // A bare success would also pass if the injected fault never fired; the
+    // degradation flag proves the faulted filter-index load was actually
+    // routed through the salvage degrade arm.
     assert!(
-        result.is_ok(),
-        "a persistent filter-index read in salvage mode must degrade the rebuildable \
-         section and recover the table, not propagate and quarantine it: {result:?}",
+        recovered.salvage_degraded_a_rebuildable_section(),
+        "the recovered table must report the degraded rebuildable section",
     );
     Ok(())
 }
