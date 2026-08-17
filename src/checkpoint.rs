@@ -185,6 +185,16 @@ pub fn link_or_copy_cross_fs(
         && dst.parent().is_some_and(|p| dst_fs.capabilities(p).reflink)
     {
         dst_fs.reflink_file(src, dst)?;
+        // Sync the CLONE at the requested durability before treating it as
+        // complete. The streamed-copy fallback below syncs its destination; the
+        // real Linux / macOS `reflink_file` implementations do not, and the
+        // surrounding checkpoint code syncs only DIRECTORIES. Without this a
+        // power loss can leave the checkpoint's manifest and directory entries
+        // persisted while the cloned inode's extents are not — an immutable
+        // snapshot that verifies as corrupt on the next open.
+        let dst_file = dst_fs.open(dst, &FsOpenOptions::new().read(true))?;
+        FsFile::sync_all_with(&*dst_file, sync_mode)?;
+        drop(dst_file);
         return Ok(dst_fs.metadata(dst)?.len);
     }
 
@@ -336,6 +346,30 @@ pub fn link_tables(
         // the number of files, so plain adds cannot overflow.
         bytes += written;
         count += 1;
+
+        // A tight-space-restricted table keeps its EXACT recovery bound so a
+        // checkpoint that later needs manifest repair recovers the restriction;
+        // without it, repair of the backup finds a punched SST with no bound and
+        // conservatively discards the live suffix of its first readable block. Take
+        // the bound from the CAPTURED version view (`restrict_lower_bound`), not by
+        // re-reading the live `.restrict-bound` sidecar file: a concurrent
+        // tight-space compaction can be overwriting that sidecar (tightening the
+        // same SST id's bound) while we copy it, so a file read would race the
+        // snapshot. The captured view's bound is consistent with the SST bytes just
+        // linked, so write the checkpoint's own sidecar from it. An unrestricted
+        // table carries no bound and needs no sidecar.
+        if let Some(bound) = table.restrict_lower_bound() {
+            let dst_sidecar = crate::restrict_bound::sidecar_path(&dst);
+            crate::restrict_bound::write(
+                target_fs.as_ref(),
+                &dst,
+                table.encryption.as_deref(),
+                table.id(),
+                bound,
+                sync_mode,
+            )?;
+            bytes += target_fs.metadata(&dst_sidecar)?.len;
+        }
     }
     Ok((count, bytes))
 }
@@ -692,6 +726,30 @@ pub fn run_checkpoint<T: AbstractTree>(
     // tables / blob files that compaction marks as deleted are held back.
     let _pause = deletion_pause.acquire();
 
+    // Reconcile any table left with a PENDING in-place-heal attestation before
+    // the snapshot: such a table has healed bytes on disk but the live version
+    // still records its pre-heal digest, and the `.heal-attest` sidecar is not
+    // copied into the checkpoint. Linking it as-is would capture a digest that
+    // never matches the linked bytes, failing the immutable checkpoint's
+    // integrity check forever with no marker to reconcile. Reconciling here
+    // refreshes the digest and consumes the sidecar so the version captured
+    // below is self-consistent. Runs BEFORE `enter_link_window` because the
+    // reconcile takes each table's mutation window, which the link window (its
+    // write half) mutually excludes, so doing it after would deadlock.
+    #[cfg(feature = "page_ecc")]
+    crate::scrub::reconcile_pending_heals(tree)?;
+    // A build WITHOUT page_ecc cannot reconcile a pending heal (no ECC scan
+    // machinery), but a feature-enabled binary may have healed an SST and
+    // crashed before refreshing its manifest, leaving a `.heal-attest` marker.
+    // Linking that table would snapshot healed bytes under the stale pre-heal
+    // digest with no marker copied, so abort the checkpoint instead.
+    #[cfg(not(feature = "page_ecc"))]
+    crate::scrub::abort_checkpoint_if_pending_heals(
+        tree,
+        "this build is compiled without page_ecc, so it has no ECC scan machinery; \
+         run a scrub with a Page-ECC-enabled build",
+    )?;
+
     // Capture the seqno BEFORE the flush. Sampling later (between flush
     // and `current_version()`) is unsafe: a concurrent writer can land
     // in the freshly-rotated active memtable, advance `visible_seqno`,
@@ -718,7 +776,36 @@ pub fn run_checkpoint<T: AbstractTree>(
     // history readers below that watermark might need; using
     // `SeqNo::MAX` (a previous oversight) wiped every older version
     // of every key.
+    //
+    // The flush runs BEFORE the link window below, and must: its version
+    // install blocks on `compaction_state`, and holding the link window's
+    // write half across that wait closes a three-way cycle — a tight-space
+    // compaction holds `compaction_state` while waiting for a table's heal
+    // lock, and a heal patrol holds that heal lock while waiting for the
+    // link window's read half.
     tree.flush_active_memtable(0)?;
+
+    // Hold the link window from here on: an in-place heal that has already
+    // probed an SST's link count as exclusive must not observe this
+    // checkpoint linking that SST mid-heal (the snapshot would capture bytes
+    // the heal is about to change, under a digest the checkpoint manifest
+    // already recorded). The heal side holds the read half per table. Nothing
+    // under the window blocks on `compaction_state` (see the flush ordering
+    // above), so the window cannot participate in a lock cycle.
+    let _link_window = deletion_pause.enter_link_window();
+
+    // Residual-race guard: the pre-window reconciliation released each table's
+    // mutation window before the link window was taken, so a concurrent heal
+    // could have left a fresh pending marker in between (including during the
+    // flush above). Reconciling now is impossible (it needs the mutation
+    // window the link window excludes), so abort if any marker remains rather
+    // than snapshot a healed table under a stale digest. The operator retries;
+    // the next attempt reconciles it.
+    crate::scrub::abort_checkpoint_if_pending_heals(
+        tree,
+        "a concurrent heal left a pending marker after the pre-window reconcile, \
+         and the held link window excludes the mutation window reconciliation needs",
+    )?;
 
     let version = tree.current_version();
 
@@ -803,5 +890,5 @@ pub fn run_checkpoint<T: AbstractTree>(
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason = "test code")]
+#[expect(clippy::unwrap_used, clippy::expect_used, reason = "test code")]
 mod tests;

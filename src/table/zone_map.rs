@@ -253,6 +253,27 @@ impl ZoneMap {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    /// Number of recorded entries at or above `from_offset`: the LIVE entries
+    /// of a tight-space restricted view (its `[0, from_offset)` blocks are
+    /// punched, so their stats describe dead blocks). `from_offset == 0` yields
+    /// [`len`](Self::len).
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn live_len(&self, from_offset: u64) -> usize {
+        self.entries
+            .iter()
+            .filter(|(off, _)| *off >= from_offset)
+            .count()
+    }
+
+    /// Test-only: the raw `(offset, columns)` entries, for forges that
+    /// re-encode the section with a record removed or altered.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn entries(&self) -> &[(u64, Vec<ColumnStats>)] {
+        &self.entries
+    }
 }
 
 /// Forward cursor over a [`ZoneMap`], optimized for ascending-offset block

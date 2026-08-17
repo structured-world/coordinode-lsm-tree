@@ -84,6 +84,26 @@ pub enum FaultOp {
     SyncData,
     /// [`FsFile::set_len`] — truncate / extend.
     SetLen,
+    /// [`Fs::metadata`] — path metadata probe (existence / size). Failing it
+    /// models a stat that races file creation or an inaccessible path, e.g. to
+    /// exercise TOCTOU windows between an existence check and an open.
+    Metadata,
+    /// [`FsFile::hard_link_count`] — link-count probe consulted before
+    /// in-place mutation. Failing it exercises the fail-closed path (treat
+    /// the file as shared).
+    HardLinkCount,
+    /// [`Fs::hard_link`] — the destination link of a copy-style publish.
+    /// Failing it with [`io::ErrorKind::Unsupported`] models a backend that
+    /// leaves the trait default in place (no hard-link support).
+    HardLink,
+    /// [`Fs::allocated_size`] — the physical-allocation probe manifest repair
+    /// uses to detect a hole-punched SST. Failing it exercises the fail-closed
+    /// path (a probe error must not be read as "unpunched").
+    AllocatedSize,
+    /// [`Fs::punch_hole`] — the tight-space per-block prefix reclaim. Failing
+    /// it exercises the partial-punch geometry recovery (the reclaim stops at
+    /// the first failed punch so the resulting hole pattern stays classifiable).
+    PunchHole,
 }
 
 /// What a matched [`FaultRule`] does to the operation.
@@ -112,6 +132,7 @@ pub enum Fault {
 pub struct FaultRule {
     op: FaultOp,
     path_substr: Option<String>,
+    offset: Option<u64>,
     skip: u64,
     count: u64,
     fault: Fault,
@@ -120,13 +141,14 @@ pub struct FaultRule {
 impl FaultRule {
     /// Creates a rule that, by default, fires `fault` on **every** matching
     /// `op` (no path filter, no skip, unlimited fires). Refine with
-    /// [`on_path`](Self::on_path), [`skip`](Self::skip),
-    /// [`times`](Self::times), or [`once`](Self::once).
+    /// [`on_path`](Self::on_path), [`at_offset`](Self::at_offset),
+    /// [`skip`](Self::skip), [`times`](Self::times), or [`once`](Self::once).
     #[must_use]
     pub const fn new(op: FaultOp, fault: Fault) -> Self {
         Self {
             op,
             path_substr: None,
+            offset: None,
             skip: 0,
             count: u64::MAX,
             fault,
@@ -139,6 +161,25 @@ impl FaultRule {
     #[must_use]
     pub fn on_path(mut self, substr: impl Into<String>) -> Self {
         self.path_substr = Some(substr.into());
+        self
+    }
+
+    /// Restricts a [`FaultOp::ReadAt`] rule to positioned reads at exactly
+    /// `offset`. Lets a test fault ONE section of a file (e.g. a single data
+    /// block) while every other positioned read on the same file proceeds, so
+    /// a fault can isolate one decode-load from the reads a recovery pass makes
+    /// on the same path. Only [`FaultOp::ReadAt`] carries an offset: setting one
+    /// on any other op makes the rule UNMATCHABLE (it never fires), so the debug
+    /// assertion below catches that mistake instead of silently disabling it.
+    #[must_use]
+    pub fn at_offset(mut self, offset: u64) -> Self {
+        debug_assert!(
+            matches!(self.op, FaultOp::ReadAt),
+            "at_offset only applies to FaultOp::ReadAt; setting it on {:?} makes the rule \
+             unmatchable",
+            self.op,
+        );
+        self.offset = Some(offset);
         self
     }
 
@@ -165,10 +206,32 @@ impl FaultRule {
     }
 
     /// Returns `true` if this rule matches an operation of `op` at `path`.
+    ///
+    /// Offset-scoped rules ([`at_offset`](Self::at_offset)) never match here:
+    /// only the offset-aware [`FaultInjector::check_read_at`] path can fire
+    /// them, since a positioned offset is meaningful only for
+    /// [`FaultOp::ReadAt`].
     fn matches(&self, op: FaultOp, path: Option<&Path>) -> bool {
-        if self.op != op {
+        if self.op != op || self.offset.is_some() {
             return false;
         }
+        self.matches_path(path)
+    }
+
+    /// Returns `true` if this [`FaultOp::ReadAt`] rule matches a positioned read
+    /// at `offset` on `path`. An unset [`at_offset`](Self::at_offset) matches
+    /// any offset; a set one matches only that exact offset.
+    fn matches_read_at(&self, path: Option<&Path>, offset: u64) -> bool {
+        if self.op != FaultOp::ReadAt {
+            return false;
+        }
+        if self.offset.is_some_and(|want| want != offset) {
+            return false;
+        }
+        self.matches_path(path)
+    }
+
+    fn matches_path(&self, path: Option<&Path>) -> bool {
         match (&self.path_substr, path) {
             (None, _) => true,
             (Some(sub), Some(p)) => p.to_string_lossy().contains(sub.as_str()),
@@ -187,6 +250,11 @@ impl FaultRule {
 #[derive(Default)]
 pub struct FaultInjector {
     rules: spin::Mutex<Vec<FaultRule>>,
+    /// Observed `(path, mode)` pairs from every file-level `sync_all_with` /
+    /// `sync_data_with`, in call order — lets a test assert WHICH durability
+    /// mode a component synced its files at (e.g. a salvage writer honouring
+    /// `Config::sync_mode`), which the pass-through delegation cannot show.
+    sync_log: spin::Mutex<Vec<(PathBuf, SyncMode)>>,
 }
 
 impl FaultInjector {
@@ -204,9 +272,30 @@ impl FaultInjector {
         self.rules.lock().push(rule);
     }
 
-    /// Removes all armed rules.
+    /// Removes all armed rules AND the recorded sync observations, resetting the
+    /// injector so a later phase cannot see state (rules or `sync_modes_for`
+    /// entries) recorded before the `clear()`.
     pub fn clear(&self) {
         self.rules.lock().clear();
+        self.sync_log.lock().clear();
+    }
+
+    /// Records one file-level mode-carrying sync observation (see
+    /// [`Self::sync_modes_for`]).
+    fn record_sync(&self, path: &Path, mode: SyncMode) {
+        self.sync_log.lock().push((path.to_path_buf(), mode));
+    }
+
+    /// The [`SyncMode`]s observed via `sync_all_with` / `sync_data_with` on
+    /// files whose path contains `substr`, in call order.
+    #[must_use]
+    pub fn sync_modes_for(&self, substr: &str) -> Vec<SyncMode> {
+        self.sync_log
+            .lock()
+            .iter()
+            .filter(|(p, _)| p.to_string_lossy().contains(substr))
+            .map(|(_, m)| *m)
+            .collect()
     }
 
     /// Consults the rules for an operation of `op` at `path`, advancing the
@@ -218,20 +307,40 @@ impl FaultInjector {
             if !rule.matches(op, path) {
                 continue;
             }
-            // First matching rule owns this occurrence.
-            if rule.skip > 0 {
-                rule.skip -= 1;
-                return None;
-            }
-            if rule.count == 0 {
-                return None;
-            }
-            if rule.count != u64::MAX {
-                rule.count -= 1;
-            }
-            return Some(rule.fault);
+            return Self::fire(rule);
         }
         None
+    }
+
+    /// Consults the rules for a positioned [`FaultOp::ReadAt`] at `offset` on
+    /// `path`, honouring an [`at_offset`](FaultRule::at_offset) scope. Advances
+    /// the matched rule's skip/fire counters exactly like [`check`](Self::check).
+    fn check_read_at(&self, path: Option<&Path>, offset: u64) -> Option<Fault> {
+        let mut rules = self.rules.lock();
+        for rule in rules.iter_mut() {
+            if !rule.matches_read_at(path, offset) {
+                continue;
+            }
+            return Self::fire(rule);
+        }
+        None
+    }
+
+    /// Advances a matched rule's skip/fire budget and returns the [`Fault`] to
+    /// apply, or `None` when the rule is still skipping or is exhausted. The
+    /// first matching rule owns the occurrence.
+    fn fire(rule: &mut FaultRule) -> Option<Fault> {
+        if rule.skip > 0 {
+            rule.skip -= 1;
+            return None;
+        }
+        if rule.count == 0 {
+            return None;
+        }
+        if rule.count != u64::MAX {
+            rule.count -= 1;
+        }
+        Some(rule.fault)
     }
 }
 
@@ -338,6 +447,9 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
+        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::Metadata, Some(path)) {
+            return Err(fault_error(kind, FaultOp::Metadata));
+        }
         self.inner.metadata(path)
     }
 
@@ -356,10 +468,20 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn exists(&self, path: &Path) -> io::Result<bool> {
+        // A `Metadata` fault on an existence probe models a stat that RACED file
+        // creation and saw the path absent (the TOCTOU window `FaultOp::Metadata`
+        // documents): report `Ok(false)` so the caller proceeds to create/open,
+        // where a concurrent creator's file then surfaces as `AlreadyExists`.
+        if let Some(Fault::Error(_)) = self.injector.check(FaultOp::Metadata, Some(path)) {
+            return Ok(false);
+        }
         self.inner.exists(path)
     }
 
     fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::HardLink, Some(dst)) {
+            return Err(fault_error(kind, FaultOp::HardLink));
+        }
         self.inner.hard_link(src, dst)
     }
 
@@ -380,6 +502,9 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn punch_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<()> {
+        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::PunchHole, Some(path)) {
+            return Err(fault_error(kind, FaultOp::PunchHole));
+        }
         self.inner.punch_hole(path, offset, len)
     }
 
@@ -392,11 +517,21 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn hard_link_count(&self, path: &Path) -> io::Result<u64> {
+        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::HardLinkCount, Some(path)) {
+            return Err(fault_error(kind, FaultOp::HardLinkCount));
+        }
         self.inner.hard_link_count(path)
     }
 
     fn available_space(&self, path: &Path) -> io::Result<u64> {
         self.inner.available_space(path)
+    }
+
+    fn allocated_size(&self, path: &Path) -> io::Result<Option<u64>> {
+        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::AllocatedSize, Some(path)) {
+            return Err(fault_error(kind, FaultOp::AllocatedSize));
+        }
+        self.inner.allocated_size(path)
     }
 }
 
@@ -475,6 +610,7 @@ impl FsFile for FaultFile {
     }
 
     fn sync_all_with(&self, mode: SyncMode) -> io::Result<()> {
+        self.injector.record_sync(&self.path, mode);
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::SyncAll, Some(&self.path)) {
             return Err(fault_error(kind, FaultOp::SyncAll));
         }
@@ -482,6 +618,7 @@ impl FsFile for FaultFile {
     }
 
     fn sync_data_with(&self, mode: SyncMode) -> io::Result<()> {
+        self.injector.record_sync(&self.path, mode);
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::SyncData, Some(&self.path)) {
             return Err(fault_error(kind, FaultOp::SyncData));
         }
@@ -489,7 +626,20 @@ impl FsFile for FaultFile {
     }
 
     fn metadata(&self) -> io::Result<FsMetadata> {
+        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::Metadata, Some(&self.path)) {
+            return Err(fault_error(kind, FaultOp::Metadata));
+        }
         self.inner.metadata()
+    }
+
+    fn hard_link_count(&self) -> io::Result<u64> {
+        if let Some(Fault::Error(kind)) = self
+            .injector
+            .check(FaultOp::HardLinkCount, Some(&self.path))
+        {
+            return Err(fault_error(kind, FaultOp::HardLinkCount));
+        }
+        self.inner.hard_link_count()
     }
 
     fn set_len(&self, size: u64) -> io::Result<()> {
@@ -500,7 +650,7 @@ impl FsFile for FaultFile {
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::ReadAt, Some(&self.path)) {
+        if let Some(Fault::Error(kind)) = self.injector.check_read_at(Some(&self.path), offset) {
             return Err(fault_error(kind, FaultOp::ReadAt));
         }
         self.inner.read_at(buf, offset)

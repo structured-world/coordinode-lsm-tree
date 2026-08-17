@@ -27,7 +27,7 @@ use core::sync::atomic::AtomicBool;
 
 pub fn recover_blob_files(
     folder: &Path,
-    ids: &[(BlobFileId, Checksum)],
+    ids: &[(BlobFileId, Checksum, u64)],
     tree_id: TreeId,
     descriptor_table: Option<&Arc<DescriptorTable>>,
     fs: &Arc<dyn Fs>,
@@ -90,7 +90,9 @@ pub fn recover_blob_files(
 
         let blob_file_path = &dirent.path;
 
-        if let Some(&(_, checksum)) = ids.iter().find(|(id, _)| id == &blob_file_id) {
+        if let Some(&(_, checksum, live_data_start)) =
+            ids.iter().find(|(id, _, _)| id == &blob_file_id)
+        {
             log::trace!(
                 "Recovering blob file #{blob_file_id:?} from {}",
                 blob_file_path.display(),
@@ -135,6 +137,7 @@ pub fn recover_blob_files(
                 is_deleted: AtomicBool::new(false),
                 punch_on_drop: portable_atomic::AtomicU64::new(u64::MAX),
                 checksum,
+                live_data_start,
                 file_accessor,
                 tree_id,
                 fs: fs.clone(),
@@ -198,6 +201,26 @@ pub fn recover_blob_file(
     tree_id: TreeId,
     fs: &Arc<dyn Fs>,
 ) -> crate::Result<BlobFile> {
+    recover_blob_file_from(path, id, checksum, tree_id, fs, 0)
+}
+
+/// As [`recover_blob_file`], but for a view whose consumed prefix below
+/// `live_data_start` was reclaimed by a tight-space relocation: `checksum`
+/// covers only `[live_data_start, end)`, and integrity checks hash from there
+/// rather than over the punched (zeroed) prefix. `live_data_start = 0` is a
+/// whole, unreclaimed file.
+///
+/// # Errors
+///
+/// Propagates any error from opening or parsing the blob file.
+pub fn recover_blob_file_from(
+    path: &Path,
+    id: BlobFileId,
+    checksum: Checksum,
+    tree_id: TreeId,
+    fs: &Arc<dyn Fs>,
+    live_data_start: u64,
+) -> crate::Result<BlobFile> {
     let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
 
     // Same meta-section read as `recover_blob_files`' per-id branch above.
@@ -222,6 +245,7 @@ pub fn recover_blob_file(
         is_deleted: AtomicBool::new(false),
         punch_on_drop: portable_atomic::AtomicU64::new(u64::MAX),
         checksum,
+        live_data_start,
         file_accessor: FileAccessor::File(file),
         tree_id,
         fs: fs.clone(),

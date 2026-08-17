@@ -16,6 +16,7 @@ fn recovery_with(version_id: u64, table_ids: Vec<Vec<Vec<RecoveredTable>>>) -> R
         blob_file_ids: Vec::new(),
         gc_stats: crate::blob_tree::FragmentationMap::default(),
         restrictions: crate::HashMap::default(),
+        blob_restrictions: crate::HashMap::default(),
         stats: RecoveryStats::default(),
     }
 }
@@ -144,6 +145,36 @@ fn apply_edit_merges_and_advances_restrictions() {
         rec.restrictions.get(&1),
         Some(&crate::UserKey::from(&b"mmm"[..])),
         "a later slice's higher bound overwrites the earlier one",
+    );
+}
+
+/// Blob frontiers replay exactly like table restrictions: each relocation
+/// slice records the file's new (higher) first-live byte, and a later slice
+/// overwrites the earlier one. Losing this would make a reopened tree hash a
+/// reclaimed blob file whole and report it corrupt.
+#[test]
+fn apply_edit_merges_and_advances_blob_restrictions() {
+    let mut rec = recovery_with(1, vec![vec![vec![rtable(1, 10)]]]);
+    assert!(rec.blob_restrictions.is_empty(), "starts unreclaimed");
+
+    rec.apply_edit(&VersionEdit {
+        new_version_id: 2,
+        blob_restrictions: vec![(9, 4_096)],
+        ..Default::default()
+    })
+    .expect("apply");
+    assert_eq!(rec.blob_restrictions.get(&9), Some(&4_096));
+
+    rec.apply_edit(&VersionEdit {
+        new_version_id: 3,
+        blob_restrictions: vec![(9, 65_536)],
+        ..Default::default()
+    })
+    .expect("apply");
+    assert_eq!(
+        rec.blob_restrictions.get(&9),
+        Some(&65_536),
+        "a later slice's higher frontier overwrites the earlier one",
     );
 }
 

@@ -34,7 +34,12 @@ impl From<u128> for Timestamp {
     }
 }
 
-#[derive(Debug)]
+// `PartialEq`: the out-of-band verifier compares the two decoded meta
+// mirrors: a tail re-stamped to another internally-consistent payload is
+// detectable only by disagreeing with `meta_mid`. `Clone` lets that verifier
+// compare an ECC-masked copy ([`Self::without_ecc`]) without consuming the
+// original.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedMeta {
     pub id: TableId,
     pub created_at: Timestamp,
@@ -51,6 +56,30 @@ pub struct ParsedMeta {
     pub file_size: u64,
     pub item_count: u64,
     pub tombstone_count: u64,
+
+    /// Number of RANGE tombstones the writer emitted into the
+    /// `range_tombstones` section. Distinct from `tombstone_count` (point
+    /// deletes). Salvage cross-checks it against the parsed section: a `> 0`
+    /// count with no readable section means the section was hidden (renamed /
+    /// re-roled), so salvaging would resurrect the rows it masked.
+    pub range_tombstone_count: u64,
+
+    /// Number of positions in this table's `delete_bitmap` section, or `None`
+    /// for tables written before this field existed. The section is optional
+    /// (omitted when empty), so this authenticated count lets a reader detect a
+    /// re-stamped TOC that hid a non-empty bitmap (renamed it, or replaced it
+    /// with another valid optional section): a `Some(n)` with `n > 0` and no
+    /// readable delete-bitmap section is a forgery that would resurrect every
+    /// positionally-deleted row.
+    pub delete_bitmap_len: Option<u64>,
+
+    /// XXH3-128 of the delete-bitmap section's encoded bytes, binding its
+    /// CONTENTS (not just its cardinality) into the meta. `None` on tables
+    /// written before this field. A count-only cross-check would accept an
+    /// equal-cardinality checksum-valid substitution that, during manifest repair
+    /// (no original whole-file digest), resurrects deleted rows / drops live ones.
+    pub delete_bitmap_hash: Option<u128>,
+
     pub weak_tombstone_count: u64,
     pub weak_tombstone_reclaimable: u64,
 
@@ -114,11 +143,27 @@ pub struct ParsedMeta {
     /// path (the restart heads sit every `data_block_restart_interval` entries).
     pub data_block_restart_interval: u8,
 
+    /// Restart interval the index blocks were encoded with. Not consumed on
+    /// the read path (index blocks decode without it), but persisted so a
+    /// layout-mirroring rewrite (salvage) reproduces the source's index
+    /// encoding instead of the writer default.
+    pub index_block_restart_interval: u8,
+
     /// Whether this SST's data blocks are column-organized (PAX) rather than
     /// row-major. Read from the optional `descriptor#columnar` property;
     /// defaults to `false` for SSTs written without it (row-major). The reader
     /// reconstructs row entries from a columnar block on load.
     pub columnar: bool,
+
+    /// Bulk-ingest provenance from the optional `descriptor#bulk_ingested`
+    /// property: `Some(true)` = bulk-ingested (every entry at LOCAL seqno 0, MVCC
+    /// ordering carried by a manifest-only `global_seqno`), `Some(false)` = a
+    /// normal flush / compaction table (offset 0), `None` = the key is ABSENT, a
+    /// legacy SST of UNKNOWN provenance. Manifest repair fails closed on
+    /// `Some(true)` and treats `None` as ambiguous (a legacy table may itself
+    /// have been bulk-ingested), since it cannot reconstruct the offset from the
+    /// SST alone.
+    pub bulk_ingested: Option<bool>,
 }
 
 macro_rules! read_u8 {
@@ -190,6 +235,24 @@ fn validated_restart_interval_index(restart_interval: u8) -> crate::Result<u8> {
 }
 
 impl ParsedMeta {
+    /// Returns `self` with the ECC-descriptor fields normalized to their
+    /// "no scheme" values (`page_ecc = false`, `ecc_params = None`,
+    /// `ecc_unrecognized = false`).
+    ///
+    /// The out-of-band mirror comparison uses this so two `meta` / `meta_mid`
+    /// copies diverge only on a NON-ECC field: an ECC-descriptor-only difference
+    /// (a lone unrecognized sibling, or a descriptor-only forge) is arbitrated
+    /// separately and must not by itself condemn a healthy table, while a change
+    /// to a correctness field like `created_at` still surfaces even when it hides
+    /// behind an unrecognized descriptor.
+    #[cfg(feature = "std")]
+    pub(crate) fn without_ecc(mut self) -> Self {
+        self.page_ecc = false;
+        self.ecc_params = None;
+        self.ecc_unrecognized = false;
+        self
+    }
+
     #[expect(clippy::too_many_lines)]
     pub fn load_with_handle(
         file: &dyn FsFile,
@@ -270,7 +333,7 @@ impl ParsedMeta {
             }
         }
 
-        let _index_block_restart_interval =
+        let index_block_restart_interval =
             validated_restart_interval_index(read_u8!(block, b"restart_interval#index", &cmp))?;
         // Data-block restart interval: needed to rebuild a positional restart
         // index when partial-decoding a block (lazy read path).
@@ -284,6 +347,20 @@ impl ParsedMeta {
             None => false,
             Some(v) => match v.value.as_ref() {
                 [b] => *b != 0,
+                _ => return Err(crate::Error::InvalidHeader("TableMeta")),
+            },
+        };
+
+        // Optional bulk-ingest provenance. `None` = the key is ABSENT: a legacy
+        // SST (written before the flag existed) whose provenance is UNKNOWN, so
+        // manifest repair must treat it as AMBIGUOUS (it may be a legacy
+        // bulk-ingested table that stored local seqno 0 under a manifest-only
+        // offset). `Some(true/false)` = a newer SST that authoritatively records
+        // whether it was bulk-ingested. One byte, non-zero meaning ingested.
+        let bulk_ingested = match block.point_read(b"descriptor#bulk_ingested", SeqNo::MAX, &cmp)? {
+            None => None,
+            Some(v) => match v.value.as_ref() {
+                [b] => Some(*b != 0),
                 _ => return Err(crate::Error::InvalidHeader("TableMeta")),
             },
         };
@@ -303,6 +380,7 @@ impl ParsedMeta {
         }
         let item_count = read_u64!(block, b"item_count", &cmp);
         let tombstone_count = read_u64!(block, b"tombstone_count", &cmp);
+        let range_tombstone_count = read_u64!(block, b"range_tombstone_count", &cmp);
         let data_block_count = read_u64!(block, b"block_count#data", &cmp);
         let index_block_count = read_u64!(block, b"block_count#index", &cmp);
         let _filter_block_count = read_u64!(block, b"block_count#filter", &cmp);
@@ -442,8 +520,27 @@ impl ParsedMeta {
                 None => Ok(None),
             }
         };
+        // Present-but-wrong-width is corrupt meta, so require exactly 16 bytes.
+        let read_opt_u128 = |key: &[u8]| -> crate::Result<Option<u128>> {
+            match block.point_read(key, SeqNo::MAX, &cmp)? {
+                Some(item) => {
+                    let bytes = <[u8; 16]>::try_from(&item.value[..])
+                        .map_err(|_| crate::Error::InvalidHeader("TableMeta"))?;
+                    Ok(Some(u128::from_le_bytes(bytes)))
+                }
+                None => Ok(None),
+            }
+        };
         let sum_user_key_bytes = read_opt_u64(b"key_bytes#sum")?;
         let sum_value_bytes = read_opt_u64(b"value_bytes#sum")?;
+        // Intentionally OPTIONAL, not a required `read_u64!`: tables written
+        // before this field carry no key and must still decode (`None`). It also
+        // does not need to be mandatory for the forgery cross-check — the whole
+        // meta block is verified field-for-field against the recovery-time copy
+        // and the mirror, so a stripped or forged key fails meta integrity long
+        // before the `delete_bitmap_len` cross-check would run.
+        let delete_bitmap_len = read_opt_u64(b"descriptor#delete_bitmap_len")?;
+        let delete_bitmap_hash = read_opt_u128(b"descriptor#delete_bitmap_hash")?;
 
         Ok(Self {
             id,
@@ -456,6 +553,9 @@ impl ParsedMeta {
             file_size,
             item_count,
             tombstone_count,
+            range_tombstone_count,
+            delete_bitmap_len,
+            delete_bitmap_hash,
             weak_tombstone_count,
             weak_tombstone_reclaimable,
             sum_user_key_bytes,
@@ -467,7 +567,9 @@ impl ParsedMeta {
             ecc_params,
             ecc_unrecognized,
             data_block_restart_interval,
+            index_block_restart_interval,
             columnar,
+            bulk_ingested,
         })
     }
 }

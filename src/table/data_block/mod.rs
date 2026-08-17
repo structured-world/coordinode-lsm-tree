@@ -697,6 +697,25 @@ impl DataBlock {
         }
     }
 
+    /// Test-only: the `(offset, len)` span of the embedded hash index within
+    /// this block's (footer-stripped) `inner.data`, or `None` when the block
+    /// carries no hash index. Used by the forgery helpers to corrupt the
+    /// hash index in place.
+    #[cfg(test)]
+    pub(crate) fn hash_index_span(&self) -> Option<(usize, usize)> {
+        use core::mem::size_of;
+
+        let trailer = Trailer::new(&self.inner);
+        let offset = size_of::<u8>() + size_of::<u8>() + size_of::<u32>() + size_of::<u32>();
+        let mut reader = trailer.as_slice().get(offset..)?;
+        let hash_index_len = reader.read_u32::<LittleEndian>().ok()?;
+        let hash_index_offset = reader.read_u32::<LittleEndian>().ok()?;
+        if hash_index_len == 0 {
+            return None;
+        }
+        Some((hash_index_offset as usize, hash_index_len as usize))
+    }
+
     /// Returns the number of hash buckets.
     #[must_use]
     pub fn hash_bucket_count(&self) -> Option<usize> {
@@ -961,6 +980,45 @@ impl DataBlock {
             Decoder::<InternalValue, DataBlockParsedItem>::new(&self.inner),
             comparator,
         )
+    }
+
+    /// The user key of the block's FIRST (lowest) entry, or `None` when the block
+    /// decodes to no entries. Repair uses it to derive a resurrection-mode
+    /// restriction that keeps the whole first readable (straddling) block.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a block-decode failure from [`try_iter`](Self::try_iter).
+    #[cfg(feature = "std")]
+    pub(crate) fn first_user_key(
+        &self,
+        comparator: crate::comparator::SharedComparator,
+    ) -> crate::Result<Option<crate::UserKey>> {
+        match self.try_iter(comparator)?.next() {
+            Some(item) => Ok(Some(item.materialize(&self.inner.data).key.user_key)),
+            None => Ok(None),
+        }
+    }
+
+    /// Validates the binary index against the sequentially derived restart
+    /// heads (see [`Decoder::verify_binary_index`]): the sequential decode
+    /// never reads the pointers, so a forged pointer passes every
+    /// entry-level cross-check while seeks trust it and can start at the
+    /// wrong restart head.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when a pointer disagrees with its
+    /// restart head; [`crate::Error::InvalidTrailer`] on a malformed trailer.
+    #[cfg_attr(
+        not(feature = "std"),
+        allow(
+            dead_code,
+            reason = "reconcile-gate check; the verify/scrub consumers are std-gated"
+        )
+    )]
+    pub(crate) fn verify_binary_index(&self) -> crate::Result<()> {
+        Decoder::<InternalValue, DataBlockParsedItem>::verify_binary_index(&self.inner)
     }
 
     /// Returns the binary index length (number of pointers).

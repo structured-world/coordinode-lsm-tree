@@ -8,7 +8,7 @@ fn vlog_recovery_missing_blob_file_returns_unrecoverable() {
     let dir = tempfile::tempdir().unwrap();
     let result = recover_blob_files(
         dir.path(),
-        &[(0, Checksum::from_raw(0))],
+        &[(0, Checksum::from_raw(0), 0)],
         0,
         None,
         &(Arc::new(crate::fs::StdFs) as Arc<dyn crate::fs::Fs>),
@@ -38,7 +38,7 @@ fn vlog_recovery_nonexistent_folder_with_ids_returns_unrecoverable() {
     let missing = dir.path().join("no_such_dir");
     let result = recover_blob_files(
         &missing,
-        &[(0, Checksum::from_raw(0))],
+        &[(0, Checksum::from_raw(0), 0)],
         0,
         None,
         &(Arc::new(crate::fs::StdFs) as Arc<dyn crate::fs::Fs>),

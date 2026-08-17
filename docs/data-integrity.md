@@ -255,8 +255,31 @@ inspection, or rollback to a known-good point.
   fully-valid file, quarantine the corrupt ones, and report the key range each
   dropped, so one bad block costs only its own keys instead of the whole file. A
   columnar segment with a damaged sidecar degrades conservatively: a torn
-  sub-column drops just its block, and a corrupt delete-bitmap reads as "all rows
-  live, pending recompaction" rather than failing the open.
+  sub-column drops just its block. A delete-bearing segment whose positional
+  delete bitmap cannot be applied (unreadable bitmap, or a bitmap whose
+  positioning zone map is unreadable) fails the salvage closed by default —
+  recovering "all rows live" would resurrect deleted rows — unless explicitly
+  opted in (`SalvageOptions::allow_delete_resurrection`, `sst-dump salvage
+  --allow-delete-resurrection`).
+- **`salvage::salvage_blob_file(src, dest, &fs, id, &comparator) -> crate::Result<BlobSalvageReport>`**:
+  record-granular salvage of one blob (vlog) file. The `comparator` must be the
+  SAME `SharedComparator` the source tree was written with (pass the tree's
+  configured comparator, or `comparator::default_comparator()` for the default
+  lexicographic ordering): the salvage walk orders and validates recovered
+  records under it, so a mismatched comparator would mis-order the output. When a frame fails checksum,
+  header-CRC, or structural validation, the record stream re-syncs to the next
+  frame magic WHEN one is found in-bounds; if none is (for example a CRC-vouched
+  frame end overruns the data section), the scan terminates. Either way the
+  resync magic (and every frame chained after it) has an unproven boundary (it
+  may be nested in the damaged frame's user bytes), so the walk **drops the
+  entire tail past the first resync / termination** (fail closed): the
+  conservative loss is as much as everything after the first damaged record, not
+  just that one record, because a fabricated chain of checksum-valid frames is
+  indistinguishable from genuine ones and re-emitting it would forge records.
+  Only records BEFORE the first resync are recovered. The salvaged file is written COMPACTED, so it is **not a drop-in
+  replacement** while SST entries hold `ValueHandle::offset` values into the
+  source: re-target them through `BlobSalvageReport::offset_remap` first (a
+  source offset absent from the map is a lost record).
 - **`Config::repair_with_salvage(true)`** (also `tools/sst-dump repair
   --salvage`): the manifest rebuild above, but an SST that fails verification is
   block-salvaged in place instead of being left out, and

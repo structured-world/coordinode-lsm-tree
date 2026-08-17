@@ -433,6 +433,16 @@ pub(crate) enum BlockScrubOutcome {
 /// Returns the [`BlockScrubOutcome`], or `Err` when the block is uncorrectable
 /// (checksum failed and parity could not recover it) or unreadable; the caller
 /// records that as an uncorrectable finding rather than silently skipping it.
+///
+/// Scope: FRAME integrity only — checksum, decompress, decrypt, ECC. The
+/// block body (restart trailer, entry framing, value-type tags) is
+/// deliberately NOT decoded here: a scrub is a lightweight bit-rot patrol,
+/// and any body-level fault in a checksum-clean block is (a) not producible
+/// by media corruption (the checksum covers the payload) and (b) the domain
+/// of callers that fully decode and validate block bodies (e.g. the salvage
+/// walk's row materialization). [`crate::verify::verify_sst_file`] is likewise
+/// a frame-level verifier. Both the plain patrol scrub and the in-place heal
+/// share exactly this depth.
 #[cfg(feature = "std")]
 #[expect(
     clippy::too_many_arguments,
@@ -459,7 +469,7 @@ pub(crate) fn scrub_block(
         #[cfg(zstd_any)]
         zstd_dict,
     )?;
-    let (_block, ecc_status, recovery) = Block::from_file_with_recovery(
+    let (block, ecc_status, recovery) = Block::from_file_with_recovery(
         fd.as_ref(),
         *handle,
         crate::table::block::BlockIdentity {
@@ -470,6 +480,15 @@ pub(crate) fn scrub_block(
         },
         &transform,
     )?;
+    // Role check, mirroring `load_block`'s swap-defence: an index entry
+    // misdirected at another (checksum-valid) block of a different role must
+    // surface as an uncorrectable finding, not scrub clean.
+    if block.header.block_type != block_type {
+        return Err(crate::Error::InvalidTag((
+            "BlockType",
+            block.header.block_type.into(),
+        )));
+    }
 
     Ok(match ecc_status {
         crate::table::block::EccStatus::Corrected => {

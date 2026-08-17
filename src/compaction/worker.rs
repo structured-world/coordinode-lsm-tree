@@ -80,6 +80,13 @@ pub struct Options {
 
     pub compaction_state: Arc<Mutex<CompactionState>>,
 
+    /// The tree-wide deletion pause, installed on every compaction-produced table
+    /// before it becomes visible. A flush registers it via `register_tables`, but
+    /// compaction installs its outputs directly (`install_merge` / tight-space),
+    /// so it must be threaded here — without it a Page-ECC output's in-place heal
+    /// skips the checkpoint mutation window and can race a checkpoint hard-link.
+    pub deletion_pause: Arc<crate::deletion_pause::DeletionPause>,
+
     /// Shared handle to the live runtime config. Compaction loads
     /// a fresh snapshot via [`crate::runtime_config::handle::RuntimeConfigHandle::load_full`]
     /// each time it writes the manifest, so toggles applied via
@@ -117,6 +124,7 @@ impl Options {
             mvcc_gc_watermark: 0,
 
             compaction_state: tree.compaction_state.clone(),
+            deletion_pause: tree.deletion_pause.clone(),
             runtime_config: tree.runtime_config.clone(),
             encryption: tree.config.encryption.clone(),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::new(
@@ -881,7 +889,18 @@ fn run_tight_space_compaction(
         .hide(payload.table_ids.iter().copied());
 
     let dst_lvl: usize = payload.canonical_level.into();
-    let is_last_level = payload.dest_level == opts.config.level_count - 1;
+    // Tight-space slice merges run WITHOUT bottommost GC (tombstone drop, seqno
+    // zeroing, range-tombstone application) even when the destination IS the last
+    // level. A slice restricts a surviving input and hides its consumed prefix; if a
+    // fully-consumed sibling carried the tombstone for a key that also lives in that
+    // prefix, last-level GC would drop the tombstone from the output. A crash window
+    // that leaves the survivor unrestricted (sidecar not yet written, prefix not yet
+    // punched) would then let manifest repair re-expose the deleted rows. Retaining
+    // every record makes the slice output a SUPERSET that shadows any surviving
+    // prefix in every crash window; a later normal last-level compaction reclaims
+    // the deferred GC. Space is still reclaimed here via the hole punch, which is
+    // what tight-space is for.
+    let bottommost_gc = false;
     let blobs_folder = opts.config.path.join(BLOBS_FOLDER);
     // Canonicalize range tombstones across all inputs (a boundary-spanning RT is
     // otherwise copied into every slice output).
@@ -935,16 +954,29 @@ fn run_tight_space_compaction(
                 &rts,
                 (lower.clone(), Bound::Excluded(boundary.clone())),
                 dst_lvl,
-                is_last_level,
+                bottommost_gc,
                 &blobs_folder,
                 reloc,
             )?;
             drop(version);
 
             let outputs: Vec<Table> = produced.created_tables().to_vec();
+            // Install the tree-wide deletion pause on each slice output before the
+            // version edit makes it visible (mirrors `install_merge` — a compaction
+            // output that skipped it could race a checkpoint hard-link on a later
+            // in-place heal).
+            for table in &outputs {
+                table.install_deletion_pause(Arc::clone(&opts.deletion_pause));
+            }
             // KV-separation: blob files this slice relocated live entries into,
             // plus the GC diff of entries it dropped.
             let mut new_blobs: Vec<BlobFile> = produced.created_blob_files().to_vec();
+            // Capture the rollback set NOW, before the reopened stale views are
+            // pushed onto `new_blobs` below: `mark_as_deleted` on a reopened view
+            // unlinks its SHARED path (the still-live stale blob the current version
+            // references), so a rollback must delete only the genuinely-new blob
+            // files this slice created, never the reopened views.
+            let blobs_for_cleanup = new_blobs.clone();
             let frag = produced.blob_frag_map().clone();
             let gc_diff = if frag.is_empty() { None } else { Some(frag) };
 
@@ -969,17 +1001,84 @@ fn run_tight_space_compaction(
             if relocating {
                 for sf in &current_stale {
                     if let Some(off) = resume_offsets.get(&sf.id()).copied() {
-                        new_blobs.push(sf.reopen()?);
+                        // The re-opened view serves only `[off, end)`: the prior
+                        // view punches everything below once its readers drain.
+                        // Capture the digest over that live suffix NOW, while the
+                        // file is still whole, and record `off` as the view's
+                        // frontier — a whole-file digest would never match the
+                        // punched file, and integrity checks hash from the
+                        // frontier for exactly this reason.
+                        new_blobs.push(sf.reopen_restricted(off)?);
                         prior_to_punch.push((sf.clone(), off));
                     }
                 }
             }
 
-            let blobs_for_cleanup = new_blobs.clone();
+            // Serialize each surviving input's suffix-digest capture (inside
+            // `reopen_restricted` below) and this slice's manifest install
+            // against a concurrent in-place heal on the same table identity. A
+            // patrol that heals a suffix block BETWEEN the digest read and the
+            // version edit would bind the restricted manifest to a pre-heal
+            // suffix digest; the patrol then sees the restriction change and
+            // skips its whole-file refresh, and its attestation binds whole-file
+            // (not suffix) digests, so once the prefix is punched the mismatch is
+            // permanently unattributable. Hold each restricted input's heal lock
+            // across the reopen AND the `upgrade_version` below (released when
+            // these guards drop at the end of this slice iteration). Only inputs
+            // that extend past the boundary (`max >= boundary`) are re-opened, so
+            // only those are locked. The patrol holds at most one table's heal
+            // lock at a time, so acquiring several here cannot deadlock it.
+            //
+            // Lock-order note: this path takes `compaction_state` (held from
+            // `do_compaction`) BEFORE these heal locks, while the patrol reconcile
+            // takes a heal lock and then `compaction_state` inside
+            // `refresh_table_checksum`. To keep that inversion from deadlocking,
+            // the patrol side `try_lock`s `compaction_state` and skips its refresh
+            // on contention rather than blocking — so it never waits on
+            // `compaction_state` while holding a heal lock this loop wants.
+            #[cfg(feature = "page_ecc")]
+            let heal_locks: Vec<Arc<parking_lot::Mutex<()>>> = current_views
+                .iter()
+                .filter(|v| {
+                    comparator.compare(v.metadata.key_range.max(), boundary)
+                        != core::cmp::Ordering::Less
+                })
+                .map(Table::heal_lock_arc)
+                .collect();
+            #[cfg(feature = "page_ecc")]
+            let _heal_guards: Vec<parking_lot::MutexGuard<'_, ()>> =
+                heal_locks.iter().map(|l| l.lock()).collect();
 
             // Classify each input at this boundary: restrict (extends past it) or
             // remove (fully consumed by this slice). Re-open restricted views as
             // distinct Inners so a prior view drops and punches independently.
+            //
+            // `run_subcompaction` above already finalized this slice's output SSTs
+            // and blob files, but the install below is what references them. A
+            // failure between here and the install (a sidecar write or a restricted
+            // reopen) returns before any version points at those outputs, so, like
+            // the install error path below, roll them back now instead of pinning
+            // the space until the next open's orphan sweep. Tight-space runs exactly
+            // when free space is scarce, so an ENOSPC here would otherwise both abort
+            // the reclaim and hold the bytes this slice just consumed.
+            // Pre-install rollback. The slice's finalized outputs/blobs are still
+            // unreferenced (no version points at them), so on any failure before the
+            // install commits they must be retracted or the scarce space stays pinned
+            // until the next orphan sweep. No `.restrict-bound` sidecar is touched
+            // here: the sidecar write is STRICTLY POST-COMMIT (the mark step below the
+            // install), so an aborted slice never publishes one and there is nothing
+            // to retract. That ordering is the crash-safety invariant — a sidecar on
+            // disk always denotes a committed restriction (see the mark step and
+            // `docs/manifest-recovery.md`).
+            let rollback = |e: crate::Error| -> crate::Error {
+                for t in &outputs {
+                    t.mark_as_deleted();
+                }
+                for b in &blobs_for_cleanup {
+                    b.mark_as_deleted();
+                }
+                e
+            };
             let mut restricted_pairs: Vec<(TableId, Table)> = Vec::new();
             let mut removed_ids: Vec<TableId> = Vec::new();
             let mut next_views: Vec<Table> = Vec::new();
@@ -989,7 +1088,13 @@ fn run_tight_space_compaction(
                 {
                     removed_ids.push(view.id());
                 } else {
-                    let restricted = view.reopen_restricted(boundary.clone())?;
+                    // Open the restricted view over the same physical SST. This is an
+                    // IN-MEMORY reopen (it reads the live suffix digest but writes
+                    // nothing to disk), so a failure here commits nothing and just
+                    // rolls back the finalized outputs. The `.restrict-bound` sidecar
+                    // that records this view's exact bound is written only AFTER the
+                    // install commits (the mark step below), never here.
+                    let restricted = view.reopen_restricted(boundary.clone()).map_err(rollback)?;
                     restricted_pairs.push((view.id(), restricted.clone()));
                     next_views.push(restricted);
                 }
@@ -1019,22 +1124,53 @@ fn run_tight_space_compaction(
                 opts.encryption.clone(),
             );
             if let Err(e) = install {
-                for t in &outputs {
-                    t.mark_as_deleted();
-                }
-                for b in &blobs_for_cleanup {
-                    b.mark_as_deleted();
-                }
-                return Err(e);
+                // The install did not commit, so no sidecar was written (the mark
+                // step below is strictly post-commit) and the punches never arm:
+                // retract only the finalized-but-unreferenced outputs so the scarce
+                // space is freed now instead of at the next orphan sweep.
+                return Err(rollback(e));
             }
 
-            // Arm each surviving prior SST view to punch its consumed prefix on
-            // drop; a fully-consumed input is deleted outright (data is in outputs).
+            // Mark, then punch. The install committed, so now record each restricted
+            // input's exact bound to its `.restrict-bound` sidecar — STRICTLY AFTER
+            // the commit, so a sidecar on disk always denotes a committed restriction
+            // (manifest repair honors it without a commit protocol). Then arm the
+            // prefix punch. A fully-consumed input is deleted outright (its data is in
+            // the outputs).
+            //
+            // A sidecar write that fails HERE is not fatal: the restriction is already
+            // durable in the manifest. Log it and leave that input UNPUNCHED, so a
+            // later manifest-loss repair sees no-sidecar + unpunched and keeps the
+            // whole input (the committed output shadows the redundant prefix, its own
+            // tombstones intact, so nothing resurrects). Punching an input whose
+            // sidecar did not land would instead force repair to derive a conservative
+            // bound and drop up to one live block — so never punch without the sidecar.
             for view in &current_views {
                 if removed_ids.contains(&view.id()) {
                     view.mark_as_deleted();
                 } else {
-                    view.mark_punch_on_drop(view.punch_offset_for(boundary)?);
+                    match view.write_restrict_sidecar(boundary, opts.config.sync_mode) {
+                        Ok(()) => match view.punch_offset_for(boundary) {
+                            Ok(off) => view.mark_punch_on_drop(off),
+                            // Post-commit, so a punch-offset lookup failure is non-fatal,
+                            // exactly like the sidecar-write failure below: the restriction
+                            // is already durable (manifest + sidecar), so leave the input
+                            // unpunched and let a later compaction reclaim it. Propagating
+                            // `?` here would abort an already-committed slice.
+                            Err(e) => log::error!(
+                                "tight-space could not resolve the punch offset for table \
+                                 {} after committing its restriction: {e}; leaving the input \
+                                 unpunched, a later compaction reclaims it",
+                                view.id(),
+                            ),
+                        },
+                        Err(e) => log::error!(
+                            "tight-space could not write the restrict-bound sidecar for \
+                             table {} after committing its restriction: {e}; leaving the \
+                             input unpunched, a later compaction rewrites it",
+                            view.id(),
+                        ),
+                    }
                 }
             }
             // Arm each re-opened stale blob file's prior view to punch its
@@ -1097,7 +1233,7 @@ fn run_tight_space_compaction(
             &rts,
             (lower.clone(), Bound::Unbounded),
             dst_lvl,
-            is_last_level,
+            bottommost_gc,
             &blobs_folder,
             tail_reloc,
         )?;

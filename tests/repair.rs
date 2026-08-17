@@ -47,7 +47,7 @@ fn count_sst_files(dir: &std::path::Path) -> std::io::Result<usize> {
 
 #[test]
 fn repair_rebuilds_manifest_and_preserves_all_keys() -> lsm_tree::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
 
     // Three flushes → three L0 tables, with an overwrite in the last batch so
     // repair has to preserve the latest value across overlapping L0 runs.
@@ -124,7 +124,7 @@ fn repair_rebuilds_manifest_and_preserves_all_keys() -> lsm_tree::Result<()> {
 
 #[test]
 fn repair_skips_unreadable_file_but_recovers_the_rest() -> lsm_tree::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
 
     {
         let tree = Config::new(
@@ -187,7 +187,7 @@ fn repair_skips_unreadable_file_but_recovers_the_rest() -> lsm_tree::Result<()> 
 
 #[test]
 fn repair_with_no_ssts_produces_empty_readable_tree() -> lsm_tree::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
 
     // Open and close without ever flushing: the manifest exists but no SST does
     // (manifest lost before the first flush is the scenario).
@@ -226,7 +226,7 @@ fn repair_with_no_ssts_produces_empty_readable_tree() -> lsm_tree::Result<()> {
 
 #[test]
 fn repair_reports_non_table_id_filename_as_unreadable() -> lsm_tree::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
 
     {
         let tree = Config::new(
@@ -296,7 +296,7 @@ fn repair_reports_non_table_id_filename_as_unreadable() -> lsm_tree::Result<()> 
 // and skipped — while intact SSTs still recover and the tree reopens.
 #[test]
 fn repair_rejects_corrupted_sst_and_recovers_the_rest() -> lsm_tree::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
 
     {
         let tree = Config::new(
@@ -390,7 +390,7 @@ fn repair_rejects_corrupted_sst_and_recovers_the_rest() -> lsm_tree::Result<()> 
 #[cfg(unix)]
 #[test]
 fn repair_reports_unopenable_file_as_unreadable() -> lsm_tree::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
 
     {
         let tree = Config::new(
@@ -432,7 +432,7 @@ fn repair_reports_unopenable_file_as_unreadable() -> lsm_tree::Result<()> {
 
 #[test]
 fn repair_fails_when_a_bad_filename_cannot_be_quarantined() -> lsm_tree::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
     let big = |i: u64| format!("{i:08}").repeat(512);
 
     {
@@ -482,7 +482,7 @@ fn repair_fails_when_a_bad_table_filename_cannot_be_quarantined() -> lsm_tree::R
     // Sibling of the blob-side test above, covering the standard `tables/`
     // quarantine path so the false-success regression cannot slip back for
     // standard trees.
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
 
     {
         let tree = Config::new(
@@ -537,7 +537,7 @@ fn count_blob_files(dir: &std::path::Path) -> std::io::Result<usize> {
 
 #[test]
 fn repair_rebuilds_blob_tree_manifest_and_preserves_values() -> lsm_tree::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
 
     // ~4 KiB values, above the 1 KiB KV-separation threshold, so they spill into
     // the value log as blob files: the artifact a blob-tree repair must
@@ -628,11 +628,32 @@ fn sorted_sst_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// (data is written first; index / filter / meta live at the tail), so the SST
 /// still opens but one data block fails its checksum.
 fn corrupt_data_region(path: &std::path::Path) -> std::io::Result<()> {
+    // Locate the `data` section through the SFA trailer TOC rather than assuming
+    // it begins at offset 0: a byte a fixed depth into the section's payload is
+    // stable against tail growth (the index / filter / meta / trailer that follow
+    // can change size, e.g. a new meta key) AND correct even if the data section
+    // ever stops being written first.
+    const DEPTH: u64 = 512;
+    let pos = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = lsm_tree::sfa::Reader::from_reader(&mut f)
+            .map_err(|e| std::io::Error::other(format!("read SFA TOC: {e}")))?;
+        let entry = reader
+            .toc()
+            .iter()
+            .find(|e| e.name() == b"data")
+            .expect("the SST carries a data section");
+        assert!(
+            entry.len() > DEPTH,
+            "data section (len {}) is too small to corrupt a block at depth {DEPTH}",
+            entry.len(),
+        );
+        usize::try_from(entry.pos() + DEPTH).expect("position fits usize")
+    };
     let mut bytes = std::fs::read(path)?;
-    let at = bytes.len() / 4;
-    if let Some(b) = bytes.get_mut(at) {
-        *b ^= 0xFF;
-    }
+    *bytes
+        .get_mut(pos)
+        .expect("corruption offset within the SST") ^= 0xFF;
     std::fs::write(path, &bytes)
 }
 
@@ -642,7 +663,7 @@ fn corrupt_data_region(path: &std::path::Path) -> std::io::Result<()> {
 /// instead of leaving a table that errors on read.
 #[test]
 fn repair_with_salvage_recovers_a_block_corrupt_sst() -> lsm_tree::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
     {
         let tree = Config::new(
             dir.path(),
@@ -707,11 +728,70 @@ fn repair_with_salvage_recovers_a_block_corrupt_sst() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A salvaging repair must persist the recovered SST at the CONFIGURED
+/// durability: with `Config::sync_mode = Full`, the rebuilt manifest is
+/// synced Full while a salvage writer left at its Normal default would give
+/// the freshly recovered SST weaker durability than everything around it —
+/// a repair reported as durable could lose the recovered file across power
+/// failure on platforms where Full means `F_FULLFSYNC`.
+#[test]
+fn repair_with_salvage_syncs_the_recovered_sst_at_the_configured_mode() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::{FaultFs, Fs, StdFs, SyncMode};
+    use std::sync::Arc;
+
+    let dir = lsm_tree::get_tmp_folder();
+    {
+        let tree = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0..500 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let ssts = sorted_sst_paths(dir.path());
+    let victim = ssts.first().expect("an SST to corrupt");
+    corrupt_data_region(victim)?;
+    nuke_manifest(dir.path())?;
+
+    // Repair under Full durability through a sync-observing Fs.
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .sync_mode(SyncMode::Full)
+    .with_shared_fs(fs)
+    .repair_with_salvage(true)?;
+    assert_eq!(report.salvaged, 1, "{:?}", report.unreadable_files);
+
+    // The salvaged table file (under tables/) must have been synced at the
+    // configured Full mode, not the salvage writer's Normal default.
+    let modes = injector.sync_modes_for("tables");
+    assert!(
+        !modes.is_empty(),
+        "the salvage writer syncs the recovered SST through the injected Fs",
+    );
+    assert!(
+        modes.iter().all(|m| *m == SyncMode::Full),
+        "every sync of the recovered SST must use the configured Full mode (a single \
+         Normal sync must fail the test), got {modes:?}",
+    );
+    Ok(())
+}
+
 /// An SST whose container (SFA trailer) is corrupt cannot be opened even in
 /// salvage mode, so repair reports it unreadable rather than salvaging it.
 #[test]
 fn repair_with_salvage_reports_an_unopenable_sst_as_unreadable() -> lsm_tree::Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = lsm_tree::get_tmp_folder();
     {
         let tree = Config::new(
             dir.path(),
@@ -751,5 +831,738 @@ fn repair_with_salvage_reports_an_unopenable_sst_as_unreadable() -> lsm_tree::Re
         "the SST is reported unreadable: {:?}",
         report.unreadable_files,
     );
+    Ok(())
+}
+
+/// Ordinary `repair()` (salvage disabled) must QUARANTINE a structurally
+/// unreadable SST before publishing the manifest, not leave it under its numeric
+/// name in `tables/`: the rebuilt manifest omits it, so the next `Tree::open`
+/// would orphan-clean (DELETE) it — contradicting the report's promise that an
+/// operator can still investigate / recover it. The file must be moved out of
+/// `tables/` (into the repair quarantine).
+#[test]
+fn repair_quarantines_an_unreadable_sst_before_publishing() -> lsm_tree::Result<()> {
+    let dir = lsm_tree::get_tmp_folder();
+    {
+        let tree = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0..64 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let ssts = sorted_sst_paths(dir.path());
+    let victim = ssts.first().expect("an SST to corrupt").clone();
+    // Truncate the tail (SFA trailer): the container is unparseable, so recovery
+    // fails structurally on the ordinary (no-salvage) path.
+    let mut bytes = std::fs::read(&victim)?;
+    bytes.truncate(bytes.len() / 2);
+    std::fs::write(&victim, &bytes)?;
+    nuke_manifest(dir.path())?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+
+    assert_eq!(
+        report.recovered, 0,
+        "the only SST is unreadable: {report:?}"
+    );
+    assert_eq!(report.unreadable, 1, "it is reported unreadable");
+    assert!(
+        !victim.exists(),
+        "the unreadable SST must be MOVED out of tables/ (quarantined), not left to be \
+         orphan-deleted on the next open",
+    );
+    assert!(
+        report.unreadable_files[0].1.contains("quarantined to"),
+        "the reason records the quarantine destination: {:?}",
+        report.unreadable_files,
+    );
+    Ok(())
+}
+
+/// A PERSISTENT but ECC-correctable fault in an encrypted Page-ECC SST must
+/// drive `repair_with_salvage` into salvaging the table (rewriting it with
+/// clean bytes), not accept it as verified: the encrypted verify path scrubs
+/// through the table, and a scrub silently corrects the fault on read
+/// (`corrections_applied > 0` with no errors) while the corrupt bytes stay on
+/// disk — the unencrypted out-of-band verifier flags the same checksum
+/// mismatch and salvages.
+#[cfg(all(feature = "encryption", feature = "page_ecc"))]
+#[test]
+fn repair_with_salvage_correctable_ecc_fault_in_encrypted_sst_is_rewritten() -> lsm_tree::Result<()>
+{
+    use lsm_tree::Aes256GcmProvider;
+    use lsm_tree::runtime_config::EccScheme;
+    use std::sync::Arc;
+
+    let dir = lsm_tree::get_tmp_folder();
+    let provider = || Arc::new(Aes256GcmProvider::new(&[0x6B; 32]));
+    // Shared encrypted Page-ECC config: the initial open, the salvage repair, and
+    // the final reopen must all bind the SAME encryption provider and ECC scheme.
+    let cfg = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_encryption(Some(provider()))
+        .page_ecc(true)
+        .ecc_scheme(EccScheme::ReedSolomon {
+            data_shards: 4,
+            parity_shards: 2,
+        })
+    };
+    {
+        let tree = cfg().open()?;
+        for i in 0..500 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Flip one byte INSIDE the first data block's payload (the block header is
+    // ~33 bytes, so offset 40 into the `data` section is payload — NOT the
+    // parity trailer, which a clean-checksum read never validates). Within the
+    // RS(4,2) budget, so every read CORRECTS it in memory while the fault
+    // persists on disk. The shared helper locates the section via the TOC and
+    // bounds-checks the offset.
+    let ssts = sorted_sst_paths(dir.path());
+    let victim = ssts.first().expect("an SST to corrupt");
+    flip_byte_in_section(victim, b"data", SectionByte::FromStart(40))?;
+
+    nuke_manifest(dir.path())?;
+
+    let report = cfg().repair_with_salvage(true)?;
+    assert_eq!(
+        report.salvaged, 1,
+        "a persistent correctable fault drives the table through salvage: {:?}",
+        report.unreadable_files,
+    );
+    assert_eq!(
+        report.recovered, 1,
+        "the rewritten table joins the manifest"
+    );
+
+    // The tree reopens and every key reads back from the clean rewrite.
+    let tree = cfg().open()?;
+    for i in 0..500 {
+        assert!(
+            tree.get(key(i), MAX_SEQNO)?.is_some(),
+            "key {} survives the salvage rewrite",
+            key(i),
+        );
+    }
+    Ok(())
+}
+
+/// A PERSISTENT but ECC-correctable fault in an encrypted table's FILTER
+/// block must drive `repair_with_salvage` into salvaging: loading the filter
+/// through the table silently corrects the fault in memory
+/// (`EccStatus::Corrected` is hidden behind an `Ok`), while the corrupt bytes
+/// stay on disk — the same standard already applied to data blocks.
+#[cfg(all(feature = "encryption", feature = "page_ecc"))]
+#[test]
+fn repair_with_salvage_correctable_ecc_fault_in_encrypted_filter_is_rewritten()
+-> lsm_tree::Result<()> {
+    use lsm_tree::Aes256GcmProvider;
+    use lsm_tree::runtime_config::EccScheme;
+    use std::sync::Arc;
+
+    let dir = lsm_tree::get_tmp_folder();
+    let provider = || Arc::new(Aes256GcmProvider::new(&[0x8D; 32]));
+    let config = |dir: &std::path::Path| {
+        Config::new(
+            dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_encryption(Some(provider()))
+        .page_ecc(true)
+        .ecc_scheme(EccScheme::ReedSolomon {
+            data_shards: 4,
+            parity_shards: 2,
+        })
+    };
+    {
+        let tree = config(dir.path()).open()?;
+        for i in 0..500 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Flip ONE byte inside the filter block's payload (past the ~33-byte
+    // header): within the RS(4,2) budget, so a filter load CORRECTS it in
+    // memory — but the fault persists on disk.
+    let ssts = sorted_sst_paths(dir.path());
+    let victim = ssts.first().expect("an SST to corrupt");
+    flip_byte_in_section(victim, b"filter", SectionByte::FromStart(40))?;
+
+    nuke_manifest(dir.path())?;
+
+    let report = config(dir.path()).repair_with_salvage(true)?;
+    assert_eq!(
+        report.salvaged, 1,
+        "a persistent correctable filter fault drives the table through salvage: {:?}",
+        report.unreadable_files,
+    );
+    assert_eq!(
+        report.recovered, 1,
+        "the rewritten table joins the manifest"
+    );
+
+    // Exercise the REBUILT filter: reopen under the same configuration and
+    // point-read every key (point reads consult the filter, which loads
+    // lazily — `recovered == 1` alone only proves the table was admitted).
+    let tree = config(dir.path()).open()?;
+    for i in 0..500 {
+        assert!(
+            tree.get(key(i), MAX_SEQNO)?.is_some(),
+            "key {} survives the salvage rewrite",
+            key(i),
+        );
+    }
+    Ok(())
+}
+
+/// The same standard for SIDE sections loaded during recover (index TLI,
+/// meta, zone map, ...): those loads silently correct an ECC-recoverable
+/// fault in memory, so a persistent correctable flip there must also drive
+/// `repair_with_salvage` into a clean rewrite — the unencrypted out-of-band
+/// verifier flags the same raw checksum mismatch.
+#[cfg(all(feature = "encryption", feature = "page_ecc"))]
+#[test]
+fn repair_with_salvage_correctable_ecc_fault_in_encrypted_tli_is_rewritten() -> lsm_tree::Result<()>
+{
+    use lsm_tree::Aes256GcmProvider;
+    use lsm_tree::runtime_config::EccScheme;
+    use std::sync::Arc;
+
+    let dir = lsm_tree::get_tmp_folder();
+    let provider = || Arc::new(Aes256GcmProvider::new(&[0x9E; 32]));
+    let config = |dir: &std::path::Path| {
+        Config::new(
+            dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_encryption(Some(provider()))
+        .page_ecc(true)
+        .ecc_scheme(EccScheme::ReedSolomon {
+            data_shards: 4,
+            parity_shards: 2,
+        })
+    };
+    {
+        let tree = config(dir.path()).open()?;
+        for i in 0..500 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let ssts = sorted_sst_paths(dir.path());
+    let victim = ssts.first().expect("an SST to corrupt");
+    flip_byte_in_section(victim, b"tli", SectionByte::FromStart(40))?;
+
+    nuke_manifest(dir.path())?;
+
+    let report = config(dir.path()).repair_with_salvage(true)?;
+    assert_eq!(
+        report.salvaged, 1,
+        "a persistent correctable TLI fault drives the table through salvage: {:?}",
+        report.unreadable_files,
+    );
+    assert_eq!(
+        report.recovered, 1,
+        "the rewritten table joins the manifest"
+    );
+
+    // Exercise the REBUILT index: reopen under the same configuration and
+    // point-read every key (each read binary-searches the rewritten TLI —
+    // `recovered == 1` alone only proves the table was admitted).
+    let tree = config(dir.path()).open()?;
+    for i in 0..500 {
+        assert!(
+            tree.get(key(i), MAX_SEQNO)?.is_some(),
+            "key {} survives the salvage rewrite",
+            key(i),
+        );
+    }
+    Ok(())
+}
+
+/// Where in a section to flip a byte: a fixed offset from its start, or its
+/// midpoint (length-relative). `FromStart` is only used by the ECC-correction
+/// tests (it targets a specific payload byte), so it is gated on `page_ecc`;
+/// `Midpoint` is available under encryption alone.
+#[cfg(feature = "encryption")]
+enum SectionByte {
+    #[cfg(feature = "page_ecc")]
+    FromStart(u64),
+    Midpoint,
+}
+
+/// Flips one byte inside the named SFA section of an SST (locating it via the
+/// trailer TOC), at a fixed offset or the section midpoint.
+#[cfg(feature = "encryption")]
+fn flip_byte_in_section(
+    path: &std::path::Path,
+    section: &[u8],
+    at: SectionByte,
+) -> lsm_tree::Result<()> {
+    let pos = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = lsm_tree::sfa::Reader::from_reader(&mut f)?;
+        let entry = reader
+            .toc()
+            .iter()
+            .find(|e| e.name() == section)
+            .unwrap_or_else(|| panic!("the SST carries a {section:?} section"));
+        match at {
+            #[cfg(feature = "page_ecc")]
+            SectionByte::FromStart(offset) => {
+                assert!(
+                    offset < entry.len(),
+                    "flip offset {offset} must fall within the {section:?} section \
+                     (len {}), not spill into another section",
+                    entry.len(),
+                );
+                entry.pos() + offset
+            }
+            SectionByte::Midpoint => entry.pos() + entry.len() / 2,
+        }
+    };
+    let mut bytes = std::fs::read(path)?;
+    let slot = bytes
+        .get_mut(usize::try_from(pos).expect("position fits usize"))
+        .expect("flip position within the SST");
+    *slot ^= 0x40;
+    std::fs::write(path, &bytes)?;
+    Ok(())
+}
+
+/// A corrupt BLOOM FILTER block in an encrypted SST must drive
+/// `repair_with_salvage` into salvaging the table: the encrypted verify path
+/// scrubs data blocks through the table, but the filter section loads lazily
+/// on point reads — without verifying it, repair accepts an SST whose later
+/// reads fail on the corrupt filter (the unencrypted out-of-band verifier
+/// covers the filter section).
+#[cfg(feature = "encryption")]
+#[test]
+fn repair_with_salvage_corrupt_filter_in_encrypted_sst_is_rewritten() -> lsm_tree::Result<()> {
+    use lsm_tree::Aes256GcmProvider;
+    use std::sync::Arc;
+
+    let dir = lsm_tree::get_tmp_folder();
+    let provider = || Arc::new(Aes256GcmProvider::new(&[0x7C; 32]));
+    {
+        let tree = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_encryption(Some(provider()))
+        .open()?;
+        for i in 0..500 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Corrupt the middle of the `filter` SFA section (data blocks stay intact).
+    let ssts = sorted_sst_paths(dir.path());
+    let victim = ssts.first().expect("an SST to corrupt");
+    flip_byte_in_section(victim, b"filter", SectionByte::Midpoint)?;
+
+    nuke_manifest(dir.path())?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_encryption(Some(provider()))
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.salvaged, 1,
+        "a corrupt filter drives the encrypted table through salvage: {:?}",
+        report.unreadable_files,
+    );
+    assert_eq!(
+        report.recovered, 1,
+        "the rewritten table joins the manifest"
+    );
+
+    // The tree reopens with a FRESH filter and every point read succeeds.
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_encryption(Some(provider()))
+    .open()?;
+    for i in 0..500 {
+        assert!(
+            tree.get(key(i), MAX_SEQNO)?.is_some(),
+            "key {} reads back through the rebuilt filter",
+            key(i),
+        );
+    }
+    Ok(())
+}
+
+/// `repair_with_salvage` must NOT quarantine and rewrite a HEALTHY encrypted
+/// SST: the block-verify gate has to be encryption-aware (the out-of-band
+/// file walk cannot decode an encrypted meta block, so it would misreport
+/// every encrypted table as corrupt and salvage it on every repair).
+#[cfg(feature = "encryption")]
+#[test]
+fn repair_with_salvage_healthy_encrypted_sst_remains_untouched() -> lsm_tree::Result<()> {
+    use lsm_tree::Aes256GcmProvider;
+    use std::sync::Arc;
+
+    let dir = lsm_tree::get_tmp_folder();
+    let provider = || Arc::new(Aes256GcmProvider::new(&[0x5A; 32]));
+    {
+        let tree = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_encryption(Some(provider()))
+        .open()?;
+        for i in 0..500 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    nuke_manifest(dir.path())?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_encryption(Some(provider()))
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.salvaged, 0,
+        "a healthy encrypted SST is not quarantined + rewritten: {:?}",
+        report.unreadable_files,
+    );
+    assert_eq!(
+        report.recovered, 1,
+        "the healthy encrypted table joins the rebuilt manifest: {:?}",
+        report.unreadable_files,
+    );
+
+    // The tree reopens and every key reads back.
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_encryption(Some(provider()))
+    .open()?;
+    for i in 0..500 {
+        assert!(
+            tree.get(key(i), MAX_SEQNO)?.is_some(),
+            "key {} survives the repair untouched",
+            key(i),
+        );
+    }
+    Ok(())
+}
+
+/// When the same table id exists in two configured table folders — one damaged
+/// (block-salvaged LOSSILY) and one intact — repair must keep the INTACT copy,
+/// not the lossy salvage of the first-scanned one. The primary folder is scanned
+/// first, so putting the damaged copy there and an intact duplicate in a routed
+/// folder proves the intact copy supersedes the lossy salvage. Asserts on the
+/// report (`salvaged == 0`): without the fix, marking the id seen before
+/// verifying makes the first (damaged) copy win and get salvaged lossily.
+#[test]
+fn repair_prefers_an_intact_duplicate_over_a_lossy_salvage() -> lsm_tree::Result<()> {
+    use lsm_tree::config::LevelRoute;
+    use lsm_tree::fs::StdFs;
+    use std::sync::Arc;
+
+    let dir = lsm_tree::get_tmp_folder();
+    let primary = dir.path().join("primary");
+    let cold = dir.path().join("cold");
+    std::fs::create_dir_all(primary.join("tables"))?;
+    std::fs::create_dir_all(cold.join("tables"))?;
+
+    // Build one SST via a plain flush, then place a copy in each folder under its
+    // own id name (so the file-name id matches the stored table id).
+    let id_name = {
+        let build = dir.path().join("build");
+        let tree = Config::new(
+            &build,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0..1000 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+        let ssts = sorted_sst_paths(&build);
+        assert_eq!(ssts.len(), 1, "one flush → one SST");
+        let name = ssts[0].file_name().expect("sst has a file name").to_owned();
+        std::fs::copy(&ssts[0], cold.join("tables").join(&name))?;
+        std::fs::copy(&ssts[0], primary.join("tables").join(&name))?;
+        name
+    };
+    // Damage the PRIMARY (first-scanned) copy so it can only be lossily salvaged.
+    corrupt_data_region(&primary.join("tables").join(&id_name))?;
+
+    let report = Config::new(
+        &primary,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .level_routes(vec![LevelRoute {
+        levels: 5..7,
+        path: cold,
+        fs: Arc::new(StdFs),
+    }])
+    .repair_with_salvage(true)?;
+
+    assert_eq!(report.recovered, 1, "one table recovered: {report:?}");
+    assert_eq!(
+        report.salvaged, 0,
+        "the intact duplicate must supersede the lossy salvage of the damaged copy: {report:?}",
+    );
+    Ok(())
+}
+
+/// When the same table id exists intact in two configured folders, repair keeps
+/// ONE and must QUARANTINE the duplicate out of `tables/`. The rebuilt manifest
+/// records only `id + checksum` (no path), so a duplicate left in place would let
+/// the reopened tree resolve the wrong file for that id by folder order — and
+/// reopen it against the kept copy's mismatched checksum. The primary is scanned
+/// first, so it wins; the routed (cold) duplicate must land in `cold/`'s
+/// `repair-quarantine`, not stay under `cold/tables`.
+#[test]
+fn repair_quarantines_a_duplicate_table_file() -> lsm_tree::Result<()> {
+    use lsm_tree::config::LevelRoute;
+    use lsm_tree::fs::StdFs;
+    use std::sync::Arc;
+
+    let dir = lsm_tree::get_tmp_folder();
+    let primary = dir.path().join("primary");
+    let cold = dir.path().join("cold");
+    std::fs::create_dir_all(primary.join("tables"))?;
+    std::fs::create_dir_all(cold.join("tables"))?;
+
+    // One flushed SST, copied INTACT into both folders under its id name.
+    let id_name = {
+        let build = dir.path().join("build");
+        let tree = Config::new(
+            &build,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0..1000 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+        let ssts = sorted_sst_paths(&build);
+        assert_eq!(ssts.len(), 1, "one flush → one SST");
+        let name = ssts[0].file_name().expect("sst has a file name").to_owned();
+        std::fs::copy(&ssts[0], primary.join("tables").join(&name))?;
+        std::fs::copy(&ssts[0], cold.join("tables").join(&name))?;
+        name
+    };
+
+    let report = Config::new(
+        &primary,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .level_routes(vec![LevelRoute {
+        levels: 5..7,
+        path: cold.clone(),
+        fs: Arc::new(StdFs),
+    }])
+    .repair_with_salvage(true)?;
+
+    assert_eq!(report.recovered, 1, "one table recovered: {report:?}");
+    // The primary (first-scanned) copy stays; the routed duplicate is moved OUT of
+    // `cold/tables` into `cold/repair-quarantine`, so recovery can't resolve it.
+    assert!(
+        primary.join("tables").join(&id_name).exists(),
+        "the kept copy stays under the primary's tables/",
+    );
+    assert!(
+        !cold.join("tables").join(&id_name).exists(),
+        "the duplicate must NOT remain under cold/tables (recovery would resolve it \
+         for the id and reopen against a mismatched checksum): {report:?}",
+    );
+    assert!(
+        cold.join("repair-quarantine").join(&id_name).exists(),
+        "the duplicate must be quarantined into cold/repair-quarantine: {report:?}",
+    );
+    Ok(())
+}
+
+/// When two configured table folders are ALIASES of one physical directory (here
+/// a symlink), the second scan sees the SAME file the first already retained.
+/// Quarantining that repeated sighting would MOVE the kept file (both names
+/// resolve to the same directory entry) and leave the manifest referencing a
+/// missing SST. Repair must detect the alias and skip the sighting in place, so
+/// the kept SST survives and stays recovered (#69).
+#[cfg(unix)]
+#[test]
+fn repair_does_not_quarantine_an_aliased_copy_of_the_kept_sst() -> lsm_tree::Result<()> {
+    use lsm_tree::config::LevelRoute;
+    use lsm_tree::fs::StdFs;
+    use std::sync::Arc;
+
+    let dir = lsm_tree::get_tmp_folder();
+    let primary = dir.path().join("primary");
+    std::fs::create_dir_all(primary.join("tables"))?;
+    // `cold` is a SYMLINK to `primary`: both configured folders resolve to the
+    // same physical tables directory, so the SST is seen twice as one file.
+    let cold = dir.path().join("cold");
+    std::os::unix::fs::symlink(&primary, &cold)?;
+
+    let id_name = {
+        let build = dir.path().join("build");
+        let tree = Config::new(
+            &build,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0..1000 {
+            tree.insert(key(i), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+        let ssts = sorted_sst_paths(&build);
+        assert_eq!(ssts.len(), 1, "one flush → one SST");
+        let name = ssts[0].file_name().expect("sst has a file name").to_owned();
+        std::fs::copy(&ssts[0], primary.join("tables").join(&name))?;
+        name
+    };
+
+    let report = Config::new(
+        &primary,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .level_routes(vec![LevelRoute {
+        levels: 5..7,
+        path: cold,
+        fs: Arc::new(StdFs),
+    }])
+    .repair_with_salvage(true)?;
+
+    assert_eq!(report.recovered, 1, "one table recovered: {report:?}");
+    // The aliased sighting is skipped in place, never recorded as a failure: it is
+    // the SAME physical file as the kept copy, so reporting it unreadable /
+    // quarantined would misrepresent a healthy table as damaged.
+    assert_eq!(
+        report.unreadable, 0,
+        "the aliased sighting must not be reported unreadable: {:?}",
+        report.unreadable_files,
+    );
+    // The aliased sighting was skipped in place, NOT quarantined: the kept file
+    // still exists under its (single, shared) tables directory.
+    assert!(
+        primary.join("tables").join(&id_name).exists(),
+        "the aliased SST must not be moved out of tables/ (that would orphan the \
+         manifest entry): {report:?}",
+    );
+    Ok(())
+}
+
+/// A blob file that cannot be recovered is omitted from the rebuilt manifest —
+/// but any SST still holding an indirection into it MUST be excluded too.
+/// Publishing that table produces a manifest that opens fine, yet reading an
+/// affected key resolves a handle whose blob file is gone. Repair must reject
+/// the dependent table instead of shipping the inconsistent pair.
+#[test]
+fn repair_excludes_tables_referencing_an_unrecoverable_blob_file() -> lsm_tree::Result<()> {
+    let dir = lsm_tree::get_tmp_folder();
+    let big = |i: u64| format!("{i:08}").repeat(512);
+
+    {
+        let tree = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(KvSeparationOptions::default()))
+        .open()?;
+        for i in 0..50 {
+            tree.insert(key(i), big(i).as_bytes(), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Wreck every blob file's contents so recovery fails STRUCTURALLY (the file
+    // still reads, so this is a persistent failure, not a transient one).
+    let blobs = dir.path().join("blobs");
+    for entry in std::fs::read_dir(&blobs)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            std::fs::write(entry.path(), b"not a blob file at all")?;
+        }
+    }
+
+    nuke_manifest(dir.path())?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(KvSeparationOptions::default()))
+    .repair()?;
+
+    assert_eq!(
+        report.recovered, 0,
+        "an SST whose blob file is unrecoverable must not be published: {report:?}",
+    );
+    assert!(
+        report
+            .unreadable_files
+            .iter()
+            .any(|(_, reason)| reason.contains("blob file")),
+        "the report must name the missing blob dependency: {:?}",
+        report.unreadable_files,
+    );
+
+    // The repaired tree opens and every surviving read is well-defined (the
+    // dependent table is gone, so its keys are simply absent).
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(KvSeparationOptions::default()))
+    .open()?;
+    for i in 0..50 {
+        assert!(
+            tree.get(key(i), MAX_SEQNO)?.is_none(),
+            "key {} must be absent, never a dangling blob handle",
+            key(i),
+        );
+    }
     Ok(())
 }

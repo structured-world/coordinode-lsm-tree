@@ -32,6 +32,14 @@ fn raw_file_fsfile_round_trips() {
         "metadata len must match what was written"
     );
 
+    // statx-backed hard-link count: a freshly created file has exactly one link
+    // (not the `Unsupported` default that would make in-place heal skip reclaim).
+    assert_eq!(
+        FsFile::hard_link_count(&file).expect("hard_link_count"),
+        1,
+        "a freshly created file has a single hard link"
+    );
+
     // Positioned fill-or-EOF read returns the exact bytes.
     let mut rb = vec![0u8; payload.len()];
     let n = FsFile::read_at(&file, &mut rb, 0).expect("read_at");

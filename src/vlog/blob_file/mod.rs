@@ -63,6 +63,16 @@ pub struct Inner {
 
     pub checksum: Checksum,
 
+    /// First LIVE byte of this view, or `0` for a whole file. Set on the
+    /// RESTRICTED view a tight-space relocation installs: everything below it
+    /// was relocated into a fresh file and its frames are punched out (they
+    /// read back as zeros). [`Self::checksum`] then covers only
+    /// `[live_data_start, end)`, so integrity checks must hash from here —
+    /// whole-file hashing would fold in the punched prefix and report a healthy
+    /// file as corrupt. Persisted per version edit, the blob analogue of a
+    /// table's restriction bound.
+    pub(crate) live_data_start: u64,
+
     pub(crate) file_accessor: FileAccessor,
 
     /// Filesystem backend used by [`Drop`] for the physical removal.
@@ -210,7 +220,25 @@ impl Drop for Inner {
                 let off = self
                     .punch_on_drop
                     .load(core::sync::atomic::Ordering::Acquire);
-                if off != u64::MAX {
+                // Reclaim only what this tree exclusively owns. A checkpoint
+                // hard-links blob files, and its captured SSTs still reference
+                // values in the prefix being reclaimed — punching a shared
+                // inode would zero live data inside an immutable snapshot. Same
+                // guard the delete path applies before truncating; a link-count
+                // probe that FAILS is treated as shared (fail closed), losing
+                // only reclaimable space.
+                let exclusively_owned = match self.fs.hard_link_count(&self.path) {
+                    Ok(n) => n <= 1,
+                    Err(e) => {
+                        log::warn!(
+                            "Skipping tight-space punch of blob file {:?} at {}: link-count probe failed: {e:?}",
+                            self.id,
+                            self.path.display(),
+                        );
+                        false
+                    }
+                };
+                if off != u64::MAX && exclusively_owned {
                     match data_section_start(&*self.fs, &self.path) {
                         Ok(data_start) if off > data_start => {
                             if let Err(e) =
@@ -287,24 +315,37 @@ impl BlobFile {
             .store(offset, core::sync::atomic::Ordering::Release);
     }
 
-    /// Re-opens this blob file as a DISTINCT [`Inner`] (its own file handle and a
-    /// fresh punch-on-drop atomic) over the same physical file. The tight-space
-    /// relocation loop installs the re-opened view in the new version and arms
-    /// the prior view to punch its consumed prefix once its readers drain, so a
-    /// stale blob file is reclaimed in place while the suffix keeps serving the
-    /// not-yet-relocated entries — the blob analog of [`Table::reopen_restricted`](crate::Table::reopen_restricted).
+    /// Re-opens this blob file as a DISTINCT [`Inner`] (its own file handle and
+    /// a fresh punch-on-drop atomic) restricted to `[frontier, end)`: the
+    /// tight-space relocation loop installs this view in the new version and
+    /// arms the PRIOR view to punch everything below the frontier once its
+    /// readers drain, so a stale blob file is reclaimed in place while the
+    /// suffix keeps serving the not-yet-relocated entries — the blob analog of
+    /// [`Table::reopen_restricted`](crate::Table::reopen_restricted).
+    ///
+    /// The digest is re-computed over that LIVE SUFFIX now, while the file is
+    /// still whole — the punch is what makes a whole-file digest unusable, and
+    /// reading the suffix fresh also folds in anything the relocation just
+    /// wrote. The frontier rides on the view, so `diff` / the snapshot encoder
+    /// persist it and integrity checks hash from there.
     ///
     /// # Errors
     ///
-    /// Propagates any error from re-opening the file.
+    /// Propagates any error from re-opening the file or hashing its suffix.
     #[cfg(feature = "std")]
-    pub(crate) fn reopen(&self) -> crate::Result<Self> {
-        super::recover_blob_file(
+    pub(crate) fn reopen_restricted(&self, frontier: u64) -> crate::Result<Self> {
+        let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum_from(
+            &*self.0.fs,
+            &self.0.path,
+            frontier,
+        )?);
+        super::recover_blob_file_from(
             &self.0.path,
             self.0.id,
-            self.0.checksum,
+            checksum,
             self.0.tree_id,
             &self.0.fs,
+            frontier,
         )
     }
 
@@ -326,10 +367,26 @@ impl BlobFile {
         self.0.id
     }
 
+    /// First LIVE byte of this view: `0` for a whole file, or the frontier a
+    /// tight-space relocation left after reclaiming the consumed prefix. The
+    /// recorded [`checksum`](Self::checksum) covers `[live_data_start, end)`,
+    /// so integrity checks hash from here rather than over the punched prefix.
+    #[must_use]
+    pub fn live_data_start(&self) -> u64 {
+        self.0.live_data_start
+    }
+
     /// Returns the full blob file checksum.
     #[must_use]
     pub fn checksum(&self) -> Checksum {
         self.0.checksum
+    }
+
+    /// The compression applied to this blob file's values (the descriptor a
+    /// reader uses to decode each record's on-disk bytes).
+    #[must_use]
+    pub(crate) fn compression(&self) -> crate::CompressionType {
+        self.0.meta.compression
     }
 
     /// Returns the blob file path.

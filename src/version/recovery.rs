@@ -119,6 +119,34 @@ fn parse_restrictions_section(
     Ok(map)
 }
 
+/// Parses the optional `blob_restrictions` section: `count: u32 |
+/// repeat(blob file id: u64, live-data frontier: u64)`. The blob analogue of
+/// [`parse_restrictions_section`], read under the same strictness — a lost or
+/// lowered frontier would make integrity checks hash the reclaimed (zeroed)
+/// prefix and condemn a healthy blob file. Absent section is handled by the
+/// caller (legitimate: no blob prefix was ever reclaimed).
+fn parse_blob_restrictions_section(
+    mut bytes: &[u8],
+) -> crate::Result<crate::HashMap<BlobFileId, u64>> {
+    const ERR: crate::Error = crate::Error::InvalidHeader("blob_restrictions section");
+    let r = &mut bytes;
+    let count = r.read_u32::<LittleEndian>().map_err(|_| ERR)?;
+    let mut map = crate::HashMap::default();
+    for _ in 0..count {
+        let id = r.read_u64::<LittleEndian>().map_err(|_| ERR)?;
+        let frontier = r.read_u64::<LittleEndian>().map_err(|_| ERR)?;
+        // Reject a duplicate id for the same reason the table section does: a
+        // second entry could silently lower an already-advanced frontier.
+        if map.insert(id, frontier).is_some() {
+            return Err(ERR);
+        }
+    }
+    if !r.is_empty() {
+        return Err(ERR);
+    }
+    Ok(map)
+}
+
 /// Reads and validates the CURRENT version pointer file.
 ///
 /// The file format is: `version_id: u64 | checksum: u128 | checksum_type: u8`
@@ -287,6 +315,13 @@ pub struct Recovery {
     /// here is rebuilt as a restricted view ([`super::Version::from_recovery`]);
     /// stale entries for tables no longer in the layout are simply never applied.
     pub restrictions: crate::HashMap<TableId, crate::UserKey>,
+    /// Per-blob-file live-data frontiers recovered from the snapshot and
+    /// advanced by replayed edits (`blob file id → first live byte`). A blob
+    /// file present here had its consumed prefix reclaimed in place, so its
+    /// recorded checksum covers only the suffix from this offset. The blob
+    /// analogue of [`Self::restrictions`]; stale entries for blob files no
+    /// longer present are simply never applied.
+    pub blob_restrictions: crate::HashMap<BlobFileId, u64>,
     /// Per-section counters describing how many records were dropped
     /// during this recovery. Always zero under
     /// [`ManifestRecoveryMode::AbsoluteConsistency`] (any corruption
@@ -387,6 +422,11 @@ impl Recovery {
         // applied by `from_recovery`, and the next snapshot rewrite drops them.
         for (id, key) in &edit.restrictions {
             self.restrictions.insert(*id, key.clone());
+        }
+
+        // Blob frontiers advance the same way, per relocation slice.
+        for (id, frontier) in &edit.blob_restrictions {
+            self.blob_restrictions.insert(*id, *frontier);
         }
 
         self.curr_version_id = edit.new_version_id;
@@ -1193,6 +1233,15 @@ pub fn recover(
         crate::HashMap::default()
     };
 
+    // The blob analogue, read under the same strictness: a lost frontier would
+    // make integrity checks hash a reclaimed (zeroed) prefix and condemn a
+    // healthy blob file.
+    let blob_restrictions = if archive.section("blob_restrictions").is_some() {
+        parse_blob_restrictions_section(&archive.read_section("blob_restrictions")?)?
+    } else {
+        crate::HashMap::default()
+    };
+
     let mut recovery = Recovery {
         tree_type: {
             if archive.section("tree_type").is_none() {
@@ -1214,6 +1263,7 @@ pub fn recover(
         blob_file_ids,
         gc_stats,
         restrictions,
+        blob_restrictions,
         stats: RecoveryStats {
             tables_dropped_to_tail,
             tables_dropped_to_corruption,
