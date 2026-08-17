@@ -1299,12 +1299,19 @@ fn try_salvage_table(
     Ok(SalvageOutcome::Salvaged(table))
 }
 
-/// Whether any salvage-dropped DATA extent of `source` opens with an all-zero
-/// window — the hole-punch signature. A real data block's opening bytes (its
-/// header and first entry) are never all zero, so a dropped extent that reads as
-/// zeros was physically reclaimed, not merely corrupted. Probing only the
-/// DROPPED extents keeps legitimate zero runs inside intact (checksum-clean)
-/// blocks from false-positiving.
+/// Whether any salvage-dropped DATA extent of `source` contains a
+/// block-aligned all-zero run — the hole-punch signature. A real data block's
+/// bytes are never all zero across a whole block, so such a run inside a
+/// dropped extent was physically reclaimed, not merely corrupted. Restricting
+/// the scan to the DROPPED extents keeps legitimate zero runs inside intact
+/// (checksum-clean) blocks from false-positiving.
+///
+/// The scan covers each dropped extent IN FULL, up to the next dropped extent
+/// or the end of the `data` section, not just its opening window: when the
+/// physical chain breaks, the salvage walk surrenders the whole remaining tail
+/// as ONE extent whose offset is the first DAMAGED (nonzero) frame, so punched
+/// blocks deeper inside it would otherwise stay invisible and the salvaged
+/// output would publish consumed records unrestricted.
 ///
 /// # Errors
 ///
@@ -1316,20 +1323,57 @@ fn dropped_data_extent_is_zeroed(
     source: &std::path::Path,
     dropped: &[crate::salvage::DroppedBlock],
 ) -> crate::Result<bool> {
-    const PROBE: usize = 64;
+    // Shortest run accepted as a punch. A hole is punched per DATA BLOCK, so a
+    // punched block contributes a zero run at least a block long — while inside
+    // an intact block a zero run is bounded by its framing (header, key/value
+    // lengths and checksums are never all zero across a whole block). The
+    // block-header length is the smallest possible block, so a run of that many
+    // zeros cannot come from one intact framed block.
+    const MIN_RUN: u64 = crate::table::block::Header::MIN_LEN as u64;
     if dropped.is_empty() {
         return Ok(false);
     }
-    let file = fs.open(source, &crate::fs::FsOpenOptions::new().read(true))?;
-    let len = crate::fs::FsFile::metadata(&*file)?.len;
-    for d in dropped {
-        if d.section != b"data" || d.offset >= len {
-            continue;
-        }
-        let n = usize::try_from(len - d.offset).unwrap_or(PROBE).min(PROBE);
-        let bytes = crate::file::read_exact(&*file, d.offset, n)?;
-        if bytes.iter().all(|&b| b == 0) {
-            return Ok(true);
+    let mut file = fs.open(source, &crate::fs::FsOpenOptions::new().read(true))?;
+    let file_len = crate::fs::FsFile::metadata(&*file)?.len;
+    // The `data` section's physical end bounds every extent: a dropped extent
+    // runs to the next dropped one or to that end, whichever comes first.
+    let data_end = match crate::sfa::Reader::from_reader(&mut file) {
+        Ok(reader) => reader
+            .toc()
+            .iter()
+            .find(|e| e.name() == b"data")
+            .map_or(file_len, |e| e.pos().saturating_add(e.len()).min(file_len)),
+        // No readable TOC (the very corruption salvage is recovering from):
+        // fall back to the file end — a superset of the data section, and the
+        // per-extent scan below is bounded by the next extent anyway.
+        Err(_) => file_len,
+    };
+    let mut starts: Vec<u64> = dropped
+        .iter()
+        .filter(|d| d.section == b"data" && d.offset < data_end)
+        .map(|d| d.offset)
+        .collect();
+    starts.sort_unstable();
+    starts.dedup();
+    const CHUNK: usize = 64 * 1024;
+    for (i, &start) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(data_end).min(data_end);
+        let mut offset = start;
+        let mut run: u64 = 0;
+        while offset < end {
+            let want = usize::try_from(end - offset).unwrap_or(CHUNK).min(CHUNK);
+            let bytes = crate::file::read_exact(&*file, offset, want)?;
+            for &b in bytes.iter() {
+                if b == 0 {
+                    run += 1;
+                    if run >= MIN_RUN {
+                        return Ok(true);
+                    }
+                } else {
+                    run = 0;
+                }
+            }
+            offset += want as u64;
         }
     }
     Ok(false)

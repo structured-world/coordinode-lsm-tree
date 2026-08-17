@@ -2040,6 +2040,67 @@ fn resurrection_reclaims_an_irregularly_punched_set_aside() -> crate::Result<()>
     Ok(())
 }
 
+/// The salvage-walk punch guard must scan the WHOLE surrendered extent, not
+/// just its opening window: when the physical chain breaks, the walk can
+/// surrender the entire remaining data tail as ONE dropped extent whose offset
+/// is the first DAMAGED (nonzero) frame, leaving punched blocks further down
+/// invisible to a 64-byte probe. With no sidecar and an intact first block,
+/// both punch guards would then pass and the salvaged output would publish the
+/// consumed records unrestricted, resurrecting superseded data.
+#[test]
+fn salvage_guard_finds_punched_blocks_deep_in_a_surrendered_extent() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    write_multiblock_sst(&sst, &fs)?;
+
+    // Punch a MIDDLE data block (not the first), so the file's opening bytes
+    // stay intact and the zeroed region sits deep inside the data section —
+    // exactly the shape a surrendered tail hides from an opening-window probe.
+    let table = recover_sst(sst.clone(), &fs)?;
+    let mut handles = Vec::new();
+    {
+        use crate::table::block_index::BlockIndex;
+        for handle in table.block_index.iter() {
+            let handle = handle?;
+            handles.push((handle.offset().0, handle.size()));
+        }
+    }
+    assert!(handles.len() >= 4, "fixture needs several data blocks");
+    let (mid_off, mid_size) = handles[handles.len() / 2];
+    drop(table);
+    memfs.punch_hole(&sst, mid_off, u64::from(mid_size))?;
+
+    // The whole data section, surrendered as ONE extent starting at its first
+    // byte (the shape `salvage_attempt` produces after a broken chain): the
+    // opening window is intact data, the punched block is deeper in.
+    let dropped = vec![crate::salvage::DroppedBlock {
+        offset: handles[0].0,
+        section: b"data".to_vec(),
+        reason: crate::salvage::DropReason::HeaderCorrupted("surrendered tail".to_owned()),
+        key_range: None,
+    }];
+    assert!(
+        super::dropped_data_extent_is_zeroed(&*fs, &sst, &dropped)?,
+        "a punched block deeper inside the surrendered extent must be found",
+    );
+
+    // An unpunched source must still not false-positive.
+    let clean = tables.join("1");
+    write_multiblock_sst(&clean, &fs)?;
+    assert!(
+        !super::dropped_data_extent_is_zeroed(&*fs, &clean, &dropped)?,
+        "an unpunched source must never be reported as punched",
+    );
+    Ok(())
+}
+
 /// The standalone out-of-band verify must not condemn a healthy restricted
 /// punched SST: with a valid colocated sidecar attesting the committed
 /// restriction, the leading zeroed (punched) region is the reclaimed prefix
