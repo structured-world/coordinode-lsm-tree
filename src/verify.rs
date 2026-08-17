@@ -1303,6 +1303,9 @@ fn restricted_data_start(
     0
 }
 
+/// Result of [`read_ecc_params_out_of_band`]: the arbitrated ECC state plus
+/// whether the two FULLY-decoded meta mirrors disagree in any field.
+#[cfg(feature = "std")]
 struct EccProbe {
     ecc: Option<ScrubEcc>,
     mirrors_diverge: bool,
