@@ -403,19 +403,47 @@ fn reclaim_resurrectable(
             continue;
         }
         fs.rename(&data, &target)?;
-        // Bring a companion sidecar back too (present only when a corrupt-but-
-        // existing sidecar traveled with the quarantine move; a corrupt sidecar
-        // is ignored by recovery, so this is harmless bookkeeping).
+        // Everything after the rename runs inside one fallible span: a failure
+        // must NOT return with the SST sitting in `tables/` unreferenced by the
+        // previously installed manifest — a caller that reacts to the failed
+        // repair by simply REOPENING the tree would then have orphan cleanup
+        // delete the only recovered copy. On failure the file (and any moved
+        // sidecar) rolls BACK into quarantine, marker intact, where the next
+        // resurrection repair rediscovers it; quarantine — not `tables/` — is
+        // the retry-safe location for THIS flow precisely because the marker
+        // machinery re-scans it. The marker is consumed only AFTER both syncs,
+        // so a crash inside the span also leaves a marked, reclaimable file
+        // (the un-synced rename either rolls back with its directory, or the
+        // file lands in `tables/`, is recovered, and the stale marker is swept
+        // next run).
         let data_sidecar = crate::restrict_bound::sidecar_path(&data);
-        if fs.exists(&data_sidecar)? {
-            let _ = fs.rename(&data_sidecar, &crate::restrict_bound::sidecar_path(&target));
+        let target_sidecar = crate::restrict_bound::sidecar_path(&target);
+        let commit = (|| -> crate::Result<()> {
+            // Bring a companion sidecar back too (present only when a
+            // corrupt-but-existing sidecar traveled with the quarantine move; a
+            // corrupt sidecar is ignored by recovery, so this is harmless
+            // bookkeeping).
+            if fs.exists(&data_sidecar)? {
+                let _ = fs.rename(&data_sidecar, &target_sidecar);
+            }
+            // Destination first, then source: the same crash ordering the
+            // quarantine / restore moves use — the reclaimed name must be
+            // durable before its quarantine entry's removal is.
+            fs.sync_directory_with(table_base_folder, sync_mode)?;
+            fs.sync_directory_with(&quarantine_dir, sync_mode)?;
+            Ok(())
+        })();
+        if let Err(e) = commit {
+            // Best-effort: undo both moves and re-sync; surface the original
+            // error. A rollback that itself fails leaves nothing more we can
+            // safely do here — the marker still names the file for the next run.
+            let _ = fs.rename(&target, &data);
+            let _ = fs.rename(&target_sidecar, &data_sidecar);
+            let _ = fs.sync_directory_with(&quarantine_dir, sync_mode);
+            let _ = fs.sync_directory_with(table_base_folder, sync_mode);
+            return Err(e);
         }
         let _ = fs.remove_file(&marker);
-        // Destination first, then source: the same crash ordering the
-        // quarantine / restore moves use — the reclaimed name must be durable
-        // before its quarantine entry's removal is.
-        fs.sync_directory_with(table_base_folder, sync_mode)?;
-        fs.sync_directory_with(&quarantine_dir, sync_mode)?;
         log::info!(
             "reclaimed resurrectable set-aside {} -> {}",
             data.display(),

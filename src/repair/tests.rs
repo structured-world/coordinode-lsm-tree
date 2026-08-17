@@ -2040,6 +2040,81 @@ fn resurrection_reclaims_an_irregularly_punched_set_aside() -> crate::Result<()>
     Ok(())
 }
 
+/// A reclaim whose post-rename step fails must not leave the SST in `tables/`
+/// unreferenced: the previously installed manifest omits it, so a caller that
+/// responds to the failed repair by simply REOPENING the tree lets orphan
+/// cleanup delete the only recovered copy. Every failure after the rename must
+/// roll the file back into quarantine, marker intact, where the next
+/// resurrection repair rediscovers it.
+#[test]
+fn reclaim_rolls_back_to_quarantine_when_a_post_rename_step_fails() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    build_partially_punched_prefix_sst(&memfs, &fs, &tables)?;
+
+    // Default repair sets the irregularly punched SST aside with a marker.
+    let first = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .repair_with_salvage(true)?;
+    assert_eq!(first.recovered, 0, "{first:?}");
+
+    // Fault the reclaim's first destination-directory sync (the only tables/
+    // sync before the scan starts on a resurrection run): the rename back into
+    // tables/ has already happened by then.
+    let fault = FaultFs::new(memfs.as_ref().clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .once(),
+    );
+    let second = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair_with_resurrection(true, true);
+    assert!(second.is_err(), "the faulted reclaim sync must surface");
+
+    let quarantine = root.join("repair-quarantine");
+    assert!(
+        !fs.exists(&tables.join("0"))?,
+        "the reclaimed SST must not be left in tables/ where a plain reopen's \
+         orphan cleanup would delete it",
+    );
+    assert!(
+        fs.exists(&quarantine.join("0"))?,
+        "the SST must be rolled back into quarantine",
+    );
+    assert!(
+        fs.exists(&quarantine.join("0.resurrectable"))?,
+        "the marker must survive the rollback so a retry rediscovers the file",
+    );
+
+    // The retry (no fault) reclaims and recovers it.
+    let third = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .repair_with_resurrection(true, true)?;
+    assert_eq!(third.recovered, 1, "{third:?}");
+    Ok(())
+}
+
 /// The pre-salvage first-bytes guard's set-aside (a FULLY punched, sidecar-less
 /// SST that fails whole-file recovery) is two-way as well: default repair sets
 /// it aside marked, and a later resurrection repair reclaims and recovers its
