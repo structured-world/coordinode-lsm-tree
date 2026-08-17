@@ -132,6 +132,25 @@ pub fn write(
         Some(enc) => enc.encrypt(&plain)?,
         None => plain,
     };
+    publish_raw(fs, table_path, &content, sync_mode)
+}
+
+/// Atomically publishes already-encoded sidecar `content` beside `table_path`
+/// through the synced `temp + rename` protocol [`write`] uses. Also the
+/// re-publish path for raw bytes captured from an existing sidecar (a
+/// quarantine restore whose direct sidecar rename failed), which must land
+/// verbatim — they are already serialized (and possibly encrypted).
+///
+/// # Errors
+///
+/// Propagates filesystem failures from the atomic write; a failed publish
+/// leaves no partial sidecar (the temp is removed best-effort).
+pub(crate) fn publish_raw(
+    fs: &dyn Fs,
+    table_path: &Path,
+    content: &[u8],
+    sync_mode: SyncMode,
+) -> crate::Result<()> {
     // Write to a sidecar-specific `.restrict-bound.tmp` and atomically rename it
     // onto the live path. A dedicated temp suffix (not a generic `.tmp_*`) lets
     // tree recovery recognize and sweep an abandoned temp in the tables folder by
@@ -143,7 +162,7 @@ pub fn write(
             &tmp,
             &FsOpenOptions::new().write(true).create(true).truncate(true),
         )?;
-        file.write_all(&content)?;
+        file.write_all(content)?;
         file.flush()?;
         crate::fs::FsFile::sync_all_with(&*file, sync_mode)?;
         drop(file);

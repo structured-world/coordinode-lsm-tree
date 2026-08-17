@@ -324,17 +324,69 @@ fn restore_quarantined(
     table_path: &std::path::Path,
     sync_mode: crate::fs::SyncMode,
 ) -> crate::Result<()> {
+    // Capture the companion sidecar's RAW bytes BEFORE anything moves: if the
+    // direct sidecar rename below fails after the SST is already restored, the
+    // bytes are re-published at the destination instead, so the exact bound is
+    // never stranded in quarantine (where the retried repair — which scans only
+    // `tables/` — would silently degrade the restored SST to the lossy
+    // geometry fallback). A TRANSIENT probe / read failure propagates while
+    // nothing has moved yet; a PERSISTENT one leaves no rescue copy, but the
+    // direct rename below (which never reads the content) may still succeed.
+    let quarantined_sidecar = crate::restrict_bound::sidecar_path(quarantined);
+    let sidecar_state: Option<(bool, Option<Vec<u8>>)> = if fs.exists(&quarantined_sidecar)? {
+        match read_raw_file(fs, &quarantined_sidecar) {
+            Ok(bytes) => Some((true, Some(bytes))),
+            Err(e) if is_transient_io(&e) => return Err(e),
+            Err(_) => Some((true, None)),
+        }
+    } else {
+        None
+    };
     fs.rename(quarantined, table_path)?;
     // Restore the companion `.restrict-bound` sidecar too, mirroring the move
     // `quarantine_file` made: a restored SST without its exact bound would fall
     // back to a conservative punch-geometry bound on the next open. Both files
     // share the same two directories, so the syncs below cover both.
-    let quarantined_sidecar = crate::restrict_bound::sidecar_path(quarantined);
-    if fs.exists(&quarantined_sidecar)? {
-        fs.rename(
-            &quarantined_sidecar,
-            &crate::restrict_bound::sidecar_path(table_path),
-        )?;
+    //
+    // The SST is NEVER rolled back into quarantine on a sidecar failure: a
+    // pair stranded there is invisible to the retried repair entirely (a
+    // silent whole-table loss), while a restored SST with a degraded bound
+    // stays recoverable through the deterministic geometry path.
+    if let Some((_, bytes)) = sidecar_state {
+        let dest_sidecar = crate::restrict_bound::sidecar_path(table_path);
+        if let Err(rename_err) = fs.rename(&quarantined_sidecar, &dest_sidecar) {
+            match bytes {
+                Some(bytes) => {
+                    // Fallback: re-publish the captured bytes atomically at the
+                    // destination. A failure here propagates (the SST stays
+                    // restored; the retry handles the boundless punched table
+                    // deterministically).
+                    log::warn!(
+                        "restoring {}: sidecar rename failed ({rename_err}); re-publishing \
+                         the captured bytes instead",
+                        table_path.display(),
+                    );
+                    crate::restrict_bound::publish_raw(fs, table_path, &bytes, sync_mode)?;
+                    // Best-effort: drop the now-duplicated quarantine copy so a
+                    // stale bound cannot linger beside future quarantines.
+                    let _ = fs.remove_file(&quarantined_sidecar);
+                }
+                None => {
+                    // The sidecar could be neither read nor moved: its bound is
+                    // unrecoverable through any mechanism. Continue — the
+                    // restore itself succeeded, and the retry resolves the
+                    // boundless punched table deterministically (geometry
+                    // bound, or set-aside when the punch pattern is
+                    // ambiguous). Aborting here would change nothing the
+                    // retry could use.
+                    log::error!(
+                        "restoring {}: sidecar is unreadable and its rename failed \
+                         ({rename_err}); the exact restriction bound is lost",
+                        table_path.display(),
+                    );
+                }
+            }
+        }
     }
     if let Some(dst_dir) = table_path.parent() {
         fs.sync_directory_with(dst_dir, sync_mode)?;
@@ -343,6 +395,16 @@ fn restore_quarantined(
         fs.sync_directory_with(src_dir, sync_mode)?;
     }
     Ok(())
+}
+
+/// Reads a small file's complete contents. Used to capture sidecar bytes before
+/// a restore move so they can be re-published if the direct rename fails.
+#[cfg(feature = "std")]
+fn read_raw_file(fs: &dyn crate::fs::Fs, path: &std::path::Path) -> crate::Result<Vec<u8>> {
+    let file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+    let len = crate::fs::FsFile::metadata(&*file)?.len;
+    let n = usize::try_from(len).map_err(|_| crate::Error::Unrecoverable)?;
+    Ok(crate::file::read_exact(&*file, 0, n)?.to_vec())
 }
 
 /// Whether an error is an UNAMBIGUOUSLY TRANSIENT (retryable) I/O failure, as

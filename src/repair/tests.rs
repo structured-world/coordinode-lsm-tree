@@ -2320,6 +2320,64 @@ fn quarantine_rolls_back_the_sst_when_the_sidecar_move_fails() -> crate::Result<
     Ok(())
 }
 
+/// A failed sidecar rename during `restore_quarantined` must not strand the
+/// exact bound in quarantine (where the retried repair never looks, silently
+/// degrading the restored SST to the lossy geometry fallback): the restore
+/// falls back to RE-PUBLISHING the sidecar bytes captured before the move, so
+/// it completes and a retry recovers the EXACT bound. The SST itself is never
+/// rolled back into quarantine — a pair stranded there is invisible to the
+/// retry entirely.
+#[test]
+fn restore_republishes_the_sidecar_when_its_rename_fails() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, SyncMode};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    std::fs::write(&sst, b"sst bytes")?;
+
+    let fs = FaultFs::new(StdFs);
+    crate::restrict_bound::write(&fs, &sst, None, 0, b"k00050", SyncMode::Normal)?;
+    let dest = super::quarantine_file(&fs, &tables, &sst, "0", SyncMode::Normal)?;
+    let dest_sidecar = crate::restrict_bound::sidecar_path(&dest);
+    assert!(
+        fs.exists(&dest_sidecar)?,
+        "precondition: sidecar quarantined"
+    );
+
+    // Fault the sidecar's direct rename on the way BACK (`Rename` matches the
+    // destination path; only the sidecar's destination contains
+    // "restrict-bound"). `.once()` so the fallback's own tmp → final rename
+    // succeeds.
+    fs.injector().arm(
+        FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::Other))
+            .on_path("restrict-bound")
+            .once(),
+    );
+
+    super::restore_quarantined(&fs, &dest, &sst, SyncMode::Normal)?;
+    assert!(fs.exists(&sst)?, "the SST is restored to tables/");
+    let src_sidecar = crate::restrict_bound::sidecar_path(&sst);
+    assert!(
+        fs.exists(&src_sidecar)?,
+        "the sidecar must be re-published beside the restored SST",
+    );
+    match crate::restrict_bound::read(&fs, &sst, None)? {
+        crate::restrict_bound::SidecarRead::Present(id, bound) => {
+            assert_eq!(id, 0);
+            assert_eq!(bound, b"k00050", "the re-published bound is byte-intact");
+        }
+        _ => panic!("the re-published sidecar must decode to the exact bound"),
+    }
+    assert!(
+        !fs.exists(&dest_sidecar)?,
+        "no stale sidecar may linger in quarantine after the re-publish",
+    );
+    Ok(())
+}
+
 /// Asserts a punched SST at `tables/0` was recovered RESTRICTED to the exact
 /// sidecar `bound` by default repair (resurrection off): the table joins the
 /// manifest, nothing is set aside, and a key is served IFF it is at or above the
