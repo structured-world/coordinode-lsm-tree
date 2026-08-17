@@ -2205,8 +2205,7 @@ fn verify_sst_file_ignores_zero_runs_inside_live_values() -> crate::Result<()> {
     use crate::{InternalValue, ValueType};
     use std::sync::Arc;
 
-    let memfs = Arc::new(MemFs::new());
-    let fs: Arc<dyn Fs> = memfs.clone();
+    let fs: Arc<dyn Fs> = Arc::new(MemFs::new());
     let root = std::path::absolute("/db")?;
     let tables = root.join("tables");
     fs.create_dir_all(&tables)?;
