@@ -1101,7 +1101,7 @@ fn dropped_data_extent_is_zeroed(
     }
     let file = fs.open(source, &crate::fs::FsOpenOptions::new().read(true))?;
     let len = crate::fs::FsFile::metadata(&*file)?.len;
-    for d in &*dropped {
+    for d in dropped {
         if d.section != b"data" || d.offset >= len {
             continue;
         }
