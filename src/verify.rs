@@ -485,6 +485,13 @@ impl core::error::Error for BlockVerifyError {
 
 /// A non-fatal finding from a scrub run: the data is intact, but something
 /// about a table could not be fully checked.
+///
+/// Warnings do not fail [`BlockVerifyReport::is_ok`], so any consumer that
+/// renders a verdict (a CLI, an operator report) MUST surface them alongside
+/// it: a bare "OK" over a non-empty warning list misreads "nothing broken
+/// among what was checkable" as "everything verified". The skipped surface
+/// each variant names (an unverifiable parity trailer, an unwalkable ECC
+/// section) is exactly where silent rot would otherwise hide.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum BlockVerifyWarning {
