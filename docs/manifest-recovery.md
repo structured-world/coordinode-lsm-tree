@@ -196,6 +196,37 @@ GC would have dropped that tombstone and re-exposed the key; retaining it keeps
 the unrestricted survivor's prefix fully shadowed, so nothing resurrects. Space is
 reclaimed by the hole punch, and a later normal compaction does the deferred GC.
 
+## Blob frontier resolution
+
+A tight-space blob defragmentation punches the consumed prefix of a stale blob
+file, `[data_start, frontier)`, and records the frontier in the manifest's
+blob-restrictions section — its only durable copy (blob files carry no
+sidecar). When the manifest is lost, recovery re-derives the frontier from the
+punch geometry itself. Unlike an SST's bound — a *key*, which the block-aligned
+punch cannot reproduce, hence the sidecar — the blob frontier is a *byte
+offset at a frame boundary*, so the geometry recovers it exactly: the punch
+zeroes precisely `[data_start, frontier)` and the first live frame's magic
+sits at the frontier.
+
+Anchoring is structural, never length-based. A zeroed run counts only when a
+valid frame decodes at its end, so a zero-filled value payload inside the live
+suffix (stepped over by frame framing) can never move the frontier. A
+partially completed punch — intact-but-consumed frames between holes — is
+walked hole by hole, and the frontier is the end of the last anchored run.
+Non-zero bytes that fail to decode end the walk at the last anchored frontier:
+content corruption is not punch geometry and surfaces exactly as it would on
+an unpunched file. A file whose first data byte is non-zero recovers with
+frontier `0` (whole file) at zero extra read cost; this also covers the
+committed-but-unpunched crash window, whose redundant prefix is superseded by
+the relocated copies and reclaimed later — the same safe fallback as an SST
+slice that committed without its sidecar.
+
+The recovered file's digest covers the live region, `[frontier, end)`, and the
+rebuilt snapshot re-persists the restriction from the recovered frontier, so a
+later relocation resumes exactly where the punch stopped. No resurrection
+question arises: blob bytes are reachable only through value handles, so a
+frontier recovered too low exposes nothing.
+
 ## Delete-mask resolution
 
 A columnar SST records positional deletions in a delete bitmap, and the meta

@@ -191,6 +191,16 @@ impl VersionEdit {
         // Omit the appended blob-frontier section entirely when there is nothing
         // to record, so the overwhelmingly common edit stays byte-identical to
         // what earlier writers produced (and decodes on them too).
+        //
+        // Deliberately NOT behind a bumped edit/manifest format version. A
+        // non-empty list is written only once a blob file's prefix has been
+        // physically hole-punched, and a binary without blob-restriction
+        // support cannot serve such a database anyway (it would read the
+        // punched region as zeros); its trailing-data rejection on this edit
+        // is the fail-fast that stops it from opening a store it cannot
+        // handle. Rolling back a binary stays possible for every database
+        // that never used tight-space blob reclaim — exactly the databases a
+        // rollback could still serve.
         if !self.blob_restrictions.is_empty() {
             out.write_u32::<LittleEndian>(u32_len(self.blob_restrictions.len())?)?;
             for (id, frontier) in &self.blob_restrictions {
