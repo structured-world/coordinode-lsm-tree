@@ -1678,9 +1678,12 @@ fn recover_blob_files(
         return Ok((blob_files, unreadable));
     }
 
-    // Guard against the same id surfacing twice (symlinked / aliased entries).
-    let mut seen_ids: crate::HashSet<crate::vlog::BlobFileId> = crate::HashSet::default();
-
+    // Collect and ORDER the candidates before recovering: `read_dir` order is
+    // FS-dependent, and duplicate-id resolution below must be deterministic.
+    // Per id, the writer's own `id.to_string()` spelling is the canonical file
+    // and sorts first, so a foreign alternate spelling (`01` for id 1) can
+    // never displace it regardless of directory iteration order.
+    let mut candidates: Vec<(crate::vlog::BlobFileId, PathBuf, String)> = Vec::new();
     for dirent in config.fs.read_dir(&blobs_folder)? {
         let crate::fs::FsDirEntry {
             path: blob_path,
@@ -1714,8 +1717,47 @@ fn recover_blob_files(
             ));
             continue;
         };
+        candidates.push((blob_id, blob_path, file_name));
+    }
+    candidates.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| {
+                (a.1 != blobs_folder.join(a.0.to_string()))
+                    .cmp(&(b.1 != blobs_folder.join(b.0.to_string())))
+            })
+            .then_with(|| a.2.cmp(&b.2))
+    });
 
-        if !seen_ids.insert(blob_id) {
+    // The path recovered for each id, for the duplicate-vs-alias decision.
+    let mut kept_paths: crate::HashMap<crate::vlog::BlobFileId, PathBuf> =
+        crate::HashMap::default();
+
+    for (blob_id, blob_path, file_name) in candidates {
+        if let Some(kept) = kept_paths.get(&blob_id) {
+            // A second directory entry for an already-recovered id. An ALIAS
+            // (symlink / case-folded spelling of the SAME physical file) is
+            // skipped silently. A DISTINCT physical file must be quarantined:
+            // the manifest records one checksum per id, and a stale duplicate
+            // left in `blobs/` would race the kept file for reads on the next
+            // open (directory iteration order picks the physical file). Same
+            // fail-on-quarantine-failure policy as every other set-aside.
+            if same_physical_file(&*config.fs, kept, &*config.fs, &blob_path) {
+                continue;
+            }
+            let dest = quarantine_file(
+                &*config.fs,
+                &blobs_folder,
+                &blob_path,
+                &file_name,
+                config.sync_mode,
+            )?;
+            unreadable.push((
+                blob_path,
+                format!(
+                    "duplicate of blob file id {blob_id}; quarantined to {}",
+                    dest.display()
+                ),
+            ));
             continue;
         }
 
@@ -1761,7 +1803,6 @@ fn recover_blob_files(
             // mirroring the table-recovery path.
             Err(e) if is_transient_io(&e) => return Err(e),
             Err(e) => {
-                seen_ids.remove(&blob_id);
                 quarantine_unreadable(blob_path, &file_name, &e, &mut unreadable)?;
                 continue;
             }
@@ -1775,7 +1816,6 @@ fn recover_blob_files(
             // Same transient/persistent split as the frontier probe above.
             Err(e) if is_transient_io(&e) => return Err(e),
             Err(e) => {
-                seen_ids.remove(&blob_id);
                 quarantine_unreadable(blob_path, &file_name, &e, &mut unreadable)?;
                 continue;
             }
@@ -1788,12 +1828,12 @@ fn recover_blob_files(
                 if let Some(p) = &config.recovery_progress {
                     p.blob_file_recovered();
                 }
+                kept_paths.insert(blob_id, blob_path);
                 blob_files.push(bf);
             }
             // Same transient/persistent split as the checksum read above.
             Err(e) if is_transient_io(&e) => return Err(e),
             Err(e) => {
-                seen_ids.remove(&blob_id);
                 quarantine_unreadable(blob_path, &file_name, &e, &mut unreadable)?;
             }
         }
