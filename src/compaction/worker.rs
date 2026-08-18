@@ -991,29 +991,6 @@ fn run_tight_space_compaction(
             }
             drop(produced);
 
-            // Re-open each stale blob file as a distinct Inner: the re-opened view
-            // replaces the original in the new version (same id), and the original
-            // — held only by prior snapshots after this — punches its consumed
-            // `[data_start, frontier)` prefix when it drains. Mirrors the SST
-            // `reopen_restricted` swap. Files with no consumption yet are skipped
-            // (nothing to punch, original stays installed).
-            let mut prior_to_punch: Vec<(BlobFile, u64)> = Vec::new();
-            if relocating {
-                for sf in &current_stale {
-                    if let Some(off) = resume_offsets.get(&sf.id()).copied() {
-                        // The re-opened view serves only `[off, end)`: the prior
-                        // view punches everything below once its readers drain.
-                        // Capture the digest over that live suffix NOW, while the
-                        // file is still whole, and record `off` as the view's
-                        // frontier — a whole-file digest would never match the
-                        // punched file, and integrity checks hash from the
-                        // frontier for exactly this reason.
-                        new_blobs.push(sf.reopen_restricted(off)?);
-                        prior_to_punch.push((sf.clone(), off));
-                    }
-                }
-            }
-
             // Serialize each surviving input's suffix-digest capture (inside
             // `reopen_restricted` below) and this slice's manifest install
             // against a concurrent in-place heal on the same table identity. A
@@ -1079,6 +1056,44 @@ fn run_tight_space_compaction(
                 }
                 e
             };
+
+            // Re-open each stale blob file as a distinct Inner: the re-opened view
+            // replaces the original in the new version (same id), and the original
+            // — held only by prior snapshots after this — punches its consumed
+            // `[data_start, frontier)` prefix when it drains. Mirrors the SST
+            // `reopen_restricted` swap. Files with no consumption yet are skipped
+            // (nothing to punch, original stays installed). Sits BELOW the
+            // rollback closure on purpose: this reopen hashes the stale file's
+            // live suffix, and a failure here — like the restricted SST reopen
+            // below — must retract the slice's finalized-but-unreferenced
+            // outputs, not leak them until an orphan sweep.
+            let mut prior_to_punch: Vec<(BlobFile, u64)> = Vec::new();
+            if relocating {
+                // Test-only failpoint: a restricted-blob reopen failure at this
+                // exact point (outputs finalized, install not yet run).
+                #[cfg(test)]
+                if opts
+                    .config
+                    .fail_tight_blob_reopen
+                    .swap(false, core::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(rollback(cancelled_compaction()));
+                }
+                for sf in &current_stale {
+                    if let Some(off) = resume_offsets.get(&sf.id()).copied() {
+                        // The re-opened view serves only `[off, end)`: the prior
+                        // view punches everything below once its readers drain.
+                        // Capture the digest over that live suffix NOW, while the
+                        // file is still whole, and record `off` as the view's
+                        // frontier — a whole-file digest would never match the
+                        // punched file, and integrity checks hash from the
+                        // frontier for exactly this reason.
+                        new_blobs.push(sf.reopen_restricted(off).map_err(rollback)?);
+                        prior_to_punch.push((sf.clone(), off));
+                    }
+                }
+            }
+
             let mut restricted_pairs: Vec<(TableId, Table)> = Vec::new();
             let mut removed_ids: Vec<TableId> = Vec::new();
             let mut next_views: Vec<Table> = Vec::new();

@@ -626,6 +626,15 @@ pub struct Config {
     #[cfg(all(test, feature = "std"))]
     pub(crate) fail_tight_after_first_slice: Arc<core::sync::atomic::AtomicBool>,
 
+    /// Test-only failpoint: when armed, a tight-space relocation fails at the
+    /// restricted-blob reopen step of its current slice — after the slice's
+    /// outputs were finalized but before the install — so the pre-install
+    /// rollback (retract the finalized-but-unreferenced outputs) can be
+    /// exercised deterministically. Behind `cfg(test)`, never compiled into
+    /// release builds.
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) fail_tight_blob_reopen: Arc<core::sync::atomic::AtomicBool>,
+
     /// Pre-trained zstd dictionary for dictionary compression.
     ///
     /// When set together with a [`CompressionType::ZstdDict`] compression
@@ -757,6 +766,8 @@ impl Default for Config {
             fail_one_subcompaction: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             #[cfg(all(test, feature = "std"))]
             fail_tight_after_first_slice: Arc::new(core::sync::atomic::AtomicBool::new(false)),
+            #[cfg(all(test, feature = "std"))]
+            fail_tight_blob_reopen: Arc::new(core::sync::atomic::AtomicBool::new(false)),
         }
     }
 }

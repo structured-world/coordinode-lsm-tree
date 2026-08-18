@@ -995,6 +995,124 @@ fn tight_space_blob_relocation_crash_after_first_slice_recovers_all_keys() -> cr
     Ok(())
 }
 
+/// A restricted-blob reopen failure mid-slice — after `run_subcompaction`
+/// finalized the slice's output SSTs and blob files, before the install
+/// references them — must ROLL BACK those outputs like every other
+/// pre-install failure. Leaking them until the next open's orphan sweep pins
+/// disk space under the exact condition that triggered tight-space in the
+/// first place: scarce free space.
+#[test]
+fn tight_space_blob_reopen_failure_rolls_back_the_slice_outputs() -> crate::Result<()> {
+    use core::sync::atomic::Ordering;
+
+    const N: u64 = 4_000;
+    let k = |i: u64| format!("key{i:08}");
+    let val = |i: u64, generation: u8| -> Vec<u8> {
+        let mut s = (i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (u64::from(generation) << 1);
+        (0..200u32)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "xorshift byte extraction; the high bits are intentionally dropped"
+                )]
+                let byte = (s >> 24) as u8;
+                byte
+            })
+            .collect()
+    };
+
+    let dir = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    let shared: Arc<dyn crate::fs::Fs> = Arc::new(mem.clone());
+    let config = Config::new(
+        &dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_shared_fs(Arc::clone(&shared))
+    .with_kv_separation(Some(
+        KvSeparationOptions::default()
+            .separation_threshold(64)
+            .age_cutoff(1.0)
+            .staleness_threshold(0.1)
+            .file_target_size(48 * 1024),
+    ));
+    let failpoint = config.fail_tight_blob_reopen.clone();
+    let tree = match config.open()? {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+
+    // Same fragmented-generation setup as the crash-after-first-slice test:
+    // gen 1 everywhere, gen 2 over the even keys, one ample-space merge to
+    // learn the fragmentation.
+    for i in 0..N {
+        tree.insert(k(i).as_bytes(), val(i, 1), i);
+    }
+    tree.flush_active_memtable(0)?;
+    for i in (0..N).step_by(2) {
+        tree.insert(k(i).as_bytes(), val(i, 2), N + i);
+    }
+    tree.flush_active_memtable(0)?;
+    let gc_watermark = 4 * N;
+    tree.index.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+    })?;
+    tree.major_compact(64 * 1024 * 1024, gc_watermark)?;
+
+    let used = tree.storage_stats()?.used_bytes;
+    mem.set_capacity(used + used / 4);
+    tree.index.update_runtime_config(|c| {
+        c.tight_space_compaction = true;
+    })?;
+
+    // Snapshot the on-disk file sets, then fail the FIRST slice's blob reopen.
+    let list_names = |folder: &std::path::Path| -> crate::Result<Vec<String>> {
+        let mut names: Vec<String> = if shared.exists(folder)? {
+            shared
+                .read_dir(folder)?
+                .into_iter()
+                .map(|e| e.file_name)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        names.sort();
+        Ok(names)
+    };
+    let tables_before = list_names(&dir.path().join("tables"))?;
+    let blobs_before = list_names(&dir.path().join("blobs"))?;
+
+    failpoint.store(true, Ordering::SeqCst);
+    assert!(
+        tree.major_compact(64 * 1024 * 1024, gc_watermark).is_err(),
+        "the injected blob-reopen failure must abort the compaction",
+    );
+    assert!(
+        !failpoint.load(Ordering::SeqCst),
+        "the failpoint should have fired and disarmed",
+    );
+
+    // The failed slice committed nothing, so its finalized outputs must be
+    // retracted — not leaked until an orphan sweep.
+    assert_eq!(
+        list_names(&dir.path().join("tables"))?,
+        tables_before,
+        "the aborted slice's output SSTs must be rolled back",
+    );
+    assert_eq!(
+        list_names(&dir.path().join("blobs"))?,
+        blobs_before,
+        "the aborted slice's output blob files must be rolled back",
+    );
+    Ok(())
+}
+
 /// A range tombstone fully below the GC watermark must be applied during a
 /// last-level compaction: its covered keys are physically dropped AND the
 /// tombstone itself is GC'd. If the keys were only suppressed (not dropped)
