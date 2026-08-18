@@ -551,6 +551,111 @@ fn tree_columnar_scan_masks_per_row_seqno_when_snapshot_straddles_segment() {
     assert_eq!(scan_keys(&tree, SeqNo::MAX), vec![key(0), key(1), key(2)]);
 }
 
+/// Reads a bytes column's row values (offset-table layout: `(rows+1)` u32
+/// offsets, then the payload).
+fn bytes_rows(col: &Column, rows: usize) -> Vec<Vec<u8>> {
+    let off = |i: usize| {
+        let b: [u8; 4] = col.data[i * 4..i * 4 + 4].try_into().unwrap();
+        u32::from_le_bytes(b) as usize
+    };
+    let payload = &col.data[(rows + 1) * 4..];
+    (0..rows)
+        .map(|i| payload[off(i)..off(i + 1)].to_vec())
+        .collect()
+}
+
+#[test]
+fn tree_columnar_scan_singleton_segment_dedups_overwritten_key() {
+    // A flush-produced columnar segment holds every MVCC version of an
+    // overwritten key. A SINGLETON segment (no overlapping neighbor) must still
+    // return one row per key — the newest visible version — exactly like the
+    // overlapping-merge path does.
+    let folder = get_tmp_folder();
+    let tree = open_columnar(folder.path());
+    tree.insert(key(0), b"old".to_vec(), 1);
+    tree.insert(key(1), b"only".to_vec(), 2);
+    tree.insert(key(0), b"new".to_vec(), 3); // overwrite k0
+    tree.flush_active_memtable(0).expect("flush");
+
+    // All-visible scan: each key exactly once, k0 at its newest value.
+    let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for batch in tree
+        .columnar_scan(&[COL_USER_KEY, COL_VALUE], None, SeqNo::MAX, ..)
+        .expect("scan")
+    {
+        let batch = batch.expect("batch");
+        let rows = batch.row_count as usize;
+        let key_col = batch
+            .columns
+            .iter()
+            .find(|c| c.column_id == COL_USER_KEY)
+            .expect("key column");
+        let val_col = batch
+            .columns
+            .iter()
+            .find(|c| c.column_id == COL_VALUE)
+            .expect("value column");
+        got.extend(
+            bytes_rows(key_col, rows)
+                .into_iter()
+                .zip(bytes_rows(val_col, rows)),
+        );
+    }
+    assert_eq!(
+        got,
+        vec![(key(0), b"new".to_vec()), (key(1), b"only".to_vec()),],
+        "singleton segment dedups an overwritten key to its newest version"
+    );
+
+    // A snapshot straddling the segment sees k0's OLD version (the newest one
+    // visible below the snapshot) — once, not zero or two times.
+    assert_eq!(
+        scan_keys(&tree, 2),
+        vec![key(0)],
+        "straddling snapshot keeps the newest VISIBLE version, once"
+    );
+}
+
+#[test]
+fn tree_columnar_scan_singleton_predicate_runs_after_dedup() {
+    // The newest version of k0 fails the predicate while its shadowed older
+    // version matches: the key must be dropped, not resurrected through the
+    // older matching version. Mirrors the overlapping-merge path's
+    // predicate-after-dedup ordering.
+    let folder = get_tmp_folder();
+    let tree = open_columnar(folder.path());
+    tree.insert(key(0), b"match".to_vec(), 1);
+    tree.insert(key(1), b"match".to_vec(), 2);
+    tree.insert(key(0), b"zzz-miss".to_vec(), 3); // newest k0 fails the predicate
+    tree.flush_active_memtable(0).expect("flush");
+
+    let pred = ColumnRangePredicate {
+        column_id: COL_VALUE,
+        lower: Some(b"match".to_vec()),
+        upper: Some(b"match".to_vec()),
+    };
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    for batch in tree
+        .columnar_scan(&[COL_USER_KEY], Some(&pred), SeqNo::MAX, ..)
+        .expect("scan")
+    {
+        let batch = batch.expect("batch");
+        let rows = batch.row_count as usize;
+        let key_col = batch
+            .columns
+            .iter()
+            .find(|c| c.column_id == COL_USER_KEY)
+            .expect("key column");
+        got.extend(bytes_rows(key_col, rows));
+    }
+    assert_eq!(
+        got,
+        vec![key(1)],
+        "a key whose newest version fails the predicate is dropped, not \
+         served from a shadowed older matching version"
+    );
+}
+
 #[test]
 fn tree_columnar_scan_applies_delete_bitmap_masking() {
     // A columnar segment carrying a positional delete-bitmap (built by relocating

@@ -21,10 +21,13 @@
 //! overlap:
 //!
 //! - A **singleton** group (a segment whose key range overlaps no other) whose
-//!   rows are all visible streams its
+//!   rows are all visible AND provably one-version-per-key (the writer's
+//!   distinct-key count equals its row count) streams its
 //!   [`Table::columnar_scan`](crate::Table::columnar_scan) batches verbatim —
 //!   zero-copy column-skip, no key decode, no row gather. A singleton the
-//!   snapshot straddles gets a per-row seqno mask first.
+//!   snapshot straddles gets a per-row seqno mask first, and one that can hold
+//!   several versions of a key (an overwritten key in a flush / compaction
+//!   product) additionally gets per-key newest-visible dedup.
 //! - An **overlapping** group is row-merged: the projection is augmented with the
 //!   intrinsic key + seqno columns, each segment's rows are visibility-masked and
 //!   tagged with their effective seqno, the union is sorted by `(key asc,
@@ -66,6 +69,12 @@ struct Segment {
     global: SeqNo,
     /// Whether every row is visible at the snapshot, or visibility is per-row.
     visibility: SeqnoVisibility,
+    /// Whether this segment can physically hold several MVCC versions of one
+    /// key (a flush / compaction product with an overwritten key). Proven
+    /// unique only when the writer's distinct-key count equals the row count;
+    /// legacy tables without the count are conservatively assumed to carry
+    /// duplicates. Gates the singleton path's per-key newest-visible dedup.
+    may_dup: bool,
 }
 
 /// One key-disjoint group of segments: either a single segment (streamed
@@ -141,11 +150,16 @@ impl Tree {
                 ));
             }
             let key_range = &table.metadata.key_range;
+            let may_dup = table
+                .metadata
+                .key_count
+                .is_none_or(|k| k != table.metadata.item_count);
             segments.push(Segment {
                 min: key_range.min().clone(),
                 max: key_range.max().clone(),
                 global: table.global_seqno(),
                 visibility,
+                may_dup,
                 table: table.clone(),
             });
         }
@@ -240,6 +254,9 @@ impl ColumnarScan {
     /// (when the snapshot straddles the segment) or outside the requested range
     /// (when the segment only partially overlaps it).
     fn process_singleton(&self, seg: &Segment) -> crate::Result<Vec<ColumnBatch>> {
+        if seg.may_dup {
+            return self.process_singleton_dedup(seg);
+        }
         let range_filter = !self.range_is_full();
         if seg.visibility == SeqnoVisibility::All && !range_filter {
             let mut out = seg
@@ -326,6 +343,128 @@ impl ColumnarScan {
             }
             if range_filter && !key_projected {
                 visible.columns.retain(|c| c.column_id != COL_USER_KEY);
+            }
+            if visible.row_count > 0 {
+                out.push(visible);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Singleton whose segment can physically hold several MVCC versions of one
+    /// key (`Segment::may_dup`): every version is a physical row, so the scan
+    /// must keep only the newest VISIBLE version per key instead of streaming
+    /// the segment verbatim. Rows are stored in internal-key order (key
+    /// ascending, seqno descending within a key), so within each key run the
+    /// invisible too-new versions come first and the first visible row is the
+    /// newest visible version; a run can span batch boundaries, so the last
+    /// kept key carries across batches. The predicate runs AFTER dedup
+    /// (mirroring [`Self::merge_group`]): a key whose newest version fails the
+    /// predicate is dropped, never served from an older matching version —
+    /// which also rules out predicate-driven zone-map block-skip here.
+    fn process_singleton_dedup(&self, seg: &Segment) -> crate::Result<Vec<ColumnBatch>> {
+        // Decode the columns the dedup needs even when the caller did not
+        // project them (dropped again at the end): the key column always, the
+        // seqno column when the snapshot straddles the segment, the predicate
+        // column for the after-dedup filter.
+        let key_projected = self.projection.contains(&COL_USER_KEY);
+        let seqno_projected = self.projection.contains(&COL_SEQNO);
+        let partial = seg.visibility == SeqnoVisibility::Partial;
+        let mut augmented = self.projection.clone();
+        if !key_projected {
+            augmented.push(COL_USER_KEY);
+        }
+        if partial && !seqno_projected {
+            augmented.push(COL_SEQNO);
+        }
+        let predicate_col = self.predicate.as_ref().map(|p| p.column_id);
+        let predicate_col_projected = predicate_col.is_some_and(|c| self.projection.contains(&c));
+        if let Some(pc) = predicate_col
+            && !augmented.contains(&pc)
+        {
+            augmented.push(pc);
+        }
+
+        // Visible iff `local < threshold` (the snapshot in this segment's local
+        // seqno space); `Partial` guarantees the subtraction is in range.
+        let threshold = self.seqno.saturating_sub(seg.global);
+        let range_filter = !self.range_is_full();
+        let cmp = self.comparator.as_ref();
+
+        let mut out = Vec::new();
+        // The user key of the last key run whose newest visible version was
+        // already emitted (or deliberately dropped by the range filter) —
+        // owned, because a run can span batch boundaries.
+        let mut last_key: Option<alloc::vec::Vec<u8>> = None;
+        for batch in seg.table.columnar_scan(&augmented, None)? {
+            if batch.row_count == 0 {
+                continue;
+            }
+            let key_col = batch
+                .columns
+                .iter()
+                .find(|c| c.column_id == COL_USER_KEY)
+                .ok_or(Error::InvalidHeader(
+                    "columnar_scan: dedup batch missing the key column",
+                ))?;
+            let seqno_col = if partial {
+                Some(
+                    batch
+                        .columns
+                        .iter()
+                        .find(|c| c.column_id == COL_SEQNO)
+                        .ok_or(Error::InvalidHeader(
+                            "columnar_scan: dedup batch missing the seqno column",
+                        ))?,
+                )
+            } else {
+                None
+            };
+
+            let mut mask = Vec::with_capacity(batch.row_count as usize);
+            for row in 0..batch.row_count {
+                let visible = match seqno_col {
+                    Some(seqno_col) => fixed_u64_row(&seqno_col.data, row)? < threshold,
+                    None => true,
+                };
+                if !visible {
+                    mask.push(false);
+                    continue;
+                }
+                let key = bytes_column_row(&key_col.data, batch.row_count, row)?;
+                if last_key
+                    .as_deref()
+                    .is_some_and(|p| cmp.compare(p, key) == core::cmp::Ordering::Equal)
+                {
+                    // A later visible version of an already-decided key run —
+                    // shadowed by the newest visible version above it.
+                    mask.push(false);
+                    continue;
+                }
+                // First visible row of a new key run = the newest visible
+                // version. Deciding the run here (even when the range filter
+                // drops the row) also drops its older versions above.
+                last_key = Some(key.to_vec());
+                mask.push(!range_filter || key_in_bounds(key, &self.lo, &self.hi, cmp));
+            }
+
+            let mut visible = filter_batch(&batch, &mask);
+            // The predicate runs on the deduped survivors only (see doc).
+            if let Some(pred) = self.predicate.as_ref() {
+                let pred_mask = pred.matching_rows(&visible);
+                visible = filter_batch(&visible, &pred_mask);
+            }
+            // Match the singleton contract: yield exactly the projected columns.
+            if !key_projected {
+                visible.columns.retain(|c| c.column_id != COL_USER_KEY);
+            }
+            if !seqno_projected {
+                visible.columns.retain(|c| c.column_id != COL_SEQNO);
+            }
+            if let Some(pc) = predicate_col
+                && !predicate_col_projected
+            {
+                visible.columns.retain(|c| c.column_id != pc);
             }
             if visible.row_count > 0 {
                 out.push(visible);

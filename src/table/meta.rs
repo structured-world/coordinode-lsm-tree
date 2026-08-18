@@ -55,6 +55,15 @@ pub struct ParsedMeta {
     pub(super) highest_kv_seqno: SeqNo,
     pub file_size: u64,
     pub item_count: u64,
+
+    /// Number of DISTINCT user keys the writer counted (the `key_count` meta
+    /// key), or `None` for tables written before this field was persisted.
+    /// Together with [`Self::item_count`] it proves key uniqueness:
+    /// `key_count == item_count` means no key carries more than one version,
+    /// so a scan can skip per-key newest-visible dedup. `None` is conservative
+    /// (duplicate versions assumed).
+    pub key_count: Option<u64>,
+
     pub tombstone_count: u64,
 
     /// Number of RANGE tombstones the writer emitted into the
@@ -541,6 +550,7 @@ impl ParsedMeta {
         // before the `delete_bitmap_len` cross-check would run.
         let delete_bitmap_len = read_opt_u64(b"descriptor#delete_bitmap_len")?;
         let delete_bitmap_hash = read_opt_u128(b"descriptor#delete_bitmap_hash")?;
+        let key_count = read_opt_u64(b"key_count")?;
 
         Ok(Self {
             id,
@@ -552,6 +562,7 @@ impl ParsedMeta {
             highest_kv_seqno,
             file_size,
             item_count,
+            key_count,
             tombstone_count,
             range_tombstone_count,
             delete_bitmap_len,
