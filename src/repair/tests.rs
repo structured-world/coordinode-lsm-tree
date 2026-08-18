@@ -2105,6 +2105,76 @@ fn salvage_guard_finds_punched_blocks_deep_in_a_surrendered_extent() -> crate::R
     Ok(())
 }
 
+/// The punch guard must be STRUCTURE-anchored, not length-anchored: a zero run
+/// counts as punch evidence only when it ends where intact structure begins (a
+/// decodable block header, the extent end, or the data-section end). SST
+/// values are arbitrary bytes, so an ordinary unpunched table whose value
+/// carries a header-sized run of zeros inside a surrendered extent must NOT be
+/// classified as punched — under the default no-resurrection policy that
+/// false positive quarantines an otherwise usable salvage as bound-lost.
+#[test]
+fn salvage_guard_ignores_zero_filled_values_inside_a_surrendered_extent() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{InternalValue, ValueType};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+
+    // An UNPUNCHED table whose values embed zero runs longer than a block
+    // header, framed mid-payload by non-zero bytes on both sides.
+    let mut w =
+        crate::table::Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+    for i in 0..32u32 {
+        let mut value = vec![b'x'; 8];
+        value.extend_from_slice(&[0u8; 64]);
+        value.extend_from_slice(b"tail");
+        w.write(InternalValue::from_components(
+            format!("k{i:05}").into_bytes(),
+            value,
+            u64::from(i) + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(w.finish()?.is_some(), "the SST is non-empty");
+
+    // Self-check the fixture: the raw data region really does contain a zero
+    // run at least MIN_RUN long (no compression swallowed it), so a
+    // length-anchored guard WOULD have fired here.
+    {
+        let file = fs.open(&sst, &crate::fs::FsOpenOptions::new().read(true))?;
+        let len = crate::fs::FsFile::metadata(&*file)?.len;
+        let bytes = crate::file::read_exact(&*file, 0, usize::try_from(len).unwrap_or(0))?;
+        let min_run = crate::table::block::Header::MIN_LEN;
+        let has_run = bytes.windows(min_run).any(|w| w.iter().all(|&b| b == 0));
+        assert!(has_run, "fixture must embed a header-sized zero run");
+    }
+
+    // The whole data section surrendered as one extent from its first byte.
+    let table = recover_sst(sst.clone(), &fs)?;
+    let first_off = {
+        use crate::table::block_index::BlockIndex;
+        let mut it = table.block_index.iter();
+        it.next().expect("at least one block")?.offset().0
+    };
+    drop(table);
+    let dropped = vec![crate::salvage::DroppedBlock {
+        offset: first_off,
+        section: b"data".to_vec(),
+        reason: crate::salvage::DropReason::HeaderCorrupted("surrendered tail".to_owned()),
+        key_range: None,
+    }];
+    assert!(
+        !super::dropped_data_extent_is_zeroed(&*fs, &sst, &dropped)?,
+        "a zero-filled value inside the surrendered extent is not punch evidence",
+    );
+    Ok(())
+}
+
 /// The standalone out-of-band verify must not condemn a healthy restricted
 /// punched SST: with a valid colocated sidecar attesting the committed
 /// restriction, the leading zeroed (punched) region is the reclaimed prefix

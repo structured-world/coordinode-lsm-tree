@@ -1329,11 +1329,14 @@ fn try_salvage_table(
 }
 
 /// Whether any salvage-dropped DATA extent of `source` contains a
-/// block-aligned all-zero run — the hole-punch signature. A real data block's
-/// bytes are never all zero across a whole block, so such a run inside a
-/// dropped extent was physically reclaimed, not merely corrupted. Restricting
-/// the scan to the DROPPED extents keeps legitimate zero runs inside intact
-/// (checksum-clean) blocks from false-positiving.
+/// structure-anchored all-zero run — the hole-punch signature. A real data
+/// block's bytes are never all zero across a whole block, so a header-length
+/// run that ends where intact structure begins (a decodable block header, the
+/// next dropped extent, or the data-section end) was physically reclaimed, not
+/// merely corrupted. Restricting the scan to the DROPPED extents keeps
+/// legitimate zero runs inside intact (checksum-clean) blocks from
+/// false-positiving, and the structural anchor keeps header-sized zero runs
+/// inside a damaged extent's VALUE payloads from doing the same.
 ///
 /// The scan covers each dropped extent IN FULL, up to the next dropped extent
 /// or the end of the `data` section, not just its opening window: when the
@@ -1384,6 +1387,26 @@ fn dropped_data_extent_is_zeroed(
         .collect();
     starts.sort_unstable();
     starts.dedup();
+
+    // A qualifying run must additionally be STRUCTURE-ANCHORED: it counts as
+    // punch evidence only when it ends where intact structure begins — a
+    // decodable block header (magic + type + the header's own checksum), the
+    // next dropped extent, or the data-section end. SST values are arbitrary
+    // bytes, so a header-sized zero run INSIDE a damaged extent's payload is
+    // otherwise indistinguishable from a punch by length alone, and a bare
+    // length test would quarantine an otherwise usable salvage as bound-lost
+    // under the default no-resurrection policy.
+    let header_decodes_at = |pos: u64| -> crate::Result<bool> {
+        use crate::coding::Decode;
+        let max = crate::table::block::Header::MAX_LEN as u64;
+        let want = usize::try_from(file_len.saturating_sub(pos).min(max)).unwrap_or(0);
+        if want < crate::table::block::Header::MIN_LEN {
+            return Ok(false);
+        }
+        let bytes = crate::file::read_exact(&*file, pos, want)?;
+        Ok(crate::table::block::Header::decode_from(&mut &bytes[..]).is_ok())
+    };
+
     const CHUNK: usize = 64 * 1024;
     for (i, &start) in starts.iter().enumerate() {
         let end = starts.get(i + 1).copied().unwrap_or(data_end).min(data_end);
@@ -1392,17 +1415,23 @@ fn dropped_data_extent_is_zeroed(
         while offset < end {
             let want = usize::try_from(end - offset).unwrap_or(CHUNK).min(CHUNK);
             let bytes = crate::file::read_exact(&*file, offset, want)?;
-            for &b in bytes.iter() {
+            for (j, &b) in bytes.iter().enumerate() {
                 if b == 0 {
                     run += 1;
-                    if run >= MIN_RUN {
+                } else {
+                    if run >= MIN_RUN && header_decodes_at(offset + j as u64)? {
                         return Ok(true);
                     }
-                } else {
                     run = 0;
                 }
             }
             offset += want as u64;
+        }
+        // A run reaching the extent end needs no header anchor: it terminates
+        // at the next dropped extent or the data-section end, both of which
+        // are structural boundaries themselves.
+        if run >= MIN_RUN {
+            return Ok(true);
         }
     }
     Ok(false)
