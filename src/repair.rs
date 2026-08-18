@@ -748,13 +748,7 @@ fn record_best(
     path: &std::path::Path,
     file_name: &str,
     sync_mode: crate::fs::SyncMode,
-    progress: Option<&crate::RecoveryProgress>,
 ) -> crate::Result<()> {
-    // Counts candidate recordings (per recovered FILE): a duplicate id later
-    // displaced by a better copy was still a recovered file.
-    if let Some(p) = progress {
-        p.table_recovered();
-    }
     let candidate = TableCandidate {
         table,
         complete,
@@ -2390,7 +2384,6 @@ fn repair_tree(
                                 &table_path,
                                 &file_name,
                                 config.sync_mode,
-                                config.recovery_progress.as_deref(),
                             )?;
                         }
                         RepairKeepDecision::Quarantine(reason) => {
@@ -2483,7 +2476,6 @@ fn repair_tree(
                                         &table_path,
                                         &file_name,
                                         config.sync_mode,
-                                        config.recovery_progress.as_deref(),
                                     )?;
                                 }
                                 Ok(SalvageOutcome::Unusable | SalvageOutcome::PunchedBoundLost) => {
@@ -2537,7 +2529,6 @@ fn repair_tree(
                         &table_path,
                         &file_name,
                         config.sync_mode,
-                        config.recovery_progress.as_deref(),
                     )?;
                 }
                 Err(e) if salvage => {
@@ -2685,7 +2676,6 @@ fn repair_tree(
                                 &table_path,
                                 &file_name,
                                 config.sync_mode,
-                                config.recovery_progress.as_deref(),
                             )?;
                         }
                         Ok(SalvageOutcome::Unusable) => {
@@ -2860,12 +2850,18 @@ fn repair_tree(
     }
 
     // `salvaged` is a subset of `recovered`, so derive it from the tables that
-    // survived every filter above.
+    // survived every filter above. The live progress counter follows the same
+    // rule: a candidate displaced by deduplication or dropped by dependency
+    // filtering never counts, so the snapshot cannot claim more tables than
+    // the rebuilt manifest holds.
     let salvaged = recovered_tables
         .iter()
         .filter(|(_, complete)| !complete)
         .count();
     let recovered_tables: Vec<Table> = recovered_tables.into_iter().map(|(t, _)| t).collect();
+    if let Some(p) = &config.recovery_progress {
+        p.tables_recovered_add(recovered_tables.len() as u64);
+    }
 
     // Each recovered table becomes its own single-table L0 run. L0 permits
     // overlapping runs, so this is always legal regardless of key overlap;

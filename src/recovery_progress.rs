@@ -79,9 +79,14 @@ impl RecoveryProgress {
         self.tables_discovered.fetch_add(1, Relaxed);
     }
 
-    /// One table recovered into the rebuilt manifest (whole or salvaged).
-    pub(crate) fn table_recovered(&self) {
-        self.tables_recovered.fetch_add(1, Relaxed);
+    /// Tables recovered into the rebuilt manifest (whole or salvaged).
+    /// Published once the survivor set is final — after duplicate displacement
+    /// and blob-dependency filtering — so the counter never exceeds what the
+    /// manifest actually holds.
+    pub(crate) fn tables_recovered_add(&self, n: u64) {
+        if n > 0 {
+            self.tables_recovered.fetch_add(n, Relaxed);
+        }
     }
 
     /// One blob file recognized in the scan (by its numeric id).

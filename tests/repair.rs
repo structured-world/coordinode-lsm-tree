@@ -1573,6 +1573,9 @@ fn repair_excludes_tables_referencing_an_unrecoverable_blob_file() -> lsm_tree::
 /// while `recovered` is 0 falsely tells an operator that data was restored.
 #[test]
 fn repair_report_drops_salvaged_count_for_blob_filtered_tables() -> lsm_tree::Result<()> {
+    use lsm_tree::RecoveryProgress;
+    use std::sync::Arc;
+
     let dir = lsm_tree::get_tmp_folder();
     let big = |i: u64| format!("{i:08}").repeat(512);
 
@@ -1604,12 +1607,14 @@ fn repair_report_drops_salvaged_count_for_blob_filtered_tables() -> lsm_tree::Re
     }
     nuke_manifest(dir.path())?;
 
+    let progress = Arc::new(RecoveryProgress::default());
     let report = Config::new(
         dir.path(),
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
     .with_kv_separation(Some(KvSeparationOptions::default()))
+    .with_recovery_progress(progress.clone())
     .repair_with_salvage(true)?;
 
     assert_eq!(
@@ -1620,6 +1625,19 @@ fn repair_report_drops_salvaged_count_for_blob_filtered_tables() -> lsm_tree::Re
         report.salvaged, 0,
         "salvaged is a subset of recovered, so a quarantined salvage must not \
          count: {report:?}",
+    );
+    // The live counters follow the same rule: a candidate displaced by
+    // deduplication or dropped by dependency filtering never counts as
+    // recovered, so the progress snapshot cannot claim more tables than the
+    // rebuilt manifest holds.
+    let snap = progress.snapshot();
+    assert!(
+        snap.tables_discovered >= 1,
+        "the table file was discovered: {snap:?}"
+    );
+    assert_eq!(
+        snap.tables_recovered, 0,
+        "a blob-filtered salvage must not count as recovered: {snap:?}",
     );
     Ok(())
 }
