@@ -2113,13 +2113,13 @@ fn salvage_guard_finds_punched_blocks_deep_in_a_surrendered_extent() -> crate::R
 /// classified as punched — under the default no-resurrection policy that
 /// false positive quarantines an otherwise usable salvage as bound-lost.
 #[test]
+#[expect(clippy::expect_used, reason = "test code")]
 fn salvage_guard_ignores_zero_filled_values_inside_a_surrendered_extent() -> crate::Result<()> {
     use crate::fs::{Fs, MemFs};
     use crate::{InternalValue, ValueType};
     use std::sync::Arc;
 
-    let memfs = Arc::new(MemFs::new());
-    let fs: Arc<dyn Fs> = memfs.clone();
+    let fs: Arc<dyn Fs> = Arc::new(MemFs::new());
     let root = std::path::absolute("/db")?;
     let tables = root.join("tables");
     fs.create_dir_all(&tables)?;
