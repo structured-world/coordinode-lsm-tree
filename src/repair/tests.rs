@@ -5777,7 +5777,7 @@ fn repair_excludes_tables_with_handles_below_a_blob_frontier() -> crate::Result<
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .with_shared_fs(memfs.clone())
+    .with_shared_fs(memfs)
     .with_kv_separation(Some(
         KvSeparationOptions::default().separation_threshold(16),
     ))
