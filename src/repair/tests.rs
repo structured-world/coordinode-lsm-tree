@@ -5630,6 +5630,114 @@ fn blob_recovery_derives_the_frontier_of_a_punched_blob_file() -> crate::Result<
     Ok(())
 }
 
+/// A persistently unreadable blob file must be QUARANTINED, not left in
+/// `blobs/`: the rebuilt manifest omits it, so the next successful open's
+/// orphan sweep would DELETE the reported path and the operator would lose the
+/// only source from which intact records might later be salvaged — the same
+/// treatment the unreadable-SST path already applies.
+#[test]
+fn blob_recovery_quarantines_a_persistently_unreadable_blob_file() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, SequenceNumberCounter};
+    use std::io::Write;
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    memfs.create_dir_all(&blobs)?;
+    {
+        // A parseable id whose content is not a blob file (no SFA trailer):
+        // persistently unreadable, not transient.
+        let mut f = memfs.open(
+            &blobs.join("3"),
+            &crate::fs::FsOpenOptions::new().write(true).create(true),
+        )?;
+        f.write_all(b"not a blob file")?;
+    }
+
+    let config = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs.clone());
+
+    let (files, unreadable) = super::recover_blob_files(&config)?;
+    assert!(files.is_empty(), "nothing recoverable");
+    assert_eq!(unreadable.len(), 1, "the bad blob is reported");
+    assert!(
+        !memfs.exists(&blobs.join("3"))?,
+        "the unreadable blob must be moved out of blobs/ so the next open's \
+         orphan sweep cannot delete it"
+    );
+    assert!(
+        memfs.exists(&root.join("repair-quarantine").join("3"))?,
+        "the unreadable blob is preserved in the quarantine directory"
+    );
+    Ok(())
+}
+
+/// Two directory entries that parse to the SAME blob id (`1` and `01`) but are
+/// DISTINCT physical files: the duplicate must be quarantined, not silently
+/// left in `blobs/` — the rebuilt manifest records one checksum per id, while
+/// a leftover stale duplicate would race the kept file for reads on the next
+/// open (directory iteration order picks the physical file). The canonical
+/// name (the writer's own `id.to_string()` spelling) is the one kept.
+#[test]
+fn blob_recovery_quarantines_a_duplicate_blob_id() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    memfs.create_dir_all(&blobs)?;
+
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    // Both are VALID blob files with different content, parsing to id 1.
+    for (name, val) in [("1", b"canonical".as_slice()), ("01", b"stale-dup")] {
+        let mut w = crate::vlog::blob_file::writer::Writer::new(blobs.join(name), 1, 0, &*fs_dyn)?;
+        w.write(b"k", 1, val)?;
+        w.finish()?;
+    }
+
+    let config = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs.clone());
+
+    let (files, unreadable) = super::recover_blob_files(&config)?;
+    assert_eq!(files.len(), 1, "one blob file per id");
+    assert_eq!(
+        unreadable.len(),
+        1,
+        "the displaced duplicate is reported: {unreadable:?}"
+    );
+    assert!(
+        memfs.exists(&blobs.join("1"))?,
+        "the canonical spelling is the kept file"
+    );
+    assert!(
+        !memfs.exists(&blobs.join("01"))?,
+        "the duplicate must be moved out of blobs/, not silently left behind"
+    );
+    // The recorded checksum matches the KEPT file.
+    let kept = crate::Checksum::from_raw(super::compute_table_checksum(
+        &*config.fs,
+        &blobs.join("1"),
+    )?);
+    assert_eq!(
+        files.first().map(crate::vlog::BlobFile::checksum),
+        Some(kept),
+        "the manifest checksum must describe the kept canonical file"
+    );
+    Ok(())
+}
+
 /// A TRANSIENT read failure while reading a blob file (the frontier probe or
 /// the streaming checksum) must PROPAGATE, not land in `unreadable`: recording
 /// it there installs a manifest that omits the blob, and the next open's

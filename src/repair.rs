@@ -1730,6 +1730,28 @@ fn recover_blob_files(
         // Rebuilding with frontier 0 would instead leave a later relocation
         // scan starting inside the punched (zeroed) prefix. An unpunched file
         // short-circuits to 0 on its first (non-zero) data byte.
+        // Persistent per-file failure: QUARANTINE before recording unreadable,
+        // mirroring the unreadable-SST path. The rebuilt manifest omits this
+        // file, so a later `Tree::open` would orphan-clean (DELETE) it from
+        // `blobs/`, contradicting the report's promise that an operator can
+        // still investigate / salvage it. A FAILED quarantine aborts the whole
+        // repair (the file must not be both omitted and left in place).
+        let quarantine_unreadable = |blob_path: PathBuf,
+                                     file_name: &str,
+                                     e: &crate::Error,
+                                     unreadable: &mut UnreadableFiles|
+         -> crate::Result<()> {
+            let dest = quarantine_file(
+                &*config.fs,
+                &blobs_folder,
+                &blob_path,
+                file_name,
+                config.sync_mode,
+            )?;
+            unreadable.push((blob_path, format!("{e}; quarantined to {}", dest.display())));
+            Ok(())
+        };
+
         let frontier = match derive_blob_frontier(&config.fs, &blob_path, blob_id) {
             Ok(f) => f,
             // A TRANSIENT read (flaky I/O) is retryable: recording the blob
@@ -1740,7 +1762,7 @@ fn recover_blob_files(
             Err(e) if is_transient_io(&e) => return Err(e),
             Err(e) => {
                 seen_ids.remove(&blob_id);
-                unreadable.push((blob_path, e.to_string()));
+                quarantine_unreadable(blob_path, &file_name, &e, &mut unreadable)?;
                 continue;
             }
         };
@@ -1754,7 +1776,7 @@ fn recover_blob_files(
             Err(e) if is_transient_io(&e) => return Err(e),
             Err(e) => {
                 seen_ids.remove(&blob_id);
-                unreadable.push((blob_path, e.to_string()));
+                quarantine_unreadable(blob_path, &file_name, &e, &mut unreadable)?;
                 continue;
             }
         };
@@ -1772,7 +1794,7 @@ fn recover_blob_files(
             Err(e) if is_transient_io(&e) => return Err(e),
             Err(e) => {
                 seen_ids.remove(&blob_id);
-                unreadable.push((blob_path, e.to_string()));
+                quarantine_unreadable(blob_path, &file_name, &e, &mut unreadable)?;
             }
         }
     }
