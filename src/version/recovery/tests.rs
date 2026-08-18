@@ -118,7 +118,7 @@ fn apply_grows_levels_for_a_higher_index() {
 }
 
 #[test]
-fn apply_edit_merges_and_advances_restrictions() {
+fn apply_edit_advances_restrictions_per_slice() {
     let mut rec = recovery_with(1, vec![vec![vec![rtable(1, 10)]]]);
     assert!(rec.restrictions.is_empty(), "starts unrestricted");
 
@@ -153,7 +153,7 @@ fn apply_edit_merges_and_advances_restrictions() {
 /// overwrites the earlier one. Losing this would make a reopened tree hash a
 /// reclaimed blob file whole and report it corrupt.
 #[test]
-fn apply_edit_merges_and_advances_blob_restrictions() {
+fn apply_edit_advances_blob_restrictions_per_slice() {
     let mut rec = recovery_with(1, vec![vec![vec![rtable(1, 10)]]]);
     assert!(rec.blob_restrictions.is_empty(), "starts unreclaimed");
 
@@ -175,6 +175,81 @@ fn apply_edit_merges_and_advances_blob_restrictions() {
         rec.blob_restrictions.get(&9),
         Some(&65_536),
         "a later slice's higher frontier overwrites the earlier one",
+    );
+}
+
+/// Every edit carries the FULL restriction set of its version (the encoder
+/// derives it by iterating the version's tables / blob files), so replay must
+/// REPLACE the maps, not merge into them: an entry absent from a later edit
+/// was lifted. A merged-in stale blob frontier is not harmless — blob file ids
+/// are reused (the id counter reseeds from the maximum live id), so a removed
+/// restricted file's frontier would attach to an unrelated whole file added
+/// later under the same id, making integrity checks hash only its suffix.
+#[test]
+fn apply_edit_clears_a_removed_blob_files_frontier() {
+    let mut rec = recovery_with(1, vec![vec![vec![rtable(1, 10)]]]);
+
+    rec.apply_edit(&VersionEdit {
+        new_version_id: 2,
+        added_blob_files: vec![AddedBlobFile { id: 9, checksum: 1 }],
+        blob_restrictions: vec![(9, 4_096)],
+        ..Default::default()
+    })
+    .expect("apply");
+    assert_eq!(rec.blob_restrictions.get(&9), Some(&4_096));
+
+    // The restricted file is removed; the edit's full frontier set is empty.
+    rec.apply_edit(&VersionEdit {
+        new_version_id: 3,
+        removed_blob_file_ids: vec![9],
+        ..Default::default()
+    })
+    .expect("apply");
+    assert!(
+        rec.blob_restrictions.is_empty(),
+        "a removed blob file's frontier must not outlive it: {:?}",
+        rec.blob_restrictions,
+    );
+
+    // Id 9 is reused by a NEW, unrestricted whole file: it must reopen with
+    // frontier 0, not the removed file's stale suffix frontier.
+    rec.apply_edit(&VersionEdit {
+        new_version_id: 4,
+        added_blob_files: vec![AddedBlobFile { id: 9, checksum: 2 }],
+        ..Default::default()
+    })
+    .expect("apply");
+    assert_eq!(
+        rec.blob_restrictions.get(&9),
+        None,
+        "a reused id's whole replacement file must not inherit a stale frontier",
+    );
+}
+
+/// The SST analogue: a table whose restriction was lifted (the punched
+/// survivor was rewritten away) stops appearing in later edits' full sets, so
+/// replay must drop its entry rather than carry it forever.
+#[test]
+fn apply_edit_drops_restrictions_absent_from_a_later_edit() {
+    let mut rec = recovery_with(1, vec![vec![vec![rtable(1, 10)]]]);
+
+    rec.apply_edit(&VersionEdit {
+        new_version_id: 2,
+        restrictions: vec![(1, crate::UserKey::from(&b"ccc"[..]))],
+        ..Default::default()
+    })
+    .expect("apply");
+    assert!(rec.restrictions.contains_key(&1));
+
+    rec.apply_edit(&VersionEdit {
+        new_version_id: 3,
+        ..Default::default()
+    })
+    .expect("apply");
+    assert!(
+        rec.restrictions.is_empty(),
+        "a lifted restriction must not survive replay: {:?}",
+        rec.restrictions,
     );
 }
 

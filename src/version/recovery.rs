@@ -311,16 +311,19 @@ pub struct Recovery {
     pub blob_file_ids: Vec<(BlobFileId, Checksum)>,
     pub gc_stats: crate::blob_tree::FragmentationMap,
     /// Per-table tight-space key-range lower bounds recovered from the snapshot
-    /// `restrictions` section and advanced by replayed edits. A table id present
-    /// here is rebuilt as a restricted view ([`super::Version::from_recovery`]);
-    /// stale entries for tables no longer in the layout are simply never applied.
+    /// `restrictions` section and REPLACED wholesale by each replayed edit
+    /// (every edit carries its version's full set). A table id present here is
+    /// rebuilt as a restricted view ([`super::Version::from_recovery`]); a
+    /// lifted restriction is absent from the next edit's set and so dropped.
     pub restrictions: crate::HashMap<TableId, crate::UserKey>,
     /// Per-blob-file live-data frontiers recovered from the snapshot and
-    /// advanced by replayed edits (`blob file id → first live byte`). A blob
-    /// file present here had its consumed prefix reclaimed in place, so its
-    /// recorded checksum covers only the suffix from this offset. The blob
-    /// analogue of [`Self::restrictions`]; stale entries for blob files no
-    /// longer present are simply never applied.
+    /// REPLACED wholesale by each replayed edit (`blob file id → first live
+    /// byte`). A blob file present here had its consumed prefix reclaimed in
+    /// place, so its recorded checksum covers only the suffix from this
+    /// offset. The blob analogue of [`Self::restrictions`]; wholesale
+    /// replacement (never a merge) matters here because blob ids are reused,
+    /// so a removed file's stale frontier must not attach to a later file
+    /// under the same id.
     pub blob_restrictions: crate::HashMap<BlobFileId, u64>,
     /// Per-section counters describing how many records were dropped
     /// during this recovery. Always zero under
@@ -408,26 +411,30 @@ impl Recovery {
             self.gc_stats = crate::blob_tree::FragmentationMap::decode_from(&mut &bytes[..])?;
         }
 
-        // Tight-space restrictions advance per slice: each edit lists the
-        // straddling input's new (higher) lower bound, so a later edit overwrites
-        // the earlier bound for the same table. A monotonicity (no-regression)
-        // check would be COMPARATOR-RELATIVE — "advancing" is defined by the
-        // tree's configured comparator, not byte order — but the comparator is not
-        // plumbed into recovery, so a byte-order check would wrongly reject valid
-        // advances (or miss real regressions) under a custom/reverse comparator.
-        // The edit log is framing-checksummed, so a corrupt/reordered edit is
-        // already rejected upstream; the comparator-independent duplicate guard
-        // lives in `parse_restrictions_section` for the snapshot path.
-        // Entries for tables later dropped from the layout are simply never
-        // applied by `from_recovery`, and the next snapshot rewrite drops them.
-        for (id, key) in &edit.restrictions {
-            self.restrictions.insert(*id, key.clone());
-        }
-
-        // Blob frontiers advance the same way, per relocation slice.
-        for (id, frontier) in &edit.blob_restrictions {
-            self.blob_restrictions.insert(*id, *frontier);
-        }
+        // Tight-space restrictions REPLACE wholesale: the encoder derives every
+        // edit's `restrictions` / `blob_restrictions` by iterating the new
+        // version's tables / blob files, so each edit carries the FULL current
+        // set, not a delta. Replacing both advances a bound per slice (the
+        // later full set carries the higher bound) AND drops a lifted one (its
+        // entry is simply absent). Merging instead would let a removed
+        // restricted blob file's frontier outlive it and attach to an
+        // unrelated whole file added later under the same id — blob ids are
+        // reused (the id counter reseeds from the maximum live id) — making
+        // integrity checks hash only that file's suffix. A monotonicity
+        // (no-regression) check would be COMPARATOR-RELATIVE — "advancing" is
+        // defined by the tree's configured comparator, not byte order — but
+        // the comparator is not plumbed into recovery, so a byte-order check
+        // would wrongly reject valid advances (or miss real regressions) under
+        // a custom/reverse comparator. The edit log is framing-checksummed, so
+        // a corrupt/reordered edit is already rejected upstream; the
+        // comparator-independent duplicate guard lives in
+        // `parse_restrictions_section` for the snapshot path.
+        self.restrictions = edit
+            .restrictions
+            .iter()
+            .map(|(id, key)| (*id, key.clone()))
+            .collect();
+        self.blob_restrictions = edit.blob_restrictions.iter().copied().collect();
 
         self.curr_version_id = edit.new_version_id;
         Ok(())
