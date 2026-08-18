@@ -2781,15 +2781,20 @@ fn repair_tree(
         }
     }
 
-    // Collect the best copy per id. `salvaged` is derived from the FINAL
-    // candidates (a lossy copy later superseded by a complete duplicate must not
-    // count), not incremented inline.
-    let salvaged = recovered_by_id.values().filter(|c| !c.complete).count();
-    let mut recovered_tables: Vec<Table> = recovered_by_id.into_values().map(|c| c.table).collect();
+    // Collect the best copy per id, carrying each candidate's completeness so
+    // `salvaged` can be derived from the tables that actually make the
+    // manifest — after the blob-dependency filtering below, not before (a
+    // salvaged table quarantined for an unrecoverable blob dependency must not
+    // count, or `salvaged` could exceed `recovered`). A lossy copy superseded
+    // by a complete duplicate is likewise already gone from the candidates.
+    let mut recovered_tables: Vec<(Table, bool)> = recovered_by_id
+        .into_values()
+        .map(|c| (c.table, c.complete))
+        .collect();
 
     // Newest first: higher sequence number nearer the L0 head, matching the
     // ordering the merge reader expects for its newest-run-first short-circuit.
-    recovered_tables.sort_by_key(|t| std::cmp::Reverse(t.get_highest_seqno()));
+    recovered_tables.sort_by_key(|(t, _)| std::cmp::Reverse(t.get_highest_seqno()));
 
     // KV-separated (blob) trees additionally carry a blob-file list. Discover the
     // blob files from the `blobs/` folder (no manifest to filter against) and
@@ -2822,8 +2827,8 @@ fn repair_tree(
     // there. A table whose `linked_blob_files` section cannot be read is treated
     // the same way: its dependencies are unknown, so it cannot be proven safe.
     if config.kv_separation_opts.is_some() {
-        let mut kept: Vec<Table> = Vec::with_capacity(recovered_tables.len());
-        for table in recovered_tables {
+        let mut kept: Vec<(Table, bool)> = Vec::with_capacity(recovered_tables.len());
+        for (table, complete) in recovered_tables {
             let missing: Option<String> = match table.list_blob_file_references() {
                 Ok(Some(links)) => links
                     .iter()
@@ -2834,7 +2839,7 @@ fn repair_tree(
                 Err(e) => Some(format!("blob-file reference list unreadable ({e})")),
             };
             let Some(reason) = missing else {
-                kept.push(table);
+                kept.push((table, complete));
                 continue;
             };
             let path = (*table.path).clone();
@@ -2853,6 +2858,14 @@ fn repair_tree(
         }
         recovered_tables = kept;
     }
+
+    // `salvaged` is a subset of `recovered`, so derive it from the tables that
+    // survived every filter above.
+    let salvaged = recovered_tables
+        .iter()
+        .filter(|(_, complete)| !complete)
+        .count();
+    let recovered_tables: Vec<Table> = recovered_tables.into_iter().map(|(t, _)| t).collect();
 
     // Each recovered table becomes its own single-table L0 run. L0 permits
     // overlapping runs, so this is always legal regardless of key overlap;

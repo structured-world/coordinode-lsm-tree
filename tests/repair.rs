@@ -1567,6 +1567,63 @@ fn repair_excludes_tables_referencing_an_unrecoverable_blob_file() -> lsm_tree::
     Ok(())
 }
 
+/// `salvaged` is documented as a subset of `recovered`, so a block-salvaged
+/// table that the blob-dependency filter later quarantines (its referenced
+/// blob file is unrecoverable) must not be counted: reporting it as salvaged
+/// while `recovered` is 0 falsely tells an operator that data was restored.
+#[test]
+fn repair_report_drops_salvaged_count_for_blob_filtered_tables() -> lsm_tree::Result<()> {
+    let dir = lsm_tree::get_tmp_folder();
+    let big = |i: u64| format!("{i:08}").repeat(512);
+
+    {
+        let tree = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(KvSeparationOptions::default()))
+        .open()?;
+        for i in 0..300 {
+            tree.insert(key(i), big(i).as_bytes(), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // The SST is block-corrupt (so repair block-salvages it) AND its blob
+    // files are wrecked (so the dependency filter quarantines the salvaged
+    // copy).
+    let ssts = sorted_sst_paths(dir.path());
+    corrupt_data_region(ssts.first().expect("an SST to corrupt"))?;
+    let blobs = dir.path().join("blobs");
+    for entry in std::fs::read_dir(&blobs)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            std::fs::write(entry.path(), b"not a blob file at all")?;
+        }
+    }
+    nuke_manifest(dir.path())?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(KvSeparationOptions::default()))
+    .repair_with_salvage(true)?;
+
+    assert_eq!(
+        report.recovered, 0,
+        "the blob-dependent salvaged table must not be published: {report:?}",
+    );
+    assert_eq!(
+        report.salvaged, 0,
+        "salvaged is a subset of recovered, so a quarantined salvage must not \
+         count: {report:?}",
+    );
+    Ok(())
+}
+
 /// The live-progress handle wired via `Config::with_recovery_progress` must
 /// tick while a repair runs: table files as they are discovered / recovered,
 /// blocks and KV entries as a salvage walk re-emits a corrupted SST, and blob
