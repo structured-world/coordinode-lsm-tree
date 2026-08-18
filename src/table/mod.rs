@@ -5908,10 +5908,47 @@ impl Table {
         // blocks in key (= write) order, the same order the writer assigned row
         // positions, so `row_base` is each block's first global row position.
         let has_deletes = !self.delete_bitmap.is_empty();
+        // Row count of a block that is stepped over without decoding, from its
+        // zone-map entry. A punched block CANNOT be decoded (it reads as
+        // zeros), so the zone map is the only source; without it every later
+        // row's positional delete mapping would silently shift — fail loudly
+        // instead.
+        let skipped_rows = |offset| {
+            self.zone_map
+                .columns_for(offset)
+                .and_then(|stats| stats.first())
+                .map(|s| s.row_count)
+                .ok_or(crate::Error::InvalidHeader(
+                    "columnar_scan: skipped block has no zone-map row count while positional deletes are present",
+                ))
+        };
+        // Tight-space restriction: data blocks wholly below the bound are
+        // hole-punched (they read as zeros), so they are stepped over, never
+        // decoded — the same key-based clamp the row-oriented scans apply.
+        // The first live block may STRADDLE the bound (the punch is
+        // block-aligned, the bound is a key), so its sub-bound rows are
+        // masked below.
+        let restrict = self.restrict_lower_bound();
+        let mut first_live_block = restrict.is_some();
         let mut row_base: u32 = 0;
         let mut out = Vec::new();
         for keyed in self.block_index.iter() {
             let keyed = keyed?;
+            if let Some(bound) = restrict
+                && self.comparator.compare(keyed.end_key(), bound.as_ref())
+                    == core::cmp::Ordering::Less
+            {
+                // The whole block precedes the bound: superseded (and normally
+                // punched) — skip it, keeping the position cursor aligned.
+                if has_deletes {
+                    row_base = row_base.wrapping_add(skipped_rows(*keyed.offset())?);
+                }
+                continue;
+            }
+            // Only the FIRST block at or past the bound can straddle it: keys
+            // ascend across blocks, so every later block is entirely live.
+            let straddles_bound = first_live_block;
+            first_live_block = false;
             // Zone-map block skip: prove the block is out of range and never
             // load it. A missing entry is conservative (cannot skip).
             if let Some(pred) = predicate
@@ -5922,15 +5959,42 @@ impl Table {
                 // (from its zone-map stats) so later blocks still map to the
                 // right delete positions. Skipped rows are predicate-excluded, so
                 // whether they are deleted does not affect the output.
-                if has_deletes && let Some(first) = stats.first() {
-                    row_base = row_base.wrapping_add(first.row_count);
+                if has_deletes {
+                    row_base = row_base.wrapping_add(skipped_rows(*keyed.offset())?);
                 }
                 continue;
             }
             let handle = BlockHandle::new(keyed.offset(), keyed.size());
             let batch = self.load_columnar_block_projected(&handle, &decode_projection)?;
             let row_count = batch.row_count;
-            let mut batch = if predicate.is_some() || has_deletes {
+            // Sub-bound row mask for the straddling block, from its key column
+            // decoded separately (one extra cached block read for at most one
+            // block per scan) so the main projection stays untouched.
+            let bound_mask: Option<Vec<bool>> = match restrict {
+                Some(bound) if straddles_bound => {
+                    use crate::table::columnar::{COL_USER_KEY, bytes_column_row};
+                    let keyed_batch =
+                        self.load_columnar_block_projected(&handle, &[COL_USER_KEY])?;
+                    let key_col = keyed_batch
+                        .columns
+                        .iter()
+                        .find(|c| c.column_id == COL_USER_KEY)
+                        .ok_or(crate::Error::InvalidHeader(
+                            "columnar_scan: straddling block is missing the key column",
+                        ))?;
+                    let mut mask = Vec::with_capacity(row_count as usize);
+                    for row in 0..row_count {
+                        let key = bytes_column_row(&key_col.data, row_count, row)?;
+                        mask.push(
+                            self.comparator.compare(key, bound.as_ref())
+                                != core::cmp::Ordering::Less,
+                        );
+                    }
+                    Some(mask)
+                }
+                _ => None,
+            };
+            let mut batch = if predicate.is_some() || has_deletes || bound_mask.is_some() {
                 let mut keep = match predicate {
                     Some(pred) => pred.matching_rows(&batch),
                     None => alloc::vec![true; row_count as usize],
@@ -5942,6 +6006,13 @@ impl Table {
                             *k = false;
                         }
                         pos = pos.wrapping_add(1);
+                    }
+                }
+                if let Some(mask) = &bound_mask {
+                    for (k, live) in keep.iter_mut().zip(mask) {
+                        if !live {
+                            *k = false;
+                        }
                     }
                 }
                 crate::table::columnar_predicate::filter_batch(&batch, &keep)

@@ -4891,6 +4891,100 @@ fn delete_bitmap_masks_rows_in_columnar_scan() -> crate::Result<()> {
     Ok(())
 }
 
+/// A tight-space-restricted columnar SST has its consumed prefix hole-punched
+/// (those data blocks read as zeros). The columnar scan must skip the punched
+/// blocks instead of decoding them, mask the straddling block's sub-bound rows,
+/// and keep positional delete-bitmap mapping intact across the skipped blocks.
+#[cfg(feature = "columnar")]
+#[test]
+#[expect(clippy::unwrap_used)]
+fn restricted_columnar_scan_skips_punched_prefix_and_masks_sub_bound_rows() -> crate::Result<()> {
+    use crate::table::columnar::{
+        COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, column_batch_to_entries,
+    };
+    use std::io::{Seek, SeekFrom, Write as _};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+
+    let n = 256u32;
+    let keys: Vec<Vec<u8>> = (0..n).map(|i| format!("k{i:04}").into_bytes()).collect();
+    // One deleted row inside the (to-be-punched) prefix, one in the live
+    // suffix: the live one only masks correctly if the scan advances the
+    // positional row base across the skipped punched blocks.
+    let deleted_punched = 1u32;
+    let deleted_live = 250u32;
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_data_block_size(256);
+    for key in &keys {
+        writer.write(crate::InternalValue::from_components(
+            key.as_slice(),
+            b"v",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    writer.delete_bitmap_mut().insert(deleted_punched);
+    writer.delete_bitmap_mut().insert(deleted_live);
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    let handles: Vec<_> = table
+        .block_index
+        .iter()
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert!(handles.len() >= 3, "need several blocks to punch a prefix");
+
+    // Bound = two keys past the first block's end, so exactly one block is
+    // punched and the first live block STRADDLES the bound (one sub-bound row).
+    let first_end = handles[0].end_key().to_vec();
+    let j = keys.iter().position(|k| *k == first_end).unwrap();
+    let bound_idx = j + 2;
+    assert!(
+        bound_idx < deleted_live as usize,
+        "the live deleted row must stay above the bound"
+    );
+    let bound = crate::UserKey::from(keys[bound_idx].as_slice());
+
+    let punch_off = table.punch_offset_for(&bound)?;
+    assert_eq!(
+        punch_off,
+        handles[1].offset().0,
+        "exactly the first block is below the bound"
+    );
+
+    let restricted = table.with_restriction(bound);
+
+    // Simulate the tight-space hole punch: the consumed prefix reads as zeros.
+    let mut f = std::fs::OpenOptions::new().write(true).open(&file)?;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(&vec![0u8; usize::try_from(punch_off).unwrap()])?;
+    f.sync_all()?;
+
+    let batches =
+        restricted.columnar_scan(&[COL_USER_KEY, COL_SEQNO, COL_VALUE_TYPE, COL_VALUE], None)?;
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    for batch in &batches {
+        for entry in column_batch_to_entries(batch)? {
+            got.push(entry.key.user_key.to_vec());
+        }
+    }
+
+    let expected: Vec<Vec<u8>> = (bound_idx..n as usize)
+        .filter(|&i| i != deleted_live as usize)
+        .map(|i| keys[i].clone())
+        .collect();
+    assert_eq!(
+        got, expected,
+        "scan must start at the bound, mask the straddling block's sub-bound \
+         rows, and keep delete positions aligned across the punched prefix"
+    );
+    Ok(())
+}
+
 #[test]
 fn copy_on_write_strategy_suppresses_the_delete_bitmap_section() -> crate::Result<()> {
     let dir = tempdir()?;
