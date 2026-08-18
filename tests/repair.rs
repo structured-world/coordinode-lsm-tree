@@ -1566,3 +1566,115 @@ fn repair_excludes_tables_referencing_an_unrecoverable_blob_file() -> lsm_tree::
     }
     Ok(())
 }
+
+/// The live-progress handle wired via `Config::with_recovery_progress` must
+/// tick while a repair runs: table files as they are discovered / recovered,
+/// blocks and KV entries as a salvage walk re-emits a corrupted SST, and blob
+/// files on a KV-separated tree. Counter effects are asserted after the run
+/// (the run is too fast to poll mid-flight here; the handle's whole purpose is
+/// that a UI thread MAY poll it concurrently).
+#[test]
+fn repair_ticks_the_recovery_progress_counters() -> lsm_tree::Result<()> {
+    use lsm_tree::RecoveryProgress;
+    use std::sync::Arc;
+
+    // Standard tree: one intact SST + one with a corrupted data block, so the
+    // repair recovers one whole table and block-salvages the other.
+    let dir = lsm_tree::get_tmp_folder();
+    {
+        let tree = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0..500 {
+            tree.insert(key(i), format!("v0-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+        for i in 500..1000 {
+            tree.insert(key(i), format!("v0-{i}"), 1000 + i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let total = count_sst_files(dir.path())?;
+    let ssts = sorted_sst_paths(dir.path());
+    corrupt_data_region(ssts.first().expect("an SST to corrupt"))?;
+    nuke_manifest(dir.path())?;
+
+    let progress = Arc::new(RecoveryProgress::default());
+    Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_recovery_progress(progress.clone())
+    .repair_with_salvage(true)?;
+
+    let snap = progress.snapshot();
+    assert_eq!(
+        snap.tables_discovered, total as u64,
+        "every table file must be counted as discovered"
+    );
+    assert_eq!(
+        snap.tables_recovered, total as u64,
+        "whole and salvaged tables must both count as recovered"
+    );
+    assert!(
+        snap.blocks_scanned > 0,
+        "the salvage walk must tick inspected blocks: {snap:?}"
+    );
+    assert!(
+        snap.blocks_recovered > 0,
+        "the salvage walk must tick re-emitted blocks: {snap:?}"
+    );
+    assert!(
+        snap.kvs_recovered > 0,
+        "the salvage walk must tick recovered KV entries: {snap:?}"
+    );
+
+    // KV-separated tree: blob files must tick too.
+    let blob_dir = lsm_tree::get_tmp_folder();
+    {
+        let tree = Config::new(
+            &blob_dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .open()?;
+        let lsm_tree::AnyTree::Blob(tree) = tree else {
+            panic!("expected a blob tree");
+        };
+        for i in 0..20 {
+            tree.insert(key(i).as_bytes(), vec![b'v'; 128], i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    nuke_manifest(blob_dir.path())?;
+
+    let blob_progress = Arc::new(RecoveryProgress::default());
+    Config::new(
+        blob_dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .with_recovery_progress(blob_progress.clone())
+    .repair()?;
+
+    let snap = blob_progress.snapshot();
+    assert!(
+        snap.blob_files_discovered > 0,
+        "blob files must be counted as discovered: {snap:?}"
+    );
+    assert_eq!(
+        snap.blob_files_recovered, snap.blob_files_discovered,
+        "every intact blob file must be counted as recovered"
+    );
+    Ok(())
+}

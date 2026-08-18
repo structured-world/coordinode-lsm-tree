@@ -261,6 +261,10 @@ pub(crate) struct SalvageBlock {
     /// ECC recovery healed the block, so the faulty on-disk bytes must not be
     /// propagated and the caller re-encodes the healed payload instead.
     pub verbatim: Option<VerbatimCopy>,
+    /// Whether ECC recovery had to heal the block to read it. Kept separate
+    /// from `verbatim` (which is also `None` for verbatim-ineligible clean
+    /// reads) so the walk's live progress counts genuine heals only.
+    pub ecc_recovered: bool,
 }
 
 /// Raw on-disk frame captured for a verbatim block copy:
@@ -1066,7 +1070,11 @@ impl Table {
         } else {
             None
         };
-        Ok(SalvageBlock { block, verbatim })
+        Ok(SalvageBlock {
+            block,
+            verbatim,
+            ecc_recovered: recovery.is_some(),
+        })
     }
 
     /// Whether `raw`'s parity trailer matches freshly computed parity over its

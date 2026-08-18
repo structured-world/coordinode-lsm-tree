@@ -82,6 +82,14 @@ pub struct SalvageOptions {
     /// and its matching rows vanish from every prefix read.
     /// [`crate::repair`] passes the tree's configured extractor.
     pub prefix_extractor: Option<Arc<dyn crate::prefix::PrefixExtractor>>,
+    /// Shared live-progress counters the block walk ticks per inspected /
+    /// re-emitted / dropped block and per recovered row, or `None` (the
+    /// default) to skip publishing. [`crate::repair`] forwards the handle set
+    /// via [`Config::with_recovery_progress`](crate::Config::with_recovery_progress);
+    /// a standalone [`salvage_sst_with_options`] caller sets it directly and
+    /// polls [`RecoveryProgress::snapshot`](crate::RecoveryProgress::snapshot)
+    /// from another thread.
+    pub progress: Option<Arc<crate::RecoveryProgress>>,
 }
 
 /// Why a block could not be salvaged and had to be dropped.
@@ -894,6 +902,7 @@ fn salvage_attempt(
         comparator,
         !delete_mask_unpositionable,
         allow_verbatim,
+        options.progress.as_deref(),
     ) {
         Ok(walk) => walk,
         Err(e) => {
@@ -1083,12 +1092,60 @@ fn fold_blob_links(
         reason = "the delete mask exists only for columnar sources; without the feature the flag has no consumer"
     )
 )]
+/// The walk totals already published to a [`crate::RecoveryProgress`] handle,
+/// so each [`publish_progress`] call sends only the delta (the shared counters
+/// are cumulative across every table of one repair).
+#[derive(Default)]
+struct PublishedProgress {
+    blocks_scanned: usize,
+    blocks_recovered: usize,
+    blocks_dropped: usize,
+    blocks_healed: u64,
+    kvs: u64,
+    columns: u64,
+}
+
+/// Publishes the walk's running totals as deltas against `published`, then
+/// records them as published. A `None` handle is a no-op.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a plain projection of the walk's running totals; bundling them into a struct would only rename the call sites"
+)]
+fn publish_progress(
+    progress: Option<&crate::RecoveryProgress>,
+    published: &mut PublishedProgress,
+    blocks_scanned: usize,
+    blocks_recovered: usize,
+    blocks_dropped: usize,
+    blocks_healed: u64,
+    kvs: u64,
+    columns: u64,
+) {
+    let Some(p) = progress else { return };
+    p.add_blocks(
+        (blocks_scanned - published.blocks_scanned) as u64,
+        (blocks_recovered - published.blocks_recovered) as u64,
+        (blocks_dropped - published.blocks_dropped) as u64,
+        blocks_healed - published.blocks_healed,
+    );
+    p.add_rows(kvs - published.kvs, columns - published.columns);
+    *published = PublishedProgress {
+        blocks_scanned,
+        blocks_recovered,
+        blocks_dropped,
+        blocks_healed,
+        kvs,
+        columns,
+    };
+}
+
 fn salvage_blocks(
     table: &crate::table::Table,
     mut writer: crate::table::Writer,
     comparator: &crate::comparator::SharedComparator,
     apply_delete_mask: bool,
     allow_verbatim: bool,
+    progress: Option<&crate::RecoveryProgress>,
 ) -> crate::Result<SalvageWalk> {
     use crate::table::block::ParsedItem;
     use alloc::format;
@@ -1097,6 +1154,9 @@ fn salvage_blocks(
     let mut blocks_salvaged = 0usize;
     let mut blocks_copied_verbatim = 0usize;
     let mut entries_salvaged = 0u64;
+    let mut blocks_healed = 0u64;
+    let mut columns_salvaged = 0u64;
+    let mut published = PublishedProgress::default();
     let mut dropped: Vec<DroppedBlock> = Vec::new();
     // Blob links DERIVED from the recovered entries' indirections, keyed by
     // blob file id — exact for the recovered copy (only emitted rows count).
@@ -1454,6 +1514,19 @@ fn salvage_blocks(
     blocks_total += dropped.len();
 
     for (block_handle, end_key) in items {
+        // Publish the previous iteration's outcome (top-of-loop so every
+        // `continue` path is covered; the totals-vs-published delta form makes
+        // the call idempotent per state).
+        publish_progress(
+            progress,
+            &mut published,
+            blocks_total,
+            blocks_salvaged,
+            dropped.len(),
+            blocks_healed,
+            entries_salvaged,
+            columns_salvaged,
+        );
         blocks_total += 1;
         let offset = *block_handle.offset();
 
@@ -1526,6 +1599,7 @@ fn salvage_blocks(
                             Ok(_) => {
                                 entries_salvaged += rows;
                                 blocks_salvaged += 1;
+                                columns_salvaged += batch.columns.len() as u64;
                                 fold_blob_links(&mut derived_blob_links, &block_links);
                             }
                             Err(
@@ -1570,6 +1644,7 @@ fn salvage_blocks(
                     // to decode. Only writer errors (I/O to the destination)
                     // stay hard errors.
                     Ok(mut sb) => {
+                        let ecc_healed = sb.ecc_recovered;
                         if !allow_verbatim {
                             sb.verbatim = None;
                         }
@@ -1652,8 +1727,12 @@ fn salvage_blocks(
                                         if verbatim {
                                             blocks_copied_verbatim += 1;
                                         }
+                                        if ecc_healed {
+                                            blocks_healed += 1;
+                                        }
                                         entries_salvaged += rows;
                                         blocks_salvaged += 1;
+                                        columns_salvaged += batch.columns.len() as u64;
                                         fold_blob_links(&mut derived_blob_links, &block_links);
                                     }
                                     Err(
@@ -1708,6 +1787,7 @@ fn salvage_blocks(
         // is re-emitted entry by entry from its healed payload.
         match table.salvage_load_block(&block_handle, crate::table::block::BlockType::Data) {
             Ok(mut sb) => {
+                let ecc_healed = sb.ecc_recovered;
                 if !allow_verbatim {
                     sb.verbatim = None;
                 }
@@ -1829,6 +1909,9 @@ fn salvage_blocks(
                                     if verbatim {
                                         blocks_copied_verbatim += 1;
                                     }
+                                    if ecc_healed {
+                                        blocks_healed += 1;
+                                    }
                                     entries_salvaged += count;
                                     blocks_salvaged += 1;
                                     fold_blob_links(&mut derived_blob_links, &block_links);
@@ -1886,6 +1969,18 @@ fn salvage_blocks(
         }
         prev_end = end_key.or(prev_end);
     }
+    // Final publish: the last iteration's outcome (the loop publishes at the
+    // TOP, so the tail is otherwise unaccounted).
+    publish_progress(
+        progress,
+        &mut published,
+        blocks_total,
+        blocks_salvaged,
+        dropped.len(),
+        blocks_healed,
+        entries_salvaged,
+        columns_salvaged,
+    );
 
     let wrote = blocks_salvaged > 0;
     if wrote {

@@ -748,7 +748,13 @@ fn record_best(
     path: &std::path::Path,
     file_name: &str,
     sync_mode: crate::fs::SyncMode,
+    progress: Option<&crate::RecoveryProgress>,
 ) -> crate::Result<()> {
+    // Counts candidate recordings (per recovered FILE): a duplicate id later
+    // displaced by a better copy was still a recovered file.
+    if let Some(p) = progress {
+        p.table_recovered();
+    }
     let candidate = TableCandidate {
         table,
         complete,
@@ -1237,6 +1243,9 @@ fn try_salvage_table(
             // it the rebuilt filter loses the source's prefix hashes and
             // prefix scans see the salvaged copy as definitely absent.
             prefix_extractor: config.prefix_extractor.clone(),
+            // Forward the caller's live-progress handle so the block walk
+            // ticks per inspected / recovered block while it runs.
+            progress: config.recovery_progress.clone(),
         },
     )?;
     if report.salvaged_path.is_none() {
@@ -1707,6 +1716,10 @@ fn recover_blob_files(
             continue;
         }
 
+        if let Some(p) = &config.recovery_progress {
+            p.blob_file_discovered();
+        }
+
         // A tight-space-punched blob records its live-data frontier only in
         // the manifest; with the manifest lost, re-derive it from the punch
         // geometry so the rebuilt manifest restores the restriction (the
@@ -1746,7 +1759,12 @@ fn recover_blob_files(
         match crate::vlog::recover_blob_file_from(
             &blob_path, blob_id, checksum, 0, &config.fs, frontier,
         ) {
-            Ok(bf) => blob_files.push(bf),
+            Ok(bf) => {
+                if let Some(p) = &config.recovery_progress {
+                    p.blob_file_recovered();
+                }
+                blob_files.push(bf);
+            }
             // Same transient/persistent split as the checksum read above.
             Err(e) if is_transient_io(&e) => return Err(e),
             Err(e) => {
@@ -1971,6 +1989,10 @@ fn repair_tree(
                 ));
                 continue;
             };
+
+            if let Some(p) = &config.recovery_progress {
+                p.table_discovered();
+            }
 
             // Skip a duplicate id ONLY when we already hold a COMPLETE copy — a
             // duplicate cannot improve on it. A previously-seen LOSSY salvage does
@@ -2274,6 +2296,7 @@ fn repair_tree(
                                 &table_path,
                                 &file_name,
                                 config.sync_mode,
+                                config.recovery_progress.as_deref(),
                             )?;
                         }
                         RepairKeepDecision::Quarantine(reason) => {
@@ -2366,6 +2389,7 @@ fn repair_tree(
                                         &table_path,
                                         &file_name,
                                         config.sync_mode,
+                                        config.recovery_progress.as_deref(),
                                     )?;
                                 }
                                 Ok(SalvageOutcome::Unusable | SalvageOutcome::PunchedBoundLost) => {
@@ -2419,6 +2443,7 @@ fn repair_tree(
                         &table_path,
                         &file_name,
                         config.sync_mode,
+                        config.recovery_progress.as_deref(),
                     )?;
                 }
                 Err(e) if salvage => {
@@ -2566,6 +2591,7 @@ fn repair_tree(
                                 &table_path,
                                 &file_name,
                                 config.sync_mode,
+                                config.recovery_progress.as_deref(),
                             )?;
                         }
                         Ok(SalvageOutcome::Unusable) => {

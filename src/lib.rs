@@ -372,6 +372,11 @@ pub mod restrict_bound;
 #[cfg(feature = "std")]
 pub mod salvage;
 
+/// Live progress counters for long-running recovery (repair / salvage).
+// std-only: its only producers (repair, salvage) are std-gated.
+#[cfg(feature = "std")]
+pub mod recovery_progress;
+
 pub(crate) mod active_tombstone_set;
 pub(crate) mod range_tombstone;
 pub(crate) mod range_tombstone_filter;
@@ -500,6 +505,8 @@ pub use encryption::Aes256GcmProvider;
 #[cfg(feature = "std")]
 pub use background_deleter::BackgroundDeleter;
 pub use pinnable_slice::PinnableSlice;
+#[cfg(feature = "std")]
+pub use recovery_progress::{RecoveryProgress, RecoveryProgressSnapshot};
 #[cfg(feature = "std")]
 pub use repair::RepairReport;
 pub use write_batch::WriteBatch;
