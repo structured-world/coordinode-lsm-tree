@@ -1071,27 +1071,6 @@ fn fold_blob_links(
     }
 }
 
-/// Walks `table`'s data blocks in index order, re-emitting every block that
-/// loads and decodes cleanly into `writer` and recording the rest.
-///
-/// `apply_delete_mask` gates the delete-masked re-emit of a delete-bearing
-/// columnar source: `false` means the mask is unpositionable (degraded bitmap
-/// or unverified zone-map positions) and the caller explicitly opted into
-/// resurrection — the walk then re-emits every row LIVE rather than masking
-/// against unverified positions. Ignored for sources without a delete-bitmap
-/// section.
-///
-/// Consumes `writer`: on success it is finished (when at least one block was
-/// emitted) or dropped (when none were). On a `write` / `finish` error the
-/// writer is dropped as the error unwinds, so the caller must remove the partial
-/// destination it left behind.
-#[cfg_attr(
-    not(feature = "columnar"),
-    expect(
-        unused_variables,
-        reason = "the delete mask exists only for columnar sources; without the feature the flag has no consumer"
-    )
-)]
 /// The walk totals already published to a [`crate::RecoveryProgress`] handle,
 /// so each [`publish_progress`] call sends only the delta (the shared counters
 /// are cumulative across every table of one repair).
@@ -1139,6 +1118,27 @@ fn publish_progress(
     };
 }
 
+/// Walks `table`'s data blocks in index order, re-emitting every block that
+/// loads and decodes cleanly into `writer` and recording the rest.
+///
+/// `apply_delete_mask` gates the delete-masked re-emit of a delete-bearing
+/// columnar source: `false` means the mask is unpositionable (degraded bitmap
+/// or unverified zone-map positions) and the caller explicitly opted into
+/// resurrection — the walk then re-emits every row LIVE rather than masking
+/// against unverified positions. Ignored for sources without a delete-bitmap
+/// section.
+///
+/// Consumes `writer`: on success it is finished (when at least one block was
+/// emitted) or dropped (when none were). On a `write` / `finish` error the
+/// writer is dropped as the error unwinds, so the caller must remove the partial
+/// destination it left behind.
+#[cfg_attr(
+    not(feature = "columnar"),
+    expect(
+        unused_variables,
+        reason = "the delete mask exists only for columnar sources; without the feature the flag has no consumer"
+    )
+)]
 fn salvage_blocks(
     table: &crate::table::Table,
     mut writer: crate::table::Writer,

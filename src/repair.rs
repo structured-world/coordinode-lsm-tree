@@ -1688,6 +1688,42 @@ fn derive_blob_frontier(
     }
 }
 
+/// Whether any of `table`'s blob indirections points BELOW a recovered punched
+/// blob file's live-data frontier — i.e. into its zeroed prefix. The
+/// id-presence dependency check cannot see this case: the blob EXISTS, but a
+/// pre-relocation SST file left behind by a crash still holds handles into the
+/// prefix the relocation punched, and publishing it would resolve those reads
+/// into zeroed bytes. Returns the first offending handle's description, or
+/// `None` when every handle lands in live blob data. Called only when at least
+/// one recovered blob file carries a frontier, so the sequential entry scan
+/// costs nothing on the common path.
+#[cfg(feature = "std")]
+fn handle_below_blob_frontier(
+    table: &Table,
+    frontiers: &crate::HashMap<crate::vlog::BlobFileId, u64>,
+) -> crate::Result<Option<String>> {
+    use crate::coding::Decode;
+
+    for entry in table.scan()? {
+        let entry = entry?;
+        if entry.key.value_type != crate::ValueType::Indirection {
+            continue;
+        }
+        let mut cursor = &entry.value[..];
+        let ind = crate::blob_tree::handle::BlobIndirection::decode_from(&mut cursor)?;
+        if let Some(&frontier) = frontiers.get(&ind.vhandle.blob_file_id)
+            && ind.vhandle.offset < frontier
+        {
+            return Ok(Some(format!(
+                "blob handle into file {} at offset {} lies below its recovered \
+                 live-data frontier {frontier}",
+                ind.vhandle.blob_file_id, ind.vhandle.offset,
+            )));
+        }
+    }
+    Ok(None)
+}
+
 fn recover_blob_files(
     config: &Config,
 ) -> crate::Result<(Vec<crate::vlog::BlobFile>, UnreadableFiles)> {
@@ -2817,6 +2853,15 @@ fn repair_tree(
     // there. A table whose `linked_blob_files` section cannot be read is treated
     // the same way: its dependencies are unknown, so it cannot be proven safe.
     if config.kv_separation_opts.is_some() {
+        // Live-data frontiers of the recovered blob files whose consumed
+        // prefix was punched: a handle pointing below one dereferences zeroed
+        // bytes. Non-empty only after a tight-space blob relocation, so the
+        // per-table handle scan below is skipped entirely on the common path.
+        let punched_frontiers: crate::HashMap<crate::vlog::BlobFileId, u64> = blob_file_list
+            .iter()
+            .filter(|bf| bf.live_data_start() > 0)
+            .map(|bf| (bf.id(), bf.live_data_start()))
+            .collect();
         let mut kept: Vec<(Table, bool)> = Vec::with_capacity(recovered_tables.len());
         for (table, complete) in recovered_tables {
             let missing: Option<String> = match table.list_blob_file_references() {
@@ -2827,6 +2872,21 @@ fn repair_tree(
                 Ok(None) => None,
                 Err(e) if is_transient_io(&e) => return Err(e),
                 Err(e) => Some(format!("blob-file reference list unreadable ({e})")),
+            };
+            // The id-presence check above cannot see a handle whose blob
+            // EXISTS but whose offset lies below that blob's punched frontier
+            // (a pre-relocation SST file left behind by a crash): publishing
+            // it would resolve reads into the zeroed prefix. Scan the actual
+            // handles only when a punched blob was recovered at all.
+            let missing = match missing {
+                None if !punched_frontiers.is_empty() => {
+                    match handle_below_blob_frontier(&table, &punched_frontiers) {
+                        Ok(r) => r,
+                        Err(e) if is_transient_io(&e) => return Err(e),
+                        Err(e) => Some(format!("blob handles unreadable ({e})")),
+                    }
+                }
+                m => m,
             };
             let Some(reason) = missing else {
                 kept.push((table, complete));

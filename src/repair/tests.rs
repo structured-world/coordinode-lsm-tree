@@ -5700,6 +5700,105 @@ fn blob_recovery_derives_the_frontier_of_a_punched_blob_file() -> crate::Result<
     Ok(())
 }
 
+/// A recovered SST whose blob handles point BELOW a punched blob file's
+/// derived live-data frontier must be set aside, exactly like one referencing
+/// a missing blob id: the id exists, but a read through such a handle
+/// dereferences the punched (zeroed) prefix and fails. Reachable when a crash
+/// leaves a pre-relocation SST file on disk after the relocation's punch ran
+/// and the manifest is lost.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_excludes_tables_with_handles_below_a_blob_frontier() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        for i in 0..8u32 {
+            tree.insert(format!("k{i:04}").as_bytes(), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Simulate the crash aftermath of a blob relocation: the blob's first
+    // frame is punched (its value lives elsewhere now) while a pre-relocation
+    // SST still holds a handle into that prefix, and the manifest is gone.
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let blob_path = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one blob file")
+        .path;
+    let entries: Vec<_> = crate::vlog::BlobFileScanner::new(&blob_path, &*fs_dyn, 0)?
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert!(entries.len() >= 2, "several frames written");
+    let frontier = entries.first().expect("first frame").frame_end;
+    let data_start = {
+        let mut file = fs_dyn.open(&blob_path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut file)?;
+        reader
+            .toc()
+            .section(b"data")
+            .expect("blob file has a data section")
+            .pos()
+    };
+    memfs.punch_hole(&blob_path, data_start, frontier - data_start)?;
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs.clone())
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .repair()?;
+
+    assert_eq!(
+        report.recovered, 0,
+        "an SST holding a handle below the punched blob's frontier must be \
+         set aside, not published with a handle into zeroed bytes: {report:?}",
+    );
+    assert!(
+        report
+            .unreadable_files
+            .iter()
+            .any(|(_, reason)| reason.contains("frontier")),
+        "the report names the stale-handle cause: {:?}",
+        report.unreadable_files,
+    );
+    Ok(())
+}
+
 /// A persistently unreadable blob file must be QUARANTINED, not left in
 /// `blobs/`: the rebuilt manifest omits it, so the next successful open's
 /// orphan sweep would DELETE the reported path and the operator would lose the
