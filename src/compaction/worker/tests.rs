@@ -1098,18 +1098,36 @@ fn tight_space_blob_reopen_failure_rolls_back_the_slice_outputs() -> crate::Resu
         "the failpoint should have fired and disarmed",
     );
 
-    // The failed slice committed nothing, so its finalized outputs must be
-    // retracted — not leaked until an orphan sweep.
-    assert_eq!(
-        list_names(&dir.path().join("tables"))?,
-        tables_before,
-        "the aborted slice's output SSTs must be rolled back",
-    );
-    assert_eq!(
-        list_names(&dir.path().join("blobs"))?,
-        blobs_before,
-        "the aborted slice's output blob files must be rolled back",
-    );
+    // The failed slice committed nothing of its own, but EARLIER merges /
+    // slices of the same compaction may have legitimately installed before the
+    // failpoint fired (their outputs are referenced by the current version,
+    // their consumed inputs deleted), so exact before/after file-set equality
+    // is interleaving-dependent. The leak-free invariant is: every file that
+    // APPEARED since the snapshot must be REFERENCED by the current version —
+    // the aborted slice's retracted outputs are neither pre-existing nor
+    // referenced, so a missed rollback still fails this check.
+    let version = tree.current_version();
+    let referenced_tables: Vec<String> =
+        version.iter_tables().map(|t| t.id().to_string()).collect();
+    let referenced_blobs: Vec<String> = version
+        .blob_files
+        .iter()
+        .map(|bf| bf.id().to_string())
+        .collect();
+    for name in list_names(&dir.path().join("tables"))? {
+        assert!(
+            tables_before.contains(&name) || referenced_tables.contains(&name),
+            "leaked table file {name}: neither pre-existing nor referenced by \
+             the current version (rollback missed it)",
+        );
+    }
+    for name in list_names(&dir.path().join("blobs"))? {
+        assert!(
+            blobs_before.contains(&name) || referenced_blobs.contains(&name),
+            "leaked blob file {name}: neither pre-existing nor referenced by \
+             the current version (rollback missed it)",
+        );
+    }
     Ok(())
 }
 
