@@ -4985,6 +4985,126 @@ fn restricted_columnar_scan_skips_punched_prefix_and_masks_sub_bound_rows() -> c
     Ok(())
 }
 
+/// The heal unshare copy must reproduce the source's ACTUAL hole pattern, not
+/// the logical restriction: a tight-space slice that committed but failed its
+/// restriction-sidecar write deliberately leaves the restricted SST unpunched
+/// (punching without the sidecar would force a lossy conservative bound on a
+/// later manifest-loss repair). A heal detach of such a table must therefore
+/// copy the intact prefix verbatim — introducing holes below the logical
+/// bound would punch the file without its sidecar. Actually-punched extents
+/// still stay holes (no re-allocation on the near-full tight-space disk).
+#[cfg(feature = "page_ecc")]
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn unshare_for_heal_preserves_unpunched_blocks_of_a_restricted_table() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::table::block_index::BlockIndex;
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    memfs.create_dir_all(&root)?;
+
+    let build = |name: &str| -> crate::Result<Table> {
+        let path = root.join(name);
+        let mut writer = Writer::new(path.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(256);
+        for i in 0..256u32 {
+            writer.write(crate::InternalValue::from_components(
+                format!("k{i:04}").into_bytes(),
+                b"v",
+                1,
+                crate::ValueType::Value,
+            ))?;
+        }
+        let (_, checksum) = writer.finish()?.expect("table written");
+        #[cfg(feature = "metrics")]
+        let metrics = Arc::new(Metrics::default());
+        Table::recover(
+            path,
+            checksum,
+            0,
+            0,
+            0,
+            Arc::new(Cache::with_capacity_bytes(1_000_000)),
+            None,
+            Arc::clone(&fs),
+            false,
+            false,
+            None,
+            #[cfg(zstd_any)]
+            None,
+            crate::comparator::default_comparator(),
+            #[cfg(feature = "metrics")]
+            metrics,
+        )
+    };
+
+    let all_zero = |path: &std::path::Path, off: u64, len: usize| -> crate::Result<bool> {
+        let file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let bytes = crate::file::read_exact(&*file, off, len)?;
+        Ok(bytes.iter().all(|&b| b == 0))
+    };
+
+    // COMMITTED-BUT-UNPUNCHED: restricted view over an intact file. The heal
+    // copy must keep every byte (no new holes).
+    let table = build("0")?;
+    let handles: Vec<_> = table
+        .block_index
+        .iter()
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert!(handles.len() >= 3, "need several blocks to restrict over");
+    let bound = handles.get(1).expect("second block").end_key().clone();
+    let (b0_off, b0_len) = {
+        let h = handles.first().expect("first block");
+        (h.offset().0, h.size() as usize)
+    };
+    let restricted = table.with_restriction(bound.clone());
+    let source = fs.open(
+        &restricted.path,
+        &crate::fs::FsOpenOptions::new().read(true),
+    )?;
+    restricted
+        .unshare_for_heal(&*source, crate::fs::SyncMode::Normal)
+        .expect("unshare succeeds");
+    assert!(
+        !all_zero(&restricted.path, b0_off, b0_len)?,
+        "an unpunched restricted table's prefix blocks must be copied verbatim, \
+         not turned into holes the (missing) sidecar does not cover"
+    );
+
+    // ACTUALLY PUNCHED: the same restriction whose prefix data blocks were
+    // hole-punched. The heal copy must keep those extents as holes.
+    let table = build("1")?;
+    let handles: Vec<_> = table
+        .block_index
+        .iter()
+        .collect::<crate::Result<Vec<_>>>()?;
+    let punch = table.punch_offset_for(&bound)?;
+    for h in &handles {
+        if h.offset().0 < punch {
+            memfs.punch_hole(&table.path, h.offset().0, u64::from(h.size()))?;
+        }
+    }
+    let (p0_off, p0_len) = {
+        let h = handles.first().expect("first block");
+        (h.offset().0, h.size() as usize)
+    };
+    let restricted = table.with_restriction(bound);
+    let source = fs.open(
+        &restricted.path,
+        &crate::fs::FsOpenOptions::new().read(true),
+    )?;
+    restricted
+        .unshare_for_heal(&*source, crate::fs::SyncMode::Normal)
+        .expect("unshare succeeds");
+    assert!(
+        all_zero(&restricted.path, p0_off, p0_len)?,
+        "a genuinely punched extent stays a hole in the heal copy"
+    );
+    Ok(())
+}
+
 #[test]
 fn copy_on_write_strategy_suppresses_the_delete_bitmap_section() -> crate::Result<()> {
     let dir = tempdir()?;

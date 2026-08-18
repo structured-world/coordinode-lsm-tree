@@ -1497,14 +1497,45 @@ impl Table {
             // tight-space punched (via `Inner::drop`). The block index yields ONLY
             // data-block handles, so live index / filter blocks interleaved below the
             // frontier are NOT in this set and stay in the copied complement.
+            //
+            // Each candidate extent is PROBED for actual zeros rather than assumed
+            // punched from the logical bound alone: a slice that committed but
+            // failed its restriction-sidecar write deliberately leaves the input
+            // UNPUNCHED (punching without the sidecar would force a lossy
+            // conservative bound on a later manifest-loss repair), and the heal
+            // copy must not introduce holes that state never had. An intact
+            // sub-bound block reads non-zero (its header magic alone guarantees
+            // it) and is copied verbatim; a genuinely punched extent reads as
+            // zeros and stays a hole.
             let mut holes: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
             if sparse {
                 use crate::table::block_index::BlockIndex;
+                let mut probe = alloc::vec::Vec::new();
                 for handle in self.block_index.iter() {
                     let handle = handle.map_err(|e| alloc::format!("block index iter: {e}"))?;
                     let block_off = handle.offset().0;
-                    if block_off < punch {
-                        holes.push((block_off, u64::from(handle.size())));
+                    let block_len = u64::from(handle.size());
+                    if block_off >= punch {
+                        continue;
+                    }
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "a block's on-disk size is a u32, which fits usize"
+                    )]
+                    {
+                        probe.resize(block_len as usize, 0u8);
+                    }
+                    let n = source
+                        .read_at(&mut probe, block_off)
+                        .map_err(|e| alloc::format!("probe block at {block_off}: {e}"))?;
+                    if n < probe.len() {
+                        return Err(alloc::format!(
+                            "probe block at {block_off}: short read ({n} of {} bytes)",
+                            probe.len(),
+                        ));
+                    }
+                    if probe.iter().all(|&b| b == 0) {
+                        holes.push((block_off, block_len));
                     }
                 }
                 holes.sort_unstable();
