@@ -5549,6 +5549,7 @@ fn is_corruption_aborts_the_repair_on_a_transient_io() {
 /// structure, never on zero runs alone, so a zero-filled payload inside the
 /// live suffix cannot move the frontier.
 #[test]
+#[expect(clippy::expect_used, reason = "test code")]
 fn blob_recovery_derives_the_frontier_of_a_punched_blob_file() -> crate::Result<()> {
     use crate::fs::{Fs, MemFs};
     use crate::{Config, SequenceNumberCounter};
@@ -5575,7 +5576,7 @@ fn blob_recovery_derives_the_frontier_of_a_punched_blob_file() -> crate::Result<
     let entries: Vec<_> = crate::vlog::BlobFileScanner::new(&punched_path, &*fs_dyn, 0)?
         .collect::<crate::Result<Vec<_>>>()?;
     assert_eq!(entries.len(), 3, "three frames written");
-    let frontier = entries[0].frame_end;
+    let frontier = entries.first().expect("first frame").frame_end;
     let data_start = {
         let mut file = fs_dyn.open(&punched_path, &crate::fs::FsOpenOptions::new().read(true))?;
         let reader = crate::sfa::Reader::from_reader(&mut file)?;
@@ -5594,7 +5595,7 @@ fn blob_recovery_derives_the_frontier_of_a_punched_blob_file() -> crate::Result<
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .with_shared_fs(memfs.clone());
+    .with_shared_fs(memfs);
 
     let (files, unreadable) = super::recover_blob_files(&config)?;
     assert!(
@@ -5651,7 +5652,7 @@ fn blob_recovery_propagates_a_transient_checksum_failure() -> crate::Result<()> 
         // garbage file would classify persistent-unreadable before any read
         // could be faulted).
         let fs_dyn: Arc<dyn Fs> = memfs.clone();
-        let mut w = crate::vlog::blob_file::writer::Writer::new(&blobs.join("0"), 0, 0, &*fs_dyn)?;
+        let mut w = crate::vlog::blob_file::writer::Writer::new(blobs.join("0"), 0, 0, &*fs_dyn)?;
         w.write(b"k", 1, b"blob bytes")?;
         w.finish()?;
     }

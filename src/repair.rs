@@ -1598,7 +1598,10 @@ fn derive_blob_frontier(
         const CHUNK: u64 = 64 * 1024;
         let mut pos = from;
         while pos < data_end {
-            #[expect(
+            // `#[allow]`, not `#[expect]`: target-width-dependent lint (`u64 as
+            // usize`) — on 64-bit targets Clippy proves the `min()` bound fits
+            // usize and an `#[expect]` would be unfulfilled under `-D warnings`.
+            #[allow(
                 clippy::cast_possible_truncation,
                 reason = "min() bounds the window by CHUNK, which fits usize"
             )]
@@ -1647,7 +1650,7 @@ fn derive_blob_frontier(
                 None => return Ok(committed),
                 Some(Ok(entry)) if !entry.resynced => pos = entry.frame_end,
                 Some(Err(e)) if is_transient_io(&e) => return Err(e),
-                Some(Ok(_)) | Some(Err(_)) => {
+                Some(Ok(_) | Err(_)) => {
                     // The frame starting at `pos` failed (or the scanner
                     // resynced past unproven bytes). Another zeroed hole
                     // continues the walk; anything else is content corruption
