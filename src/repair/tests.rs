@@ -5535,17 +5535,111 @@ fn is_corruption_aborts_the_repair_on_a_transient_io() {
     );
 }
 
-/// A TRANSIENT read failure while checksumming a blob file must PROPAGATE, not
-/// land in `unreadable`: recording it there installs a manifest that omits the
-/// blob, and the next open's orphan sweep then deletes the healthy file —
-/// permanent value loss from a one-shot I/O fault. The table-recovery path
-/// already propagates; the blob scan must match it.
+/// Manifest-loss repair of a tight-space-punched blob file must restore the
+/// live-data frontier from the punch geometry: the manifest's
+/// `blob_restrictions` record is the frontier's only durable copy, and a repair
+/// that rebuilds the blob with frontier `0` (plus a whole-file digest over the
+/// zeroed prefix) leaves a later relocation scan starting inside the punched
+/// region. The frontier is a byte offset at a frame boundary, so — unlike the
+/// SST bound, which is a key and needs its sidecar — the geometry recovers it
+/// EXACTLY: the zeroed run from the data-section start ends where a valid
+/// frame decodes.
+///
+/// The second live frame's value is ALL ZEROS: the probe must anchor on frame
+/// structure, never on zero runs alone, so a zero-filled payload inside the
+/// live suffix cannot move the frontier.
+#[test]
+fn blob_recovery_derives_the_frontier_of_a_punched_blob_file() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    memfs.create_dir_all(&blobs)?;
+    let punched_path = blobs.join("0");
+    let whole_path = blobs.join("1");
+
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    for path in [&punched_path, &whole_path] {
+        let mut w = crate::vlog::blob_file::writer::Writer::new(path, 0, 0, &*fs_dyn)?;
+        w.write(b"a", 1, &[b'x'; 300])?;
+        w.write(b"b", 2, &vec![0u8; 400])?; // zero payload in the live suffix
+        w.write(b"c", 3, &[b'y'; 300])?;
+        w.finish()?;
+    }
+
+    // Frontier = the first frame's end boundary (what a tight-space slice
+    // records after relocating frame 0), data start from the SFA TOC.
+    let entries: Vec<_> = crate::vlog::BlobFileScanner::new(&punched_path, &*fs_dyn, 0)?
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert_eq!(entries.len(), 3, "three frames written");
+    let frontier = entries[0].frame_end;
+    let data_start = {
+        let mut file = fs_dyn.open(&punched_path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut file)?;
+        reader
+            .toc()
+            .section(b"data")
+            .expect("blob file has a data section")
+            .pos()
+    };
+
+    // The tight-space punch: the consumed prefix reads as zeros.
+    memfs.punch_hole(&punched_path, data_start, frontier - data_start)?;
+
+    let config = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs.clone());
+
+    let (files, unreadable) = super::recover_blob_files(&config)?;
+    assert!(
+        unreadable.is_empty(),
+        "both blob files recover: {unreadable:?}"
+    );
+    assert_eq!(files.len(), 2, "both blob files recovered");
+    let punched = files.iter().find(|f| f.id() == 0).expect("punched file");
+    let whole = files.iter().find(|f| f.id() == 1).expect("whole file");
+
+    assert_eq!(
+        punched.live_data_start(),
+        frontier,
+        "repair must derive the punched file's frontier from its geometry"
+    );
+    let suffix_digest = crate::Checksum::from_raw(super::compute_table_checksum_from(
+        &*config.fs,
+        &punched_path,
+        frontier,
+    )?);
+    assert_eq!(
+        punched.checksum(),
+        suffix_digest,
+        "the recorded digest must cover the live suffix, not the zeroed prefix"
+    );
+
+    assert_eq!(
+        whole.live_data_start(),
+        0,
+        "an unpunched file keeps the whole-file frontier"
+    );
+    Ok(())
+}
+
+/// A TRANSIENT read failure while reading a blob file (the frontier probe or
+/// the streaming checksum) must PROPAGATE, not land in `unreadable`: recording
+/// it there installs a manifest that omits the blob, and the next open's
+/// orphan sweep then deletes the healthy file — permanent value loss from a
+/// one-shot I/O fault. The table-recovery path already propagates; the blob
+/// scan must match it.
 #[test]
 fn blob_recovery_propagates_a_transient_checksum_failure() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
     use crate::io::ErrorKind;
     use crate::{Config, SequenceNumberCounter};
-    use std::io::Write;
     use std::sync::Arc;
 
     let memfs = Arc::new(MemFs::new());
@@ -5553,19 +5647,25 @@ fn blob_recovery_propagates_a_transient_checksum_failure() -> crate::Result<()> 
     let blobs = root.join(crate::file::BLOBS_FOLDER);
     memfs.create_dir_all(&blobs)?;
     {
-        let mut f = memfs.open(
-            &blobs.join("0"),
-            &crate::fs::FsOpenOptions::new().write(true).create(true),
-        )?;
-        f.write_all(b"blob bytes")?;
+        // A VALID blob file, so the transient fault is the only obstacle (a
+        // garbage file would classify persistent-unreadable before any read
+        // could be faulted).
+        let fs_dyn: Arc<dyn Fs> = memfs.clone();
+        let mut w = crate::vlog::blob_file::writer::Writer::new(&blobs.join("0"), 0, 0, &*fs_dyn)?;
+        w.write(b"k", 1, b"blob bytes")?;
+        w.finish()?;
     }
 
-    // Fault the streaming read the whole-file checksum performs, with a
-    // RETRYABLE kind.
+    // Fault the per-file streaming reads (frontier probe + whole-file
+    // checksum) with a RETRYABLE kind. `WouldBlock` (EAGAIN), not
+    // `Interrupted` (EINTR): both classify transient, but `std::io`'s
+    // `read_exact` transparently retries `Interrupted`, so a permanently
+    // armed EINTR would spin the probe's buffered reads forever instead of
+    // surfacing.
     let fault = FaultFs::new(memfs.as_ref().clone());
     fault
         .injector()
-        .arm(FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::Interrupted)).on_path("blobs"));
+        .arm(FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::WouldBlock)).on_path("blobs"));
 
     let config = Config::new(
         &root,

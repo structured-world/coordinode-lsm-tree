@@ -1529,6 +1529,130 @@ fn restrict_salvaged_output(
 ///
 /// Returns the recovered blob files and the per-file failure reasons (merged
 /// into the repair report's `unreadable_files`).
+/// Derives a blob file's tight-space live-data frontier from its on-disk punch
+/// geometry, for a manifest-loss repair.
+///
+/// The frontier — where a tight-space relocation's punched `[data_start,
+/// frontier)` prefix ends and the live suffix begins — is recorded only in the
+/// manifest's `blob_restrictions` section. Unlike an SST's restriction bound (a
+/// KEY, which the block-aligned punch cannot reproduce and which therefore
+/// needs its `.restrict-bound` sidecar), the blob frontier is a byte offset at
+/// a frame boundary, so the geometry recovers it EXACTLY: the punch zeroes
+/// precisely `[data_start, frontier)` and the first live frame's magic sits at
+/// `frontier`.
+///
+/// Anchoring is structural, never length-based: a zeroed run counts only when a
+/// frame decodes cleanly at its end, so a zero-filled value payload inside the
+/// live suffix (stepped over by frame framing) can never move the frontier. A
+/// partially completed punch (a crash mid-reclaim can leave intact-but-consumed
+/// frames between holes) is walked hole-by-hole, and the frontier is the end of
+/// the LAST zeroed run the anchored walk reaches. Non-zero bytes that fail to
+/// decode end the walk at the last anchored frontier: content corruption is not
+/// punch geometry, and it surfaces exactly as it would on an unpunched file.
+///
+/// Returns `0` (whole file) when the first data byte is non-zero: the punch
+/// always starts at the data start, so an unpunched file — including one whose
+/// committed punch never ran before a crash — short-circuits without a walk,
+/// keeping the common repair path at zero extra read cost. The redundant
+/// unpunched prefix is superseded by relocated copies and reclaimed later, the
+/// same safe fallback the SST path takes for a committed-but-unpunched slice.
+///
+/// # Errors
+///
+/// Propagates I/O and TOC errors (the caller classifies transient ones for
+/// retry, like every other per-file repair probe).
+fn derive_blob_frontier(
+    fs: &Arc<dyn crate::fs::Fs>,
+    path: &std::path::Path,
+    blob_id: crate::vlog::BlobFileId,
+) -> crate::Result<u64> {
+    let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+    let (data_start, data_end) = {
+        let reader = crate::sfa::Reader::from_reader(&mut file)?;
+        let data = reader
+            .toc()
+            .section(b"data")
+            .ok_or(crate::Error::InvalidHeader("BlobFile"))?;
+        let end = data
+            .pos()
+            .checked_add(data.len())
+            .ok_or(crate::Error::InvalidHeader("BlobFile"))?;
+        (data.pos(), end)
+    };
+    if data_start >= data_end {
+        return Ok(0);
+    }
+
+    // Ends of the contiguous all-zero run starting at `from` (chunked reads,
+    // capped by the data-section end).
+    let skip_zeros = |from: u64| -> crate::Result<u64> {
+        const CHUNK: u64 = 64 * 1024;
+        let mut pos = from;
+        while pos < data_end {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "min() bounds the window by CHUNK, which fits usize"
+            )]
+            let want = (data_end - pos).min(CHUNK) as usize;
+            let chunk = crate::file::read_exact(&*file, pos, want)?;
+            match chunk.iter().position(|b| *b != 0) {
+                Some(hit) => return Ok(pos + hit as u64),
+                None => pos += want as u64,
+            }
+        }
+        Ok(data_end)
+    };
+
+    // Fast path: an unpunched file's first frame magic (non-zero) sits at the
+    // data start.
+    if skip_zeros(data_start)? == data_start {
+        return Ok(0);
+    }
+
+    let mut pos = data_start;
+    // The last structure-anchored frontier: committed only once a frame has
+    // decoded cleanly at a zeroed run's end.
+    let mut committed: u64 = 0;
+    loop {
+        let run_end = skip_zeros(pos)?;
+        if run_end >= data_end {
+            // Zeros to the section end: the whole data region was consumed
+            // (the final slice's punch ran, its drop lagged the crash).
+            return Ok(data_end);
+        }
+        let mut scanner = crate::vlog::BlobFileScanner::resume(path, &**fs, blob_id, run_end)?;
+        match scanner.next() {
+            Some(Ok(entry)) if !entry.resynced => {
+                committed = run_end;
+                pos = entry.frame_end;
+            }
+            Some(Err(e)) if is_transient_io(&e) => return Err(e),
+            // The zeroed run is not punch geometry (no frame decodes at its
+            // end): keep the last anchored frontier.
+            _ => return Ok(committed),
+        }
+        // Chain frames from the anchor until the section ends cleanly or the
+        // chain breaks (another hole, or content corruption).
+        loop {
+            match scanner.next() {
+                None => return Ok(committed),
+                Some(Ok(entry)) if !entry.resynced => pos = entry.frame_end,
+                Some(Err(e)) if is_transient_io(&e) => return Err(e),
+                Some(Ok(_)) | Some(Err(_)) => {
+                    // The frame starting at `pos` failed (or the scanner
+                    // resynced past unproven bytes). Another zeroed hole
+                    // continues the walk; anything else is content corruption
+                    // and ends it at the last anchored frontier.
+                    if skip_zeros(pos)? == pos {
+                        return Ok(committed);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
 fn recover_blob_files(
     config: &Config,
 ) -> crate::Result<(Vec<crate::vlog::BlobFile>, UnreadableFiles)> {
@@ -1583,8 +1707,15 @@ fn recover_blob_files(
             continue;
         }
 
-        let checksum = match compute_table_checksum(&*config.fs, &blob_path) {
-            Ok(c) => crate::Checksum::from_raw(c),
+        // A tight-space-punched blob records its live-data frontier only in
+        // the manifest; with the manifest lost, re-derive it from the punch
+        // geometry so the rebuilt manifest restores the restriction (the
+        // snapshot encoder persists it from the recovered `live_data_start`).
+        // Rebuilding with frontier 0 would instead leave a later relocation
+        // scan starting inside the punched (zeroed) prefix. An unpunched file
+        // short-circuits to 0 on its first (non-zero) data byte.
+        let frontier = match derive_blob_frontier(&config.fs, &blob_path, blob_id) {
+            Ok(f) => f,
             // A TRANSIENT read (flaky I/O) is retryable: recording the blob
             // unreadable commits a manifest without the still-in-place file,
             // which the next open's orphan sweep then DELETES — permanent value
@@ -1598,7 +1729,23 @@ fn recover_blob_files(
             }
         };
 
-        match crate::vlog::recover_blob_file(&blob_path, blob_id, checksum, 0, &config.fs) {
+        // The digest covers the live region only — `[frontier, end)` for a
+        // punched file, the whole file for `frontier == 0` — matching what
+        // `reopen_restricted` records and what integrity checks recompute.
+        let checksum = match compute_table_checksum_from(&*config.fs, &blob_path, frontier) {
+            Ok(c) => crate::Checksum::from_raw(c),
+            // Same transient/persistent split as the frontier probe above.
+            Err(e) if is_transient_io(&e) => return Err(e),
+            Err(e) => {
+                seen_ids.remove(&blob_id);
+                unreadable.push((blob_path, e.to_string()));
+                continue;
+            }
+        };
+
+        match crate::vlog::recover_blob_file_from(
+            &blob_path, blob_id, checksum, 0, &config.fs, frontier,
+        ) {
             Ok(bf) => blob_files.push(bf),
             // Same transient/persistent split as the checksum read above.
             Err(e) if is_transient_io(&e) => return Err(e),
