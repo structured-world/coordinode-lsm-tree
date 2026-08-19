@@ -125,7 +125,11 @@ fn write_sidecar(
         file.sync_all()?;
         drop(file);
         // Atomic replace: the live sidecar is either the old marker or the fully
-        // written new one, never a truncated in-between.
+        // written new one, never a truncated in-between. `std::fs::rename`
+        // REPLACES an existing destination FILE on every supported platform
+        // (on Windows via replace-existing semantics; only a destination
+        // DIRECTORY fails there), so re-publishing over the in-progress marker
+        // — the completed marker lands on the same path — works everywhere.
         fs.rename(&tmp, &path)?;
         if let Some(parent) = path.parent() {
             fs.sync_directory(parent)?;
