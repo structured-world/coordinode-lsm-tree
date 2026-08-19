@@ -1467,16 +1467,16 @@ impl Table {
             .len;
 
         // A tight-space-restricted view has reclaimed the DATA blocks below its
-        // frontier, but NOT the whole `[0, punch)` span: live index / filter blocks
-        // are interleaved among those data blocks (partitioned index / filter) and
-        // the reopen path reads them, so `Inner::drop` punches each data block
-        // INDIVIDUALLY and leaves the metadata blocks intact. Reproduce that exact
-        // hole pattern in the heal copy — copy the live blocks, leave the reclaimed
-        // data-block extents as holes — instead of materializing the zeros (which
-        // would re-allocate the reclaimed space, an ENOSPC risk on the near-full disk
-        // tight-space runs on) OR zeroing the whole prefix (which would corrupt the
-        // interleaved metadata). `punch` is `0` for a normal (unrestricted) table, so
-        // its copy is byte-for-byte as before.
+        // frontier. The frontier lies inside the `data` section (index / filter /
+        // meta sections all sit past the data region), and `Inner::drop` punches
+        // each data block INDIVIDUALLY, top-down, stopping at the first failure —
+        // so the prefix may be zeroed only partially. Reproduce the punched
+        // extents as HOLES in the heal copy — probing each one, not assuming it —
+        // instead of materializing the zeros (which would re-allocate the
+        // reclaimed space, an ENOSPC risk on the near-full disk tight-space runs
+        // on) or blindly zeroing the whole prefix (which would discard the
+        // intact bytes an incomplete punch left behind). `punch` is `0` for a
+        // normal (unrestricted) table, so its copy is byte-for-byte as before.
         let punch = self
             .punch_offset()
             .map_err(|e| alloc::format!("punch offset: {e}"))?;
@@ -1494,9 +1494,9 @@ impl Table {
         // Any failure past this point must take the copy with it (see above).
         let mut copy = || -> Result<(), alloc::string::String> {
             // The reclaimed DATA-block extents below the frontier — exactly what
-            // tight-space punched (via `Inner::drop`). The block index yields ONLY
-            // data-block handles, so live index / filter blocks interleaved below the
-            // frontier are NOT in this set and stay in the copied complement.
+            // tight-space punched (via `Inner::drop`). The block index yields the
+            // data-block handles, so the copied complement keeps everything the
+            // punch never touches (the straddling block and every later section).
             //
             // Each candidate extent is PROBED for actual zeros rather than assumed
             // punched from the logical bound alone: a slice that committed but

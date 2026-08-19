@@ -370,11 +370,13 @@ impl Drop for Inner {
             // is fine that this view's own handles drop right after this body.
             //
             // Punch each data block below the boundary INDIVIDUALLY rather than
-            // the whole `[0, offset)` span: index / filter blocks are interleaved
-            // among the data blocks and the reopen path reads them, so a single
-            // span punch would zero a section the SST needs. The block index
-            // yields only data-block handles, so iterating it punches exactly the
-            // reclaimable data and never an index / filter / footer region.
+            // the whole `[0, offset)` span. The boundary lies inside the `data`
+            // section, whose blocks the writer lays out contiguously from
+            // offset 0 (index / filter / meta sections all sit PAST the data
+            // region), so a span punch would zero the same bytes — the
+            // per-block form is kept for the classifiable hole pattern below,
+            // not for section safety. The block index yields only data-block
+            // handles, so iterating it punches exactly the reclaimable data.
             //
             // Punch TOP-DOWN (highest reclaimable block first) and STOP at the
             // first failure. This keeps the resulting hole pattern CLASSIFIABLE

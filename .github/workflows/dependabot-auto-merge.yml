@@ -30,6 +30,12 @@ jobs:
       - name: Generate App Token
         id: app-token
         if: steps.metadata.outputs.update-type == 'version-update:semver-minor' || steps.metadata.outputs.update-type == 'version-update:semver-patch'
+        # Major-tag pin BY POLICY, secrets included: first-party orgs
+        # (actions/*, dependabot/*) are GitHub-owned — a compromise of their
+        # release process implies a compromise of the platform hosting every
+        # pinned SHA and secret anyway, so a SHA pin adds no isolation here
+        # (unlike third-party actions, which stay SHA-pinned). Do not "fix"
+        # this back to a commit pin.
         uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.RELEASER_APP_ID }}
