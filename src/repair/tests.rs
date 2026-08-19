@@ -5667,7 +5667,7 @@ fn blob_recovery_derives_the_frontier_of_a_punched_blob_file() -> crate::Result<
     )
     .with_shared_fs(memfs);
 
-    let (files, unreadable) = super::recover_blob_files(&config)?;
+    let (files, unreadable, _rewrites) = super::recover_blob_files(&config)?;
     assert!(
         unreadable.is_empty(),
         "both blob files recover: {unreadable:?}"
@@ -5700,15 +5700,138 @@ fn blob_recovery_derives_the_frontier_of_a_punched_blob_file() -> crate::Result<
     Ok(())
 }
 
-/// A recovered SST whose blob handles point BELOW a punched blob file's
-/// derived live-data frontier must be set aside, exactly like one referencing
-/// a missing blob id: the id exists, but a read through such a handle
-/// dereferences the punched (zeroed) prefix and fails. Reachable when a crash
-/// leaves a pre-relocation SST file on disk after the relocation's punch ran
-/// and the manifest is lost.
+/// A blob file with a checksum-corrupt value frame must not be blessed as-is:
+/// restamping a digest over the damaged bytes would launder the corruption
+/// past every later integrity check while reads of the affected value still
+/// fail. Repair instead SALVAGES the blob (quarantining the original, writing
+/// a compacted copy holding every intact record) and REWRITES the referencing
+/// SSTs through the salvage offset map — surviving records keep working, the
+/// lost record's entry is dropped (its key reads as absent, never an error).
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
-fn repair_excludes_tables_with_handles_below_a_blob_frontier() -> crate::Result<()> {
+fn repair_salvages_a_frame_corrupt_blob_and_remaps_handles() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let value = |i: u32| alloc::vec![b'a' + u8::try_from(i).expect("small i"); 64];
+
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        for i in 0..8u32 {
+            tree.insert(format!("k{i:04}").as_bytes(), value(i), u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Corrupt the LAST record's payload (the salvage walk keeps everything
+    // before the first damaged frame, so only this record is lost).
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let blob_path = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one blob file")
+        .path;
+    let entries: Vec<_> = crate::vlog::BlobFileScanner::new(&blob_path, &*fs_dyn, 0)?
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert_eq!(entries.len(), 8, "eight separated values");
+    let last = entries.last().expect("last frame");
+    let flip_at = last.frame_end - 8; // inside the last frame's payload
+    {
+        let mut file = memfs.open(
+            &blob_path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        let byte = crate::file::read_exact(&*file, flip_at, 1)?;
+        file.seek(SeekFrom::Start(flip_at))?;
+        file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
+    }
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs.clone())
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "the referencing table survives, rewritten through the remap: {report:?}",
+    );
+
+    // Reopen: every intact record reads its value; the lost record's key is
+    // ABSENT (its entry was dropped), never a read error.
+    let tree = match Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .open()?
+    {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+    };
+    for i in 0..7u32 {
+        assert_eq!(
+            tree.get(format!("k{i:04}").as_bytes(), crate::MAX_SEQNO)?
+                .as_deref(),
+            Some(value(i).as_slice()),
+            "intact record k{i:04} must survive the blob salvage + handle remap",
+        );
+    }
+    assert_eq!(
+        tree.get(b"k0007", crate::MAX_SEQNO)?,
+        None,
+        "the corrupt record's key reads as absent, never as an error",
+    );
+    Ok(())
+}
+
+/// A recovered SST whose blob handles point BELOW a punched blob file's
+/// derived live-data frontier must not be published as-is — a read through
+/// such a handle dereferences the punched (zeroed) prefix and fails. Instead
+/// of setting the whole table aside (discarding its intact entries), repair
+/// REWRITES it: the sub-frontier entries are dropped (their records were
+/// relocated elsewhere and this pre-relocation survivor is stale), every
+/// other entry is preserved. Reachable when a crash leaves a pre-relocation
+/// SST file on disk after the relocation's punch ran and the manifest is lost.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_rewrites_tables_with_handles_below_a_blob_frontier() -> crate::Result<()> {
     use crate::fs::{Fs, MemFs};
     use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
     use std::sync::Arc;
@@ -5777,25 +5900,50 @@ fn repair_excludes_tables_with_handles_below_a_blob_frontier() -> crate::Result<
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .with_shared_fs(memfs)
+    .with_shared_fs(Arc::clone(&memfs) as Arc<dyn Fs>)
     .with_kv_separation(Some(
         KvSeparationOptions::default().separation_threshold(16),
     ))
     .repair()?;
 
     assert_eq!(
-        report.recovered, 0,
-        "an SST holding a handle below the punched blob's frontier must be \
-         set aside, not published with a handle into zeroed bytes: {report:?}",
+        report.recovered, 1,
+        "the table survives, rewritten with its stale handles dropped: {report:?}",
     );
-    assert!(
-        report
-            .unreadable_files
-            .iter()
-            .any(|(_, reason)| reason.contains("frontier")),
-        "the report names the stale-handle cause: {:?}",
-        report.unreadable_files,
+    assert_eq!(
+        report.salvaged, 1,
+        "the rewrite runs through the salvage pipeline and counts as such: {report:?}",
     );
+
+    // Reopen: the punched-prefix record's key is absent (its entry was
+    // dropped — the record was relocated elsewhere and this survivor is
+    // stale), every later record still reads.
+    let tree = match Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .open()?
+    {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+    };
+    assert_eq!(
+        tree.get(b"k0000", crate::MAX_SEQNO)?,
+        None,
+        "the sub-frontier record's key reads as absent, never as an error",
+    );
+    for i in 1..8u32 {
+        assert!(
+            tree.get(format!("k{i:04}").as_bytes(), crate::MAX_SEQNO)?
+                .is_some(),
+            "record k{i:04} above the frontier must survive the rewrite",
+        );
+    }
     Ok(())
 }
 
@@ -5832,7 +5980,7 @@ fn blob_recovery_quarantines_a_persistently_unreadable_blob_file() -> crate::Res
     )
     .with_shared_fs(memfs.clone());
 
-    let (files, unreadable) = super::recover_blob_files(&config)?;
+    let (files, unreadable, _rewrites) = super::recover_blob_files(&config)?;
     assert!(files.is_empty(), "nothing recoverable");
     assert_eq!(unreadable.len(), 1, "the bad blob is reported");
     assert!(
@@ -5879,7 +6027,7 @@ fn blob_recovery_quarantines_a_duplicate_blob_id() -> crate::Result<()> {
     )
     .with_shared_fs(memfs.clone());
 
-    let (files, unreadable) = super::recover_blob_files(&config)?;
+    let (files, unreadable, _rewrites) = super::recover_blob_files(&config)?;
     assert_eq!(files.len(), 1, "one blob file per id");
     assert_eq!(
         unreadable.len(),
@@ -5957,7 +6105,7 @@ fn blob_recovery_propagates_a_transient_checksum_failure() -> crate::Result<()> 
         result.is_err(),
         "a transient blob checksum failure must propagate for a retry, not be \
          recorded as unreadable: {:?}",
-        result.map(|(files, unreadable)| (files.len(), unreadable)),
+        result.map(|(files, unreadable, _)| (files.len(), unreadable)),
     );
     Ok(())
 }

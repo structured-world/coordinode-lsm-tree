@@ -1180,30 +1180,52 @@ enum SalvageOutcome {
     PunchedBoundLost,
 }
 
+/// What one [`try_salvage_table`] call operates on: the source paths and the
+/// per-call policy. Bundled so the salvage entry keeps a small signature as
+/// its policy surface grows.
+#[cfg(feature = "std")]
+struct TableSalvage<'a> {
+    /// The already-quarantined corrupt original (the salvage source). The
+    /// CALLER performs the quarantine move and aborts the whole repair when it
+    /// fails — a manifest omitting a still-in-place file would let the next
+    /// open's orphan cleanup delete the only copy. An error returned from the
+    /// salvage is therefore always post-quarantine: the original is safely
+    /// preserved, and the caller records the failure instead of aborting.
+    quarantined: &'a std::path::Path,
+    /// Where the recovered copy is written (the original table path).
+    table_path: &'a std::path::Path,
+    /// The durable table id (its file name).
+    table_id: TableId,
+    /// Fail closed when the salvage walk reveals the source was PUNCHED (a
+    /// dropped data extent reads as zeros) — set by the recovery-failure arm
+    /// when it has no recoverable restriction bound and resurrection is off.
+    /// The pre-salvage first-bytes probe catches a punched FIRST block cheaply,
+    /// but a partial punch (the punch-on-drop reclaim continues past an
+    /// individual `punch_hole` failure) can leave the first block intact while
+    /// later prefix blocks are zeroed; only the walk sees those. The
+    /// verification arm passes `false`: it derives the bound from its restricted
+    /// view, so its salvage output is re-restricted, never ambiguous.
+    reject_punched_without_bound: bool,
+    /// Per-blob handle rewrite for a table referencing a blob file this repair
+    /// reshaped (salvaged into a compacted copy, or recovered with a punched
+    /// frontier); `None` on the plain corrupt-table salvage paths.
+    blob_rewrite:
+        Option<Arc<crate::HashMap<crate::vlog::BlobFileId, crate::salvage::BlobFileRewrite>>>,
+}
+
 fn try_salvage_table(
     config: &Config,
     fs: &Arc<dyn crate::fs::Fs>,
     allow_resurrection: bool,
-    // The already-quarantined corrupt original (the salvage source). The
-    // CALLER performs the quarantine move and aborts the whole repair when it
-    // fails — a manifest omitting a still-in-place file would let the next
-    // open's orphan cleanup delete the only copy. An error returned from HERE
-    // is therefore always post-quarantine: the original is safely preserved,
-    // and the caller records the failure instead of aborting.
-    quarantined: &std::path::Path,
-    table_path: &std::path::Path,
-    table_id: TableId,
-    // Fail closed when the salvage walk reveals the source was PUNCHED (a
-    // dropped data extent reads as zeros) — set by the recovery-failure arm
-    // when it has no recoverable restriction bound and resurrection is off.
-    // The pre-salvage first-bytes probe catches a punched FIRST block cheaply,
-    // but a partial punch (the punch-on-drop reclaim continues past an
-    // individual `punch_hole` failure) can leave the first block intact while
-    // later prefix blocks are zeroed; only the walk sees those. The
-    // verification arm passes `false`: it derives the bound from its restricted
-    // view, so its salvage output is re-restricted, never ambiguous.
-    reject_punched_without_bound: bool,
+    salvage: TableSalvage<'_>,
 ) -> crate::Result<SalvageOutcome> {
+    let TableSalvage {
+        quarantined,
+        table_path,
+        table_id,
+        reject_punched_without_bound,
+        blob_rewrite,
+    } = salvage;
     // Salvage under the tree's configured comparator + crypto/dictionary context
     // so the rewritten SST opens, orders, and decrypts / decompresses consistently
     // with the rest of the tree on reopen (the reopen below uses the same
@@ -1237,6 +1259,7 @@ fn try_salvage_table(
             // it the rebuilt filter loses the source's prefix hashes and
             // prefix scans see the salvaged copy as definitely absent.
             prefix_extractor: config.prefix_extractor.clone(),
+            blob_rewrite,
             // Forward the caller's live-progress handle so the block walk
             // ticks per inspected / recovered block while it runs.
             progress: config.recovery_progress.clone(),
@@ -1688,6 +1711,68 @@ fn derive_blob_frontier(
     }
 }
 
+/// Quarantines a recovered table the blob-dependency stage cannot publish and
+/// records the reason. Consumes the handle (released before the move); a
+/// failed quarantine aborts the repair — the file must not be both omitted
+/// from the manifest and left in place for the next open's orphan sweep.
+#[cfg(feature = "std")]
+fn set_aside_table(
+    table: Table,
+    reason: &str,
+    unreadable_files: &mut Vec<(PathBuf, String)>,
+    sync_mode: crate::fs::SyncMode,
+) -> crate::Result<()> {
+    let path = (*table.path).clone();
+    let (Some(base), Some(name)) = (
+        path.parent().map(std::path::Path::to_path_buf),
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string),
+    ) else {
+        return Err(crate::Error::Unrecoverable);
+    };
+    let fs = table.fs.clone();
+    drop(table); // release the handle before the quarantine move
+    let dest = quarantine_file(&*fs, &base, &path, &name, sync_mode)?;
+    unreadable_files.push((path, format!("{reason}; set aside at {}", dest.display())));
+    Ok(())
+}
+
+/// Whether every frame in `path`'s live data range (`[live_data_start, end)`)
+/// decodes and checksums cleanly, with no resynchronization. Repair must not
+/// record a digest over damaged frames: the restamped digest would launder the
+/// corruption past every later integrity check while reads of the affected
+/// values still fail — such a file is salvaged instead.
+///
+/// # Errors
+///
+/// Propagates transient I/O for retry; any structural or persistent frame
+/// failure is a conclusive `Ok(false)`.
+#[cfg(feature = "std")]
+fn validate_blob_frames(
+    fs: &Arc<dyn crate::fs::Fs>,
+    path: &std::path::Path,
+    blob_id: crate::vlog::BlobFileId,
+    live_data_start: u64,
+) -> crate::Result<bool> {
+    let scanner = if live_data_start > 0 {
+        crate::vlog::BlobFileScanner::resume(path, &**fs, blob_id, live_data_start)?
+    } else {
+        crate::vlog::BlobFileScanner::new(path, &**fs, blob_id)?
+    };
+    for item in scanner {
+        match item {
+            Ok(entry) if !entry.resynced => {}
+            Err(e) if is_transient_io(&e) => return Err(e),
+            // A resynced frame has an unprovable boundary (damage upstream);
+            // any other error is a structural or persistent frame failure.
+            // Both are conclusive: this file's frames do not all verify.
+            Ok(_) | Err(_) => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
 /// Whether any of `table`'s blob indirections points BELOW a recovered punched
 /// blob file's live-data frontier — i.e. into its zeroed prefix. The
 /// id-presence dependency check cannot see this case: the blob EXISTS, but a
@@ -1726,15 +1811,25 @@ fn handle_below_blob_frontier(
 
 fn recover_blob_files(
     config: &Config,
-) -> crate::Result<(Vec<crate::vlog::BlobFile>, UnreadableFiles)> {
+) -> crate::Result<(
+    Vec<crate::vlog::BlobFile>,
+    UnreadableFiles,
+    crate::HashMap<crate::vlog::BlobFileId, crate::salvage::BlobFileRewrite>,
+)> {
     let blobs_folder = config.path.join(crate::file::BLOBS_FOLDER);
     let mut blob_files: Vec<crate::vlog::BlobFile> = Vec::new();
     let mut unreadable: UnreadableFiles = Vec::new();
+    // How referencing SSTs' handles must be rewritten for the blob files this
+    // scan RESHAPED: `Remap` for a file salvaged into a compacted copy,
+    // `DropBelow` for an intact file recovered with a punched frontier. Empty
+    // on the common path.
+    let mut rewrites: crate::HashMap<crate::vlog::BlobFileId, crate::salvage::BlobFileRewrite> =
+        crate::HashMap::default();
 
     // No `blobs/` folder = no blob files (a blob tree that never spilled a value
     // to the value log). Nothing to recover; the manifest records an empty list.
     if !config.fs.exists(&blobs_folder)? {
-        return Ok((blob_files, unreadable));
+        return Ok((blob_files, unreadable, rewrites));
     }
 
     // Collect and ORDER the candidates before recovering: `read_dir` order is
@@ -1867,6 +1962,127 @@ fn recover_blob_files(
             }
         };
 
+        // Validate the live frame range BEFORE recording a digest: hashing
+        // damaged frames would restamp (launder) the corruption past every
+        // later integrity check while reads of the affected values still
+        // fail. An invalid file is SALVAGED instead of blessed or thrown
+        // away whole: the original is quarantined (preserved), the surviving
+        // records are re-emitted into a compacted replacement under the
+        // canonical name, and the offset relocation is recorded so the
+        // referencing SSTs are rewritten onto the new offsets.
+        let frames_valid = validate_blob_frames(&config.fs, &blob_path, blob_id, frontier)?;
+        if !frames_valid {
+            let quarantined = quarantine_file(
+                &*config.fs,
+                &blobs_folder,
+                &blob_path,
+                &file_name,
+                config.sync_mode,
+            )?;
+            let dest = blobs_folder.join(blob_id.to_string());
+            let report = match crate::salvage::salvage_blob_file(
+                &quarantined,
+                dest,
+                &config.fs,
+                blob_id,
+                &config.comparator,
+                frontier,
+            ) {
+                Ok(report) => report,
+                // Transient reads must retry; the salvage discarded its own
+                // partial output, and the original sits safely in quarantine —
+                // but a retried repair scans `blobs/` again, so restore the
+                // original first or the retry would see no file at all.
+                Err(e) if is_transient_io(&e) => {
+                    config.fs.rename(&quarantined, &blob_path)?;
+                    return Err(e);
+                }
+                Err(e) => {
+                    unreadable.push((
+                        blob_path,
+                        format!(
+                            "value frames failed validation and salvage failed ({e}); \
+                             original preserved at {}",
+                            quarantined.display(),
+                        ),
+                    ));
+                    continue;
+                }
+            };
+            let Some(salvaged_path) = report.salvaged_path else {
+                unreadable.push((
+                    blob_path,
+                    format!(
+                        "value frames failed validation and no record was recoverable; \
+                         original preserved at {}",
+                        quarantined.display(),
+                    ),
+                ));
+                continue;
+            };
+            let checksum = match compute_table_checksum(&*config.fs, &salvaged_path) {
+                Ok(c) => crate::Checksum::from_raw(c),
+                Err(e) if is_transient_io(&e) => {
+                    return Err(e);
+                }
+                Err(e) => {
+                    let _ = config.fs.remove_file(&salvaged_path);
+                    unreadable.push((
+                        blob_path,
+                        format!(
+                            "salvaged replacement unreadable ({e}); original preserved at {}",
+                            quarantined.display(),
+                        ),
+                    ));
+                    continue;
+                }
+            };
+            match crate::vlog::recover_blob_file_from(
+                &salvaged_path,
+                blob_id,
+                checksum,
+                0,
+                &config.fs,
+                0,
+            ) {
+                Ok(bf) => {
+                    if let Some(p) = &config.recovery_progress {
+                        p.blob_file_recovered();
+                    }
+                    kept_paths.insert(blob_id, salvaged_path);
+                    blob_files.push(bf);
+                    rewrites.insert(
+                        blob_id,
+                        crate::salvage::BlobFileRewrite::Remap(
+                            report.offset_remap.iter().copied().collect(),
+                        ),
+                    );
+                    unreadable.push((
+                        blob_path,
+                        format!(
+                            "{} of {} records salvaged into a compacted replacement \
+                             (the rest were corrupt); original preserved at {}",
+                            report.records_salvaged,
+                            report.records_total,
+                            quarantined.display(),
+                        ),
+                    ));
+                }
+                Err(e) if is_transient_io(&e) => return Err(e),
+                Err(e) => {
+                    let _ = config.fs.remove_file(&salvaged_path);
+                    unreadable.push((
+                        blob_path,
+                        format!(
+                            "salvaged replacement unreadable ({e}); original preserved at {}",
+                            quarantined.display(),
+                        ),
+                    ));
+                }
+            }
+            continue;
+        }
+
         // The digest covers the live region only — `[frontier, end)` for a
         // punched file, the whole file for `frontier == 0` — matching what
         // `reopen_restricted` records and what integrity checks recompute.
@@ -1887,6 +2103,15 @@ fn recover_blob_files(
                 if let Some(p) = &config.recovery_progress {
                     p.blob_file_recovered();
                 }
+                if frontier > 0 {
+                    // A punched-but-intact file: a stale handle below its
+                    // frontier (a pre-relocation SST left behind by a crash)
+                    // must be dropped by the table-rewrite stage.
+                    rewrites.insert(
+                        blob_id,
+                        crate::salvage::BlobFileRewrite::DropBelow(frontier),
+                    );
+                }
                 kept_paths.insert(blob_id, blob_path);
                 blob_files.push(bf);
             }
@@ -1898,7 +2123,7 @@ fn recover_blob_files(
         }
     }
 
-    Ok((blob_files, unreadable))
+    Ok((blob_files, unreadable, rewrites))
 }
 
 impl Config {
@@ -2480,13 +2705,17 @@ fn repair_tree(
                                 config,
                                 &folder_fs,
                                 allow_resurrection,
-                                &quarantined,
-                                &table_path,
-                                table_id,
-                                // The bound (when any) comes from the restricted
-                                // view and is re-imposed below, so a punched
-                                // source is never ambiguous on this arm.
-                                false,
+                                TableSalvage {
+                                    quarantined: &quarantined,
+                                    table_path: &table_path,
+                                    table_id,
+                                    // The bound (when any) comes from the
+                                    // restricted view and is re-imposed below,
+                                    // so a punched source is never ambiguous
+                                    // on this arm.
+                                    reject_punched_without_bound: false,
+                                    blob_rewrite: None,
+                                },
                             ) {
                                 Ok(SalvageOutcome::Salvaged(salvaged)) => {
                                     // Re-impose the tight-space restriction on the
@@ -2683,10 +2912,13 @@ fn repair_tree(
                         config,
                         &folder_fs,
                         allow_resurrection,
-                        &quarantined,
-                        &table_path,
-                        table_id,
-                        reject_punched,
+                        TableSalvage {
+                            quarantined: &quarantined,
+                            table_path: &table_path,
+                            table_id,
+                            reject_punched_without_bound: reject_punched,
+                            blob_rewrite: None,
+                        },
                     ) {
                         Ok(SalvageOutcome::Salvaged(salvaged)) => {
                             // Re-impose the tight-space restriction on the salvaged
@@ -2834,9 +3066,14 @@ fn repair_tree(
     // Runs BEFORE the L0 runs are built: a table whose indirections point into a
     // blob file this scan could NOT recover must not be published (see the
     // dependency check below), so the surviving blob ids have to be known first.
+    let mut blob_rewrites: crate::HashMap<
+        crate::vlog::BlobFileId,
+        crate::salvage::BlobFileRewrite,
+    > = crate::HashMap::default();
     let (tree_type, blob_file_list) = if config.kv_separation_opts.is_some() {
-        let (blob_files, blob_unreadable) = recover_blob_files(config)?;
+        let (blob_files, blob_unreadable, rewrites) = recover_blob_files(config)?;
         unreadable_files.extend(blob_unreadable);
+        blob_rewrites = rewrites;
         let map: crate::HashMap<crate::vlog::BlobFileId, crate::vlog::BlobFile> =
             blob_files.into_iter().map(|bf| (bf.id(), bf)).collect();
         (TreeType::Blob, BlobFileList::new(map))
@@ -2848,50 +3085,116 @@ fn repair_tree(
     };
 
     // Drop any recovered table that still references a blob file the scan could
-    // not recover. Publishing the pair yields a manifest that opens fine while a
-    // read of an affected key resolves a handle into a blob file that is not
+    // not recover: publishing the pair yields a manifest that opens fine while
+    // a read of an affected key resolves a handle into a blob file that is not
     // there. A table whose `linked_blob_files` section cannot be read is treated
-    // the same way: its dependencies are unknown, so it cannot be proven safe.
+    // the same way (its dependencies are unknown, so it cannot be proven safe).
+    // A table referencing a RESHAPED blob file — one the blob scan salvaged
+    // into a compacted copy, or recovered with a punched frontier — is instead
+    // REWRITTEN through the salvage pipeline: its handles are re-targeted at
+    // the relocated records and only entries whose record no longer exists are
+    // dropped, so intact live data is never discarded over a reshaped
+    // dependency.
     if config.kv_separation_opts.is_some() {
-        // Live-data frontiers of the recovered blob files whose consumed
-        // prefix was punched: a handle pointing below one dereferences zeroed
-        // bytes. Non-empty only after a tight-space blob relocation, so the
-        // per-table handle scan below is skipped entirely on the common path.
-        let punched_frontiers: crate::HashMap<crate::vlog::BlobFileId, u64> = blob_file_list
+        // Frontiers of the punched-but-intact blob files (the `DropBelow`
+        // rewrite entries): a handle below one dereferences zeroed bytes.
+        // Empty on the common path, so no table's handles are scanned.
+        let punched_frontiers: crate::HashMap<crate::vlog::BlobFileId, u64> = blob_rewrites
             .iter()
-            .filter(|bf| bf.live_data_start() > 0)
-            .map(|bf| (bf.id(), bf.live_data_start()))
+            .filter_map(|(id, rw)| match rw {
+                crate::salvage::BlobFileRewrite::DropBelow(f) => Some((*id, *f)),
+                crate::salvage::BlobFileRewrite::Remap(_) => None,
+            })
             .collect();
+        let blob_rewrites = Arc::new(blob_rewrites);
         let mut kept: Vec<(Table, bool)> = Vec::with_capacity(recovered_tables.len());
         for (table, complete) in recovered_tables {
-            let missing: Option<String> = match table.list_blob_file_references() {
-                Ok(Some(links)) => links
+            // One reference read drives everything below: the missing-id check
+            // and the rewrite decision.
+            let links = match table.list_blob_file_references() {
+                Ok(links) => links,
+                Err(e) if is_transient_io(&e) => return Err(e),
+                Err(e) => {
+                    set_aside_table(
+                        table,
+                        &format!("blob-file reference list unreadable ({e})"),
+                        &mut unreadable_files,
+                        config.sync_mode,
+                    )?;
+                    continue;
+                }
+            };
+            if let Some(l) = links.as_ref().and_then(|links| {
+                links
                     .iter()
                     .find(|l| !blob_file_list.contains_key(l.blob_file_id))
-                    .map(|l| format!("blob file {} is not recoverable", l.blob_file_id)),
-                Ok(None) => None,
-                Err(e) if is_transient_io(&e) => return Err(e),
-                Err(e) => Some(format!("blob-file reference list unreadable ({e})")),
-            };
-            // The id-presence check above cannot see a handle whose blob
-            // EXISTS but whose offset lies below that blob's punched frontier
-            // (a pre-relocation SST file left behind by a crash): publishing
-            // it would resolve reads into the zeroed prefix. Scan the actual
-            // handles only when a punched blob was recovered at all.
-            let missing = match missing {
-                None if !punched_frontiers.is_empty() => {
+            }) {
+                set_aside_table(
+                    table,
+                    &format!("blob file {} is not recoverable", l.blob_file_id),
+                    &mut unreadable_files,
+                    config.sync_mode,
+                )?;
+                continue;
+            }
+            // Whether this table's handles must be rewritten: any reference to
+            // a SALVAGED (compacted, every offset moved) blob file, or a
+            // handle that actually lies below a punched blob's frontier (a
+            // pre-relocation SST file left behind by a crash — the id-presence
+            // check cannot see it).
+            let mut needs_rewrite = false;
+            if let Some(links) = &links {
+                if links.iter().any(|l| {
+                    matches!(
+                        blob_rewrites.get(&l.blob_file_id),
+                        Some(crate::salvage::BlobFileRewrite::Remap(_))
+                    )
+                }) {
+                    needs_rewrite = true;
+                } else if !punched_frontiers.is_empty()
+                    && links
+                        .iter()
+                        .any(|l| punched_frontiers.contains_key(&l.blob_file_id))
+                {
                     match handle_below_blob_frontier(&table, &punched_frontiers) {
-                        Ok(r) => r,
+                        Ok(hit) => needs_rewrite = hit.is_some(),
                         Err(e) if is_transient_io(&e) => return Err(e),
-                        Err(e) => Some(format!("blob handles unreadable ({e})")),
+                        Err(e) => {
+                            set_aside_table(
+                                table,
+                                &format!("blob handles unreadable ({e})"),
+                                &mut unreadable_files,
+                                config.sync_mode,
+                            )?;
+                            continue;
+                        }
                     }
                 }
-                m => m,
-            };
-            let Some(reason) = missing else {
+            }
+            if !needs_rewrite {
                 kept.push((table, complete));
                 continue;
-            };
+            }
+            // A RESTRICTED survivor keeps the set-aside path: the salvage
+            // rewrite emits an UNRESTRICTED copy, which would resurrect the
+            // punched prefix the restriction hides. The compound state (a
+            // restricted view whose blob dependency was also reshaped) is
+            // preserved for the operator instead.
+            if table.restrict_lower_bound().is_some() {
+                set_aside_table(
+                    table,
+                    "restricted table references a reshaped blob file",
+                    &mut unreadable_files,
+                    config.sync_mode,
+                )?;
+                continue;
+            }
+            // Rewrite through the salvage pipeline: quarantine the original
+            // (preserved), re-emit every entry with re-targeted handles,
+            // dropping only entries whose blob record no longer exists. The
+            // rewritten table counts as salvaged (its content may be lossy
+            // relative to the original).
+            let table_id = table.id();
             let path = (*table.path).clone();
             let (Some(base), Some(name)) = (
                 path.parent().map(std::path::Path::to_path_buf),
@@ -2903,8 +3206,40 @@ fn repair_tree(
             };
             let fs = table.fs.clone();
             drop(table); // release the handle before the quarantine move
-            let dest = quarantine_file(&*fs, &base, &path, &name, config.sync_mode)?;
-            unreadable_files.push((path, format!("{reason}; set aside at {}", dest.display())));
+            let quarantined = quarantine_file(&*fs, &base, &path, &name, config.sync_mode)?;
+            match try_salvage_table(
+                config,
+                &fs,
+                allow_resurrection,
+                TableSalvage {
+                    quarantined: &quarantined,
+                    table_path: &path,
+                    table_id,
+                    reject_punched_without_bound: false,
+                    blob_rewrite: Some(Arc::clone(&blob_rewrites)),
+                },
+            ) {
+                Ok(SalvageOutcome::Salvaged(rewritten)) => kept.push((rewritten, false)),
+                Ok(SalvageOutcome::Unusable | SalvageOutcome::PunchedBoundLost) => {
+                    unreadable_files.push((
+                        path,
+                        format!(
+                            "blob-handle rewrite produced nothing; original preserved at {}",
+                            quarantined.display(),
+                        ),
+                    ));
+                }
+                Err(e) if is_transient_io(&e) => return Err(e),
+                Err(e) => {
+                    unreadable_files.push((
+                        path,
+                        format!(
+                            "blob-handle rewrite failed ({e}); original preserved at {}",
+                            quarantined.display(),
+                        ),
+                    ));
+                }
+            }
         }
         recovered_tables = kept;
     }

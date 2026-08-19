@@ -227,6 +227,34 @@ later relocation resumes exactly where the punch stopped. No resurrection
 question arises: blob bytes are reachable only through value handles, so a
 frontier recovered too low exposes nothing.
 
+## Blob frame validation and salvage
+
+Before a blob file's digest is recorded, its live frame range is walked frame
+by frame. Recording a digest over damaged frames would *launder* the
+corruption: every later integrity check passes (the file matches its recorded
+digest) while reads of the affected values still fail. A file whose frames do
+not all verify is therefore never blessed as-is. It is **salvaged**: the
+original moves to quarantine (preserved), every record whose checksum verifies
+— decompressed and re-compressed for a compressed file, proving the content
+round-trips — is re-emitted into a compacted replacement under the canonical
+name, and the per-record offset relocation is retained. Records after the
+first damaged frame are conservatively surrendered (their boundaries are
+unprovable); a dictionary-compressed file is the one shape blob salvage cannot
+re-emit, and such a file is set aside whole with its referencing tables.
+
+A salvaged blob file is compacted, so every surviving record lands at a new
+offset. The SSTs referencing it are then **rewritten** through the salvage
+pipeline rather than set aside: each indirection entry is re-targeted at its
+record's new offset, and only entries whose record was lost are dropped — the
+lost key reads as absent afterwards, never as an error, and intact live data
+is never discarded over a reshaped dependency. The same rewrite drops a stale
+handle that points below a punched-but-intact blob file's frontier (a
+pre-relocation SST left behind by a crash). Two shapes still set a table
+aside, deterministically and with the original preserved: a table whose
+reference list cannot be read, and a *restricted* survivor whose blob
+dependency was reshaped (the rewrite would emit an unrestricted copy and
+resurrect its punched prefix).
+
 ## Delete-mask resolution
 
 A columnar SST records positional deletions in a delete bitmap, and the meta
