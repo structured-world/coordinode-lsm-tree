@@ -3538,6 +3538,71 @@ fn heal_in_place_aborts_when_the_attestation_cannot_be_persisted() -> crate::Res
     Ok(())
 }
 
+/// A heal whose block WRITE landed but whose `sync_data` FAILED keeps its
+/// attestation on purpose (the on-disk bytes may already differ from the
+/// manifest digest, so a later patrol must still be able to attribute them).
+/// That later patrol reads the corrected bytes back from the page cache and
+/// finds the table clean — but refreshing the manifest digest then would
+/// record a post-heal digest over bytes that were never synced: a power loss
+/// discards the healed block while the manifest keeps the new digest, and the
+/// table is permanently unreconcilable. The reconciliation must therefore sync
+/// the SST data itself before refreshing, and keep reporting the table as
+/// unreconciled when that sync fails.
+#[test]
+fn heal_reconcile_refuses_to_refresh_when_the_sst_data_cannot_be_synced() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst_footered(dir.path());
+
+    // Attributable heal scenario: rot a parity byte, rebuild the manifest over
+    // the rotted bytes so the digest matches the CURRENT file.
+    corrupt_parity_trailer_byte(&sst_path, &block)?;
+    rebuild_manifest_over_current_bytes(dir.path())?;
+    let manifest_digest = |tree: &crate::Tree| {
+        let binding = tree.version_history.read().latest_version();
+        binding
+            .version
+            .iter_tables()
+            .next()
+            .map(|t| t.checksum())
+            .expect("the table is in the manifest")
+    };
+
+    // Heal with the SST's data sync faulted: the block write lands (so the
+    // attestation is deliberately kept) while the bytes are never durable.
+    let fault = FaultFs::new(crate::fs::StdFs);
+    let injector = fault.injector();
+    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(fault));
+    let digest_before = manifest_digest(&tree);
+    injector
+        .arm(FaultRule::new(FaultOp::SyncData, Fault::Error(ErrorKind::Other)).on_path("tables"));
+    let _ = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    assert!(
+        heal_attest_path(&sst_path).exists(),
+        "a write-attempted heal keeps its attestation for a later patrol",
+    );
+
+    // The follow-up patrol sees clean (page-cached) bytes and would refresh the
+    // manifest digest through the marker — but the SST data still cannot be
+    // synced, so the refresh must be refused.
+    let report = patrol_scrub(&tree, &PatrolScrubOptions::default().heal_in_place(true));
+    injector.clear();
+
+    assert_eq!(
+        manifest_digest(&tree),
+        digest_before,
+        "the manifest digest must not be refreshed over bytes that were never \
+         synced: a power loss would discard the healed block: {report:?}",
+    );
+    assert!(
+        heal_attest_path(&sst_path).exists(),
+        "the marker survives so a later, syncable patrol can still reconcile",
+    );
+    Ok(())
+}
+
 /// The checkpoint's pre-window reconciliation only scans ECC tables, so a
 /// pending `.heal-attest` marker it cannot consume (here: one on a non-ECC
 /// table) whose digest is STALE — healed bytes not yet reconciled — must still

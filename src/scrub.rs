@@ -987,6 +987,30 @@ fn refresh_healed_checksum(
         );
     }
 
+    // The healed bytes must be DURABLE before the manifest records their digest.
+    // A heal whose write landed but whose sync failed keeps its attestation on
+    // purpose, and this patrol may be reading those corrected bytes straight
+    // from the page cache: refreshing the digest now would leave a power loss
+    // free to discard the healed block while the manifest keeps the post-heal
+    // digest, stranding the table forever. Sync the SST here; a failure keeps
+    // the marker and reports the table as still unreconciled, so a later
+    // patrol on a healthy device completes the reconciliation.
+    if let Err(e) = (|| -> crate::Result<()> {
+        let file = table
+            .fs
+            .open(&table.path, &crate::fs::FsOpenOptions::new().read(true))?;
+        crate::fs::FsFile::sync_data_with(&*file, crate::fs::SyncMode::Full)?;
+        Ok(())
+    })() {
+        return refuse(
+            alloc::format!(
+                "digest mismatch whose healed bytes could not be synced ({e}); \
+                 the manifest digest was not refreshed"
+            ),
+            false,
+        );
+    }
+
     // Pass the captured view's restriction so the install, under its own lock,
     // rejects the refresh if a compaction swapped the current view to a different
     // restriction after the pre-window check below (closing that TOCTOU: `fresh`
