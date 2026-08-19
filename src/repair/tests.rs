@@ -380,6 +380,77 @@ fn highest_existing_version_id_none_when_no_versions_present() -> crate::Result<
     Ok(())
 }
 
+/// A plain `repair()` (salvage off) must not BLESS an SST whose data block is
+/// corrupt: whole-file recovery succeeds (the data section is read lazily), and
+/// the digest is freshly computed over the already-corrupt bytes, so keeping
+/// the table would launder the corruption — the rebuilt manifest counts it as
+/// recovered and `verify_integrity` passes while reads of the affected block
+/// fail. Block verification runs on EVERY repair; the salvage flag only decides
+/// whether a damaged table is rewritten (salvage) or set aside (plain).
+#[test]
+fn plain_repair_quarantines_a_table_with_a_corrupt_data_block() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?;
+        for i in 0..8u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Flip a payload byte of the sole data block: container, index, and meta
+    // stay intact, so whole-file recovery opens the table fine and only a
+    // block-level check can see the damage.
+    let offset = sole_data_block_offset(&recover_table(sst.clone(), &fs)?);
+    let flip = usize::try_from(offset).unwrap_or(0) + 16;
+    let mut bytes = std::fs::read(&sst)?;
+    if let Some(b) = bytes.get_mut(flip) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&sst, &bytes)?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+    assert_eq!(
+        report.recovered, 0,
+        "a table that errors on read must not be blessed into the manifest: {report:?}",
+    );
+    assert_eq!(
+        report.unreadable, 1,
+        "the damaged table is set aside and reported: {:?}",
+        report.unreadable_files,
+    );
+    let [(_, reason)] = report.unreadable_files.as_slice() else {
+        panic!(
+            "expected exactly one unreadable file, got {:?}",
+            report.unreadable_files,
+        );
+    };
+    assert!(
+        reason.contains("salvage"),
+        "the reason points the operator at the salvage-enabled repair, got: {reason}",
+    );
+    Ok(())
+}
+
 /// `repair_with_salvage` on an SST whose ONLY data block is corrupt: whole-file
 /// recovery still succeeds (the data section is read lazily) but verification
 /// fails, and block-salvage finds nothing recoverable, so the table is reported

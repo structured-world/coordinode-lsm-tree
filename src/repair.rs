@@ -2794,19 +2794,67 @@ fn repair_tree(
                         }
                     }
                 }
+                // Salvage OFF: block-verify all the same. Whole-file recovery is
+                // lazy on the data section, and the manifest digest is freshly
+                // computed over whatever bytes are there — blessing a table with
+                // a corrupt data block would LAUNDER the damage (the report
+                // counts it recovered and `verify_integrity` passes while reads
+                // of the affected block fail). The salvage flag only decides what
+                // happens to a damaged table: rewritten (on) or set aside (off,
+                // here), with the report pointing at the salvage-enabled repair.
                 Ok(table) => {
-                    record_best(
-                        &mut recovered_by_id,
-                        &mut unreadable_files,
-                        table_id,
-                        table,
-                        true,
+                    match verify_keep_decision(
+                        config,
                         &folder_fs,
-                        &table_base_folder,
                         &table_path,
-                        &file_name,
-                        config.sync_mode,
-                    )?;
+                        &table,
+                        allow_resurrection,
+                    )? {
+                        RepairKeepDecision::Keep => {
+                            record_best(
+                                &mut recovered_by_id,
+                                &mut unreadable_files,
+                                table_id,
+                                table,
+                                true,
+                                &folder_fs,
+                                &table_base_folder,
+                                &table_path,
+                                &file_name,
+                                config.sync_mode,
+                            )?;
+                        }
+                        decision @ (RepairKeepDecision::Quarantine(_)
+                        | RepairKeepDecision::Salvage) => {
+                            let reason = match decision {
+                                RepairKeepDecision::Quarantine(reason) => reason,
+                                _ => {
+                                    "verification found corrupt data blocks; run a \
+                                     salvage-enabled repair to rewrite the readable blocks"
+                                }
+                            };
+                            drop(table);
+                            // Quarantine (not leave-in-place): a later
+                            // `Tree::open` orphan-cleans table files the rebuilt
+                            // manifest does not reference, so an unquarantined
+                            // original would be DELETED. A failed quarantine
+                            // aborts the whole repair for the same reason as the
+                            // salvage arm.
+                            match quarantine_file(
+                                &*folder_fs,
+                                &table_base_folder,
+                                &table_path,
+                                &file_name,
+                                config.sync_mode,
+                            ) {
+                                Ok(dest) => unreadable_files.push((
+                                    table_path,
+                                    format!("{reason}; quarantined to {}", dest.display()),
+                                )),
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    }
                 }
                 Err(e) if salvage => {
                     // A TRANSIENT recovery failure (Io) is retryable and must NOT
