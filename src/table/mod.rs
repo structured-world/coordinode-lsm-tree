@@ -2271,6 +2271,16 @@ impl Table {
                     // The write_all may have written some bytes even if it then
                     // errored (a partial write); mark the file as possibly mutated
                     // so a later failure does not drop the attestation.
+                    //
+                    // Retaining the attestation across a failed sync is what lets
+                    // a later patrol attribute these bytes — but those bytes are
+                    // NOT durable yet, and that patrol may read them straight from
+                    // the page cache and find the table clean. Recording their
+                    // digest then would let a power loss discard the healed block
+                    // while the manifest keeps the post-heal digest. The
+                    // reconciliation therefore syncs the SST itself before
+                    // refreshing (and refuses the refresh when that sync fails);
+                    // see `crate::scrub`'s marker-based reconcile.
                     write_attempted = true;
                     let durable = match write_back {
                         Ok(()) => file
