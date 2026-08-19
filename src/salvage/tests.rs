@@ -8260,6 +8260,7 @@ fn salvage_blob_file_drops_a_frame_with_a_forged_value_length() -> crate::Result
 /// compressed bytes that this path cannot faithfully re-emit yet.
 #[cfg(feature = "lz4")]
 #[test]
+#[expect(clippy::expect_used, reason = "test code")]
 fn salvage_blob_file_recovers_a_compressed_source() -> crate::Result<()> {
     let dir = tempdir()?;
     let source = dir.path().join("blob_source");

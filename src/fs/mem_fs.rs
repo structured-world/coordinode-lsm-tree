@@ -1087,7 +1087,7 @@ impl Fs for MemFs {
         }
     }
 
-    /// MemFs has no inode concept — [`Fs::hard_link`] produces an independent
+    /// `MemFs` has no inode concept — [`Fs::hard_link`] produces an independent
     /// COPY — so a file's bytes are never shared with another name and the
     /// count is exactly `1` (matching this backend's
     /// [`FsFile::hard_link_count`]). Answering instead of inheriting the

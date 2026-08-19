@@ -3566,7 +3566,7 @@ fn heal_reconcile_refuses_to_refresh_when_the_sst_data_cannot_be_synced() -> cra
             .version
             .iter_tables()
             .next()
-            .map(|t| t.checksum())
+            .map(crate::table::Table::checksum)
             .expect("the table is in the manifest")
     };
 

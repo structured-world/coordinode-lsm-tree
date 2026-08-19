@@ -324,16 +324,27 @@ fn every_hookable_op_faults_when_armed() -> io::Result<()> {
 fn hard_link_count_path_accessor_faults_when_armed() {
     // The path-based `Fs::hard_link_count` accessor (used by the blob-file and
     // table reclaim probes) must consult the injector, not delegate blind, so an
-    // armed `FaultOp::HardLinkCount` exercises its fail-closed path. MemFs's path
-    // accessor is `Unsupported`; the injected fault must override it with `Other`,
-    // which a blind delegation could not do.
-    let fs = FaultFs::new(MemFs::new());
+    // armed `FaultOp::HardLinkCount` exercises its fail-closed path. MemFs
+    // answers `1` for a file it holds (its `hard_link` copies, so bytes are
+    // never shared); the injected fault must override that with `Other`, which
+    // a blind delegation could not do.
+    let inner = MemFs::new();
+    inner.create_dir_all(Path::new("/d")).expect("create dir");
+    drop(
+        inner
+            .open(
+                Path::new("/d/f"),
+                &crate::fs::FsOpenOptions::new().write(true).create(true),
+            )
+            .expect("create file"),
+    );
+    let fs = FaultFs::new(inner);
     let inj = fs.injector();
 
     let unarmed = fs
         .hard_link_count(Path::new("/d/f"))
-        .expect_err("MemFs's path accessor is Unsupported");
-    assert_eq!(unarmed.kind(), ErrorKind::Unsupported);
+        .expect("MemFs answers its own path accessor");
+    assert_eq!(unarmed, 1, "MemFs never shares bytes between names");
 
     inj.arm(FaultRule::new(
         FaultOp::HardLinkCount,
