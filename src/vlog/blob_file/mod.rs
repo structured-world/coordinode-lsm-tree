@@ -226,18 +226,41 @@ impl Drop for Inner {
                 // inode would zero live data inside an immutable snapshot. Same
                 // guard the delete path applies before truncating; a link-count
                 // probe that FAILS is treated as shared (fail closed), losing
-                // only reclaimable space.
-                let exclusively_owned = match self.fs.hard_link_count(&self.path) {
-                    Ok(n) => n <= 1,
-                    Err(e) => {
-                        log::warn!(
-                            "Skipping tight-space punch of blob file {:?} at {}: link-count probe failed: {e:?}",
-                            self.id,
-                            self.path.display(),
-                        );
-                        false
-                    }
-                };
+                // only reclaimable space. An ACTIVE deletion pause additionally
+                // defers the reclaim: the pause covers the checkpoint's whole
+                // copy/link pass, so standing down removes the probe-then-punch
+                // window in which the checkpoint could link this inode after
+                // the probe read 1 — mirroring the table-prefix punch.
+                //
+                // The residual window (a checkpoint whose pause lands after
+                // this check) is closed by lifetimes, not by a lock: the
+                // checkpoint captures its version UNDER the held link window
+                // and that version holds an Arc on every blob handle it links,
+                // so a capture that still sees the pre-relocation view keeps
+                // THIS Inner alive (this drop cannot run concurrently), and a
+                // capture of the post-relocation view records the restricted
+                // frontier, whose digest never covers the prefix punched here.
+                // Blocking on the mutation gate instead is not an option in a
+                // Drop impl: the checkpoint drops its captured version while
+                // holding the gate's write half, and if that drop releases the
+                // last Arc of an armed Inner, taking the read half here would
+                // self-deadlock.
+                let pause_active = self
+                    .deletion_pause
+                    .get()
+                    .is_some_and(|pause| pause.is_active());
+                let exclusively_owned = !pause_active
+                    && match self.fs.hard_link_count(&self.path) {
+                        Ok(n) => n <= 1,
+                        Err(e) => {
+                            log::warn!(
+                                "Skipping tight-space punch of blob file {:?} at {}: link-count probe failed: {e:?}",
+                                self.id,
+                                self.path.display(),
+                            );
+                            false
+                        }
+                    };
                 if off != u64::MAX && exclusively_owned {
                     match data_section_start(&*self.fs, &self.path) {
                         Ok(data_start) if off > data_start => {

@@ -1931,8 +1931,13 @@ fn compaction_outputs_inherit_the_deletion_pause() -> crate::Result<()> {
 
 /// Builds a one-flush blob tree on `capfs`, then arms the tight-space prefix
 /// reclaim on its blob file and releases every reference so the drop path runs.
-/// Returns the bytes the reclaim punched.
-fn punch_blob_prefix_on_drop(capfs: &capfs::CapacityFs, link_count: u64) -> crate::Result<u64> {
+/// `pause_active` installs a checkpoint deletion pause and holds it across the
+/// drop. Returns the bytes the reclaim punched.
+fn punch_blob_prefix_on_drop(
+    capfs: &capfs::CapacityFs,
+    link_count: u64,
+    pause_active: bool,
+) -> crate::Result<u64> {
     use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
 
     let dir = tempfile::tempdir()?;
@@ -1969,6 +1974,16 @@ fn punch_blob_prefix_on_drop(capfs: &capfs::CapacityFs, link_count: u64) -> crat
     // The link count the reclaim probes: 1 = exclusively owned, 2 = an inode a
     // checkpoint has hard-linked.
     capfs.set_link_count(link_count);
+
+    // A checkpoint's deletion pause, when requested, is held ACTIVE across the
+    // drop, modelling a checkpoint running concurrently with the reclaim. The
+    // TREE'S pause is acquired (the open already installed it on every blob
+    // handle; a fresh one would be a no-op install).
+    let _guard = if pause_active {
+        Some(tree.index.deletion_pause.acquire())
+    } else {
+        None
+    };
 
     // Arm the reclaim, then release EVERY reference (the tree's version holds
     // one too) so the blob file's drop path — the code under test — runs.
@@ -2041,17 +2056,33 @@ fn reclaimed_blob_file_verifies_against_its_live_suffix() -> crate::Result<()> {
 /// positive control — it proves the reclaim really fires in this fixture.
 #[test]
 fn blob_prefix_reclaim_skips_a_hard_linked_inode() -> crate::Result<()> {
-    let owned = punch_blob_prefix_on_drop(&capfs::CapacityFs::new(), 1)?;
+    let owned = punch_blob_prefix_on_drop(&capfs::CapacityFs::new(), 1, false)?;
     assert!(
         owned > 0,
         "control: an exclusively-owned blob file must have its prefix reclaimed",
     );
 
-    let shared = punch_blob_prefix_on_drop(&capfs::CapacityFs::new(), 2)?;
+    let shared = punch_blob_prefix_on_drop(&capfs::CapacityFs::new(), 2, false)?;
     assert_eq!(
         shared, 0,
         "a blob file shared with a checkpoint must not be punched: the snapshot \
          still references values in the reclaimed prefix",
+    );
+    Ok(())
+}
+
+/// The blob-prefix reclaim must also stand down while a checkpoint's deletion
+/// pause is ACTIVE, exactly like the table-prefix punch: the pause covers the
+/// checkpoint's whole copy/link pass, so deferring the reclaim (losing only
+/// reclaimable space) removes the probe-then-punch window in which the
+/// checkpoint could link the inode after the link count read 1.
+#[test]
+fn blob_prefix_reclaim_skips_while_a_deletion_pause_is_active() -> crate::Result<()> {
+    let punched = punch_blob_prefix_on_drop(&capfs::CapacityFs::new(), 1, true)?;
+    assert_eq!(
+        punched, 0,
+        "an active checkpoint pause must defer the reclaim, closing the \
+         probe-to-punch race against the checkpoint's link pass",
     );
     Ok(())
 }
