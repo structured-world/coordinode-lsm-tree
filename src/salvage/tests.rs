@@ -51,7 +51,7 @@ fn salvage_blob_file_drops_the_whole_tail_after_a_resync() -> crate::Result<()> 
     slot.copy_from_slice(&6u16.to_le_bytes());
     std::fs::write(&source, &bytes)?;
 
-    let report = salvage_blob_file(&source, dest, &fs, 0, &default_comparator())?;
+    let report = salvage_blob_file(&source, dest, &fs, 0, &default_comparator(), 0)?;
     // aaaa recovered; bbbb drops (header CRC) and arms the resync taint; cccc is
     // the first frame reached by the byte scan (unproven boundary). The taint is
     // sticky, so the walk STOPS there and reports the whole surrendered tail
@@ -2823,6 +2823,7 @@ fn attempt_owns_temp_tracks_the_written_outcome_not_the_error_kind() {
         blocks_salvaged: 1,
         blocks_copied_verbatim: 0,
         entries_salvaged: 1,
+        entries_dropped_by_rewrite: 0,
         dropped: alloc::vec::Vec::new(),
         delete_rows_resurrected: false,
     };
@@ -2854,6 +2855,7 @@ fn arbitrate_mirrors_propagates_a_transient_loss_to_an_incomplete_success() {
         blocks_salvaged: 4 - dropped,
         blocks_copied_verbatim: 0,
         entries_salvaged: 4,
+        entries_dropped_by_rewrite: 0,
         dropped: (0..dropped)
             .map(|i| DroppedBlock {
                 offset: i as u64,
@@ -7025,6 +7027,7 @@ fn salvage_recovers_an_encrypted_sst_with_the_provider() -> crate::Result<()> {
         allow_delete_resurrection: false,
         sync_mode: crate::fs::SyncMode::Normal,
         prefix_extractor: None,
+        blob_rewrite: None,
         progress: None,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
@@ -7120,6 +7123,7 @@ fn salvage_recovers_a_dictionary_sst_with_the_dictionary() -> crate::Result<()> 
         allow_delete_resurrection: false,
         sync_mode: crate::fs::SyncMode::Normal,
         prefix_extractor: None,
+        blob_rewrite: None,
         progress: None,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
@@ -7208,6 +7212,7 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
         allow_delete_resurrection: false,
         sync_mode: crate::fs::SyncMode::Normal,
         prefix_extractor: None,
+        blob_rewrite: None,
         progress: None,
     };
     let recovered_wrong = salvage_sst_with_options(&source, dest.clone(), &fs, &wrong)
@@ -7227,6 +7232,7 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
         allow_delete_resurrection: false,
         sync_mode: crate::fs::SyncMode::Normal,
         prefix_extractor: None,
+        blob_rewrite: None,
         progress: None,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
@@ -7311,7 +7317,7 @@ fn salvage_blob_file_recovers_every_record_of_a_healthy_file() -> crate::Result<
     ];
     build_blob(&source, &fs, &records)?;
 
-    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator())?;
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator(), 0)?;
     assert!(
         report.is_complete(),
         "a healthy blob file drops nothing: {report:?}"
@@ -7349,7 +7355,7 @@ fn salvage_blob_file_drops_a_frame_whose_key_regresses() -> crate::Result<()> {
     let records: Vec<(&[u8], &[u8])> = vec![(b"k0", b"v0"), (b"k2", b"v2"), (b"k1", b"v1")];
     build_blob(&source, &fs, &records)?;
 
-    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator())?;
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator(), 0)?;
     assert_eq!(
         report.records_salvaged, 2,
         "the order-regressing frame is dropped, not re-emitted: {report:?}",
@@ -7407,7 +7413,7 @@ fn salvage_blob_file_keeps_reverse_ordered_records_under_a_reverse_comparator() 
     build_blob(&source, &fs, &records)?;
 
     let comparator: crate::comparator::SharedComparator = Arc::new(ReverseComparator);
-    let report = salvage_blob_file(&source, dest, &fs, 0, &comparator)?;
+    let report = salvage_blob_file(&source, dest, &fs, 0, &comparator, 0)?;
     assert_eq!(
         report.records_salvaged, 3,
         "descending order is NOT regressing under a reverse comparator: {report:?}",
@@ -7448,7 +7454,7 @@ fn salvage_blob_file_syncs_the_destination_directory() -> crate::Result<()> {
         FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).on_path("blobdest"),
     );
 
-    let Err(err) = salvage_blob_file(&source, dest, &fs, 0, &default_comparator()) else {
+    let Err(err) = salvage_blob_file(&source, dest, &fs, 0, &default_comparator(), 0) else {
         panic!("the destination-directory fsync fault must surface");
     };
     // Assert the surfaced error is the INJECTED directory-sync fault, not some
@@ -7489,7 +7495,7 @@ fn salvage_blob_file_keeps_a_racing_dest_created_after_the_existence_probe() -> 
     );
     let fs: Arc<dyn Fs> = Arc::new(fault);
 
-    let result = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator());
+    let result = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator(), 0);
     assert!(
         result.is_err(),
         "the destination is taken, the salvage fails: {result:?}",
@@ -7766,7 +7772,7 @@ fn salvage_blob_file_keeps_a_preexisting_dest_on_open_failure() -> crate::Result
     build_blob(&source, &fs, &[(b"k0", b"v0")])?;
     std::fs::write(&dest, b"pre-existing destination bytes")?;
 
-    let result = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator());
+    let result = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator(), 0);
     assert!(
         result.is_err(),
         "an already-existing destination fails the salvage: {result:?}",
@@ -7825,7 +7831,7 @@ fn salvage_blob_file_reports_an_offset_remap_for_every_salvaged_record() -> crat
         std::fs::write(&source, &bytes)?;
     }
 
-    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator())?;
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator(), 0)?;
     assert_eq!(report.records_salvaged, 1, "{report:?}");
     assert_eq!(
         report.dropped.len(),
@@ -7891,7 +7897,7 @@ fn salvage_blob_file_removes_the_partial_dest_when_a_write_fails() -> crate::Res
         FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::Other)).on_path("blob_salvaged"),
     );
 
-    let result = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator());
+    let result = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator(), 0);
     assert!(
         result.is_err(),
         "a failed destination write must error the salvage",
@@ -7935,7 +7941,7 @@ fn salvage_blob_file_drops_a_corrupt_record_and_keeps_the_rest() -> crate::Resul
     }
     std::fs::write(&source, &bytes)?;
 
-    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator())?;
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator(), 0)?;
     // The corrupt k1 drops on its checksum, and the scanner then RESYNCS to the
     // next magic. k2's frame is reached by that byte scan through k1's damaged
     // bytes, so its boundary is UNPROVEN. The taint is sticky, so the walk STOPS at
@@ -8013,7 +8019,7 @@ fn salvage_blob_file_removes_the_empty_dest_when_nothing_is_recoverable() -> cra
     }
     std::fs::write(&source, &bytes)?;
 
-    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator())?;
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator(), 0)?;
     assert_eq!(report.records_salvaged, 0, "{report:?}");
     assert_eq!(report.dropped.len(), 2, "both records drop: {report:?}");
     assert_eq!(
@@ -8063,7 +8069,7 @@ fn salvage_blob_file_stops_at_a_smashed_frame_and_keeps_the_prefix() -> crate::R
     magic.copy_from_slice(b"????");
     std::fs::write(&source, &bytes)?;
 
-    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator())?;
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator(), 0)?;
     assert_eq!(
         report.records_salvaged, 2,
         "the records before the smashed frame are recovered: {report:?}",
@@ -8144,7 +8150,7 @@ fn salvage_blob_file_drops_an_empty_key_frame() -> crate::Result<()> {
     patch(&mut bytes, 38..42, &new_hcrc.to_le_bytes());
     std::fs::write(&source, &bytes)?;
 
-    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator())?;
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator(), 0)?;
     assert_eq!(
         report.dropped.len(),
         1,
@@ -8231,7 +8237,7 @@ fn salvage_blob_file_drops_a_frame_with_a_forged_value_length() -> crate::Result
     patch(&mut bytes, 38..42, &new_hcrc.to_le_bytes());
     std::fs::write(&source, &bytes)?;
 
-    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator())?;
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator(), 0)?;
     assert_eq!(
         report.dropped.len(),
         1,
@@ -8254,25 +8260,97 @@ fn salvage_blob_file_drops_a_frame_with_a_forged_value_length() -> crate::Result
 /// compressed bytes that this path cannot faithfully re-emit yet.
 #[cfg(feature = "lz4")]
 #[test]
-fn salvage_blob_file_rejects_a_compressed_source() -> crate::Result<()> {
+fn salvage_blob_file_recovers_a_compressed_source() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("blob_source");
+    let dest = dir.path().join("blob_salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let value = b"some compressible value aaaaaaaaaaaaaaaa";
+
+    {
+        let mut writer =
+            BlobWriter::new(&source, 0, 0, &*fs)?.use_compression(crate::CompressionType::Lz4);
+        writer.write(b"k0", 0, value)?;
+        writer.finish()?;
+    }
+
+    // A compressed source is salvaged by DECOMPRESSING each record (proving it
+    // round-trips) and re-emitting it under the same compression descriptor —
+    // never copied through verbatim, which would store undecodable bytes.
+    let report = salvage_blob_file(&source, dest.clone(), &fs, 0, &default_comparator(), 0)?;
+    assert_eq!(report.records_salvaged, 1, "the record is recovered");
+    assert!(
+        report.is_complete(),
+        "nothing dropped: {:?}",
+        report.dropped
+    );
+    assert_eq!(report.salvaged_path.as_ref(), Some(&dest));
+
+    // The recovered copy reads back through the live blob reader.
+    let handle = crate::vlog::recover_blob_file(
+        &dest,
+        0,
+        crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &dest)?),
+        0,
+        &fs,
+    )?;
+    assert_eq!(
+        handle.compression(),
+        crate::CompressionType::Lz4,
+        "the copy keeps the source's compression descriptor",
+    );
+    let (_, salvaged_offset) = *report.offset_remap.first().expect("one remap entry");
+    // The re-emitted record's ON-DISK size (its own compression run), read
+    // back from the copy — a live SST handle carries exactly this.
+    let on_disk_size = {
+        let entry = crate::vlog::BlobFileScanner::new(&dest, &*fs, 0)?
+            .next()
+            .expect("one record")?;
+        u32::try_from(entry.frame_end - entry.offset).expect("frame fits u32")
+            - u32::try_from(crate::vlog::blob_file::writer::BLOB_HEADER_LEN + b"k0".len())
+                .expect("header fits u32")
+    };
+    let file = std::fs::File::open(&dest)?;
+    let reader = crate::vlog::blob_file::reader::Reader::new(&handle, &file);
+    let vhandle = crate::vlog::ValueHandle {
+        blob_file_id: 0,
+        offset: salvaged_offset,
+        on_disk_size,
+    };
+    assert_eq!(
+        reader.get(b"k0", &vhandle)?.as_ref(),
+        value,
+        "the salvaged record decompresses to its original value",
+    );
+    Ok(())
+}
+
+#[test]
+fn salvage_blob_file_rejects_a_dictionary_compressed_source() -> crate::Result<()> {
     let dir = tempdir()?;
     let source = dir.path().join("blob_source");
     let dest = dir.path().join("blob_salvaged");
     let fs: Arc<dyn Fs> = Arc::new(StdFs);
 
+    // A dictionary descriptor with no dictionary context on this standalone
+    // path: fail closed rather than re-emit undecodable values.
     {
         let mut writer =
             BlobWriter::new(&source, 0, 0, &*fs)?.use_compression(crate::CompressionType::Lz4);
+        writer.metadata_compression_override = Some(crate::CompressionType::ZstdDict {
+            level: 3,
+            dict_id: 7,
+        });
         writer.write(b"k0", 0, b"some compressible value aaaaaaaaaaaaaaaa")?;
         writer.finish()?;
     }
 
     assert!(
         matches!(
-            salvage_blob_file(&source, dest, &fs, 0, &default_comparator()),
+            salvage_blob_file(&source, dest, &fs, 0, &default_comparator(), 0),
             Err(crate::Error::FeatureUnsupported(_)),
         ),
-        "a compressed blob file must be rejected rather than mis-salvaged",
+        "a dictionary-compressed blob file must be rejected rather than mis-salvaged",
     );
     Ok(())
 }

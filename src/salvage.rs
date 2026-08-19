@@ -82,6 +82,15 @@ pub struct SalvageOptions {
     /// and its matching rows vanish from every prefix read.
     /// [`crate::repair`] passes the tree's configured extractor.
     pub prefix_extractor: Option<Arc<dyn crate::prefix::PrefixExtractor>>,
+    /// Per-blob-file handle rewrite applied to every re-emitted indirection
+    /// entry, or `None` (the default) to re-emit handles untouched.
+    /// [`crate::repair`] fills it after reshaping blob files (a blob salvage
+    /// compacted a file, or a punched file's frontier was recovered), so the
+    /// rewritten SST's handles land on live records; an entry whose record no
+    /// longer exists is DROPPED and counted in
+    /// [`SalvageReport::entries_dropped_by_rewrite`]. A set rewrite disables
+    /// verbatim block copy-through (raw block bytes would carry stale handles).
+    pub blob_rewrite: Option<Arc<crate::HashMap<crate::vlog::BlobFileId, BlobFileRewrite>>>,
     /// Shared live-progress counters the block walk ticks per inspected /
     /// re-emitted / dropped block and per recovered row, or `None` (the
     /// default) to skip publishing. [`crate::repair`] forwards the handle set
@@ -90,6 +99,25 @@ pub struct SalvageOptions {
     /// polls [`RecoveryProgress::snapshot`](crate::RecoveryProgress::snapshot)
     /// from another thread.
     pub progress: Option<Arc<crate::RecoveryProgress>>,
+}
+
+/// How a referencing SST's blob handles into ONE blob file must be rewritten
+/// when repair reshaped that file. Keyed per blob-file id in
+/// [`SalvageOptions::blob_rewrite`].
+#[derive(Debug, Clone)]
+pub enum BlobFileRewrite {
+    /// The blob file was salvaged into a COMPACTED copy: every surviving
+    /// record moved to the offset recorded in
+    /// [`BlobSalvageReport::offset_remap`] (source offset → salvaged offset).
+    /// A handle whose source offset is absent points at a record the salvage
+    /// dropped — its entry is removed from the rewritten SST (its key then
+    /// reads as absent instead of erroring on damaged bytes).
+    Remap(crate::HashMap<u64, u64>),
+    /// The blob file is intact but its consumed prefix was punched at this
+    /// live-data frontier: a handle below it (a pre-relocation SST left behind
+    /// by a crash) points into zeroed bytes — its entry is removed; handles at
+    /// or above the frontier are kept untouched.
+    DropBelow(u64),
 }
 
 /// Why a block could not be salvaged and had to be dropped.
@@ -159,6 +187,12 @@ pub struct SalvageReport {
     pub blocks_copied_verbatim: usize,
     /// Entries recovered into the salvaged SST.
     pub entries_salvaged: u64,
+    /// Entries REMOVED by the [`SalvageOptions::blob_rewrite`] handle rewrite
+    /// (their blob record was dropped by a blob salvage, or lies below a
+    /// punched frontier). Always zero without a configured rewrite. These are
+    /// accounted separately from [`dropped`](Self::dropped): the block itself
+    /// was healthy, only individual value records no longer exist.
+    pub entries_dropped_by_rewrite: u64,
     /// Blocks the walk had to drop, with their key ranges where known.
     pub dropped: Vec<DroppedBlock>,
     /// `true` when the source carried positional deletes that could NOT be
@@ -192,6 +226,7 @@ impl SalvageReport {
     ///     blocks_salvaged: 4,
     ///     blocks_copied_verbatim: 4,
     ///     entries_salvaged: 100,
+    ///     entries_dropped_by_rewrite: 0,
     ///     dropped: Vec::new(),
     ///     delete_rows_resurrected: false,
     /// };
@@ -902,6 +937,7 @@ fn salvage_attempt(
         comparator,
         !delete_mask_unpositionable,
         allow_verbatim,
+        options.blob_rewrite.as_deref(),
         options.progress.as_deref(),
     ) {
         Ok(walk) => walk,
@@ -931,6 +967,7 @@ fn salvage_attempt(
         blocks_salvaged: walk.blocks_salvaged,
         blocks_copied_verbatim: walk.blocks_copied_verbatim,
         entries_salvaged: walk.entries_salvaged,
+        entries_dropped_by_rewrite: walk.entries_dropped_by_rewrite,
         dropped: walk.dropped,
         // Resurrection happened exactly when the delete mask was unappliable and
         // the opt-in let the walk re-emit unmasked (the fail-closed branch above
@@ -947,6 +984,7 @@ struct SalvageWalk {
     blocks_salvaged: usize,
     blocks_copied_verbatim: usize,
     entries_salvaged: u64,
+    entries_dropped_by_rewrite: u64,
     dropped: Vec<DroppedBlock>,
     wrote: bool,
 }
@@ -1006,6 +1044,52 @@ fn classify_drop(
         // whose index entry is lost.
         key_range: end_key.map(|ek| (prev_end.cloned().unwrap_or_else(UserKey::empty), ek.clone())),
     }
+}
+
+/// Applies a [`BlobFileRewrite`] set to a block's decoded entries: handles
+/// into a remapped blob are re-encoded at their salvaged offset, and entries
+/// whose record no longer exists (absent from the remap, or below a punched
+/// frontier) are removed and counted. An indirection that fails to decode is
+/// corrupt content — the caller drops the whole block, as everywhere else.
+/// Runs BEFORE blob-link derivation so the rewritten SST's
+/// `linked_blob_files` reflects the NEW handles.
+fn rewrite_block_indirections(
+    entries: Vec<crate::InternalValue>,
+    rewrite: &crate::HashMap<crate::vlog::BlobFileId, BlobFileRewrite>,
+    dropped_entries: &mut u64,
+) -> crate::Result<Vec<crate::InternalValue>> {
+    use crate::coding::{Decode, Encode};
+
+    let mut out = Vec::with_capacity(entries.len());
+    for mut entry in entries {
+        if entry.key.value_type != crate::ValueType::Indirection {
+            out.push(entry);
+            continue;
+        }
+        let mut cursor = &entry.value[..];
+        let mut ind = crate::blob_tree::handle::BlobIndirection::decode_from(&mut cursor)?;
+        match rewrite.get(&ind.vhandle.blob_file_id) {
+            None => out.push(entry),
+            Some(BlobFileRewrite::Remap(map)) => match map.get(&ind.vhandle.offset) {
+                Some(&salvaged_offset) => {
+                    ind.vhandle.offset = salvaged_offset;
+                    let mut buf = Vec::new();
+                    ind.encode_into(&mut buf)?;
+                    entry.value = buf.into();
+                    out.push(entry);
+                }
+                None => *dropped_entries += 1,
+            },
+            Some(BlobFileRewrite::DropBelow(frontier)) => {
+                if ind.vhandle.offset < *frontier {
+                    *dropped_entries += 1;
+                } else {
+                    out.push(entry);
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Decodes the [`crate::blob_tree::handle::BlobIndirection`] of every
@@ -1145,17 +1229,22 @@ fn salvage_blocks(
     comparator: &crate::comparator::SharedComparator,
     apply_delete_mask: bool,
     allow_verbatim: bool,
+    blob_rewrite: Option<&crate::HashMap<crate::vlog::BlobFileId, BlobFileRewrite>>,
     progress: Option<&crate::RecoveryProgress>,
 ) -> crate::Result<SalvageWalk> {
     use crate::table::block::ParsedItem;
     use alloc::format;
 
+    // A handle rewrite invalidates every raw block byte (it carries the old
+    // handles), so the verbatim copy-through is disabled for the whole walk.
+    let allow_verbatim = allow_verbatim && blob_rewrite.is_none();
     let mut blocks_total = 0usize;
     let mut blocks_salvaged = 0usize;
     let mut blocks_copied_verbatim = 0usize;
     let mut entries_salvaged = 0u64;
     let mut blocks_healed = 0u64;
     let mut columns_salvaged = 0u64;
+    let mut entries_dropped_by_rewrite = 0u64;
     let mut published = PublishedProgress::default();
     let mut dropped: Vec<DroppedBlock> = Vec::new();
     // Blob links DERIVED from the recovered entries' indirections, keyed by
@@ -1574,6 +1663,64 @@ fn salvage_blocks(
                 // keeps any (readable) deletes applied.
                 match table.load_columnar_block_masked(&block_handle) {
                     Ok(Some(batch)) => {
+                        // Handle rewrite on the delete-masked path: same
+                        // entry round-trip as the unmasked columnar arm (the
+                        // mask is already applied, so only surviving rows are
+                        // transformed), with the same sub-column fail-closed.
+                        let batch = match blob_rewrite {
+                            Some(rw) => {
+                                if batch.columns.len() > 4 {
+                                    return Err(crate::Error::FeatureUnsupported(
+                                        "blob-handle rewrite of a columnar block \
+                                         with value sub-columns",
+                                    ));
+                                }
+                                let step = crate::table::columnar::column_batch_to_entries(&batch)
+                                    .and_then(|entries| {
+                                        rewrite_block_indirections(
+                                            entries,
+                                            rw,
+                                            &mut entries_dropped_by_rewrite,
+                                        )
+                                    });
+                                match step {
+                                    Ok(entries) if entries.is_empty() => {
+                                        // Every surviving record removed by the
+                                        // rewrite: nothing to emit, nothing lost.
+                                        prev_end = end_key.or(prev_end);
+                                        continue;
+                                    }
+                                    Ok(entries) => {
+                                        match crate::table::columnar::entries_to_column_batch(
+                                            &entries,
+                                        ) {
+                                            Ok(batch) => batch,
+                                            Err(e) => {
+                                                dropped.push(classify_drop(
+                                                    &e,
+                                                    offset,
+                                                    prev_end.as_ref(),
+                                                    end_key.as_ref(),
+                                                ));
+                                                prev_end = end_key.or(prev_end);
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        dropped.push(classify_drop(
+                                            &e,
+                                            offset,
+                                            prev_end.as_ref(),
+                                            end_key.as_ref(),
+                                        ));
+                                        prev_end = end_key.or(prev_end);
+                                        continue;
+                                    }
+                                }
+                            }
+                            None => batch,
+                        };
                         let rows = u64::from(batch.row_count);
                         // Indirections of the SURVIVING (unmasked) rows,
                         // BEFORE emit: an undecodable indirection is corrupt
@@ -1670,6 +1817,64 @@ fn salvage_blocks(
                                 ));
                             }
                             Ok((batch, entries)) => {
+                                // Apply the blob-handle rewrite by round-tripping
+                                // through the row entries, then rebuilding the
+                                // batch, so the emitted block carries the NEW
+                                // handles. A batch with value SUB-COLUMNS cannot
+                                // round-trip (they are not reconstructible from
+                                // entries) — a KV-separated columnar flush never
+                                // writes them (indirections live in the opaque
+                                // value column), so fail closed on the exotic
+                                // combination instead of silently dropping data.
+                                let (batch, entries) = match blob_rewrite {
+                                    Some(rw) => {
+                                        if batch.columns.len() > 4 {
+                                            return Err(crate::Error::FeatureUnsupported(
+                                                "blob-handle rewrite of a columnar block \
+                                                 with value sub-columns",
+                                            ));
+                                        }
+                                        let entries = match rewrite_block_indirections(
+                                            entries,
+                                            rw,
+                                            &mut entries_dropped_by_rewrite,
+                                        ) {
+                                            Ok(entries) => entries,
+                                            Err(e) => {
+                                                dropped.push(classify_drop(
+                                                    &e,
+                                                    offset,
+                                                    prev_end.as_ref(),
+                                                    end_key.as_ref(),
+                                                ));
+                                                prev_end = end_key.or(prev_end);
+                                                continue;
+                                            }
+                                        };
+                                        if entries.is_empty() {
+                                            // Every record removed by the rewrite:
+                                            // nothing to emit, nothing lost.
+                                            prev_end = end_key.or(prev_end);
+                                            continue;
+                                        }
+                                        match crate::table::columnar::entries_to_column_batch(
+                                            &entries,
+                                        ) {
+                                            Ok(batch) => (batch, entries),
+                                            Err(e) => {
+                                                dropped.push(classify_drop(
+                                                    &e,
+                                                    offset,
+                                                    prev_end.as_ref(),
+                                                    end_key.as_ref(),
+                                                ));
+                                                prev_end = end_key.or(prev_end);
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    None => (batch, entries),
+                                };
                                 let rows = u64::from(batch.row_count);
                                 // Indirections BEFORE emit: an entry tagged as an
                                 // indirection whose value fails to decode is
@@ -1863,6 +2068,39 @@ fn salvage_blocks(
                                 prev_end = end_key.or(prev_end);
                                 continue;
                             }
+                            // Apply the blob-handle rewrite BEFORE deriving
+                            // links or emitting: removed entries must not
+                            // count as salvaged, and the derived links must
+                            // reflect the NEW handles. An undecodable
+                            // indirection is corrupt content — drop the block,
+                            // like the link derivation below.
+                            let entries = match blob_rewrite {
+                                Some(rw) => match rewrite_block_indirections(
+                                    entries,
+                                    rw,
+                                    &mut entries_dropped_by_rewrite,
+                                ) {
+                                    Ok(entries) => entries,
+                                    Err(e) => {
+                                        dropped.push(classify_drop(
+                                            &e,
+                                            offset,
+                                            prev_end.as_ref(),
+                                            end_key.as_ref(),
+                                        ));
+                                        prev_end = end_key.or(prev_end);
+                                        continue;
+                                    }
+                                },
+                                None => entries,
+                            };
+                            if entries.is_empty() {
+                                // Every entry's record was removed by the
+                                // rewrite: the block legitimately contributes
+                                // nothing (accounted per entry, not a loss).
+                                prev_end = end_key.or(prev_end);
+                                continue;
+                            }
                             let count = entries.len() as u64;
                             // Indirections BEFORE emit: an entry tagged as an
                             // indirection whose value fails to decode is
@@ -2005,6 +2243,7 @@ fn salvage_blocks(
         blocks_salvaged,
         blocks_copied_verbatim,
         entries_salvaged,
+        entries_dropped_by_rewrite,
         dropped,
         wrote,
     })
@@ -2067,6 +2306,52 @@ impl BlobSalvageReport {
     }
 }
 
+/// Decompresses one blob record's on-disk bytes for the salvage re-emit,
+/// mirroring the live reader's per-compression dispatch: the frame checksum
+/// covered the ON-DISK bytes, so a clean-checksum record must additionally
+/// prove its content round-trips before it is re-emitted (re-compressed under
+/// the same descriptor). `None` verifies the length equality the uncompressed
+/// format guarantees. Dictionary compression never reaches here — the salvage
+/// entry rejects it up front (no dictionary context on this standalone path).
+fn decompress_blob_value(
+    compression: crate::CompressionType,
+    on_disk: &[u8],
+    real_len: usize,
+) -> crate::Result<alloc::borrow::Cow<'_, [u8]>> {
+    match compression {
+        crate::CompressionType::None => {
+            if on_disk.len() != real_len {
+                return Err(crate::Error::InvalidHeader("Blob"));
+            }
+            Ok(alloc::borrow::Cow::Borrowed(on_disk))
+        }
+        #[cfg(feature = "lz4")]
+        crate::CompressionType::Lz4 => {
+            let mut buf = alloc::vec![0u8; real_len];
+            let written = lz4_flex::block::decompress_into(on_disk, &mut buf)
+                .map_err(|_| crate::Error::Decompress(compression))?;
+            if written != real_len {
+                return Err(crate::Error::Decompress(compression));
+            }
+            Ok(alloc::borrow::Cow::Owned(buf))
+        }
+        #[cfg(zstd_any)]
+        crate::CompressionType::Zstd(_) => {
+            use crate::compression::CompressionProvider as _;
+            let decompressed = crate::compression::ZstdBackend::decompress(on_disk, real_len)
+                .map_err(|_| crate::Error::Decompress(compression))?;
+            if decompressed.len() != real_len {
+                return Err(crate::Error::Decompress(compression));
+            }
+            Ok(alloc::borrow::Cow::Owned(decompressed))
+        }
+        #[cfg(zstd_any)]
+        crate::CompressionType::ZstdDict { .. } => Err(crate::Error::FeatureUnsupported(
+            "salvage of a dictionary-compressed blob file",
+        )),
+    }
+}
+
 /// Whether `entry`'s internal key sorts BEFORE `prev` under the blob-file order
 /// (ascending user key, ties broken by DESCENDING seqno, newest first). A `None`
 /// `prev` (the first accepted record) never regresses. The user-key ordering uses
@@ -2120,6 +2405,13 @@ fn blob_key_regresses(
 /// [`BlobSalvageReport::offset_remap`] first; a source offset absent from the
 /// map is a lost record.
 ///
+/// `live_data_start` is the source's tight-space live-data frontier (`0` for a
+/// whole, unreclaimed file): the walk starts there, so a punched prefix — which
+/// reads as zeros and would otherwise rot the first header, arm the sticky
+/// resync taint, and surrender the entire LIVE suffix — is never inspected.
+/// Records below the frontier are dead by definition (their relocated copies
+/// live elsewhere), so skipping them loses nothing.
+///
 /// [`Error::FeatureUnsupported`]: crate::Error::FeatureUnsupported
 ///
 /// # Errors
@@ -2134,15 +2426,20 @@ pub fn salvage_blob_file(
     fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
     blob_file_id: crate::vlog::BlobFileId,
     comparator: &crate::comparator::SharedComparator,
+    live_data_start: u64,
 ) -> crate::Result<BlobSalvageReport> {
     use crate::vlog::blob_file::{scanner::Scanner, writer::Writer as BlobWriter};
     use alloc::format;
 
     // Read the source's metadata (only the TOC + meta section, NOT the data
-    // section, so a data-corrupt file still opens) to reject a compressed source:
-    // the scanner yields on-disk (compressed) bytes, and re-emitting them verbatim
-    // under a no-compression descriptor would store undecodable values. Fail
-    // closed, the same way SST salvage fails closed on range tombstones.
+    // section, so a data-corrupt file still opens) for its compression type:
+    // the scanner yields on-disk bytes, so a compressed record is DECOMPRESSED
+    // here (proving it round-trips) and re-emitted through a writer stamped
+    // with the same compression — never copied through verbatim under a
+    // mismatched descriptor. A DICTIONARY-compressed source is the one shape
+    // this standalone entry cannot handle (it carries no dictionary context),
+    // failing closed the same way SST salvage fails closed on range
+    // tombstones.
     //
     // A placeholder checksum is passed on purpose: `recover_blob_file` only STORES
     // it (it never verifies the source against it), and only `compression()` is
@@ -2153,13 +2450,19 @@ pub fn salvage_blob_file(
     // its own digest on finish.
     let source_handle =
         crate::vlog::recover_blob_file(source, blob_file_id, crate::Checksum::from_raw(0), 0, fs)?;
-    if source_handle.compression() != crate::CompressionType::None {
+    let compression = source_handle.compression();
+    #[cfg(zstd_any)]
+    if matches!(compression, crate::CompressionType::ZstdDict { .. }) {
         return Err(crate::Error::FeatureUnsupported(
-            "salvage of a compressed blob file",
+            "salvage of a dictionary-compressed blob file",
         ));
     }
 
-    let scanner = Scanner::new(source, &**fs, blob_file_id)?;
+    let scanner = if live_data_start > 0 {
+        Scanner::resume(source, &**fs, blob_file_id, live_data_start)?
+    } else {
+        Scanner::new(source, &**fs, blob_file_id)?
+    };
     // Destination ownership is decided by the writer's `create_new` open, and
     // the CONSTRUCTOR owns cleanup of any partial file it created: on a
     // constructor error this call created nothing (or the constructor already
@@ -2172,7 +2475,9 @@ pub fn salvage_blob_file(
     // synced below, so the recovered file survives a power loss the moment the
     // report claims success.
     let sync_mode = crate::fs::SyncMode::Full;
-    let mut writer = BlobWriter::new(&dest, blob_file_id, 0, &**fs)?.use_sync_mode(sync_mode);
+    let mut writer = BlobWriter::new(&dest, blob_file_id, 0, &**fs)?
+        .use_sync_mode(sync_mode)
+        .use_compression(compression);
 
     let mut records_total = 0usize;
     let mut records_salvaged = 0usize;
@@ -2231,13 +2536,17 @@ pub fn salvage_blob_file(
                     });
                 }
                 // A frame whose declared `real_val_len` disagrees with the
-                // bytes actually stored (`on_disk_val_len`; this path only
-                // salvages UNCOMPRESSED sources, so the two must be equal) is
-                // rejected by the live blob reader — re-emitting it would
-                // restamp a consistent length and launder a record live reads
-                // treat as corrupt. Drop it; the scanner is already past the
-                // frame, so the walk continues.
-                Ok(entry) if entry.uncompressed_len as usize != entry.value.len() => {
+                // bytes actually stored (for an UNCOMPRESSED source the two
+                // must be equal; a compressed record proves its length through
+                // the decompression below instead) is rejected by the live
+                // blob reader — re-emitting it would restamp a consistent
+                // length and launder a record live reads treat as corrupt.
+                // Drop it; the scanner is already past the frame, so the walk
+                // continues.
+                Ok(entry)
+                    if compression == crate::CompressionType::None
+                        && entry.uncompressed_len as usize != entry.value.len() =>
+                {
                     dropped.push(DroppedBlob {
                         reason: BlobDropReason::Corrupt(
                             "frame's declared value length disagrees with its stored bytes"
@@ -2264,6 +2573,27 @@ pub fn salvage_blob_file(
                     });
                 }
                 Ok(entry) => {
+                    // A compressed record's frame checksum covered its ON-DISK
+                    // bytes; prove the content itself round-trips by
+                    // decompressing here (the re-emit below re-compresses it
+                    // under the same descriptor). A record that fails to
+                    // decompress despite a clean checksum is structural
+                    // corruption — drop it and keep walking.
+                    let value = match decompress_blob_value(
+                        compression,
+                        &entry.value,
+                        entry.uncompressed_len as usize,
+                    ) {
+                        Ok(value) => value,
+                        Err(e) => {
+                            dropped.push(DroppedBlob {
+                                reason: BlobDropReason::Corrupt(format!(
+                                    "frame's value does not decompress: {e:?}"
+                                )),
+                            });
+                            continue;
+                        }
+                    };
                     // Record the frame relocation BEFORE the write advances the
                     // writer: existing SST ValueHandles point at SOURCE frame
                     // offsets, and the compacted rewrite shifts every record
@@ -2271,7 +2601,7 @@ pub fn salvage_blob_file(
                     // re-target handles before the salvaged file can replace
                     // the original.
                     let salvaged_offset = writer.offset();
-                    writer.write(&entry.key, entry.seqno, &entry.value)?;
+                    writer.write(&entry.key, entry.seqno, &value)?;
                     offset_remap.push((entry.offset, salvaged_offset));
                     prev_written = Some((entry.key.clone(), entry.seqno));
                     records_salvaged += 1;
