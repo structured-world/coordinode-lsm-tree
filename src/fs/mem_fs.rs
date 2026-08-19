@@ -1087,6 +1087,25 @@ impl Fs for MemFs {
         }
     }
 
+    /// MemFs has no inode concept — [`Fs::hard_link`] produces an independent
+    /// COPY — so a file's bytes are never shared with another name and the
+    /// count is exactly `1` (matching this backend's
+    /// [`FsFile::hard_link_count`]). Answering instead of inheriting the
+    /// `Unsupported` default matters for the in-place reclaim paths: they fail
+    /// closed on an unanswerable probe, so an unimplemented count would
+    /// silently disable every hole punch on this backend.
+    fn hard_link_count(&self, path: &Path) -> io::Result<u64> {
+        let state = read_state(&self.state)?;
+        if state.files.contains_key(path) {
+            Ok(1)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("file not found: {}", path.display()),
+            ))
+        }
+    }
+
     /// Simulates `fallocate(PUNCH_HOLE)`: zeroes `[offset, offset+len)` in the
     /// file (so the hole reads back as zeros) and records the reclaimed bytes so
     /// [`Fs::available_space`] reflects the freed space, while the file's logical

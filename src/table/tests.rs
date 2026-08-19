@@ -843,6 +843,150 @@ fn verify_blob_links_rejects_an_undercounted_suffix_id_on_a_restricted_view() ->
     Ok(())
 }
 
+/// An `Fs` that forwards to `MemFs` but reports every file as HARD-LINKED, so
+/// the punch path's shared-inode guard can be exercised (MemFs copies on
+/// `hard_link`, so its real count is always 1, and `StdFs` cannot punch on
+/// non-Linux hosts).
+#[cfg(feature = "std")]
+#[derive(Clone)]
+struct SharedInodeFs(crate::fs::MemFs);
+
+#[cfg(feature = "std")]
+impl crate::fs::Fs for SharedInodeFs {
+    fn open(
+        &self,
+        path: &std::path::Path,
+        options: &crate::fs::FsOpenOptions,
+    ) -> crate::io::Result<Box<dyn crate::fs::FsFile>> {
+        self.0.open(path, options)
+    }
+    fn remove_file(&self, path: &std::path::Path) -> crate::io::Result<()> {
+        self.0.remove_file(path)
+    }
+    fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> crate::io::Result<()> {
+        self.0.rename(from, to)
+    }
+    fn create_dir_all(&self, path: &std::path::Path) -> crate::io::Result<()> {
+        self.0.create_dir_all(path)
+    }
+    fn remove_dir_all(&self, path: &std::path::Path) -> crate::io::Result<()> {
+        self.0.remove_dir_all(path)
+    }
+    fn sync_directory(&self, path: &std::path::Path) -> crate::io::Result<()> {
+        self.0.sync_directory(path)
+    }
+    fn read_dir(&self, path: &std::path::Path) -> crate::io::Result<Vec<crate::fs::FsDirEntry>> {
+        self.0.read_dir(path)
+    }
+    fn metadata(&self, path: &std::path::Path) -> crate::io::Result<crate::fs::FsMetadata> {
+        self.0.metadata(path)
+    }
+    fn exists(&self, path: &std::path::Path) -> crate::io::Result<bool> {
+        self.0.exists(path)
+    }
+    fn capabilities(&self, path: &std::path::Path) -> crate::fs::FsCapabilities {
+        self.0.capabilities(path)
+    }
+    fn punch_hole(&self, path: &std::path::Path, offset: u64, len: u64) -> crate::io::Result<()> {
+        self.0.punch_hole(path, offset, len)
+    }
+    /// The whole point: every file looks shared with a checkpoint link.
+    fn hard_link_count(&self, _path: &std::path::Path) -> crate::io::Result<u64> {
+        Ok(2)
+    }
+}
+
+/// The tight-space prefix punch must FAIL CLOSED on a shared inode: a completed
+/// checkpoint hard-links the SST, so punching the retired view's data blocks
+/// would zero the SAME blocks inside the immutable checkpoint, whose manifest
+/// still records the unrestricted file and its original digest. The delete path
+/// already probes the link count before truncating; the punch must too.
+#[cfg(feature = "std")]
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn punch_on_drop_refuses_a_hard_linked_table() -> crate::Result<()> {
+    use crate::fs::Fs;
+
+    let memfs = crate::fs::MemFs::new();
+    let shared: Arc<dyn Fs> = Arc::new(SharedInodeFs(memfs.clone()));
+    let plain: Arc<dyn Fs> = Arc::new(memfs);
+    let root = std::path::absolute("/db")?;
+    shared.create_dir_all(&root)?;
+
+    let build = |fs: &Arc<dyn Fs>, name: &str| -> crate::Result<(std::path::PathBuf, Checksum)> {
+        let path = root.join(name);
+        let mut writer = Writer::new(path.clone(), 0, 0, Arc::clone(fs))?.use_data_block_size(256);
+        for i in 0..256u32 {
+            writer.write(crate::InternalValue::from_components(
+                format!("k{i:04}").into_bytes(),
+                b"v",
+                1,
+                crate::ValueType::Value,
+            ))?;
+        }
+        let (_, checksum) = writer.finish()?.expect("table written");
+        Ok((path, checksum))
+    };
+    let recover = |fs: &Arc<dyn Fs>, path: &std::path::Path, checksum| -> crate::Result<Table> {
+        #[cfg(feature = "metrics")]
+        let metrics = Arc::new(Metrics::default());
+        Table::recover(
+            path.to_path_buf(),
+            checksum,
+            0,
+            0,
+            0,
+            Arc::new(Cache::with_capacity_bytes(1_000_000)),
+            None,
+            Arc::clone(fs),
+            false,
+            false,
+            None,
+            #[cfg(zstd_any)]
+            None,
+            crate::comparator::default_comparator(),
+            #[cfg(feature = "metrics")]
+            metrics,
+        )
+    };
+    let read_all = |fs: &Arc<dyn Fs>, path: &std::path::Path| -> crate::Result<Vec<u8>> {
+        let file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let len = crate::fs::FsFile::metadata(&*file)?.len;
+        Ok(crate::file::read_exact(&*file, 0, usize::try_from(len).unwrap_or(0))?.to_vec())
+    };
+
+    // SHARED inode (a checkpoint hard-linked this SST): the punch must not run.
+    let (shared_path, shared_checksum) = build(&shared, "0")?;
+    let before = read_all(&shared, &shared_path)?;
+    let table = recover(&shared, &shared_path, shared_checksum)?;
+    let punch = table.punch_offset_for(b"k0128")?;
+    assert!(punch > 0, "the fixture has a punchable prefix");
+    table.mark_punch_on_drop(punch);
+    drop(table);
+    assert_eq!(
+        read_all(&shared, &shared_path)?,
+        before,
+        "a hard-linked SST must not be punched: the shared inode is the \
+         checkpoint's data too",
+    );
+
+    // EXCLUSIVE inode: the punch still reclaims, so the guard did not disable
+    // the reclaim path itself.
+    let (plain_path, plain_checksum) = build(&plain, "1")?;
+    let table = recover(&plain, &plain_path, plain_checksum)?;
+    let punch = table.punch_offset_for(b"k0128")?;
+    table.mark_punch_on_drop(punch);
+    drop(table);
+    let after = read_all(&plain, &plain_path)?;
+    assert!(
+        after
+            .get(..64)
+            .is_some_and(|head| head.iter().all(|&b| b == 0)),
+        "an exclusively-owned SST is still reclaimed",
+    );
+    Ok(())
+}
+
 /// `reopen_restricted` creates a DISTINCT `Inner` for the same table, so it must
 /// PROPAGATE the tree-installed shared gates onto it: the checkpoint deletion
 /// pause and the heal lock. Without them a restricted view skips the checkpoint

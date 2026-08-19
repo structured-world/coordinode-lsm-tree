@@ -391,7 +391,38 @@ impl Drop for Inner {
             let off = self
                 .punch_on_drop
                 .load(core::sync::atomic::Ordering::Acquire);
-            if off != u64::MAX {
+            // Reclaim only what this tree exclusively owns. A checkpoint
+            // hard-links SST files, and its captured manifest still records
+            // this file UNRESTRICTED under its original digest — punching a
+            // shared inode would zero those blocks inside the immutable
+            // checkpoint too. FAIL CLOSED on a shared link and on a probe
+            // that cannot answer, losing only reclaimable space; an
+            // IN-PROGRESS checkpoint is additionally excluded by the deletion
+            // pause (its window covers the link step, so a punch deferred by
+            // an active pause cannot race a link that is about to appear).
+            // Mirrors the delete path's truncate guard and the blob punch.
+            #[cfg(feature = "std")]
+            let exclusively_owned = {
+                let pause_active = self
+                    .deletion_pause
+                    .get()
+                    .is_some_and(|pause| pause.is_active());
+                !pause_active
+                    && match self.fs.hard_link_count(&self.path) {
+                        Ok(n) => n <= 1,
+                        Err(e) => {
+                            log::warn!(
+                                "Skipping tight-space punch of table {global_id:?} at {:?}: \
+                                 link-count probe failed: {e:?}",
+                                self.path,
+                            );
+                            false
+                        }
+                    }
+            };
+            #[cfg(not(feature = "std"))]
+            let exclusively_owned = true;
+            if off != u64::MAX && exclusively_owned {
                 use crate::table::block_index::BlockIndex;
                 let mut reclaimable: alloc::vec::Vec<(u64, u32)> = alloc::vec::Vec::new();
                 for handle in self.block_index.iter() {
