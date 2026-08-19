@@ -5700,6 +5700,334 @@ fn blob_recovery_derives_the_frontier_of_a_punched_blob_file() -> crate::Result<
     Ok(())
 }
 
+/// A crashed repair can leave its in-progress blob-salvage copy behind. That
+/// copy is published by an atomic rename, so a surviving one is never
+/// referenced by any manifest — it must be swept, not treated as a foreign
+/// file name. The plain open sweeps it as an orphan (a name-parse failure
+/// there would leave the tree unopenable); a repair removes it and re-derives
+/// the salvage from the original.
+#[test]
+fn a_crashed_blob_salvage_temp_is_swept_not_fatal() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::io::Write;
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        for i in 0..4u32 {
+            tree.insert(format!("k{i:04}").as_bytes(), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    // Strand a salvage temp the way a crash would.
+    let temp = root.join(crate::file::BLOBS_FOLDER).join("0.salvage-tmp");
+    {
+        let mut f = memfs.open(
+            &temp,
+            &crate::fs::FsOpenOptions::new().write(true).create(true),
+        )?;
+        f.write_all(b"partial salvage output")?;
+    }
+
+    // A plain open sweeps it and still serves every key.
+    let tree = match Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs.clone())
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .open()?
+    {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+    };
+    for i in 0..4u32 {
+        assert!(
+            tree.get(format!("k{i:04}").as_bytes(), crate::MAX_SEQNO)?
+                .is_some(),
+            "record k{i:04} must still read with a stranded salvage temp present",
+        );
+    }
+    drop(tree);
+    assert!(
+        !memfs.exists(&temp)?,
+        "the plain open must sweep the stranded salvage temp",
+    );
+    Ok(())
+}
+
+/// A blob salvage must never leave a HALF-PUBLISHED state, whatever moment a
+/// transient fault strikes. The compacted replacement is only usable together
+/// with the offset remap this invocation derives, so a retry that found an
+/// unverified replacement under the canonical name would bless it as an
+/// ordinary intact blob and publish the referencing SSTs with their OLD
+/// offsets — handles resolving to the wrong records. The salvage therefore
+/// builds into a private temp and publishes atomically: at every fault timing
+/// the tree is either fully repaired or exactly as it was found.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_never_half_publishes_a_salvaged_blob_under_transient_faults() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let root = std::path::absolute("/db")?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let read_all = |fs: &Arc<dyn Fs>, path: &std::path::Path| -> crate::Result<Vec<u8>> {
+        let file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let len = crate::fs::FsFile::metadata(&*file)?.len;
+        Ok(crate::file::read_exact(&*file, 0, usize::try_from(len).unwrap_or(0))?.to_vec())
+    };
+
+    // Builds a fresh tree whose single blob file has a corrupt LAST record and
+    // whose manifest is gone. Returns the fs, the blob path, and its bytes.
+    let fixture = || -> crate::Result<(Arc<MemFs>, std::path::PathBuf, Vec<u8>)> {
+        let memfs = Arc::new(MemFs::new());
+        {
+            let tree = match Config::new(
+                &root,
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .with_shared_fs(memfs.clone())
+            .with_kv_separation(Some(
+                KvSeparationOptions::default().separation_threshold(16),
+            ))
+            .open()?
+            {
+                crate::AnyTree::Blob(t) => t,
+                crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+            };
+            for i in 0..8u32 {
+                tree.insert(format!("k{i:04}").as_bytes(), vec![b'v'; 64], u64::from(i));
+            }
+            tree.flush_active_memtable(0)?;
+        }
+        let fs_dyn: Arc<dyn Fs> = memfs.clone();
+        let blob_path = memfs
+            .read_dir(&blobs)?
+            .into_iter()
+            .find(|e| !e.is_dir)
+            .expect("one blob file")
+            .path;
+        let last = crate::vlog::BlobFileScanner::new(&blob_path, &*fs_dyn, 0)?
+            .collect::<crate::Result<Vec<_>>>()?
+            .last()
+            .expect("a last frame")
+            .frame_end;
+        {
+            let mut file = memfs.open(
+                &blob_path,
+                &crate::fs::FsOpenOptions::new().read(true).write(true),
+            )?;
+            let byte = crate::file::read_exact(&*file, last - 8, 1)?;
+            file.seek(SeekFrom::Start(last - 8))?;
+            file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
+        }
+        for e in memfs.read_dir(&root)? {
+            let is_version = e
+                .file_name
+                .strip_prefix('v')
+                .is_some_and(|rest| rest.parse::<u64>().is_ok());
+            if is_version || e.file_name == "current" {
+                memfs.remove_file(&e.path)?;
+            }
+        }
+        let corrupted = read_all(&fs_dyn, &blob_path)?;
+        Ok((memfs, blob_path, corrupted))
+    };
+
+    // Sweep the fault across the whole blob-salvage read sequence, so no single
+    // step (frame scan, digest, metadata re-read) escapes the invariant.
+    for skip in [0u64, 4, 8, 16, 24, 32, 48, 64, 96, 128] {
+        let (memfs, blob_path, corrupted) = fixture()?;
+        let fs_dyn: Arc<dyn Fs> = memfs.clone();
+        let fault = FaultFs::new((*memfs).clone());
+        fault.injector().arm(
+            FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Interrupted))
+                .on_path("blobs")
+                .skip(skip),
+        );
+
+        let result = Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_fs(fault)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .repair();
+
+        // No salvage temp is ever left behind, whatever the outcome.
+        assert!(
+            !memfs.exists(&blobs.join("0.salvage-tmp"))?,
+            "skip={skip}: a salvage temp must never survive the repair",
+        );
+        if result.is_err() {
+            // Aborted: the canonical path still holds the ORIGINAL bytes, so a
+            // retry re-salvages and re-derives the remap.
+            assert_eq!(
+                read_all(&fs_dyn, &blob_path)?,
+                corrupted,
+                "skip={skip}: an aborted repair must leave the original blob at \
+                 the canonical path, never an unverified replacement",
+            );
+        } else {
+            // Completed: the replacement is published AND the referencing table
+            // was rewritten onto its offsets, so every surviving record reads.
+            let tree = match Config::new(
+                &root,
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .with_shared_fs(memfs.clone())
+            .with_kv_separation(Some(
+                KvSeparationOptions::default().separation_threshold(16),
+            ))
+            .open()?
+            {
+                crate::AnyTree::Blob(t) => t,
+                crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+            };
+            for i in 0..7u32 {
+                assert!(
+                    tree.get(format!("k{i:04}").as_bytes(), crate::MAX_SEQNO)?
+                        .is_some(),
+                    "skip={skip}: record k{i:04} must survive a completed repair",
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A TRANSIENT failure during the blob-handle rewrite must leave the tree
+/// exactly as it found it: the source SST was already quarantined for the
+/// rewrite, so propagating the retryable error without restoring it would let
+/// the retried repair — which scans only `tables/` — rebuild a manifest that
+/// silently omits every key of that table. Mirrors the other salvage arms,
+/// which restore before propagating.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_restores_a_quarantined_table_when_the_rewrite_fails_transiently() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        for i in 0..8u32 {
+            tree.insert(format!("k{i:04}").as_bytes(), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Punch the blob's first frame: its remaining frames stay VALID (so the
+    // blob itself is not salvaged and never enters quarantine), while the
+    // pre-relocation SST's stale handle forces the handle-rewrite path — the
+    // only consumer of the quarantine here.
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let blob_path = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one blob file")
+        .path;
+    let frontier = crate::vlog::BlobFileScanner::new(&blob_path, &*fs_dyn, 0)?
+        .next()
+        .expect("a first frame")?
+        .frame_end;
+    let data_start = {
+        let mut file = fs_dyn.open(&blob_path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut file)?;
+        reader
+            .toc()
+            .section(b"data")
+            .expect("blob file has a data section")
+            .pos()
+    };
+    memfs.punch_hole(&blob_path, data_start, frontier - data_start)?;
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    // Fault the rewrite's reads of the quarantined SST with a RETRYABLE kind.
+    let fault = FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Interrupted))
+            .on_path("repair-quarantine"),
+    );
+
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .repair();
+    assert!(
+        result.is_err(),
+        "a transient rewrite failure must propagate for a retry: {result:?}",
+    );
+
+    assert!(
+        memfs.exists(&root.join("tables").join("0"))?,
+        "the source SST must be restored to tables/ before the retryable error \
+         propagates, or the retry rebuilds a manifest without its keys",
+    );
+    Ok(())
+}
+
 /// A blob file with a checksum-corrupt value frame must not be blessed as-is:
 /// restamping a digest over the damaged bytes would launder the corruption
 /// past every later integrity check while reads of the affected value still

@@ -83,6 +83,20 @@ pub fn recover_blob_files(
             continue;
         }
 
+        // `{id}.salvage-tmp`: a manifest repair's in-progress blob salvage
+        // copy. It is published by an atomic rename, so one that survives is
+        // always from a crashed repair and never referenced by any manifest —
+        // sweep it like any other orphan instead of failing the name parse
+        // (which would leave the tree unopenable until an operator intervened).
+        // Both halves must parse so a foreign name that merely ends in the
+        // suffix is NOT treated as ours.
+        if let Some(id_part) = file_name.strip_suffix(".salvage-tmp")
+            && id_part.parse::<BlobFileId>().is_ok()
+        {
+            orphaned_blob_files.push(dirent.path.clone());
+            continue;
+        }
+
         let blob_file_id = file_name.parse::<BlobFileId>().map_err(|e| {
             log::error!("invalid blob file name {file_name:?}: {e:?}");
             crate::Error::Unrecoverable

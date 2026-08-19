@@ -1849,6 +1849,20 @@ fn recover_blob_files(
             continue;
         }
 
+        // A crashed earlier repair's in-progress blob salvage copy: it is
+        // published by an atomic rename, so a surviving one is never
+        // referenced and never authoritative. Remove it rather than
+        // quarantining it as a foreign name (and re-salvage from the original
+        // below if that file still fails validation). Both halves must parse
+        // so a foreign name merely ending in the suffix is not treated as ours.
+        if file_name
+            .strip_suffix(".salvage-tmp")
+            .is_some_and(|id| id.parse::<crate::vlog::BlobFileId>().is_ok())
+        {
+            let _ = config.fs.remove_file(&blob_path);
+            continue;
+        }
+
         let Ok(blob_id) = file_name.parse::<crate::vlog::BlobFileId>() else {
             // A non-numeric name aborts the reopen's blob recovery (it parses
             // every name in blobs/), so it MUST be moved out of the way. If the
@@ -1965,13 +1979,80 @@ fn recover_blob_files(
         // Validate the live frame range BEFORE recording a digest: hashing
         // damaged frames would restamp (launder) the corruption past every
         // later integrity check while reads of the affected values still
-        // fail. An invalid file is SALVAGED instead of blessed or thrown
-        // away whole: the original is quarantined (preserved), the surviving
-        // records are re-emitted into a compacted replacement under the
-        // canonical name, and the offset relocation is recorded so the
-        // referencing SSTs are rewritten onto the new offsets.
+        // fail. An invalid file is SALVAGED instead of blessed or thrown away
+        // whole: its surviving records are re-emitted into a compacted
+        // replacement and the offset relocation is recorded so the referencing
+        // SSTs are rewritten onto the new offsets.
+        //
+        // The replacement is built in a PRIVATE temp and published (original to
+        // quarantine, temp renamed onto the canonical name) only once it is
+        // fully verified — the same publish-from-temp discipline the SST
+        // salvage arbitration and the tight-space install use. Nothing observable
+        // changes until that last step, so a failure at any earlier point simply
+        // drops the temp: there is no half-published state to unwind, and no
+        // window where a retry could find an unverified replacement under the
+        // canonical name and bless it as an ordinary intact blob (its offset
+        // remap lives only in this invocation, so the referencing SSTs would
+        // keep their old, now-wrong offsets).
         let frames_valid = validate_blob_frames(&config.fs, &blob_path, blob_id, frontier)?;
         if !frames_valid {
+            let temp = blobs_folder.join(format!("{blob_id}.salvage-tmp"));
+            let _ = config.fs.remove_file(&temp);
+            let salvage = (|| -> crate::Result<Option<(crate::vlog::BlobFile, crate::salvage::BlobSalvageReport)>> {
+                let report = crate::salvage::salvage_blob_file(
+                    &blob_path,
+                    temp.clone(),
+                    &config.fs,
+                    blob_id,
+                    &config.comparator,
+                    frontier,
+                )?;
+                let Some(salvaged_path) = report.salvaged_path.clone() else {
+                    return Ok(None);
+                };
+                let checksum = crate::Checksum::from_raw(compute_table_checksum(
+                    &*config.fs,
+                    &salvaged_path,
+                )?);
+                let bf = crate::vlog::recover_blob_file_from(
+                    &salvaged_path,
+                    blob_id,
+                    checksum,
+                    0,
+                    &config.fs,
+                    0,
+                )?;
+                Ok(Some((bf, report)))
+            })();
+            let (bf, report) = match salvage {
+                Ok(Some(pair)) => pair,
+                // Nothing recoverable, or a persistent failure: the original is
+                // untouched at its canonical path, so preserve it in quarantine
+                // and report — exactly like any other unreadable blob.
+                Ok(None) => {
+                    let _ = config.fs.remove_file(&temp);
+                    let e = crate::Error::InvalidHeader(
+                        "blob value frames failed validation and no record was recoverable",
+                    );
+                    quarantine_unreadable(blob_path, &file_name, &e, &mut unreadable)?;
+                    continue;
+                }
+                Err(e) if is_transient_io(&e) => {
+                    // Nothing was published; dropping the temp restores the
+                    // pre-repair state exactly, so the retry re-salvages and
+                    // re-derives the remap.
+                    let _ = config.fs.remove_file(&temp);
+                    return Err(e);
+                }
+                Err(e) => {
+                    let _ = config.fs.remove_file(&temp);
+                    quarantine_unreadable(blob_path, &file_name, &e, &mut unreadable)?;
+                    continue;
+                }
+            };
+
+            // Verified: publish. The original moves to quarantine (preserved for
+            // offline inspection) and the replacement takes the canonical name.
             let quarantined = quarantine_file(
                 &*config.fs,
                 &blobs_folder,
@@ -1979,107 +2060,38 @@ fn recover_blob_files(
                 &file_name,
                 config.sync_mode,
             )?;
-            let dest = blobs_folder.join(blob_id.to_string());
-            let report = match crate::salvage::salvage_blob_file(
-                &quarantined,
-                dest,
-                &config.fs,
-                blob_id,
-                &config.comparator,
-                frontier,
-            ) {
-                Ok(report) => report,
-                // Transient reads must retry; the salvage discarded its own
-                // partial output, and the original sits safely in quarantine —
-                // but a retried repair scans `blobs/` again, so restore the
-                // original first or the retry would see no file at all.
-                Err(e) if is_transient_io(&e) => {
-                    config.fs.rename(&quarantined, &blob_path)?;
-                    return Err(e);
-                }
-                Err(e) => {
-                    unreadable.push((
-                        blob_path,
-                        format!(
-                            "value frames failed validation and salvage failed ({e}); \
-                             original preserved at {}",
-                            quarantined.display(),
-                        ),
-                    ));
-                    continue;
-                }
-            };
-            let Some(salvaged_path) = report.salvaged_path else {
-                unreadable.push((
-                    blob_path,
-                    format!(
-                        "value frames failed validation and no record was recoverable; \
-                         original preserved at {}",
-                        quarantined.display(),
-                    ),
-                ));
-                continue;
-            };
-            let checksum = match compute_table_checksum(&*config.fs, &salvaged_path) {
-                Ok(c) => crate::Checksum::from_raw(c),
-                Err(e) if is_transient_io(&e) => {
-                    return Err(e);
-                }
-                Err(e) => {
-                    let _ = config.fs.remove_file(&salvaged_path);
-                    unreadable.push((
-                        blob_path,
-                        format!(
-                            "salvaged replacement unreadable ({e}); original preserved at {}",
-                            quarantined.display(),
-                        ),
-                    ));
-                    continue;
-                }
-            };
-            match crate::vlog::recover_blob_file_from(
-                &salvaged_path,
-                blob_id,
-                checksum,
-                0,
-                &config.fs,
-                0,
-            ) {
-                Ok(bf) => {
-                    if let Some(p) = &config.recovery_progress {
-                        p.blob_file_recovered();
-                    }
-                    kept_paths.insert(blob_id, salvaged_path);
-                    blob_files.push(bf);
-                    rewrites.insert(
-                        blob_id,
-                        crate::salvage::BlobFileRewrite::Remap(
-                            report.offset_remap.iter().copied().collect(),
-                        ),
-                    );
-                    unreadable.push((
-                        blob_path,
-                        format!(
-                            "{} of {} records salvaged into a compacted replacement \
-                             (the rest were corrupt); original preserved at {}",
-                            report.records_salvaged,
-                            report.records_total,
-                            quarantined.display(),
-                        ),
-                    ));
-                }
-                Err(e) if is_transient_io(&e) => return Err(e),
-                Err(e) => {
-                    let _ = config.fs.remove_file(&salvaged_path);
-                    unreadable.push((
-                        blob_path,
-                        format!(
-                            "salvaged replacement unreadable ({e}); original preserved at {}",
-                            quarantined.display(),
-                        ),
-                    ));
-                }
+            if let Err(e) = config.fs.rename(&temp, &blob_path) {
+                // The canonical name is free but the publish failed: put the
+                // original back so the tree is exactly as it was found.
+                let _ = config.fs.rename(&quarantined, &blob_path);
+                let _ = config.fs.remove_file(&temp);
+                return Err(e.into());
             }
+            config
+                .fs
+                .sync_directory_with(&blobs_folder, config.sync_mode)?;
+
+            if let Some(p) = &config.recovery_progress {
+                p.blob_file_recovered();
+            }
+            kept_paths.insert(blob_id, blob_path.clone());
+            blob_files.push(bf);
+            rewrites.insert(
+                blob_id,
+                crate::salvage::BlobFileRewrite::Remap(
+                    report.offset_remap.iter().copied().collect(),
+                ),
+            );
+            unreadable.push((
+                blob_path,
+                format!(
+                    "{} of {} records salvaged into a compacted replacement \
+                     (the rest were corrupt); original preserved at {}",
+                    report.records_salvaged,
+                    report.records_total,
+                    quarantined.display(),
+                ),
+            ));
             continue;
         }
 
@@ -3229,7 +3241,21 @@ fn repair_tree(
                         ),
                     ));
                 }
-                Err(e) if is_transient_io(&e) => return Err(e),
+                // A retryable failure must leave the tree as it was found: the
+                // source is already in quarantine, and the retried repair scans
+                // only `tables/`, so propagating without restoring would let it
+                // rebuild a manifest that silently omits every key of this
+                // table. Mirrors the other salvage arms.
+                Err(e) if is_transient_io(&e) => {
+                    restore_quarantined(
+                        &*fs,
+                        &quarantined,
+                        &path,
+                        config.encryption.as_deref(),
+                        config.sync_mode,
+                    )?;
+                    return Err(e);
+                }
                 Err(e) => {
                     unreadable_files.push((
                         path,
