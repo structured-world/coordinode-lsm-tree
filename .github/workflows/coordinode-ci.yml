@@ -360,7 +360,10 @@ jobs:
         # `--retries 0` overrides the ci profile's retries: the fuzzer dumps the
         # EXACT failing SST, and a retry (on a non-deterministic corpus) would
         # either overwrite that dump or mask a real failure that does not replay.
-        run: cargo nextest run --profile ci --all-features --run-ignored=only --retries 0 -E 'test(fuzz_heal_bitrot)'
+        # `ignored-only` is the documented selector value; the shorter `only`
+        # is a deprecated alias current nextest still accepts (this job ran
+        # fine on it) but newer releases may drop.
+        run: cargo nextest run --profile ci --all-features --run-ignored=ignored-only --retries 0 -E 'test(fuzz_heal_bitrot)'
       - name: Dump reproducer on failure
         if: failure()
         # The corpus is not byte-deterministic (encrypted / timestamped SSTs), so

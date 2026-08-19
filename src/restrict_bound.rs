@@ -166,6 +166,11 @@ pub(crate) fn publish_raw(
         file.flush()?;
         crate::fs::FsFile::sync_all_with(&*file, sync_mode)?;
         drop(file);
+        // `std::fs::rename` REPLACES an existing destination FILE on every
+        // supported platform (on Windows via MOVEFILE_REPLACE_EXISTING /
+        // POSIX-semantics rename; only a destination DIRECTORY fails there),
+        // so re-publishing over an earlier slice's sidecar is atomic
+        // everywhere — no remove-then-rename window.
         fs.rename(&tmp, &path)?;
         if let Some(parent) = path.parent() {
             fs.sync_directory_with(parent, sync_mode)?;
