@@ -984,6 +984,25 @@ fn punch_on_drop_refuses_a_hard_linked_table() -> crate::Result<()> {
             .is_some_and(|head| head.iter().all(|&b| b == 0)),
         "an exclusively-owned SST is still reclaimed",
     );
+
+    // EXCLUSIVE inode but an ACTIVE checkpoint pause: the punch stands down —
+    // the pause covers the checkpoint's whole copy/link pass, so deferring
+    // removes the probe-then-punch window in which the checkpoint could link
+    // the inode after the count read 1. Mirrors the blob-prefix reclaim.
+    let (paused_path, paused_checksum) = build(&plain, "2")?;
+    let before = read_all(&plain, &paused_path)?;
+    let table = recover(&plain, &paused_path, paused_checksum)?;
+    let pause = crate::deletion_pause::DeletionPause::new_shared();
+    table.install_deletion_pause(std::sync::Arc::clone(&pause));
+    let _guard = pause.acquire();
+    let punch = table.punch_offset_for(b"k0128")?;
+    table.mark_punch_on_drop(punch);
+    drop(table);
+    assert_eq!(
+        read_all(&plain, &paused_path)?,
+        before,
+        "an active checkpoint pause must defer the SST prefix reclaim",
+    );
     Ok(())
 }
 

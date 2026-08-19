@@ -76,7 +76,8 @@ flowchart TD
 
     V0{Verify data blocks} -->|all clean| MASK0
     V0 -->|transient| PROP3[Propagate for retry]
-    V0 -->|some corrupt| VSALV
+    V0 -->|some corrupt,<br/>salvage on| VSALV
+    V0 -->|some corrupt,<br/>salvage off| VQUAR[Set aside with the reason;<br/>a salvage-enabled repair rewrites it]
     OPEN -->|recovery fails,<br/>blocks salvageable| VSALV
     VSALV[Salvage: recover readable blocks;<br/>drop the corrupt ones] --> VRES[Re-restrict the output to the bound;<br/>from the restricted view or the sidecar;<br/>fail-closed unless resurrection is on]
     VRES --> MASK0
@@ -163,6 +164,20 @@ the corrupt blocks are lost, and nothing below the bound is resurrected. Only
 the irregular-punch state above — where no live suffix can even be delimited —
 sets a table aside, and the resurrection flag still recovers its readable
 region.
+
+**Verification runs on every repair; the salvage flag only picks the remedy.**
+Whole-file recovery is lazy on the data section and the manifest digest is
+computed freshly from the bytes on disk, so admitting an unverified table would
+*launder* any data-block corruption: the rebuilt manifest counts it recovered
+and later integrity checks pass while reads of the affected block fail. Every
+recovered table is therefore block-verified, with or without salvage. What
+differs is the remedy for a damaged one: with salvage it is rewritten from its
+readable blocks; without, it is set aside with a reason pointing at the
+salvage-enabled repair. One exception is kept deliberately: a table whose
+payloads all verify clean but whose ECC parity is partially rotted stays
+admitted even without salvage — its digest over the rotted parity is exactly
+the *attributable* state the in-place heal reconciles, so admitting it is the
+entry into that repair, not a laundered digest.
 
 **Salvage always re-restricts, on every path that reaches it.** Salvage rewrites
 its source as a fresh, *unpunched* table that re-emits the straddling block's
