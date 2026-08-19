@@ -1103,10 +1103,21 @@ fn verify_keep_decision(
     table_path: &std::path::Path,
     table: &Table,
     allow_resurrection: bool,
+    // Whether this repair may REWRITE a damaged table (block salvage). Off,
+    // the degraded verdicts resolve without a rewrite: corrupt / unverifiable
+    // content is set aside (with the reason pointing at the salvage-enabled
+    // repair), while rotted-parity-but-readable content is KEPT — its payloads
+    // verified clean, and blessing its digest is the entry into the normal
+    // attributable heal (a patrol re-stamps the parity and reconciles).
+    salvage: bool,
 ) -> crate::Result<RepairKeepDecision> {
     Ok(
         match block_verify_verdict(config, folder_fs, table_path, table)? {
             BlockVerifyVerdict::Clean => RepairKeepDecision::Keep,
+            BlockVerifyVerdict::Corrupt if !salvage => RepairKeepDecision::Quarantine(
+                "verification found corrupt data blocks; run a salvage-enabled repair \
+                 to rewrite the readable blocks",
+            ),
             BlockVerifyVerdict::Corrupt => {
                 // A `Corrupt` verdict from a catalogue that could HIDE a deletion
                 // section (an omitted / renamed / shadowed `range_tombstones` or
@@ -1135,14 +1146,15 @@ fn verify_keep_decision(
                 }
             }
             BlockVerifyVerdict::DegradedButReadable => {
-                if table.range_tombstones().is_empty() {
+                if salvage && table.range_tombstones().is_empty() {
                     RepairKeepDecision::Salvage
                 } else {
                     log::warn!(
                         "table {} at {}: every payload verified clean but its ECC is \
-                     partially uncheckable or rotted, and salvage cannot re-emit its \
-                     range tombstones — keeping the table as-is; recompact to re-stamp \
-                     it under fresh, verifiable parity",
+                     partially uncheckable or rotted, and this repair cannot rewrite it \
+                     (salvage off, or range tombstones it cannot re-emit) — keeping the \
+                     table as-is; a patrol heal or recompaction re-stamps it under \
+                     fresh, verifiable parity",
                         table.metadata.id,
                         table_path.display(),
                     );
@@ -1150,13 +1162,19 @@ fn verify_keep_decision(
                 }
             }
             BlockVerifyVerdict::DegradedUnscanned => {
-                if table.range_tombstones().is_empty() {
+                if salvage && table.range_tombstones().is_empty() {
                     RepairKeepDecision::Salvage
-                } else {
+                } else if salvage {
                     RepairKeepDecision::Quarantine(
                         "ECC descriptor unrecognized (the block walk cannot verify the \
                      table) and salvage cannot re-emit its range tombstones; the table \
                      is excluded (recompact it under a supported scheme to re-admit it)",
+                    )
+                } else {
+                    RepairKeepDecision::Quarantine(
+                        "ECC descriptor unrecognized (the block walk cannot verify the \
+                     table); run a salvage-enabled repair to rewrite it under fresh, \
+                     verifiable parity",
                     )
                 }
             }
@@ -2644,6 +2662,7 @@ fn repair_tree(
                         &table_path,
                         &table,
                         allow_resurrection,
+                        true,
                     )? {
                         RepairKeepDecision::Keep => {
                             record_best(
@@ -2809,6 +2828,7 @@ fn repair_tree(
                         &table_path,
                         &table,
                         allow_resurrection,
+                        false,
                     )? {
                         RepairKeepDecision::Keep => {
                             record_best(
@@ -2824,6 +2844,8 @@ fn repair_tree(
                                 config.sync_mode,
                             )?;
                         }
+                        // `Salvage` is unreachable with the flag off, but a
+                        // defensive fallthrough beats a panic in a repair path.
                         decision @ (RepairKeepDecision::Quarantine(_)
                         | RepairKeepDecision::Salvage) => {
                             let reason = match decision {

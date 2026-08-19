@@ -576,18 +576,73 @@ fn corrupt_parity_trailer_byte(
     Ok(())
 }
 
-/// Rebuilds the manifest from whatever is on disk, recording the digest of
-/// the CURRENT (possibly rotted) bytes, and asserts exactly one table was
-/// admitted. This is how the reconcile tests seed a manifest digest that
-/// disagrees with the ORIGINAL bytes a later heal restores.
+/// Rebuilds the manifest by hand, recording the digest of the CURRENT
+/// (possibly rotted) bytes of the single table under `tables/`. This seeds the
+/// state the reconcile tests need — a manifest digest that matches damaged
+/// bytes exactly (as when the damage lands before the digest is first
+/// recorded) — which `Config::repair()` deliberately refuses to produce: its
+/// block verification quarantines a table whose data blocks do not verify
+/// rather than blessing a laundered digest.
 fn rebuild_manifest_over_current_bytes(dir: &std::path::Path) -> crate::Result<()> {
-    let report = crate::Config::new(
+    use crate::version::{Level, Run, Version};
+    use std::sync::Arc;
+
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(crate::fs::StdFs);
+    let sst_path = dir.join("tables").join("0");
+    let checksum =
+        crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &sst_path)?);
+    #[cfg(feature = "metrics")]
+    let metrics = Arc::new(crate::Metrics::default());
+    let table = crate::table::Table::recover(
+        sst_path,
+        checksum,
+        0,
+        0,
+        0,
+        Arc::new(crate::Cache::with_capacity_bytes(1_000_000)),
+        None,
+        Arc::clone(&fs),
+        false,
+        false,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        crate::comparator::default_comparator(),
+        #[cfg(feature = "metrics")]
+        metrics,
+    )?;
+
+    // Remove the prior snapshots so the hand-built one is the newest.
+    let mut next_version_id = 0u64;
+    for entry in fs.read_dir(dir)? {
+        if let Some(rest) = entry.file_name.strip_prefix('v')
+            && let Ok(n) = rest.parse::<u64>()
+        {
+            next_version_id = next_version_id.max(n + 1);
+        }
+    }
+
+    let run = Run::new(alloc::vec![table]).expect("a non-empty run");
+    let mut levels = alloc::vec![Level::from_runs(alloc::vec![Arc::new(run)])];
+    for _ in 1..7 {
+        levels.push(Level::empty());
+    }
+    let version = Version::from_levels(
+        next_version_id,
+        crate::config::TreeType::Standard,
+        levels,
+        crate::version::BlobFileList::new(crate::HashMap::default()),
+        crate::blob_tree::FragmentationMap::default(),
+    );
+    crate::version::persist_version(
         dir,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .repair()?;
-    assert_eq!(report.recovered, 1, "{report:?}");
+        &version,
+        crate::comparator::default_comparator().name(),
+        &*fs,
+        Arc::new(crate::runtime_config::types::RuntimeConfig::default()),
+        None,
+        crate::fs::SyncMode::Full,
+    )?;
     Ok(())
 }
 

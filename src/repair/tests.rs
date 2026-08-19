@@ -3949,7 +3949,7 @@ fn verify_keep_decision_grades_a_persistent_walk_io_error_as_corruption() -> cra
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     );
-    let decision = verify_keep_decision(&config, &faulting, &sst, &table, false);
+    let decision = verify_keep_decision(&config, &faulting, &sst, &table, false, true);
     assert!(
         decision.is_ok(),
         "a persistent walk read error must be graded as corruption (a decision), not \
