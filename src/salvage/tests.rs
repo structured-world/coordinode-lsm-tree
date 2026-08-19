@@ -7840,18 +7840,31 @@ fn salvage_blob_file_reports_an_offset_remap_for_every_salvaged_record() -> crat
     );
 
     // The remap covers exactly the salvaged records, keyed by their SOURCE
-    // offsets, and its targets are the actual frame offsets in the recovered
-    // file (verified against a scan of the destination).
-    let dest_offsets: Vec<u64> = BlobScanner::new(&dest, &*fs, 0)?
+    // offsets, and its targets are the actual frame offsets AND on-disk value
+    // sizes in the recovered file (verified against a scan of the destination —
+    // a live read cross-checks the handle's size against the frame header, so
+    // the relocation must carry the re-emitted size, not the source's).
+    let dest_records: Vec<(u64, u32)> = BlobScanner::new(&dest, &*fs, 0)?
         .filter_map(Result::ok)
-        .map(|e| e.offset)
+        .map(|e| {
+            let value_start = e.offset
+                + u64::try_from(crate::vlog::blob_file::writer::BLOB_HEADER_LEN).unwrap_or(0)
+                + u64::try_from(e.key.len()).unwrap_or(0);
+            (
+                e.offset,
+                u32::try_from(e.frame_end - value_start).unwrap_or(0),
+            )
+        })
         .collect();
-    let expected: Vec<(u64, u64)> = std::iter::once(&0usize)
-        .zip(&dest_offsets)
-        .map(|(&src_idx, &new)| {
+    let expected: Vec<(u64, super::BlobRecordRelocation)> = std::iter::once(&0usize)
+        .zip(&dest_records)
+        .map(|(&src_idx, &(offset, on_disk_size))| {
             (
                 source_offsets.get(src_idx).copied().unwrap_or(u64::MAX),
-                new,
+                super::BlobRecordRelocation {
+                    offset,
+                    on_disk_size,
+                },
             )
         })
         .collect();
@@ -8300,23 +8313,17 @@ fn salvage_blob_file_recovers_a_compressed_source() -> crate::Result<()> {
         crate::CompressionType::Lz4,
         "the copy keeps the source's compression descriptor",
     );
-    let (_, salvaged_offset) = *report.offset_remap.first().expect("one remap entry");
-    // The re-emitted record's ON-DISK size (its own compression run), read
-    // back from the copy — a live SST handle carries exactly this.
-    let on_disk_size = {
-        let entry = crate::vlog::BlobFileScanner::new(&dest, &*fs, 0)?
-            .next()
-            .expect("one record")?;
-        u32::try_from(entry.frame_end - entry.offset).expect("frame fits u32")
-            - u32::try_from(crate::vlog::blob_file::writer::BLOB_HEADER_LEN + b"k0".len())
-                .expect("header fits u32")
-    };
+    // A live SST handle is rebuilt straight from the relocation: BOTH its
+    // fields come from the salvaged file (the reader cross-checks the size
+    // against the frame header, so the relocation's size must be the
+    // re-emitted one).
+    let (_, relocation) = *report.offset_remap.first().expect("one remap entry");
     let file = std::fs::File::open(&dest)?;
     let reader = crate::vlog::blob_file::reader::Reader::new(&handle, &file);
     let vhandle = crate::vlog::ValueHandle {
         blob_file_id: 0,
-        offset: salvaged_offset,
-        on_disk_size,
+        offset: relocation.offset,
+        on_disk_size: relocation.on_disk_size,
     };
     assert_eq!(
         reader.get(b"k0", &vhandle)?.as_ref(),
@@ -8353,6 +8360,64 @@ fn salvage_blob_file_rejects_a_dictionary_compressed_source() -> crate::Result<(
             Err(crate::Error::FeatureUnsupported(_)),
         ),
         "a dictionary-compressed blob file must be rejected rather than mis-salvaged",
+    );
+    Ok(())
+}
+
+/// The blob-handle rewrite must install BOTH relocation fields into a remapped
+/// indirection: the salvaged file is compacted (offset moves) AND its records
+/// are re-compressed (the on-disk size may change — compressor output is not
+/// stable across versions), while `Reader::get` cross-checks the handle's size
+/// against the frame header and rejects a mismatch. Carrying only the offset
+/// would leave otherwise-salvaged values unreadable.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn blob_handle_rewrite_installs_the_relocated_size() -> crate::Result<()> {
+    use crate::blob_tree::handle::BlobIndirection;
+    use crate::coding::{Decode, Encode};
+    use crate::vlog::ValueHandle;
+    use crate::{InternalValue, ValueType};
+
+    let ind = BlobIndirection {
+        vhandle: ValueHandle {
+            blob_file_id: 7,
+            offset: 400,
+            on_disk_size: 64,
+        },
+        size: 100,
+    };
+    let mut value = Vec::new();
+    ind.encode_into(&mut value)?;
+    let entries = vec![InternalValue::from_components(
+        b"k".to_vec(),
+        value,
+        1,
+        ValueType::Indirection,
+    )];
+
+    // The salvaged replacement re-emitted this record at a new offset AND a
+    // new (re-compressed) on-disk size.
+    let mut map = crate::HashMap::default();
+    map.insert(
+        400u64,
+        super::BlobRecordRelocation {
+            offset: 16,
+            on_disk_size: 61,
+        },
+    );
+    let mut rewrite = crate::HashMap::default();
+    rewrite.insert(7u64, super::BlobFileRewrite::Remap(map));
+
+    let mut dropped = 0u64;
+    let out = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
+    assert_eq!(dropped, 0, "the record survived, nothing drops");
+    let entry = out.first().expect("one rewritten entry");
+    let rewritten = BlobIndirection::decode_from(&mut &entry.value[..])?;
+    assert_eq!(rewritten.vhandle.offset, 16, "the offset is re-targeted");
+    assert_eq!(
+        rewritten.vhandle.on_disk_size, 61,
+        "the on-disk size is the RE-EMITTED record's, not the source's: the \
+         reader rejects a handle whose size disagrees with the frame header",
     );
     Ok(())
 }

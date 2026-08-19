@@ -107,12 +107,12 @@ pub struct SalvageOptions {
 #[derive(Debug, Clone)]
 pub enum BlobFileRewrite {
     /// The blob file was salvaged into a COMPACTED copy: every surviving
-    /// record moved to the offset recorded in
-    /// [`BlobSalvageReport::offset_remap`] (source offset → salvaged offset).
-    /// A handle whose source offset is absent points at a record the salvage
-    /// dropped — its entry is removed from the rewritten SST (its key then
-    /// reads as absent instead of erroring on damaged bytes).
-    Remap(crate::HashMap<u64, u64>),
+    /// record moved (and, when re-compressed, may have changed on-disk size),
+    /// per [`BlobSalvageReport::offset_remap`]. A handle whose source offset
+    /// is absent points at a record the salvage dropped — its entry is removed
+    /// from the rewritten SST (its key then reads as absent instead of
+    /// erroring on damaged bytes).
+    Remap(crate::HashMap<u64, BlobRecordRelocation>),
     /// The blob file is intact but its consumed prefix was punched at this
     /// live-data frontier: a handle below it (a pre-relocation SST left behind
     /// by a crash) points into zeroed bytes — its entry is removed; handles at
@@ -1071,8 +1071,12 @@ fn rewrite_block_indirections(
         match rewrite.get(&ind.vhandle.blob_file_id) {
             None => out.push(entry),
             Some(BlobFileRewrite::Remap(map)) => match map.get(&ind.vhandle.offset) {
-                Some(&salvaged_offset) => {
-                    ind.vhandle.offset = salvaged_offset;
+                Some(&relocation) => {
+                    // BOTH fields: a live read cross-checks the handle's size
+                    // against the frame header, so a stale size from the
+                    // source file would reject the salvaged record.
+                    ind.vhandle.offset = relocation.offset;
+                    ind.vhandle.on_disk_size = relocation.on_disk_size;
                     let mut buf = Vec::new();
                     ind.encode_into(&mut buf)?;
                     entry.value = buf.into();
@@ -2286,14 +2290,17 @@ pub struct BlobSalvageReport {
     pub records_total: usize,
     /// Records successfully re-emitted into the salvaged blob file.
     pub records_salvaged: usize,
-    /// `(source_offset, salvaged_offset)` for every re-emitted record, in walk
+    /// `(source_offset, relocation)` for every re-emitted record, in walk
     /// order. The salvaged file is written COMPACTED — after the first dropped
-    /// record every later record lands at a NEW offset — so existing SST
-    /// entries whose `ValueHandle::offset` points into the source file must be
-    /// remapped through this table before the salvaged file can replace the
-    /// original under the same id. A source offset absent from this map (and
-    /// implied by [`Self::dropped`]) is lost: its handle has no target.
-    pub offset_remap: Vec<(u64, u64)>,
+    /// record every later record lands at a NEW offset, and a compressed
+    /// record is re-compressed, so its on-disk size may change too — so
+    /// existing SST entries whose `ValueHandle`
+    /// points into the source file must be rewritten through this table
+    /// (BOTH fields; a live read cross-checks the handle against the frame
+    /// header) before the salvaged file can replace the original under the
+    /// same id. A source offset absent from this map (and implied by
+    /// [`Self::dropped`]) is lost: its handle has no target.
+    pub offset_remap: Vec<(u64, BlobRecordRelocation)>,
     /// Records the walk had to drop.
     pub dropped: Vec<DroppedBlob>,
 }
@@ -2304,6 +2311,23 @@ impl BlobSalvageReport {
     pub fn is_complete(&self) -> bool {
         self.dropped.is_empty()
     }
+}
+
+/// Where one blob record landed in the salvaged replacement file.
+///
+/// Carried per source offset in [`BlobSalvageReport::offset_remap`]. Both
+/// fields must be installed into a referencing SST's rewritten
+/// `ValueHandle`: the compacted rewrite moves the
+/// record, and the decompress + re-compress re-emit may change its on-disk
+/// size (compressor output is not stable across versions or implementations),
+/// while a live read cross-checks the handle's size against the frame header
+/// and rejects a mismatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobRecordRelocation {
+    /// Offset of the re-emitted record in the salvaged file.
+    pub offset: u64,
+    /// On-disk size of the re-emitted (possibly re-compressed) value.
+    pub on_disk_size: u32,
 }
 
 /// Decompresses one blob record's on-disk bytes for the salvage re-emit,
@@ -2481,7 +2505,7 @@ pub fn salvage_blob_file(
 
     let mut records_total = 0usize;
     let mut records_salvaged = 0usize;
-    let mut offset_remap: Vec<(u64, u64)> = Vec::new();
+    let mut offset_remap: Vec<(u64, BlobRecordRelocation)> = Vec::new();
     let mut dropped: Vec<DroppedBlob> = Vec::new();
     // The internal key of the last record accepted for re-emit, to enforce the
     // `BlobWriter` sorted-input contract on the salvaged file (see the accept
@@ -2601,8 +2625,19 @@ pub fn salvage_blob_file(
                     // re-target handles before the salvaged file can replace
                     // the original.
                     let salvaged_offset = writer.offset();
-                    writer.write(&entry.key, entry.seqno, &value)?;
-                    offset_remap.push((entry.offset, salvaged_offset));
+                    // `write` re-compresses under the salvaged file's own
+                    // descriptor and returns the resulting ON-DISK value size —
+                    // recorded per record because compressor output is not
+                    // stable across versions, so the source handle's size
+                    // cannot be assumed to survive the round-trip.
+                    let on_disk_size = writer.write(&entry.key, entry.seqno, &value)?;
+                    offset_remap.push((
+                        entry.offset,
+                        BlobRecordRelocation {
+                            offset: salvaged_offset,
+                            on_disk_size,
+                        },
+                    ));
                     prev_written = Some((entry.key.clone(), entry.seqno));
                     records_salvaged += 1;
                 }

@@ -1114,10 +1114,6 @@ fn verify_keep_decision(
     Ok(
         match block_verify_verdict(config, folder_fs, table_path, table)? {
             BlockVerifyVerdict::Clean => RepairKeepDecision::Keep,
-            BlockVerifyVerdict::Corrupt if !salvage => RepairKeepDecision::Quarantine(
-                "verification found corrupt data blocks; run a salvage-enabled repair \
-                 to rewrite the readable blocks",
-            ),
             BlockVerifyVerdict::Corrupt => {
                 // A `Corrupt` verdict from a catalogue that could HIDE a deletion
                 // section (an omitted / renamed / shadowed `range_tombstones` or
@@ -1133,6 +1129,12 @@ fn verify_keep_decision(
                 // salvage itself (`salvage_with_context` fails closed on a corrupt
                 // rebuildable section when no deletion is visible), which both this
                 // path and the recovery-failure salvage path funnel through.
+                //
+                // Probed BEFORE the salvage-off branch below on purpose: with
+                // salvage off the table quarantines either way, but this reason
+                // is the accurate one — pointing that operator at a
+                // salvage-enabled repair would mislead (it quarantines the
+                // concealment case too, unless resurrection is enabled).
                 if toc_may_hide_deletions(folder_fs, table_path)? && !allow_resurrection {
                     RepairKeepDecision::Quarantine(
                         "TOC corruption may hide deletion metadata (range tombstones \
@@ -1141,8 +1143,13 @@ fn verify_keep_decision(
                      resurrection to salvage it, accepting that suppressed rows \
                      reappear",
                     )
-                } else {
+                } else if salvage {
                     RepairKeepDecision::Salvage
+                } else {
+                    RepairKeepDecision::Quarantine(
+                        "verification found corrupt data blocks; run a salvage-enabled \
+                         repair to rewrite the readable blocks",
+                    )
                 }
             }
             BlockVerifyVerdict::DegradedButReadable => {
