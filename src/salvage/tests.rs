@@ -8326,6 +8326,7 @@ fn salvage_blob_file_recovers_a_compressed_source() -> crate::Result<()> {
     Ok(())
 }
 
+#[cfg(all(feature = "lz4", zstd_any))]
 #[test]
 fn salvage_blob_file_rejects_a_dictionary_compressed_source() -> crate::Result<()> {
     let dir = tempdir()?;

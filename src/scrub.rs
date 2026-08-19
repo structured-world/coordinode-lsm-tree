@@ -996,9 +996,13 @@ fn refresh_healed_checksum(
     // the marker and reports the table as still unreconciled, so a later
     // patrol on a healthy device completes the reconciliation.
     if let Err(e) = (|| -> crate::Result<()> {
-        let file = table
-            .fs
-            .open(&table.path, &crate::fs::FsOpenOptions::new().read(true))?;
+        // Write access is required for the flush alone (Windows refuses to
+        // flush a read-only handle with ERROR_ACCESS_DENIED); nothing is
+        // written through it.
+        let file = table.fs.open(
+            &table.path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
         crate::fs::FsFile::sync_data_with(&*file, crate::fs::SyncMode::Full)?;
         Ok(())
     })() {
