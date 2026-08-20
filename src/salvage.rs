@@ -2471,6 +2471,7 @@ pub fn salvage_blob_file(
     blob_file_id: crate::vlog::BlobFileId,
     comparator: &crate::comparator::SharedComparator,
     live_data_start: u64,
+    #[cfg(zstd_any)] zstd_dictionary: Option<&alloc::sync::Arc<crate::compression::ZstdDictionary>>,
 ) -> crate::Result<BlobSalvageReport> {
     use crate::vlog::blob_file::{scanner::Scanner, writer::Writer as BlobWriter};
     use alloc::format;
@@ -2480,10 +2481,10 @@ pub fn salvage_blob_file(
     // the scanner yields on-disk bytes, so a compressed record is DECOMPRESSED
     // here (proving it round-trips) and re-emitted through a writer stamped
     // with the same compression — never copied through verbatim under a
-    // mismatched descriptor. A DICTIONARY-compressed source is the one shape
-    // this standalone entry cannot handle (it carries no dictionary context),
-    // failing closed the same way SST salvage fails closed on range
-    // tombstones.
+    // mismatched descriptor. A DICTIONARY-compressed source decodes only when
+    // the caller supplies the matching dictionary (manifest repair passes the
+    // tree's configured one); without it this entry fails closed, the same
+    // way SST salvage fails closed on range tombstones.
     //
     // A placeholder checksum is passed on purpose: `recover_blob_file` only STORES
     // it (it never verifies the source against it), and only `compression()` is
@@ -2496,9 +2497,9 @@ pub fn salvage_blob_file(
         crate::vlog::recover_blob_file(source, blob_file_id, crate::Checksum::from_raw(0), 0, fs)?;
     let compression = source_handle.compression();
     #[cfg(zstd_any)]
-    if matches!(compression, crate::CompressionType::ZstdDict { .. }) {
+    if matches!(compression, crate::CompressionType::ZstdDict { .. }) && zstd_dictionary.is_none() {
         return Err(crate::Error::FeatureUnsupported(
-            "salvage of a dictionary-compressed blob file",
+            "salvage of a dictionary-compressed blob file without its dictionary",
         ));
     }
 
@@ -2522,6 +2523,12 @@ pub fn salvage_blob_file(
     let mut writer = BlobWriter::new(&dest, blob_file_id, 0, &**fs)?
         .use_sync_mode(sync_mode)
         .use_compression(compression);
+    #[cfg(zstd_any)]
+    {
+        // The re-emit re-compresses under the source's descriptor; a
+        // dictionary descriptor needs the dictionary on the write side too.
+        writer = writer.use_zstd_dictionary(zstd_dictionary.cloned());
+    }
 
     let mut records_total = 0usize;
     let mut records_salvaged = 0usize;
@@ -2628,7 +2635,7 @@ pub fn salvage_blob_file(
                         &entry.value,
                         entry.uncompressed_len as usize,
                         #[cfg(zstd_any)]
-                        None,
+                        zstd_dictionary.map(alloc::sync::Arc::as_ref),
                     ) {
                         Ok(value) => value,
                         Err(e) => {

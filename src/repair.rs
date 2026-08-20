@@ -1811,6 +1811,7 @@ fn validate_blob_frames(
     };
     let mut count: u64 = 0;
     let mut uncompressed_total: u64 = 0;
+    let mut compressed_total: u64 = 0;
     let mut first_key: Option<crate::UserKey> = None;
     let mut prev: Option<(crate::UserKey, crate::SeqNo)> = None;
     for item in scanner {
@@ -1844,6 +1845,9 @@ fn validate_blob_frames(
                 }
                 count += 1;
                 uncompressed_total += u64::from(entry.uncompressed_len);
+                // Sum of u32-bounded on-disk lengths within one file: cannot
+                // overflow u64 (the file itself cannot reach 2^64 bytes).
+                compressed_total += entry.value.len() as u64;
                 if first_key.is_none() {
                     first_key = Some(entry.key.clone());
                 }
@@ -1868,6 +1872,7 @@ fn validate_blob_frames(
         };
         if meta.item_count != count
             || meta.total_uncompressed_bytes != uncompressed_total
+            || meta.total_compressed_bytes != compressed_total
             || !range_matches
         {
             log::warn!(
@@ -2117,6 +2122,11 @@ fn recover_blob_files(
                     blob_id,
                     &config.comparator,
                     frontier,
+                    // Repair has the tree's dictionary context, so a
+                    // dictionary-compressed blob salvages its intact frames
+                    // instead of being set aside whole.
+                    #[cfg(zstd_any)]
+                    config.zstd_dictionary.as_ref(),
                 )?;
                 let Some(salvaged_path) = report.salvaged_path.clone() else {
                     return Ok(None);
