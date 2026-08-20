@@ -247,10 +247,21 @@ frontier recovered too low exposes nothing.
 ## Blob frame validation and salvage
 
 Before a blob file's digest is recorded, its live frame range is walked frame
-by frame. Recording a digest over damaged frames would *launder* the
+by frame. Recording a digest over damaged content would *launder* the
 corruption: every later integrity check passes (the file matches its recorded
-digest) while reads of the affected values still fail. A file whose frames do
-not all verify is therefore never blessed as-is. It is **salvaged**: the
+digest) while reads of the affected values still fail. Framing checks alone
+are not enough — the frame checksum is unkeyed and covers only the on-disk
+bytes — so the walk verifies four independent properties: every frame decodes
+and checksums cleanly with no resynchronization; every compressed payload
+actually decompresses (a re-stamped checksum over an undecodable payload
+frames cleanly, yet every live read fails); frame keys never regress under
+the tree comparator (individually-valid frames reordered on disk break the
+sorted-input contract the relocation merge scanner relies on); and, for an
+unpunched file, the metadata counters — item count, uncompressed byte total,
+key range — match the scanned frames (blob GC's dead-file arithmetic trusts
+those counters, so an understated total could reclaim a file whose uncounted
+frames are still referenced). A file that fails any of these is never blessed
+as-is. It is **salvaged**: the
 original moves to quarantine (preserved), every record whose checksum verifies
 — decompressed and re-compressed for a compressed file, proving the content
 round-trips — is re-emitted into a compacted replacement under the canonical

@@ -2330,18 +2330,20 @@ pub struct BlobRecordRelocation {
     pub on_disk_size: u32,
 }
 
-/// Decompresses one blob record's on-disk bytes for the salvage re-emit,
-/// mirroring the live reader's per-compression dispatch: the frame checksum
-/// covered the ON-DISK bytes, so a clean-checksum record must additionally
-/// prove its content round-trips before it is re-emitted (re-compressed under
-/// the same descriptor). `None` verifies the length equality the uncompressed
-/// format guarantees. Dictionary compression never reaches here — the salvage
-/// entry rejects it up front (no dictionary context on this standalone path).
-fn decompress_blob_value(
+/// Decompresses one blob record's on-disk bytes, mirroring the live reader's
+/// per-compression dispatch: the frame checksum covered the ON-DISK bytes, so
+/// a clean-checksum record must additionally prove its content round-trips —
+/// the salvage re-emit and repair's frame validation both gate on this.
+/// `None` verifies the length equality the uncompressed format guarantees.
+/// Dictionary compression decodes only when the caller supplies the matching
+/// dictionary (repair has the tree's config); the standalone salvage entry
+/// passes none and rejects dictionary sources up front.
+pub(crate) fn decompress_blob_value<'a>(
     compression: crate::CompressionType,
-    on_disk: &[u8],
+    on_disk: &'a [u8],
     real_len: usize,
-) -> crate::Result<alloc::borrow::Cow<'_, [u8]>> {
+    #[cfg(zstd_any)] zstd_dictionary: Option<&crate::compression::ZstdDictionary>,
+) -> crate::Result<alloc::borrow::Cow<'a, [u8]>> {
     match compression {
         crate::CompressionType::None => {
             if on_disk.len() != real_len {
@@ -2370,9 +2372,27 @@ fn decompress_blob_value(
             Ok(alloc::borrow::Cow::Owned(decompressed))
         }
         #[cfg(zstd_any)]
-        crate::CompressionType::ZstdDict { .. } => Err(crate::Error::FeatureUnsupported(
-            "salvage of a dictionary-compressed blob file",
-        )),
+        crate::CompressionType::ZstdDict { dict_id, .. } => {
+            use crate::compression::CompressionProvider as _;
+            let Some(dict) = zstd_dictionary else {
+                return Err(crate::Error::FeatureUnsupported(
+                    "salvage of a dictionary-compressed blob file",
+                ));
+            };
+            if dict.id() != dict_id {
+                return Err(crate::Error::ZstdDictMismatch {
+                    expected: dict_id,
+                    got: Some(dict.id()),
+                });
+            }
+            let decompressed =
+                crate::compression::ZstdBackend::decompress_with_dict(on_disk, dict, real_len)
+                    .map_err(|_| crate::Error::Decompress(compression))?;
+            if decompressed.len() != real_len {
+                return Err(crate::Error::Decompress(compression));
+            }
+            Ok(alloc::borrow::Cow::Owned(decompressed))
+        }
     }
 }
 
@@ -2382,7 +2402,7 @@ fn decompress_blob_value(
 /// the tree's `comparator`, not raw bytes: a KV-separated tree may be configured
 /// with a reverse or otherwise non-lexicographic comparator, and a valid blob
 /// file from such a tree must not be judged as regressing.
-fn blob_key_regresses(
+pub(crate) fn blob_key_regresses(
     comparator: &crate::comparator::SharedComparator,
     prev: Option<&(crate::UserKey, crate::SeqNo)>,
     entry: &crate::vlog::blob_file::scanner::ScanEntry,
@@ -2607,6 +2627,8 @@ pub fn salvage_blob_file(
                         compression,
                         &entry.value,
                         entry.uncompressed_len as usize,
+                        #[cfg(zstd_any)]
+                        None,
                     ) {
                         Ok(value) => value,
                         Err(e) => {

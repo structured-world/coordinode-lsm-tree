@@ -5689,6 +5689,226 @@ fn is_corruption_aborts_the_repair_on_a_transient_io() {
 /// The second live frame's value is ALL ZEROS: the probe must anchor on frame
 /// structure, never on zero runs alone, so a zero-filled payload inside the
 /// live suffix cannot move the frontier.
+fn write_three_frame_blob(
+    memfs: &std::sync::Arc<crate::fs::MemFs>,
+    path: &std::path::Path,
+) -> crate::Result<()> {
+    let fs_dyn: std::sync::Arc<dyn crate::fs::Fs> = memfs.clone();
+    let mut w = crate::vlog::blob_file::writer::Writer::new(path, 0, 0, &*fs_dyn)?;
+    w.write(b"a", 1, &[b'x'; 300])?;
+    w.write(b"b", 2, &[b'y'; 300])?;
+    w.write(b"c", 3, &[b'z'; 300])?;
+    w.finish()?;
+    Ok(())
+}
+
+fn blob_validation_config(memfs: std::sync::Arc<crate::fs::MemFs>) -> crate::Config {
+    crate::Config::new(
+        std::path::PathBuf::from("/db"),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+}
+
+/// Individually checksum-valid blob frames REORDERED on disk must fail frame
+/// validation: every blob reader and the relocation merge scanner rely on the
+/// sorted-by-internal-key contract, so a blessed out-of-order file corrupts a
+/// later relocation's pointer association. Same regression rule the blob
+/// salvage walk applies.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn blob_frame_validation_rejects_reordered_frames() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    memfs.create_dir_all(&root)?;
+    let path = root.join("0");
+    write_three_frame_blob(&memfs, &path)?;
+
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let entries: Vec<_> = crate::vlog::BlobFileScanner::new(&path, &*fs_dyn, 0)?
+        .collect::<crate::Result<Vec<_>>>()?;
+    let (a, b) = (
+        entries.first().expect("frame a"),
+        entries.get(1).expect("frame b"),
+    );
+    assert_eq!(
+        a.frame_end - a.offset,
+        b.frame_end - b.offset,
+        "equal-length frames swap cleanly",
+    );
+    // Swap the first two frames byte-for-byte: each frame's checksum is
+    // self-contained, so both stay individually valid — only the order breaks.
+    let frame = |e: &crate::vlog::blob_file::scanner::ScanEntry| -> crate::Result<Vec<u8>> {
+        Ok(crate::file::read_exact(
+            &*memfs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?,
+            e.offset,
+            usize::try_from(e.frame_end - e.offset).expect("frame fits usize"),
+        )?
+        .to_vec())
+    };
+    let (bytes_a, bytes_b) = (frame(a)?, frame(b)?);
+    {
+        let mut f = memfs.open(
+            &path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        f.seek(SeekFrom::Start(a.offset))?;
+        f.write_all(&bytes_b)?;
+        f.write_all(&bytes_a)?;
+    }
+
+    let config = blob_validation_config(memfs);
+    assert!(
+        !super::validate_blob_frames(&config, &path, 0, 0)?,
+        "reordered (individually valid) frames must fail validation",
+    );
+    Ok(())
+}
+
+/// A compressed frame whose checksum was RE-STAMPED over an undecodable
+/// payload frames cleanly (the checksum covers only the on-disk bytes), yet
+/// every live read of the value fails. Frame validation must decompress each
+/// payload before accepting the file — otherwise the rebuilt manifest
+/// launders exactly the corruption its digest is supposed to expose.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn blob_frame_validation_rejects_a_restamped_compressed_payload() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    memfs.create_dir_all(&root)?;
+    let path = root.join("0");
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    {
+        let mut w = crate::vlog::blob_file::writer::Writer::new(&path, 0, 0, &*fs_dyn)?
+            .use_compression(crate::CompressionType::Lz4);
+        w.write(b"a", 1, b"compressible compressible compressible")?;
+        w.finish()?;
+    }
+
+    // Overwrite the compressed payload with same-length garbage and RE-STAMP
+    // the frame checksum (xxh3_128 over key + value + header_crc bytes), so
+    // the frame verifies while the payload no longer decompresses.
+    let entry = crate::vlog::BlobFileScanner::new(&path, &*fs_dyn, 0)?
+        .next()
+        .expect("one frame")?;
+    let header_len = u64::try_from(crate::vlog::blob_file::writer::BLOB_HEADER_LEN).expect("small");
+    let value_start = entry.offset + header_len + 1; // 1-byte key
+    let value_len = usize::try_from(entry.frame_end - value_start).expect("fits");
+    let crc_bytes = crate::file::read_exact(
+        &*memfs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?,
+        entry.offset + 38, // header_crc sits last in the 42-byte header
+        4,
+    )?
+    .to_vec();
+    let garbage = vec![0xA5u8; value_len];
+    let restamped = {
+        let mut hasher = xxhash_rust::xxh3::Xxh3::default();
+        hasher.update(b"a");
+        hasher.update(&garbage);
+        hasher.update(&crc_bytes);
+        hasher.digest128()
+    };
+    {
+        let mut f = memfs.open(
+            &path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        f.seek(SeekFrom::Start(entry.offset + 4))?;
+        f.write_all(&restamped.to_le_bytes())?;
+        f.seek(SeekFrom::Start(value_start))?;
+        f.write_all(&garbage)?;
+    }
+    // The scanner (framing + raw checksum only) must accept the tampered file:
+    // the whole point is that framing checks cannot see this shape.
+    assert!(
+        crate::vlog::BlobFileScanner::new(&path, &*fs_dyn, 0)?
+            .next()
+            .expect("one frame")
+            .is_ok(),
+        "fixture: the restamped frame must still pass the raw scan",
+    );
+
+    let config = blob_validation_config(memfs);
+    assert!(
+        !super::validate_blob_frames(&config, &path, 0, 0)?,
+        "a checksum-restamped, undecodable compressed payload must fail validation",
+    );
+    Ok(())
+}
+
+/// A checksum-valid metadata block whose COUNTERS lie must fail frame
+/// validation: blob GC's dead-file arithmetic trusts the recorded
+/// uncompressed byte total, so an understated value lets `is_dead` reclaim a
+/// file whose uncounted frames are still referenced. The scanned frames are
+/// the ground truth; the metadata must agree with them.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn blob_frame_validation_rejects_lying_metadata_counters() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    memfs.create_dir_all(&root)?;
+    let victim = root.join("0");
+    let donor = root.join("donor");
+
+    // Same id, same key lengths, all-equal metadata field WIDTHS — but the
+    // donor holds fewer frames, so its (block-checksum-valid) metadata
+    // understates the victim's counters once transplanted.
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    write_three_frame_blob(&memfs, &victim)?;
+    {
+        let mut w = crate::vlog::blob_file::writer::Writer::new(&donor, 0, 0, &*fs_dyn)?;
+        w.write(b"a", 1, &[b'x'; 300])?;
+        w.write(b"c", 3, &[b'z'; 300])?;
+        w.finish()?;
+    }
+    let section = |path: &std::path::Path| -> crate::Result<(u64, u64)> {
+        let mut f = memfs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut f)?;
+        let meta = reader.toc().section(b"meta").expect("meta section");
+        Ok((meta.pos(), meta.len()))
+    };
+    let (victim_pos, victim_len) = section(&victim)?;
+    let (donor_pos, donor_len) = section(&donor)?;
+    assert_eq!(
+        victim_len, donor_len,
+        "equal-width metadata transplants cleanly"
+    );
+    let donor_meta = crate::file::read_exact(
+        &*memfs.open(&donor, &crate::fs::FsOpenOptions::new().read(true))?,
+        donor_pos,
+        usize::try_from(donor_len).expect("fits"),
+    )?
+    .to_vec();
+    {
+        let mut f = memfs.open(
+            &victim,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        f.seek(SeekFrom::Start(victim_pos))?;
+        f.write_all(&donor_meta)?;
+    }
+
+    let config = blob_validation_config(memfs);
+    assert!(
+        !super::validate_blob_frames(&config, &victim, 0, 0)?,
+        "metadata counters disagreeing with the scanned frames must fail validation",
+    );
+    Ok(())
+}
+
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
 fn blob_recovery_derives_the_frontier_of_a_punched_blob_file() -> crate::Result<()> {

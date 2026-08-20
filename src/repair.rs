@@ -1764,10 +1764,26 @@ fn set_aside_table(
 }
 
 /// Whether every frame in `path`'s live data range (`[live_data_start, end)`)
-/// decodes and checksums cleanly, with no resynchronization. Repair must not
-/// record a digest over damaged frames: the restamped digest would launder the
-/// corruption past every later integrity check while reads of the affected
-/// values still fail — such a file is salvaged instead.
+/// verifies. Repair must not record a digest over damaged content: the
+/// restamped digest would launder the corruption past every later integrity
+/// check while reads of the affected values still fail — such a file is
+/// salvaged instead. Framing checks alone are not enough, because the frame
+/// checksum is unkeyed and covers only the ON-DISK bytes; each acceptance
+/// criterion below closes a distinct restamp/reorder shape:
+///
+/// - every frame decodes and checksums cleanly, with no resynchronization;
+/// - a compressed frame's payload DECOMPRESSES (a re-stamped checksum over an
+///   undecodable compressed payload frames cleanly, yet every live read of
+///   the value fails);
+/// - frame keys never regress under the tree comparator (individually-valid
+///   frames reordered on disk break the sorted-input contract every blob
+///   reader and the relocation merge scanner rely on);
+/// - for an unpunched file, the metadata counters match the scanned frames
+///   (the meta block's item count, uncompressed byte total, and key range are
+///   what blob GC's dead-file arithmetic trusts — an understated total lets
+///   `is_dead` reclaim a file whose uncounted frames are still referenced).
+///   A punched file skips this: its metadata describes the whole original
+///   file, while the scan covers only the live suffix.
 ///
 /// # Errors
 ///
@@ -1775,24 +1791,94 @@ fn set_aside_table(
 /// failure is a conclusive `Ok(false)`.
 #[cfg(feature = "std")]
 fn validate_blob_frames(
-    fs: &Arc<dyn crate::fs::Fs>,
+    config: &Config,
     path: &std::path::Path,
     blob_id: crate::vlog::BlobFileId,
     live_data_start: u64,
 ) -> crate::Result<bool> {
+    let fs = &config.fs;
+    // Metadata + compression via a placeholder-checksum open (the handle is
+    // never read through; `recover_blob_file` only stores the checksum).
+    let handle =
+        crate::vlog::recover_blob_file(path, blob_id, crate::Checksum::from_raw(0), 0, fs)?;
+    let compression = handle.compression();
+    let comparator = &config.comparator;
+
     let scanner = if live_data_start > 0 {
         crate::vlog::BlobFileScanner::resume(path, &**fs, blob_id, live_data_start)?
     } else {
         crate::vlog::BlobFileScanner::new(path, &**fs, blob_id)?
     };
+    let mut count: u64 = 0;
+    let mut uncompressed_total: u64 = 0;
+    let mut first_key: Option<crate::UserKey> = None;
+    let mut prev: Option<(crate::UserKey, crate::SeqNo)> = None;
     for item in scanner {
         match item {
-            Ok(entry) if !entry.resynced => {}
+            Ok(entry) if !entry.resynced => {
+                if crate::salvage::blob_key_regresses(comparator, prev.as_ref(), &entry) {
+                    log::warn!(
+                        "blob file {blob_id} at {}: frame at {} regresses below the \
+                         previous frame's key — the frames were reordered",
+                        path.display(),
+                        entry.offset,
+                    );
+                    return Ok(false);
+                }
+                if crate::salvage::decompress_blob_value(
+                    compression,
+                    &entry.value,
+                    entry.uncompressed_len as usize,
+                    #[cfg(zstd_any)]
+                    config.zstd_dictionary.as_deref(),
+                )
+                .is_err()
+                {
+                    log::warn!(
+                        "blob file {blob_id} at {}: frame at {} does not decompress \
+                         despite a clean checksum",
+                        path.display(),
+                        entry.offset,
+                    );
+                    return Ok(false);
+                }
+                count += 1;
+                uncompressed_total += u64::from(entry.uncompressed_len);
+                if first_key.is_none() {
+                    first_key = Some(entry.key.clone());
+                }
+                prev = Some((entry.key.clone(), entry.seqno));
+            }
             Err(e) if is_transient_io(&e) => return Err(e),
             // A resynced frame has an unprovable boundary (damage upstream);
             // any other error is a structural or persistent frame failure.
             // Both are conclusive: this file's frames do not all verify.
             Ok(_) | Err(_) => return Ok(false),
+        }
+    }
+
+    if live_data_start == 0 {
+        let meta = handle.meta();
+        let range_matches = match (&first_key, &prev) {
+            (Some(first), Some((last, _))) => {
+                meta.key_range.min().as_ref() == first.as_ref()
+                    && meta.key_range.max().as_ref() == last.as_ref()
+            }
+            _ => count == 0,
+        };
+        if meta.item_count != count
+            || meta.total_uncompressed_bytes != uncompressed_total
+            || !range_matches
+        {
+            log::warn!(
+                "blob file {blob_id} at {}: metadata disagrees with the scanned frames \
+                 (meta: {} items / {} uncompressed bytes; scanned: {count} / \
+                 {uncompressed_total})",
+                path.display(),
+                meta.item_count,
+                meta.total_uncompressed_bytes,
+            );
+            return Ok(false);
         }
     }
     Ok(true)
@@ -2019,7 +2105,7 @@ fn recover_blob_files(
         // canonical name and bless it as an ordinary intact blob (its offset
         // remap lives only in this invocation, so the referencing SSTs would
         // keep their old, now-wrong offsets).
-        let frames_valid = validate_blob_frames(&config.fs, &blob_path, blob_id, frontier)?;
+        let frames_valid = validate_blob_frames(config, &blob_path, blob_id, frontier)?;
         if !frames_valid {
             let temp = blobs_folder.join(format!("{blob_id}.salvage-tmp"));
             let _ = config.fs.remove_file(&temp);

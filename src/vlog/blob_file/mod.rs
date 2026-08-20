@@ -412,6 +412,12 @@ impl BlobFile {
         self.0.meta.compression
     }
 
+    /// The file's decoded metadata block (counters, key range, compression).
+    #[must_use]
+    pub(crate) fn meta(&self) -> &Metadata {
+        &self.0.meta
+    }
+
     /// Returns the blob file path.
     #[must_use]
     pub fn path(&self) -> &Path {
