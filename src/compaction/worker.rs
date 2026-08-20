@@ -889,15 +889,18 @@ fn run_tight_space_compaction(
         .hide(payload.table_ids.iter().copied());
 
     let dst_lvl: usize = payload.canonical_level.into();
-    // Tight-space slice merges run WITHOUT bottommost GC (tombstone drop, seqno
-    // zeroing, range-tombstone application) even when the destination IS the last
-    // level. A slice restricts a surviving input and hides its consumed prefix; if a
-    // fully-consumed sibling carried the tombstone for a key that also lives in that
-    // prefix, last-level GC would drop the tombstone from the output. A crash window
-    // that leaves the survivor unrestricted (sidecar not yet written, prefix not yet
-    // punched) would then let manifest repair re-expose the deleted rows. Retaining
-    // every record makes the slice output a SUPERSET that shadows any surviving
-    // prefix in every crash window; a later normal last-level compaction reclaims
+    // Tight-space slice merges apply NO removal semantics: no bottommost GC
+    // (tombstone drop, seqno zeroing, range-tombstone application) even when the
+    // destination IS the last level, and no user compaction filter (passed as
+    // `false` to each slice's sub-compaction below). A slice restricts a surviving
+    // input and hides its consumed prefix; if a fully-consumed sibling carried the
+    // tombstone for a key that also lives in that prefix, last-level GC would drop
+    // the tombstone from the output — and a filter verdict would drop a record
+    // that survives nowhere else. A crash window that leaves the survivor
+    // unrestricted (sidecar not yet written, prefix not yet punched) would then
+    // let manifest repair re-expose the removed rows. Retaining every record makes
+    // the slice output a SUPERSET that shadows any surviving prefix in every crash
+    // window; a later normal last-level compaction reclaims
     // the deferred GC. Space is still reclaimed here via the hole punch, which is
     // what tight-space is for.
     let bottommost_gc = false;
@@ -955,6 +958,8 @@ fn run_tight_space_compaction(
                 (lower.clone(), Bound::Excluded(boundary.clone())),
                 dst_lvl,
                 bottommost_gc,
+                // Slices apply no removal semantics; see the parameter docs.
+                false,
                 &blobs_folder,
                 reloc,
             )?;
@@ -1156,10 +1161,13 @@ fn run_tight_space_compaction(
             // A sidecar write that fails HERE is not fatal: the restriction is already
             // durable in the manifest. Log it and leave that input UNPUNCHED, so a
             // later manifest-loss repair sees no-sidecar + unpunched and keeps the
-            // whole input (the committed output shadows the redundant prefix, its own
-            // tombstones intact, so nothing resurrects). Punching an input whose
-            // sidecar did not land would instead force repair to derive a conservative
-            // bound and drop up to one live block — so never punch without the sidecar.
+            // whole input. That is safe ONLY because the slice merge applies no
+            // removal semantics (no bottommost GC, no compaction filter — see the
+            // superset invariant above), so the committed output shadows every row
+            // of the redundant prefix and nothing resurrects. Punching an input
+            // whose sidecar did not land would instead force repair to derive a
+            // conservative bound and drop up to one live block — so never punch
+            // without the sidecar.
             for view in &current_views {
                 if removed_ids.contains(&view.id()) {
                     view.mark_as_deleted();
@@ -1249,6 +1257,8 @@ fn run_tight_space_compaction(
             (lower.clone(), Bound::Unbounded),
             dst_lvl,
             bottommost_gc,
+            // Slices apply no removal semantics; see the parameter docs.
+            false,
             &blobs_folder,
             tail_reloc,
         )?;
@@ -1317,6 +1327,15 @@ fn run_subcompaction(
     bounds: (core::ops::Bound<UserKey>, core::ops::Bound<UserKey>),
     dst_lvl: usize,
     is_last_level: bool,
+    // Whether the user compaction filter runs in this merge. `false` on
+    // tight-space slices, which apply NO removal semantics (bottommost GC is
+    // deferred the same way): a slice's output must be a SUPERSET that shadows
+    // any surviving input prefix in every crash window — a post-commit sidecar
+    // write failure deliberately leaves the input unpunched, and a
+    // manifest-loss repair then republishes that prefix whole, so a record the
+    // filter removed here would survive nowhere else and resurrect. The
+    // filtering is deferred, not lost: the next normal compaction applies it.
+    apply_compaction_filter: bool,
     blobs_folder: &std::path::Path,
     // When `Some` (tight-space blob defrag only), this sub-compaction relocates
     // the live entries of `stale_files` into a fresh compact blob file, resuming
@@ -1380,11 +1399,14 @@ fn run_subcompaction(
     }
 
     let filter_ctx = Context { is_last_level };
-    let mut compaction_filter = opts
-        .config
-        .compaction_filter_factory
-        .as_ref()
-        .map(|f| f.make_filter(&filter_ctx));
+    let mut compaction_filter = if apply_compaction_filter {
+        opts.config
+            .compaction_filter_factory
+            .as_ref()
+            .map(|f| f.make_filter(&filter_ctx))
+    } else {
+        None
+    };
 
     // KV separation (no relocation on this path): track fragmentation from
     // dropped/GC'd entries so the merged install updates blob GC stats.
@@ -2016,6 +2038,7 @@ fn merge_tables(
                                 range,
                                 dst_lvl,
                                 is_last_level,
+                                true,
                                 &blobs,
                                 // The parallel path never relocates blobs; tight
                                 // blob defrag is the serial slice loop's domain.
@@ -2062,6 +2085,7 @@ fn merge_tables(
                                 range,
                                 dst_lvl,
                                 is_last_level,
+                                true,
                                 &blobs_folder,
                                 None,
                             )

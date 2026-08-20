@@ -636,6 +636,200 @@ fn tight_space_sidecar_write_fault_is_nonfatal_and_recovers() -> crate::Result<(
     Ok(())
 }
 
+/// A tight-space slice must apply NO removal semantics: its output must be a
+/// SUPERSET that shadows any surviving input prefix in every crash window (a
+/// sidecar write that fails post-commit deliberately leaves the input
+/// unpunched, and a manifest-loss repair then republishes that prefix whole).
+/// Bottommost GC is already deferred for this reason; the user compaction
+/// filter must be deferred the same way — a record the filter removed from the
+/// slice output survives nowhere else, so the crash window would resurrect it.
+/// The filtering is not lost, only deferred: the next normal compaction over
+/// the output applies it.
+#[test]
+fn tight_space_slice_defers_the_compaction_filter() -> crate::Result<()> {
+    use crate::compaction::filter::{
+        CompactionFilter, Context as FilterContext, Factory, ItemAccessor, Verdict,
+    };
+
+    let victim = tight_space_key(100);
+
+    struct DropVictim(Vec<u8>);
+    impl CompactionFilter for DropVictim {
+        fn filter_item(
+            &mut self,
+            item: ItemAccessor<'_>,
+            _ctx: &FilterContext,
+        ) -> crate::Result<Verdict> {
+            if item.key().as_ref() == self.0.as_slice() {
+                Ok(Verdict::Destroy)
+            } else {
+                Ok(Verdict::Keep)
+            }
+        }
+    }
+    struct DropVictimFactory(Vec<u8>);
+    impl Factory for DropVictimFactory {
+        fn name(&self) -> &'static str {
+            "drop-victim"
+        }
+        fn make_filter(&self, _ctx: &FilterContext) -> Box<dyn CompactionFilter> {
+            Box::new(DropVictim(self.0.clone()))
+        }
+    }
+
+    let dir = tempfile::tempdir()?;
+    let capfs = capfs::CapacityFs::new();
+    let shared: Arc<dyn crate::fs::Fs> = Arc::new(capfs.clone());
+    let config = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_compaction_filter_factory(Some(Arc::new(DropVictimFactory(
+        victim.clone().into_bytes(),
+    ))))
+    .with_shared_fs(Arc::clone(&shared));
+    let tree = match config.open()? {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    for i in 0..TIGHT_SPACE_KEYS {
+        tree.insert(tight_space_key(i).as_bytes(), vec![0xCDu8; 64], i);
+    }
+    tree.flush_active_memtable(0)?;
+    let used = tree.storage_stats()?.used_bytes;
+
+    capfs.set_available_space(used / 4);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = true;
+    })?;
+    let result = tree.major_compact(64 * 1024 * 1024, 0)?;
+    assert_eq!(
+        result.action,
+        crate::compaction::CompactionAction::Merged,
+        "tight-space must have engaged and merged, got {result:?}",
+    );
+
+    assert!(
+        tree.get(victim.as_bytes(), crate::MAX_SEQNO)?.is_some(),
+        "the tight-space slice must DEFER the compaction filter (its output \
+         must be a superset shadowing any surviving input prefix); the filter \
+         applies on the next normal compaction instead",
+    );
+    Ok(())
+}
+
+/// A last-level tight-space slice defers bottommost GC (tombstone drop, RT
+/// application, seqno zeroing), so its output is a SUPERSET of every input's
+/// consumed prefix. Pins the resurrection-safety consequence end to end: a
+/// post-commit sidecar write failure leaves an input unpunched with no
+/// sidecar, a manifest-loss repair then republishes that input WHOLE — and a
+/// key whose tombstone lived in a fully-consumed (deleted) sibling input must
+/// still read as deleted, because the deferred-GC output retains the
+/// tombstone and shadows the resurrected prefix.
+#[test]
+fn tight_space_sidecar_fault_must_not_resurrect_evicted_deletes() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let capfs = capfs::CapacityFs::new();
+    let fault = FaultFs::new(capfs.clone());
+    let injector = fault.injector();
+    let shared: Arc<dyn crate::fs::Fs> = Arc::new(fault);
+
+    let config = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_shared_fs(Arc::clone(&shared));
+    let tree = match config.open()? {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+
+    // One big table holding every key, then a tiny sibling holding ONLY the
+    // tombstone of an early key: the slice fully consumes the sibling (its
+    // sole key sits below the first boundary, so the file is deleted) while
+    // the big input becomes a restricted survivor.
+    let victim = tight_space_key(100);
+    for i in 0..TIGHT_SPACE_KEYS {
+        tree.insert(tight_space_key(i).as_bytes(), vec![0xCDu8; 64], i);
+    }
+    tree.flush_active_memtable(0)?;
+    tree.remove(victim.as_bytes(), TIGHT_SPACE_KEYS + 1);
+    tree.flush_active_memtable(0)?;
+    let used = tree.storage_stats()?.used_bytes;
+
+    // Tight space + every sidecar write faulted, exactly like the non-fatal
+    // sidecar-fault test above — but here the last-level merge EVICTS the
+    // tombstone, so the unpunched-prefix fallback is not available.
+    capfs.set_available_space(used / 4);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = true;
+    })?;
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other)).on_path("restrict-bound"),
+    );
+    let result = tree.major_compact(64 * 1024 * 1024, TIGHT_SPACE_KEYS + 2)?;
+    assert_eq!(
+        result.action,
+        crate::compaction::CompactionAction::Merged,
+        "tight-space must have engaged and merged, got {result:?}",
+    );
+    injector.clear();
+
+    // The delete must hold on the live tree.
+    assert_eq!(
+        tree.get(victim.as_bytes(), crate::MAX_SEQNO)?,
+        None,
+        "the tombstoned key is gone on the live tree",
+    );
+
+    // Lose the manifest, repair, reopen: the deleted key must STAY deleted.
+    drop(tree);
+    for e in shared.read_dir(dir.path())? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            shared.remove_file(&e.path)?;
+        }
+    }
+    Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::clone(&shared))
+    .repair()?;
+    let reopened = match Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::clone(&shared))
+    .open()?
+    {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    assert_eq!(
+        reopened.get(victim.as_bytes(), crate::MAX_SEQNO)?,
+        None,
+        "a tombstone evicted by the last-level slice must never resurrect \
+         through an unpunched, sidecarless input after a manifest-loss repair",
+    );
+    Ok(())
+}
+
 /// The `.restrict-bound` sidecar is written STRICTLY AFTER the version install
 /// commits, so an install FAILURE leaves NO sidecar (nothing to retract) and the
 /// slice's finalized outputs must be rolled back at once (marked deleted, so their

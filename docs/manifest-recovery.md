@@ -203,10 +203,12 @@ only prefix the installed output already covers; and a slice that committed but
 crashed before writing its sidecar leaves an unpunched input with no sidecar,
 which recovers unrestricted while the committed output shadows the redundant
 prefix by sequence number. That shadowing is total because a tight-space slice
-output is a **superset** of its consumed inputs — the slice merge runs without
-bottommost GC (no tombstone drop, no seqno zeroing), so the output retains every
-record, including a tombstone whose deleted key also lived in this survivor's
-prefix but whose tombstone-bearing sibling was fully consumed. Ordinary last-level
+output is a **superset** of its consumed inputs — the slice merge applies no
+removal semantics at all: no bottommost GC (no tombstone drop, no seqno
+zeroing) and no user compaction filter (its verdicts are deferred to the next
+normal compaction), so the output retains every record, including a tombstone
+whose deleted key also lived in this survivor's prefix but whose
+tombstone-bearing sibling was fully consumed. Ordinary last-level
 GC would have dropped that tombstone and re-exposed the key; retaining it keeps
 the unrestricted survivor's prefix fully shadowed, so nothing resurrects. Space is
 reclaimed by the hole punch, and a later normal compaction does the deferred GC.
