@@ -1207,6 +1207,44 @@ fn heal_skips_blocks_below_the_restriction_bound() -> crate::Result<()> {
     Ok(())
 }
 
+/// A tight-space restricted reopen produces a DISTINCT `Inner`, so every
+/// tree-installed shared gate must be carried forward — including the ECC
+/// heal-hint sink. Without it, a correctable read from the restricted view
+/// can no longer queue the table for a healing recompaction: persistent
+/// bitrot keeps being corrected in memory on every read but is never
+/// scheduled for a durable rewrite.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn restricted_reopen_carries_the_heal_hint_sink_forward() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (_sst_path, _block) = write_ecc_sst(dir.path());
+
+    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(crate::fs::StdFs));
+    let table = {
+        let binding = tree.version_history.read().latest_version();
+        binding
+            .version
+            .iter_tables()
+            .next()
+            .expect("flush produced one table")
+            .clone()
+    };
+    // The sink the owning tree installed (install one if the config left the
+    // slot empty — the transfer contract is the same either way).
+    table.install_heal_hints(crate::heal_hints::HealHints::new_shared(true));
+    let installed = table.heal_hints_for_test().expect("the sink is installed");
+
+    let restricted = table.reopen_restricted(crate::UserKey::from(b"key-001000".as_slice()))?;
+    let carried = restricted.heal_hints_for_test();
+    assert!(
+        carried.is_some_and(|c| std::sync::Arc::ptr_eq(&c, &installed)),
+        "the restricted reopen must carry the SAME heal-hint sink forward, or \
+         correctable reads from the restricted view stop queueing the table \
+         for a durable healing recompaction",
+    );
+    Ok(())
+}
+
 /// A heal whose manifest-digest refresh loses the compaction-state `try_lock`
 /// (a concurrent compaction is mid-install; blocking would invert the
 /// heal-lock / compaction-state order and deadlock) must NOT report a clean

@@ -7510,6 +7510,13 @@ impl Table {
         }
         #[cfg(all(feature = "std", feature = "page_ecc"))]
         reopened.install_heal_lock(self.heal_lock_arc());
+        // The heal-hint sink too: a correctable read from the restricted view
+        // must still queue this table for a healing recompaction, or
+        // persistent bitrot keeps being corrected in memory on every read but
+        // is never scheduled for a durable rewrite.
+        if let Some(hints) = self.0.heal_hints.get() {
+            reopened.install_heal_hints(Arc::clone(hints));
+        }
         Ok(reopened.with_restriction(lower))
     }
 
@@ -7648,6 +7655,13 @@ impl Table {
     /// healing recompaction.
     pub(crate) fn install_heal_hints(&self, hints: Arc<crate::heal_hints::HealHints>) {
         let _ = self.0.heal_hints.set(Box::new(hints));
+    }
+
+    /// The installed heal-hint sink, exposed so tests outside this module can
+    /// assert it is carried across same-id reopens.
+    #[cfg(test)]
+    pub(crate) fn heal_hints_for_test(&self) -> Option<Arc<crate::heal_hints::HealHints>> {
+        self.0.heal_hints.get().cloned()
     }
 
     #[must_use]
