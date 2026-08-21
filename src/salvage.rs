@@ -1010,6 +1010,9 @@ fn discard_partial(fs: &alloc::sync::Arc<dyn crate::fs::Fs>, dest: &std::path::P
 /// syncable directory: fsyncing it fails and the caller would discard the
 /// recovered file it had just written. Map the empty (and absent) parent to the
 /// current directory so a bare relative destination still gets its entry synced.
+/// Every [`Fs`](crate::fs::Fs) backend accepts `.` in `sync_directory` — the
+/// in-memory backend recognizes it as its implicit root — so this spelling is
+/// safe regardless of which backend performs the salvage.
 fn entry_directory(path: &std::path::Path) -> &std::path::Path {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,

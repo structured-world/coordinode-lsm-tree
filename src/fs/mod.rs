@@ -785,6 +785,12 @@ pub trait Fs: Send + Sync + 'static {
     /// On platforms that do not support directory fsync (e.g. Windows),
     /// this may be a no-op.
     ///
+    /// Implementations must accept `.` (the current / implicit root
+    /// directory): callers syncing the new entry of a bare relative file pass
+    /// it, because an empty [`Path::parent`] is not a syncable name. A
+    /// backend that admits a file creation must be able to sync the entry it
+    /// created.
+    ///
     /// # Errors
     ///
     /// Returns an I/O error if the sync operation fails.
