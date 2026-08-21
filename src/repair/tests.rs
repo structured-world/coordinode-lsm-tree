@@ -5711,6 +5711,64 @@ fn blob_validation_config(memfs: std::sync::Arc<crate::fs::MemFs>) -> crate::Con
     .with_shared_fs(memfs)
 }
 
+/// A blob file whose stored metadata id disagrees with its FILE NAME is a
+/// renamed or swapped file, not damaged content: publishing it under the
+/// filename's id would resolve existing SST handles into foreign frames
+/// (failed reads, or another generation's value when the key matches), and
+/// salvaging it would re-emit the foreign records under that id — laundering
+/// the swap. Repair must set such a file aside.
+#[test]
+fn blob_recovery_quarantines_a_file_whose_metadata_id_disagrees() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    memfs.create_dir_all(&blobs)?;
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    for id in 0u64..2 {
+        let path = blobs.join(id.to_string());
+        let mut w = crate::vlog::blob_file::writer::Writer::new(&path, id, 0, &*fs_dyn)?;
+        w.write(b"a", 1, &[b'x'; 200])?;
+        w.finish()?;
+    }
+    // Swap the two files' NAMES: each file's content (and stored metadata id)
+    // now belongs to the other name.
+    let (zero, one, tmp) = (blobs.join("0"), blobs.join("1"), blobs.join("swap-tmp"));
+    memfs.rename(&zero, &tmp)?;
+    memfs.rename(&one, &zero)?;
+    memfs.rename(&tmp, &one)?;
+
+    let config = blob_validation_config(Arc::clone(&memfs));
+    let recovery = super::recover_blob_files(&config)?;
+    assert!(
+        recovery.files.is_empty(),
+        "no swapped file may be published under its filename's id",
+    );
+    assert_eq!(
+        recovery.unreadable.len(),
+        2,
+        "both swapped files are set aside: {:?}",
+        recovery.unreadable,
+    );
+    assert!(
+        recovery
+            .unreadable
+            .iter()
+            .all(|(_, reason)| reason.contains("disagrees")),
+        "the reason names the id mismatch: {:?}",
+        recovery.unreadable,
+    );
+    let quarantine = root.join("repair-quarantine");
+    assert_eq!(
+        memfs.read_dir(&quarantine)?.len(),
+        2,
+        "the originals are preserved in quarantine, recoverable by an operator",
+    );
+    Ok(())
+}
+
 /// Individually checksum-valid blob frames REORDERED on disk must fail frame
 /// validation: every blob reader and the relocation merge scanner rely on the
 /// sorted-by-internal-key contract, so a blessed out-of-order file corrupts a
@@ -5924,8 +5982,8 @@ fn blob_recovery_derives_the_frontier_of_a_punched_blob_file() -> crate::Result<
     let whole_path = blobs.join("1");
 
     let fs_dyn: Arc<dyn Fs> = memfs.clone();
-    for path in [&punched_path, &whole_path] {
-        let mut w = crate::vlog::blob_file::writer::Writer::new(path, 0, 0, &*fs_dyn)?;
+    for (id, path) in [(0u64, &punched_path), (1u64, &whole_path)] {
+        let mut w = crate::vlog::blob_file::writer::Writer::new(path, id, 0, &*fs_dyn)?;
         w.write(b"a", 1, &[b'x'; 300])?;
         w.write(b"b", 2, &vec![0u8; 400])?; // zero payload in the live suffix
         w.write(b"c", 3, &[b'y'; 300])?;
@@ -5958,7 +6016,8 @@ fn blob_recovery_derives_the_frontier_of_a_punched_blob_file() -> crate::Result<
     )
     .with_shared_fs(memfs);
 
-    let (files, unreadable, _rewrites) = super::recover_blob_files(&config)?;
+    let recovery = super::recover_blob_files(&config)?;
+    let (files, unreadable) = (recovery.files, recovery.unreadable);
     assert!(
         unreadable.is_empty(),
         "both blob files recover: {unreadable:?}"
@@ -6407,6 +6466,25 @@ fn repair_salvages_a_frame_corrupt_blob_and_remaps_handles() -> crate::Result<()
         report.recovered, 1,
         "the referencing table survives, rewritten through the remap: {report:?}",
     );
+    // The salvaged replacement IS in the rebuilt manifest, so it must be
+    // reported as a salvage outcome — never in `unreadable_files`, whose
+    // contract is "left out of the manifest".
+    assert_eq!(
+        report.unreadable, 0,
+        "an installed salvaged blob is not an unreadable file: {report:?}",
+    );
+    assert_eq!(
+        report.blob_files_salvaged.len(),
+        1,
+        "the salvage outcome is reported in its own field: {report:?}",
+    );
+    assert!(
+        report
+            .blob_files_salvaged
+            .first()
+            .is_some_and(|(_, note)| note.contains("records salvaged")),
+        "the note describes what was recovered: {report:?}",
+    );
 
     // Reopen: every intact record reads its value; the lost record's key is
     // ABSENT (its entry was dropped), never a read error.
@@ -6599,7 +6677,8 @@ fn blob_recovery_quarantines_a_persistently_unreadable_blob_file() -> crate::Res
     )
     .with_shared_fs(memfs.clone());
 
-    let (files, unreadable, _rewrites) = super::recover_blob_files(&config)?;
+    let recovery = super::recover_blob_files(&config)?;
+    let (files, unreadable) = (recovery.files, recovery.unreadable);
     assert!(files.is_empty(), "nothing recoverable");
     assert_eq!(unreadable.len(), 1, "the bad blob is reported");
     assert!(
@@ -6646,7 +6725,8 @@ fn blob_recovery_quarantines_a_duplicate_blob_id() -> crate::Result<()> {
     )
     .with_shared_fs(memfs.clone());
 
-    let (files, unreadable, _rewrites) = super::recover_blob_files(&config)?;
+    let recovery = super::recover_blob_files(&config)?;
+    let (files, unreadable) = (recovery.files, recovery.unreadable);
     assert_eq!(files.len(), 1, "one blob file per id");
     assert_eq!(
         unreadable.len(),
@@ -6724,7 +6804,7 @@ fn blob_recovery_propagates_a_transient_checksum_failure() -> crate::Result<()> 
         result.is_err(),
         "a transient blob checksum failure must propagate for a retry, not be \
          recorded as unreadable: {:?}",
-        result.map(|(files, unreadable, _)| (files.len(), unreadable)),
+        result.map(|r| (r.files.len(), r.unreadable)),
     );
     Ok(())
 }

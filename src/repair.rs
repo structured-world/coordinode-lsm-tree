@@ -78,6 +78,14 @@ pub struct RepairReport {
     /// Path and human-readable error for each unreadable file.
     pub unreadable_files: Vec<(PathBuf, String)>,
 
+    /// Damaged blob files whose salvaged replacement IS installed in the
+    /// rebuilt manifest: the canonical (installed) path plus a note on what
+    /// was recovered and where the damaged original is preserved. Disjoint
+    /// from [`unreadable_files`](RepairReport::unreadable_files), which lists
+    /// only files LEFT OUT of the manifest. Empty for standard trees and for
+    /// repairs where no blob file needed salvage.
+    pub blob_files_salvaged: Vec<(PathBuf, String)>,
+
     /// Description of the level-assignment strategy used (constant for now;
     /// surfaced so the report is self-explanatory and forward-compatible).
     pub method: &'static str,
@@ -1925,13 +1933,22 @@ fn handle_below_blob_frontier(
     Ok(None)
 }
 
-fn recover_blob_files(
-    config: &Config,
-) -> crate::Result<(
-    Vec<crate::vlog::BlobFile>,
-    UnreadableFiles,
-    crate::HashMap<crate::vlog::BlobFileId, crate::salvage::BlobFileRewrite>,
-)> {
+/// What the blob directory scan recovered, and how, for the rebuilt manifest.
+#[cfg(feature = "std")]
+struct BlobRecovery {
+    /// Blob files to record in the manifest (whole, punched, or salvaged).
+    files: Vec<crate::vlog::BlobFile>,
+    /// Files LEFT OUT of the manifest, with the reason each was set aside.
+    unreadable: UnreadableFiles,
+    /// Handle rewrites for reshaped files (salvaged / punched frontiers).
+    rewrites: crate::HashMap<crate::vlog::BlobFileId, crate::salvage::BlobFileRewrite>,
+    /// Damaged files whose salvaged replacement IS installed: canonical path
+    /// plus a note (records recovered / lost, where the original is kept).
+    /// Disjoint from `unreadable` — these files made the manifest.
+    salvaged: Vec<(PathBuf, String)>,
+}
+
+fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
     let blobs_folder = config.path.join(crate::file::BLOBS_FOLDER);
     let mut blob_files: Vec<crate::vlog::BlobFile> = Vec::new();
     let mut unreadable: UnreadableFiles = Vec::new();
@@ -1941,11 +1958,17 @@ fn recover_blob_files(
     // on the common path.
     let mut rewrites: crate::HashMap<crate::vlog::BlobFileId, crate::salvage::BlobFileRewrite> =
         crate::HashMap::default();
+    let mut salvaged_notes: Vec<(PathBuf, String)> = Vec::new();
 
     // No `blobs/` folder = no blob files (a blob tree that never spilled a value
     // to the value log). Nothing to recover; the manifest records an empty list.
     if !config.fs.exists(&blobs_folder)? {
-        return Ok((blob_files, unreadable, rewrites));
+        return Ok(BlobRecovery {
+            files: blob_files,
+            unreadable,
+            rewrites,
+            salvaged: salvaged_notes,
+        });
     }
 
     // Collect and ORDER the candidates before recovering: `read_dir` order is
@@ -2092,6 +2115,48 @@ fn recover_blob_files(
             }
         };
 
+        // IDENTITY before content: the id under which this file will be
+        // published comes from its FILENAME, but the metadata records the id
+        // it was written as. A mismatch means a renamed or swapped file — not
+        // damaged content — and publishing it under the filename's id would
+        // resolve existing SST handles into foreign frames (a read fails on
+        // the key cross-check, or, when the foreign frame happens to hold the
+        // same key, silently serves another generation's value). Salvage is
+        // the WRONG remedy here (it would re-emit the foreign records under
+        // the filename's id, laundering the swap); set the file aside.
+        {
+            // Placeholder-checksum open (stored, never verified). Same
+            // transient/persistent split as every other per-file step: an
+            // unreadable meta section sets THIS file aside, never the repair.
+            let handle = match crate::vlog::recover_blob_file(
+                &blob_path,
+                blob_id,
+                crate::Checksum::from_raw(0),
+                0,
+                &config.fs,
+            ) {
+                Ok(handle) => handle,
+                Err(e) if is_transient_io(&e) => return Err(e),
+                Err(e) => {
+                    quarantine_unreadable(blob_path, &file_name, &e, &mut unreadable)?;
+                    continue;
+                }
+            };
+            let stored = handle.meta().id;
+            if stored != blob_id {
+                let e = crate::Error::InvalidHeader(
+                    "blob file's stored metadata id disagrees with its file name",
+                );
+                log::warn!(
+                    "blob file at {}: metadata records id {stored}, file name says \
+                     {blob_id} — a renamed or swapped file; setting it aside",
+                    blob_path.display(),
+                );
+                quarantine_unreadable(blob_path, &file_name, &e, &mut unreadable)?;
+                continue;
+            }
+        }
+
         // Validate the live frame range BEFORE recording a digest: hashing
         // damaged frames would restamp (launder) the corruption past every
         // later integrity check while reads of the affected values still
@@ -2203,7 +2268,10 @@ fn recover_blob_files(
                     report.offset_remap.iter().copied().collect(),
                 ),
             );
-            unreadable.push((
+            // The replacement IS installed in the rebuilt manifest, so this is
+            // a salvage outcome, not an unreadable file — `unreadable_files`
+            // lists only files LEFT OUT of the manifest.
+            salvaged_notes.push((
                 blob_path,
                 format!(
                     "{} of {} records salvaged into a compacted replacement \
@@ -2256,7 +2324,12 @@ fn recover_blob_files(
         }
     }
 
-    Ok((blob_files, unreadable, rewrites))
+    Ok(BlobRecovery {
+        files: blob_files,
+        unreadable,
+        rewrites,
+        salvaged: salvaged_notes,
+    })
 }
 
 impl Config {
@@ -3255,12 +3328,14 @@ fn repair_tree(
         crate::vlog::BlobFileId,
         crate::salvage::BlobFileRewrite,
     > = crate::HashMap::default();
+    let mut blob_files_salvaged: Vec<(PathBuf, String)> = Vec::new();
     let (tree_type, blob_file_list) = if config.kv_separation_opts.is_some() {
-        let (blob_files, blob_unreadable, rewrites) = recover_blob_files(config)?;
-        unreadable_files.extend(blob_unreadable);
-        blob_rewrites = rewrites;
+        let recovery = recover_blob_files(config)?;
+        unreadable_files.extend(recovery.unreadable);
+        blob_rewrites = recovery.rewrites;
+        blob_files_salvaged = recovery.salvaged;
         let map: crate::HashMap<crate::vlog::BlobFileId, crate::vlog::BlobFile> =
-            blob_files.into_iter().map(|bf| (bf.id(), bf)).collect();
+            recovery.files.into_iter().map(|bf| (bf.id(), bf)).collect();
         (TreeType::Blob, BlobFileList::new(map))
     } else {
         (
@@ -3540,6 +3615,7 @@ fn repair_tree(
         salvaged,
         unreadable: unreadable_files.len(),
         unreadable_files,
+        blob_files_salvaged,
         method: "all-to-L0 with sequence-number ordering",
         warnings,
     })
