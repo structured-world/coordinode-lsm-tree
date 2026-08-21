@@ -6044,6 +6044,77 @@ fn blob_frame_validation_rejects_understated_metadata_on_a_punched_file() -> cra
     Ok(())
 }
 
+/// The RANGE half of the punched-file lower-bound check, isolated from the
+/// counter half: the donor's metadata counts exactly as many items and bytes
+/// as the victim's live suffix, but its key range ends BELOW the suffix's
+/// last key — so only the containment requirement can reject the transplant.
+/// A key range that fails to contain the live suffix mislocates the file in
+/// every range-based pruning decision built on the rebuilt manifest.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn blob_frame_validation_rejects_a_range_not_containing_the_punched_suffix() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    memfs.create_dir_all(&root)?;
+    let victim = root.join("0");
+    let donor = root.join("donor");
+
+    // Two frames of the SAME sizes as the victim's live suffix (`b`, `c` at
+    // 300 bytes each), so item and byte totals match exactly — but the
+    // donor's max key `b` sits below the suffix's last key `c`.
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    write_three_frame_blob(&memfs, &victim)?;
+    {
+        let mut w = crate::vlog::blob_file::writer::Writer::new(&donor, 0, 0, &*fs_dyn)?;
+        w.write(b"a", 1, &[b'x'; 300])?;
+        w.write(b"b", 2, &[b'y'; 300])?;
+        w.finish()?;
+    }
+    let suffix_start = crate::vlog::BlobFileScanner::new(&victim, &*fs_dyn, 0)?
+        .next()
+        .expect("first frame")?
+        .frame_end;
+
+    let section = |path: &std::path::Path| -> crate::Result<(u64, u64)> {
+        let mut f = memfs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut f)?;
+        let meta = reader.toc().section(b"meta").expect("meta section");
+        Ok((meta.pos(), meta.len()))
+    };
+    let (victim_pos, victim_len) = section(&victim)?;
+    let (donor_pos, donor_len) = section(&donor)?;
+    assert_eq!(
+        victim_len, donor_len,
+        "equal-width metadata transplants cleanly"
+    );
+    let donor_meta = crate::file::read_exact(
+        &*memfs.open(&donor, &crate::fs::FsOpenOptions::new().read(true))?,
+        donor_pos,
+        usize::try_from(donor_len).expect("fits"),
+    )?
+    .to_vec();
+    {
+        let mut f = memfs.open(
+            &victim,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        f.seek(SeekFrom::Start(victim_pos))?;
+        f.write_all(&donor_meta)?;
+    }
+
+    let config = blob_validation_config(memfs);
+    assert!(
+        !super::validate_blob_frames(&config, &victim, 0, suffix_start)?,
+        "a key range not containing the scanned suffix must fail validation \
+         even when the item and byte totals satisfy the lower bounds",
+    );
+    Ok(())
+}
+
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
 fn blob_recovery_derives_the_frontier_of_a_punched_blob_file() -> crate::Result<()> {
