@@ -5967,6 +5967,83 @@ fn blob_frame_validation_rejects_lying_metadata_counters() -> crate::Result<()> 
     Ok(())
 }
 
+/// A PUNCHED blob file's metadata describes the whole original file while the
+/// scan covers only the live suffix, so exact-equality checks are impossible —
+/// but the subset relation still bounds the metadata from BELOW: its item and
+/// byte totals must be at least the suffix totals and its key range must
+/// contain the scanned suffix. Understated totals are what blob GC's dead-file
+/// arithmetic trusts, so blessing them lets `is_dead` reclaim a file whose
+/// uncounted frames are still referenced.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn blob_frame_validation_rejects_understated_metadata_on_a_punched_file() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    memfs.create_dir_all(&root)?;
+    let victim = root.join("0");
+    let donor = root.join("donor");
+
+    // The donor holds ONE frame, so its (block-checksum-valid) metadata
+    // understates even the victim's two-frame live SUFFIX once transplanted.
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    write_three_frame_blob(&memfs, &victim)?;
+    {
+        let mut w = crate::vlog::blob_file::writer::Writer::new(&donor, 0, 0, &*fs_dyn)?;
+        w.write(b"a", 1, &[b'x'; 300])?;
+        w.finish()?;
+    }
+    // Scanning resumes at the second frame — the shape a tight-space punch of
+    // the first frame leaves behind (no actual hole is needed here; the
+    // frontier alone selects the suffix).
+    let suffix_start = crate::vlog::BlobFileScanner::new(&victim, &*fs_dyn, 0)?
+        .next()
+        .expect("first frame")?
+        .frame_end;
+
+    let config = blob_validation_config(Arc::clone(&memfs));
+    assert!(
+        super::validate_blob_frames(&config, &victim, 0, suffix_start)?,
+        "fixture: the untampered punched file must pass validation",
+    );
+
+    let section = |path: &std::path::Path| -> crate::Result<(u64, u64)> {
+        let mut f = memfs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut f)?;
+        let meta = reader.toc().section(b"meta").expect("meta section");
+        Ok((meta.pos(), meta.len()))
+    };
+    let (victim_pos, victim_len) = section(&victim)?;
+    let (donor_pos, donor_len) = section(&donor)?;
+    assert_eq!(
+        victim_len, donor_len,
+        "equal-width metadata transplants cleanly"
+    );
+    let donor_meta = crate::file::read_exact(
+        &*memfs.open(&donor, &crate::fs::FsOpenOptions::new().read(true))?,
+        donor_pos,
+        usize::try_from(donor_len).expect("fits"),
+    )?
+    .to_vec();
+    {
+        let mut f = memfs.open(
+            &victim,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        f.seek(SeekFrom::Start(victim_pos))?;
+        f.write_all(&donor_meta)?;
+    }
+
+    assert!(
+        !super::validate_blob_frames(&config, &victim, 0, suffix_start)?,
+        "metadata understating the live suffix must fail validation on a punched file",
+    );
+    Ok(())
+}
+
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
 fn blob_recovery_derives_the_frontier_of_a_punched_blob_file() -> crate::Result<()> {

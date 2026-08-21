@@ -1790,8 +1790,10 @@ fn set_aside_table(
 ///   (the meta block's item count, uncompressed byte total, and key range are
 ///   what blob GC's dead-file arithmetic trusts — an understated total lets
 ///   `is_dead` reclaim a file whose uncounted frames are still referenced).
-///   A punched file skips this: its metadata describes the whole original
-///   file, while the scan covers only the live suffix.
+///   A punched file's metadata describes the whole original file while the
+///   scan covers only the live suffix, so it is checked against the LOWER
+///   bounds the subset relation implies instead: totals at least the suffix
+///   totals, key range containing the scanned suffix.
 ///
 /// # Errors
 ///
@@ -1869,8 +1871,8 @@ fn validate_blob_frames(
         }
     }
 
+    let meta = handle.meta();
     if live_data_start == 0 {
-        let meta = handle.meta();
         let range_matches = match (&first_key, &prev) {
             (Some(first), Some((last, _))) => {
                 meta.key_range.min().as_ref() == first.as_ref()
@@ -1886,6 +1888,39 @@ fn validate_blob_frames(
             log::warn!(
                 "blob file {blob_id} at {}: metadata disagrees with the scanned frames \
                  (meta: {} items / {} uncompressed bytes; scanned: {count} / \
+                 {uncompressed_total})",
+                path.display(),
+                meta.item_count,
+                meta.total_uncompressed_bytes,
+            );
+            return Ok(false);
+        }
+    } else {
+        // A punched file's metadata describes the WHOLE original file while
+        // the scan covers only the live suffix — a subset — so exact equality
+        // is impossible. The subset relation still bounds the metadata from
+        // BELOW: totals must be at least the suffix totals and the key range
+        // must contain the scanned suffix. Blessing understated totals would
+        // let blob GC's dead-file arithmetic reclaim a file whose uncounted
+        // frames are still referenced.
+        let range_contains = match (&first_key, &prev) {
+            (Some(first), Some((last, _))) => {
+                comparator.compare(meta.key_range.min().as_ref(), first.as_ref())
+                    != core::cmp::Ordering::Greater
+                    && comparator.compare(last.as_ref(), meta.key_range.max().as_ref())
+                        != core::cmp::Ordering::Greater
+            }
+            // An empty suffix constrains nothing.
+            _ => true,
+        };
+        if meta.item_count < count
+            || meta.total_uncompressed_bytes < uncompressed_total
+            || meta.total_compressed_bytes < compressed_total
+            || !range_contains
+        {
+            log::warn!(
+                "blob file {blob_id} at {}: metadata understates the scanned live \
+                 suffix (meta: {} items / {} uncompressed bytes; suffix: {count} / \
                  {uncompressed_total})",
                 path.display(),
                 meta.item_count,
