@@ -997,6 +997,15 @@ impl Fs for MemFs {
     }
 
     fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        // The implicit root always exists: `ensure_parent_dir` accepts an
+        // empty or `/` parent when creating files, and callers syncing a bare
+        // relative file's new entry name that root `.` (an empty
+        // `Path::parent` is not a syncable name on any backend). Rejecting
+        // these spellings would fail the sync of an entry whose creation this
+        // backend just allowed.
+        if path.as_os_str().is_empty() || path == Path::new(".") || path == Path::new("/") {
+            return Ok(());
+        }
         // Durability is a no-op, but validate the path is an existing directory.
         let state = read_state(&self.state)?;
         if !state.dirs.contains(path) {

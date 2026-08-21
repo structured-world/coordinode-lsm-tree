@@ -7355,6 +7355,39 @@ fn salvage_blob_file_recovers_every_record_of_a_healthy_file() -> crate::Result<
     Ok(())
 }
 
+/// A bare relative destination (`recovered`, no parent component) must
+/// salvage cleanly on `MemFs` too: the backend accepts the empty parent as
+/// its implicit root at creation, so the post-publication entry sync (which
+/// names that root `.`) must not fail and drag the freshly written
+/// destination down with it.
+#[test]
+fn salvage_blob_file_accepts_a_bare_relative_destination_on_memfs() -> crate::Result<()> {
+    let fs: Arc<dyn Fs> = Arc::new(crate::fs::MemFs::new());
+    let source = std::path::Path::new("blob_source");
+    let dest = std::path::PathBuf::from("recovered");
+
+    let records: Vec<(&[u8], &[u8])> = vec![(b"k0", b"v0"), (b"k1", b"v1")];
+    build_blob(source, &fs, &records)?;
+
+    let report = salvage_blob_file(
+        source,
+        dest.clone(),
+        &fs,
+        0,
+        &default_comparator(),
+        0,
+        #[cfg(zstd_any)]
+        None,
+    )?;
+    assert!(report.is_complete(), "nothing to drop: {report:?}");
+    assert_eq!(report.records_salvaged, 2);
+    assert!(
+        fs.exists(&dest)?,
+        "the salvaged destination survives its entry sync",
+    );
+    Ok(())
+}
+
 /// A checksum-consistent frame whose key regresses below the previous salvaged
 /// record must be DROPPED, not re-emitted: `BlobWriter` requires records in
 /// key order, and a salvaged file that violates it corrupts its own key range
