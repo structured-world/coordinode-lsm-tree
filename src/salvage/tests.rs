@@ -7355,6 +7355,101 @@ fn salvage_blob_file_recovers_every_record_of_a_healthy_file() -> crate::Result<
     Ok(())
 }
 
+/// A backend WITHOUT `hard_link` (the trait's default `Unsupported` impl)
+/// whose `exists` probe races a concurrent creator: the probe reports the
+/// destination free, but a full file already sits there by publish time.
+/// The publish must still refuse to replace it — `rename` REPLACES an
+/// existing destination by contract, so a probe-then-rename fallback would
+/// silently overwrite the concurrently published file. The claim must be
+/// atomic (`create_new`), never a TOCTOU probe.
+///
+/// The wrapper models the race deterministically: `exists` always answers
+/// `false` (the probe's view), every other operation is the real backend.
+/// Divergent meta mirrors force the arbitration path, whose winner publishes
+/// through the temp-then-claim helper; `lz4`-gated because the divergence is
+/// forged via `compression#data` → Lz4.
+#[cfg(feature = "lz4")]
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn publish_refuses_to_replace_a_concurrently_created_destination_without_hard_links()
+-> crate::Result<()> {
+    use crate::fs::{Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions};
+    use crate::io;
+    use std::path::Path;
+
+    /// Delegates to [`StdFs`], but: `hard_link` stays the trait default
+    /// (`Unsupported`), and `exists` always reports `false` — the state the
+    /// probe saw before a concurrent creator published the destination.
+    #[derive(Debug)]
+    struct RacingProbeFs(StdFs);
+    impl Fs for RacingProbeFs {
+        fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
+            self.0.open(path, opts)
+        }
+        fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+            self.0.create_dir_all(path)
+        }
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
+            self.0.read_dir(path)
+        }
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            self.0.remove_file(path)
+        }
+        fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+            self.0.remove_dir_all(path)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.0.rename(from, to)
+        }
+        fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
+            self.0.metadata(path)
+        }
+        fn sync_directory(&self, path: &Path) -> io::Result<()> {
+            self.0.sync_directory(path)
+        }
+        fn exists(&self, _path: &Path) -> io::Result<bool> {
+            Ok(false)
+        }
+    }
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("dest");
+
+    // The concurrently published destination the probe cannot see.
+    let concurrent = b"concurrently published content".to_vec();
+    std::fs::write(&dest, &concurrent)?;
+
+    let fs: Arc<dyn Fs> = Arc::new(RacingProbeFs(StdFs));
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0u64..10 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+    // Diverge the meta mirrors so salvage takes the arbitration path, whose
+    // winning attempt publishes from a private temp.
+    crate::test_forge::forge_tail_meta_value(&source, b"compression#data", &[1])?;
+
+    let result = salvage_sst(&source, dest.clone(), &fs);
+    assert!(
+        result.as_ref().is_err_and(
+            |e| matches!(e, crate::Error::Io(e) if e.kind() == crate::io::ErrorKind::AlreadyExists)
+        ),
+        "the publish must refuse the taken destination, not replace it: {result:?}",
+    );
+    assert_eq!(
+        std::fs::read(&dest)?,
+        concurrent,
+        "the concurrently published file must survive byte-for-byte",
+    );
+    Ok(())
+}
+
 /// A bare relative destination (`recovered`, no parent component) must
 /// salvage cleanly on `MemFs` too: the backend accepts the empty parent as
 /// its implicit root at creation, so the post-publication entry sync (which

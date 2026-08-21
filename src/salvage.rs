@@ -558,8 +558,9 @@ fn next_arb_temp(
 /// `dest` with NO-REPLACE semantics, so a foreign file already at `dest` is
 /// never destroyed — the whole reason both attempts write to private temps.
 /// `hard_link` claims `dest` atomically (it fails `AlreadyExists` if anything is
-/// there); a backend without `hard_link` falls back to a probe-then-rename. On
-/// any failure the temp is discarded and the error propagates, so a retry and
+/// there); a backend without `hard_link` claims it with `create_new` instead —
+/// equally atomic, so no fallback ever replaces a concurrently published file.
+/// On any failure the temp is discarded and the error propagates, so a retry and
 /// the repair caller both see `dest` as it was (free, or still owned by whoever
 /// holds it). A successful publish is made durable before the temp name drops.
 fn publish_from_temp(
@@ -601,19 +602,31 @@ fn publish_from_temp(
             return Err(already_exists());
         }
         Err(e) if e.kind() == crate::io::ErrorKind::Unsupported => {
-            // A backend without `hard_link` can still create + rename ordinary
-            // files; fall back to a best-effort no-replace publish. This reopens
-            // a narrow check-then-rename window, but ONLY on backends that cannot
-            // claim a destination atomically at all — every in-tree `Fs`
-            // implements `hard_link`.
-            match fs.exists(dest) {
-                Ok(false) => {
+            // A backend without `hard_link` can still claim the destination
+            // ATOMICALLY: `create_new` fails `AlreadyExists` when anything sits
+            // there, and the rename below then replaces only OUR OWN empty
+            // claim — never a concurrently published file (`rename` replaces
+            // an existing destination by contract, so a probe-then-rename
+            // fallback would silently overwrite a racing creator's file). A
+            // crash between the claim and the rename leaves an empty `dest`
+            // that recovery quarantines as unreadable, while the temp copy
+            // still holds the content for a re-derive.
+            match fs.open(
+                dest,
+                &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+            ) {
+                Ok(claim) => {
+                    drop(claim);
                     if let Err(e) = fs.rename(temp, dest) {
+                        // Release the claim: an empty file left under the
+                        // canonical name would make every retry fail
+                        // `AlreadyExists` against our own leftover.
+                        discard_partial(fs, dest);
                         discard_partial(fs, temp);
                         return Err(e.into());
                     }
                 }
-                Ok(true) => {
+                Err(e) if e.kind() == crate::io::ErrorKind::AlreadyExists => {
                     discard_partial(fs, temp);
                     return Err(already_exists());
                 }
