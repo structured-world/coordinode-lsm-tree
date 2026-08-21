@@ -753,8 +753,16 @@ pub trait Fs: Send + Sync + 'static {
 
     /// Renames a file from `from` to `to`.
     ///
-    /// If `to` already exists as a regular file, it is atomically replaced.
-    /// This is required by [`rewrite_atomic`](crate::file::rewrite_atomic)
+    /// If `to` already exists as a regular file, it is atomically replaced —
+    /// on EVERY supported platform. `std::fs::rename` (the [`StdFs`] backend)
+    /// honors this on Windows too via replace-existing semantics; only a
+    /// destination DIRECTORY fails there, and a destination file that other
+    /// handles hold open is still replaceable because the standard library
+    /// opens files with full sharing (including delete). Every temp-then-rename
+    /// publish in the crate (version pointers, restriction sidecars, heal
+    /// attestations, detached heal copies, salvaged blobs) relies on this
+    /// contract; implementations must preserve it. This is required by
+    /// [`rewrite_atomic`](crate::file::rewrite_atomic)
     /// for crash-safe version pointer updates.
     ///
     /// lsm-tree only renames files (table files, version pointers), never

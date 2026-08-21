@@ -334,6 +334,12 @@ fn run_repair(db_dir: &std::path::Path, salvage: bool) -> ExitCode {
     for (path, reason) in &report.unreadable_files {
         println!("  skipped {} — {reason}", path.display());
     }
+    if !report.blob_files_salvaged.is_empty() {
+        println!("blob salvage:  {}", report.blob_files_salvaged.len());
+        for (path, note) in &report.blob_files_salvaged {
+            println!("  salvaged {} — {note}", path.display());
+        }
+    }
     for warning in &report.warnings {
         println!("warning:       {warning}");
     }

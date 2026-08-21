@@ -1602,6 +1602,8 @@ impl Table {
             // F_FULLFSYNC hardware barrier, same as the flush path).
             tmp.sync_all_with(sync_mode)
                 .map_err(|e| alloc::format!("sync heal copy: {e}"))?;
+            // Replaces the live path on every platform, open handles included
+            // — see the `Fs::rename` contract.
             self.fs
                 .rename(&tmp_path, &self.path)
                 .map_err(|e| alloc::format!("rename heal copy into place: {e}"))
