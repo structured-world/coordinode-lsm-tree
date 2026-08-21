@@ -1604,19 +1604,19 @@ fn restrict_salvaged_output(
     }
 }
 
-/// Discovers the blob files of a KV-separated tree for `repair` by scanning the
-/// single `blobs/` folder, with no manifest id list to filter against.
-///
-/// Mirrors the table scan in [`repair_tree`]: a non-numeric name is quarantined
-/// out of `blobs/` (the reopened tree's blob recovery parses every name and
-/// would abort on a bad one); a blob file that cannot be checksummed or whose
-/// metadata is unreadable is reported and left in place (it reads back as a
-/// harmless orphan on the next open). The recovered checksum is the whole-file
-/// XXH3-128 digest, identical to the one the blob writer accumulated via
-/// `ChecksummedWriter`, since blob files are written strictly sequentially.
-///
-/// Returns the recovered blob files and the per-file failure reasons (merged
-/// into the repair report's `unreadable_files`).
+/// What a blob file's punch-geometry walk proved about its live data.
+#[cfg(feature = "std")]
+enum BlobFrontier {
+    /// No punched prefix: the whole file is live.
+    Whole,
+    /// Live data begins at this byte offset; the `[data_start, offset)` prefix
+    /// is punched.
+    Punched(u64),
+    /// The punch consumed EVERY frame: the relocation completed and only the
+    /// file's removal lagged the crash. No live data remains.
+    FullyConsumed,
+}
+
 /// Derives a blob file's tight-space live-data frontier from its on-disk punch
 /// geometry, for a manifest-loss repair.
 ///
@@ -1638,12 +1638,14 @@ fn restrict_salvaged_output(
 /// decode end the walk at the last anchored frontier: content corruption is not
 /// punch geometry, and it surfaces exactly as it would on an unpunched file.
 ///
-/// Returns `0` (whole file) when the first data byte is non-zero: the punch
-/// always starts at the data start, so an unpunched file — including one whose
-/// committed punch never ran before a crash — short-circuits without a walk,
-/// keeping the common repair path at zero extra read cost. The redundant
+/// Returns [`BlobFrontier::Whole`] when the first data byte is non-zero: the
+/// punch always starts at the data start, so an unpunched file — including one
+/// whose committed punch never ran before a crash — short-circuits without a
+/// walk, keeping the common repair path at zero extra read cost. The redundant
 /// unpunched prefix is superseded by relocated copies and reclaimed later, the
 /// same safe fallback the SST path takes for a committed-but-unpunched slice.
+/// Zeros through the whole data section are [`BlobFrontier::FullyConsumed`]:
+/// a completed relocation whose file removal lagged the crash.
 ///
 /// # Errors
 ///
@@ -1653,7 +1655,7 @@ fn derive_blob_frontier(
     fs: &Arc<dyn crate::fs::Fs>,
     path: &std::path::Path,
     blob_id: crate::vlog::BlobFileId,
-) -> crate::Result<u64> {
+) -> crate::Result<BlobFrontier> {
     let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
     let (data_start, data_end) = {
         let reader = crate::sfa::Reader::from_reader(&mut file)?;
@@ -1668,7 +1670,7 @@ fn derive_blob_frontier(
         (data.pos(), end)
     };
     if data_start >= data_end {
-        return Ok(0);
+        return Ok(BlobFrontier::Whole);
     }
 
     // Ends of the contiguous all-zero run starting at `from` (chunked reads,
@@ -1697,36 +1699,45 @@ fn derive_blob_frontier(
     // Fast path: an unpunched file's first frame magic (non-zero) sits at the
     // data start.
     if skip_zeros(data_start)? == data_start {
-        return Ok(0);
+        return Ok(BlobFrontier::Whole);
     }
 
-    let mut pos = data_start;
     // The last structure-anchored frontier: committed only once a frame has
-    // decoded cleanly at a zeroed run's end.
-    let mut committed: u64 = 0;
+    // decoded cleanly at a zeroed run's end. Zero = no run was ever anchored,
+    // which reports the file whole (an unproven punch is content, not
+    // geometry).
+    let committed = |c: u64| {
+        if c == 0 {
+            BlobFrontier::Whole
+        } else {
+            BlobFrontier::Punched(c)
+        }
+    };
+    let mut pos = data_start;
+    let mut anchored: u64 = 0;
     loop {
         let run_end = skip_zeros(pos)?;
         if run_end >= data_end {
             // Zeros to the section end: the whole data region was consumed
             // (the final slice's punch ran, its drop lagged the crash).
-            return Ok(data_end);
+            return Ok(BlobFrontier::FullyConsumed);
         }
         let mut scanner = crate::vlog::BlobFileScanner::resume(path, &**fs, blob_id, run_end)?;
         match scanner.next() {
             Some(Ok(entry)) if !entry.resynced => {
-                committed = run_end;
+                anchored = run_end;
                 pos = entry.frame_end;
             }
             Some(Err(e)) if is_transient_io(&e) => return Err(e),
             // The zeroed run is not punch geometry (no frame decodes at its
             // end): keep the last anchored frontier.
-            _ => return Ok(committed),
+            _ => return Ok(committed(anchored)),
         }
         // Chain frames from the anchor until the section ends cleanly or the
         // chain breaks (another hole, or content corruption).
         loop {
             match scanner.next() {
-                None => return Ok(committed),
+                None => return Ok(committed(anchored)),
                 Some(Ok(entry)) if !entry.resynced => pos = entry.frame_end,
                 Some(Err(e)) if is_transient_io(&e) => return Err(e),
                 Some(Ok(_) | Err(_)) => {
@@ -1735,7 +1746,7 @@ fn derive_blob_frontier(
                     // continues the walk; anything else is content corruption
                     // and ends it at the last anchored frontier.
                     if skip_zeros(pos)? == pos {
-                        return Ok(committed);
+                        return Ok(committed(anchored));
                     }
                     break;
                 }
@@ -1983,6 +1994,16 @@ struct BlobRecovery {
     salvaged: Vec<(PathBuf, String)>,
 }
 
+/// Discovers the blob files of a KV-separated tree for `repair` by scanning the
+/// single `blobs/` folder, with no manifest id list to filter against.
+///
+/// Mirrors the table scan in [`repair_tree`]: a non-numeric name is quarantined
+/// out of `blobs/` (the reopened tree's blob recovery parses every name and
+/// would abort on a bad one); a blob file that cannot be checksummed or whose
+/// metadata is unreadable is reported and left in place (it reads back as a
+/// harmless orphan on the next open). The recovered checksum is the whole-file
+/// XXH3-128 digest, identical to the one the blob writer accumulated via
+/// `ChecksummedWriter`, since blob files are written strictly sequentially.
 fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
     let blobs_folder = config.path.join(crate::file::BLOBS_FOLDER);
     let mut blob_files: Vec<crate::vlog::BlobFile> = Vec::new();
@@ -2137,7 +2158,48 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
         };
 
         let frontier = match derive_blob_frontier(&config.fs, &blob_path, blob_id) {
-            Ok(f) => f,
+            Ok(BlobFrontier::Whole) => 0,
+            Ok(BlobFrontier::Punched(f)) => f,
+            Ok(BlobFrontier::FullyConsumed) => {
+                // Every frame is punched away: the relocation that consumed
+                // this file completed, only its removal lagged the crash.
+                // Finish that drop instead of publishing an empty-suffix
+                // handle — whole-file metadata over zero live frames is a
+                // file blob GC's stale-byte arithmetic can never retire (its
+                // frames are already gone, so the stale count never reaches
+                // the recorded totals). No live data is discarded: the walk
+                // proved the whole data section reads as zeros.
+                log::info!(
+                    "blob file {blob_id} at {}: its punch consumed every frame — \
+                     completing the relocation's lagged file drop",
+                    blob_path.display(),
+                );
+                match config.fs.remove_file(&blob_path) {
+                    Ok(()) => {
+                        // Entry durability is best-effort: if the removal's
+                        // directory entry resurfaces after a power loss, the
+                        // file is outside the rebuilt manifest and the next
+                        // open's orphan sweep removes it again.
+                        let _ = config
+                            .fs
+                            .sync_directory_with(&blobs_folder, config.sync_mode);
+                    }
+                    Err(e) => {
+                        let e = crate::Error::from(e);
+                        if is_transient_io(&e) {
+                            return Err(e);
+                        }
+                        // Left in place, it is a harmless orphan (outside the
+                        // manifest) that the next open sweeps.
+                        log::warn!(
+                            "blob file {blob_id} at {}: could not complete the lagged \
+                             drop ({e}); the next open's orphan sweep removes it",
+                            blob_path.display(),
+                        );
+                    }
+                }
+                continue;
+            }
             // A TRANSIENT read (flaky I/O) is retryable: recording the blob
             // unreadable commits a manifest without the still-in-place file,
             // which the next open's orphan sweep then DELETES — permanent value

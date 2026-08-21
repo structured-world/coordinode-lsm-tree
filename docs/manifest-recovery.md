@@ -244,6 +244,14 @@ later relocation resumes exactly where the punch stopped. No resurrection
 question arises: blob bytes are reachable only through value handles, so a
 frontier recovered too low exposes nothing.
 
+Zeros through the *whole* data section mean the punch consumed every frame:
+the relocation completed and only the file's removal lagged the crash.
+Recovery completes that drop instead of publishing an empty-suffix handle —
+whole-file metadata over zero live frames would leave a file blob GC's
+stale-byte arithmetic can never retire. No live data is discarded: the walk
+proved nothing live remains, and if the removal itself fails the file stays a
+harmless orphan outside the manifest that the next open sweeps.
+
 ## Blob frame validation and salvage
 
 Before a blob file's digest is recorded, its live frame range is walked frame

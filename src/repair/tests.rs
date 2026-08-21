@@ -6198,6 +6198,70 @@ fn blob_recovery_derives_the_frontier_of_a_punched_blob_file() -> crate::Result<
     Ok(())
 }
 
+/// A blob file whose punch consumed EVERY frame is a completed tight-space
+/// relocation whose file removal lagged the crash: the frontier walk proves
+/// the whole data section reads as zeros, so no live data remains. Repair
+/// must finish that interrupted drop — publishing an empty-suffix handle
+/// with whole-file metadata instead would leave a file blob GC's stale-byte
+/// arithmetic can never retire (its frames are already gone, so the stale
+/// count never reaches the recorded totals): an immortal empty file.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn blob_recovery_completes_the_drop_of_a_fully_punched_blob_file() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    memfs.create_dir_all(&blobs)?;
+    let consumed_path = blobs.join("0");
+    let live_path = blobs.join("1");
+
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    for (id, path) in [(0u64, &consumed_path), (1u64, &live_path)] {
+        let mut w = crate::vlog::blob_file::writer::Writer::new(path, id, 0, &*fs_dyn)?;
+        w.write(b"a", 1, &[b'x'; 300])?;
+        w.write(b"b", 2, &[b'y'; 300])?;
+        w.finish()?;
+    }
+
+    // Punch the ENTIRE data section: every frame is consumed, only the
+    // trailer sections (meta, TOC) survive.
+    let (data_start, data_end) = {
+        let mut file = fs_dyn.open(&consumed_path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut file)?;
+        let data = reader
+            .toc()
+            .section(b"data")
+            .expect("blob file has a data section");
+        (data.pos(), data.pos() + data.len())
+    };
+    memfs.punch_hole(&consumed_path, data_start, data_end - data_start)?;
+
+    let config = blob_validation_config(Arc::clone(&memfs));
+    let recovery = super::recover_blob_files(&config)?;
+    assert!(
+        recovery.unreadable.is_empty(),
+        "a fully consumed file is a completed relocation, not damage: {:?}",
+        recovery.unreadable,
+    );
+    assert_eq!(
+        recovery.files.len(),
+        1,
+        "only the live blob file is published"
+    );
+    assert_eq!(
+        recovery.files.first().map(crate::vlog::BlobFile::id),
+        Some(1)
+    );
+    assert!(
+        !memfs.exists(&consumed_path)?,
+        "the fully punched file's lagged drop is completed",
+    );
+    Ok(())
+}
+
 /// A crashed repair can leave its in-progress blob-salvage copy behind. That
 /// copy is published by an atomic rename, so a surviving one is never
 /// referenced by any manifest — it must be swept, not treated as a foreign
