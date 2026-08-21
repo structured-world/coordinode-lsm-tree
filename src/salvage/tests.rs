@@ -7360,6 +7360,12 @@ fn salvage_blob_file_recovers_every_record_of_a_healthy_file() -> crate::Result<
 /// its implicit root at creation, so the post-publication entry sync (which
 /// names that root `.`) must not fail and drag the freshly written
 /// destination down with it.
+///
+/// No SST twin exists for this shape: the SST writer absolutizes its path up
+/// front (so open / remove / directory fsync all see one name), which means a
+/// bare relative SST destination on `MemFs` fails cleanly at CREATION (the
+/// absolutized parent is no `MemFs` directory) — the post-publication window
+/// this test pins is unreachable on that path.
 #[test]
 fn salvage_blob_file_accepts_a_bare_relative_destination_on_memfs() -> crate::Result<()> {
     let fs: Arc<dyn Fs> = Arc::new(crate::fs::MemFs::new());
