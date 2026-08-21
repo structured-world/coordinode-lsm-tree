@@ -243,6 +243,11 @@ impl Fs for StdFs {
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        // `std::fs::rename` satisfies the trait's replace contract on every
+        // platform: on Windows it maps to `MoveFileExW` with
+        // `MOVEFILE_REPLACE_EXISTING` (POSIX-semantics rename on newer
+        // toolchains), so an existing destination FILE — open handles
+        // included — is atomically replaced, same as on Unix.
         std::fs::rename(from, to).map_err(io::Error::from)
     }
 
