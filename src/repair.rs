@@ -669,6 +669,31 @@ fn keep_best_candidate(
     }
 }
 
+/// Removes a blob-salvage temp on a path where the repair goes on to COMMIT a
+/// manifest. A missing temp is fine; ANY other failure fails the repair: the
+/// rebuilt manifest never references the temp, so left in `blobs/` the next
+/// open's orphan sweep would hit the same removal failure — reporting success
+/// for a tree that cannot open would be a lie. Quarantine is NOT an out here:
+/// it preserves damaged DATA for the operator, and a temp is discardable
+/// garbage — while a directory that refuses removal refuses the rename too.
+/// Paths where the repair itself returns an error need only best-effort
+/// removal: the retry re-attempts it and fails honestly if it still cannot.
+#[cfg(feature = "std")]
+fn remove_temp(config: &Config, temp: &std::path::Path) -> crate::Result<()> {
+    match config.fs.remove_file(temp) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => {
+            log::error!(
+                "repair: cannot remove salvage temp {} ({e}); failing the repair — \
+                 left in place, the next open's orphan sweep would hit the same error",
+                temp.display(),
+            );
+            Err(e.into())
+        }
+    }
+}
+
 /// Whether `a` and `b` name the SAME physical file — a symlink, junction, or
 /// case-insensitive alias resolving to one directory entry (two configured table
 /// folders pointing at the same location). Used so a repeated sighting of one SST
@@ -2085,37 +2110,14 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
             .strip_suffix(".salvage-tmp")
             .is_some_and(|id| id.parse::<crate::vlog::BlobFileId>().is_ok())
         {
-            match config.fs.remove_file(&blob_path) {
-                Ok(()) => {}
-                Err(e) => {
-                    let e = crate::Error::from(e);
-                    if is_transient_io(&e) {
-                        return Err(e);
-                    }
-                    // The temp must NOT stay in `blobs/`: it is outside the
-                    // rebuilt manifest, so the next open classifies it as an
-                    // orphan and its sweep PROPAGATES the same removal
-                    // failure — repair would report success for a tree that
-                    // cannot open. Move it out durably (like a non-numeric
-                    // foreign name); a failed move fails the repair, which is
-                    // honest when the directory refuses both.
-                    let dest = quarantine_file(
-                        &*config.fs,
-                        &blobs_folder,
-                        &blob_path,
-                        &file_name,
-                        config.sync_mode,
-                    )?;
-                    unreadable.push((
-                        blob_path,
-                        format!(
-                            "leftover salvage temp could not be removed ({e}); \
-                             set aside at {}",
-                            dest.display()
-                        ),
-                    ));
-                }
-            }
+            // A removal failure fails the repair: the temp is outside the
+            // rebuilt manifest, so the next open classifies it as an orphan
+            // and its sweep hits the same removal failure — reporting success
+            // for a tree that cannot open would be a lie. Quarantine is not
+            // an out (it preserves damaged DATA; a temp is discardable
+            // garbage, and a directory refusing removal refuses the rename
+            // too). Retry after the filesystem is fixed.
+            remove_temp(config, &blob_path)?;
             continue;
         }
 
@@ -2246,25 +2248,22 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
                             .sync_directory_with(&blobs_folder, config.sync_mode);
                     }
                     Err(e) => {
+                        // Any removal failure fails the repair: the file is
+                        // outside the rebuilt manifest, so the next open
+                        // rediscovers it as an orphan and its sweep hits the
+                        // same removal failure — reporting success for a tree
+                        // that cannot open would be a lie. Quarantine is not
+                        // an out (it preserves damaged DATA for the operator;
+                        // this file holds none, and a directory refusing the
+                        // removal refuses the rename too). Retry once the
+                        // filesystem is fixed.
                         let e = crate::Error::from(e);
-                        if is_transient_io(&e) {
-                            return Err(e);
-                        }
-                        // The file must NOT stay in `blobs/`: it is outside
-                        // the rebuilt manifest, so the next open rediscovers
-                        // it as an orphan and its sweep PROPAGATES the same
-                        // removal failure — repair would report success for a
-                        // tree that cannot open. Move it durably out of the
-                        // scanned directory instead (quarantine, reported);
-                        // if even that fails, the repair itself errors, which
-                        // is honest: no openable tree can be produced while
-                        // the directory refuses both.
-                        log::warn!(
-                            "blob file {blob_id} at {}: could not complete the lagged \
-                             drop ({e}); setting the empty file aside instead",
+                        log::error!(
+                            "blob file {blob_id} at {}: cannot complete the lagged \
+                             drop ({e}); failing the repair",
                             blob_path.display(),
                         );
-                        quarantine_unreadable(blob_path, &file_name, &e, &mut unreadable)?;
+                        return Err(e);
                     }
                 }
                 continue;
@@ -2343,7 +2342,7 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
         // keep their old, now-wrong offsets).
         let Some(live) = validate_blob_frames(config, &blob_path, blob_id, frontier)? else {
             let temp = blobs_folder.join(format!("{blob_id}.salvage-tmp"));
-            let _ = config.fs.remove_file(&temp);
+            remove_temp(config, &temp)?;
             let salvage = (|| -> crate::Result<Option<(crate::vlog::BlobFile, crate::salvage::BlobSalvageReport)>> {
                 let report = crate::salvage::salvage_blob_file(
                     &blob_path,
@@ -2381,7 +2380,7 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
                 // untouched at its canonical path, so preserve it in quarantine
                 // and report — exactly like any other unreadable blob.
                 Ok(None) => {
-                    let _ = config.fs.remove_file(&temp);
+                    remove_temp(config, &temp)?;
                     let e = crate::Error::InvalidHeader(
                         "blob value frames failed validation and no record was recoverable",
                     );
@@ -2391,12 +2390,14 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
                 Err(e) if is_transient_io(&e) => {
                     // Nothing was published; dropping the temp restores the
                     // pre-repair state exactly, so the retry re-salvages and
-                    // re-derives the remap.
+                    // re-derives the remap. Best-effort is enough on this
+                    // ERROR path: no manifest is committed, and the retry's
+                    // candidate sweep sets a stuck temp aside.
                     let _ = config.fs.remove_file(&temp);
                     return Err(e);
                 }
                 Err(e) => {
-                    let _ = config.fs.remove_file(&temp);
+                    remove_temp(config, &temp)?;
                     quarantine_unreadable(blob_path, &file_name, &e, &mut unreadable)?;
                     continue;
                 }
@@ -2414,6 +2415,9 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
             if let Err(e) = config.fs.rename(&temp, &blob_path) {
                 // The canonical name is free but the publish failed: put the
                 // original back so the tree is exactly as it was found.
+                // Best-effort temp removal is enough on this ERROR path: no
+                // manifest is committed, and the retry's candidate sweep sets
+                // a stuck temp aside.
                 let _ = config.fs.rename(&quarantined, &blob_path);
                 let _ = config.fs.remove_file(&temp);
                 return Err(e.into());

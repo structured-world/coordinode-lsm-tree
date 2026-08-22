@@ -6339,14 +6339,135 @@ fn repair_seeds_garbage_accounting_for_a_punched_blob_prefix() -> crate::Result<
     Ok(())
 }
 
-/// A crashed repair's leftover `{id}.salvage-tmp` whose removal fails
-/// PERSISTENTLY must not be shrugged off: the rebuilt manifest never
+/// A salvage temp left behind by THIS repair's own failed blob salvage (the
+/// salvage recovered nothing and the temp's removal fails PERSISTENTLY) must
+/// fail the repair, not be shrugged off: the rebuilt manifest never
 /// references it, so the next open classifies it as an orphan and its sweep
-/// PROPAGATES the same removal failure — repair would report success for a
-/// tree that cannot open. The temp must be durably moved out of the scanned
-/// directory instead, exactly like a non-numeric foreign name.
+/// hits the same removal failure — reporting success for a tree that cannot
+/// open would be a lie.
 #[test]
-fn repair_quarantines_a_salvage_temp_whose_removal_fails() -> crate::Result<()> {
+fn repair_fails_when_its_own_salvage_temp_cannot_be_removed() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        tree.insert(b"k0", alloc::vec![b'x'; 64], 0);
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Wreck the ENTIRE data section with non-zero garbage: validation fails
+    // (no punch geometry — the bytes are not zeros) and the salvage recovers
+    // NOTHING, entering the nothing-recoverable cleanup path.
+    let blob_path = root.join(crate::file::BLOBS_FOLDER).join("0");
+    let (data_start, data_len) = {
+        let mut f = fs_dyn.open(&blob_path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut f)?;
+        let data = reader
+            .toc()
+            .section(b"data")
+            .ok_or(crate::Error::InvalidHeader("BlobFile"))?;
+        (data.pos(), data.len())
+    };
+    {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "test fixture data section is tiny"
+        )]
+        let garbage = alloc::vec![0xA5u8; data_len as usize];
+        let mut f = memfs.open(
+            &blob_path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        f.seek(SeekFrom::Start(data_start))?;
+        f.write_all(&garbage)?;
+    }
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    // Every removal of the salvage temp fails persistently — including the
+    // salvage's own internal discard — so the temp survives to the cleanup.
+    let fault = FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        FaultRule::new(
+            FaultOp::RemoveFile,
+            Fault::Error(ErrorKind::PermissionDenied),
+        )
+        .on_path("salvage-tmp"),
+    );
+    let fault_config = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ));
+
+    let result = fault_config.repair();
+    assert!(
+        result.is_err(),
+        "repair must FAIL, not report success for a tree that cannot open: {result:?}",
+    );
+
+    // Once the filesystem is fixed (no fault), a retry completes the cleanup
+    // and produces an openable tree.
+    let retry_config = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs.clone())
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ));
+    retry_config.repair()?;
+    assert!(
+        !memfs.exists(&root.join(crate::file::BLOBS_FOLDER).join("0.salvage-tmp"))?,
+        "the retry removes the temp",
+    );
+    retry_config.open()?;
+    Ok(())
+}
+
+/// A crashed repair's leftover `{id}.salvage-tmp` whose removal fails
+/// PERSISTENTLY must fail the repair: the rebuilt manifest never references
+/// it, so the next open classifies it as an orphan and its sweep hits the
+/// same removal failure — reporting success for a tree that cannot open
+/// would be a lie. Quarantine is not an out (the temp is discardable
+/// garbage, not damaged data). A retry after the filesystem is fixed
+/// completes the sweep.
+#[test]
+fn repair_fails_when_a_leftover_salvage_temp_cannot_be_removed() -> crate::Result<()> {
     use crate::AbstractTree;
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
     use crate::io::ErrorKind;
@@ -6395,8 +6516,8 @@ fn repair_quarantines_a_salvage_temp_whose_removal_fails() -> crate::Result<()> 
         }
     }
 
-    // Its removal fails PERSISTENTLY; the rename into quarantine still works.
-    // (The filter has no separator, so it matches Windows paths too.)
+    // Its removal fails PERSISTENTLY. (The filter has no separator, so it
+    // matches Windows paths too.)
     let fault = FaultFs::new((*memfs).clone());
     fault.injector().arm(
         FaultRule::new(
@@ -6415,33 +6536,41 @@ fn repair_quarantines_a_salvage_temp_whose_removal_fails() -> crate::Result<()> 
         KvSeparationOptions::default().separation_threshold(16),
     ));
 
-    let report = fault_config.repair()?;
-    assert_eq!(
-        report.unreadable, 1,
-        "the immovable temp is reported as set aside: {report:?}",
-    );
+    let result = fault_config.repair();
     assert!(
-        !memfs.exists(&tmp_path)?,
-        "the temp must be durably moved OUT of blobs/ — left in place, the next \
-         open's orphan sweep hits the same removal failure and the tree cannot open",
+        result.is_err(),
+        "repair must FAIL, not report success for a tree that cannot open: {result:?}",
     );
+
+    // Once the filesystem is fixed, a retry sweeps the temp and the tree opens.
+    let retry_config = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs.clone())
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ));
+    let report = retry_config.repair()?;
+    assert!(!memfs.exists(&tmp_path)?, "the retry removes the temp");
     assert_eq!(
         report.recovered, 1,
         "the data survives untouched: {report:?}"
     );
-    fault_config.open()?;
+    retry_config.open()?;
     Ok(())
 }
 
 /// A fully punched blob whose lagged drop hits a PERSISTENT removal failure
-/// must not be left in `blobs/` with a shrug: the rebuilt manifest omits the
-/// file, so the next open rediscovers it as an orphan and its sweep
-/// PROPAGATES the same removal failure — repair would report success for a
-/// tree that cannot open. The file must be durably moved out of the scanned
-/// directory (quarantined and reported) instead; only if that also fails may
-/// the repair itself error.
+/// must fail the repair, not be left in `blobs/` with a shrug: the rebuilt
+/// manifest omits the file, so the next open rediscovers it as an orphan and
+/// its sweep hits the same removal failure — reporting success for a tree
+/// that cannot open would be a lie. Quarantine is not an out (the walk
+/// proved the file holds no live data — nothing to preserve). A retry after
+/// the filesystem is fixed completes the drop.
 #[test]
-fn repair_quarantines_a_fully_punched_blob_whose_drop_cannot_complete() -> crate::Result<()> {
+fn repair_fails_when_a_fully_punched_blobs_drop_cannot_complete() -> crate::Result<()> {
     use crate::AbstractTree;
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
     use crate::io::ErrorKind;
@@ -6495,10 +6624,9 @@ fn repair_quarantines_a_fully_punched_blob_whose_drop_cannot_complete() -> crate
         }
     }
 
-    // Its removal fails PERSISTENTLY; the rename into quarantine still works.
-    // The path filter avoids a separator so it also matches Windows paths
-    // (`...\blobs\0`); the only file removed under `blobs` in this fixture is
-    // the consumed blob itself.
+    // Its removal fails PERSISTENTLY. The path filter avoids a separator so
+    // it also matches Windows paths (`...\blobs\0`); the only file removed
+    // under `blobs` in this fixture is the consumed blob itself.
     let fault = FaultFs::new((*memfs).clone());
     fault.injector().arm(
         FaultRule::new(
@@ -6517,20 +6645,32 @@ fn repair_quarantines_a_fully_punched_blob_whose_drop_cannot_complete() -> crate
         KvSeparationOptions::default().separation_threshold(16),
     ));
 
-    let report = fault_config.repair()?;
-    // Two set-asides: the immovable fully-consumed blob itself, and the
-    // pre-relocation SST still referencing it (its dependency is gone either
-    // way — the real relocation would have rewritten it before the crash).
-    assert_eq!(
-        report.unreadable, 2,
-        "the immovable fully-consumed file is reported as left out: {report:?}",
+    let result = fault_config.repair();
+    assert!(
+        result.is_err(),
+        "repair must FAIL, not report success for a tree that cannot open: {result:?}",
     );
     assert!(
-        !memfs.exists(&blob_path)?,
-        "the file must be durably moved OUT of blobs/ — left in place, the next \
-         open's orphan sweep hits the same removal failure and the tree cannot open",
+        memfs.exists(&blob_path)?,
+        "nothing is moved or discarded on the failure path",
     );
-    fault_config.open()?;
+
+    // Once the filesystem is fixed, a retry completes the drop and opens.
+    let retry_config = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs.clone())
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ));
+    retry_config.repair()?;
+    assert!(
+        !memfs.exists(&blob_path)?,
+        "the retry completes the lagged drop",
+    );
+    retry_config.open()?;
     Ok(())
 }
 
