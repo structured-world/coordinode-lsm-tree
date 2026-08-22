@@ -684,9 +684,12 @@ fn keep_best_candidate(
 /// [`Fs::backend_id`](crate::fs::Fs::backend_id), whose `None` means "no shared
 /// namespace guarantee" and is therefore treated as DISTINCT.
 ///
-/// Canonicalization that fails on EITHER path (e.g. a virtual path with no OS
-/// presence) conservatively returns `false` too — treat the paths as distinct —
-/// so a genuine duplicate is still quarantined.
+/// Within one namespace, alias resolution is the backend's own
+/// ([`Fs::same_file`](crate::fs::Fs::same_file)): kernel-backed backends
+/// canonicalize through the host, virtual ones compare paths literally — a
+/// host symlink must never alias two distinct virtual files. A probe that
+/// cannot decide answers `false` (distinct), so a genuine duplicate is still
+/// quarantined.
 #[cfg(feature = "std")]
 fn same_physical_file(
     fs_a: &dyn crate::fs::Fs,
@@ -700,10 +703,12 @@ fn same_physical_file(
         // path spellings are not comparable, so never alias them.
         _ => return false,
     }
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(ca), Ok(cb)) => ca == cb,
-        _ => false,
-    }
+    // Alias resolution belongs to the BACKEND, not the host: canonicalizing a
+    // virtual backend's paths through the host filesystem would let a host
+    // symlink alias two unrelated virtual files, and the "duplicate" loser
+    // would escape quarantine. Kernel-backed backends canonicalize; virtual
+    // ones compare literally.
+    fs_a.same_file(a, b)
 }
 
 /// Quarantines a duplicate table file that lost to a better same-id copy, moving

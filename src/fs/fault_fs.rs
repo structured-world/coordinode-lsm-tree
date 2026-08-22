@@ -437,6 +437,10 @@ impl<F: Fs> Fs for FaultFs<F> {
         self.inner.remove_dir_all(path)
     }
 
+    fn same_file(&self, a: &Path, b: &Path) -> bool {
+        self.inner.same_file(a, b)
+    }
+
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         // Rename rules match the destination path: that is the stable name
         // (manifest, version pointer) a test targets.

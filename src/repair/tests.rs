@@ -2334,6 +2334,51 @@ fn same_physical_file_requires_a_shared_namespace() -> crate::Result<()> {
     Ok(())
 }
 
+/// Two DISTINCT virtual files whose path strings happen to canonicalize to
+/// one host inode (a host symlink joins the directories) are still distinct:
+/// alias resolution belongs to the BACKEND, and a virtual backend's path
+/// strings are distinct files by construction. Resolving them through the
+/// host would declare the pair aliases, skip quarantining the duplicate
+/// loser, and let a later reopen resolve the leftover against the kept
+/// copy's manifest checksum. Unix-only: the fixture needs an unprivileged
+/// host symlink.
+#[cfg(unix)]
+#[test]
+fn same_physical_file_ignores_host_symlinks_for_a_virtual_backend() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use std::io::Write;
+    use std::sync::Arc;
+
+    // Host: real directory `x` with a file, and symlink `y` -> `x`, so
+    // `x/0` and `y/0` canonicalize to the SAME host inode.
+    let dir = tempfile::tempdir()?;
+    let x = dir.path().join("x");
+    std::fs::create_dir(&x)?;
+    std::fs::write(x.join("0"), b"host bytes")?;
+    let y = dir.path().join("y");
+    std::os::unix::fs::symlink(&x, &y)?;
+
+    // Virtual backend: the SAME two path strings name two DISTINCT files.
+    let memfs: Arc<dyn Fs> = Arc::new(MemFs::new());
+    let (a, b) = (x.join("0"), y.join("0"));
+    for (path, bytes) in [(&a, b"first".as_slice()), (&b, b"second".as_slice())] {
+        if let Some(parent) = path.parent() {
+            memfs.create_dir_all(parent)?;
+        }
+        let mut f = memfs.open(
+            path,
+            &crate::fs::FsOpenOptions::new().write(true).create(true),
+        )?;
+        f.write_all(bytes)?;
+    }
+
+    assert!(
+        !super::same_physical_file(&*memfs, &a, &*memfs, &b),
+        "a host symlink must not alias two distinct virtual files",
+    );
+    Ok(())
+}
+
 /// A zero run INSIDE a live value must never move the frontier: the derive
 /// anchors only on a run whose end is a VALIDATED block header (magic +
 /// header checksum), so a value carrying `Header::MIN_LEN` zeros — perfectly

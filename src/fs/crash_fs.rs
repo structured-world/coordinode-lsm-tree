@@ -283,6 +283,10 @@ impl Fs for CrashFs {
         Ok(())
     }
 
+    fn same_file(&self, a: &Path, b: &Path) -> bool {
+        self.inner.same_file(a, b)
+    }
+
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         self.inner.rename(from, to)?;
         let mut state = self.state.lock();

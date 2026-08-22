@@ -242,6 +242,17 @@ impl Fs for StdFs {
         std::fs::remove_dir_all(path).map_err(io::Error::from)
     }
 
+    fn same_file(&self, a: &Path, b: &Path) -> bool {
+        // Kernel-backed namespace: resolve both spellings through the host
+        // (symlinks, `..`, case folding). A canonicalization failure on
+        // either side answers "distinct", so a real duplicate is still
+        // handled rather than skipped.
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(ca), Ok(cb)) => ca == cb,
+            _ => false,
+        }
+    }
+
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         // `std::fs::rename` satisfies the trait's replace contract on every
         // platform: on Windows it maps to `MoveFileExW` with

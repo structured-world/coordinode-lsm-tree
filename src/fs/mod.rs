@@ -751,6 +751,21 @@ pub trait Fs: Send + Sync + 'static {
     /// Returns an I/O error if the directory cannot be removed.
     fn remove_dir_all(&self, path: &Path) -> io::Result<()>;
 
+    /// Whether `a` and `b` name the SAME physical file within this backend's
+    /// namespace (aliases: symlinked spellings, `..` traversals, case folding).
+    ///
+    /// The default is literal path equality — correct for virtual backends
+    /// ([`MemFs`]), whose distinct path strings are distinct files by
+    /// construction; resolving them through the HOST filesystem would let a
+    /// host symlink alias two unrelated virtual files. Kernel-backed backends
+    /// ([`StdFs`]) override this with host canonicalization. A probe that
+    /// cannot decide must answer `false` (treat as distinct): callers use
+    /// `true` to skip duplicate handling, so a false positive lets a real
+    /// duplicate escape.
+    fn same_file(&self, a: &Path, b: &Path) -> bool {
+        a == b
+    }
+
     /// Renames a file from `from` to `to`.
     ///
     /// If `to` already exists as a regular file, it is atomically replaced —
