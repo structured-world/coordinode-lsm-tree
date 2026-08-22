@@ -2080,7 +2080,37 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
             .strip_suffix(".salvage-tmp")
             .is_some_and(|id| id.parse::<crate::vlog::BlobFileId>().is_ok())
         {
-            let _ = config.fs.remove_file(&blob_path);
+            match config.fs.remove_file(&blob_path) {
+                Ok(()) => {}
+                Err(e) => {
+                    let e = crate::Error::from(e);
+                    if is_transient_io(&e) {
+                        return Err(e);
+                    }
+                    // The temp must NOT stay in `blobs/`: it is outside the
+                    // rebuilt manifest, so the next open classifies it as an
+                    // orphan and its sweep PROPAGATES the same removal
+                    // failure — repair would report success for a tree that
+                    // cannot open. Move it out durably (like a non-numeric
+                    // foreign name); a failed move fails the repair, which is
+                    // honest when the directory refuses both.
+                    let dest = quarantine_file(
+                        &*config.fs,
+                        &blobs_folder,
+                        &blob_path,
+                        &file_name,
+                        config.sync_mode,
+                    )?;
+                    unreadable.push((
+                        blob_path,
+                        format!(
+                            "leftover salvage temp could not be removed ({e}); \
+                             set aside at {}",
+                            dest.display()
+                        ),
+                    ));
+                }
+            }
             continue;
         }
 
