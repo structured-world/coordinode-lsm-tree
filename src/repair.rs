@@ -2215,13 +2215,21 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
                         if is_transient_io(&e) {
                             return Err(e);
                         }
-                        // Left in place, it is a harmless orphan (outside the
-                        // manifest) that the next open sweeps.
+                        // The file must NOT stay in `blobs/`: it is outside
+                        // the rebuilt manifest, so the next open rediscovers
+                        // it as an orphan and its sweep PROPAGATES the same
+                        // removal failure — repair would report success for a
+                        // tree that cannot open. Move it durably out of the
+                        // scanned directory instead (quarantine, reported);
+                        // if even that fails, the repair itself errors, which
+                        // is honest: no openable tree can be produced while
+                        // the directory refuses both.
                         log::warn!(
                             "blob file {blob_id} at {}: could not complete the lagged \
-                             drop ({e}); the next open's orphan sweep removes it",
+                             drop ({e}); setting the empty file aside instead",
                             blob_path.display(),
                         );
+                        quarantine_unreadable(blob_path, &file_name, &e, &mut unreadable)?;
                     }
                 }
                 continue;
@@ -3748,7 +3756,7 @@ fn repair_tree(
     ];
     if config.kv_separation_opts.is_some() {
         warnings.push(
-            "Blob fragmentation stats reset to empty; blob GC will re-learn reclaimable space over time",
+            "Blob fragmentation stats reset (punched prefixes reseeded); blob GC re-learns the rest over time",
         );
     }
 
