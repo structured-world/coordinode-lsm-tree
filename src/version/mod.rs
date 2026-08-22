@@ -1052,6 +1052,15 @@ impl Version {
         // consumed prefix was reclaimed in place. Fixed-width entries (id then
         // offset) — a blob frontier is a byte position, not a key. Empty on
         // versions that never reclaimed a blob prefix.
+        //
+        // No format bump for this (or the `restrictions`) section: a snapshot
+        // carries a non-empty entry only once tight-space reclaim has RUN, and
+        // opening such a tree with a binary that predates the feature is a
+        // DOWNGRADE — outside the support contract (consumers pin the exact
+        // crate version and move in lockstep with the engine). Trees that
+        // never reclaimed write an empty section and stay fully readable
+        // either way, matching the append-only edit-log treatment of the same
+        // data.
         writer.start("blob_restrictions")?;
         let blob_restricted: Vec<(crate::vlog::BlobFileId, u64)> = self
             .blob_files
