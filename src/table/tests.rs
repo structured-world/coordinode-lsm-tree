@@ -756,6 +756,64 @@ fn reopen_restricted_yields_a_distinct_clamped_view() -> crate::Result<()> {
     )
 }
 
+/// A LEGACY table (written before `descriptor#delete_bitmap_hash` existed)
+/// carrying a delete bitmap must still reconcile on the directly attributable
+/// heal path: there the pre-heal digest matched the manifest, authenticating
+/// the bitmap bytes, so the missing hash proves nothing. Rejecting it strips
+/// the heal attestation and strands the healed table under a stale digest
+/// forever. Repair (no matching digest) must keep failing closed on the same
+/// file.
+#[test]
+fn metadata_bounds_accept_a_legacy_bitmap_when_digest_authenticated() -> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("legacy");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    writer.omit_delete_bitmap_hash_for_test = true;
+    for i in 0..16u32 {
+        writer.write(crate::InternalValue::from_components(
+            format!("key{i:03}").into_bytes(),
+            b"v".as_slice(),
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    writer.delete_bitmap_mut().insert(3);
+    assert!(writer.finish()?.is_some(), "legacy SST is non-empty");
+
+    let table = Table::recover(
+        file,
+        crate::Checksum::from_raw(0),
+        0,
+        0,
+        0,
+        Arc::new(Cache::with_capacity_bytes(1_000_000)),
+        Some(Arc::new(DescriptorTable::new(10))),
+        Arc::clone(&fs),
+        false,
+        false,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        crate::comparator::default_comparator(),
+        #[cfg(feature = "metrics")]
+        Default::default(),
+    )?;
+    assert!(
+        table.verify_metadata_bounds(false).is_err(),
+        "repair (no matching digest) keeps failing closed on the \
+         unauthenticatable legacy bitmap",
+    );
+    table.verify_metadata_bounds(true)?;
+    Ok(())
+}
+
 /// A restricted view's compaction scanner must start at the restriction:
 /// the punched prefix reads as zeros (a raw scan aborts on the first punched
 /// block), and even before the punch runs, the sub-bound rows' authoritative

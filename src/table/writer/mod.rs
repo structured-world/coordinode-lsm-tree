@@ -82,6 +82,14 @@ pub struct LinkedFile {
 /// `BlockIndexWriter` / `FilterWriter` are generic over a writer `W: Write + Seek`.
 /// `Fs::open()` returns `Box<dyn FsFile>` which implements `Write + Seek`,
 /// so `BufWriter<Box<dyn FsFile>>` satisfies the required trait bounds.
+#[cfg_attr(
+    test,
+    expect(
+        clippy::struct_excessive_bools,
+        reason = "the test-only legacy-meta flag pushes the count past the lint's \
+                  threshold; the production field set stays below it"
+    )
+)]
 pub struct Writer {
     /// Filesystem backend
     fs: Arc<dyn Fs>,
@@ -187,6 +195,11 @@ pub struct Writer {
     /// dropped instead); under merge-on-read / adaptive a non-empty bitmap is
     /// written. Default: adaptive (writes the bitmap).
     delete_strategy: crate::config::DeleteStrategy,
+
+    /// Test-only: omit `descriptor#delete_bitmap_hash` from the meta, producing
+    /// the file a pre-hash writer emitted (see `MetaSectionParams`).
+    #[cfg(test)]
+    pub(crate) omit_delete_bitmap_hash_for_test: bool,
 
     /// Resolved retrieval-ribbon locator settings for this table, or `None`
     /// (default) when the level's [`crate::config::LocatorPolicy`] is disabled.
@@ -392,6 +405,8 @@ impl Writer {
             zone_map_section: Vec::new(),
             delete_bitmap: crate::table::delete_bitmap::DeleteBitmap::new(),
             delete_strategy: crate::config::DeleteStrategy::default(),
+            #[cfg(test)]
+            omit_delete_bitmap_hash_for_test: false,
 
             locator: None,
             locators: Vec::new(),
@@ -2337,6 +2352,8 @@ impl Writer {
                 0
             },
             created_at_nanos,
+            #[cfg(test)]
+            omit_delete_bitmap_hash: self.omit_delete_bitmap_hash_for_test,
         };
 
         // MID meta copy — defends against torn-write at the file tail
@@ -2575,6 +2592,12 @@ struct MetaSectionParams<'a> {
     /// different wall-clock readings and shift TTL/FIFO ordering on
     /// MID-fallback recovery.
     created_at_nanos: u128,
+    /// Test-only: simulate a LEGACY table written before
+    /// `descriptor#delete_bitmap_hash` existed, so gates that must accept (or
+    /// reject) an unauthenticatable bitmap can be exercised against a real
+    /// file. Never settable in production.
+    #[cfg(test)]
+    omit_delete_bitmap_hash: bool,
 }
 
 /// Resolves a `(page_ecc, EccScheme)` config pair into the per-block
@@ -2785,6 +2808,13 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
     // of order, then the whole list is sorted below.
     if let Some(flag) = p.bulk_ingested {
         meta_items.push(meta("descriptor#bulk_ingested", &[u8::from(flag)]));
+    }
+
+    // Test-only legacy simulation: drop the bitmap-content hash so the file
+    // matches what a pre-hash writer produced.
+    #[cfg(test)]
+    if p.omit_delete_bitmap_hash {
+        meta_items.retain(|kv| kv.key.user_key.as_ref() != b"descriptor#delete_bitmap_hash");
     }
 
     // The data-block encoder requires sorted keys; the entry above may be out of

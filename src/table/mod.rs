@@ -4244,7 +4244,17 @@ impl Table {
     /// [`crate::Error::InvalidHeader`] when the recorded bounds disagree
     /// with the decoded contents; any I/O / decode error from the full scan.
     #[cfg(feature = "std")]
-    pub(crate) fn verify_metadata_bounds(&self) -> crate::Result<()> {
+    /// `bitmap_digest_authenticated`: whether the caller has ALREADY
+    /// authenticated this file's bytes — bitmap section included — against a
+    /// matching manifest digest (the directly attributable heal path: the
+    /// pre-heal digest probed equal, so the file differs solely by that
+    /// pass's corrections). Only then may a LEGACY table whose bitmap
+    /// carries no `descriptor#delete_bitmap_hash` pass; repair has no such
+    /// digest and must keep failing closed on it.
+    pub(crate) fn verify_metadata_bounds(
+        &self,
+        bitmap_digest_authenticated: bool,
+    ) -> crate::Result<()> {
         // Re-read the meta FROM DISK: the in-memory copy was parsed at
         // recover time, so an on-disk re-stamp after the open (the very
         // forge this check exists for) would be invisible to it.
@@ -4550,13 +4560,20 @@ impl Table {
                         ));
                     }
                 }
-                None => {
+                None if !bitmap_digest_authenticated => {
                     return Err(crate::Error::InvalidHeader(
                         "delete_bitmap section present without a \
                          descriptor#delete_bitmap_hash; its contents cannot be \
                          authenticated during repair / heal",
                     ));
                 }
+                // A LEGACY table (written before the hash existed) on the
+                // directly attributable heal path: the pre-heal digest
+                // matched the manifest, so the bitmap bytes — untouched by
+                // the data-block heal — were just authenticated by that
+                // digest. Rejecting here would strip the heal attestation
+                // and strand the healed table under a stale digest forever.
+                None => {}
             }
         }
         // Range tombstones mask entries in OLDER tables during reads and
@@ -5916,7 +5933,10 @@ impl Table {
                 if self.comparator.compare(keyed.end_key(), bound.as_ref())
                     == core::cmp::Ordering::Less
                 {
-                    block_count = block_count.saturating_sub(1);
+                    // Cannot underflow: this loop walks the block index the
+                    // count was derived from, so at most `block_count`
+                    // decrements can ever run.
+                    block_count -= 1;
                     continue;
                 }
                 start_offset = keyed.offset().0;

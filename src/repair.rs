@@ -1002,7 +1002,7 @@ fn block_verify_verdict(
         // retrieve are corruption; salvage re-emits the block with fresh
         // indexes.
         BlockVerifyVerdict::Corrupt
-    } else if is_corruption(table.verify_metadata_bounds())? {
+    } else if is_corruption(table.verify_metadata_bounds(false))? {
         // Both meta mirrors re-stamped CONSISTENTLY pass the mirror
         // comparison, yet run selection trusts the recorded key range — a
         // narrowed range hides real keys (and the range tombstones masking

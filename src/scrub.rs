@@ -977,7 +977,11 @@ fn refresh_healed_checksum(
     // this table — a narrowed range silently hides real keys and the range
     // tombstones that mask older tables. Cross-check the recorded bounds
     // against the decoded contents before trusting the digest.
-    if let Err(e) = table.verify_metadata_bounds() {
+    // `true`: this is the attributable branch — the pre-heal digest matched
+    // the manifest, authenticating every byte outside this pass's data-block
+    // corrections, the bitmap section included. A legacy table without
+    // `descriptor#delete_bitmap_hash` must still reconcile here.
+    if let Err(e) = table.verify_metadata_bounds(true) {
         return refuse(
             alloc::format!(
                 "digest mismatch with a metadata-bounds cross-check failure ({e}); \
