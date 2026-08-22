@@ -1114,6 +1114,13 @@ fn run_tight_space_compaction(
                     // rolls back the finalized outputs. The `.restrict-bound` sidecar
                     // that records this view's exact bound is written only AFTER the
                     // install commits (the mark step below), never here.
+                    //
+                    // Later ordinary compactions read this view through
+                    // `Table::scan()`, which starts at the restriction bound
+                    // (blocks below it are punched and unreadable, and the
+                    // prefix rows' authoritative copies live in the slice
+                    // output) — so the restricted SST stays compactable and is
+                    // eventually retired through the normal path.
                     let restricted = view.reopen_restricted(boundary.clone()).map_err(rollback)?;
                     restricted_pairs.push((view.id(), restricted.clone()));
                     next_views.push(restricted);
