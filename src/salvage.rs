@@ -653,8 +653,17 @@ fn publish_from_temp(
         return Err(e.into());
     }
     // Durable; drop the temp name (the inode lives on under `dest`). A crash
-    // before this leaves the temp in the recovery-owned `.healtmp-` namespace.
-    discard_partial(fs, temp);
+    // before this leaves the temp in the recovery-owned `.healtmp-` namespace,
+    // which the next open sweeps. A LIVE removal failure must propagate
+    // instead of being shrugged off: the repair caller commits a manifest
+    // that never references the temp, so a stuck `.healtmp-` name makes that
+    // same open sweep hit the same removal error — success would describe a
+    // tree that cannot open. A missing temp is fine (a concurrent sweep won).
+    match fs.remove_file(temp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
     rep.salvaged_path = Some(dest.to_path_buf());
     Ok(rep)
 }
@@ -2453,10 +2462,14 @@ pub(crate) fn blob_key_regresses(
 /// section) still terminates the walk cleanly.
 ///
 /// `blob_file_id` is the source's id (its file name), recorded in the recovered
-/// file's metadata. The recovered file is written with no value compression, so
-/// a **compressed** source is rejected with [`Error::FeatureUnsupported`] rather
-/// than re-emitted under a mismatched descriptor (the scanner yields on-disk
-/// bytes; faithfully recompressing them is a separate step).
+/// file's metadata. The recovered file PRESERVES the source's value-compression
+/// descriptor: each surviving value is decompressed (validating the payload)
+/// and re-emitted through the writer under the same codec, so LZ4 and Zstd
+/// sources salvage in full. A dictionary-compressed source additionally needs
+/// its dictionary via `zstd_dictionary` — without it the values cannot be
+/// decoded, and the salvage is rejected with [`Error::FeatureUnsupported`]
+/// rather than guessing (the repair caller passes the tree's configured
+/// dictionary automatically).
 ///
 /// The salvaged file is written COMPACTED: after the first dropped record,
 /// every later record lands at a new offset, so it is **not a drop-in
@@ -2477,9 +2490,10 @@ pub(crate) fn blob_key_regresses(
 /// # Errors
 ///
 /// Returns an error when `source` cannot be opened at all (its metadata / SFA
-/// trailer is unreadable), when it is a compressed blob file, or when writing
-/// `dest` fails. Per-record corruption is not an error: such records are dropped
-/// and listed in the returned [`BlobSalvageReport`].
+/// trailer is unreadable), when it is dictionary-compressed and no matching
+/// dictionary was supplied, or when writing `dest` fails. Per-record
+/// corruption is not an error: such records are dropped and listed in the
+/// returned [`BlobSalvageReport`].
 pub fn salvage_blob_file(
     source: &std::path::Path,
     dest: std::path::PathBuf,

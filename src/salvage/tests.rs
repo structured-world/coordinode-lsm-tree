@@ -2715,7 +2715,7 @@ fn verify_metadata_bounds_rejects_a_hidden_delete_bitmap() -> crate::Result<()> 
     crate::test_forge::forge_section_omitted(&source, b"delete_bitmap")?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_metadata_bounds() else {
+    let Err(err) = table.verify_metadata_bounds(false) else {
         panic!("a hidden delete_bitmap with a recorded count > 0 must be rejected");
     };
     assert!(
@@ -2762,7 +2762,7 @@ fn verify_metadata_bounds_rejects_an_equal_cardinality_delete_bitmap_substitutio
     crate::test_forge::forge_delete_bitmap_substitute(&source, 0, &[6, 21, 41])?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_metadata_bounds() else {
+    let Err(err) = table.verify_metadata_bounds(false) else {
         panic!("an equal-cardinality bitmap substitution must be rejected by the content hash");
     };
     assert!(
@@ -3043,7 +3043,7 @@ fn verify_metadata_bounds_rejects_a_zero_count_with_a_live_bitmap() -> crate::Re
     )?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_metadata_bounds() else {
+    let Err(err) = table.verify_metadata_bounds(false) else {
         panic!("a recorded count of 0 with a present non-empty bitmap must be rejected");
     };
     assert!(
@@ -3594,7 +3594,7 @@ fn verify_metadata_bounds_rejects_a_raised_seqno_min_on_a_range_tombstone_table(
     crate::test_forge::forge_meta_value_both_mirrors(&source, b"seqno#min", &5u64.to_le_bytes())?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_metadata_bounds() else {
+    let Err(err) = table.verify_metadata_bounds(false) else {
         panic!("a seqno#min above the real minimum must be rejected even with range tombstones");
     };
     assert!(
@@ -3670,7 +3670,7 @@ fn verify_metadata_bounds_keeps_a_real_weak_tombstone_matching_the_rt_sentinel()
     crate::test_forge::forge_meta_value_both_mirrors(&source, b"seqno#min", &4u64.to_le_bytes())?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_metadata_bounds() else {
+    let Err(err) = table.verify_metadata_bounds(false) else {
         panic!("a seqno#min above a real weak tombstone matching the RT sentinel must be rejected");
     };
     assert!(
@@ -3719,7 +3719,7 @@ fn verify_metadata_bounds_rejects_a_range_tombstone_count_mismatch() -> crate::R
     crate::test_forge::forge_section_omitted(&source, b"range_tombstones")?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_metadata_bounds() else {
+    let Err(err) = table.verify_metadata_bounds(false) else {
         panic!("a range_tombstones count mismatch must be rejected");
     };
     assert!(
@@ -7351,6 +7351,55 @@ fn salvage_blob_file_recovers_every_record_of_a_healthy_file() -> crate::Result<
     assert_eq!(
         recovered, expected,
         "every record round-trips through salvage"
+    );
+    Ok(())
+}
+
+/// A published salvage whose TEMP-name removal fails persistently must
+/// surface the error, not shrug: the repair caller commits a manifest that
+/// never references the temp, so a stuck `.healtmp-` name makes the next
+/// open's artifact sweep hit the same removal failure — reporting success
+/// would describe a tree that cannot open. Arbitration forces the
+/// temp-then-publish path; `lz4`-gated for the mirror-divergence forge.
+#[cfg(feature = "lz4")]
+#[test]
+fn publish_fails_when_the_temp_name_cannot_be_dropped() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+
+    // The fault filter has no separator, so it matches Windows paths too.
+    let fault = FaultFs::new(StdFs);
+    fault.injector().arm(
+        FaultRule::new(
+            FaultOp::RemoveFile,
+            Fault::Error(ErrorKind::PermissionDenied),
+        )
+        .on_path("healtmp"),
+    );
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0u64..10 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+    crate::test_forge::forge_tail_meta_value(&source, b"compression#data", &[1])?;
+
+    let result = salvage_sst(&source, dest, &fs);
+    assert!(
+        result.as_ref().is_err_and(
+            |e| matches!(e, crate::Error::Io(e) if e.kind() == ErrorKind::PermissionDenied)
+        ),
+        "a stuck temp name must fail the salvage, not be shrugged off: {result:?}",
     );
     Ok(())
 }
