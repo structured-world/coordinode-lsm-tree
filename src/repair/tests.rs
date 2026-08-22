@@ -5822,7 +5822,7 @@ fn blob_frame_validation_rejects_reordered_frames() -> crate::Result<()> {
 
     let config = blob_validation_config(memfs);
     assert!(
-        !super::validate_blob_frames(&config, &path, 0, 0)?,
+        super::validate_blob_frames(&config, &path, 0, 0)?.is_none(),
         "reordered (individually valid) frames must fail validation",
     );
     Ok(())
@@ -5897,7 +5897,7 @@ fn blob_frame_validation_rejects_a_restamped_compressed_payload() -> crate::Resu
 
     let config = blob_validation_config(memfs);
     assert!(
-        !super::validate_blob_frames(&config, &path, 0, 0)?,
+        super::validate_blob_frames(&config, &path, 0, 0)?.is_none(),
         "a checksum-restamped, undecodable compressed payload must fail validation",
     );
     Ok(())
@@ -5961,7 +5961,7 @@ fn blob_frame_validation_rejects_lying_metadata_counters() -> crate::Result<()> 
 
     let config = blob_validation_config(memfs);
     assert!(
-        !super::validate_blob_frames(&config, &victim, 0, 0)?,
+        super::validate_blob_frames(&config, &victim, 0, 0)?.is_none(),
         "metadata counters disagreeing with the scanned frames must fail validation",
     );
     Ok(())
@@ -6006,7 +6006,7 @@ fn blob_frame_validation_rejects_understated_metadata_on_a_punched_file() -> cra
 
     let config = blob_validation_config(Arc::clone(&memfs));
     assert!(
-        super::validate_blob_frames(&config, &victim, 0, suffix_start)?,
+        super::validate_blob_frames(&config, &victim, 0, suffix_start)?.is_some(),
         "fixture: the untampered punched file must pass validation",
     );
 
@@ -6038,7 +6038,7 @@ fn blob_frame_validation_rejects_understated_metadata_on_a_punched_file() -> cra
     }
 
     assert!(
-        !super::validate_blob_frames(&config, &victim, 0, suffix_start)?,
+        super::validate_blob_frames(&config, &victim, 0, suffix_start)?.is_none(),
         "metadata understating the live suffix must fail validation on a punched file",
     );
     Ok(())
@@ -6108,7 +6108,7 @@ fn blob_frame_validation_rejects_a_range_not_containing_the_punched_suffix() -> 
 
     let config = blob_validation_config(memfs);
     assert!(
-        !super::validate_blob_frames(&config, &victim, 0, suffix_start)?,
+        super::validate_blob_frames(&config, &victim, 0, suffix_start)?.is_none(),
         "a key range not containing the scanned suffix must fail validation \
          even when the item and byte totals satisfy the lower bounds",
     );
@@ -6195,6 +6195,99 @@ fn blob_recovery_derives_the_frontier_of_a_punched_blob_file() -> crate::Result<
         0,
         "an unpunched file keeps the whole-file frontier"
     );
+    Ok(())
+}
+
+/// A PARTIALLY punched blob file recovers with its whole-file metadata, so
+/// the rebuilt manifest's garbage accounting must be SEEDED with the punched
+/// prefix: those frames can never be observed by a future compaction, so
+/// with an empty fragmentation map the recorded stale bytes stay below the
+/// metadata totals forever and `is_dead` can never retire the file — even
+/// after every surviving suffix handle is dropped.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_seeds_garbage_accounting_for_a_punched_blob_prefix() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+
+    let open_config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+    {
+        let tree = match open_config().open()? {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        for i in 0..8u32 {
+            tree.insert(
+                format!("k{i:04}").as_bytes(),
+                alloc::vec![b'a' + u8::try_from(i).expect("small i"); 64],
+                u64::from(i),
+            );
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Punch the first TWO frames — the shape a tight-space relocation leaves
+    // after consuming a prefix — and record the prefix's expected garbage.
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let blob_path = blobs.join("0");
+    let entries: Vec<_> = crate::vlog::BlobFileScanner::new(&blob_path, &*fs_dyn, 0)?
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert_eq!(entries.len(), 8, "eight separated values");
+    let prefix: Vec<_> = entries.iter().take(2).collect();
+    let frontier = prefix.last().expect("two frames").frame_end;
+    let prefix_bytes: u64 = prefix.iter().map(|e| u64::from(e.uncompressed_len)).sum();
+    let prefix_on_disk: u64 = prefix.iter().map(|e| e.value.len() as u64).sum();
+    let data_start = {
+        let mut f = fs_dyn.open(&blob_path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut f)?;
+        reader
+            .toc()
+            .section(b"data")
+            .expect("blob file has a data section")
+            .pos()
+    };
+    memfs.punch_hole(&blob_path, data_start, frontier - data_start)?;
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    open_config().repair()?;
+
+    let tree = match open_config().open()? {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+    };
+    let binding = tree.index.version_history.read().latest_version();
+    let entry = binding.version.gc_stats().get(&0).copied();
+    let entry = entry.expect(
+        "the rebuilt manifest must seed garbage accounting for the punched prefix, \
+         or the file can never be retired by blob GC",
+    );
+    assert_eq!(entry.bytes, prefix_bytes, "stale uncompressed bytes");
+    assert_eq!(entry.on_disk_bytes, prefix_on_disk, "stale on-disk bytes");
+    assert_eq!(entry.len, 2, "two punched-away records");
     Ok(())
 }
 

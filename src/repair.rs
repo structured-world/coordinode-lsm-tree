@@ -1604,6 +1604,17 @@ fn restrict_salvaged_output(
     }
 }
 
+/// The scanned totals of a validated blob file's LIVE frames. For a punched
+/// file these cover only the suffix, and the difference to the whole-file
+/// metadata totals is exactly the punched prefix's garbage — what seeds the
+/// rebuilt manifest's fragmentation accounting.
+#[cfg(feature = "std")]
+struct BlobLiveTotals {
+    items: u64,
+    uncompressed_bytes: u64,
+    compressed_bytes: u64,
+}
+
 /// What a blob file's punch-geometry walk proved about its live data.
 #[cfg(feature = "std")]
 enum BlobFrontier {
@@ -1806,17 +1817,21 @@ fn set_aside_table(
 ///   bounds the subset relation implies instead: totals at least the suffix
 ///   totals, key range containing the scanned suffix.
 ///
+/// Returns the scanned live totals on success — the caller seeds the punched
+/// prefix's garbage accounting from their difference to the whole-file
+/// metadata.
+///
 /// # Errors
 ///
 /// Propagates transient I/O for retry; any structural or persistent frame
-/// failure is a conclusive `Ok(false)`.
+/// failure is a conclusive `Ok(None)`.
 #[cfg(feature = "std")]
 fn validate_blob_frames(
     config: &Config,
     path: &std::path::Path,
     blob_id: crate::vlog::BlobFileId,
     live_data_start: u64,
-) -> crate::Result<bool> {
+) -> crate::Result<Option<BlobLiveTotals>> {
     let fs = &config.fs;
     // Metadata + compression via a placeholder-checksum open (the handle is
     // never read through; `recover_blob_file` only stores the checksum).
@@ -1845,7 +1860,7 @@ fn validate_blob_frames(
                         path.display(),
                         entry.offset,
                     );
-                    return Ok(false);
+                    return Ok(None);
                 }
                 if crate::salvage::decompress_blob_value(
                     compression,
@@ -1862,7 +1877,7 @@ fn validate_blob_frames(
                         path.display(),
                         entry.offset,
                     );
-                    return Ok(false);
+                    return Ok(None);
                 }
                 count += 1;
                 uncompressed_total += u64::from(entry.uncompressed_len);
@@ -1878,7 +1893,7 @@ fn validate_blob_frames(
             // A resynced frame has an unprovable boundary (damage upstream);
             // any other error is a structural or persistent frame failure.
             // Both are conclusive: this file's frames do not all verify.
-            Ok(_) | Err(_) => return Ok(false),
+            Ok(_) | Err(_) => return Ok(None),
         }
     }
 
@@ -1904,7 +1919,7 @@ fn validate_blob_frames(
                 meta.item_count,
                 meta.total_uncompressed_bytes,
             );
-            return Ok(false);
+            return Ok(None);
         }
     } else {
         // A punched file's metadata describes the WHOLE original file while
@@ -1937,10 +1952,14 @@ fn validate_blob_frames(
                 meta.item_count,
                 meta.total_uncompressed_bytes,
             );
-            return Ok(false);
+            return Ok(None);
         }
     }
-    Ok(true)
+    Ok(Some(BlobLiveTotals {
+        items: count,
+        uncompressed_bytes: uncompressed_total,
+        compressed_bytes: compressed_total,
+    }))
 }
 
 /// Whether any of `table`'s blob indirections points BELOW a recovered punched
@@ -1992,6 +2011,11 @@ struct BlobRecovery {
     /// plus a note (records recovered / lost, where the original is kept).
     /// Disjoint from `unreadable` — these files made the manifest.
     salvaged: Vec<(PathBuf, String)>,
+    /// Garbage accounting seeded for punched files: the consumed prefix is
+    /// stale by construction but can never be observed by a future
+    /// compaction, so without this seed `is_dead` could never retire the
+    /// file.
+    frag: crate::blob_tree::FragmentationMap,
 }
 
 /// Discovers the blob files of a KV-separated tree for `repair` by scanning the
@@ -2015,6 +2039,7 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
     let mut rewrites: crate::HashMap<crate::vlog::BlobFileId, crate::salvage::BlobFileRewrite> =
         crate::HashMap::default();
     let mut salvaged_notes: Vec<(PathBuf, String)> = Vec::new();
+    let mut frag = crate::blob_tree::FragmentationMap::default();
 
     // No `blobs/` folder = no blob files (a blob tree that never spilled a value
     // to the value log). Nothing to recover; the manifest records an empty list.
@@ -2024,6 +2049,7 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
             unreadable,
             rewrites,
             salvaged: salvaged_notes,
+            frag,
         });
     }
 
@@ -2272,8 +2298,7 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
         // canonical name and bless it as an ordinary intact blob (its offset
         // remap lives only in this invocation, so the referencing SSTs would
         // keep their old, now-wrong offsets).
-        let frames_valid = validate_blob_frames(config, &blob_path, blob_id, frontier)?;
-        if !frames_valid {
+        let Some(live) = validate_blob_frames(config, &blob_path, blob_id, frontier)? else {
             let temp = blobs_folder.join(format!("{blob_id}.salvage-tmp"));
             let _ = config.fs.remove_file(&temp);
             let salvage = (|| -> crate::Result<Option<(crate::vlog::BlobFile, crate::salvage::BlobSalvageReport)>> {
@@ -2379,7 +2404,7 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
                 ),
             ));
             continue;
-        }
+        };
 
         // The digest covers the live region only — `[frontier, end)` for a
         // punched file, the whole file for `frontier == 0` — matching what
@@ -2409,6 +2434,26 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
                         blob_id,
                         crate::salvage::BlobFileRewrite::DropBelow(frontier),
                     );
+                    // Seed the punched prefix's garbage: the recovered handle
+                    // keeps its WHOLE-FILE metadata totals, while the prefix's
+                    // frames can never be observed by a future compaction. An
+                    // empty fragmentation map would pin the recorded stale
+                    // bytes below the totals forever, so `is_dead` could
+                    // never retire the file even after every suffix handle is
+                    // gone. The differences cannot underflow: validation just
+                    // proved the metadata totals are at least the suffix's.
+                    let meta = bf.meta();
+                    let prefix_items = meta.item_count - live.items;
+                    let prefix_len =
+                        usize::try_from(prefix_items).map_err(|_| crate::Error::Unrecoverable)?;
+                    frag.insert(
+                        blob_id,
+                        crate::blob_tree::FragmentationEntry::new(
+                            prefix_len,
+                            meta.total_uncompressed_bytes - live.uncompressed_bytes,
+                            meta.total_compressed_bytes - live.compressed_bytes,
+                        ),
+                    );
                 }
                 kept_paths.insert(blob_id, blob_path);
                 blob_files.push(bf);
@@ -2426,6 +2471,7 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
         unreadable,
         rewrites,
         salvaged: salvaged_notes,
+        frag,
     })
 }
 
@@ -3426,11 +3472,13 @@ fn repair_tree(
         crate::salvage::BlobFileRewrite,
     > = crate::HashMap::default();
     let mut blob_files_salvaged: Vec<(PathBuf, String)> = Vec::new();
+    let mut blob_frag = crate::blob_tree::FragmentationMap::default();
     let (tree_type, blob_file_list) = if config.kv_separation_opts.is_some() {
         let recovery = recover_blob_files(config)?;
         unreadable_files.extend(recovery.unreadable);
         blob_rewrites = recovery.rewrites;
         blob_files_salvaged = recovery.salvaged;
+        blob_frag = recovery.frag;
         let map: crate::HashMap<crate::vlog::BlobFileId, crate::vlog::BlobFile> =
             recovery.files.into_iter().map(|bf| (bf.id(), bf)).collect();
         (TreeType::Blob, BlobFileList::new(map))
@@ -3657,13 +3705,10 @@ fn repair_tree(
         None => 0,
     };
 
-    let version = Version::from_levels(
-        version_id,
-        tree_type,
-        levels,
-        blob_file_list,
-        crate::blob_tree::FragmentationMap::default(),
-    );
+    // Seeded with the punched prefixes' garbage: those frames can never be
+    // observed by a future compaction, so an empty map would pin every punched
+    // file's stale count below its whole-file metadata totals forever.
+    let version = Version::from_levels(version_id, tree_type, levels, blob_file_list, blob_frag);
 
     // Persist with the tree's own runtime config, not defaults: it drives the
     // manifest framing (checksum algorithm, page ECC, footer mirror, manifest

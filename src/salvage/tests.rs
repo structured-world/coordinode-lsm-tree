@@ -7370,7 +7370,6 @@ fn salvage_blob_file_recovers_every_record_of_a_healthy_file() -> crate::Result<
 /// forged via `compression#data` → Lz4.
 #[cfg(feature = "lz4")]
 #[test]
-#[expect(clippy::expect_used, reason = "test code")]
 fn publish_refuses_to_replace_a_concurrently_created_destination_without_hard_links()
 -> crate::Result<()> {
     use crate::fs::{Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions};
