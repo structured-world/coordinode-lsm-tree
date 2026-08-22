@@ -1827,8 +1827,11 @@ impl Tree {
             }
         }
         for table in version.iter_tables() {
-            for rt in table.range_tombstones() {
-                push_range_tombstone(rt);
+            // Clamped to the view's tight-space restriction: the punched
+            // prefix's deletions are re-emitted by the slice output that
+            // superseded it, so the raw list would duplicate those events.
+            for rt in table.visible_range_tombstones() {
+                push_range_tombstone(&rt);
             }
         }
 

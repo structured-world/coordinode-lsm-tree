@@ -756,6 +756,55 @@ fn reopen_restricted_yields_a_distinct_clamped_view() -> crate::Result<()> {
     )
 }
 
+/// A restricted view exposes range tombstones CLAMPED to the live suffix:
+/// a tombstone wholly below the bound is the punched prefix's deletion (the
+/// slice output that superseded the prefix carries its clipped copy), and a
+/// straddling tombstone starts at the bound. Unclamped, `scan_since` would
+/// emit the same deletion twice and cover keys this view no longer owns.
+/// The unrestricted view keeps the full list.
+#[test]
+fn restricted_view_clamps_visible_range_tombstones() -> crate::Result<()> {
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"z", b"v", 0, crate::ValueType::Value),
+    ];
+    let rt = |s: &[u8], e: &[u8], seqno| {
+        crate::range_tombstone::RangeTombstone::new(
+            crate::UserKey::from(s),
+            crate::UserKey::from(e),
+            seqno,
+        )
+    };
+    test_with_table(
+        &items,
+        |table| {
+            let unrestricted: Vec<_> = table.visible_range_tombstones().collect();
+            assert_eq!(
+                unrestricted.len(),
+                3,
+                "the unrestricted view keeps the full list: {unrestricted:?}",
+            );
+
+            let restricted = table.reopen_restricted(crate::UserKey::from(&b"g"[..]))?;
+            let visible: Vec<_> = restricted.visible_range_tombstones().collect();
+            assert_eq!(
+                visible,
+                vec![rt(b"g", b"m", 5), rt(b"p", b"r", 6)],
+                "wholly-below dropped, straddling clamped to the bound, \
+                 above-bound untouched",
+            );
+            Ok(())
+        },
+        None,
+        Some(|mut w: Writer| {
+            w.write_range_tombstone(rt(b"a", b"c", 4)); // wholly below "g"
+            w.write_range_tombstone(rt(b"a", b"m", 5)); // straddles "g"
+            w.write_range_tombstone(rt(b"p", b"r", 6)); // above "g"
+            w
+        }),
+    )
+}
+
 /// A restricted view must still cross-check its `linked_blob_files` section: the
 /// section carries no checksum, so a same-size rot that under-counts (or drops) a
 /// blob id the READABLE SUFFIX still references passes the block walk, and blob GC

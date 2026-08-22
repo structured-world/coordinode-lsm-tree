@@ -7820,6 +7820,31 @@ impl Table {
         &self.0.range_tombstones
     }
 
+    /// The range tombstones as visible through THIS view: a tight-space
+    /// restriction clamps them to the live suffix (`>= bound`). The punched
+    /// prefix's deletions belong to the slice output that superseded it, so
+    /// exposing them unclamped would emit a change-data-capture event twice
+    /// (once from the clipped copy in the slice output, once from here) and
+    /// cover keys this view no longer owns. Read-path masking keeps using
+    /// the raw list — an over-wide tombstone there only masks keys the
+    /// restricted view refuses to serve anyway.
+    pub(crate) fn visible_range_tombstones(&self) -> impl Iterator<Item = RangeTombstone> + '_ {
+        self.0.range_tombstones.iter().filter_map(move |rt| {
+            let Some(bound) = self.1.as_ref() else {
+                return Some(rt.clone());
+            };
+            // Live keys are `>= bound`; a tombstone covers `[start, end)`.
+            if self.comparator.compare(&rt.end, bound) != core::cmp::Ordering::Greater {
+                // Wholly below the restriction: every covered key is punched.
+                return None;
+            }
+            if self.comparator.compare(&rt.start, bound) == core::cmp::Ordering::Less {
+                return Some(RangeTombstone::new(bound.clone(), rt.end.clone(), rt.seqno));
+            }
+            Some(rt.clone())
+        })
+    }
+
     pub(crate) fn mark_as_deleted(&self) {
         self.0
             .is_deleted
