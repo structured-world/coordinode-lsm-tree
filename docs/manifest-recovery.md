@@ -242,7 +242,11 @@ The recovered file's digest covers the live region, `[frontier, end)`, and the
 rebuilt snapshot re-persists the restriction from the recovered frontier, so a
 later relocation resumes exactly where the punch stopped. No resurrection
 question arises: blob bytes are reachable only through value handles, so a
-frontier recovered too low exposes nothing.
+frontier recovered too low exposes nothing. The rebuilt manifest's garbage
+accounting is seeded with the punched prefix (whole-file metadata totals minus
+the validation scan's live-suffix totals): no future compaction can observe
+the consumed frames, so without the seed the file's stale count could never
+reach its metadata totals and blob GC could never retire it.
 
 Zeros through the *whole* data section mean the punch consumed every frame:
 the relocation completed and only the file's removal lagged the crash.
