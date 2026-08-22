@@ -253,8 +253,10 @@ the relocation completed and only the file's removal lagged the crash.
 Recovery completes that drop instead of publishing an empty-suffix handle —
 whole-file metadata over zero live frames would leave a file blob GC's
 stale-byte arithmetic can never retire. No live data is discarded: the walk
-proved nothing live remains, and if the removal itself fails the file stays a
-harmless orphan outside the manifest that the next open sweeps.
+proved nothing live remains. If the removal fails persistently, the file is
+durably moved into quarantine and reported instead of being left in `blobs/`
+— an orphan there would make the next open's sweep hit the same removal
+failure, so repair would claim success for a tree that cannot open.
 
 ## Blob frame validation and salvage
 
