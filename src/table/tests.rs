@@ -756,6 +756,52 @@ fn reopen_restricted_yields_a_distinct_clamped_view() -> crate::Result<()> {
     )
 }
 
+/// A restricted view's compaction scanner must start at the restriction:
+/// the punched prefix reads as zeros (a raw scan aborts on the first punched
+/// block), and even before the punch runs, the sub-bound rows' authoritative
+/// copies live in the superseding slice output — a serial compaction reading
+/// them through the restricted input would merge every prefix row twice.
+/// The unrestricted view keeps scanning the whole file.
+#[test]
+#[expect(clippy::unwrap_used)]
+fn restricted_view_scan_starts_at_the_bound() -> crate::Result<()> {
+    let items: Vec<_> = (0..40u32)
+        .map(|i| {
+            crate::InternalValue::from_components(
+                format!("key{i:03}").into_bytes(),
+                b"v".as_slice(),
+                0,
+                crate::ValueType::Value,
+            )
+        })
+        .collect();
+    test_with_table(
+        &items,
+        |table| {
+            let restricted = table.reopen_restricted(crate::UserKey::from(&b"key020"[..]))?;
+            let keys: Vec<_> = restricted
+                .scan()?
+                .map(|r| r.unwrap().key.user_key)
+                .collect();
+            let expected: Vec<_> = (20..40u32)
+                .map(|i| crate::UserKey::from(format!("key{i:03}").into_bytes()))
+                .collect();
+            assert_eq!(
+                keys, expected,
+                "the restricted scan must yield only keys at or past the bound",
+            );
+
+            let full = table.scan()?.count();
+            assert_eq!(full, 40, "the unrestricted view scans the whole file");
+            Ok(())
+        },
+        None,
+        // Tiny blocks so the table spans several data blocks and the bound
+        // lands mid-file (skipped whole blocks + a straddling block).
+        Some(|w: Writer| w.use_data_block_size(64)),
+    )
+}
+
 /// A restricted view exposes range tombstones CLAMPED to the live suffix:
 /// a tombstone wholly below the bound is the punched prefix's deletion (the
 /// slice output that superseded the prefix carries its clipped copy), and a

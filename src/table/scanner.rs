@@ -52,6 +52,15 @@ pub struct Scanner {
     /// Data-block restart interval, used to re-encode a reconstructed columnar
     /// block (matches the value the SST recorded).
     restart_interval: u8,
+
+    /// Tight-space restriction lower bound of the view being scanned. The
+    /// caller already positions the scan at the first live block; this filter
+    /// drops the sub-bound entries of that STRADDLING block (their
+    /// authoritative copies live in the superseding slice output).
+    lower_bound: Option<crate::UserKey>,
+    /// `true` while entries may still fall below `lower_bound`. Keys ascend,
+    /// so once one entry reaches the bound the comparison is retired.
+    filtering_below_bound: bool,
 }
 
 impl Scanner {
@@ -76,6 +85,8 @@ impl Scanner {
         table_id: crate::TableId,
         columnar: bool,
         restart_interval: u8,
+        start_offset: u64,
+        lower_bound: Option<crate::UserKey>,
     ) -> crate::Result<Self> {
         // 2 MiB buffer matches RocksDB's `compaction_readahead_size`
         // default and is large enough that the kernel can fold the
@@ -88,7 +99,7 @@ impl Scanner {
         // tuning beyond this would benefit from a configurable knob,
         // tracked as the configurable-readahead follow-up under #133.
         const SCANNER_READAHEAD_BYTES: usize = 2 * 1024 * 1024;
-        let file = fs.open(path, &FsOpenOptions::new().read(true))?;
+        let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
         // The scanner walks every block in order — tell the kernel so
         // it can ramp readahead aggressively and evict already-read
         // pages instead of pinning them. Best-effort: hint() is
@@ -96,6 +107,16 @@ impl Scanner {
         // on the default heuristic, so drop the error rather than
         // failing the open.
         let _ = file.hint(FileHint::Sequential);
+        // A tight-space restricted view starts at its first LIVE block: the
+        // blocks below it are hole-punched (they read as zeros and cannot
+        // decode). `block_count` was reduced by the caller to match.
+        if start_offset > 0 {
+            #[cfg(not(feature = "std"))]
+            use crate::io::{Seek, SeekFrom};
+            #[cfg(feature = "std")]
+            use std::io::{Seek, SeekFrom};
+            file.seek(SeekFrom::Start(start_offset))?;
+        }
         let mut reader = BufReader::with_capacity(SCANNER_READAHEAD_BYTES, file);
 
         let block = Self::fetch_next_block(
@@ -134,6 +155,9 @@ impl Scanner {
             table_id,
             columnar,
             restart_interval,
+
+            filtering_below_bound: lower_bound.is_some(),
+            lower_bound,
         })
     }
 
@@ -231,6 +255,18 @@ impl Iterator for Scanner {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(mut item) = self.iter.next() {
+                // Sub-bound entries of the straddling first block belong to
+                // the slice output that superseded the punched prefix; keys
+                // ascend, so the comparison retires at the first live entry.
+                if self.filtering_below_bound {
+                    if let Some(bound) = &self.lower_bound
+                        && self.comparator.compare(&item.key.user_key, bound.as_ref())
+                            == core::cmp::Ordering::Less
+                    {
+                        continue;
+                    }
+                    self.filtering_below_bound = false;
+                }
                 item.key.seqno += self.global_seqno;
                 return Some(Ok(item));
             }

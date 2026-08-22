@@ -5895,11 +5895,34 @@ impl Table {
             clippy::expect_used,
             reason = "there shouldn't be 4 billion data blocks in a single table"
         )]
-        let block_count = self
+        let mut block_count: usize = self
             .metadata
             .data_block_count
             .try_into()
             .expect("data block count should fit");
+
+        // Tight-space restriction: start at the first LIVE block. Blocks
+        // wholly below the bound are hole-punched (they read as zeros and
+        // cannot decode), and even before the punch runs their rows'
+        // authoritative copies live in the superseding slice output — a
+        // compaction reading them here would merge every prefix row twice.
+        // The bound never exceeds the table's last key, so at least one live
+        // block always remains; the straddling block's sub-bound entries are
+        // dropped by the scanner's key filter.
+        let mut start_offset = 0u64;
+        if let Some(bound) = &self.1 {
+            for keyed in self.block_index.iter() {
+                let keyed = keyed?;
+                if self.comparator.compare(keyed.end_key(), bound.as_ref())
+                    == core::cmp::Ordering::Less
+                {
+                    block_count = block_count.saturating_sub(1);
+                    continue;
+                }
+                start_offset = keyed.offset().0;
+                break;
+            }
+        }
 
         Scanner::new(
             &self.fs,
@@ -5916,6 +5939,8 @@ impl Table {
             self.metadata.id,
             self.metadata.columnar,
             self.metadata.data_block_restart_interval,
+            start_offset,
+            self.1.clone(),
         )
     }
 
