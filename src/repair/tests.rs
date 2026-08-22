@@ -2349,31 +2349,34 @@ fn same_physical_file_ignores_host_symlinks_for_a_virtual_backend() -> crate::Re
     use std::io::Write;
     use std::sync::Arc;
 
-    // Host: real directory `x` with a file, and symlink `y` -> `x`, so
-    // `x/0` and `y/0` canonicalize to the SAME host inode.
+    // Host: a real directory with a file, and a symlink to it, so the two
+    // path spellings canonicalize to the SAME host inode.
     let dir = tempfile::tempdir()?;
-    let x = dir.path().join("x");
-    std::fs::create_dir(&x)?;
-    std::fs::write(x.join("0"), b"host bytes")?;
-    let y = dir.path().join("y");
-    std::os::unix::fs::symlink(&x, &y)?;
+    let real_dir = dir.path().join("x");
+    std::fs::create_dir(&real_dir)?;
+    std::fs::write(real_dir.join("0"), b"host bytes")?;
+    let linked_dir = dir.path().join("y");
+    std::os::unix::fs::symlink(&real_dir, &linked_dir)?;
 
     // Virtual backend: the SAME two path strings name two DISTINCT files.
     let memfs: Arc<dyn Fs> = Arc::new(MemFs::new());
-    let (a, b) = (x.join("0"), y.join("0"));
-    for (path, bytes) in [(&a, b"first".as_slice()), (&b, b"second".as_slice())] {
+    let (real_path, linked_path) = (real_dir.join("0"), linked_dir.join("0"));
+    for (path, bytes) in [
+        (&real_path, b"first".as_slice()),
+        (&linked_path, b"second".as_slice()),
+    ] {
         if let Some(parent) = path.parent() {
             memfs.create_dir_all(parent)?;
         }
-        let mut f = memfs.open(
+        let mut file = memfs.open(
             path,
             &crate::fs::FsOpenOptions::new().write(true).create(true),
         )?;
-        f.write_all(bytes)?;
+        file.write_all(bytes)?;
     }
 
     assert!(
-        !super::same_physical_file(&*memfs, &a, &*memfs, &b),
+        !super::same_physical_file(&*memfs, &real_path, &*memfs, &linked_path),
         "a host symlink must not alias two distinct virtual files",
     );
     Ok(())
