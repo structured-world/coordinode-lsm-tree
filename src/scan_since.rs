@@ -106,4 +106,36 @@ impl ScanSinceEvent {
             | Self::RangeTombstone { seqno, .. } => *seqno,
         }
     }
+
+    /// Total order the scanner sorts with: seqno first (the public replay
+    /// contract), then a deterministic tie-break over the full payload so
+    /// byte-identical events land ADJACENT and a single `dedup` pass can
+    /// collapse them. Identical copies are a real post-repair state — a
+    /// manifest-loss repair publishes every surviving SST, including both
+    /// the inputs and outputs of a compaction that crashed before deleting
+    /// its inputs — and each copy carries the same key, value, and seqno.
+    pub(crate) fn replay_ordering(&self, other: &Self) -> core::cmp::Ordering {
+        fn rank(e: &ScanSinceEvent) -> u8 {
+            match e {
+                ScanSinceEvent::Insert { .. } => 0,
+                ScanSinceEvent::MergeOperand { .. } => 1,
+                ScanSinceEvent::PointTombstone { .. } => 2,
+                ScanSinceEvent::RangeTombstone { .. } => 3,
+            }
+        }
+        fn payload(e: &ScanSinceEvent) -> (&Slice, Option<&Slice>) {
+            match e {
+                ScanSinceEvent::Insert { key, value, .. } => (key, Some(value)),
+                ScanSinceEvent::MergeOperand { key, operand, .. } => (key, Some(operand)),
+                ScanSinceEvent::PointTombstone { key, .. } => (key, None),
+                ScanSinceEvent::RangeTombstone {
+                    start_key, end_key, ..
+                } => (start_key, Some(end_key)),
+            }
+        }
+        self.seqno()
+            .cmp(&other.seqno())
+            .then_with(|| rank(self).cmp(&rank(other)))
+            .then_with(|| payload(self).cmp(&payload(other)))
+    }
 }

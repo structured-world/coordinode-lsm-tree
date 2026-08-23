@@ -530,3 +530,54 @@ fn scan_since_with_locator_enabled_is_correct() -> lsm_tree::Result<()> {
     }
     Ok(())
 }
+
+/// One committed change must be emitted ONCE even when the record physically
+/// lives in two published tables. That state is real: a manifest-loss repair
+/// publishes every surviving SST as its own L0 run, including both the inputs
+/// and outputs of a compaction that crashed before deleting its inputs (or a
+/// tight-space input whose restriction sidecar failed to persist alongside
+/// the slice output that re-emitted its prefix). The copies are byte-identical
+/// (same key, value, and seqno), so the scanner deduplicates them; without
+/// that, a CDC consumer replays every affected change twice.
+#[test]
+fn scan_since_deduplicates_identical_events_from_duplicated_tables() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path())?;
+
+    // Two SSTs carrying the SAME committed changes — the post-repair shape of
+    // an input + output pair.
+    tree.insert(b"dup", b"v1", 10);
+    tree.remove_range(b"a", b"m", 11);
+    tree.flush_active_memtable(0)?;
+    tree.insert(b"dup", b"v1", 10);
+    tree.remove_range(b"a", b"m", 11);
+    tree.flush_active_memtable(0)?;
+
+    // A distinct change with the SAME seqno as the duplicated insert (a write
+    // batch commits many keys under one seqno) must NOT be collapsed.
+    tree.insert(b"other", b"v2", 10);
+    tree.flush_active_memtable(0)?;
+
+    let got = events(&tree, 0)?;
+    assert_eq!(
+        got.len(),
+        3,
+        "the duplicated insert and range tombstone are each emitted once, \
+         the distinct same-seqno insert stays: {got:?}",
+    );
+    assert_eq!(
+        got.iter()
+            .filter(|e| matches!(e, ScanSinceEvent::Insert { key, .. } if key.as_ref() == b"dup"))
+            .count(),
+        1,
+        "the byte-identical duplicated insert must be deduplicated: {got:?}",
+    );
+    assert_eq!(
+        got.iter()
+            .filter(|e| matches!(e, ScanSinceEvent::RangeTombstone { .. }))
+            .count(),
+        1,
+        "the byte-identical duplicated range tombstone must be deduplicated: {got:?}",
+    );
+    Ok(())
+}

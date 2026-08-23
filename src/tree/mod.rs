@@ -1835,8 +1835,19 @@ impl Tree {
             }
         }
 
-        // Replay order is increasing seqno across every source.
-        events.sort_by_key(ScanSinceEvent::seqno);
+        // Replay order is increasing seqno across every source; the ordering's
+        // payload tie-break makes byte-identical copies adjacent so one dedup
+        // pass collapses them. One committed change can physically live in TWO
+        // published tables: a manifest-loss repair publishes every surviving
+        // SST as its own L0 run, including both the inputs and outputs of a
+        // compaction that crashed before deleting its inputs (or a tight-space
+        // input whose restriction sidecar failed to persist alongside the
+        // slice output that re-emitted its prefix). Point reads shadow such
+        // copies by seqno, but this enumeration would deliver the change twice
+        // to a CDC consumer. Distinct same-seqno events (one write batch spans
+        // many keys) differ in payload and are preserved.
+        events.sort_by(ScanSinceEvent::replay_ordering);
+        events.dedup();
 
         Ok(events.into_iter())
     }
