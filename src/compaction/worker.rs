@@ -986,8 +986,12 @@ fn run_tight_space_compaction(
             // return its space immediately, and this loop rolls back exactly
             // when space is scarce.
             for table in &outputs {
-                table.install_deletion_pause(Arc::clone(&opts.deletion_pause));
-                table.install_heal_hints(Arc::clone(&opts.heal_hints));
+                table.bind_to_tree(&crate::table::TableSinks {
+                    deletion_pause: &opts.deletion_pause,
+                    heal_hints: &opts.heal_hints,
+                    #[cfg(feature = "std")]
+                    background_deleter: None,
+                });
             }
             // KV-separation: blob files this slice relocated live entries into,
             // plus the GC diff of entries it dropped.

@@ -146,6 +146,29 @@ enum UnshareState {
 ///
 /// Deleted entries are represented by tombstones.
 ///
+/// The tree-wide machinery a freshly created table must be bound to before it
+/// becomes reachable, passed to [`Table::bind_to_tree`].
+///
+/// Collected in one type on purpose: publication happens from several places
+/// (flush, recovery, ingest, compaction, the tight-space slice loop), and
+/// having each install sinks by hand is what let two of them silently drift
+/// into publishing tables that could never schedule their own healing.
+pub(crate) struct TableSinks<'a> {
+    /// Defers cleanup while a checkpoint is capturing, so an in-place heal
+    /// cannot race a hard-link.
+    pub deletion_pause: &'a Arc<crate::deletion_pause::DeletionPause>,
+    /// Where a confirmed-persistent ECC correction queues the table for a
+    /// healing rewrite.
+    pub heal_hints: &'a Arc<crate::heal_hints::HealHints>,
+    /// Moves an obsolete table's `unlink` off the foreground path.
+    ///
+    /// `None` for outputs that can be ROLLED BACK: the tight-space slice loop
+    /// rolls back exactly when free space is scarce, and there the space has
+    /// to come back now rather than when a background pass gets to it.
+    #[cfg(feature = "std")]
+    pub background_deleter: Option<&'a Arc<crate::BackgroundDeleter>>,
+}
+
 /// Tables can be merged together to improve read performance and free unneeded disk space by removing outdated item versions.
 #[doc(alias("sstable", "sst", "sorted string table"))]
 #[derive(Clone)]
@@ -7748,6 +7771,28 @@ impl Table {
     /// healing recompaction.
     pub(crate) fn install_heal_hints(&self, hints: Arc<crate::heal_hints::HealHints>) {
         let _ = self.0.heal_hints.set(Box::new(hints));
+    }
+
+    /// Binds this freshly created table to the tree's shared machinery.
+    ///
+    /// **Every path that makes a new table reachable must call this**, and
+    /// nothing else should install the individual sinks by hand: a table is
+    /// only correct once it is bound, and hand-rolled installation at each
+    /// publication site is how sites come to differ. A table that skips it
+    /// looks perfectly healthy and fails silently and much later — a
+    /// confirmed-persistent ECC correction can never queue it for a healing
+    /// rewrite, so the bitrot stays on disk and every read pays the
+    /// correction again, and its in-place heal can race a checkpoint's
+    /// hard-link.
+    ///
+    /// Idempotent per sink, so re-binding a table is harmless.
+    pub(crate) fn bind_to_tree(&self, sinks: &TableSinks<'_>) {
+        self.install_deletion_pause(Arc::clone(sinks.deletion_pause));
+        self.install_heal_hints(Arc::clone(sinks.heal_hints));
+        #[cfg(feature = "std")]
+        if let Some(deleter) = sinks.background_deleter {
+            self.install_background_deleter(Arc::clone(deleter));
+        }
     }
 
     /// The installed heal-hint sink, exposed so tests outside this module can

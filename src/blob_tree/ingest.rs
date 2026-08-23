@@ -242,6 +242,19 @@ impl<'a> BlobIngestion<'a> {
             })
             .collect::<crate::Result<Vec<_>>>()?;
 
+        // Bind every ingested table to the tree BEFORE the version edit makes
+        // it reachable — see the same step in the standard tree's ingest.
+        // Without it an ingested SST can never queue itself for a healing
+        // rewrite, and its in-place heal can race a checkpoint hard-link.
+        for table in &created_tables {
+            table.bind_to_tree(&crate::table::TableSinks {
+                deletion_pause: &index.deletion_pause,
+                heal_hints: &index.heal_hints,
+                #[cfg(feature = "std")]
+                background_deleter: Some(&index.background_deleter),
+            });
+        }
+
         // Upgrade the version with our ingested tables and blob files, using
         // the global_seqno we allocated earlier. This ensures the version,
         // tables, and blob files all share the same sequence number, which is

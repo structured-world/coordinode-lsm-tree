@@ -961,10 +961,12 @@ impl AbstractTree for Tree {
         // file so an in-flight checkpoint defers their cleanup if they
         // later get marked `is_deleted` by compaction.
         for table in tables {
-            table.install_deletion_pause(Arc::clone(&self.deletion_pause));
-            #[cfg(feature = "std")]
-            table.install_background_deleter(Arc::clone(&self.background_deleter));
-            table.install_heal_hints(Arc::clone(&self.heal_hints));
+            table.bind_to_tree(&crate::table::TableSinks {
+                deletion_pause: &self.deletion_pause,
+                heal_hints: &self.heal_hints,
+                #[cfg(feature = "std")]
+                background_deleter: Some(&self.background_deleter),
+            });
         }
         if let Some(bfs) = blob_files {
             for bf in bfs {
@@ -4009,10 +4011,12 @@ impl Tree {
         let recovered_blobs: Vec<BlobFile> = version.blob_files.iter().cloned().collect();
 
         for table in &recovered_tables {
-            table.install_deletion_pause(Arc::clone(&deletion_pause));
-            #[cfg(feature = "std")]
-            table.install_background_deleter(Arc::clone(&background_deleter));
-            table.install_heal_hints(Arc::clone(&heal_hints));
+            table.bind_to_tree(&crate::table::TableSinks {
+                deletion_pause: &deletion_pause,
+                heal_hints: &heal_hints,
+                #[cfg(feature = "std")]
+                background_deleter: Some(&background_deleter),
+            });
         }
         for blob_file in &recovered_blobs {
             blob_file.install_deletion_pause(Arc::clone(&deletion_pause));

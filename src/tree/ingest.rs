@@ -479,6 +479,21 @@ impl<'a> Ingestion<'a> {
             })
             .collect::<crate::Result<Vec<_>>>()?;
 
+        // Bind every ingested table to the tree BEFORE the version edit makes
+        // it reachable. Ingest builds and publishes its tables itself rather
+        // than going through `register_tables`, so without this an ingested
+        // SST could never queue itself for a healing rewrite (its bitrot would
+        // be re-corrected on every read but never repaired on disk) and its
+        // in-place heal could race a checkpoint hard-link.
+        for table in &created_tables {
+            table.bind_to_tree(&crate::table::TableSinks {
+                deletion_pause: &self.tree.deletion_pause,
+                heal_hints: &self.tree.heal_hints,
+                #[cfg(feature = "std")]
+                background_deleter: Some(&self.tree.background_deleter),
+            });
+        }
+
         // Upgrade the version with our ingested tables, using the global_seqno
         // we allocated earlier. This ensures the version and all tables share
         // the same sequence number.

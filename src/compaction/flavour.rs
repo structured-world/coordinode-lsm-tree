@@ -369,8 +369,12 @@ pub(super) fn install_merge(
     // point: the space must come back now, not when a background pass gets to
     // it. Flush outputs, which have no such rollback, keep it.
     for table in &created_tables {
-        table.install_deletion_pause(alloc::sync::Arc::clone(&opts.deletion_pause));
-        table.install_heal_hints(alloc::sync::Arc::clone(&opts.heal_hints));
+        table.bind_to_tree(&crate::table::TableSinks {
+            deletion_pause: &opts.deletion_pause,
+            heal_hints: &opts.heal_hints,
+            #[cfg(feature = "std")]
+            background_deleter: None,
+        });
     }
 
     // Globally-dead blob files are dropped once, from the install-time version.

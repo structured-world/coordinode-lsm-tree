@@ -1207,6 +1207,70 @@ fn heal_skips_blocks_below_the_restriction_bound() -> crate::Result<()> {
     Ok(())
 }
 
+/// EVERY table the tree makes reachable must carry the heal-hint sink,
+/// whichever path published it. A table that skips it looks perfectly healthy
+/// and fails silently much later: a confirmed-persistent ECC correction can
+/// never queue it for a healing rewrite, so the bitrot stays on disk and every
+/// read pays the correction again.
+///
+/// Publication happens from several places — flush, compaction, and bulk
+/// ingest, which builds and installs its tables itself — and each one binding
+/// the sinks by hand is what let two of them drift. This walks the live
+/// version after exercising all three, so a future path that forgets is
+/// caught here rather than in a support ticket.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn every_published_table_carries_the_heal_hint_sink() -> crate::Result<()> {
+    use crate::AbstractTree;
+
+    let dir = tempfile::tempdir()?;
+    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(crate::fs::StdFs));
+
+    // Flush, then compaction over two flushed tables.
+    for round in 0..2u64 {
+        for i in 0..32u64 {
+            tree.insert(
+                format!("key-{i:06}").as_bytes(),
+                format!("v{round}").as_bytes(),
+                round * 100 + i,
+            );
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    tree.major_compact(u64::MAX, 1_000)?;
+
+    // Bulk ingest, which publishes its tables without going through the
+    // flush path's registration.
+    let mut ingestion = crate::tree::ingest::Ingestion::new(&tree)?;
+    for i in 0..16u64 {
+        ingestion.write(
+            format!("ingested-{i:06}").as_bytes().into(),
+            format!("i{i}").as_bytes().into(),
+        )?;
+    }
+    ingestion.finish()?;
+
+    let live: Vec<_> = {
+        let binding = tree.version_history.read().latest_version();
+        binding.version.iter_tables().cloned().collect()
+    };
+    assert!(
+        live.len() >= 2,
+        "flush, compaction and ingest all published"
+    );
+    for table in &live {
+        assert!(
+            table
+                .heal_hints_for_test()
+                .is_some_and(|sink| std::sync::Arc::ptr_eq(&sink, &tree.heal_hints)),
+            "live table {} carries no heal-hint sink: a correctable fault in \
+             it could never schedule a durable heal",
+            table.id(),
+        );
+    }
+    Ok(())
+}
+
 /// Compaction installs its outputs directly instead of going through
 /// `register_tables`, so it must install the same tree-wide sinks a flush
 /// gets — the heal-hint sink included. Without it a confirmed-persistent ECC
