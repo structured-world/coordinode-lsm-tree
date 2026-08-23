@@ -5881,6 +5881,9 @@ fn blob_frame_validation_rejects_reordered_frames() -> crate::Result<()> {
 /// every live read of the value fails. Frame validation must decompress each
 /// payload before accepting the file — otherwise the rebuilt manifest
 /// launders exactly the corruption its digest is supposed to expose.
+// Needs a compressor: the whole point is a COMPRESSED payload whose frame
+// checksum was restamped, which cannot be built without one.
+#[cfg(feature = "lz4")]
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
 fn blob_frame_validation_rejects_a_restamped_compressed_payload() -> crate::Result<()> {
@@ -7206,19 +7209,16 @@ fn repair_salvages_a_frame_corrupt_blob_and_remaps_handles() -> crate::Result<()
     Ok(())
 }
 
-/// A repair that crashes AFTER publishing a salvaged blob replacement but
-/// BEFORE rewriting the referencing SSTs must leave enough durable state for
-/// a retry to finish the relocation. The replacement validates as an
-/// ordinary intact blob on the retry, so without the remap sidecar the retry
-/// would bless it as-is while every SST handle still points at the OLD
-/// offsets — reads of every surviving record would fail. The salvage here
-/// runs from a punched frontier, so the replacement's offsets genuinely
-/// SHIFT (a whole-file salvage happens to re-emit at identical offsets and
-/// would mask the bug).
+/// A repair that fails part-way must leave the tree byte-for-byte as it was
+/// found, so the retry re-derives everything from the untouched originals.
+/// This is what makes recovery safe without a journal: the salvaged
+/// replacement is written under a FRESH blob id and the damaged original is
+/// left alone, so nothing a crashed attempt did has to be understood — or
+/// undone — by the next one. The fault here lands in the table-rewrite
+/// stage, after the blob stage has already produced a replacement.
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
-fn a_repair_retry_after_a_crash_between_blob_publish_and_table_rewrite_completes_the_remap()
--> crate::Result<()> {
+fn a_failed_repair_leaves_the_originals_intact_and_the_retry_succeeds() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
     use crate::io::ErrorKind;
     use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
@@ -7305,10 +7305,8 @@ fn a_repair_retry_after_a_crash_between_blob_publish_and_table_rewrite_completes
         ))
     };
 
-    // First attempt: the blob stage completes (replacement published, remap
-    // sidecar written), then the table-rewrite stage hits a transient fault
-    // reading the quarantined SST and the repair propagates it — the crash
-    // window between the two stages.
+    // First attempt: the blob stage produces a replacement, then the
+    // table-rewrite stage hits a transient fault and the repair propagates it.
     let fault = FaultFs::new((*memfs).clone());
     fault.injector().arm(
         FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Interrupted))
@@ -7319,23 +7317,20 @@ fn a_repair_retry_after_a_crash_between_blob_publish_and_table_rewrite_completes
         result.is_err(),
         "the transient table-stage failure must propagate: {result:?}",
     );
+    // The damaged original is still there, untouched: nothing was published
+    // over it, so the retry has the same inputs the first attempt had.
     assert!(
-        memfs.exists(&blobs.join("0.remap"))?,
-        "the published replacement must leave its remap durably recorded, or \
-         the retry cannot rewrite the referencing tables",
+        memfs.exists(&blob_path)?,
+        "a failed repair must leave the damaged original in place — the \
+         tables it has not rewritten yet still reference it",
     );
 
-    // Retry with the fault gone: it adopts the sidecar, rewrites the SST
-    // through the recorded remap, and removes the sidecar before committing.
+    // Retry with the fault gone: it re-derives the whole picture from those
+    // untouched originals; no state from the crashed attempt is consulted.
     let report = config(memfs.clone()).repair()?;
     assert_eq!(
         report.recovered, 1,
         "the referencing table survives the retry, rewritten: {report:?}",
-    );
-    assert!(
-        !memfs.exists(&blobs.join("0.remap"))?,
-        "the sidecar is consumed by the retry: a stale one under a committed \
-         manifest would poison a later repair's rewrite set",
     );
 
     let tree = match config(memfs).open()? {
@@ -7396,17 +7391,17 @@ fn punch_and_corrupt_blob(
     Ok(())
 }
 
-/// A blob newly damaged BETWEEN a crashed repair and its retry must not make
-/// the retry un-recognize tables the crashed attempt already rewrote. The
-/// stamps are per blob: a table stamped for blob 0's remap is skipped even
-/// though the retry's rewrite set grew to also cover blob 1 — recognizing
-/// rewrites by a whole-set fingerprint would instead pass the table through
-/// blob 0's remap AGAIN, and its already-relocated handles (absent from the
-/// map's source offsets) would be dropped as dead records.
+/// The inputs may CHANGE between a failed repair and its retry — here a
+/// second blob file is damaged in between — and the retry must still produce
+/// a correct tree. It does because it carries nothing forward: each run
+/// re-derives its whole picture from the artifacts it finds, so a larger set
+/// of damage is simply a different derivation, not a reconciliation problem.
+/// (An earlier design recorded what the previous run had done and had to
+/// recognise it again afterwards, which is exactly what a changing input set
+/// breaks.)
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
-fn a_blob_damaged_between_repair_attempts_must_not_unrecognize_stamped_tables() -> crate::Result<()>
-{
+fn a_retry_handles_damage_that_appeared_after_the_failed_attempt() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
     use crate::io::ErrorKind;
     use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
@@ -7470,42 +7465,28 @@ fn a_blob_damaged_between_repair_attempts_must_not_unrecognize_stamped_tables() 
         ))
     };
 
-    // First attempt: blob 0 is salvaged and its referencing SST is rewritten
-    // (stamped), then the sidecar cleanup — which runs after the table stage,
-    // before the manifest commit — fails persistently: the crash point where
-    // rewritten, stamped tables and the surviving sidecar coexist.
+    // First attempt: blob 0 is salvaged, then the table-rewrite stage fails.
     let fault = FaultFs::new((*memfs).clone());
     fault.injector().arm(
-        FaultRule::new(
-            FaultOp::RemoveFile,
-            Fault::Error(ErrorKind::PermissionDenied),
-        )
-        .on_path("remap"),
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Interrupted))
+            .on_path("repair-quarantine"),
     );
     let result = config(Arc::new(fault)).repair();
     assert!(
         result.is_err(),
-        "the sidecar-cleanup failure must fail the repair: {result:?}",
-    );
-    assert!(
-        memfs.exists(&blobs.join("0.remap"))?,
-        "the crash point leaves blob 0's sidecar in place",
+        "the table-stage failure must propagate: {result:?}",
     );
 
-    // Blob 1 is damaged BETWEEN the attempts — the retry's rewrite set grows.
+    // Blob 1 is damaged BETWEEN the attempts, so the retry faces MORE damage
+    // than the failed attempt did.
     punch_and_corrupt_blob(&memfs, &blobs.join("1"))?;
 
-    // Retry: blob 0's remap is adopted from the sidecar and blob 1 is newly
-    // salvaged. The stamped table (blob 0's) must be recognized per blob and
-    // kept; only blob 1's table is rewritten.
+    // The retry salvages both blobs and rewrites both tables, deriving all of
+    // it from the originals, which the failed attempt left untouched.
     let report = config(memfs.clone()).repair()?;
     assert_eq!(
         report.recovered, 2,
         "both referencing tables survive the retry: {report:?}",
-    );
-    assert!(
-        !memfs.exists(&blobs.join("0.remap"))? && !memfs.exists(&blobs.join("1.remap"))?,
-        "both sidecars are consumed by the successful retry",
     );
 
     let tree = match config(memfs).open()? {
@@ -7534,76 +7515,8 @@ fn a_blob_damaged_between_repair_attempts_must_not_unrecognize_stamped_tables() 
     Ok(())
 }
 
-/// A blob whose remap sidecar survives a crash but arrives CORRUPT must fail
-/// the repair closed: the replacement alone cannot say where its records used
-/// to live, so rewriting the referencing tables from a guessed map would
-/// corrupt reads. The operator retries after restoring the sidecar or
-/// accepts the loss explicitly.
-#[test]
-fn repair_fails_closed_on_a_corrupt_blob_remap_sidecar() -> crate::Result<()> {
-    use crate::fs::{Fs, MemFs};
-    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
-    use std::sync::Arc;
-
-    let memfs = Arc::new(MemFs::new());
-    let root = std::path::absolute("/db")?;
-
-    {
-        let tree = match Config::new(
-            &root,
-            SequenceNumberCounter::default(),
-            SequenceNumberCounter::default(),
-        )
-        .with_shared_fs(memfs.clone())
-        .with_kv_separation(Some(
-            KvSeparationOptions::default().separation_threshold(16),
-        ))
-        .open()?
-        {
-            crate::AnyTree::Blob(t) => t,
-            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
-        };
-        tree.insert(b"k", alloc::vec![b'v'; 64], 0);
-        tree.flush_active_memtable(0)?;
-    }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
-    // A sidecar for the (perfectly intact) blob 0, with garbage content.
-    let sidecar = root.join(crate::file::BLOBS_FOLDER).join("0.remap");
-    {
-        use std::io::Write;
-        let mut f = memfs.open(
-            &sidecar,
-            &crate::fs::FsOpenOptions::new().write(true).create(true),
-        )?;
-        f.write_all(b"not a remap")?;
-    }
-
-    let result = Config::new(
-        &root,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .with_shared_fs(memfs)
-    .with_kv_separation(Some(
-        KvSeparationOptions::default().separation_threshold(16),
-    ))
-    .repair();
-    assert!(
-        matches!(result, Err(crate::Error::InvalidHeader("BlobRemapSidecar"))),
-        "a corrupt remap sidecar must fail the repair closed: {result:?}",
-    );
-    Ok(())
-}
-
 /// Builds a one-blob tree with its manifest removed, ready for a repair.
+#[expect(clippy::expect_used, reason = "test code")]
 fn blob_tree_without_manifest(
     memfs: &std::sync::Arc<crate::fs::MemFs>,
     root: &std::path::Path,
@@ -7626,7 +7539,15 @@ fn blob_tree_without_manifest(
             crate::AnyTree::Blob(t) => t,
             crate::AnyTree::Standard(_) => panic!("expected blob tree"),
         };
-        tree.insert(b"k", alloc::vec![b'v'; 64], 0);
+        // Eight separated values, matching what `punch_and_corrupt_blob`
+        // expects to find when a test damages this blob file.
+        for i in 0..8u32 {
+            tree.insert(
+                format!("k{i:04}").as_bytes(),
+                alloc::vec![b'a' + u8::try_from(i).expect("small i"); 64],
+                u64::from(i),
+            );
+        }
         tree.flush_active_memtable(0)?;
     }
     for e in memfs.read_dir(root)? {
@@ -7641,14 +7562,13 @@ fn blob_tree_without_manifest(
     Ok(())
 }
 
-/// A remap sidecar is adopted only under its CANONICAL name. An alternate
-/// numeric spelling parses to the same blob id, so adopting by parse alone
-/// would let directory-iteration order decide which of two same-id sidecars
-/// wins — nondeterministically rewriting live SST handles through a foreign
-/// remap. The non-canonical file is set aside instead, and the repair
-/// succeeds on the intact tree rather than failing closed on its contents.
+/// The salvaged replacement takes a FRESH blob id and the damaged original
+/// keeps its own, so a repaired tree ends up with the replacement live and
+/// the original preserved aside — never one file overwritten by the other.
+/// Set-aside happens only after the manifest is committed, which is what lets
+/// a failed attempt leave the original in place for the retry.
 #[test]
-fn repair_sets_aside_a_non_canonical_remap_sidecar_spelling() -> crate::Result<()> {
+fn a_salvaged_blob_takes_a_fresh_id_and_the_original_is_preserved() -> crate::Result<()> {
     use crate::fs::{Fs, MemFs};
     use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
     use std::sync::Arc;
@@ -7656,19 +7576,8 @@ fn repair_sets_aside_a_non_canonical_remap_sidecar_spelling() -> crate::Result<(
     let memfs = Arc::new(MemFs::new());
     let root = std::path::absolute("/db")?;
     blob_tree_without_manifest(&memfs, &root)?;
-
-    // `00.remap` parses to id 0 but is not what the writer would produce.
-    // Its content is garbage: adopting it would fail the repair closed, so a
-    // successful repair proves it was never adopted.
     let blobs = root.join(crate::file::BLOBS_FOLDER);
-    {
-        use std::io::Write;
-        let mut f = memfs.open(
-            &blobs.join("00.remap"),
-            &crate::fs::FsOpenOptions::new().write(true).create(true),
-        )?;
-        f.write_all(b"not a remap")?;
-    }
+    punch_and_corrupt_blob(&memfs, &blobs.join("0"))?;
 
     let report = Config::new(
         &root,
@@ -7681,68 +7590,17 @@ fn repair_sets_aside_a_non_canonical_remap_sidecar_spelling() -> crate::Result<(
     ))
     .repair()?;
     assert_eq!(
-        report.recovered, 1,
-        "the intact table is recovered; the foreign sidecar is not adopted: {report:?}",
+        report.blob_files_salvaged.len(),
+        1,
+        "the damaged blob was salvaged: {report:?}",
     );
     assert!(
-        !memfs.exists(&blobs.join("00.remap"))?,
-        "the non-canonical spelling is moved out of the engine-owned folder",
+        memfs.exists(&blobs.join("1"))?,
+        "the replacement took the next free id rather than the original's",
     );
-    Ok(())
-}
-
-/// A remap sidecar's length is untrusted. Reading it whole before checking
-/// its digest would let an oversized foreign file exhaust memory and abort
-/// the repair; the reader must reject a length its blob file cannot justify
-/// (one 20-byte entry per surviving record, each occupying at least a frame
-/// header) and take the ordinary fail-closed corruption path instead.
-#[test]
-fn repair_rejects_a_remap_sidecar_larger_than_its_blob_can_justify() -> crate::Result<()> {
-    use crate::fs::{Fs, MemFs};
-    use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
-    use std::sync::Arc;
-
-    let memfs = Arc::new(MemFs::new());
-    let root = std::path::absolute("/db")?;
-    blob_tree_without_manifest(&memfs, &root)?;
-
-    let blobs = root.join(crate::file::BLOBS_FOLDER);
-    let blob_len = memfs.metadata(&blobs.join("0"))?.len;
-    // One entry per frame header is the ceiling; go an order of magnitude past
-    // it, with a VALID digest so only the length bound can reject it.
-    let entries = usize::try_from(blob_len).unwrap_or(usize::MAX) * 10;
-    let mut body = Vec::with_capacity(8 + entries * 20);
-    body.extend_from_slice(&(entries as u64).to_le_bytes());
-    for i in 0..entries as u64 {
-        body.extend_from_slice(&i.to_le_bytes());
-        body.extend_from_slice(&i.to_le_bytes());
-        body.extend_from_slice(&64u32.to_le_bytes());
-    }
-    let digest = crate::hash::hash128(&body);
-    body.extend_from_slice(&digest.to_le_bytes());
-    {
-        use std::io::Write;
-        let mut f = memfs.open(
-            &blobs.join("0.remap"),
-            &crate::fs::FsOpenOptions::new().write(true).create(true),
-        )?;
-        f.write_all(&body)?;
-    }
-
-    let result = Config::new(
-        &root,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .with_shared_fs(memfs)
-    .with_kv_separation(Some(
-        KvSeparationOptions::default().separation_threshold(16),
-    ))
-    .repair();
     assert!(
-        matches!(result, Err(crate::Error::InvalidHeader("BlobRemapSidecar"))),
-        "an implausibly long sidecar is rejected before it is allocated, \
-         then fails closed like any other corrupt one: {result:?}",
+        !memfs.exists(&blobs.join("0"))?,
+        "the superseded original is set aside once the manifest is committed",
     );
     Ok(())
 }

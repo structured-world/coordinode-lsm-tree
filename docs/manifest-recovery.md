@@ -43,6 +43,48 @@ These hold at every branch of the algorithm below.
   `WouldBlock`) propagates so the caller can retry; it is never laundered into a
   keep-or-drop verdict. Persistent failures classify deterministically.
 
+## Recovery model
+
+There is no repair journal, and there is deliberately none: recovery runs
+precisely when the manifest — the tree's only transaction record — is gone, so
+a second log would need its own recovery. Everything recovery knows is
+therefore **derived by scanning the artifacts themselves**, the way `fsck`
+rebuilds a block bitmap by walking inodes instead of trusting the stored one.
+Three rules follow, and every branch of the algorithm obeys them.
+
+**The manifest commit is the only act that makes anything live.** A repair
+prepares its results and then publishes them with a single atomic
+`persist_version`; nothing it writes before that is reachable. Consequently a
+repair never overwrites an existing table or blob-file id — a salvaged
+replacement is a *new* id, and the originals stay where they were. A crash at
+any earlier point therefore leaves the tree byte-for-byte as it was found,
+plus unreferenced files that the next open's orphan sweep removes. This is the
+copy-on-write discipline, not a journal: the old tree stays intact until the
+root pointer moves.
+
+**Durable intermediate state, if it exists at all, records absolute facts —
+never deltas.** A journal replays block *contents* because only absolute
+writes are idempotent under repeated replay; a recorded `old offset -> new
+offset` mapping is a delta, and re-applying one to already-relocated handles
+destroys live data. Recovery therefore persists no relocation records. It also
+carries **nothing between runs**: a leftover from a crashed attempt cannot be
+validated against a tree that may have changed underneath it, so each run
+re-derives its whole picture from a fresh scan.
+
+**In-place mutation is legal only when its result can be re-derived by
+scanning.** When free space allows a copy, a damaged artifact is rebuilt into
+a fresh id and published by the manifest commit (above). When space does not
+allow a copy — the tight-space regime — the only permitted mutation is
+*excision*: physically punching the damaged extent so that surviving data
+keeps its original offsets. Excision qualifies because it is idempotent
+(punching twice equals punching once) and self-describing (a zeroed,
+structure-anchored run is detectable, and `derive_blob_frontier` reconstructs
+the geometry from it). Relocation and compaction never qualify, because the
+mapping they depend on cannot be recovered from the resulting file. This is
+how filesystems treat an unreadable extent: the bad range is marked and the
+rest of the file keeps reading at its original offsets, because re-laying-out
+a file would invalidate every reference to it.
+
 ## Algorithm
 
 ```mermaid
@@ -355,3 +397,49 @@ not a dead-end.
   restriction ever brings deleted or superseded data back.
 - **Turn a retryable fault into a permanent verdict.** Transient I/O propagates;
   it never becomes a keep-or-drop decision.
+
+## Known weak spots
+
+Stated explicitly rather than left to be rediscovered. Each is a place where
+the model above is not yet fully realised, with the consequence spelled out.
+
+**Excision is prefix-only.** A restricted SST carries a single lower bound and
+a punched blob file a single live-data frontier, so both express "everything
+before this point is gone" and nothing else. A hole punched in the *middle* of
+an artifact has no representation. In the tight-space regime — where a copy is
+impossible and excision is the only tool — a mid-file break therefore forces a
+choice between restricting past the hole (discarding intact live data below
+it, against the invariant) and rewriting (needing space that is not there).
+The derivation engine is not the obstacle: `dropped_data_extent_is_zeroed`
+already walks a *set* of punched extents, bounds each by the next one, and
+finds holes deep inside a surrendered tail — it simply reports one boolean.
+The obstacle is the read model, below.
+
+**An interior hole cannot mean "absent".** A key range that a table no longer
+covers falls through to older versions in lower levels, which is why a lost
+prefix is expressed as a key-range *restriction* rather than as missing rows.
+An interior hole has no such expression: the table's key range stays
+contiguous around it, so treating an excised block's rows as absent would
+resurrect superseded versions of exactly those keys — silently, and regardless
+of `allow_resurrection`. The sound reading is the filesystem one: a read
+resolving into an excised extent must fail with a typed error (the equivalent
+of `EIO`), so the loss is reported rather than papered over, with
+`allow_resurrection` as the operator's explicit opt-in to treat the rows as
+gone instead. Modelling coverage as a *set* of key ranges would be the
+alternative and is far more invasive: every overlap check, seek, and
+compaction-input choice assumes one contiguous range per table.
+
+**The publish phase is a sequence of renames, not one atomic act.** Publishing
+under fresh ids reduces this to "write new files, then commit the manifest",
+where only the commit is observable — but the file writes themselves are
+several operations. They are safe because nothing references the new ids until
+the commit, and unreferenced files are swept; the residual exposure is disk
+space held by orphans between a crash and the next open, not correctness.
+
+**Repair assumes an exclusive tree.** It runs single-threaded against a tree
+nobody else has open, and that assumption is currently procedural rather than
+enforced by a lock file. A concurrent writer during repair is undefined; the
+cross-process directory lock that would enforce it is tracked separately.
+Note that a lock addresses concurrency only — it is not a substitute for any
+of the crash-safety properties above, which must hold even for a single
+process that dies mid-repair.

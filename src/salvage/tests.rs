@@ -7037,7 +7037,6 @@ fn salvage_recovers_an_encrypted_sst_with_the_provider() -> crate::Result<()> {
         sync_mode: crate::fs::SyncMode::Normal,
         prefix_extractor: None,
         blob_rewrite: None,
-        blob_remap_stamps: None,
         progress: None,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
@@ -7134,7 +7133,6 @@ fn salvage_recovers_a_dictionary_sst_with_the_dictionary() -> crate::Result<()> 
         sync_mode: crate::fs::SyncMode::Normal,
         prefix_extractor: None,
         blob_rewrite: None,
-        blob_remap_stamps: None,
         progress: None,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
@@ -7224,7 +7222,6 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
         sync_mode: crate::fs::SyncMode::Normal,
         prefix_extractor: None,
         blob_rewrite: None,
-        blob_remap_stamps: None,
         progress: None,
     };
     let recovered_wrong = salvage_sst_with_options(&source, dest.clone(), &fs, &wrong)
@@ -7245,7 +7242,6 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
         sync_mode: crate::fs::SyncMode::Normal,
         prefix_extractor: None,
         blob_rewrite: None,
-        blob_remap_stamps: None,
         progress: None,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
@@ -8821,13 +8817,25 @@ fn blob_handle_rewrite_installs_the_relocated_size() -> crate::Result<()> {
         },
     );
     let mut rewrite = crate::HashMap::default();
-    rewrite.insert(7u64, super::BlobFileRewrite::Remap(map));
+    // The replacement is a FRESH blob file, so the handle must be retargeted
+    // at its id as well as at the new offset.
+    rewrite.insert(
+        7u64,
+        super::BlobFileRewrite::Remap {
+            new_id: 9,
+            offsets: map,
+        },
+    );
 
     let mut dropped = 0u64;
     let out = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
     assert_eq!(dropped, 0, "the record survived, nothing drops");
     let entry = out.first().expect("one rewritten entry");
     let rewritten = BlobIndirection::decode_from(&mut &entry.value[..])?;
+    assert_eq!(
+        rewritten.vhandle.blob_file_id, 9,
+        "the handle names the salvaged replacement, not the damaged original",
+    );
     assert_eq!(rewritten.vhandle.offset, 16, "the offset is re-targeted");
     assert_eq!(
         rewritten.vhandle.on_disk_size, 61,

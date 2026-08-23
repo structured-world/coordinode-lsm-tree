@@ -297,15 +297,6 @@ pub struct Writer {
     /// Default `Some(false)`.
     bulk_ingested: Option<bool>,
 
-    /// Manifest-repair per-blob rewrite stamps: `(blob id, fingerprint of
-    /// that blob's applied offset remap)` pairs, sorted by blob id.
-    /// `Some(_)` stamps `descriptor#blob_remap_stamps` into the meta so a
-    /// repair retry can prove PER BLOB which remaps the table already
-    /// carries and re-apply only the missing ones (re-applying an applied
-    /// map to relocated handles would drop live entries). `None` (default)
-    /// omits the key.
-    blob_remap_stamps: Option<Vec<(crate::vlog::BlobFileId, u128)>>,
-
     /// Pre-trained zstd dictionary for dictionary compression
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
@@ -451,7 +442,6 @@ impl Writer {
             use_zone_map: false,
             use_columnar: false,
             bulk_ingested: Some(false),
-            blob_remap_stamps: None,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -911,19 +901,6 @@ impl Writer {
     pub(crate) fn use_bulk_ingested(mut self, bulk_ingested: Option<bool>) -> Self {
         self.assert_not_started("use_bulk_ingested");
         self.bulk_ingested = bulk_ingested;
-        self
-    }
-
-    /// Stamps the manifest-repair per-blob rewrite fingerprints (see
-    /// [`Self::blob_remap_stamps`] field) into the produced table's meta.
-    /// Pairs must be sorted by blob id (the meta payload is canonical).
-    #[must_use]
-    pub(crate) fn use_blob_remap_stamps(
-        mut self,
-        stamps: Option<Vec<(crate::vlog::BlobFileId, u128)>>,
-    ) -> Self {
-        self.assert_not_started("use_blob_remap_stamps");
-        self.blob_remap_stamps = stamps;
         self
     }
 
@@ -2349,7 +2326,6 @@ impl Writer {
             initial_level: self.initial_level,
             use_columnar: self.use_columnar,
             bulk_ingested: self.bulk_ingested,
-            blob_remap_stamps: self.blob_remap_stamps.take(),
             range_tombstone_count,
             // Record the count that corresponds to the delete_bitmap section
             // ACTUALLY written above, via the single `writes_delete_bitmap`
@@ -2598,10 +2574,6 @@ struct MetaSectionParams<'a> {
     /// Bulk-ingest provenance: `Some(_)` writes `descriptor#bulk_ingested`,
     /// `None` omits it (unknown provenance, preserving a legacy SST's absence).
     bulk_ingested: Option<bool>,
-    /// Manifest-repair per-blob rewrite stamps: `Some(_)` writes
-    /// `descriptor#blob_remap_stamps` (24-byte pairs sorted by blob id) so a
-    /// repair retry can prove per blob which remaps this table carries.
-    blob_remap_stamps: Option<Vec<(crate::vlog::BlobFileId, u128)>>,
     range_tombstone_count: u64,
     /// Number of positions in this table's delete bitmap. Recorded so a reader
     /// can AUTHENTICATE the bitmap's presence: the section itself is optional
@@ -2836,20 +2808,6 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
     // of order, then the whole list is sorted below.
     if let Some(flag) = p.bulk_ingested {
         meta_items.push(meta("descriptor#bulk_ingested", &[u8::from(flag)]));
-    }
-
-    // Manifest-repair per-blob rewrite stamps: emitted only on tables a
-    // repair rewrote through blob offset maps, so a repair RETRY can prove
-    // per blob which remaps the table already carries and re-apply only the
-    // missing ones. Payload = 24-byte (id, fingerprint) pairs sorted by blob
-    // id (canonical). Absent everywhere else.
-    if let Some(stamps) = &p.blob_remap_stamps {
-        let mut payload = Vec::with_capacity(stamps.len() * 24);
-        for (id, fp) in stamps {
-            payload.extend_from_slice(&id.to_le_bytes());
-            payload.extend_from_slice(&fp.to_le_bytes());
-        }
-        meta_items.push(meta("descriptor#blob_remap_stamps", &payload));
     }
 
     // Test-only legacy simulation: drop the bitmap-content hash so the file

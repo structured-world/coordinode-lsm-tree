@@ -91,13 +91,6 @@ pub struct SalvageOptions {
     /// [`SalvageReport::entries_dropped_by_rewrite`]. A set rewrite disables
     /// verbatim block copy-through (raw block bytes would carry stale handles).
     pub blob_rewrite: Option<Arc<crate::HashMap<crate::vlog::BlobFileId, BlobFileRewrite>>>,
-    /// Per-blob rewrite stamps for the produced SST's meta
-    /// (`descriptor#blob_remap_stamps`), or `None` (the default) to omit the
-    /// key. [`crate::repair`] passes the UNION of the source table's existing
-    /// stamps and the remaps this rewrite applies, sorted by blob id, so a
-    /// repair retry can prove per blob which remaps the table carries and
-    /// re-apply only the missing ones.
-    pub blob_remap_stamps: Option<alloc::vec::Vec<(crate::vlog::BlobFileId, u128)>>,
     /// Shared live-progress counters the block walk ticks per inspected /
     /// re-emitted / dropped block and per recovered row, or `None` (the
     /// default) to skip publishing. [`crate::repair`] forwards the handle set
@@ -113,13 +106,22 @@ pub struct SalvageOptions {
 /// [`SalvageOptions::blob_rewrite`].
 #[derive(Debug, Clone)]
 pub enum BlobFileRewrite {
-    /// The blob file was salvaged into a COMPACTED copy: every surviving
-    /// record moved (and, when re-compressed, may have changed on-disk size),
-    /// per [`BlobSalvageReport::offset_remap`]. A handle whose source offset
-    /// is absent points at a record the salvage dropped — its entry is removed
-    /// from the rewritten SST (its key then reads as absent instead of
-    /// erroring on damaged bytes).
-    Remap(crate::HashMap<u64, BlobRecordRelocation>),
+    /// The blob file was salvaged into a COMPACTED copy under a FRESH blob
+    /// file id: every surviving record moved (and, when re-compressed, may
+    /// have changed on-disk size), per [`BlobSalvageReport::offset_remap`].
+    /// A rewritten handle is retargeted at `new_id` as well as at the new
+    /// offset, because the replacement is a new file — the damaged original
+    /// keeps its own id and stays untouched until the manifest commit makes
+    /// the replacement live. A handle whose source offset is absent points at
+    /// a record the salvage dropped — its entry is removed from the rewritten
+    /// SST (its key then reads as absent instead of erroring on damaged
+    /// bytes).
+    Remap {
+        /// Id of the salvaged replacement the rewritten handles must target.
+        new_id: crate::vlog::BlobFileId,
+        /// Source offset -> where that record landed in the replacement.
+        offsets: crate::HashMap<u64, BlobRecordRelocation>,
+    },
     /// The blob file is intact but its consumed prefix was punched at this
     /// live-data frontier: a handle below it (a pre-relocation SST left behind
     /// by a crash) points into zeroed bytes — its entry is removed; handles at
@@ -949,12 +951,7 @@ fn salvage_attempt(
         // the rebuilt filter only carries the source's prefix hashes when
         // the caller supplies it.
         .use_prefix_extractor(options.prefix_extractor.clone())
-        .use_encryption(options.encryption.clone())
-        // A record-relocating rewrite stamps the per-blob fingerprints of the
-        // remaps this table now carries (the caller passes the union of the
-        // source's stamps and the applied set), so a repair retry can prove
-        // per blob what was applied and re-apply only the missing remaps.
-        .use_blob_remap_stamps(options.blob_remap_stamps.clone());
+        .use_encryption(options.encryption.clone());
     // Without an extractor, DISABLE the filter entirely rather than rebuild one
     // from complete-key hashes: the source's prefix-indexing intent is
     // unknowable (the extractor is not persisted and cannot be inferred), and a
@@ -1113,20 +1110,24 @@ fn rewrite_block_indirections(
         let mut ind = crate::blob_tree::handle::BlobIndirection::decode_from(&mut cursor)?;
         match rewrite.get(&ind.vhandle.blob_file_id) {
             None => out.push(entry),
-            Some(BlobFileRewrite::Remap(map)) => match map.get(&ind.vhandle.offset) {
-                Some(&relocation) => {
-                    // BOTH fields: a live read cross-checks the handle's size
-                    // against the frame header, so a stale size from the
-                    // source file would reject the salvaged record.
-                    ind.vhandle.offset = relocation.offset;
-                    ind.vhandle.on_disk_size = relocation.on_disk_size;
-                    let mut buf = Vec::new();
-                    ind.encode_into(&mut buf)?;
-                    entry.value = buf.into();
-                    out.push(entry);
+            Some(BlobFileRewrite::Remap { new_id, offsets }) => {
+                match offsets.get(&ind.vhandle.offset) {
+                    Some(&relocation) => {
+                        // ALL THREE fields: the replacement is a NEW file, so the
+                        // handle must name it; and a live read cross-checks the
+                        // handle's size against the frame header, so a stale size
+                        // from the source file would reject the salvaged record.
+                        ind.vhandle.blob_file_id = *new_id;
+                        ind.vhandle.offset = relocation.offset;
+                        ind.vhandle.on_disk_size = relocation.on_disk_size;
+                        let mut buf = Vec::new();
+                        ind.encode_into(&mut buf)?;
+                        entry.value = buf.into();
+                        out.push(entry);
+                    }
+                    None => *dropped_entries += 1,
                 }
-                None => *dropped_entries += 1,
-            },
+            }
             Some(BlobFileRewrite::DropBelow(frontier)) => {
                 if ind.vhandle.offset < *frontier {
                     *dropped_entries += 1;
@@ -2376,72 +2377,6 @@ pub struct BlobRecordRelocation {
     pub offset: u64,
     /// On-disk size of the re-emitted (possibly re-compressed) value.
     pub on_disk_size: u32,
-}
-
-/// Deterministic fingerprint of ONE blob file's offset remap, stamped per
-/// blob into every SST the repair rewrites through it (meta
-/// `descriptor#blob_remap_stamps`). A repair RETRY recomputes the same value
-/// for that blob — salvage is deterministic over an unchanged source, and a
-/// remap adopted from a persisted sidecar is byte-identical — so a table
-/// whose stamp for the blob matches provably carries that relocation and
-/// must not pass through it again (re-applying the map to relocated handles
-/// would treat them as dropped records). Fingerprints are PER BLOB, not over
-/// the whole rewrite set: the set can grow between attempts (a blob newly
-/// damaged before the retry), and a whole-set value would then stop
-/// recognizing tables rewritten for the earlier blobs. `DropBelow` rewrites
-/// are never stamped — dropping handles below a frontier is idempotent and
-/// self-retiring (a rewritten table has none left).
-pub(crate) fn blob_remap_fingerprint(map: &crate::HashMap<u64, BlobRecordRelocation>) -> u128 {
-    crate::hash::hash128(&encode_remap(map))
-}
-
-/// Canonical byte encoding of one salvage offset remap: entry count, then
-/// `(source offset, new offset, new on-disk size)` triples by ascending
-/// source offset. Deterministic (hash maps iterate arbitrarily, hence the
-/// sort), so it doubles as the sidecar payload and the fingerprint input.
-pub(crate) fn encode_remap(map: &crate::HashMap<u64, BlobRecordRelocation>) -> alloc::vec::Vec<u8> {
-    let mut olds: alloc::vec::Vec<u64> = map.keys().copied().collect();
-    olds.sort_unstable();
-    let mut buf = alloc::vec::Vec::with_capacity(8 + olds.len() * 20);
-    buf.extend_from_slice(&(olds.len() as u64).to_le_bytes());
-    for old in olds {
-        // The offset came from this map's own key set.
-        let Some(rel) = map.get(&old) else { continue };
-        buf.extend_from_slice(&old.to_le_bytes());
-        buf.extend_from_slice(&rel.offset.to_le_bytes());
-        buf.extend_from_slice(&rel.on_disk_size.to_le_bytes());
-    }
-    buf
-}
-
-/// Decodes [`encode_remap`]'s payload. `None` on any structural mismatch
-/// (short buffer, trailing bytes, count disagreement) — the caller treats
-/// that as a corrupt sidecar and fails closed.
-pub(crate) fn decode_remap(mut bytes: &[u8]) -> Option<crate::HashMap<u64, BlobRecordRelocation>> {
-    let take = |bytes: &mut &[u8], n: usize| -> Option<alloc::vec::Vec<u8>> {
-        let (head, tail) = bytes.split_at_checked(n)?;
-        *bytes = tail;
-        Some(head.to_vec())
-    };
-    let count = u64::from_le_bytes(take(&mut bytes, 8)?.try_into().ok()?);
-    let count = usize::try_from(count).ok()?;
-    let mut map = crate::HashMap::default();
-    for _ in 0..count {
-        let old = u64::from_le_bytes(take(&mut bytes, 8)?.try_into().ok()?);
-        let offset = u64::from_le_bytes(take(&mut bytes, 8)?.try_into().ok()?);
-        let on_disk_size = u32::from_le_bytes(take(&mut bytes, 4)?.try_into().ok()?);
-        map.insert(
-            old,
-            BlobRecordRelocation {
-                offset,
-                on_disk_size,
-            },
-        );
-    }
-    if !bytes.is_empty() || map.len() != count {
-        return None;
-    }
-    Some(map)
 }
 
 /// Decompresses one blob record's on-disk bytes, mirroring the live reader's
