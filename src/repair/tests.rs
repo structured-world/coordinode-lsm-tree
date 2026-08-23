@@ -2292,6 +2292,46 @@ fn verify_sst_file_honors_a_restricted_punched_prefix() -> crate::Result<()> {
     Ok(())
 }
 
+/// A read that lands in a hole-punched extent must say so. The rows are
+/// permanently gone, and the two plausible alternatives are both wrong: a
+/// checksum mismatch reads as "the bytes rotted" and invites a heal or scrub
+/// that can never succeed, while reporting the key as merely absent would let
+/// the lookup fall through to a superseded version in a lower level and
+/// silently resurrect it. The zeros identify themselves at read time, so this
+/// needs nothing recorded anywhere — which is what lets an in-place excision
+/// survive a crash without a journal.
+#[test]
+fn a_read_into_a_punched_extent_reports_it_as_excised() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    write_multiblock_sst(&sst, &fs)?;
+
+    let table = recover_sst(sst.clone(), &fs)?;
+    let keyed = table
+        .data_block_handles()
+        .next()
+        .transpose()?
+        .ok_or(crate::Error::Unrecoverable)?;
+    let first: &crate::table::BlockHandle = keyed.as_ref();
+    memfs.punch_hole(&sst, first.offset().0, u64::from(first.size()))?;
+
+    let Err(err) = table.load_data_block(first) else {
+        panic!("a punched block cannot load");
+    };
+    assert!(
+        matches!(err, crate::Error::Excised { offset } if offset == first.offset().0),
+        "a punched extent must be reported as excised, not as damaged bytes: {err:?}",
+    );
+    Ok(())
+}
+
 /// Two same-id copies living in DIFFERENT filesystem namespaces are distinct
 /// files even when their paths spell the same string: canonicalizing both
 /// through the host filesystem would call them aliases and skip quarantining

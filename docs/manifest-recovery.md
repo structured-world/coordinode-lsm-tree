@@ -415,19 +415,25 @@ already walks a *set* of punched extents, bounds each by the next one, and
 finds holes deep inside a surrendered tail — it simply reports one boolean.
 The obstacle is the read model, below.
 
-**An interior hole cannot mean "absent".** A key range that a table no longer
-covers falls through to older versions in lower levels, which is why a lost
-prefix is expressed as a key-range *restriction* rather than as missing rows.
-An interior hole has no such expression: the table's key range stays
-contiguous around it, so treating an excised block's rows as absent would
-resurrect superseded versions of exactly those keys — silently, and regardless
-of `allow_resurrection`. The sound reading is the filesystem one: a read
-resolving into an excised extent must fail with a typed error (the equivalent
-of `EIO`), so the loss is reported rather than papered over, with
-`allow_resurrection` as the operator's explicit opt-in to treat the rows as
-gone instead. Modelling coverage as a *set* of key ranges would be the
-alternative and is far more invasive: every overlap check, seek, and
-compaction-input choice assumes one contiguous range per table.
+**An interior hole cannot mean "absent" — and does not.** A key range that a
+table no longer covers falls through to older versions in lower levels, which
+is why a lost prefix is expressed as a key-range *restriction* rather than as
+missing rows. An interior hole has no such expression: the table's key range
+stays contiguous around it, so treating an excised block's rows as absent
+would resurrect superseded versions of exactly those keys — silently, and
+regardless of `allow_resurrection`. Reads therefore take the filesystem
+reading: one that resolves into an excised extent fails with
+[`Error::Excised`](crate::Error::Excised), the equivalent of `EIO` on a bad
+extent, so the loss is reported rather than papered over as rotted bytes
+(which would invite a heal that can never succeed) or as a missing key.
+
+That check costs nothing and stores nothing: an all-zero extent identifies
+itself, so the classification happens on the failure path at read time, which
+is precisely what lets an in-place excision survive a crash unrecorded. What
+remains open is the *policy* half — modelling a table's coverage as a set of
+key ranges, so an interior hole could be expressed as lost coverage rather
+than as an erroring read. That is far more invasive: every overlap check,
+seek, and compaction-input choice assumes one contiguous range per table.
 
 **The publish phase is a sequence of renames, not one atomic act.** Publishing
 under fresh ids reduces this to "write new files, then commit the manifest",

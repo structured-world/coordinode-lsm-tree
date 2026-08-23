@@ -22,6 +22,25 @@ pub enum Error {
     /// Some required files could not be recovered from disk
     Unrecoverable,
 
+    /// The read resolved into an extent that was physically EXCISED — a
+    /// hole-punched region that reads back as zeros.
+    ///
+    /// Tight-space reclaim punches consumed extents in place, and manifest
+    /// recovery may keep a table whose surviving blocks are intact around
+    /// such a hole rather than discard the whole file. Reading one of the
+    /// punched blocks is a genuine, permanent loss of exactly those rows, and
+    /// it is reported as such instead of being smuggled out as a checksum
+    /// mismatch (which reads as "the bytes rotted") or, worse, as "no such
+    /// key" — the latter would fall through to a superseded version in a
+    /// lower level and silently resurrect it.
+    ///
+    /// This is the engine's equivalent of a filesystem returning `EIO` for a
+    /// bad extent while the rest of the file keeps reading.
+    Excised {
+        /// Byte offset of the excised block within the file.
+        offset: u64,
+    },
+
     /// Checksum mismatch
     ChecksumMismatch {
         /// Checksum of loaded block

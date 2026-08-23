@@ -724,6 +724,45 @@ impl Table {
         )
         .and_then(|block| DataBlock::from_loaded(block, has_kv_footer))
         .map(Some)
+        .map_err(|e| self.classify_excised(handle, e))
+    }
+
+    /// Re-reports a failed block load as [`crate::Error::Excised`] when the
+    /// block's bytes are physically absent — an all-zero extent, the signature
+    /// of a hole punch — rather than damaged.
+    ///
+    /// Tight-space reclaim punches consumed extents in place, so a table can
+    /// legitimately survive with intact blocks around a hole. A read that
+    /// lands in the hole is a permanent loss of exactly those rows, and the
+    /// distinction matters to the caller: rotted bytes may be healable and
+    /// are worth retrying or scrubbing, an excised extent never is. The probe
+    /// runs ONLY on the failure path, so a healthy read pays nothing for it,
+    /// and it needs no recorded state — the zeros identify themselves, which
+    /// is what lets an in-place excision survive any crash unrecorded.
+    #[cfg(feature = "std")]
+    fn classify_excised(&self, handle: &BlockHandle, err: crate::Error) -> crate::Error {
+        // A transient / positioned-read failure is not a verdict about the
+        // bytes: leave it exactly as it is so the caller can still retry.
+        if matches!(err, crate::Error::Io(_)) {
+            return err;
+        }
+        let Ok(file) = self.fs.open(&self.path, &FsOpenOptions::new().read(true)) else {
+            return err;
+        };
+        match Self::block_is_zeroed_in(&*file, handle) {
+            Ok(true) => crate::Error::Excised {
+                offset: handle.offset().0,
+            },
+            // Not zeroed, or the probe itself failed: the original verdict
+            // stands — never let a probe failure mask the real error.
+            Ok(false) | Err(_) => err,
+        }
+    }
+
+    /// No-std builds have no `Fs` open on this path; the original error stands.
+    #[cfg(not(feature = "std"))]
+    const fn classify_excised(&self, _handle: &BlockHandle, err: crate::Error) -> crate::Error {
+        err
     }
 
     /// Loads a columnar data block and reconstructs it as a row-major

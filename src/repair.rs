@@ -1435,6 +1435,31 @@ fn dropped_data_extent_is_zeroed(
     source: &std::path::Path,
     dropped: &[crate::salvage::DroppedBlock],
 ) -> crate::Result<bool> {
+    Ok(!excised_extents(fs, source, dropped)?.is_empty())
+}
+
+/// The physically excised byte ranges of `source`'s data section: the
+/// structure-anchored all-zero runs inside its dropped extents, which is what
+/// a hole punch leaves behind. Derived purely by scanning, so the result
+/// survives any crash without being recorded anywhere — the property the
+/// recovery model depends on for in-place repair (see
+/// `docs/manifest-recovery.md`).
+///
+/// Ranges come back ascending and disjoint. A PREFIX punch yields one range
+/// starting at the data section; a mid-file punch yields an interior range,
+/// which the prefix-only restriction model cannot express — see the weak-spot
+/// list in the same document.
+///
+/// # Errors
+///
+/// Propagates the open / read failure (a transient one aborts the repair for a
+/// retry, exactly like the other salvage-path reads).
+#[cfg(feature = "std")]
+fn excised_extents(
+    fs: &dyn crate::fs::Fs,
+    source: &std::path::Path,
+    dropped: &[crate::salvage::DroppedBlock],
+) -> crate::Result<Vec<(u64, u64)>> {
     // Shortest run accepted as a punch. A hole is punched per DATA BLOCK, so a
     // punched block contributes a zero run at least a block long — while inside
     // an intact block a zero run is bounded by its framing (header, key/value
@@ -1442,8 +1467,9 @@ fn dropped_data_extent_is_zeroed(
     // block-header length is the smallest possible block, so a run of that many
     // zeros cannot come from one intact framed block.
     const MIN_RUN: u64 = crate::table::block::Header::MIN_LEN as u64;
+    let mut excised: Vec<(u64, u64)> = Vec::new();
     if dropped.is_empty() {
-        return Ok(false);
+        return Ok(excised);
     }
     let mut file = fs.open(source, &crate::fs::FsOpenOptions::new().read(true))?;
     let file_len = crate::fs::FsFile::metadata(&*file)?.len;
@@ -1499,8 +1525,9 @@ fn dropped_data_extent_is_zeroed(
                 if b == 0 {
                     run += 1;
                 } else {
-                    if run >= MIN_RUN && header_decodes_at(offset + j as u64)? {
-                        return Ok(true);
+                    let run_end = offset + j as u64;
+                    if run >= MIN_RUN && header_decodes_at(run_end)? {
+                        excised.push((run_end - run, run_end));
                     }
                     run = 0;
                 }
@@ -1511,10 +1538,21 @@ fn dropped_data_extent_is_zeroed(
         // at the next dropped extent or the data-section end, both of which
         // are structural boundaries themselves.
         if run >= MIN_RUN {
-            return Ok(true);
+            excised.push((end - run, end));
         }
     }
-    Ok(false)
+    // The per-extent walks are already ascending and cannot overlap (each is
+    // bounded by the next extent), but a run that ends exactly where the next
+    // begins is one hole physically — merge so callers see maximal ranges.
+    excised.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(excised.len());
+    for (start, end) in excised {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    Ok(merged)
 }
 
 /// Whether the source SST's first data block reads as all zeros, the signature of
