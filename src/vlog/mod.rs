@@ -97,6 +97,35 @@ pub fn recover_blob_files(
             continue;
         }
 
+        // `{id}.remap`: a manifest repair's durable record of a published
+        // salvaged replacement's offset relocation. It outlives a crashed
+        // repair ON PURPOSE — the retry adopts it to finish rewriting the
+        // referencing SSTs — so it is SKIPPED, never swept: deleting it would
+        // strand every handle on the pre-salvage offsets with no surviving
+        // record of where the records moved. Failing the name parse instead
+        // would leave the tree unopenable until an operator intervened, which
+        // is exactly the state the sidecar exists to recover from. Both halves
+        // must parse so a foreign name merely ending in the suffix is NOT
+        // treated as ours.
+        if let Some(id_part) = file_name.strip_suffix(".remap")
+            && id_part.parse::<BlobFileId>().is_ok()
+        {
+            continue;
+        }
+
+        // `.tmp_{pid}_{seq}`: the staging file the sidecar's atomic write
+        // renames from, stranded by a crash in between. Never published,
+        // never referenced — sweep it like any other orphan rather than
+        // aborting the recovery on its name.
+        if file_name
+            .strip_prefix(".tmp_")
+            .and_then(|rest| rest.split_once('_'))
+            .is_some_and(|(pid, seq)| pid.parse::<u32>().is_ok() && seq.parse::<u64>().is_ok())
+        {
+            orphaned_blob_files.push(dirent.path.clone());
+            continue;
+        }
+
         let blob_file_id = file_name.parse::<BlobFileId>().map_err(|e| {
             log::error!("invalid blob file name {file_name:?}: {e:?}");
             crate::Error::Unrecoverable

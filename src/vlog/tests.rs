@@ -46,6 +46,41 @@ fn vlog_recovery_nonexistent_folder_with_ids_returns_unrecoverable() {
     assert!(matches!(result, Err(crate::Error::Unrecoverable)));
 }
 
+/// A crashed manifest repair can leave its own working files in `blobs/`: a
+/// `{id}.remap` sidecar (the durable record of a published replacement's
+/// offset relocation) and the `.tmp_{pid}_{seq}` staging file its atomic
+/// write goes through. Neither parses as a blob id, so without an explicit
+/// skip the plain open aborts the whole recovery and the tree cannot be
+/// opened at all — the operator loses the retry that would finish the
+/// relocation. The sidecar must SURVIVE (the retry reads it); the staging
+/// file is never-referenced garbage and is swept like any other orphan.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn vlog_recovery_keeps_a_remap_sidecar_and_sweeps_its_staging_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = dir.path().join("7.remap");
+    let staging = dir.path().join(".tmp_1234_9");
+    std::fs::write(&sidecar, b"remap payload").unwrap();
+    std::fs::write(&staging, b"partial").unwrap();
+
+    let (blob_files, orphans) = recover_blob_files(
+        dir.path(),
+        &[],
+        0,
+        None,
+        &(Arc::new(crate::fs::StdFs) as Arc<dyn crate::fs::Fs>),
+    )
+    .expect("a repair's own leftovers must not make the tree unopenable");
+
+    assert!(blob_files.is_empty(), "neither leftover is a blob file");
+    assert_eq!(
+        orphans,
+        vec![staging],
+        "the staging file is swept; the sidecar is NOT (a repair retry \
+         needs it to finish the relocation)",
+    );
+}
+
 #[test]
 fn recover_blob_file_on_non_blob_file_errors() {
     // A file that is not a valid blob (no SFA trailer / `meta` section) must
