@@ -7603,6 +7603,150 @@ fn repair_fails_closed_on_a_corrupt_blob_remap_sidecar() -> crate::Result<()> {
     Ok(())
 }
 
+/// Builds a one-blob tree with its manifest removed, ready for a repair.
+fn blob_tree_without_manifest(
+    memfs: &std::sync::Arc<crate::fs::MemFs>,
+    root: &std::path::Path,
+) -> crate::Result<()> {
+    use crate::fs::Fs;
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+
+    {
+        let tree = match Config::new(
+            root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        tree.insert(b"k", alloc::vec![b'v'; 64], 0);
+        tree.flush_active_memtable(0)?;
+    }
+    for e in memfs.read_dir(root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+    Ok(())
+}
+
+/// A remap sidecar is adopted only under its CANONICAL name. An alternate
+/// numeric spelling parses to the same blob id, so adopting by parse alone
+/// would let directory-iteration order decide which of two same-id sidecars
+/// wins — nondeterministically rewriting live SST handles through a foreign
+/// remap. The non-canonical file is set aside instead, and the repair
+/// succeeds on the intact tree rather than failing closed on its contents.
+#[test]
+fn repair_sets_aside_a_non_canonical_remap_sidecar_spelling() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    blob_tree_without_manifest(&memfs, &root)?;
+
+    // `00.remap` parses to id 0 but is not what the writer would produce.
+    // Its content is garbage: adopting it would fail the repair closed, so a
+    // successful repair proves it was never adopted.
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    {
+        use std::io::Write;
+        let mut f = memfs.open(
+            &blobs.join("00.remap"),
+            &crate::fs::FsOpenOptions::new().write(true).create(true),
+        )?;
+        f.write_all(b"not a remap")?;
+    }
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs.clone())
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "the intact table is recovered; the foreign sidecar is not adopted: {report:?}",
+    );
+    assert!(
+        !memfs.exists(&blobs.join("00.remap"))?,
+        "the non-canonical spelling is moved out of the engine-owned folder",
+    );
+    Ok(())
+}
+
+/// A remap sidecar's length is untrusted. Reading it whole before checking
+/// its digest would let an oversized foreign file exhaust memory and abort
+/// the repair; the reader must reject a length its blob file cannot justify
+/// (one 20-byte entry per surviving record, each occupying at least a frame
+/// header) and take the ordinary fail-closed corruption path instead.
+#[test]
+fn repair_rejects_a_remap_sidecar_larger_than_its_blob_can_justify() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    blob_tree_without_manifest(&memfs, &root)?;
+
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let blob_len = memfs.metadata(&blobs.join("0"))?.len;
+    // One entry per frame header is the ceiling; go an order of magnitude past
+    // it, with a VALID digest so only the length bound can reject it.
+    let entries = usize::try_from(blob_len).unwrap_or(usize::MAX) * 10;
+    let mut body = Vec::with_capacity(8 + entries * 20);
+    body.extend_from_slice(&(entries as u64).to_le_bytes());
+    for i in 0..entries as u64 {
+        body.extend_from_slice(&i.to_le_bytes());
+        body.extend_from_slice(&i.to_le_bytes());
+        body.extend_from_slice(&64u32.to_le_bytes());
+    }
+    let digest = crate::hash::hash128(&body);
+    body.extend_from_slice(&digest.to_le_bytes());
+    {
+        use std::io::Write;
+        let mut f = memfs.open(
+            &blobs.join("0.remap"),
+            &crate::fs::FsOpenOptions::new().write(true).create(true),
+        )?;
+        f.write_all(&body)?;
+    }
+
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .repair();
+    assert!(
+        matches!(result, Err(crate::Error::InvalidHeader("BlobRemapSidecar"))),
+        "an implausibly long sidecar is rejected before it is allocated, \
+         then fails closed like any other corrupt one: {result:?}",
+    );
+    Ok(())
+}
+
 /// A recovered SST whose blob handles point BELOW a punched blob file's
 /// derived live-data frontier must not be published as-is — a read through
 /// such a handle dereferences the punched (zeroed) prefix and fails. Instead

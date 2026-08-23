@@ -725,7 +725,29 @@ fn write_remap_sidecar(
 fn read_remap_sidecar(
     config: &Config,
     path: &std::path::Path,
+    blob_len: u64,
 ) -> crate::Result<Option<crate::HashMap<u64, crate::salvage::BlobRecordRelocation>>> {
+    // The sidecar's length is untrusted (a foreign or corrupt file can claim
+    // any size), so bound it BEFORE allocating: reading it whole first would
+    // let an oversized file exhaust memory and abort the repair instead of
+    // producing the intended fail-closed corruption error. Every remap entry
+    // (20 bytes) describes exactly one record that survived into the
+    // replacement, and every such record occupies at least one frame header
+    // in that file — so the entry count can never exceed
+    // `blob_len / BLOB_HEADER_LEN`, plus the 8-byte count and 16-byte digest.
+    // Plain arithmetic: `max_entries` is at most `u64::MAX / 42`, so the
+    // product with 20 (and the 24-byte envelope) provably stays in range.
+    let max_entries = blob_len / crate::vlog::blob_file::writer::BLOB_HEADER_LEN as u64;
+    let max_len = 24 + max_entries * 20;
+    let len = config.fs.metadata(path)?.len;
+    if len > max_len {
+        log::warn!(
+            "blob remap sidecar at {}: {len} bytes exceeds the {max_len} its \
+             blob file can justify; treating it as corrupt",
+            path.display(),
+        );
+        return Ok(None);
+    }
     let mut file = config
         .fs
         .open(path, &crate::fs::FsOpenOptions::new().read(true))?;
@@ -2195,13 +2217,37 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
         // relocation of an already-published salvaged replacement whose
         // referencing SSTs were not all rewritten before the crash. Collect it
         // for adoption when its blob validates below (and for strict removal
-        // after the table-rewrite stage either way). Both halves must parse so
-        // a foreign name merely ending in the suffix is not treated as ours.
+        // after the table-rewrite stage either way).
+        //
+        // Only the CANONICAL spelling is ours: the writer names it
+        // `{id}.remap` with the id's own `to_string`, so an alternate numeric
+        // spelling (`01.remap`) parses to the same id but was never produced
+        // here. Adopting by parse alone would let `read_dir` order decide
+        // which of two same-id sidecars wins — nondeterministically applying
+        // a foreign remap and rewriting live SST handles onto wrong offsets.
+        // A non-canonical spelling is therefore treated like any other
+        // foreign name in this engine-owned folder: set aside, never adopted.
         if let Some(id) = file_name
             .strip_suffix(".remap")
             .and_then(|id| id.parse::<crate::vlog::BlobFileId>().ok())
         {
-            sidecar_paths.insert(id, blob_path);
+            if file_name == format!("{id}.remap") {
+                sidecar_paths.insert(id, blob_path);
+            } else {
+                let dest = quarantine_file(
+                    &*config.fs,
+                    &blobs_folder,
+                    &blob_path,
+                    &file_name,
+                    config.sync_mode,
+                )?;
+                log::warn!(
+                    "blob remap sidecar at {}: non-canonical spelling for id {id}; \
+                     set aside at {} rather than adopted",
+                    blob_path.display(),
+                    dest.display(),
+                );
+            }
             continue;
         }
 
@@ -2621,14 +2667,16 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
                 // replacement published by a crashed earlier repair whose
                 // referencing SSTs were not all rewritten. Adopt the recorded
                 // remap so the table-rewrite stage finishes that relocation;
-                // tables the crashed attempt DID rewrite carry the rewrite
-                // set's fingerprint and are skipped there. A sidecar that
-                // fails its digest or decode fails the repair closed —
+                // tables the crashed attempt DID rewrite carry this blob's
+                // remap stamp and are skipped there. A sidecar that fails its
+                // length bound, digest, or decode fails the repair closed —
                 // rewriting handles from a guessed map would corrupt reads,
                 // and the replacement alone cannot say where its records
                 // used to live.
                 if let Some(sidecar) = sidecar_paths.remove(&blob_id) {
-                    let Some(map) = read_remap_sidecar(config, &sidecar)? else {
+                    // The replacement bounds how large its own remap can be.
+                    let blob_len = config.fs.metadata(&blob_path)?.len;
+                    let Some(map) = read_remap_sidecar(config, &sidecar, blob_len)? else {
                         log::error!(
                             "blob file {blob_id}: its remap sidecar {} is corrupt; \
                              failing the repair — without the recorded relocation \
