@@ -1207,6 +1207,51 @@ fn heal_skips_blocks_below_the_restriction_bound() -> crate::Result<()> {
     Ok(())
 }
 
+/// Compaction installs its outputs directly instead of going through
+/// `register_tables`, so it must install the same tree-wide sinks a flush
+/// gets — the heal-hint sink included. Without it a confirmed-persistent ECC
+/// correction while reading a compaction output corrects the block in memory
+/// but can never queue that SST for a healing rewrite, so the bitrot stays on
+/// disk indefinitely (and every later read pays the correction again).
+#[cfg(feature = "page_ecc")]
+#[test]
+fn a_compaction_output_carries_the_heal_hint_sink() -> crate::Result<()> {
+    use crate::AbstractTree;
+
+    let dir = tempfile::tempdir()?;
+    let tree = open_ecc_tree_on(dir.path(), std::sync::Arc::new(crate::fs::StdFs));
+
+    // Two flushes, then a compaction that merges them into a fresh output.
+    for round in 0..2u64 {
+        for i in 0..64u64 {
+            tree.insert(
+                format!("key-{i:06}").as_bytes(),
+                format!("v{round}").as_bytes(),
+                round * 100 + i,
+            );
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    tree.major_compact(u64::MAX, 1_000)?;
+
+    let outputs: Vec<_> = {
+        let binding = tree.version_history.read().latest_version();
+        binding.version.iter_tables().cloned().collect()
+    };
+    assert!(!outputs.is_empty(), "the compaction produced an output");
+    for table in &outputs {
+        assert!(
+            table
+                .heal_hints_for_test()
+                .is_some_and(|sink| { std::sync::Arc::ptr_eq(&sink, &tree.heal_hints) }),
+            "compaction output {} must carry the tree's heal-hint sink, or a \
+             correctable read from it can never schedule a durable heal",
+            table.id(),
+        );
+    }
+    Ok(())
+}
+
 /// A tight-space restricted reopen produces a DISTINCT `Inner`, so every
 /// tree-installed shared gate must be carried forward — including the ECC
 /// heal-hint sink. Without it, a correctable read from the restricted view

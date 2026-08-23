@@ -87,6 +87,21 @@ pub struct Options {
     /// skips the checkpoint mutation window and can race a checkpoint hard-link.
     pub deletion_pause: Arc<crate::deletion_pause::DeletionPause>,
 
+    /// The tree-wide ECC heal-hint sink, installed on every
+    /// compaction-produced table alongside the deletion pause and for the
+    /// same reason: a flush registers it via `register_tables`, but
+    /// compaction installs its outputs directly. Without it a
+    /// confirmed-persistent ECC correction while reading such an output
+    /// corrects the block in memory yet can never queue the SST for a
+    /// healing rewrite, so the bitrot stays on disk indefinitely.
+    pub heal_hints: Arc<crate::heal_hints::HealHints>,
+
+    /// The tree-wide background file deleter, threaded for the same reason:
+    /// without it an obsolete compaction output's `unlink` runs on the
+    /// foreground path instead of the background deleter.
+    #[cfg(feature = "std")]
+    pub background_deleter: Arc<crate::BackgroundDeleter>,
+
     /// Shared handle to the live runtime config. Compaction loads
     /// a fresh snapshot via [`crate::runtime_config::handle::RuntimeConfigHandle::load_full`]
     /// each time it writes the manifest, so toggles applied via
@@ -125,6 +140,9 @@ impl Options {
 
             compaction_state: tree.compaction_state.clone(),
             deletion_pause: tree.deletion_pause.clone(),
+            heal_hints: tree.heal_hints.clone(),
+            #[cfg(feature = "std")]
+            background_deleter: tree.background_deleter.clone(),
             runtime_config: tree.runtime_config.clone(),
             encryption: tree.config.encryption.clone(),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::new(
@@ -966,12 +984,19 @@ fn run_tight_space_compaction(
             drop(version);
 
             let outputs: Vec<Table> = produced.created_tables().to_vec();
-            // Install the tree-wide deletion pause on each slice output before the
-            // version edit makes it visible (mirrors `install_merge` — a compaction
-            // output that skipped it could race a checkpoint hard-link on a later
-            // in-place heal).
+            // Install the tree-wide sinks on each slice output before the
+            // version edit makes it visible (mirrors `install_merge`): the
+            // deletion pause, so a later in-place heal cannot race a
+            // checkpoint hard-link; the heal-hint sink, so a
+            // confirmed-persistent ECC correction on a read can queue this
+            // SST for a healing rewrite instead of leaving the bitrot on
+            // disk; and the background deleter, so its eventual unlink stays
+            // off the foreground path.
             for table in &outputs {
                 table.install_deletion_pause(Arc::clone(&opts.deletion_pause));
+                table.install_heal_hints(Arc::clone(&opts.heal_hints));
+                #[cfg(feature = "std")]
+                table.install_background_deleter(Arc::clone(&opts.background_deleter));
             }
             // KV-separation: blob files this slice relocated live entries into,
             // plus the GC diff of entries it dropped.

@@ -355,12 +355,19 @@ pub(super) fn install_merge(
 
     let tables_out = created_tables.len();
 
-    // Install the tree-wide deletion pause on every output BEFORE the version edit
-    // makes it visible. A flush registers this via `register_tables`; a compaction
-    // installs its outputs here, so without this an output's in-place heal would
-    // skip the checkpoint mutation window and could race a checkpoint hard-link.
+    // Install the tree-wide sinks on every output BEFORE the version edit makes
+    // it visible. A flush registers these via `register_tables`; a compaction
+    // installs its outputs here. Without the deletion pause an output's
+    // in-place heal would skip the checkpoint mutation window and could race a
+    // checkpoint hard-link; without the heal-hint sink a confirmed-persistent
+    // ECC correction on a read could never queue the SST for a healing
+    // rewrite, leaving the bitrot on disk; without the background deleter its
+    // eventual unlink would run on the foreground path.
     for table in &created_tables {
         table.install_deletion_pause(alloc::sync::Arc::clone(&opts.deletion_pause));
+        table.install_heal_hints(alloc::sync::Arc::clone(&opts.heal_hints));
+        #[cfg(feature = "std")]
+        table.install_background_deleter(alloc::sync::Arc::clone(&opts.background_deleter));
     }
 
     // Globally-dead blob files are dropped once, from the install-time version.
