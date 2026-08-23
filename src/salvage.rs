@@ -1290,6 +1290,11 @@ fn salvage_blocks(
     let mut blocks_copied_verbatim = 0usize;
     let mut entries_salvaged = 0u64;
     let mut blocks_healed = 0u64;
+    // Only the columnar copy-through / re-emit arms count columns.
+    #[cfg_attr(
+        not(feature = "columnar"),
+        expect(unused_mut, reason = "only the columnar walk arms count columns")
+    )]
     let mut columns_salvaged = 0u64;
     let mut entries_dropped_by_rewrite = 0u64;
     let mut published = PublishedProgress::default();

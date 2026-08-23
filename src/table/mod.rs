@@ -4243,14 +4243,23 @@ impl Table {
     ///
     /// [`crate::Error::InvalidHeader`] when the recorded bounds disagree
     /// with the decoded contents; any I/O / decode error from the full scan.
-    #[cfg(feature = "std")]
     /// `bitmap_digest_authenticated`: whether the caller has ALREADY
     /// authenticated this file's bytes — bitmap section included — against a
     /// matching manifest digest (the directly attributable heal path: the
     /// pre-heal digest probed equal, so the file differs solely by that
     /// pass's corrections). Only then may a LEGACY table whose bitmap
     /// carries no `descriptor#delete_bitmap_hash` pass; repair has no such
-    /// digest and must keep failing closed on it.
+    /// digest and must keep failing closed on it. The flag drives the
+    /// delete-bitmap gate below, which exists only on columnar builds
+    /// (a positional delete bitmap is a columnar-layout section).
+    #[cfg(feature = "std")]
+    #[cfg_attr(
+        not(feature = "columnar"),
+        expect(
+            unused_variables,
+            reason = "the delete-bitmap gate it drives is columnar-only"
+        )
+    )]
     pub(crate) fn verify_metadata_bounds(
         &self,
         bitmap_digest_authenticated: bool,

@@ -763,7 +763,12 @@ fn reopen_restricted_yields_a_distinct_clamped_view() -> crate::Result<()> {
 /// the heal attestation and strands the healed table under a stale digest
 /// forever. Repair (no matching digest) must keep failing closed on the same
 /// file.
+///
+/// Columnar-gated like the delete-bitmap authentication gate itself: a
+/// non-columnar build has no positional-delete masking, so the gate (and
+/// this fixture's bitmap) does not exist there.
 #[test]
+#[cfg(feature = "columnar")]
 fn metadata_bounds_accept_a_legacy_bitmap_when_digest_authenticated() -> crate::Result<()> {
     use crate::config::DeleteStrategy;
 
