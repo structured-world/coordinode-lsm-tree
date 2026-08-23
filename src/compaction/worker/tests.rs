@@ -417,7 +417,7 @@ fn restricted_view_passes_every_reconcile_gate() -> crate::Result<()> {
     restricted.verify_filter(None)?;
     restricted.verify_block_layout()?;
     restricted.verify_point_read_reachability()?;
-    restricted.verify_metadata_bounds()?;
+    restricted.verify_metadata_bounds(false)?;
     Ok(())
 }
 

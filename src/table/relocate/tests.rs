@@ -129,7 +129,7 @@ fn relocated_mor_table_passes_metadata_bounds_cross_check() -> crate::Result<()>
 
     // The re-encoded meta describes the appended bitmap, so the forgery
     // cross-check accepts the healthy relocated table.
-    relocated.verify_metadata_bounds()?;
+    relocated.verify_metadata_bounds(false)?;
     Ok(())
 }
 
