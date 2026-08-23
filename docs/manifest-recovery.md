@@ -305,10 +305,14 @@ canonical name, its offset remap is durably recorded in a `blobs/{id}.remap`
 sidecar (checksummed, written atomically); the replacement then validates as
 an ordinary intact blob on a retry, and the sidecar is what tells that retry
 the referencing tables still need rewriting. Each rewritten table is stamped
-with a fingerprint of the whole rewrite set — salvage is deterministic over
-an unchanged source, so a retry recomputes the same value and skips tables
-already carrying it (re-applying the map to relocated handles would drop live
-entries). The sidecars are removed, strictly, after the table stage and
+per blob with a fingerprint of the remap it applied — salvage is
+deterministic over an unchanged source, so a retry recomputes the same value
+per blob and passes each table through only the remaps it does not carry yet
+(re-applying an applied map to relocated handles would drop live entries).
+The stamps are per blob rather than one whole-set value because the rewrite
+set can grow between attempts — a blob newly damaged before the retry must
+not un-recognize tables already rewritten for the earlier blobs. The
+sidecars are removed, strictly, after the table stage and
 before the manifest commit: a crash anywhere in between leaves either the
 sidecar (the retry re-adopts the remap) or a fully consistent tree, while a
 corrupt surviving sidecar fails the repair closed — the replacement alone

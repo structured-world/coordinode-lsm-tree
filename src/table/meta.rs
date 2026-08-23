@@ -174,16 +174,19 @@ pub struct ParsedMeta {
     /// SST alone.
     pub bulk_ingested: Option<bool>,
 
-    /// Fingerprint of the manifest-repair blob-handle rewrite this table was
-    /// produced by, from the optional `descriptor#blob_remap_fingerprint`
-    /// property. Salvaging a damaged blob file relocates its surviving
-    /// records, and the referencing SSTs are rewritten onto the new offsets;
-    /// the rewritten SST records the rewrite-set fingerprint so a repair
-    /// RETRY (after a crash mid-way) can prove the table was already
-    /// rewritten by the same deterministic rewrite and skip it — re-applying
-    /// the offset map to already-rewritten handles would drop live entries.
-    /// `None` = not produced by a blob-handle rewrite.
-    pub blob_remap_fingerprint: Option<u128>,
+    /// Per-blob stamps of the manifest-repair handle rewrites this table has
+    /// been through, from the optional `descriptor#blob_remap_stamps`
+    /// property: `(blob file id, fingerprint of that blob's applied offset
+    /// remap)` pairs, sorted by blob id. Salvaging a damaged blob file
+    /// relocates its surviving records and the referencing SSTs are rewritten
+    /// onto the new offsets; the stamps let a repair RETRY (after a crash
+    /// mid-way) prove PER BLOB which remaps this table already carries and
+    /// re-apply only the missing ones — re-applying an already-applied map to
+    /// relocated handles would drop live entries. Per-blob (not a whole-set
+    /// fingerprint) because the rewrite set can GROW between attempts: a blob
+    /// newly damaged before the retry must not un-recognize tables rewritten
+    /// for the earlier blobs. `None` = never blob-handle-rewritten.
+    pub blob_remap_stamps: Option<alloc::vec::Vec<(crate::vlog::BlobFileId, u128)>>,
 }
 
 macro_rules! read_u8 {
@@ -385,15 +388,33 @@ impl ParsedMeta {
             },
         };
 
-        // Optional blob-handle rewrite fingerprint (see the field doc). Absent
-        // on every table not produced by a manifest-repair blob rewrite.
-        let blob_remap_fingerprint =
-            match block.point_read(b"descriptor#blob_remap_fingerprint", SeqNo::MAX, &cmp)? {
+        // Optional per-blob rewrite stamps (see the field doc). Absent on
+        // every table never blob-handle-rewritten. Payload is a sequence of
+        // 24-byte (blob id LE u64, remap fingerprint LE u128) pairs sorted by
+        // blob id; any other length is a corrupt meta.
+        let blob_remap_stamps =
+            match block.point_read(b"descriptor#blob_remap_stamps", SeqNo::MAX, &cmp)? {
                 None => None,
-                Some(v) => match <[u8; 16]>::try_from(v.value.as_ref()) {
-                    Ok(bytes) => Some(u128::from_le_bytes(bytes)),
-                    Err(_) => return Err(crate::Error::InvalidHeader("TableMeta")),
-                },
+                Some(v) => {
+                    let bytes = v.value.as_ref();
+                    if bytes.is_empty() || bytes.len() % 24 != 0 {
+                        return Err(crate::Error::InvalidHeader("TableMeta"));
+                    }
+                    let mut stamps = alloc::vec::Vec::with_capacity(bytes.len() / 24);
+                    for pair in bytes.chunks_exact(24) {
+                        let (id, fp) = pair.split_at(8);
+                        let id = u64::from_le_bytes(
+                            id.try_into()
+                                .map_err(|_| crate::Error::InvalidHeader("TableMeta"))?,
+                        );
+                        let fp = u128::from_le_bytes(
+                            fp.try_into()
+                                .map_err(|_| crate::Error::InvalidHeader("TableMeta"))?,
+                        );
+                        stamps.push((id, fp));
+                    }
+                    Some(stamps)
+                }
             };
 
         let id = read_u64!(block, b"table_id", &cmp);
@@ -603,7 +624,7 @@ impl ParsedMeta {
             index_block_restart_interval,
             columnar,
             bulk_ingested,
-            blob_remap_fingerprint,
+            blob_remap_stamps,
         })
     }
 }

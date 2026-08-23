@@ -1324,6 +1324,10 @@ struct TableSalvage<'a> {
     /// frontier); `None` on the plain corrupt-table salvage paths.
     blob_rewrite:
         Option<Arc<crate::HashMap<crate::vlog::BlobFileId, crate::salvage::BlobFileRewrite>>>,
+    /// Per-blob rewrite stamps for the produced SST's meta: the union of the
+    /// source table's existing stamps and the remaps this rewrite applies,
+    /// sorted by blob id. `None` on the plain corrupt-table salvage paths.
+    blob_remap_stamps: Option<Vec<(crate::vlog::BlobFileId, u128)>>,
 }
 
 fn try_salvage_table(
@@ -1338,6 +1342,7 @@ fn try_salvage_table(
         table_id,
         reject_punched_without_bound,
         blob_rewrite,
+        blob_remap_stamps,
     } = salvage;
     // Salvage under the tree's configured comparator + crypto/dictionary context
     // so the rewritten SST opens, orders, and decrypts / decompresses consistently
@@ -1373,6 +1378,7 @@ fn try_salvage_table(
             // prefix scans see the salvaged copy as definitely absent.
             prefix_extractor: config.prefix_extractor.clone(),
             blob_rewrite,
+            blob_remap_stamps,
             // Forward the caller's live-progress handle so the block walk
             // ticks per inspected / recovered block while it runs.
             progress: config.recovery_progress.clone(),
@@ -3251,6 +3257,7 @@ fn repair_tree(
                                     // on this arm.
                                     reject_punched_without_bound: false,
                                     blob_rewrite: None,
+                                    blob_remap_stamps: None,
                                 },
                             ) {
                                 Ok(SalvageOutcome::Salvaged(salvaged)) => {
@@ -3505,6 +3512,7 @@ fn repair_tree(
                             table_id,
                             reject_punched_without_bound: reject_punched,
                             blob_rewrite: None,
+                            blob_remap_stamps: None,
                         },
                     ) {
                         Ok(SalvageOutcome::Salvaged(salvaged)) => {
@@ -3699,14 +3707,25 @@ fn repair_tree(
                 crate::salvage::BlobFileRewrite::Remap(_) => None,
             })
             .collect();
-        // The rewrite set's identity, for retry idempotence: a table already
-        // stamped with this fingerprint was rewritten by a crashed earlier
-        // attempt of this SAME deterministic rewrite (salvage over an
-        // unchanged source re-derives the same remap; an adopted sidecar IS
-        // that remap). Re-applying the map to its already-relocated handles
-        // would treat them as dropped records, so such a table is kept as-is.
-        let rewrite_fingerprint = crate::salvage::rewrite_set_fingerprint(&blob_rewrites);
-        let blob_rewrites = Arc::new(blob_rewrites);
+        // Per-blob remap identities, for retry idempotence: a table stamped
+        // with a blob's fingerprint was rewritten for THAT blob by a crashed
+        // earlier attempt (salvage over an unchanged source re-derives the
+        // same remap; an adopted sidecar IS that remap). Re-applying an
+        // applied map to its relocated handles would treat them as dropped
+        // records, so each table below is passed through only the remaps it
+        // does not yet carry. Tracked per blob rather than as one whole-set
+        // value because the rewrite set can GROW between attempts (a blob
+        // newly damaged before the retry) — a whole-set fingerprint would
+        // then stop recognizing tables rewritten for the earlier blobs.
+        let remap_fingerprints: crate::HashMap<crate::vlog::BlobFileId, u128> = blob_rewrites
+            .iter()
+            .filter_map(|(id, rw)| match rw {
+                crate::salvage::BlobFileRewrite::Remap(map) => {
+                    Some((*id, crate::salvage::blob_remap_fingerprint(map)))
+                }
+                crate::salvage::BlobFileRewrite::DropBelow(_) => None,
+            })
+            .collect();
         let mut kept: Vec<(Table, bool)> = Vec::with_capacity(recovered_tables.len());
         for (table, complete) in recovered_tables {
             // One reference read drives everything below: the missing-id check
@@ -3737,29 +3756,27 @@ fn repair_tree(
                 )?;
                 continue;
             }
-            // Already rewritten by a crashed earlier attempt of this same
-            // rewrite set (fingerprint match): its handles hold the RELOCATED
-            // offsets, so it is correct as it stands and must not pass
-            // through the rewrite again. It stays a salvage outcome (lossy
-            // relative to the pre-damage original), hence `complete = false`.
-            if table.metadata.blob_remap_fingerprint.is_some()
-                && table.metadata.blob_remap_fingerprint == rewrite_fingerprint
-            {
-                kept.push((table, false));
-                continue;
-            }
+            // Remap stamps this table already carries (from a crashed
+            // earlier attempt's rewrite): those relocations are DONE — its
+            // handles hold the new offsets — and must not be applied again.
+            // Cloned (tiny, rare path): the table handle is moved into `kept`
+            // below while these stamps stay in use for the rewrite decision.
+            let carried: Vec<(crate::vlog::BlobFileId, u128)> =
+                table.metadata.blob_remap_stamps.clone().unwrap_or_default();
+            let carries = |id: crate::vlog::BlobFileId, fp: u128| {
+                carried.iter().any(|&(cid, cfp)| cid == id && cfp == fp)
+            };
             // Whether this table's handles must be rewritten: any reference to
-            // a SALVAGED (compacted, every offset moved) blob file, or a
-            // handle that actually lies below a punched blob's frontier (a
-            // pre-relocation SST file left behind by a crash — the id-presence
-            // check cannot see it).
+            // a SALVAGED (compacted, every offset moved) blob file whose remap
+            // the table does not carry yet, or a handle that actually lies
+            // below a punched blob's frontier (a pre-relocation SST file left
+            // behind by a crash — the id-presence check cannot see it).
             let mut needs_rewrite = false;
             if let Some(links) = &links {
                 if links.iter().any(|l| {
-                    matches!(
-                        blob_rewrites.get(&l.blob_file_id),
-                        Some(crate::salvage::BlobFileRewrite::Remap(_))
-                    )
+                    remap_fingerprints
+                        .get(&l.blob_file_id)
+                        .is_some_and(|fp| !carries(l.blob_file_id, *fp))
                 }) {
                     needs_rewrite = true;
                 } else if !punched_frontiers.is_empty()
@@ -3783,7 +3800,10 @@ fn repair_tree(
                 }
             }
             if !needs_rewrite {
-                kept.push((table, complete));
+                // A stamped table is the product of an earlier attempt's
+                // rewrite — a salvage outcome, lossy relative to the
+                // pre-damage original — so it must count as salvaged.
+                kept.push((table, complete && carried.is_empty()));
                 continue;
             }
             // A RESTRICTED survivor keeps the set-aside path: the salvage
@@ -3805,6 +3825,43 @@ fn repair_tree(
             // dropping only entries whose blob record no longer exists. The
             // rewritten table counts as salvaged (its content may be lossy
             // relative to the original).
+            //
+            // The applied set EXCLUDES remaps this table already carries
+            // (their handles hold the destination offsets — passing them
+            // through the map again would drop them as missing records) and
+            // keeps every `DropBelow` (idempotent: a rewritten table has no
+            // sub-frontier handles left to drop).
+            let applying: crate::HashMap<crate::vlog::BlobFileId, crate::salvage::BlobFileRewrite> =
+                blob_rewrites
+                    .iter()
+                    .filter(|(id, rw)| match rw {
+                        crate::salvage::BlobFileRewrite::DropBelow(_) => true,
+                        crate::salvage::BlobFileRewrite::Remap(_) => remap_fingerprints
+                            .get(*id)
+                            .is_none_or(|fp| !carries(**id, *fp)),
+                    })
+                    .map(|(id, rw)| (*id, rw.clone()))
+                    .collect();
+            // The produced table's stamps: the carried set plus a stamp for
+            // every referenced blob whose remap is being applied now. A
+            // carried stamp for a blob whose remap CHANGED (its salvaged
+            // replacement was damaged again and re-salvaged) is superseded
+            // in place: the new map's source offsets are the offsets this
+            // table's handles hold after the earlier rewrite.
+            let mut stamps: Vec<(crate::vlog::BlobFileId, u128)> = carried.clone();
+            if let Some(links) = &links {
+                for l in links {
+                    let Some(fp) = remap_fingerprints.get(&l.blob_file_id) else {
+                        continue;
+                    };
+                    match stamps.iter_mut().find(|(cid, _)| *cid == l.blob_file_id) {
+                        Some(stamp) => stamp.1 = *fp,
+                        None => stamps.push((l.blob_file_id, *fp)),
+                    }
+                }
+            }
+            stamps.sort_unstable_by_key(|&(cid, _)| cid);
+            let stamps = (!stamps.is_empty()).then_some(stamps);
             let table_id = table.id();
             let path = (*table.path).clone();
             let (Some(base), Some(name)) = (
@@ -3827,7 +3884,8 @@ fn repair_tree(
                     table_path: &path,
                     table_id,
                     reject_punched_without_bound: false,
-                    blob_rewrite: Some(Arc::clone(&blob_rewrites)),
+                    blob_rewrite: Some(Arc::new(applying)),
+                    blob_remap_stamps: stamps,
                 },
             ) {
                 Ok(SalvageOutcome::Salvaged(rewritten)) => kept.push((rewritten, false)),

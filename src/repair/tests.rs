@@ -7360,6 +7360,180 @@ fn a_repair_retry_after_a_crash_between_blob_publish_and_table_rewrite_completes
     Ok(())
 }
 
+/// Punches a blob file's first two frames and rots the last frame's payload,
+/// so validation fails and the salvage re-emits the surviving middle frames
+/// from the replacement's start — a non-identity remap.
+#[expect(clippy::expect_used, reason = "test code")]
+fn punch_and_corrupt_blob(
+    memfs: &crate::fs::MemFs,
+    blob_path: &std::path::Path,
+) -> crate::Result<()> {
+    use crate::fs::Fs;
+    use std::io::{Seek, SeekFrom, Write};
+    let entries: Vec<_> = crate::vlog::BlobFileScanner::new(blob_path, memfs, 0)?
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert_eq!(entries.len(), 8, "eight separated values");
+    let frontier = entries.get(1).expect("second frame").frame_end;
+    let data_start = {
+        let mut file = memfs.open(blob_path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut file)?;
+        reader
+            .toc()
+            .section(b"data")
+            .expect("blob file has a data section")
+            .pos()
+    };
+    memfs.punch_hole(blob_path, data_start, frontier - data_start)?;
+    let last = entries.last().expect("last frame");
+    let flip_at = last.frame_end - 8; // inside the last frame's payload
+    let mut file = memfs.open(
+        blob_path,
+        &crate::fs::FsOpenOptions::new().read(true).write(true),
+    )?;
+    let byte = crate::file::read_exact(&*file, flip_at, 1)?;
+    file.seek(SeekFrom::Start(flip_at))?;
+    file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
+    Ok(())
+}
+
+/// A blob newly damaged BETWEEN a crashed repair and its retry must not make
+/// the retry un-recognize tables the crashed attempt already rewrote. The
+/// stamps are per blob: a table stamped for blob 0's remap is skipped even
+/// though the retry's rewrite set grew to also cover blob 1 — recognizing
+/// rewrites by a whole-set fingerprint would instead pass the table through
+/// blob 0's remap AGAIN, and its already-relocated handles (absent from the
+/// map's source offsets) would be dropped as dead records.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_blob_damaged_between_repair_attempts_must_not_unrecognize_stamped_tables() -> crate::Result<()>
+{
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let value = |prefix: u8, i: u32| alloc::vec![prefix + u8::try_from(i).expect("small i"); 64];
+
+    // Two flushes → two SSTs, each referencing its OWN blob file (0 and 1).
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        for i in 0..8u32 {
+            tree.insert(format!("a{i:04}").as_bytes(), value(b'a', i), u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+        for i in 0..8u32 {
+            tree.insert(
+                format!("b{i:04}").as_bytes(),
+                value(b'b', i),
+                u64::from(8 + i),
+            );
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    punch_and_corrupt_blob(&memfs, &blobs.join("0"))?;
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    let config = |fs: Arc<dyn Fs>| {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+
+    // First attempt: blob 0 is salvaged and its referencing SST is rewritten
+    // (stamped), then the sidecar cleanup — which runs after the table stage,
+    // before the manifest commit — fails persistently: the crash point where
+    // rewritten, stamped tables and the surviving sidecar coexist.
+    let fault = FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        FaultRule::new(
+            FaultOp::RemoveFile,
+            Fault::Error(ErrorKind::PermissionDenied),
+        )
+        .on_path("remap"),
+    );
+    let result = config(Arc::new(fault)).repair();
+    assert!(
+        result.is_err(),
+        "the sidecar-cleanup failure must fail the repair: {result:?}",
+    );
+    assert!(
+        memfs.exists(&blobs.join("0.remap"))?,
+        "the crash point leaves blob 0's sidecar in place",
+    );
+
+    // Blob 1 is damaged BETWEEN the attempts — the retry's rewrite set grows.
+    punch_and_corrupt_blob(&memfs, &blobs.join("1"))?;
+
+    // Retry: blob 0's remap is adopted from the sidecar and blob 1 is newly
+    // salvaged. The stamped table (blob 0's) must be recognized per blob and
+    // kept; only blob 1's table is rewritten.
+    let report = config(memfs.clone()).repair()?;
+    assert_eq!(
+        report.recovered, 2,
+        "both referencing tables survive the retry: {report:?}",
+    );
+    assert!(
+        !memfs.exists(&blobs.join("0.remap"))? && !memfs.exists(&blobs.join("1.remap"))?,
+        "both sidecars are consumed by the successful retry",
+    );
+
+    let tree = match config(memfs).open()? {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+    };
+    for (prefix, tag) in [(b'a', "a"), (b'b', "b")] {
+        for i in 2..7u32 {
+            assert_eq!(
+                tree.get(format!("{tag}{i:04}").as_bytes(), crate::MAX_SEQNO)?
+                    .as_deref(),
+                Some(value(prefix, i).as_slice()),
+                "surviving record {tag}{i:04} must read after the retry \
+                 (a stamped table passed through an applied remap again would \
+                 drop its live records)",
+            );
+        }
+        for lost in [0u32, 1, 7] {
+            assert_eq!(
+                tree.get(format!("{tag}{lost:04}").as_bytes(), crate::MAX_SEQNO)?,
+                None,
+                "punched/corrupt record {tag}{lost:04} reads as absent, never an error",
+            );
+        }
+    }
+    Ok(())
+}
+
 /// A blob whose remap sidecar survives a crash but arrives CORRUPT must fail
 /// the repair closed: the replacement alone cannot say where its records used
 /// to live, so rewriting the referencing tables from a guessed map would

@@ -91,6 +91,13 @@ pub struct SalvageOptions {
     /// [`SalvageReport::entries_dropped_by_rewrite`]. A set rewrite disables
     /// verbatim block copy-through (raw block bytes would carry stale handles).
     pub blob_rewrite: Option<Arc<crate::HashMap<crate::vlog::BlobFileId, BlobFileRewrite>>>,
+    /// Per-blob rewrite stamps for the produced SST's meta
+    /// (`descriptor#blob_remap_stamps`), or `None` (the default) to omit the
+    /// key. [`crate::repair`] passes the UNION of the source table's existing
+    /// stamps and the remaps this rewrite applies, sorted by blob id, so a
+    /// repair retry can prove per blob which remaps the table carries and
+    /// re-apply only the missing ones.
+    pub blob_remap_stamps: Option<alloc::vec::Vec<(crate::vlog::BlobFileId, u128)>>,
     /// Shared live-progress counters the block walk ticks per inspected /
     /// re-emitted / dropped block and per recovered row, or `None` (the
     /// default) to skip publishing. [`crate::repair`] forwards the handle set
@@ -943,15 +950,11 @@ fn salvage_attempt(
         // the caller supplies it.
         .use_prefix_extractor(options.prefix_extractor.clone())
         .use_encryption(options.encryption.clone())
-        // A record-relocating rewrite stamps its set fingerprint into the
-        // produced table, so a repair retry can prove the table was already
-        // rewritten and skip it (see `rewrite_set_fingerprint`).
-        .use_blob_remap_fingerprint(
-            options
-                .blob_rewrite
-                .as_deref()
-                .and_then(rewrite_set_fingerprint),
-        );
+        // A record-relocating rewrite stamps the per-blob fingerprints of the
+        // remaps this table now carries (the caller passes the union of the
+        // source's stamps and the applied set), so a repair retry can prove
+        // per blob what was applied and re-apply only the missing remaps.
+        .use_blob_remap_stamps(options.blob_remap_stamps.clone());
     // Without an extractor, DISABLE the filter entirely rather than rebuild one
     // from complete-key hashes: the source's prefix-indexing intent is
     // unknowable (the extractor is not persisted and cannot be inferred), and a
@@ -2370,48 +2373,21 @@ pub struct BlobRecordRelocation {
     pub on_disk_size: u32,
 }
 
-/// Deterministic fingerprint of a repair invocation's blob-handle rewrite
-/// set, stamped into every SST the repair rewrites through it (meta
-/// `descriptor#blob_remap_fingerprint`). A repair RETRY recomputes the same
-/// value — blob salvage is deterministic over an unchanged source, and a
+/// Deterministic fingerprint of ONE blob file's offset remap, stamped per
+/// blob into every SST the repair rewrites through it (meta
+/// `descriptor#blob_remap_stamps`). A repair RETRY recomputes the same value
+/// for that blob — salvage is deterministic over an unchanged source, and a
 /// remap adopted from a persisted sidecar is byte-identical — so a table
-/// already carrying the fingerprint is provably rewritten and must be kept
-/// as-is (re-applying the offset map to relocated handles would treat them
-/// as dropped records). `None` when no rewrite RELOCATES records (a
-/// `DropBelow`-only set is idempotent, so no stamp is needed).
-///
-/// Canonical encoding: blob ids ascending; per rewrite a tag byte, then for
-/// a remap its entries by ascending source offset. Hash maps iterate in
-/// arbitrary order, hence the explicit sort.
-pub(crate) fn rewrite_set_fingerprint(
-    rewrites: &crate::HashMap<crate::vlog::BlobFileId, BlobFileRewrite>,
-) -> Option<u128> {
-    use alloc::vec::Vec;
-    if !rewrites
-        .values()
-        .any(|r| matches!(r, BlobFileRewrite::Remap(_)))
-    {
-        return None;
-    }
-    let mut buf: Vec<u8> = Vec::new();
-    let mut ids: Vec<crate::vlog::BlobFileId> = rewrites.keys().copied().collect();
-    ids.sort_unstable();
-    for id in ids {
-        buf.extend_from_slice(&id.to_le_bytes());
-        match rewrites.get(&id) {
-            Some(BlobFileRewrite::DropBelow(frontier)) => {
-                buf.push(0);
-                buf.extend_from_slice(&frontier.to_le_bytes());
-            }
-            Some(BlobFileRewrite::Remap(map)) => {
-                buf.push(1);
-                buf.extend_from_slice(&encode_remap(map));
-            }
-            // The id came from this map's own key set.
-            None => {}
-        }
-    }
-    Some(crate::hash::hash128(&buf))
+/// whose stamp for the blob matches provably carries that relocation and
+/// must not pass through it again (re-applying the map to relocated handles
+/// would treat them as dropped records). Fingerprints are PER BLOB, not over
+/// the whole rewrite set: the set can grow between attempts (a blob newly
+/// damaged before the retry), and a whole-set value would then stop
+/// recognizing tables rewritten for the earlier blobs. `DropBelow` rewrites
+/// are never stamped — dropping handles below a frontier is idempotent and
+/// self-retiring (a rewritten table has none left).
+pub(crate) fn blob_remap_fingerprint(map: &crate::HashMap<u64, BlobRecordRelocation>) -> u128 {
+    crate::hash::hash128(&encode_remap(map))
 }
 
 /// Canonical byte encoding of one salvage offset remap: entry count, then
