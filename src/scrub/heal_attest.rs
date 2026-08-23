@@ -338,6 +338,10 @@ pub(super) fn attests(
 /// would reread the now-readable marker, find it no longer matches the current
 /// bytes, and delete it — stranding the table with neither attribution nor
 /// marker. On `Inconclusive` the caller must preserve the marker and retry.
+///
+/// Gated to match its only caller, the Page-ECC in-place heal: without that
+/// feature nothing performs a heal, so nothing has a marker to re-attest.
+#[cfg(any(feature = "page_ecc", test))]
 pub fn attests_post(
     fs: &dyn Fs,
     table_path: &Path,

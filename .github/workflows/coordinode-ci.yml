@@ -229,6 +229,14 @@ jobs:
         # `--all-targets` lints tests + benches too, not just the lib; without
         # it, test-harness code under `--all-features` is never clippy-checked.
         run: cargo clippy --all-features --all-targets -- -D warnings
+      - name: Clippy (default features)
+        if: needs.changes.outputs.code != 'false'
+        # The feature set a consumer gets by simply depending on the crate.
+        # `--all-features` does NOT cover it: code reachable only when a
+        # feature is OFF is never compiled there, so this configuration rotted
+        # unnoticed until its tests stopped compiling altogether. Lint both, or
+        # the one nobody builds is the one that breaks.
+        run: cargo clippy --all-targets -- -D warnings
 
   test:
     needs: [changes, lint]

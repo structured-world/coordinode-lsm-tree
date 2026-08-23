@@ -7796,8 +7796,9 @@ impl Table {
     }
 
     /// The installed heal-hint sink, exposed so tests outside this module can
-    /// assert it is carried across same-id reopens.
-    #[cfg(test)]
+    /// assert every publication path binds it. Gated with the tests that use
+    /// it: without Page ECC nothing produces a heal hint to begin with.
+    #[cfg(all(test, feature = "page_ecc"))]
     pub(crate) fn heal_hints_for_test(&self) -> Option<Arc<crate::heal_hints::HealHints>> {
         self.0.heal_hints.get().cloned()
     }

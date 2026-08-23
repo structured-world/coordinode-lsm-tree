@@ -219,7 +219,15 @@ pub struct DecoderMeta {
 
 // Test-only: the binary-index forge patches pointer bytes in place and needs
 // the trailer-derived layout; production readers go through the decoder.
+/// Read-only views used by the on-disk forgery helpers, which need a block's
+/// real binary-index geometry to aim a forged pointer at it. Compiled in
+/// every feature subset alongside those helpers, whose own consumers are
+/// feature-gated.
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "consumed by a forge helper whose tests are feature-gated"
+)]
 impl DecoderMeta {
     /// Byte offset of the binary index within the block payload.
     #[must_use]

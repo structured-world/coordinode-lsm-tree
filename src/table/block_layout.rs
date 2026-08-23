@@ -149,7 +149,11 @@ impl BlockLayoutMap {
     /// of a tight-space restricted view (its `[0, from_offset)` blocks are
     /// punched, so their layout entries describe dead frames). `from_offset ==
     /// 0` yields [`len`](Self::len).
-    #[cfg(feature = "std")]
+    ///
+    /// Gated to match its only caller: the section it describes records how a
+    /// data block split into inner zstd blocks, so the cross-check that reads
+    /// this exists only where zstd does.
+    #[cfg(all(feature = "std", feature = "zstd"))]
     pub fn live_len(&self, from_offset: u64) -> usize {
         self.entries
             .iter()

@@ -2387,6 +2387,16 @@ pub struct BlobRecordRelocation {
 /// Dictionary compression decodes only when the caller supplies the matching
 /// dictionary (repair has the tree's config); the standalone salvage entry
 /// passes none and rejects dictionary sources up front.
+// The lifetime is only elidable when the dictionary parameter is compiled
+// out: with it there are two input references and elision cannot tie the
+// output to the right one, so the name has to stay.
+#[cfg_attr(
+    not(zstd_any),
+    expect(
+        clippy::elidable_lifetime_names,
+        reason = "named to stay valid in the zstd build, where a second reference parameter exists"
+    )
+)]
 pub(crate) fn decompress_blob_value<'a>(
     compression: crate::CompressionType,
     on_disk: &'a [u8],

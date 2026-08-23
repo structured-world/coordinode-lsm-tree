@@ -4856,6 +4856,16 @@ fn forge_tail_meta_table_id(
             value.copy_from_slice(&descriptor);
         }
     }
+    // The range is reused below to re-checksum after the parity refresh, which
+    // only a Page-ECC build compiles — hence the clone, and hence the lint
+    // firing only where that reuse is absent.
+    #[cfg_attr(
+        not(feature = "page_ecc"),
+        expect(
+            clippy::redundant_clone,
+            reason = "the range is reused by the Page-ECC parity refresh below"
+        )
+    )]
     let Some(payload) = bytes.get(payload_range.clone()) else {
         panic!("meta payload within the file");
     };

@@ -9,6 +9,23 @@
     clippy::expect_used,
     reason = "test helpers assert on known-present values; a panic is the failure signal"
 )]
+// Each helper forges one specific on-disk structure, and the tests that
+// consume it are gated on the feature that structure belongs to (a delete
+// bitmap needs `columnar`, an inner-block layout needs `zstd`, and so on).
+// This module is compiled for EVERY feature subset, so in any given subset
+// the helpers whose consumers are compiled out are unused — by construction,
+// not by neglect. Gating each helper on the union of its current callers'
+// features would encode that list here and go stale the moment a test moves.
+#![allow(
+    dead_code,
+    reason = "helpers are compiled in every feature subset; their consumers are feature-gated"
+)]
+// `redundant_clone` is flow-sensitive and reads differently per subset: the
+// same binding is used again on a branch that only some subsets compile.
+#![allow(
+    clippy::redundant_clone,
+    reason = "the cloned range is reused on branches other feature subsets compile"
+)]
 
 /// Forges a STALE per-KV footer behind a RE-STAMPED block checksum in the
 /// first data block of the SST at `path`: flips one digest byte inside the

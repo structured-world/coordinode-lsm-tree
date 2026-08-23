@@ -535,6 +535,16 @@ pub(crate) fn scrub_block(
 /// checksum, and reports
 /// [`EccStatus::Unrecognized`](crate::table::block::EccStatus::Unrecognized)),
 /// so the data still loads without ECC recovery rather than failing closed.
+// The lifetime is only elidable when the dictionary parameter is compiled
+// out: with it two input references share `'a`, and the transform must borrow
+// from both for exactly as long.
+#[cfg_attr(
+    not(zstd_any),
+    expect(
+        clippy::elidable_lifetime_names,
+        reason = "named to stay valid in the zstd build, where a second reference parameter shares it"
+    )
+)]
 pub(crate) fn build_block_transform<'a>(
     compression: CompressionType,
     encryption: Option<&'a dyn EncryptionProvider>,
