@@ -641,28 +641,34 @@ fn publish_from_temp(
             return Err(e.into());
         }
     }
-    // `dest` now links the copy, but the new directory entry is a fresh
-    // mutation: without its own sync a power loss can leave the manifest
-    // referencing a `dest` that survives only under the temp name. Make the
-    // entry durable BEFORE dropping the temp. A sync failure removes the
-    // just-published copy (and the temp) and propagates, so a retry and the
-    // repair caller both see the destination free.
-    if let Err(e) = fs.sync_directory_with(entry_directory(dest), options.sync_mode) {
-        discard_partial(fs, dest);
-        discard_partial(fs, temp);
-        return Err(e.into());
-    }
-    // Durable; drop the temp name (the inode lives on under `dest`). A crash
-    // before this leaves the temp in the recovery-owned `.healtmp-` namespace,
-    // which the next open sweeps. A LIVE removal failure must propagate
-    // instead of being shrugged off: the repair caller commits a manifest
-    // that never references the temp, so a stuck `.healtmp-` name makes that
-    // same open sweep hit the same removal error — success would describe a
-    // tree that cannot open. A missing temp is fine (a concurrent sweep won).
+    // Drop the temp name BEFORE the durability sync, so one sync below covers
+    // both directory mutations (the new `dest` entry and the removed temp). A
+    // LIVE removal failure must not be shrugged off — the repair caller
+    // commits a manifest that never references the temp, and a stuck
+    // `.healtmp-` name makes the next open's artifact sweep hit the same
+    // removal error — but it must also not strand a DURABLE `dest` behind an
+    // error (a later retry would then bounce off `AlreadyExists` forever
+    // despite this call reporting failure). Nothing is synced yet, so
+    // unwinding the fresh `dest` entry returns the pair to its pre-publish
+    // state; if even the unwind fails, the retry's directory scan resolves
+    // the leftovers once the filesystem is fixed. A missing temp is fine (a
+    // concurrent sweep won).
     match fs.remove_file(temp) {
         Ok(()) => {}
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
+        Err(e) => {
+            discard_partial(fs, dest);
+            return Err(e.into());
+        }
+    }
+    // `dest` now links the copy and the temp name is gone, but both directory
+    // mutations are fresh: without a sync a power loss can leave the manifest
+    // referencing a `dest` that survives only under the temp name. A sync
+    // failure removes the just-published copy and propagates, so a retry and
+    // the repair caller both see the destination free.
+    if let Err(e) = fs.sync_directory_with(entry_directory(dest), options.sync_mode) {
+        discard_partial(fs, dest);
+        return Err(e.into());
     }
     rep.salvaged_path = Some(dest.to_path_buf());
     Ok(rep)

@@ -7394,12 +7394,19 @@ fn publish_fails_when_the_temp_name_cannot_be_dropped() -> crate::Result<()> {
     assert!(writer.finish()?.is_some(), "source SST is non-empty");
     crate::test_forge::forge_tail_meta_value(&source, b"compression#data", &[1])?;
 
-    let result = salvage_sst(&source, dest, &fs);
+    let result = salvage_sst(&source, dest.clone(), &fs);
     assert!(
         result.as_ref().is_err_and(
             |e| matches!(e, crate::Error::Io(e) if e.kind() == ErrorKind::PermissionDenied)
         ),
         "a stuck temp name must fail the salvage, not be shrugged off: {result:?}",
+    );
+    // The freshly linked destination must be unwound with the error: left
+    // installed, a retry after the filesystem is fixed would bounce off
+    // AlreadyExists forever despite this call reporting failure.
+    assert!(
+        !dest.exists(),
+        "the unpublished destination must not survive the failure",
     );
     Ok(())
 }
