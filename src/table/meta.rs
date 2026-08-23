@@ -173,6 +173,17 @@ pub struct ParsedMeta {
     /// have been bulk-ingested), since it cannot reconstruct the offset from the
     /// SST alone.
     pub bulk_ingested: Option<bool>,
+
+    /// Fingerprint of the manifest-repair blob-handle rewrite this table was
+    /// produced by, from the optional `descriptor#blob_remap_fingerprint`
+    /// property. Salvaging a damaged blob file relocates its surviving
+    /// records, and the referencing SSTs are rewritten onto the new offsets;
+    /// the rewritten SST records the rewrite-set fingerprint so a repair
+    /// RETRY (after a crash mid-way) can prove the table was already
+    /// rewritten by the same deterministic rewrite and skip it — re-applying
+    /// the offset map to already-rewritten handles would drop live entries.
+    /// `None` = not produced by a blob-handle rewrite.
+    pub blob_remap_fingerprint: Option<u128>,
 }
 
 macro_rules! read_u8 {
@@ -373,6 +384,17 @@ impl ParsedMeta {
                 _ => return Err(crate::Error::InvalidHeader("TableMeta")),
             },
         };
+
+        // Optional blob-handle rewrite fingerprint (see the field doc). Absent
+        // on every table not produced by a manifest-repair blob rewrite.
+        let blob_remap_fingerprint =
+            match block.point_read(b"descriptor#blob_remap_fingerprint", SeqNo::MAX, &cmp)? {
+                None => None,
+                Some(v) => match <[u8; 16]>::try_from(v.value.as_ref()) {
+                    Ok(bytes) => Some(u128::from_le_bytes(bytes)),
+                    Err(_) => return Err(crate::Error::InvalidHeader("TableMeta")),
+                },
+            };
 
         let id = read_u64!(block, b"table_id", &cmp);
         // Cross-check the payload's stored id against the caller's durable
@@ -581,6 +603,7 @@ impl ParsedMeta {
             index_block_restart_interval,
             columnar,
             bulk_ingested,
+            blob_remap_fingerprint,
         })
     }
 }

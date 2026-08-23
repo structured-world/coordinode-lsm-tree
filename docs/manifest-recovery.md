@@ -299,6 +299,21 @@ reference list cannot be read, and a *restricted* survivor whose blob
 dependency was reshaped (the rewrite would emit an unrestricted copy and
 resurrect its punched prefix).
 
+The blob publish and the table rewrites are separate steps, so the relocation
+is made **crash-consistent** explicitly. Before the replacement takes the
+canonical name, its offset remap is durably recorded in a `blobs/{id}.remap`
+sidecar (checksummed, written atomically); the replacement then validates as
+an ordinary intact blob on a retry, and the sidecar is what tells that retry
+the referencing tables still need rewriting. Each rewritten table is stamped
+with a fingerprint of the whole rewrite set — salvage is deterministic over
+an unchanged source, so a retry recomputes the same value and skips tables
+already carrying it (re-applying the map to relocated handles would drop live
+entries). The sidecars are removed, strictly, after the table stage and
+before the manifest commit: a crash anywhere in between leaves either the
+sidecar (the retry re-adopts the remap) or a fully consistent tree, while a
+corrupt surviving sidecar fails the repair closed — the replacement alone
+cannot say where its records used to live.
+
 ## Delete-mask resolution
 
 A columnar SST records positional deletions in a delete bitmap, and the meta

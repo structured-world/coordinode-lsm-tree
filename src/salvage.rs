@@ -942,7 +942,16 @@ fn salvage_attempt(
         // the rebuilt filter only carries the source's prefix hashes when
         // the caller supplies it.
         .use_prefix_extractor(options.prefix_extractor.clone())
-        .use_encryption(options.encryption.clone());
+        .use_encryption(options.encryption.clone())
+        // A record-relocating rewrite stamps its set fingerprint into the
+        // produced table, so a repair retry can prove the table was already
+        // rewritten and skip it (see `rewrite_set_fingerprint`).
+        .use_blob_remap_fingerprint(
+            options
+                .blob_rewrite
+                .as_deref()
+                .and_then(rewrite_set_fingerprint),
+        );
     // Without an extractor, DISABLE the filter entirely rather than rebuild one
     // from complete-key hashes: the source's prefix-indexing intent is
     // unknowable (the extractor is not persisted and cannot be inferred), and a
@@ -2359,6 +2368,99 @@ pub struct BlobRecordRelocation {
     pub offset: u64,
     /// On-disk size of the re-emitted (possibly re-compressed) value.
     pub on_disk_size: u32,
+}
+
+/// Deterministic fingerprint of a repair invocation's blob-handle rewrite
+/// set, stamped into every SST the repair rewrites through it (meta
+/// `descriptor#blob_remap_fingerprint`). A repair RETRY recomputes the same
+/// value — blob salvage is deterministic over an unchanged source, and a
+/// remap adopted from a persisted sidecar is byte-identical — so a table
+/// already carrying the fingerprint is provably rewritten and must be kept
+/// as-is (re-applying the offset map to relocated handles would treat them
+/// as dropped records). `None` when no rewrite RELOCATES records (a
+/// `DropBelow`-only set is idempotent, so no stamp is needed).
+///
+/// Canonical encoding: blob ids ascending; per rewrite a tag byte, then for
+/// a remap its entries by ascending source offset. Hash maps iterate in
+/// arbitrary order, hence the explicit sort.
+pub(crate) fn rewrite_set_fingerprint(
+    rewrites: &crate::HashMap<crate::vlog::BlobFileId, BlobFileRewrite>,
+) -> Option<u128> {
+    use alloc::vec::Vec;
+    if !rewrites
+        .values()
+        .any(|r| matches!(r, BlobFileRewrite::Remap(_)))
+    {
+        return None;
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    let mut ids: Vec<crate::vlog::BlobFileId> = rewrites.keys().copied().collect();
+    ids.sort_unstable();
+    for id in ids {
+        buf.extend_from_slice(&id.to_le_bytes());
+        match rewrites.get(&id) {
+            Some(BlobFileRewrite::DropBelow(frontier)) => {
+                buf.push(0);
+                buf.extend_from_slice(&frontier.to_le_bytes());
+            }
+            Some(BlobFileRewrite::Remap(map)) => {
+                buf.push(1);
+                buf.extend_from_slice(&encode_remap(map));
+            }
+            // The id came from this map's own key set.
+            None => {}
+        }
+    }
+    Some(crate::hash::hash128(&buf))
+}
+
+/// Canonical byte encoding of one salvage offset remap: entry count, then
+/// `(source offset, new offset, new on-disk size)` triples by ascending
+/// source offset. Deterministic (hash maps iterate arbitrarily, hence the
+/// sort), so it doubles as the sidecar payload and the fingerprint input.
+pub(crate) fn encode_remap(map: &crate::HashMap<u64, BlobRecordRelocation>) -> alloc::vec::Vec<u8> {
+    let mut olds: alloc::vec::Vec<u64> = map.keys().copied().collect();
+    olds.sort_unstable();
+    let mut buf = alloc::vec::Vec::with_capacity(8 + olds.len() * 20);
+    buf.extend_from_slice(&(olds.len() as u64).to_le_bytes());
+    for old in olds {
+        // The offset came from this map's own key set.
+        let Some(rel) = map.get(&old) else { continue };
+        buf.extend_from_slice(&old.to_le_bytes());
+        buf.extend_from_slice(&rel.offset.to_le_bytes());
+        buf.extend_from_slice(&rel.on_disk_size.to_le_bytes());
+    }
+    buf
+}
+
+/// Decodes [`encode_remap`]'s payload. `None` on any structural mismatch
+/// (short buffer, trailing bytes, count disagreement) — the caller treats
+/// that as a corrupt sidecar and fails closed.
+pub(crate) fn decode_remap(mut bytes: &[u8]) -> Option<crate::HashMap<u64, BlobRecordRelocation>> {
+    let take = |bytes: &mut &[u8], n: usize| -> Option<alloc::vec::Vec<u8>> {
+        let (head, tail) = bytes.split_at_checked(n)?;
+        *bytes = tail;
+        Some(head.to_vec())
+    };
+    let count = u64::from_le_bytes(take(&mut bytes, 8)?.try_into().ok()?);
+    let count = usize::try_from(count).ok()?;
+    let mut map = crate::HashMap::default();
+    for _ in 0..count {
+        let old = u64::from_le_bytes(take(&mut bytes, 8)?.try_into().ok()?);
+        let offset = u64::from_le_bytes(take(&mut bytes, 8)?.try_into().ok()?);
+        let on_disk_size = u32::from_le_bytes(take(&mut bytes, 4)?.try_into().ok()?);
+        map.insert(
+            old,
+            BlobRecordRelocation {
+                offset,
+                on_disk_size,
+            },
+        );
+    }
+    if !bytes.is_empty() || map.len() != count {
+        return None;
+    }
+    Some(map)
 }
 
 /// Decompresses one blob record's on-disk bytes, mirroring the live reader's

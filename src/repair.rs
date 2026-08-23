@@ -694,6 +694,56 @@ fn remove_temp(config: &Config, temp: &std::path::Path) -> crate::Result<()> {
     }
 }
 
+/// Durably records a salvaged blob's offset remap in a `blobs/{id}.remap`
+/// sidecar BEFORE the salvaged replacement is published. The publish makes
+/// the replacement validate as an ordinary intact blob, so without the
+/// sidecar a repair that crashes between the publish and the referencing
+/// SSTs' rewrite would leave a retry blessing the replacement while every
+/// handle still points at the OLD offsets. The sidecar carries that remap
+/// across the crash; the retry adopts it and finishes the rewrite.
+///
+/// Payload is [`crate::salvage::encode_remap`] followed by its XXH3-128
+/// digest; written atomically (temp + rename + directory sync) so a torn
+/// sidecar can never decode.
+#[cfg(feature = "std")]
+fn write_remap_sidecar(
+    config: &Config,
+    path: &std::path::Path,
+    map: &crate::HashMap<u64, crate::salvage::BlobRecordRelocation>,
+) -> crate::Result<()> {
+    let mut payload = crate::salvage::encode_remap(map);
+    let digest = crate::hash::hash128(&payload);
+    payload.extend_from_slice(&digest.to_le_bytes());
+    crate::file::rewrite_atomic(path, &payload, &*config.fs, config.sync_mode)?;
+    Ok(())
+}
+
+/// Reads back a remap sidecar written by [`write_remap_sidecar`]. `None` on
+/// any digest or structural mismatch — the caller fails the repair closed
+/// rather than rewriting SST handles from a corrupt map.
+#[cfg(feature = "std")]
+fn read_remap_sidecar(
+    config: &Config,
+    path: &std::path::Path,
+) -> crate::Result<Option<crate::HashMap<u64, crate::salvage::BlobRecordRelocation>>> {
+    let mut file = config
+        .fs
+        .open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+    let mut payload = Vec::new();
+    file.read_to_end(&mut payload)?;
+    let Some(body_len) = payload.len().checked_sub(16) else {
+        return Ok(None);
+    };
+    let (body, digest) = payload.split_at(body_len);
+    let Ok(digest) = <[u8; 16]>::try_from(digest) else {
+        return Ok(None);
+    };
+    if crate::hash::hash128(body) != u128::from_le_bytes(digest) {
+        return Ok(None);
+    }
+    Ok(crate::salvage::decode_remap(body))
+}
+
 /// Whether `a` and `b` name the SAME physical file — a symlink, junction, or
 /// case-insensitive alias resolving to one directory entry (two configured table
 /// folders pointing at the same location). Used so a repeated sighting of one SST
@@ -2046,6 +2096,13 @@ struct BlobRecovery {
     /// compaction, so without this seed `is_dead` could never retire the
     /// file.
     frag: crate::blob_tree::FragmentationMap,
+    /// Remap sidecars (`blobs/{id}.remap`) now accounted for — freshly
+    /// written for this scan's salvages, adopted from a crashed earlier
+    /// repair, or orphaned by a since-quarantined replacement. The caller
+    /// removes them all after the table-rewrite stage and BEFORE committing
+    /// the manifest, so a crash anywhere in between leaves either the
+    /// sidecar (retry re-adopts the remap) or a fully consistent tree.
+    remap_sidecars: Vec<PathBuf>,
 }
 
 /// Discovers the blob files of a KV-separated tree for `repair` by scanning the
@@ -2070,6 +2127,12 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
         crate::HashMap::default();
     let mut salvaged_notes: Vec<(PathBuf, String)> = Vec::new();
     let mut frag = crate::blob_tree::FragmentationMap::default();
+    let mut remap_sidecars: Vec<PathBuf> = Vec::new();
+    // Sidecars discovered by the candidate scan, keyed by blob id, awaiting
+    // the adopt-or-orphan decision once their blob's validation outcome is
+    // known. Drained into `remap_sidecars` for cleanup either way.
+    let mut sidecar_paths: crate::HashMap<crate::vlog::BlobFileId, PathBuf> =
+        crate::HashMap::default();
 
     // No `blobs/` folder = no blob files (a blob tree that never spilled a value
     // to the value log). Nothing to recover; the manifest records an empty list.
@@ -2080,6 +2143,7 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
             rewrites,
             salvaged: salvaged_notes,
             frag,
+            remap_sidecars,
         });
     }
 
@@ -2117,6 +2181,34 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
             // an out (it preserves damaged DATA; a temp is discardable
             // garbage, and a directory refusing removal refuses the rename
             // too). Retry after the filesystem is fixed.
+            remove_temp(config, &blob_path)?;
+            continue;
+        }
+
+        // A remap sidecar from a crashed earlier repair: it records the offset
+        // relocation of an already-published salvaged replacement whose
+        // referencing SSTs were not all rewritten before the crash. Collect it
+        // for adoption when its blob validates below (and for strict removal
+        // after the table-rewrite stage either way). Both halves must parse so
+        // a foreign name merely ending in the suffix is not treated as ours.
+        if let Some(id) = file_name
+            .strip_suffix(".remap")
+            .and_then(|id| id.parse::<crate::vlog::BlobFileId>().ok())
+        {
+            sidecar_paths.insert(id, blob_path);
+            continue;
+        }
+
+        // A remap sidecar's own atomic-write staging file, stranded by a
+        // crash between its creation and the rename onto the sidecar name.
+        // Never published, never referenced — discardable garbage, same
+        // strict-removal policy as the salvage temps. Both halves must
+        // parse (`.tmp_{pid}_{seq}`) so a foreign dotfile is not claimed.
+        if file_name
+            .strip_prefix(".tmp_")
+            .and_then(|rest| rest.split_once('_'))
+            .is_some_and(|(pid, seq)| pid.parse::<u32>().is_ok() && seq.parse::<u64>().is_ok())
+        {
             remove_temp(config, &blob_path)?;
             continue;
         }
@@ -2403,6 +2495,23 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
                 }
             };
 
+            // Durably record the offset remap BEFORE publishing: once the
+            // replacement holds the canonical name it validates as an
+            // ordinary intact blob, so a crash before the referencing SSTs
+            // are rewritten would otherwise strand their handles on the old
+            // offsets with no surviving record of the relocation. A retry
+            // adopts the sidecar (see the intact-blob path below); it is
+            // removed only after the table-rewrite stage, before the manifest
+            // commit. A write failure aborts with nothing published — the
+            // original is untouched and the retry starts clean.
+            let remap: crate::HashMap<u64, crate::salvage::BlobRecordRelocation> =
+                report.offset_remap.iter().copied().collect();
+            let sidecar = blobs_folder.join(format!("{blob_id}.remap"));
+            if let Err(e) = write_remap_sidecar(config, &sidecar, &remap) {
+                let _ = config.fs.remove_file(&temp);
+                return Err(e);
+            }
+
             // Verified: publish. The original moves to quarantine (preserved for
             // offline inspection) and the replacement takes the canonical name.
             let quarantined = quarantine_file(
@@ -2431,12 +2540,12 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
             }
             kept_paths.insert(blob_id, blob_path.clone());
             blob_files.push(bf);
-            rewrites.insert(
-                blob_id,
-                crate::salvage::BlobFileRewrite::Remap(
-                    report.offset_remap.iter().copied().collect(),
-                ),
-            );
+            rewrites.insert(blob_id, crate::salvage::BlobFileRewrite::Remap(remap));
+            // The freshly written sidecar supersedes any discovered one at
+            // the same path (a re-salvage after a crashed retry overwrote
+            // it); dropping the stale entry keeps the cleanup list unique.
+            sidecar_paths.remove(&blob_id);
+            remap_sidecars.push(sidecar);
             // The replacement IS installed in the rebuilt manifest, so this is
             // a salvage outcome, not an unreadable file — `unreadable_files`
             // lists only files LEFT OUT of the manifest.
@@ -2502,6 +2611,29 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
                         ),
                     );
                 }
+                // An intact blob with a remap sidecar is a salvaged
+                // replacement published by a crashed earlier repair whose
+                // referencing SSTs were not all rewritten. Adopt the recorded
+                // remap so the table-rewrite stage finishes that relocation;
+                // tables the crashed attempt DID rewrite carry the rewrite
+                // set's fingerprint and are skipped there. A sidecar that
+                // fails its digest or decode fails the repair closed —
+                // rewriting handles from a guessed map would corrupt reads,
+                // and the replacement alone cannot say where its records
+                // used to live.
+                if let Some(sidecar) = sidecar_paths.remove(&blob_id) {
+                    let Some(map) = read_remap_sidecar(config, &sidecar)? else {
+                        log::error!(
+                            "blob file {blob_id}: its remap sidecar {} is corrupt; \
+                             failing the repair — without the recorded relocation \
+                             the referencing tables cannot be rewritten safely",
+                            sidecar.display(),
+                        );
+                        return Err(crate::Error::InvalidHeader("BlobRemapSidecar"));
+                    };
+                    rewrites.insert(blob_id, crate::salvage::BlobFileRewrite::Remap(map));
+                    remap_sidecars.push(sidecar);
+                }
                 kept_paths.insert(blob_id, blob_path);
                 blob_files.push(bf);
             }
@@ -2513,12 +2645,19 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
         }
     }
 
+    // Sidecars whose blob never reached the adopt point (quarantined,
+    // duplicate, or re-salvaged under a different outcome) are orphans: the
+    // remap they record no longer applies to anything in the manifest, so
+    // they only need the same strict cleanup as the adopted ones.
+    remap_sidecars.extend(sidecar_paths.into_values());
+
     Ok(BlobRecovery {
         files: blob_files,
         unreadable,
         rewrites,
         salvaged: salvaged_notes,
         frag,
+        remap_sidecars,
     })
 }
 
@@ -3520,12 +3659,14 @@ fn repair_tree(
     > = crate::HashMap::default();
     let mut blob_files_salvaged: Vec<(PathBuf, String)> = Vec::new();
     let mut blob_frag = crate::blob_tree::FragmentationMap::default();
+    let mut blob_remap_sidecars: Vec<PathBuf> = Vec::new();
     let (tree_type, blob_file_list) = if config.kv_separation_opts.is_some() {
         let recovery = recover_blob_files(config)?;
         unreadable_files.extend(recovery.unreadable);
         blob_rewrites = recovery.rewrites;
         blob_files_salvaged = recovery.salvaged;
         blob_frag = recovery.frag;
+        blob_remap_sidecars = recovery.remap_sidecars;
         let map: crate::HashMap<crate::vlog::BlobFileId, crate::vlog::BlobFile> =
             recovery.files.into_iter().map(|bf| (bf.id(), bf)).collect();
         (TreeType::Blob, BlobFileList::new(map))
@@ -3558,6 +3699,13 @@ fn repair_tree(
                 crate::salvage::BlobFileRewrite::Remap(_) => None,
             })
             .collect();
+        // The rewrite set's identity, for retry idempotence: a table already
+        // stamped with this fingerprint was rewritten by a crashed earlier
+        // attempt of this SAME deterministic rewrite (salvage over an
+        // unchanged source re-derives the same remap; an adopted sidecar IS
+        // that remap). Re-applying the map to its already-relocated handles
+        // would treat them as dropped records, so such a table is kept as-is.
+        let rewrite_fingerprint = crate::salvage::rewrite_set_fingerprint(&blob_rewrites);
         let blob_rewrites = Arc::new(blob_rewrites);
         let mut kept: Vec<(Table, bool)> = Vec::with_capacity(recovered_tables.len());
         for (table, complete) in recovered_tables {
@@ -3587,6 +3735,17 @@ fn repair_tree(
                     &mut unreadable_files,
                     config.sync_mode,
                 )?;
+                continue;
+            }
+            // Already rewritten by a crashed earlier attempt of this same
+            // rewrite set (fingerprint match): its handles hold the RELOCATED
+            // offsets, so it is correct as it stands and must not pass
+            // through the rewrite again. It stays a salvage outcome (lossy
+            // relative to the pre-damage original), hence `complete = false`.
+            if table.metadata.blob_remap_fingerprint.is_some()
+                && table.metadata.blob_remap_fingerprint == rewrite_fingerprint
+            {
+                kept.push((table, false));
                 continue;
             }
             // Whether this table's handles must be rewritten: any reference to
@@ -3708,6 +3867,25 @@ fn repair_tree(
             }
         }
         recovered_tables = kept;
+    }
+
+    // Every referencing table is now rewritten (or set aside), so the remap
+    // sidecars have served their purpose: remove them BEFORE the manifest
+    // commit. A crash in between leaves a consistent tree either way — with
+    // a surviving sidecar the retry re-adopts the remap and the fingerprint
+    // skips the already-rewritten tables; without it the replacement and the
+    // rewritten tables are simply correct as found. Removal failures fail
+    // the repair (same strict policy as the salvage temps): a stale sidecar
+    // under a COMMITTED manifest would be re-adopted by a LATER repair whose
+    // tables no longer carry the fingerprint, rewriting correct handles.
+    if !blob_remap_sidecars.is_empty() {
+        for sidecar in &blob_remap_sidecars {
+            remove_temp(config, sidecar)?;
+        }
+        config.fs.sync_directory_with(
+            &config.path.join(crate::file::BLOBS_FOLDER),
+            config.sync_mode,
+        )?;
     }
 
     // `salvaged` is a subset of `recovered`, so derive it from the tables that
