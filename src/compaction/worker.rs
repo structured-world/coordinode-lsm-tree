@@ -1171,10 +1171,12 @@ fn run_tight_space_compaction(
             // whole input. That is safe ONLY because the slice merge applies no
             // removal semantics (no bottommost GC, no compaction filter — see the
             // superset invariant above), so the committed output shadows every row
-            // of the redundant prefix and nothing resurrects. Punching an input
-            // whose sidecar did not land would instead force repair to derive a
-            // conservative bound and drop up to one live block — so never punch
-            // without the sidecar.
+            // of the redundant prefix for point reads, nothing resurrects, and the
+            // CDC enumeration (`scan_since_seqno`) deduplicates the byte-identical
+            // copies the kept-whole input carries next to the slice output.
+            // Punching an input whose sidecar did not land would instead force
+            // repair to derive a conservative bound and drop up to one live
+            // block — so never punch without the sidecar.
             for view in &current_views {
                 if removed_ids.contains(&view.id()) {
                     view.mark_as_deleted();
