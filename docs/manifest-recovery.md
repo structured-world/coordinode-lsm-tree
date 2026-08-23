@@ -435,6 +435,23 @@ key ranges, so an interior hole could be expressed as lost coverage rather
 than as an erroring read. That is far more invasive: every overlap check,
 seek, and compaction-input choice assumes one contiguous range per table.
 
+**A block destroyed at the punch boundary is indistinguishable from a larger
+punch.** The standalone verifier derives a restricted file's live frontier
+from geometry alone: it walks frames, and the FIRST all-zero gap fixes the
+frontier and ends the derivation. That holds because a reclaim works top-down
+from the start of the data section, so its holes are the earliest in the file
+— a partially completed pass can leave an intact block ahead of them, but
+never live data ahead of a later hole. A gap appearing after the first is
+therefore a destroyed live block, and is reported rather than skipped.
+
+What geometry cannot separate is a block destroyed *immediately at* the
+boundary: its zeros merge with the reclaimed prefix into one continuous
+region, and nothing in the file says where the reclaim was meant to end.
+Resolving that needs the restriction's key bound mapped onto block offsets,
+which requires the block index — out of reach for a path-based walk that holds
+only a filesystem reference and no open table. Callers that do hold a table
+pass the exact frontier in and are unaffected.
+
 **The publish phase is a sequence of renames, not one atomic act.** Publishing
 under fresh ids reduces this to "write new files, then commit the manifest",
 where only the commit is observable — but the file writes themselves are

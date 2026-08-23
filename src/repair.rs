@@ -2193,11 +2193,18 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
     // before any is processed, so an id handed out here can never collide with
     // a file this scan has not reached yet. Repair runs single-threaded on a
     // tree nobody else has open, so no other allocator competes.
-    let mut next_blob_id = candidates
+    //
+    // `None` once the space is exhausted, and the failure is raised only where
+    // an id is actually needed — a healthy tree holding a `u64::MAX` blob is
+    // still perfectly repairable. Wrapping instead would hand out an id an
+    // existing file already holds, and publishing the replacement onto that
+    // name would destroy an unrelated original BEFORE the manifest commit, so
+    // the loss would not even surface as a failed repair.
+    let mut next_blob_id: Option<crate::vlog::BlobFileId> = candidates
         .iter()
         .map(|(id, _, _)| *id)
         .max()
-        .map_or(0, |max| max + 1);
+        .map_or(Some(0), |max| max.checked_add(1));
     candidates.sort_by(|a, b| {
         a.0.cmp(&b.0)
             .then_with(|| {
@@ -2395,8 +2402,15 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
         // exists, and the retry would set those tables aside as
         // unrecoverable.
         let Some(live) = validate_blob_frames(config, &blob_path, blob_id, frontier)? else {
-            let new_id = next_blob_id;
-            next_blob_id += 1;
+            let Some(new_id) = next_blob_id else {
+                log::error!(
+                    "blob file {blob_id} needs salvaging but the blob id space is \
+                     exhausted: there is no fresh name to publish a replacement \
+                     under, and reusing one would destroy an existing file"
+                );
+                return Err(crate::Error::Unrecoverable);
+            };
+            next_blob_id = new_id.checked_add(1);
             let temp = blobs_folder.join(format!("{new_id}.salvage-tmp"));
             remove_temp(config, &temp)?;
             let salvage = (|| -> crate::Result<Option<(crate::vlog::BlobFile, crate::salvage::BlobSalvageReport)>> {
@@ -3882,10 +3896,13 @@ fn repair_tree(
     // a failed repair leave a table referencing a blob id that no longer
     // exists — and the retry would set that table aside as unrecoverable.
     //
-    // Best-effort by design: the tree is already valid and openable. A
-    // failure here only means the superseded original stays in `blobs/`,
-    // where the next open classifies it as an orphan and removes it — the
-    // forensic copy is lost, never the tree.
+    // NOT best-effort. A superseded original left in `blobs/` is outside the
+    // committed manifest, so the next open classifies it as an orphan and
+    // removes it — and if the directory refuses the removal the way it just
+    // refused the rename, that open FAILS. Reporting a successful repair for a
+    // tree that will not open is the one outcome recovery must never produce,
+    // so the failure propagates: the manifest is already durable, and a retry
+    // once the filesystem is fixed finishes the set-aside on the same inputs.
     for (path, note) in stale_blob_originals {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -3897,12 +3914,13 @@ fn repair_tree(
                 format!("{note}; original preserved at {}", dest.display()),
             )),
             Err(e) => {
-                log::warn!(
-                    "repair: could not set aside the superseded blob original {} ({e}); \
-                     the tree is committed and valid, so the next open sweeps it as an orphan",
+                log::error!(
+                    "repair: cannot set aside the superseded blob original {} ({e}); \
+                     failing the repair — left in blobs/ it is an orphan the next \
+                     open must remove, and that removal would hit the same error",
                     path.display(),
                 );
-                blob_files_salvaged.push((path, note));
+                return Err(e);
             }
         }
     }

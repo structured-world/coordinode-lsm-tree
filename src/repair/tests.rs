@@ -2351,6 +2351,52 @@ fn a_zero_tailed_value_does_not_move_the_restricted_verify_frontier() -> crate::
     Ok(())
 }
 
+/// A restriction reclaims a PREFIX, so only leading zeroed extents may move
+/// the verify frontier. A live suffix block that was destroyed — zeroed by
+/// damage rather than reclaimed — sits after real data, and treating it as
+/// another punched extent would start verification past the loss and pronounce
+/// the file healthy while skipping exactly the destroyed region.
+#[test]
+fn a_destroyed_suffix_block_does_not_move_the_restricted_verify_frontier() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs, SyncMode};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    write_multiblock_sst(&sst, &fs)?;
+
+    // A committed restriction whose punched prefix is genuine.
+    crate::restrict_bound::write(&*fs, &sst, None, 0, b"k00130", SyncMode::Normal)?;
+    let punch = recover_sst(sst.clone(), &fs)?.punch_offset_for(b"k00130")?;
+    memfs.punch_hole(&sst, 0, punch)?;
+
+    // Now zero a block INSIDE the live suffix, as damage would — one with
+    // live blocks before it, so it is a genuine interior gap. (A block
+    // destroyed immediately at the punch boundary merges into one continuous
+    // zero region and is indistinguishable from a larger punch by geometry
+    // alone; see the weak-spot note in docs/manifest-recovery.md.)
+    let destroyed = recover_sst(sst.clone(), &fs)?
+        .data_block_handles()
+        .filter_map(Result::ok)
+        .map(|keyed| *AsRef::<crate::table::BlockHandle>::as_ref(&keyed))
+        .filter(|h| h.offset().0 >= punch)
+        .nth(2)
+        .ok_or(crate::Error::Unrecoverable)?;
+    memfs.punch_hole(&sst, destroyed.offset().0, u64::from(destroyed.size()))?;
+
+    let report = crate::verify::verify_sst_file_with_fs(&*fs, &sst);
+    assert!(
+        !report.is_ok(),
+        "a destroyed live block must be reported, not skipped as if it were \
+         another reclaimed extent: {report:?}",
+    );
+    Ok(())
+}
+
 /// A read that lands in a hole-punched extent must say so. The rows are
 /// permanently gone, and the two plausible alternatives are both wrong: a
 /// checksum mismatch reads as "the bytes rotted" and invites a heal or scrub
@@ -7668,6 +7714,52 @@ fn blob_tree_without_manifest(
             memfs.remove_file(&e.path)?;
         }
     }
+    Ok(())
+}
+
+/// A superseded original that cannot be set aside fails the repair. Left in
+/// `blobs/` it is outside the committed manifest, so the next open classifies
+/// it as an orphan and must remove it — hitting the same refusal and failing
+/// to open. Reporting success for a tree that will not open is the one
+/// outcome recovery must never produce, so the failure propagates and a retry
+/// finishes the job once the filesystem is fixed.
+#[cfg(feature = "lz4")]
+#[test]
+fn repair_fails_when_a_superseded_blob_original_cannot_be_set_aside() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    blob_tree_without_manifest(&memfs, &root)?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    punch_and_corrupt_blob(&memfs, &blobs.join("0"))?;
+
+    // The set-aside rename is refused persistently, exactly as a directory
+    // that also refuses removals would refuse it.
+    let fault = FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("repair-quarantine"),
+    );
+
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .repair();
+    assert!(
+        result.is_err(),
+        "a superseded original that cannot be set aside must fail the repair, \
+         not be reported as a success the next open cannot honour: {result:?}",
+    );
     Ok(())
 }
 

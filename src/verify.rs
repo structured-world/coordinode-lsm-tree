@@ -1337,7 +1337,17 @@ fn restricted_data_start(
             break;
         };
         if extent_is_zeroed(&*file, offset, next) {
+            // The FIRST reclaimed gap fixes the frontier, and the derivation
+            // ends there. A reclaim works top-down from the start of the data
+            // section, so its holes are the earliest ones in the file — a
+            // partially completed pass can leave an intact block ahead of them
+            // (it stops at its first failure), but never live data ahead of a
+            // LATER hole. So a gap that appears after this one is a live block
+            // that damage DESTROYED, and letting it advance the frontier too
+            // would start verification past the loss and pronounce the file
+            // healthy.
             frontier = next;
+            break;
         }
         offset = next;
     }
