@@ -2493,14 +2493,34 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
             // the manifest is committed: it is still what the not-yet-rewritten
             // SSTs reference, so removing it earlier would strand them if this
             // repair failed before committing.
-            stale_originals.push((
-                blob_path.clone(),
+            // Report only what the walk can actually account for. A
+            // structural failure DESYNCHRONIZES the record stream: the walk
+            // stops there and surrenders everything after it, so
+            // `records_total` counts the prefix it managed to frame, not the
+            // source's true population. Presenting that as "X of Y" would
+            // claim a near-complete recovery while an unknown — possibly
+            // enormous — tail went with it. Only when every loss was an
+            // individually re-synced record is the total trustworthy.
+            let surrendered_tail = report
+                .dropped
+                .iter()
+                .any(|d| matches!(d.reason, crate::salvage::BlobDropReason::Corrupt(_)));
+            let note = if surrendered_tail {
+                format!(
+                    "{} records salvaged into blob file {new_id}; the record \
+                     stream then desynchronized and the remainder of the file \
+                     was surrendered, so the number of records lost with it is \
+                     not knowable",
+                    report.records_salvaged,
+                )
+            } else {
                 format!(
                     "{} of {} records salvaged into blob file {new_id} \
-                     (the rest were corrupt)",
+                     (the rest failed their checksums)",
                     report.records_salvaged, report.records_total,
-                ),
-            ));
+                )
+            };
+            stale_originals.push((blob_path.clone(), note));
             kept_paths.insert(blob_id, blob_path);
             continue;
         };

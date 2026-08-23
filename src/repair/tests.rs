@@ -2292,6 +2292,65 @@ fn verify_sst_file_honors_a_restricted_punched_prefix() -> crate::Result<()> {
     Ok(())
 }
 
+/// The restricted-verify frontier must be derived by walking FRAMES, not by
+/// searching for zero runs. A live value whose bytes end in zeros is followed
+/// by the next real block header, which a byte-run scan accepts as a punch
+/// boundary — advancing the frontier past an intact block, so the verifier
+/// skips it and any corruption inside it while still reporting OK.
+#[test]
+fn a_zero_tailed_value_does_not_move_the_restricted_verify_frontier() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs, SyncMode};
+    use crate::{InternalValue, ValueType};
+    use std::sync::Arc;
+
+    let fs: Arc<dyn Fs> = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+
+    // Every value ends in a long zero run — legal payload, and exactly what a
+    // byte-run scan mistakes for reclaimed space.
+    {
+        let mut w =
+            crate::table::Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+        for i in 0..64u32 {
+            let mut value = format!("v{i}").into_bytes();
+            value.extend(std::iter::repeat_n(0u8, 64));
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                value,
+                u64::from(i) + 1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+    // Baseline: no sidecar, so no frontier derivation runs at all.
+    let baseline = crate::verify::verify_sst_file_with_fs(&*fs, &sst);
+    assert!(
+        baseline.is_ok(),
+        "the unpunched file must verify clean: {baseline:?}",
+    );
+
+    // A committed restriction at the very first key. Nothing is punched, so
+    // the derived frontier must stay at the data start and the verifier must
+    // still walk exactly as many blocks as it did without the sidecar.
+    crate::restrict_bound::write(&*fs, &sst, None, 0, b"k00000", SyncMode::Normal)?;
+    let restricted = crate::verify::verify_sst_file_with_fs(&*fs, &sst);
+    assert!(
+        restricted.is_ok(),
+        "an unpunched file must verify clean under a restriction: {restricted:?}",
+    );
+    assert_eq!(
+        restricted.blocks_scanned, baseline.blocks_scanned,
+        "a zero-tailed value must not be mistaken for a punched extent: \
+         the frontier would advance past live blocks and the verifier would \
+         skip them (and any corruption inside them) while reporting OK",
+    );
+    Ok(())
+}
+
 /// A read that lands in a hole-punched extent must say so. The rows are
 /// permanently gone, and the two plausible alternatives are both wrong: a
 /// checksum mismatch reads as "the bytes rotted" and invites a heal or scrub

@@ -361,13 +361,16 @@ pub(super) fn install_merge(
     // in-place heal would skip the checkpoint mutation window and could race a
     // checkpoint hard-link; without the heal-hint sink a confirmed-persistent
     // ECC correction on a read could never queue the SST for a healing
-    // rewrite, leaving the bitrot on disk; without the background deleter its
-    // eventual unlink would run on the foreground path.
+    // rewrite, leaving the bitrot on disk.
+    //
+    // The background deleter is deliberately NOT installed here. A compaction
+    // output can be rolled back — and the tight-space slice loop rolls back
+    // precisely when space is scarce — where deferring the unlink defeats the
+    // point: the space must come back now, not when a background pass gets to
+    // it. Flush outputs, which have no such rollback, keep it.
     for table in &created_tables {
         table.install_deletion_pause(alloc::sync::Arc::clone(&opts.deletion_pause));
         table.install_heal_hints(alloc::sync::Arc::clone(&opts.heal_hints));
-        #[cfg(feature = "std")]
-        table.install_background_deleter(alloc::sync::Arc::clone(&opts.background_deleter));
     }
 
     // Globally-dead blob files are dropped once, from the install-time version.

@@ -1275,11 +1275,14 @@ fn restricted_data_start(
     encryption: Option<&dyn crate::encryption::EncryptionProvider>,
     known_table_id: Option<crate::TableId>,
 ) -> u64 {
-    // A candidate frontier is only accepted when the byte right after a zero
-    // run DECODES as a block header (magic + its own checksum). A zero run
-    // inside a live value — legal payload — is not followed by a header, so it
-    // can never move the frontier into the middle of a frame.
-    const MIN_RUN: u64 = crate::table::block::Header::MIN_LEN as u64;
+    // The frontier is derived by WALKING THE FRAMES, never by searching for
+    // zero runs at arbitrary byte positions. A punch reclaims whole blocks, so
+    // a reclaimed region is exactly a run of block extents that read as zeros —
+    // and only positions the walk has proven to be block boundaries are ever
+    // tested. Scanning raw byte runs instead would accept a live block whose
+    // VALUE payload happens to end in zeros followed by the next real header,
+    // moving the frontier past an intact block and making the verifier skip it
+    // (and any corruption inside it) while still reporting OK.
     match crate::restrict_bound::read(fs, path, encryption) {
         Ok(crate::restrict_bound::SidecarRead::Present(sidecar_id, _))
             if known_table_id.is_none_or(|id| id == sidecar_id) => {}
@@ -1307,50 +1310,83 @@ fn restricted_data_start(
         return 0;
     };
     let data_end = data_pos.saturating_add(data_len).min(file_len);
-    const CHUNK: usize = 64 * 1024;
     let mut offset = data_pos;
-    let mut run: u64 = 0;
-    // End offset of the last zero run long enough to be a punched block.
+    // End of the last block extent proven to be wholly zeroed.
     let mut frontier = data_pos;
     while offset < data_end {
-        let want = usize::try_from(data_end - offset)
-            .unwrap_or(CHUNK)
-            .min(CHUNK);
-        let Ok(bytes) = crate::file::read_exact(&*file, offset, want) else {
-            return 0;
-        };
-        for (i, &b) in bytes.iter().enumerate() {
-            if b == 0 {
-                run = run.saturating_add(1);
-                continue;
+        // A live frame steps over itself WITHOUT its payload being inspected,
+        // so whatever bytes a value happens to hold can never be mistaken for
+        // reclaimed space.
+        if let Some(header) = block_header_at(&*file, offset) {
+            let step = u64::from(header.on_disk_size());
+            if step == 0 {
+                return 0; // Malformed length: refuse to guess a frontier.
             }
-            // A run ENDS here. Accept it as a reclaimed region only when it is
-            // at least a block long AND this position decodes as a real block
-            // header — the boundary proof that separates a punched block from
-            // a zero run inside a live value's payload.
-            let candidate = offset + i as u64;
-            if run >= MIN_RUN && block_header_decodes_at(&*file, candidate) {
-                frontier = candidate;
-            }
-            run = 0;
+            offset = offset.saturating_add(step);
+            continue;
         }
-        offset += want as u64;
+        // No frame here. Either this is reclaimed space or the file is
+        // damaged; the two are told apart by whether the bytes up to the NEXT
+        // frame boundary are all zero.
+        let Some(next) = next_block_header(&*file, offset, data_end) else {
+            // Nothing frames the rest of the section: a zero tail is reclaimed
+            // space, anything else is damage this must not paper over.
+            if extent_is_zeroed(&*file, offset, data_end) {
+                frontier = data_end;
+            }
+            break;
+        };
+        if extent_is_zeroed(&*file, offset, next) {
+            frontier = next;
+        }
+        offset = next;
     }
-    // `data_pos` means no validated punched run was found: nothing to skip.
+    // `data_pos` means no validated punched extent was found: nothing to skip.
     if frontier == data_pos { 0 } else { frontier }
 }
 
-/// Whether `offset` holds a decodable block header (magic matches and the
-/// header's own checksum verifies). Proves a candidate frontier lands on a
-/// real block boundary rather than inside a live value's payload.
+/// Decodes the block header at `offset`, or `None` when no frame starts there.
 #[cfg(feature = "std")]
-fn block_header_decodes_at(file: &dyn crate::fs::FsFile, offset: u64) -> bool {
+fn block_header_at(
+    file: &dyn crate::fs::FsFile,
+    offset: u64,
+) -> Option<crate::table::block::Header> {
     use crate::coding::Decode;
-    let Ok(bytes) = crate::file::read_exact(file, offset, crate::table::block::Header::MAX_LEN)
-    else {
-        return false;
-    };
-    crate::table::block::Header::decode_from(&mut &bytes[..]).is_ok()
+    let bytes = crate::file::read_exact(file, offset, crate::table::block::Header::MAX_LEN).ok()?;
+    crate::table::block::Header::decode_from(&mut &bytes[..]).ok()
+}
+
+/// The offset of the next decodable block header at or after `from`, bounded
+/// by `end`. Used to bound a candidate reclaimed extent by the frame that
+/// follows it rather than by an arbitrary byte position.
+#[cfg(feature = "std")]
+fn next_block_header(file: &dyn crate::fs::FsFile, from: u64, end: u64) -> Option<u64> {
+    let mut at = from;
+    while at < end {
+        if block_header_at(file, at).is_some() {
+            return Some(at);
+        }
+        at += 1;
+    }
+    None
+}
+
+/// Whether `[start, end)` reads back as all zeros — the hole-punch signature.
+#[cfg(feature = "std")]
+fn extent_is_zeroed(file: &dyn crate::fs::FsFile, start: u64, end: u64) -> bool {
+    const CHUNK: usize = 64 * 1024;
+    let mut at = start;
+    while at < end {
+        let want = usize::try_from(end - at).unwrap_or(CHUNK).min(CHUNK);
+        let Ok(bytes) = crate::file::read_exact(file, at, want) else {
+            return false;
+        };
+        if bytes.iter().any(|&b| b != 0) {
+            return false;
+        }
+        at += want as u64;
+    }
+    end > start
 }
 
 /// Result of [`read_ecc_params_out_of_band`]: the arbitrated ECC state plus
