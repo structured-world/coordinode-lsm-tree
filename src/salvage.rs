@@ -1075,6 +1075,29 @@ fn entry_directory(path: &std::path::Path) -> &std::path::Path {
 /// a bit-rot checksum mismatch from a structural decode error from a raw
 /// read / decompress failure, and attaching the block's `(prev_end, end_key]`
 /// range as the lower/upper bound of the lost keys.
+/// Removes the entries a LOST neighbouring block may have shadowed.
+///
+/// `boundary` is the lost block's last key when its range was known; the only
+/// key it can have held newer versions of is that one, so only its entries go.
+/// When the range is unknown (`None`), the same is true of THIS block's first
+/// key — nothing else could have sat between them — so that key's entries go
+/// instead.
+fn suppress_shadowed_boundary(
+    entries: Vec<crate::InternalValue>,
+    boundary: Option<&UserKey>,
+) -> Vec<crate::InternalValue> {
+    let Some(shadowed) = boundary
+        .cloned()
+        .or_else(|| entries.first().map(|e| e.key.user_key.clone()))
+    else {
+        return entries;
+    };
+    entries
+        .into_iter()
+        .filter(|e| e.key.user_key != shadowed)
+        .collect()
+}
+
 fn classify_drop(
     e: &crate::Error,
     offset: u64,
@@ -1326,6 +1349,18 @@ fn salvage_blocks(
     // since the index stores each block's last key (so block N covers
     // `(end_key[N-1], end_key[N]]`).
     let mut prev_end: Option<UserKey> = None;
+
+    // Set when a block is DROPPED, cleared by the next block that emits. A
+    // key's versions are contiguous, so they can straddle a block boundary with
+    // the newest at the end of one block and an older one at the start of the
+    // next — and emitting that older version after losing the newer republishes
+    // it as current (a deletion resurrects, an overwritten value returns).
+    // `Some(end_key)` names the lost block's last key, so only that key is
+    // suppressed; `None` means the lost block's range is unknown (no index
+    // separator), and then the next block's FIRST key is suppressed, since it is
+    // the only one whose newer versions could have been in there.
+    let mut lost_boundary: Option<Option<UserKey>> = None;
+    let mut dropped_seen = 0usize;
 
     // Enumerate the index handles first. A corrupt index entry stops the
     // collection after reporting it: once the index stream desyncs, later
@@ -1684,6 +1719,13 @@ fn salvage_blocks(
             columns_salvaged,
         );
         blocks_total += 1;
+        // Did the PREVIOUS iteration lose its block? `prev_end` then holds that
+        // block's last key (or `None` when its range was unknown), which is the
+        // only key this block may hold stale newer-version-shadowed entries for.
+        if dropped.len() > dropped_seen {
+            lost_boundary = Some(prev_end.clone());
+        }
+        dropped_seen = dropped.len();
         let offset = *block_handle.offset();
 
         // Columnar source: a clean block is byte-copied verbatim — preserving its
@@ -2161,9 +2203,21 @@ fn salvage_blocks(
                                 },
                                 None => entries,
                             };
+                            // Drop the entries a LOST block may have shadowed:
+                            // versions of one key are contiguous, so the key at
+                            // this boundary can have had newer versions inside
+                            // the block that went missing, and emitting the
+                            // older ones would republish them as current.
+                            let entries = match lost_boundary.take() {
+                                Some(boundary) => {
+                                    suppress_shadowed_boundary(entries, boundary.as_ref())
+                                }
+                                None => entries,
+                            };
                             if entries.is_empty() {
                                 // Every entry's record was removed by the
-                                // rewrite: the block legitimately contributes
+                                // rewrite, or every one was shadowed by a lost
+                                // block: the block legitimately contributes
                                 // nothing (accounted per entry, not a loss).
                                 prev_end = end_key.or(prev_end);
                                 continue;

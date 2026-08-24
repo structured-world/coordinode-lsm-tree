@@ -9003,3 +9003,85 @@ fn salvage_reencodes_an_ecc_recovered_columnar_block() -> crate::Result<()> {
     assert_eq!(recovered.metadata.item_count, 8, "every row is recovered");
     Ok(())
 }
+
+/// A key's MVCC versions are contiguous, so they can straddle a block
+/// boundary: the newest can be the last entry of one block and an older one the
+/// first entry of the next. When the block holding the newest version is
+/// dropped, emitting the next block as-is republishes the older version as
+/// current — a delete resurrects, or an overwritten value comes back. The
+/// boundary key's entries must be dropped with it unless resurrection is on.
+#[test]
+fn salvage_drops_the_boundary_key_when_its_newest_version_is_lost() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{InternalValue, ValueType};
+
+    let dir = tempfile::tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let source = dir.path().join("source");
+    let dest = dir.path().join("dest");
+
+    // One entry per block, so `k`'s newest version (a deletion) is the whole of
+    // block 1 and its older value the whole of block 2.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(1);
+    writer.write(InternalValue::from_components(
+        b"a",
+        b"v",
+        1,
+        ValueType::Value,
+    ))?;
+    writer.write(InternalValue::new_tombstone(b"k".as_slice(), 10))?;
+    writer.write(InternalValue::from_components(
+        b"k",
+        b"old",
+        5,
+        ValueType::Value,
+    ))?;
+    writer.write(InternalValue::from_components(
+        b"z",
+        b"v",
+        1,
+        ValueType::Value,
+    ))?;
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Corrupt the block whose last key is `k` and whose seqno is the newest:
+    // the second data block in offset order.
+    let second_off = {
+        let table = open(source.clone(), &fs)?;
+        let offsets: Vec<u64> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|kh| *kh.as_ref().offset())
+            .collect();
+        assert!(
+            offsets.len() >= 3,
+            "the fixture needs one block per entry, got {}",
+            offsets.len(),
+        );
+        usize::try_from(offsets.get(1).copied().unwrap_or_default()).unwrap_or(usize::MAX)
+    };
+    let mut bytes = std::fs::read(&source)?;
+    if let Some(b) = bytes.get_mut(second_off + crate::table::block::Header::MIN_LEN + 1) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert_eq!(report.dropped.len(), 1, "one block is lost: {report:?}");
+
+    let recovered = open(dest, &fs)?;
+    assert!(
+        recovered
+            .get(b"k", crate::SeqNo::MAX, crate::hash::hash64(b"k"))?
+            .is_none(),
+        "the older version of the boundary key must not be republished as \
+         current when the newest version was lost",
+    );
+    assert!(
+        recovered
+            .get(b"a", crate::SeqNo::MAX, crate::hash::hash64(b"a"))?
+            .is_some(),
+        "unaffected keys are still recovered",
+    );
+    Ok(())
+}
