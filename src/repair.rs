@@ -856,9 +856,9 @@ fn block_verify_verdict(
     // otherwise-healthy restricted SST. `punch_offset()` is `0` for a normal table.
     let data_start = table.punch_offset()?;
     let report = crate::verify::verify_sst_file_with_context(
-        &**folder_fs,
+        folder_fs,
         table_path,
-        config.encryption.as_deref(),
+        config.encryption.as_ref(),
         // Repair KNOWS the durable id (recovery already cross-checked it
         // against the file name), so the verify probe enforces the same meta
         // id check — a checksum-clean forged tail meta falls back to the
@@ -2807,6 +2807,102 @@ impl Config {
     }
 }
 
+/// Completes the set-aside a previous repair committed but could not carry out.
+///
+/// A repair publishes its replacements by committing the manifest and only THEN
+/// moves the superseded originals out of the way; a failure in that last step
+/// leaves both on disk with a durable, correct manifest naming the
+/// replacements. Rebuilding from that directory would salvage the damaged
+/// original again and rewrite its table again while keeping the previous
+/// rewrite too, so one history would enter L0 twice — and duplicated merge
+/// operands are applied twice on read.
+///
+/// The committed manifest is what resolves it. It is the tree's own authority
+/// on which files count: an `open()` sweeps everything it does not name as an
+/// orphan, so this applies the same rule before the scan runs — tables it does
+/// not reference are set aside (they hold rows an operator may want), blob
+/// files are removed (an unreferenced one holds nothing reachable). No state is
+/// carried between runs; this is derived from the durable manifest alone.
+///
+/// A manifest that does not load cleanly is exactly the case repair exists for,
+/// so it is not consulted at all then and the scan rebuilds from everything.
+///
+/// # Errors
+///
+/// Propagates a set-aside or removal failure: leaving a superseded file in
+/// place is what corrupts the rebuild, so the repair must fail rather than
+/// proceed past it.
+#[cfg(feature = "std")]
+fn sweep_superseded_by_committed_manifest(config: &Config) -> crate::Result<()> {
+    let Ok(recovery) = crate::version::recovery::recover(
+        &config.path,
+        &*config.fs,
+        crate::config::ManifestRecoveryMode::AbsoluteConsistency,
+        config.encryption.clone(),
+    ) else {
+        return Ok(());
+    };
+
+    let referenced_tables: crate::HashSet<TableId> = recovery
+        .table_ids
+        .iter()
+        .flatten()
+        .flatten()
+        .map(|t| t.id)
+        .collect();
+    for (table_base_folder, folder_fs) in config.all_tables_folders() {
+        if !folder_fs.exists(&table_base_folder)? {
+            continue;
+        }
+        for dirent in folder_fs.read_dir(&table_base_folder)? {
+            // Only files the scan would ADOPT as tables are swept here; a
+            // foreign name is left to the scan's own classification.
+            let Ok(id) = dirent.file_name.parse::<TableId>() else {
+                continue;
+            };
+            if dirent.is_dir || referenced_tables.contains(&id) {
+                continue;
+            }
+            let dest = quarantine_file(
+                &*folder_fs,
+                &table_base_folder,
+                &dirent.path,
+                &dirent.file_name,
+                config.sync_mode,
+            )?;
+            log::info!(
+                "repair: table {id} is superseded by the committed manifest; \
+                 set aside at {}",
+                dest.display(),
+            );
+        }
+    }
+
+    if config.kv_separation_opts.is_some() {
+        let referenced_blobs: crate::HashSet<crate::vlog::BlobFileId> =
+            recovery.blob_file_ids.iter().map(|(id, _)| *id).collect();
+        let blobs_folder = config.path.join(crate::file::BLOBS_FOLDER);
+        if config.fs.exists(&blobs_folder)? {
+            for dirent in config.fs.read_dir(&blobs_folder)? {
+                let Ok(id) = dirent.file_name.parse::<crate::vlog::BlobFileId>() else {
+                    continue;
+                };
+                if dirent.is_dir || referenced_blobs.contains(&id) {
+                    continue;
+                }
+                match config.fs.remove_file(&dirent.path) {
+                    Ok(()) => log::info!(
+                        "repair: blob file {id} is superseded by the committed manifest; removed",
+                    ),
+                    Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Core repair routine. Separated from the [`Config::repair`] entry point so the
 /// logic is testable against a borrowed config.
 fn repair_tree(
@@ -2823,6 +2919,11 @@ fn repair_tree(
     #[cfg(feature = "std")]
     let _directory_lock =
         crate::config::acquire_directory_lock(&*config.fs, &config.path, config.directory_lock)?;
+
+    // Finish the previous run's outstanding cleanup first. See
+    // `sweep_superseded_by_committed_manifest`.
+    #[cfg(feature = "std")]
+    sweep_superseded_by_committed_manifest(config)?;
 
     // Best recovered copy per table id: a complete recovery beats a lossy salvage,
     // so a duplicate id across aliased / routed table folders keeps only the best
@@ -3676,7 +3777,19 @@ fn repair_tree(
 
     // Newest first: higher sequence number nearer the L0 head, matching the
     // ordering the merge reader expects for its newest-run-first short-circuit.
-    recovered_tables.sort_by_key(|(t, _)| std::cmp::Reverse(t.get_highest_seqno()));
+    // Tie-broken by DESCENDING id: two tables can share a highest seqno (a
+    // caller may reuse an explicit seqno across separate flushed batches), and
+    // sorting by seqno alone would leave their order to the directory scan and
+    // the candidate map's iteration — so which run answers first would vary
+    // between runs of the same repair over the same files. Ids are allocated in
+    // increasing order, so the higher id is the later table and belongs nearer
+    // the L0 head.
+    recovered_tables.sort_by_key(|(t, _)| {
+        (
+            std::cmp::Reverse(t.get_highest_seqno()),
+            std::cmp::Reverse(t.id()),
+        )
+    });
 
     // Fresh ids for copies published BESIDE their source (the blob-handle
     // rewrite). Starts one past the highest id the scan saw, so a new name can

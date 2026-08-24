@@ -2246,6 +2246,164 @@ fn salvage_guard_ignores_zero_filled_values_inside_a_surrendered_extent() -> cra
     Ok(())
 }
 
+/// A repair that commits its manifest and then fails to set the superseded
+/// originals aside leaves BOTH the originals and the replacements on disk. The
+/// retry must not rebuild from all of them: it would salvage the damaged blob
+/// again, rewrite the original SST again, and keep the previous rewrite too,
+/// so one history would enter L0 twice — and duplicated merge operands are
+/// applied twice on read. The committed manifest is the authority on which
+/// files are superseded, so the retry finishes that cleanup before scanning.
+#[test]
+fn repair_retry_after_a_failed_cleanup_does_not_duplicate_the_history() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    blob_tree_without_manifest(&memfs, &root)?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    punch_and_corrupt_blob(&memfs, &blobs.join("0"))?;
+
+    let config = |fs: Arc<dyn Fs>| {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+
+    // The manifest commits, then setting the superseded originals aside fails.
+    let fault = FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("repair-quarantine"),
+    );
+    assert!(
+        config(Arc::new(fault)).repair().is_err(),
+        "the post-commit cleanup failure must propagate",
+    );
+
+    // The retry, on a healthy filesystem, finishes that cleanup and rebuilds
+    // from what the committed manifest actually names.
+    let report = config(memfs.clone()).repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "one table, not the original beside its own rewrite: {report:?}",
+    );
+
+    let tree = match config(memfs).open()? {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+    };
+    assert_eq!(
+        tree.index.current_version().iter_tables().count(),
+        1,
+        "the rebuilt manifest holds one copy of the history",
+    );
+    Ok(())
+}
+
+/// L0 order decides which run answers first, so it must be derived from the
+/// files, not from the order a directory scan happened to yield. Two tables can
+/// carry the same highest sequence number — callers may reuse an explicit seqno
+/// across separate flushed batches — and sorting by that alone leaves their
+/// relative order to hash-map iteration. Ids are allocated in increasing order,
+/// so the later table (higher id) is the newer one and belongs nearer the head.
+#[test]
+fn repair_orders_equal_seqno_tables_by_descending_id() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+
+    // Six tables, all at the same highest seqno: enough that an arbitrary
+    // iteration order is vanishingly unlikely to match id-descending by chance.
+    for id in 0..6u64 {
+        use crate::{InternalValue, ValueType};
+        let path = tables.join(id.to_string());
+        let mut w = crate::table::Writer::new(path, id, 0, Arc::clone(&fs))?;
+        w.write(InternalValue::from_components(
+            format!("k{id:04}").into_bytes(),
+            b"v",
+            7,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    let config = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs);
+    config.repair()?;
+
+    let tree = config.open()?;
+    let version = tree.current_version();
+    let ids: Vec<_> = version.iter_tables().map(crate::Table::id).collect();
+    assert_eq!(
+        ids,
+        vec![5, 4, 3, 2, 1, 0],
+        "equal-seqno tables must be ordered newest-first by id, not by scan order",
+    );
+    Ok(())
+}
+
+/// A committed restriction does not make every zero region a reclaimed one.
+/// The prefix punch runs highest-block-first and stops at its first failure, so
+/// a failure on the very first call leaves the table with NO hole at all — and
+/// then a later live block zeroed by corruption is the first gap the walk
+/// meets. Taking that gap as the frontier would skip the destroyed data and
+/// report the file clean, so the frontier must come from the table's own index
+/// (where the sidecar's bound actually falls), never from the first zeros.
+#[test]
+fn verify_sst_file_bounds_the_skip_by_the_index_not_by_the_first_zeros() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs, SyncMode};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    write_multiblock_sst(&sst, &fs)?;
+
+    // A committed restriction low in the key space, and NO punch (the first
+    // punch_hole failed). A live block WELL ABOVE the bound is then destroyed.
+    crate::restrict_bound::write(&*fs, &sst, None, 0, b"k00010", SyncMode::Normal)?;
+    let bound_offset = recover_sst(sst.clone(), &fs)?.punch_offset_for(b"k00010")?;
+    let far_above = recover_sst(sst.clone(), &fs)?.punch_offset_for(b"k00200")?;
+    assert!(
+        far_above > bound_offset,
+        "the destroyed block sits above the restriction's frontier",
+    );
+    memfs.punch_hole(&sst, bound_offset, far_above - bound_offset)?;
+
+    let report = crate::verify::verify_sst_file_with_fs(&fs, &sst);
+    assert!(
+        !report.is_ok(),
+        "destruction above the restriction frontier must be reported, not \
+         mistaken for the reclaimed prefix: errors {:?}, warnings {:?}",
+        report.errors,
+        report.warnings,
+    );
+    Ok(())
+}
+
 /// A sidecar only attests the restriction of the table it names. Standalone
 /// verification has no caller-supplied id, but the SST's own file name carries
 /// one — a checksum-valid sidecar recorded for a DIFFERENT id (copied, stale)
@@ -2272,7 +2430,7 @@ fn verify_sst_file_rejects_a_sidecar_naming_another_table() -> crate::Result<()>
     assert!(punch > 0, "the fixture has a leading block to destroy");
     memfs.punch_hole(&sst, 0, punch)?;
 
-    let report = crate::verify::verify_sst_file_with_fs(&*fs, &sst);
+    let report = crate::verify::verify_sst_file_with_fs(&fs, &sst);
     assert!(
         !report.is_ok(),
         "a foreign sidecar must not let the zeroed prefix pass as reclaimed: \
@@ -2333,7 +2491,8 @@ fn verify_sst_file_skips_a_punched_prefix_within_a_read_budget() -> crate::Resul
             .on_path("tables")
             .skip(512),
     );
-    let report = crate::verify::verify_sst_file_with_fs(&budget, &sst);
+    let budget_fs: Arc<dyn Fs> = Arc::new(budget);
+    let report = crate::verify::verify_sst_file_with_fs(&budget_fs, &sst);
     assert!(
         report.is_ok(),
         "crossing a {punch}-byte reclaimed prefix must stay well inside a \
@@ -2360,7 +2519,7 @@ fn verify_sst_file_honors_a_restricted_punched_prefix() -> crate::Result<()> {
     let punch = recover_sst(sst.clone(), &fs)?.punch_offset_for(b"k00130")?;
     memfs.punch_hole(&sst, 0, punch)?;
 
-    let report = crate::verify::verify_sst_file_with_fs(&*fs, &sst);
+    let report = crate::verify::verify_sst_file_with_fs(&fs, &sst);
     assert!(
         report.is_ok(),
         "a healthy restricted punched SST must verify clean through the \
@@ -2375,7 +2534,7 @@ fn verify_sst_file_honors_a_restricted_punched_prefix() -> crate::Result<()> {
 
     // Without the attesting sidecar the zeroed region must flag loudly.
     crate::restrict_bound::remove(&*fs, &sst, SyncMode::Normal);
-    let report = crate::verify::verify_sst_file_with_fs(&*fs, &sst);
+    let report = crate::verify::verify_sst_file_with_fs(&fs, &sst);
     assert!(
         !report.is_ok(),
         "leading zeros without a restriction sidecar are destroyed data and \
@@ -2419,7 +2578,7 @@ fn a_zero_tailed_value_does_not_move_the_restricted_verify_frontier() -> crate::
         assert!(w.finish()?.is_some(), "the SST is non-empty");
     }
     // Baseline: no sidecar, so no frontier derivation runs at all.
-    let baseline = crate::verify::verify_sst_file_with_fs(&*fs, &sst);
+    let baseline = crate::verify::verify_sst_file_with_fs(&fs, &sst);
     assert!(
         baseline.is_ok(),
         "the unpunched file must verify clean: {baseline:?}",
@@ -2429,7 +2588,7 @@ fn a_zero_tailed_value_does_not_move_the_restricted_verify_frontier() -> crate::
     // the derived frontier must stay at the data start and the verifier must
     // still walk exactly as many blocks as it did without the sidecar.
     crate::restrict_bound::write(&*fs, &sst, None, 0, b"k00000", SyncMode::Normal)?;
-    let restricted = crate::verify::verify_sst_file_with_fs(&*fs, &sst);
+    let restricted = crate::verify::verify_sst_file_with_fs(&fs, &sst);
     assert!(
         restricted.is_ok(),
         "an unpunched file must verify clean under a restriction: {restricted:?}",
@@ -2480,7 +2639,7 @@ fn a_destroyed_suffix_block_does_not_move_the_restricted_verify_frontier() -> cr
         .ok_or(crate::Error::Unrecoverable)?;
     memfs.punch_hole(&sst, destroyed.offset().0, u64::from(destroyed.size()))?;
 
-    let report = crate::verify::verify_sst_file_with_fs(&*fs, &sst);
+    let report = crate::verify::verify_sst_file_with_fs(&fs, &sst);
     assert!(
         !report.is_ok(),
         "a destroyed live block must be reported, not skipped as if it were \
@@ -2655,7 +2814,7 @@ fn verify_sst_file_ignores_zero_runs_inside_live_values() -> crate::Result<()> {
     // and the zero runs could not move the frontier anyway.
     crate::restrict_bound::write(&*fs, &sst, None, 0, b"k00010", SyncMode::Normal)?;
 
-    let report = crate::verify::verify_sst_file_with_fs(&*fs, &sst);
+    let report = crate::verify::verify_sst_file_with_fs(&fs, &sst);
     assert!(
         report.is_ok(),
         "zero-filled VALUES are legal payload and must not move the frontier: \
@@ -2710,7 +2869,7 @@ fn verify_sst_file_clears_partial_top_down_holes() -> crate::Result<()> {
         memfs.punch_hole(&sst, off, u64::from(size))?;
     }
 
-    let report = crate::verify::verify_sst_file_with_fs(&*fs, &sst);
+    let report = crate::verify::verify_sst_file_with_fs(&fs, &sst);
     assert!(
         report.is_ok(),
         "a partially reclaimed sidecar-backed SST must verify clean: errors \
@@ -5713,7 +5872,7 @@ fn verify_probe_distrusts_disagreeing_recognized_ecc_descriptors() -> crate::Res
     // and the MID mirror keeps the true RS descriptor.
     forge_tail_meta_table_id(&sst, None, Some([0u8, 0, 0, 0]))?;
 
-    let report = crate::verify::verify_sst_file_with_fs(&*fs, &sst);
+    let report = crate::verify::verify_sst_file_with_fs(&fs, &sst);
     // The forged tail IS a real finding: the full mirror comparison reports
     // the divergence. What must NOT happen is the walk mis-sizing every
     // parity trailer as a block header and condemning the data blocks — so
