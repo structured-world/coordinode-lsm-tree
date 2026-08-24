@@ -1811,8 +1811,10 @@ impl Tree {
         }
         sources.push(source);
 
-        // Sealed memtables.
-        for memtable in super_version.sealed_memtables.iter() {
+        // Sealed memtables, NEWEST first: the list is kept in seal order, and
+        // every source below must be older than the one before it, because the
+        // merge derives replay precedence from that position.
+        for memtable in super_version.sealed_memtables.iter().rev() {
             let mut source = Vec::new();
             for entry in memtable.iter() {
                 if in_window(entry.key.seqno) {
@@ -1843,13 +1845,20 @@ impl Tree {
         Ok(Self::merge_source_events(sources).into_iter())
     }
 
-    /// Merge per-source event lists into one replay-ordered stream.
+    /// Merge per-source event lists into one replay-ordered stream, `sources`
+    /// ordered NEWEST first.
     ///
-    /// Replay order is increasing seqno across every source; the ordering's
-    /// payload tie-break makes byte-identical events adjacent. What happens to
-    /// byte-identical copies follows ONE rule: the stream must mirror what a
-    /// read of the same tree does, because a consumer replaying it has to reach
-    /// the state the tree itself serves.
+    /// Replay order is increasing seqno, then — for events sharing one seqno —
+    /// increasing source AGE reversed, so the newest source's event is applied
+    /// LAST. That matters because two sources can hold different values for one
+    /// key at one seqno ([`AbstractTree::apply_batch`] takes a caller-chosen
+    /// seqno and does not require it to be unique), the tree serves the newer
+    /// one, and a consumer keeps whatever it applies last. Sorting such ties by
+    /// payload instead would decide precedence by byte order.
+    ///
+    /// What happens to byte-identical copies follows ONE rule: the stream must
+    /// mirror what a read of the same tree does, because a consumer replaying
+    /// it has to reach the state the tree itself serves.
     ///
     /// - **Merge operands are all kept.** The read path collects every
     ///   physically stored operand for a key and applies them in order — it
@@ -1868,10 +1877,11 @@ impl Tree {
     ///   Repeats WITHIN one source are still kept: they are separate entries
     ///   the source genuinely holds.
     fn merge_source_events(sources: Vec<Vec<ScanSinceEvent>>) -> Vec<ScanSinceEvent> {
-        // Per source, collapse equal neighbours into (event, count) runs.
-        let mut runs: Vec<(ScanSinceEvent, usize)> = Vec::new();
-        for mut source in sources {
-            source.sort_by(ScanSinceEvent::replay_ordering);
+        // Per source, collapse equal neighbours into (event, count) runs, each
+        // tagged with its source's recency (0 = newest).
+        let mut runs: Vec<(ScanSinceEvent, usize, usize)> = Vec::new();
+        for (recency, mut source) in sources.into_iter().enumerate() {
+            source.sort_by(ScanSinceEvent::grouping_order);
             let mut iter = source.into_iter();
             let Some(mut current) = iter.next() else {
                 continue;
@@ -1881,34 +1891,48 @@ impl Tree {
                 if event == current {
                     count += 1;
                 } else {
-                    runs.push((core::mem::replace(&mut current, event), count));
+                    runs.push((core::mem::replace(&mut current, event), count, recency));
                     count = 1;
                 }
             }
-            runs.push((current, count));
+            runs.push((current, count, recency));
         }
 
-        // Then merge the per-source runs: operands accumulate, idempotent
-        // events take the count a single source holds.
-        runs.sort_by(|(a, _), (b, _)| ScanSinceEvent::replay_ordering(a, b));
-        let mut merged = Vec::new();
+        // Merge the per-source runs: operands accumulate, idempotent events take
+        // the count a single source holds. A collapsed event keeps the recency
+        // of the NEWEST source holding it, which is the position the tree's own
+        // precedence gives it.
+        runs.sort_by(|(a, ..), (b, ..)| ScanSinceEvent::grouping_order(a, b));
+        let mut merged: Vec<(ScanSinceEvent, usize)> = Vec::new();
         let mut iter = runs.into_iter().peekable();
-        while let Some((event, mut count)) = iter.next() {
+        while let Some((event, mut count, mut recency)) = iter.next() {
             let accumulates = matches!(event, ScanSinceEvent::MergeOperand { .. });
-            while let Some((next, other)) = iter.next_if(|(next, _)| *next == event) {
+            while let Some((next, other, other_recency)) = iter.next_if(|(next, ..)| *next == event)
+            {
                 debug_assert_eq!(next, event, "next_if matched the same event");
                 count = if accumulates {
                     count.saturating_add(other)
                 } else {
                     count.max(other)
                 };
+                recency = recency.min(other_recency);
             }
             for _ in 1..count {
-                merged.push(event.clone());
+                merged.push((event.clone(), recency));
             }
-            merged.push(event);
+            merged.push((event, recency));
         }
-        merged
+
+        // Finally, replay order: seqno, then oldest source first. `sort_by` is
+        // stable, so the grouping order above still decides between distinct
+        // events of one source — deterministic, and irrelevant to convergence
+        // since they touch different keys.
+        merged.sort_by(|(a, a_recency), (b, b_recency)| {
+            a.seqno()
+                .cmp(&b.seqno())
+                .then_with(|| b_recency.cmp(a_recency))
+        });
+        merged.into_iter().map(|(event, _)| event).collect()
     }
 
     /// Iterate change events with `seqno >= target_seqno`.

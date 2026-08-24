@@ -582,6 +582,44 @@ fn scan_since_deduplicates_identical_events_from_duplicated_tables() -> lsm_tree
     Ok(())
 }
 
+/// Replay order must reproduce the tree's own precedence. Two sources can hold
+/// DIFFERENT values for one key at one sequence number — `apply_batch` takes a
+/// caller-chosen seqno and does not require it to be unique — and the tree
+/// serves the newer source's value. A consumer replaying the events in order
+/// keeps whichever arrives last, so the newer source's event has to arrive last;
+/// ordering tied seqnos by payload bytes would decide it alphabetically.
+#[test]
+fn scan_since_replays_tied_seqnos_in_source_order() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path())?;
+
+    tree.insert(b"k", b"z", 10);
+    tree.flush_active_memtable(0)?;
+    tree.insert(b"k", b"a", 10);
+    tree.flush_active_memtable(0)?;
+
+    assert_eq!(
+        tree.get(b"k", SeqNo::MAX)?.as_deref(),
+        Some(b"a".as_slice()),
+        "the newer run is what the tree serves",
+    );
+
+    let values: Vec<_> = events(&tree, 0)?
+        .iter()
+        .filter_map(|e| match e {
+            ScanSinceEvent::Insert { value, .. } => Some(value.to_vec()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![b"z".to_vec(), b"a".to_vec()],
+        "the value the tree serves must be replayed LAST, or the consumer ends \
+         up with the superseded one",
+    );
+    Ok(())
+}
+
 /// Merge operands are never collapsed across sources either. The read path
 /// applies EVERY physically stored operand for a key (it collects them without
 /// deduplicating by seqno), so two operands in two sources are two applications

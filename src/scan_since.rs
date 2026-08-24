@@ -107,14 +107,17 @@ impl ScanSinceEvent {
         }
     }
 
-    /// Total order the scanner sorts with: seqno first (the public replay
-    /// contract), then a deterministic tie-break over the full payload so
-    /// byte-identical events land ADJACENT and a single `dedup` pass can
-    /// collapse them. Identical copies are a real post-repair state — a
-    /// manifest-loss repair publishes every surviving SST, including both
-    /// the inputs and outputs of a compaction that crashed before deleting
-    /// its inputs — and each copy carries the same key, value, and seqno.
-    pub(crate) fn replay_ordering(&self, other: &Self) -> core::cmp::Ordering {
+    /// Total order that brings byte-identical events ADJACENT so one pass can
+    /// count them: seqno, then kind, then the full payload. Identical copies
+    /// are a real post-repair state — a manifest-loss repair publishes every
+    /// surviving SST, including both the inputs and outputs of a compaction
+    /// that crashed before deleting its inputs — and each copy carries the same
+    /// key, value, and seqno.
+    ///
+    /// This is NOT the emitted order. Events sharing a seqno are emitted oldest
+    /// SOURCE first, so the value the tree serves is replayed last; deciding
+    /// that by payload bytes would hand precedence to byte order.
+    pub(crate) fn grouping_order(&self, other: &Self) -> core::cmp::Ordering {
         fn rank(e: &ScanSinceEvent) -> u8 {
             match e {
                 ScanSinceEvent::Insert { .. } => 0,
