@@ -2280,3 +2280,66 @@ fn blob_prefix_reclaim_skips_while_a_deletion_pause_is_active() -> crate::Result
     );
     Ok(())
 }
+
+/// A restricted re-open builds a NEW blob-file handle and inherits none of
+/// the tree's shared machinery — which is exactly why the tight-space slice
+/// loop must bind every handle it puts into the version, not only the ones it
+/// wrote from scratch. An unbound handle's `Drop` can unlink the file while a
+/// checkpoint is capturing, and its prefix punch can zero bytes the
+/// checkpoint has already hard-linked, because the reclaim consults a pause
+/// slot nobody filled.
+#[test]
+fn a_reopened_blob_view_needs_binding_to_carry_the_deletion_pause() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = match Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .open()?
+    {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected a blob tree"),
+    };
+    for i in 0..32u64 {
+        tree.insert(format!("key{i:06}").as_bytes(), vec![b'v'; 64], i);
+    }
+    tree.flush_active_memtable(0)?;
+
+    let original = {
+        let binding = tree.index.version_history.read().latest_version();
+        binding
+            .version
+            .blob_files
+            .iter()
+            .next()
+            .cloned()
+            .ok_or(crate::Error::Unrecoverable)?
+    };
+    assert!(
+        original.deletion_pause_for_test().is_some(),
+        "a flush-published blob file is bound when it is registered",
+    );
+
+    let reopened = original.reopen_restricted(0)?;
+    assert!(
+        reopened.deletion_pause_for_test().is_none(),
+        "the re-open starts from the file on disk, so it inherits nothing — \
+         the path that publishes it is what has to bind it",
+    );
+
+    reopened.bind_to_tree(&crate::table::TableSinks {
+        deletion_pause: &tree.index.deletion_pause,
+        heal_hints: &tree.index.heal_hints,
+        #[cfg(feature = "std")]
+        background_deleter: None,
+    });
+    assert!(
+        reopened.deletion_pause_for_test().is_some(),
+        "binding is what makes a re-opened view safe to publish",
+    );
+    Ok(())
+}

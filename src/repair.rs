@@ -3609,7 +3609,7 @@ fn repair_tree(
     // Damaged blob originals whose replacement is in the rebuilt manifest.
     // Set aside only after `persist_version` — see `BlobRecovery::stale`.
     let mut stale_blob_originals: Vec<(PathBuf, String)> = Vec::new();
-    let (tree_type, blob_file_list) = if config.kv_separation_opts.is_some() {
+    let (tree_type, mut blob_file_list) = if config.kv_separation_opts.is_some() {
         let recovery = recover_blob_files(config)?;
         unreadable_files.extend(recovery.unreadable);
         blob_rewrites = recovery.rewrites;
@@ -3807,6 +3807,35 @@ fn repair_tree(
             }
         }
         recovered_tables = kept;
+
+        // Only blob files a surviving table REFERENCES go into the manifest.
+        // An unreferenced one holds no reachable value by definition, and
+        // admitting it would strand it there forever: repair cannot rebuild
+        // fragmentation stats from a directory scan, and blob GC retires a
+        // file only once its recorded stale bytes reach the totals it never
+        // gets. That also settles what a crashed earlier attempt leaves
+        // behind — a fully written salvage replacement that the crash kept
+        // out of any manifest — which would otherwise be admitted as an
+        // ordinary blob and pin a whole copy per failed attempt.
+        let mut referenced: crate::HashSet<crate::vlog::BlobFileId> = crate::HashSet::default();
+        for (table, _) in &recovered_tables {
+            for link in table.list_blob_file_references()?.into_iter().flatten() {
+                referenced.insert(link.blob_file_id);
+            }
+        }
+        let dropped: Vec<crate::vlog::BlobFileId> = blob_file_list
+            .iter()
+            .map(crate::vlog::BlobFile::id)
+            .filter(|id| !referenced.contains(id))
+            .collect();
+        for id in dropped {
+            log::debug!(
+                "blob file {id} is referenced by no recovered table; leaving it out \
+                 of the rebuilt manifest (the next open sweeps it as an orphan)"
+            );
+            blob_file_list.remove(id);
+            blob_frag.remove(&id);
+        }
     }
 
     // `salvaged` is a subset of `recovered`, so derive it from the tables that

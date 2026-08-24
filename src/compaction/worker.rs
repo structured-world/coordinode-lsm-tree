@@ -1147,6 +1147,21 @@ fn run_tight_space_compaction(
                 }
             }
 
+            // Bind the blob files this slice publishes, exactly as its SST
+            // outputs were bound above — both the freshly written ones and the
+            // re-opened restricted views, since the version edit below makes
+            // all of them reachable at once. An unbound blob's `Drop` can
+            // unlink it while a checkpoint is capturing, and its prefix punch
+            // can zero bytes the checkpoint has already hard-linked.
+            for blob_file in &new_blobs {
+                blob_file.bind_to_tree(&crate::table::TableSinks {
+                    deletion_pause: &opts.deletion_pause,
+                    heal_hints: &opts.heal_hints,
+                    #[cfg(feature = "std")]
+                    background_deleter: None,
+                });
+            }
+
             // Install one atomic, durable version edit for the slice.
             let install = opts.version_history.write().upgrade_version(
                 &opts.config.path,

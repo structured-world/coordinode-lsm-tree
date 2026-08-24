@@ -368,13 +368,20 @@ pub(super) fn install_merge(
     // precisely when space is scarce — where deferring the unlink defeats the
     // point: the space must come back now, not when a background pass gets to
     // it. Flush outputs, which have no such rollback, keep it.
+    let sinks = crate::table::TableSinks {
+        deletion_pause: &opts.deletion_pause,
+        heal_hints: &opts.heal_hints,
+        #[cfg(feature = "std")]
+        background_deleter: None,
+    };
     for table in &created_tables {
-        table.bind_to_tree(&crate::table::TableSinks {
-            deletion_pause: &opts.deletion_pause,
-            heal_hints: &opts.heal_hints,
-            #[cfg(feature = "std")]
-            background_deleter: None,
-        });
+        table.bind_to_tree(&sinks);
+    }
+    // Blob files this compaction produced need the same binding: they become
+    // reachable through the very same version edit, and an unbound one can be
+    // unlinked out from under a capturing checkpoint.
+    for blob_file in &created_blob_files {
+        blob_file.bind_to_tree(&sinks);
     }
 
     // Globally-dead blob files are dropped once, from the install-time version.

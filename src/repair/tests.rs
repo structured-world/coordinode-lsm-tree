@@ -7717,6 +7717,74 @@ fn blob_tree_without_manifest(
     Ok(())
 }
 
+/// A salvage replacement a crashed attempt left behind must not be admitted
+/// as an ordinary blob file. It is fully written and checksum-valid, so the
+/// scan cannot tell it from a real one — but no surviving table references it,
+/// and a blob nothing references holds no reachable value. Admitting it would
+/// strand a whole copy per failed attempt: repair cannot rebuild fragmentation
+/// stats from a directory scan, and GC retires a file only once its recorded
+/// stale bytes reach totals it would never get.
+#[cfg(feature = "lz4")]
+#[test]
+fn repair_leaves_an_unreferenced_blob_out_of_the_manifest() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    blob_tree_without_manifest(&memfs, &root)?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    punch_and_corrupt_blob(&memfs, &blobs.join("0"))?;
+
+    let config = |fs: Arc<dyn Fs>| {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+
+    // A first attempt that fails AFTER publishing its replacement leaves a
+    // fully written, checksum-valid blob under a fresh id that nothing points
+    // at — exactly what the scan cannot tell apart from a real blob file.
+    let fault = FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Interrupted))
+            .on_path("repair-quarantine"),
+    );
+    assert!(
+        config(Arc::new(fault)).repair().is_err(),
+        "the faulted attempt must fail after producing its replacement",
+    );
+    assert!(
+        memfs.exists(&blobs.join("1"))?,
+        "the abandoned replacement is what this test is about",
+    );
+
+    // The retry salvages the untouched original again, into yet another id.
+    config(memfs.clone()).repair()?;
+
+    let tree = config(memfs.clone()).open()?;
+    assert_eq!(
+        tree.blob_file_count(),
+        1,
+        "only the blob the surviving table references belongs in the manifest; \
+         admitting the abandoned copy would pin it forever, since repair cannot \
+         rebuild the fragmentation stats GC needs to retire it",
+    );
+    assert!(
+        !memfs.exists(&blobs.join("1"))?,
+        "the unreferenced copy is swept by the open that follows the repair",
+    );
+    Ok(())
+}
+
 /// A superseded original that cannot be set aside fails the repair. Left in
 /// `blobs/` it is outside the committed manifest, so the next open classifies
 /// it as an orphan and must remove it — hitting the same refusal and failing

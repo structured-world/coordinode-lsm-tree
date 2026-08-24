@@ -960,20 +960,17 @@ impl AbstractTree for Tree {
         // Wire the tree-wide deletion pause into every fresh table / blob
         // file so an in-flight checkpoint defers their cleanup if they
         // later get marked `is_deleted` by compaction.
+        let sinks = crate::table::TableSinks {
+            deletion_pause: &self.deletion_pause,
+            heal_hints: &self.heal_hints,
+            #[cfg(feature = "std")]
+            background_deleter: Some(&self.background_deleter),
+        };
         for table in tables {
-            table.bind_to_tree(&crate::table::TableSinks {
-                deletion_pause: &self.deletion_pause,
-                heal_hints: &self.heal_hints,
-                #[cfg(feature = "std")]
-                background_deleter: Some(&self.background_deleter),
-            });
+            table.bind_to_tree(&sinks);
         }
-        if let Some(bfs) = blob_files {
-            for bf in bfs {
-                bf.install_deletion_pause(Arc::clone(&self.deletion_pause));
-                #[cfg(feature = "std")]
-                bf.install_background_deleter(Arc::clone(&self.background_deleter));
-            }
+        for bf in blob_files.unwrap_or(&[]) {
+            bf.bind_to_tree(&sinks);
         }
 
         let mut _compaction_state = self.compaction_state.lock();
@@ -4010,18 +4007,17 @@ impl Tree {
         let recovered_tables: Vec<Table> = version.iter_tables().cloned().collect();
         let recovered_blobs: Vec<BlobFile> = version.blob_files.iter().cloned().collect();
 
+        let sinks = crate::table::TableSinks {
+            deletion_pause: &deletion_pause,
+            heal_hints: &heal_hints,
+            #[cfg(feature = "std")]
+            background_deleter: Some(&background_deleter),
+        };
         for table in &recovered_tables {
-            table.bind_to_tree(&crate::table::TableSinks {
-                deletion_pause: &deletion_pause,
-                heal_hints: &heal_hints,
-                #[cfg(feature = "std")]
-                background_deleter: Some(&background_deleter),
-            });
+            table.bind_to_tree(&sinks);
         }
         for blob_file in &recovered_blobs {
-            blob_file.install_deletion_pause(Arc::clone(&deletion_pause));
-            #[cfg(feature = "std")]
-            blob_file.install_background_deleter(Arc::clone(&background_deleter));
+            blob_file.bind_to_tree(&sinks);
         }
 
         Ok(Self(Arc::new(inner)))

@@ -384,6 +384,32 @@ impl BlobFile {
         let _ = self.0.background_deleter.set(Box::new(deleter));
     }
 
+    /// Binds this freshly created blob file to the tree's shared machinery.
+    ///
+    /// **Every path that makes a new blob file reachable must call this**, for
+    /// the same reason its table counterpart exists
+    /// ([`Table::bind_to_tree`](crate::Table::bind_to_tree)): a file that
+    /// skips it looks healthy and fails silently later. Without the deletion
+    /// pause its `Drop` can unlink the file while a checkpoint is capturing —
+    /// before the checkpoint links it — and a tight-space prefix punch can
+    /// zero bytes the checkpoint has already hard-linked.
+    ///
+    /// Idempotent per sink, so re-binding is harmless.
+    pub(crate) fn bind_to_tree(&self, sinks: &crate::table::TableSinks<'_>) {
+        self.install_deletion_pause(Arc::clone(sinks.deletion_pause));
+        #[cfg(feature = "std")]
+        if let Some(deleter) = sinks.background_deleter {
+            self.install_background_deleter(Arc::clone(deleter));
+        }
+    }
+
+    /// The installed deletion pause, so tests can assert that every path
+    /// publishing a blob file binds it.
+    #[cfg(test)]
+    pub(crate) fn deletion_pause_for_test(&self) -> Option<Arc<DeletionPause>> {
+        self.0.deletion_pause.get().cloned()
+    }
+
     /// Returns the blob file ID.
     #[must_use]
     pub fn id(&self) -> BlobFileId {
