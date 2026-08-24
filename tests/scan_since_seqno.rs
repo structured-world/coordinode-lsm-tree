@@ -793,3 +793,39 @@ fn scan_since_keeps_a_merge_operand_a_single_source_holds_twice() -> lsm_tree::R
     );
     Ok(())
 }
+
+/// Distinct operands a single source holds at one seqno must be replayed in the
+/// order that source applies them, not in payload order. A merge operator need
+/// not be commutative (string append, list push, last-writer-wins field patch),
+/// so reordering two operands of one batch changes the value the consumer ends
+/// up with.
+#[test]
+fn scan_since_replays_one_source_operands_in_application_order() -> lsm_tree::Result<()> {
+    use lsm_tree::WriteBatch;
+
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path())?;
+
+    // Payload order is the REVERSE of application order, so a sort by bytes is
+    // visible in the output.
+    let mut batch = WriteBatch::new();
+    batch.merge(b"k".as_slice(), b"B".as_slice());
+    batch.merge(b"k".as_slice(), b"A".as_slice());
+    tree.apply_batch(batch, 10)?;
+
+    let got = events(&tree, 0)?;
+    let operands: Vec<_> = got
+        .iter()
+        .filter_map(|e| match e {
+            ScanSinceEvent::MergeOperand { operand, .. } => Some(operand.to_vec()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        operands,
+        vec![b"B".to_vec(), b"A".to_vec()],
+        "the tree applies B then A, so the stream must too — an \
+         order-sensitive merge operator otherwise converges elsewhere: {got:?}",
+    );
+    Ok(())
+}

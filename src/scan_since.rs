@@ -107,6 +107,18 @@ impl ScanSinceEvent {
         }
     }
 
+    /// The user key this change applies to — the START key for a range
+    /// deletion, which is where its own ordering is anchored.
+    #[must_use]
+    pub fn key(&self) -> &Slice {
+        match self {
+            Self::Insert { key, .. }
+            | Self::MergeOperand { key, .. }
+            | Self::PointTombstone { key, .. } => key,
+            Self::RangeTombstone { start_key, .. } => start_key,
+        }
+    }
+
     /// Total order that brings byte-identical events ADJACENT so one pass can
     /// count them: seqno, then kind, then the full payload. Identical copies
     /// are a real post-repair state — a manifest-loss repair publishes every

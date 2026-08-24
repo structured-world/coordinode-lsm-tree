@@ -1878,55 +1878,93 @@ impl Tree {
     ///   the source genuinely holds.
     fn merge_source_events(sources: Vec<Vec<ScanSinceEvent>>) -> Vec<ScanSinceEvent> {
         // Per source, collapse equal neighbours into (event, count) runs, each
-        // tagged with its source's recency (0 = newest).
-        let mut runs: Vec<(ScanSinceEvent, usize, usize)> = Vec::new();
-        for (recency, mut source) in sources.into_iter().enumerate() {
-            source.sort_by(ScanSinceEvent::grouping_order);
-            let mut iter = source.into_iter();
-            let Some(mut current) = iter.next() else {
+        // tagged with its source's recency (0 = newest) and the position the
+        // source itself gives the run.
+        //
+        // The POSITION is what keeps an order-sensitive merge operator correct:
+        // a source applies the operands of one batch in the order they were
+        // added, all at one seqno, and grouping them by payload would replay
+        // them in a different order — an append or a list push then converges
+        // somewhere the tree never was. Grouping still SORTS (equal events have
+        // to meet), so each run remembers where its earliest member sat, and the
+        // final ordering below restores it.
+        struct Run {
+            event: ScanSinceEvent,
+            count: usize,
+            recency: usize,
+            position: usize,
+        }
+        let mut runs: Vec<Run> = Vec::new();
+        for (recency, source) in sources.into_iter().enumerate() {
+            let mut indexed: Vec<(usize, ScanSinceEvent)> =
+                source.into_iter().enumerate().collect();
+            indexed.sort_by(|(_, a), (_, b)| ScanSinceEvent::grouping_order(a, b));
+            let mut iter = indexed.into_iter();
+            let Some((mut position, mut current)) = iter.next() else {
                 continue;
             };
             let mut count = 1;
-            for event in iter {
+            for (index, event) in iter {
                 if event == current {
                     count += 1;
+                    position = position.min(index);
                 } else {
-                    runs.push((core::mem::replace(&mut current, event), count, recency));
+                    runs.push(Run {
+                        event: core::mem::replace(&mut current, event),
+                        count,
+                        recency,
+                        position,
+                    });
                     count = 1;
+                    position = index;
                 }
             }
-            runs.push((current, count, recency));
+            runs.push(Run {
+                event: current,
+                count,
+                recency,
+                position,
+            });
         }
 
         // Merge the per-source runs: operands accumulate, idempotent events take
         // the count a single source holds. A collapsed event keeps the recency
         // of the NEWEST source holding it, which is the position the tree's own
         // precedence gives it.
-        runs.sort_by(|(a, ..), (b, ..)| ScanSinceEvent::grouping_order(a, b));
-        let mut merged: Vec<(ScanSinceEvent, usize)> = Vec::new();
+        runs.sort_by(|a, b| ScanSinceEvent::grouping_order(&a.event, &b.event));
+        let mut merged: Vec<(ScanSinceEvent, usize, usize)> = Vec::new();
         let mut iter = runs.into_iter().peekable();
-        while let Some((event, mut count, mut recency)) = iter.next() {
+        while let Some(Run {
+            event,
+            mut count,
+            mut recency,
+            mut position,
+        }) = iter.next()
+        {
             let accumulates = matches!(event, ScanSinceEvent::MergeOperand { .. });
-            while let Some((next, other, other_recency)) = iter.next_if(|(next, ..)| *next == event)
-            {
-                debug_assert_eq!(next, event, "next_if matched the same event");
+            while let Some(other) = iter.next_if(|next| next.event == event) {
+                debug_assert_eq!(other.event, event, "next_if matched the same event");
                 count = if accumulates {
-                    count.saturating_add(other)
+                    count.saturating_add(other.count)
                 } else {
-                    count.max(other)
+                    count.max(other.count)
                 };
-                recency = recency.min(other_recency);
+                // The newest source decides both the replay slot and the
+                // position within it, so the two stay consistent.
+                if other.recency < recency {
+                    recency = other.recency;
+                    position = other.position;
+                }
             }
             for _ in 1..count {
-                merged.push((event.clone(), recency));
+                merged.push((event.clone(), recency, position));
             }
-            merged.push((event, recency));
+            merged.push((event, recency, position));
         }
 
-        // Finally, replay order: seqno, then range deletions, then oldest
-        // source first. `sort_by` is stable, so the grouping order above still
-        // decides between distinct events of one source — deterministic, and
-        // irrelevant to convergence since they touch different keys.
+        // Finally, replay order: seqno, then range deletions, then oldest source
+        // first, then the position that source gave the event — which is how an
+        // order-sensitive merge operator converges to what the tree serves.
         //
         // The range-deletion step comes BEFORE source recency, not after: a tied
         // deletion does not suppress the writes it spans (suppression is
@@ -1934,7 +1972,7 @@ impl Tree {
         // a replay that applied the deletion last would drop them. Ordering by
         // recency first would do exactly that whenever the deletion sits in the
         // newer source.
-        merged.sort_by(|(a, a_recency), (b, b_recency)| {
+        merged.sort_by(|(a, a_recency, a_pos), (b, b_recency, b_pos)| {
             fn deletion_first(e: &ScanSinceEvent) -> u8 {
                 u8::from(!matches!(e, ScanSinceEvent::RangeTombstone { .. }))
             }
@@ -1942,8 +1980,21 @@ impl Tree {
                 .cmp(&b.seqno())
                 .then_with(|| deletion_first(a).cmp(&deletion_first(b)))
                 .then_with(|| b_recency.cmp(a_recency))
+                .then_with(|| {
+                    // Within one source and one seqno, a scan yields a key's
+                    // versions NEWEST first, and the read path reverses that run
+                    // to apply them chronologically. Mirror it: same key ⇒ the
+                    // later scan position replays FIRST. Distinct keys at one
+                    // seqno touch different state, so their relative order is
+                    // free — keep it deterministic by scan position.
+                    if a.key() == b.key() {
+                        b_pos.cmp(a_pos)
+                    } else {
+                        a_pos.cmp(b_pos)
+                    }
+                })
         });
-        merged.into_iter().map(|(event, _)| event).collect()
+        merged.into_iter().map(|(event, ..)| event).collect()
     }
 
     /// Iterate change events with `seqno >= target_seqno`.
