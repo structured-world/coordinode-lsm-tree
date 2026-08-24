@@ -3601,10 +3601,12 @@ impl Table {
         Ok(bytes.iter().all(|&b| b == 0))
     }
 
-    /// Whether ANY of this table's data blocks is hole-punched (reads as zeros).
+    /// Whether ANY of this table's data blocks is hole-punched (reads as zeros)
+    /// AND the file carries the physical hole to prove it.
+    ///
     /// This is the punch test for the case where the sidecar bound itself could
-    /// not be read: a zeroed data block means the SST genuinely lost data to a
-    /// punch (bound lost → derive one from the geometry), while a fully intact
+    /// not be read: a punched data block means the SST genuinely lost data to a
+    /// reclaim (bound lost → derive one from the geometry), while a fully intact
     /// data section means an unpunched file. EVERY block is inspected, not just
     /// the first: the punch-on-drop reclaim continues past an individual
     /// `punch_hole` failure, so a partially-punched SST can keep its first block
@@ -3612,11 +3614,34 @@ impl Table {
     /// would misread that file as unpunched and recover it unrestricted, routing
     /// later reads into the zeroed blocks.
     ///
+    /// Zeros alone are NOT the evidence, because corruption that destroys the
+    /// leading data block leaves the same read-as-zeros shape a completed punch
+    /// does, and reading it as a reclaim would drop that block plus the
+    /// sub-bound rows of the first readable one while reporting the table
+    /// recovered. A punch physically deallocates, so the file must ALSO report
+    /// less allocated space than its length. A backend that cannot answer the
+    /// probe leaves the punch unproven and the zeros are treated as damage —
+    /// which preserves the whole file for the operator instead of silently
+    /// publishing a truncated view of it.
+    ///
     /// # Errors
     ///
-    /// Propagates a block-index or positioned-read failure.
+    /// Propagates a block-index, positioned-read, or allocation-probe failure.
     #[cfg(feature = "std")]
     pub(crate) fn has_punched_data_block(&self) -> crate::Result<bool> {
+        let sparse = match self.fs.allocated_size(&self.path)? {
+            Some(allocated) => {
+                allocated
+                    < crate::fs::FsFile::metadata(
+                        &*self.fs.open(&self.path, &FsOpenOptions::new().read(true))?,
+                    )?
+                    .len
+            }
+            None => false,
+        };
+        if !sparse {
+            return Ok(false);
+        }
         let file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
         for handle in self.block_index.iter() {
             let handle = handle?;
