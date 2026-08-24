@@ -1274,6 +1274,11 @@ struct TableSalvage<'a> {
     /// frontier); `None` on the plain corrupt-table salvage paths.
     blob_rewrite:
         Option<Arc<crate::HashMap<crate::vlog::BlobFileId, crate::salvage::BlobFileRewrite>>>,
+    /// Stamp the recovered copy with a FRESH identity (matching `table_path`'s
+    /// file name) instead of the source's, for the caller that publishes it
+    /// beside an untouched source. `None` keeps the source's identity, which is
+    /// what the in-place replacement paths need.
+    output_id: Option<TableId>,
 }
 
 fn try_salvage_table(
@@ -1288,6 +1293,7 @@ fn try_salvage_table(
         table_id,
         reject_punched_without_bound,
         blob_rewrite,
+        output_id,
     } = salvage;
     // Salvage under the tree's configured comparator + crypto/dictionary context
     // so the rewritten SST opens, orders, and decrypts / decompresses consistently
@@ -1323,6 +1329,7 @@ fn try_salvage_table(
             // prefix scans see the salvaged copy as definitely absent.
             prefix_extractor: config.prefix_extractor.clone(),
             blob_rewrite,
+            output_id,
             // Forward the caller's live-progress handle so the block walk
             // ticks per inspected / recovered block while it runs.
             progress: config.recovery_progress.clone(),
@@ -1364,7 +1371,7 @@ fn try_salvage_table(
         checksum,
         0,
         0,
-        table_id,
+        output_id.unwrap_or(table_id),
         config.cache.clone(),
         None,
         Arc::clone(fs),
@@ -1614,11 +1621,22 @@ fn source_prefix_is_punched(
 /// re-derive the bound from a fresh unpunched output, so the punched original must
 /// be back in place for it to re-salvage and re-restrict from.
 #[cfg(feature = "std")]
+enum SalvageRollback<'a> {
+    /// The source was moved out of the way before the salvage ran: restore it
+    /// over `table_path` so a retry starts from the state it was found in.
+    Restore(&'a std::path::Path),
+    /// The source is untouched at its own path and the output was published
+    /// beside it under a fresh id: discard that output instead. The retry
+    /// re-derives the same rewrite from the same source.
+    DiscardOutput,
+}
+
+#[cfg(feature = "std")]
 fn restrict_salvaged_output(
     folder_fs: &dyn crate::fs::Fs,
     config: &Config,
     table_path: &std::path::Path,
-    quarantined: &std::path::Path,
+    rollback: &SalvageRollback<'_>,
     salvaged: Table,
     restrict_bound: Option<crate::UserKey>,
     allow_resurrection: bool,
@@ -1654,13 +1672,27 @@ fn restrict_salvaged_output(
                     // punched original back lets the retry re-salvage and
                     // re-restrict from a known state (a `rename` needs no free
                     // space, so it survives the ENOSPC that may have caused `e`).
-                    restore_quarantined(
-                        folder_fs,
-                        quarantined,
-                        table_path,
-                        config.encryption.as_deref(),
-                        config.sync_mode,
-                    )?;
+                    match *rollback {
+                        SalvageRollback::Restore(quarantined) => restore_quarantined(
+                            folder_fs,
+                            quarantined,
+                            table_path,
+                            config.encryption.as_deref(),
+                            config.sync_mode,
+                        )?,
+                        // Nothing to restore: the source never moved. Clear the
+                        // half-published output so the retry does not adopt an
+                        // unrestricted copy of a restricted table.
+                        SalvageRollback::DiscardOutput => {
+                            crate::restrict_bound::remove(folder_fs, table_path, config.sync_mode);
+                            if let Err(e) = folder_fs.remove_file(table_path) {
+                                log::warn!(
+                                    "Failed to discard the unrestrictable salvage output {}: {e:?}",
+                                    table_path.display(),
+                                );
+                            }
+                        }
+                    }
                     Err(e)
                 }
             }
@@ -1797,9 +1829,20 @@ fn derive_blob_frontier(
     loop {
         let run_end = skip_zeros(pos)?;
         if run_end >= data_end {
-            // Zeros to the section end: the whole data region was consumed
-            // (the final slice's punch ran, its drop lagged the crash).
-            return Ok(BlobFrontier::FullyConsumed);
+            // Zeros to the section end. Only a completed relocation when
+            // NOTHING was anchored below them: reclaim punches the consumed
+            // prefix top-down from the data start, so a zeroed tail that
+            // FOLLOWS intact anchored frames cannot be punch geometry — it is
+            // destroyed data. Reporting it as consumed would drop a file whose
+            // live frames are still referenced (and set aside every table
+            // pointing at it); keeping the anchored frontier instead lets the
+            // damaged suffix surface through validation, exactly as the same
+            // damage would on an unpunched file.
+            return Ok(if anchored == 0 {
+                BlobFrontier::FullyConsumed
+            } else {
+                committed(anchored)
+            });
         }
         let mut scanner = crate::vlog::BlobFileScanner::resume(path, &**fs, blob_id, run_end)?;
         match scanner.next() {
@@ -1858,6 +1901,29 @@ fn set_aside_table(
     drop(table); // release the handle before the quarantine move
     let dest = quarantine_file(&*fs, &base, &path, &name, sync_mode)?;
     unreadable_files.push((path, format!("{reason}; set aside at {}", dest.display())));
+    Ok(())
+}
+
+/// Same as [`set_aside_table`] for a source that is no longer open: a table
+/// left in `tables/` but outside the rebuilt manifest is an orphan the next
+/// open DELETES, so every unpublished file must be moved out of the way.
+#[cfg(feature = "std")]
+fn set_aside_path(
+    fs: &dyn crate::fs::Fs,
+    base: &std::path::Path,
+    path: &std::path::Path,
+    reason: &str,
+    unreadable_files: &mut Vec<(PathBuf, String)>,
+    sync_mode: crate::fs::SyncMode,
+) -> crate::Result<()> {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Err(crate::Error::Unrecoverable);
+    };
+    let dest = quarantine_file(fs, base, path, name, sync_mode)?;
+    unreadable_files.push((
+        path.to_path_buf(),
+        format!("{reason}; set aside at {}", dest.display()),
+    ));
     Ok(())
 }
 
@@ -3198,6 +3264,7 @@ fn repair_tree(
                                     // on this arm.
                                     reject_punched_without_bound: false,
                                     blob_rewrite: None,
+                                    output_id: None,
                                 },
                             ) {
                                 Ok(SalvageOutcome::Salvaged(salvaged)) => {
@@ -3208,7 +3275,7 @@ fn repair_tree(
                                         &*folder_fs,
                                         config,
                                         &table_path,
-                                        &quarantined,
+                                        &SalvageRollback::Restore(&quarantined),
                                         salvaged,
                                         restrict_bound.clone(),
                                         allow_resurrection,
@@ -3452,6 +3519,7 @@ fn repair_tree(
                             table_id,
                             reject_punched_without_bound: reject_punched,
                             blob_rewrite: None,
+                            output_id: None,
                         },
                     ) {
                         Ok(SalvageOutcome::Salvaged(salvaged)) => {
@@ -3462,7 +3530,7 @@ fn repair_tree(
                                 &*folder_fs,
                                 config,
                                 &table_path,
-                                &quarantined,
+                                &SalvageRollback::Restore(&quarantined),
                                 salvaged,
                                 restrict_bound,
                                 allow_resurrection,
@@ -3588,6 +3656,20 @@ fn repair_tree(
     // ordering the merge reader expects for its newest-run-first short-circuit.
     recovered_tables.sort_by_key(|(t, _)| std::cmp::Reverse(t.get_highest_seqno()));
 
+    // Fresh ids for copies published BESIDE their source (the blob-handle
+    // rewrite). Starts one past the highest id the scan saw, so a new name can
+    // never displace a file this repair still has to read. `None` = exhausted,
+    // which fails the repair at the point of use rather than reusing an id.
+    let mut next_table_id: Option<TableId> = recovered_tables
+        .iter()
+        .map(|(t, _)| t.id())
+        .max()
+        .map_or(Some(0), |max| max.checked_add(1));
+    // Sources whose rewritten copy is in the rebuilt manifest. Set aside only
+    // after `persist_version` — until then they are the only copy of their
+    // rows, and a crash must leave them where a retry looks for them.
+    let mut stale_table_originals: Vec<(PathBuf, String)> = Vec::new();
+
     // KV-separated (blob) trees additionally carry a blob-file list. Discover the
     // blob files from the `blobs/` folder (no manifest to filter against) and
     // record them in the rebuilt manifest with the matching `TreeType::Blob` so
@@ -3609,6 +3691,9 @@ fn repair_tree(
     // Damaged blob originals whose replacement is in the rebuilt manifest.
     // Set aside only after `persist_version` — see `BlobRecovery::stale`.
     let mut stale_blob_originals: Vec<(PathBuf, String)> = Vec::new();
+    // Blob files the rebuilt manifest omits because nothing references them.
+    // Removed only after `persist_version`, for the same reason.
+    let mut unreferenced_blob_files: Vec<PathBuf> = Vec::new();
     let (tree_type, mut blob_file_list) = if config.kv_separation_opts.is_some() {
         let recovery = recover_blob_files(config)?;
         unreadable_files.extend(recovery.unreadable);
@@ -3721,88 +3806,88 @@ fn repair_tree(
                 kept.push((table, complete));
                 continue;
             }
-            // A RESTRICTED survivor keeps the set-aside path: the salvage
-            // rewrite emits an UNRESTRICTED copy, which would resurrect the
-            // punched prefix the restriction hides. The compound state (a
-            // restricted view whose blob dependency was also reshaped) is
-            // preserved for the operator instead.
-            if table.restrict_lower_bound().is_some() {
-                set_aside_table(
-                    table,
-                    "restricted table references a reshaped blob file",
-                    &mut unreadable_files,
-                    config.sync_mode,
-                )?;
-                continue;
-            }
             // Rewrite through the salvage pipeline: re-emit every entry with
             // re-targeted handles, dropping only entries whose blob record no
             // longer exists. The rewritten table counts as salvaged (its
             // content may be lossy relative to the original).
             //
-            // No cross-run bookkeeping is needed to make this safe to repeat:
-            // the rewrite reads the UNTOUCHED original and writes a separate
-            // output, so a crashed attempt leaves nothing for a retry to
-            // reconcile — it simply redoes the same deterministic rewrite from
-            // the same inputs.
-            let table_id = table.id();
+            // The copy is published under a FRESH id beside its untouched
+            // source, and the source is set aside only AFTER the manifest
+            // commit. Moving it first would open a window in which a crash
+            // leaves the only copy in `repair-quarantine/`, which the retry
+            // (it scans `tables/`) never looks at: the table's keys would
+            // silently vanish from the rebuilt manifest. Nothing has to be
+            // carried across runs to make this repeatable — the rewrite reads
+            // an untouched source and writes a separate output, so a retry
+            // simply redoes the same deterministic rewrite from the same
+            // inputs.
+            let source_id = table.id();
             let path = (*table.path).clone();
-            let (Some(base), Some(name)) = (
-                path.parent().map(std::path::Path::to_path_buf),
-                path.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(str::to_string),
-            ) else {
+            let Some(base) = path.parent().map(std::path::Path::to_path_buf) else {
                 return Err(crate::Error::Unrecoverable);
             };
+            let Some(new_id) = next_table_id else {
+                log::error!("repair: table ids exhausted; cannot rewrite blob handles");
+                return Err(crate::Error::Unrecoverable);
+            };
+            next_table_id = new_id.checked_add(1);
+            let output_path = base.join(new_id.to_string());
+            // A RESTRICTED source's bound must be re-imposed on the copy: the
+            // rewrite re-emits the straddling block's sub-bound rows, which the
+            // restriction hides, so an unrestricted copy would resurrect them.
+            let restrict_bound = table.restrict_lower_bound().cloned();
             let fs = table.fs.clone();
-            drop(table); // release the handle before the quarantine move
-            let quarantined = quarantine_file(&*fs, &base, &path, &name, config.sync_mode)?;
+            drop(table); // release the handle before reading the source again
             match try_salvage_table(
                 config,
                 &fs,
                 allow_resurrection,
                 TableSalvage {
-                    quarantined: &quarantined,
-                    table_path: &path,
-                    table_id,
+                    quarantined: &path,
+                    table_path: &output_path,
+                    table_id: source_id,
                     reject_punched_without_bound: false,
                     blob_rewrite: Some(Arc::clone(&blob_rewrites)),
+                    output_id: Some(new_id),
                 },
             ) {
-                Ok(SalvageOutcome::Salvaged(rewritten)) => kept.push((rewritten, false)),
-                Ok(SalvageOutcome::Unusable | SalvageOutcome::PunchedBoundLost) => {
-                    unreadable_files.push((
-                        path,
-                        format!(
-                            "blob-handle rewrite produced nothing; original preserved at {}",
-                            quarantined.display(),
-                        ),
-                    ));
-                }
-                // A retryable failure must leave the tree as it was found: the
-                // source is already in quarantine, and the retried repair scans
-                // only `tables/`, so propagating without restoring would let it
-                // rebuild a manifest that silently omits every key of this
-                // table. Mirrors the other salvage arms.
-                Err(e) if is_transient_io(&e) => {
-                    restore_quarantined(
+                Ok(SalvageOutcome::Salvaged(rewritten)) => {
+                    let rewritten = restrict_salvaged_output(
                         &*fs,
-                        &quarantined,
+                        config,
+                        &output_path,
+                        &SalvageRollback::DiscardOutput,
+                        rewritten,
+                        restrict_bound,
+                        allow_resurrection,
+                    )?;
+                    kept.push((rewritten, false));
+                    stale_table_originals
+                        .push((path, format!("blob handles rewritten into table {new_id}")));
+                }
+                Ok(SalvageOutcome::Unusable | SalvageOutcome::PunchedBoundLost) => {
+                    set_aside_path(
+                        &*fs,
+                        &base,
                         &path,
-                        config.encryption.as_deref(),
+                        "blob-handle rewrite produced nothing",
+                        &mut unreadable_files,
                         config.sync_mode,
                     )?;
-                    return Err(e);
                 }
+                // A retryable failure leaves the source where it was found, so
+                // the retry re-derives the same rewrite from it; nothing to
+                // restore.
+                Err(e) if is_transient_io(&e) => return Err(e),
                 Err(e) => {
-                    unreadable_files.push((
-                        path,
-                        format!(
-                            "blob-handle rewrite failed ({e}); original preserved at {}",
-                            quarantined.display(),
-                        ),
-                    ));
+                    set_aside_path(
+                        &*fs,
+                        &base,
+                        &path,
+                        &format!("blob-handle rewrite failed ({e})"),
+                        &mut unreadable_files,
+                        config.sync_mode,
+                    )?;
                 }
             }
         }
@@ -3831,10 +3916,19 @@ fn repair_tree(
         for id in dropped {
             log::debug!(
                 "blob file {id} is referenced by no recovered table; leaving it out \
-                 of the rebuilt manifest (the next open sweeps it as an orphan)"
+                 of the rebuilt manifest and removing it"
             );
             blob_file_list.remove(id);
             blob_frag.remove(&id);
+            // Removed POST-COMMIT (see the sweep below): until the manifest is
+            // durable the file is still what a failed attempt's inputs point
+            // at, and a retry re-derives the same decision from a fresh scan.
+            unreferenced_blob_files.push(
+                config
+                    .path
+                    .join(crate::file::BLOBS_FOLDER)
+                    .join(id.to_string()),
+            );
         }
     }
 
@@ -3950,6 +4044,54 @@ fn repair_tree(
                     path.display(),
                 );
                 return Err(e);
+            }
+        }
+    }
+
+    // Same rule for the SST sources whose rewritten copy the manifest now
+    // names: they are unreferenced from here on, and a file left in `tables/`
+    // outside the manifest is an orphan the next open DELETES — so the
+    // set-aside is what preserves them, and a failure to perform it fails the
+    // repair rather than reporting success over a tree that loses them.
+    for (path, note) in stale_table_originals {
+        let (Some(base), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+        else {
+            return Err(crate::Error::Unrecoverable);
+        };
+        match quarantine_file(&*config.fs, base, &path, name, config.sync_mode) {
+            Ok(dest) => log::info!(
+                "repair: {note}; superseded source preserved at {}",
+                dest.display(),
+            ),
+            Err(e) => {
+                log::error!(
+                    "repair: cannot set aside the superseded table {} ({e}); \
+                     failing the repair — left in tables/ it is an orphan the next \
+                     open must remove, and that removal would hit the same error",
+                    path.display(),
+                );
+                return Err(e);
+            }
+        }
+    }
+
+    // Same rule for the blob files the manifest omits because nothing
+    // references them: their data is unreachable, so there is nothing to
+    // preserve — but leaving one behind hands the next open an orphan to
+    // sweep, and a sweep that fails there fails the open. Remove them here and
+    // propagate, so a repair that reports success leaves an openable tree.
+    for path in unreferenced_blob_files {
+        match config.fs.remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                log::error!(
+                    "repair: cannot remove the unreferenced blob file {} ({e}); \
+                     failing the repair — left in blobs/ it is an orphan the next \
+                     open must remove, and that removal would hit the same error",
+                    path.display(),
+                );
+                return Err(e.into());
             }
         }
     }

@@ -6896,6 +6896,412 @@ fn blob_recovery_completes_the_drop_of_a_fully_punched_blob_file() -> crate::Res
     Ok(())
 }
 
+/// A RESTRICTED table that also needs its blob handles rewritten must be
+/// rewritten AND kept restricted, not set aside whole. Setting it aside drops
+/// every live suffix row the restriction was protecting; the salvage output
+/// path already knows how to re-impose a bound, which is exactly what keeps
+/// the rewrite from resurrecting the sub-bound rows.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_rewrites_a_restricted_table_that_references_a_reshaped_blob() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let kv = || Some(KvSeparationOptions::default().separation_threshold(16));
+
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(kv())
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        for i in 0..8u32 {
+            tree.insert(format!("k{i:04}").as_bytes(), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // The blob's first frame is reclaimed (forcing the handle rewrite) and the
+    // SST carries a committed restriction bound: the compound state.
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let blob_path = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one blob file")
+        .path;
+    // Reclaim the first THREE frames while the bound hides only the first key:
+    // the restricted view still holds handles below the frontier, which is what
+    // makes the rewrite necessary on a restricted table.
+    let frontier = crate::vlog::BlobFileScanner::new(&blob_path, &*fs_dyn, 0)?
+        .take(3)
+        .last()
+        .expect("three frames")?
+        .frame_end;
+    let data_start = {
+        let mut file = fs_dyn.open(&blob_path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut file)?;
+        reader
+            .toc()
+            .section(b"data")
+            .expect("blob file has a data section")
+            .pos()
+    };
+    memfs.punch_hole(&blob_path, data_start, frontier - data_start)?;
+
+    let source = root.join("tables").join("0");
+    crate::restrict_bound::write(
+        &*fs_dyn,
+        &source,
+        None,
+        0,
+        b"k0001",
+        crate::fs::SyncMode::Normal,
+    )?;
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    let config = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .with_kv_separation(kv());
+    let report = config.repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "the restricted table is rewritten, not set aside: {report:?}",
+    );
+
+    let tree = match config.open()? {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+    };
+    for i in 3..8u32 {
+        let key = format!("k{i:04}");
+        assert!(
+            tree.get(key.as_bytes(), crate::SeqNo::MAX)?.is_some(),
+            "{key} is in the live suffix with an intact record and must survive",
+        );
+    }
+    assert!(
+        tree.get(b"k0000", crate::SeqNo::MAX)?.is_none(),
+        "the key below the restriction bound must stay hidden",
+    );
+    Ok(())
+}
+
+/// A blob-handle rewrite must keep its SOURCE discoverable until the rebuilt
+/// manifest names the copy. The copy goes to a FRESH id beside the untouched
+/// source, and the source is set aside only after the commit: moving it first
+/// leaves a window in which a crash strands the only copy of those rows in
+/// `repair-quarantine/`, which a retry (it scans `tables/`) never looks at.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_keeps_the_rewrite_source_in_place_until_the_manifest_is_committed() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let kv = || Some(KvSeparationOptions::default().separation_threshold(16));
+
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(kv())
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        for i in 0..8u32 {
+            tree.insert(format!("k{i:04}").as_bytes(), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Punch the blob's first frame: the file stays valid, but the SST's stale
+    // handle into the reclaimed prefix forces the handle-rewrite path.
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let blob_path = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one blob file")
+        .path;
+    let frontier = crate::vlog::BlobFileScanner::new(&blob_path, &*fs_dyn, 0)?
+        .next()
+        .expect("a first frame")?
+        .frame_end;
+    let data_start = {
+        let mut file = fs_dyn.open(&blob_path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut file)?;
+        reader
+            .toc()
+            .section(b"data")
+            .expect("blob file has a data section")
+            .pos()
+    };
+    memfs.punch_hole(&blob_path, data_start, frontier - data_start)?;
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+    let source = root.join("tables").join("0");
+    assert!(memfs.exists(&source)?, "the fixture's SST is at tables/0");
+
+    // Fail the manifest commit (the CURRENT pointer's atomic swap): everything
+    // up to publication has run.
+    let fault = FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path(crate::file::CURRENT_VERSION_FILE),
+    );
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .with_kv_separation(kv())
+    .repair();
+    assert!(result.is_err(), "the commit fails: {result:?}");
+    assert!(
+        memfs.exists(&source)?,
+        "the source must still be in tables/ when the commit fails: a retry \
+         scans tables/, so a source moved out early is a table whose keys \
+         silently vanish from the rebuilt manifest",
+    );
+
+    // The retry (filesystem healthy) rebuilds from that source and every key
+    // is readable through the rewritten handles.
+    let config = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .with_kv_separation(kv());
+    config.repair()?;
+    let tree = match config.open()? {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+    };
+    // Every key except the one whose value lived in the punched frame (that
+    // record is genuinely gone; the rewrite drops entries pointing below the
+    // frontier).
+    for i in 1..8u32 {
+        let key = format!("k{i:04}");
+        assert!(
+            tree.get(key.as_bytes(), crate::SeqNo::MAX)?.is_some(),
+            "{key} survives the rewrite",
+        );
+    }
+    Ok(())
+}
+
+/// A blob file no recovered table references is left out of the rebuilt
+/// manifest — so repair must also REMOVE it, and fail if it cannot. Left in
+/// `blobs/`, it is an orphan the next open sweeps, and if that sweep hits the
+/// same removal failure the open fails while repair reported success.
+#[test]
+fn repair_fails_when_an_unreferenced_blob_cannot_be_removed() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let kv = || Some(KvSeparationOptions::default().separation_threshold(16));
+
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(kv())
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        tree.insert(b"k0", alloc::vec![b'x'; 64], 0);
+        tree.flush_active_memtable(0)?;
+    }
+
+    // A second, intact blob file no SST points at: what a crashed relocation
+    // (or a crashed earlier repair's salvage replacement) leaves behind.
+    let orphan = root.join(crate::file::BLOBS_FOLDER).join("1");
+    let mut w = crate::vlog::blob_file::writer::Writer::new(&orphan, 1, 0, &*fs_dyn)?;
+    w.write(b"z", 9, &[b'z'; 300])?;
+    w.finish()?;
+
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    // Its removal fails PERSISTENTLY. The path filter carries no separator so
+    // it matches Windows paths too.
+    let fault = FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        FaultRule::new(
+            FaultOp::RemoveFile,
+            Fault::Error(ErrorKind::PermissionDenied),
+        )
+        .on_path("blobs"),
+    );
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .with_kv_separation(kv())
+    .repair();
+    assert!(
+        result.is_err(),
+        "repair must FAIL, not report success for a tree whose next open must \
+         sweep a file it cannot remove: {result:?}",
+    );
+
+    // Once the filesystem is fixed, a retry removes it and the tree opens.
+    let retry = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs.clone())
+    .with_kv_separation(kv());
+    retry.repair()?;
+    assert!(
+        !memfs.exists(&orphan)?,
+        "the unreferenced blob is removed by the repair that omits it",
+    );
+    retry.open()?;
+    Ok(())
+}
+
+/// A zeroed TAIL is only punch geometry when nothing live sits below it.
+/// Reclaim punches the consumed prefix top-down from the data start, so zeros
+/// that FOLLOW intact, structure-anchored frames cannot be a completed
+/// relocation — they are destroyed data. Reading them as "every frame was
+/// consumed" would delete a file whose live frames are still referenced, and
+/// the dependency filter would then set aside every table pointing at it.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn blob_recovery_keeps_a_file_whose_zeroed_tail_follows_live_frames() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    memfs.create_dir_all(&blobs)?;
+    let path = blobs.join("0");
+
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let mut w = crate::vlog::blob_file::writer::Writer::new(&path, 0, 0, &*fs_dyn)?;
+    w.write(b"a", 1, &[b'x'; 300])?;
+    w.write(b"b", 2, &[b'y'; 300])?;
+    w.write(b"c", 3, &[b'z'; 300])?;
+    w.finish()?;
+
+    let entries: Vec<_> = crate::vlog::BlobFileScanner::new(&path, &*fs_dyn, 0)?
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert_eq!(entries.len(), 3, "three frames written");
+    let frontier = entries.first().expect("first frame").frame_end;
+    let tail_start = entries.get(1).expect("second frame").frame_end;
+    let (data_start, data_end) = {
+        let mut file = fs_dyn.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut file)?;
+        let data = reader
+            .toc()
+            .section(b"data")
+            .expect("blob file has a data section");
+        (data.pos(), data.pos() + data.len())
+    };
+
+    // A relocated first frame (punched prefix), an intact live second frame,
+    // and a destroyed third frame that reads as zeros to the section end.
+    memfs.punch_hole(&path, data_start, frontier - data_start)?;
+    memfs.punch_hole(&path, tail_start, data_end - tail_start)?;
+
+    let config = blob_validation_config(Arc::clone(&memfs));
+    let recovery = super::recover_blob_files(&config)?;
+    assert!(
+        memfs.exists(&path)?,
+        "a zeroed tail below live frames is damage, not a completed relocation: \
+         the file must not be dropped",
+    );
+    // The damaged tail cannot be published as-is, so the intact frame is
+    // salvaged into a fresh file — but it MUST survive: reporting the file
+    // consumed would have discarded it along with the whole file.
+    assert_eq!(
+        recovery.files.len(),
+        1,
+        "the live frame is published: {:?}",
+        recovery.unreadable,
+    );
+    let published = recovery.files.first().expect("a published blob file");
+    let keys: Vec<_> = crate::vlog::BlobFileScanner::new(
+        blobs.join(published.id().to_string()),
+        &*fs_dyn,
+        published.id(),
+    )?
+    .map(|entry| entry.map(|entry| entry.key))
+    .collect::<crate::Result<Vec<_>>>()?;
+    assert_eq!(
+        keys,
+        vec![crate::UserKey::from(b"b".as_slice())],
+        "only the intact frame survives: the relocated one was punched away, \
+         the destroyed one is unreadable",
+    );
+    Ok(())
+}
+
 /// A crashed repair can leave its in-progress blob-salvage copy behind. That
 /// copy is published by an atomic rename, so a surviving one is never
 /// referenced by any manifest — it must be swept, not treated as a foreign
@@ -7121,14 +7527,13 @@ fn repair_never_half_publishes_a_salvaged_blob_under_transient_faults() -> crate
 }
 
 /// A TRANSIENT failure during the blob-handle rewrite must leave the tree
-/// exactly as it found it: the source SST was already quarantined for the
-/// rewrite, so propagating the retryable error without restoring it would let
-/// the retried repair — which scans only `tables/` — rebuild a manifest that
-/// silently omits every key of that table. Mirrors the other salvage arms,
-/// which restore before propagating.
+/// exactly as it found it, so the retry rebuilds from the same inputs: every
+/// source SST stays in `tables/` (the only directory a repair scans), and the
+/// retry recovers its keys. A source moved out of the way before the copy is
+/// published would instead be a table whose keys silently vanish.
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
-fn repair_restores_a_quarantined_table_when_the_rewrite_fails_transiently() -> crate::Result<()> {
+fn repair_leaves_every_table_in_place_when_the_rewrite_fails_transiently() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
     use crate::io::ErrorKind;
     use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
@@ -7194,11 +7599,10 @@ fn repair_restores_a_quarantined_table_when_the_rewrite_fails_transiently() -> c
         }
     }
 
-    // Fault the rewrite's reads of the quarantined SST with a RETRYABLE kind.
+    // Fault the rewrite's reads of the source SST with a RETRYABLE kind.
     let fault = FaultFs::new((*memfs).clone());
     fault.injector().arm(
-        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Interrupted))
-            .on_path("repair-quarantine"),
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Interrupted)).on_path("tables"),
     );
 
     let result = Config::new(
@@ -7215,12 +7619,34 @@ fn repair_restores_a_quarantined_table_when_the_rewrite_fails_transiently() -> c
         result.is_err(),
         "a transient rewrite failure must propagate for a retry: {result:?}",
     );
-
     assert!(
         memfs.exists(&root.join("tables").join("0"))?,
-        "the source SST must be restored to tables/ before the retryable error \
+        "the source SST must still be in tables/ when the retryable error \
          propagates, or the retry rebuilds a manifest without its keys",
     );
+
+    // The retry, on a healthy filesystem, recovers from that source.
+    let config = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ));
+    config.repair()?;
+    let tree = match config.open()? {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+    };
+    for i in 1..8u32 {
+        let key = format!("k{i:04}");
+        assert!(
+            tree.get(key.as_bytes(), crate::SeqNo::MAX)?.is_some(),
+            "{key} is recovered by the retry",
+        );
+    }
     Ok(())
 }
 
@@ -7460,12 +7886,11 @@ fn a_failed_repair_leaves_the_originals_intact_and_the_retry_succeeds() -> crate
         ))
     };
 
-    // First attempt: the blob stage produces a replacement, then the
-    // table-rewrite stage hits a transient fault and the repair propagates it.
+    // First attempt: the blob stage produces a replacement, then the table
+    // stage hits a transient fault reading its source and propagates it.
     let fault = FaultFs::new((*memfs).clone());
     fault.injector().arm(
-        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Interrupted))
-            .on_path("repair-quarantine"),
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Interrupted)).on_path("tables"),
     );
     let result = config(Arc::new(fault)).repair();
     assert!(
@@ -7620,11 +8045,10 @@ fn a_retry_handles_damage_that_appeared_after_the_failed_attempt() -> crate::Res
         ))
     };
 
-    // First attempt: blob 0 is salvaged, then the table-rewrite stage fails.
+    // First attempt: blob 0 is salvaged, then the table stage fails.
     let fault = FaultFs::new((*memfs).clone());
     fault.injector().arm(
-        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Interrupted))
-            .on_path("repair-quarantine"),
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Interrupted)).on_path("tables"),
     );
     let result = config(Arc::new(fault)).repair();
     assert!(
@@ -7755,8 +8179,8 @@ fn repair_leaves_an_unreferenced_blob_out_of_the_manifest() -> crate::Result<()>
     // at — exactly what the scan cannot tell apart from a real blob file.
     let fault = FaultFs::new((*memfs).clone());
     fault.injector().arm(
-        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Interrupted))
-            .on_path("repair-quarantine"),
+        FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::Interrupted))
+            .on_path(crate::file::CURRENT_VERSION_FILE),
     );
     assert!(
         config(Arc::new(fault)).repair().is_err(),
@@ -7766,6 +8190,10 @@ fn repair_leaves_an_unreferenced_blob_out_of_the_manifest() -> crate::Result<()>
         memfs.exists(&blobs.join("1"))?,
         "the abandoned replacement is what this test is about",
     );
+    // The attempt's own rewritten table is discarded here, modelling a crash
+    // between the blob replacement and that table's publication: the abandoned
+    // blob is then referenced by NOTHING, which is the state under test.
+    memfs.remove_file(&root.join("tables").join("1"))?;
 
     // The retry salvages the untouched original again, into yet another id.
     config(memfs.clone()).repair()?;
@@ -7780,7 +8208,7 @@ fn repair_leaves_an_unreferenced_blob_out_of_the_manifest() -> crate::Result<()>
     );
     assert!(
         !memfs.exists(&blobs.join("1"))?,
-        "the unreferenced copy is swept by the open that follows the repair",
+        "the unreferenced copy is removed by the repair that omits it",
     );
     Ok(())
 }

@@ -59,6 +59,13 @@ pub struct SalvageOptions {
     /// poison the recovered copy's identity. [`crate::repair`] passes the id
     /// derived from the file name.
     pub expected_stored_id: Option<crate::TableId>,
+    /// Stamp the recovered copy with THIS identity instead of the source's, for
+    /// a caller that publishes the copy BESIDE its source under a fresh id
+    /// rather than in its place. `None` (the default) keeps the source's
+    /// identity, which is what an in-place replacement needs. The destination
+    /// file name must match: an SST whose stamped id disagrees with its name is
+    /// quarantined on open.
+    pub output_id: Option<crate::TableId>,
     /// Opt-in to salvaging a delete-bearing columnar SST whose positional
     /// delete bitmap cannot be applied (the bitmap section is unreadable, or a
     /// readable bitmap's positioning zone map is unreadable). The degraded
@@ -930,6 +937,8 @@ fn salvage_attempt(
     // default 0), and the copy must keep the source's identity so it reopens
     // consistently when swapped in for the original. For an encrypted source
     // the two are necessarily equal (the open's AAD binds the caller's id).
+    // `output_id` overrides that when the copy is published UNDER A NEW
+    // IDENTITY beside its source instead of replacing it.
     // A KV-separated source's entries hold ValueHandles into blob files, and
     // blob GC / relocation consults the table's linked_blob_files section to
     // decide whether a blob is still referenced. The SOURCE's list is IGNORED
@@ -940,18 +949,23 @@ fn salvage_attempt(
     // exactly from the indirections of its recovered rows: a dropped block's
     // indirections do not exist in the copy, so no source-only id can ever be
     // needed by it.
-    let writer = crate::table::Writer::new(dest.clone(), table.metadata.id, 0, Arc::clone(fs))?
-        .mirror_from(
-            &table.metadata,
-            table.has_zone_map(),
-            table.has_seqno_bounds(),
-        )
-        .use_sync_mode(options.sync_mode)
-        // The extractor is configuration (never persisted in the SST), so
-        // the rebuilt filter only carries the source's prefix hashes when
-        // the caller supplies it.
-        .use_prefix_extractor(options.prefix_extractor.clone())
-        .use_encryption(options.encryption.clone());
+    let writer = crate::table::Writer::new(
+        dest.clone(),
+        options.output_id.unwrap_or(table.metadata.id),
+        0,
+        Arc::clone(fs),
+    )?
+    .mirror_from(
+        &table.metadata,
+        table.has_zone_map(),
+        table.has_seqno_bounds(),
+    )
+    .use_sync_mode(options.sync_mode)
+    // The extractor is configuration (never persisted in the SST), so
+    // the rebuilt filter only carries the source's prefix hashes when
+    // the caller supplies it.
+    .use_prefix_extractor(options.prefix_extractor.clone())
+    .use_encryption(options.encryption.clone());
     // Without an extractor, DISABLE the filter entirely rather than rebuild one
     // from complete-key hashes: the source's prefix-indexing intent is
     // unknowable (the extractor is not persisted and cannot be inferred), and a
