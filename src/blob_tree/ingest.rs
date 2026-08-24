@@ -254,6 +254,19 @@ impl<'a> BlobIngestion<'a> {
                 background_deleter: Some(&index.background_deleter),
             });
         }
+        // The blob files this ingestion wrote become reachable through the same
+        // version edit, so they carry the same obligation: an unbound file's
+        // `Drop` can unlink it while a checkpoint is capturing, and a
+        // tight-space prefix punch can zero bytes the checkpoint has already
+        // hard-linked.
+        for blob_file in &blob_files {
+            blob_file.bind_to_tree(&crate::table::TableSinks {
+                deletion_pause: &index.deletion_pause,
+                heal_hints: &index.heal_hints,
+                #[cfg(feature = "std")]
+                background_deleter: Some(&index.background_deleter),
+            });
+        }
 
         // Upgrade the version with our ingested tables and blob files, using
         // the global_seqno we allocated earlier. This ensures the version,
@@ -295,3 +308,6 @@ impl<'a> BlobIngestion<'a> {
         &self.tree.index
     }
 }
+
+#[cfg(test)]
+mod tests;
