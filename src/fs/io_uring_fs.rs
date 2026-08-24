@@ -260,11 +260,8 @@ impl Fs for IoUringFs {
         len: u64,
     ) -> crate::io::Result<Option<bool>> {
         // Same kernel, same probe as the std backend: this is a cold diagnostic
-        // path, so it goes through the shared `lseek(SEEK_DATA)` helper rather
-        // than the ring.
-        Ok(super::std_fs::linux_caps::extent_is_hole(
-            path, offset, len,
-        )?)
+        // path, so it delegates there rather than going through the ring.
+        Fs::extent_is_hole(&super::StdFs, path, offset, len)
     }
 
     fn sync_directory(&self, path: &Path) -> crate::io::Result<()> {

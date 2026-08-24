@@ -468,7 +468,7 @@ impl Fs for StdFs {
     /// trait default ("cannot tell") is also the truthful answer.
     #[cfg(target_os = "linux")]
     fn extent_is_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<Option<bool>> {
-        linux_caps::extent_is_hole(path, offset, len)
+        Ok(linux_caps::extent_is_hole(path, offset, len)?)
     }
 }
 
