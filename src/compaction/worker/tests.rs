@@ -158,6 +158,63 @@ fn tight_space_crash_after_first_slice_recovers_all_keys_on_reopen() -> crate::R
     Ok(())
 }
 
+/// The `.restrict-bound` sidecar is written AFTER the slice commits, so a
+/// failure (or a crash) in that window leaves a committed restriction with no
+/// sidecar. The manifest still describes it, but a later manifest-loss repair
+/// would find an unrestricted input beside the slice output and publish BOTH
+/// histories — and merge operands, which are deliberately never deduplicated
+/// across sources, would then be applied twice. The window has to close by
+/// itself: the manifest is the authority, so an open that finds a restricted
+/// table without its sidecar writes it.
+#[test]
+fn open_rewrites_a_missing_restriction_sidecar() -> crate::Result<()> {
+    use crate::fs::Fs;
+
+    let dir = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    let fs: Arc<dyn Fs> = Arc::new(mem.clone());
+    let reopened = tight_space_crash_and_reopen(
+        dir.path(),
+        Arc::clone(&fs),
+        |used| mem.set_capacity(used + used / 4),
+        || mem.punched_bytes(),
+    )?;
+
+    // Locate the restricted table and delete its sidecar, reproducing the
+    // post-commit window where the write never landed.
+    let version = reopened.current_version();
+    let Some(restricted) = version
+        .iter_tables()
+        .find(|t| t.restrict_lower_bound().is_some())
+    else {
+        panic!("the crashed tight-space slice must leave a restricted table");
+    };
+    let sidecar = crate::restrict_bound::sidecar_path(&restricted.path);
+    fs.remove_file(&sidecar)?;
+    assert!(
+        fs.metadata(&sidecar).is_err(),
+        "the fixture must start from a MISSING sidecar",
+    );
+    drop(version);
+    drop(reopened);
+
+    let _tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(mem))
+    .open()?;
+
+    assert!(
+        fs.metadata(&sidecar).is_ok(),
+        "the open must republish the sidecar from the manifest'\u{2019}s own \
+         restriction, or a later manifest-loss repair republishes the whole \
+         input beside the slice output",
+    );
+    Ok(())
+}
+
 /// A real-on-disk [`Fs`](crate::fs::Fs) wrapper (over
 /// [`StdFs`](crate::fs::StdFs)) that simulates disk pressure for the tight-space
 /// compaction test while keeping every byte in a real file under the test's

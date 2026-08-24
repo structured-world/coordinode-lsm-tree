@@ -4562,6 +4562,19 @@ impl Tree {
 
         let version = Version::from_recovery(recovery, &tables, &blob_files)?;
 
+        // Republish any restriction sidecar that never landed. The sidecar is
+        // written AFTER its slice commits, so a failure (or a crash) in that
+        // window leaves a committed restriction with no `.restrict-bound` file.
+        // The manifest still describes it, so a normal open is unaffected — but
+        // a later manifest-loss repair would find an unrestricted input beside
+        // the slice output and publish BOTH histories, applying every merge
+        // operand of the consumed prefix twice (operands are deliberately never
+        // deduplicated across sources). The manifest is the authority for the
+        // bound, so derive the missing sidecar from it here and the window
+        // closes at the next open rather than staying open forever.
+        #[cfg(feature = "std")]
+        Self::republish_missing_restriction_sidecars(&version, config)?;
+
         // NOTE: Cleanup old versions
         // But only after we definitely recovered the latest version.
         // Preserve the snapshot CURRENT references (and its `edits-` log) — the
@@ -4580,6 +4593,38 @@ impl Tree {
         }
 
         Ok(version)
+    }
+
+    /// Writes the `.restrict-bound` sidecar of every restricted table in
+    /// `version` that has none, so the bound the manifest holds is recoverable
+    /// without it. A sidecar that already exists is left untouched: it was
+    /// written under the same bound, and rewriting it would churn the file on
+    /// every open. Failures propagate — an unrecoverable restriction is exactly
+    /// what this closes, so silently skipping it would keep the window open.
+    ///
+    /// The sidecar is a filesystem artifact of the tight-space reclaim path, so
+    /// this is a no-op without `std` — a build without it never writes one.
+    #[cfg(feature = "std")]
+    fn republish_missing_restriction_sidecars(
+        version: &Version,
+        config: &Config,
+    ) -> crate::Result<()> {
+        for table in version.iter_tables() {
+            let Some(bound) = table.restrict_lower_bound() else {
+                continue;
+            };
+            let sidecar = crate::restrict_bound::sidecar_path(&table.path);
+            if table.fs.metadata(&sidecar).is_ok() {
+                continue;
+            }
+            log::warn!(
+                "table {} carries a committed restriction with no sidecar; \
+                 republishing it from the manifest",
+                table.id(),
+            );
+            table.write_restrict_sidecar(bound, config.sync_mode)?;
+        }
+        Ok(())
     }
 
     /// Removes a recovery-swept artifact (an abandoned heal copy / temp / marker),

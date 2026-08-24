@@ -1201,17 +1201,17 @@ fn run_tight_space_compaction(
             // the outputs).
             //
             // A sidecar write that fails HERE is not fatal: the restriction is already
-            // durable in the manifest. Log it and leave that input UNPUNCHED, so a
-            // later manifest-loss repair sees no-sidecar + unpunched and keeps the
-            // whole input. That is safe ONLY because the slice merge applies no
-            // removal semantics (no bottommost GC, no compaction filter — see the
-            // superset invariant above), so the committed output shadows every row
-            // of the redundant prefix for point reads, nothing resurrects, and the
-            // CDC enumeration (`scan_since_seqno`) deduplicates the byte-identical
-            // copies the kept-whole input carries next to the slice output.
-            // Punching an input whose sidecar did not land would instead force
-            // repair to derive a conservative bound and drop up to one live
-            // block — so never punch without the sidecar.
+            // durable in the manifest, which is what the bound is recovered FROM —
+            // the next open republishes any sidecar that never landed. Log it and
+            // leave that input UNPUNCHED meanwhile, so a manifest-loss repair that
+            // runs before that open sees no-sidecar + unpunched and keeps the whole
+            // input rather than deriving a conservative bound and dropping up to one
+            // live block. Keeping it whole is itself only tolerable transiently: the
+            // repair would publish both the input and the slice output as L0 runs,
+            // and while point reads are shadowed by the output, merge operands are
+            // deliberately never deduplicated across sources, so an operand in the
+            // consumed prefix WOULD be applied twice. Hence the republish on open —
+            // never punch without the sidecar, and never leave it missing for good.
             for view in &current_views {
                 if removed_ids.contains(&view.id()) {
                     view.mark_as_deleted();
