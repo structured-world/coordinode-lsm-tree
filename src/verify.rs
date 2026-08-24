@@ -1369,14 +1369,31 @@ fn block_header_at(
 /// The offset of the next decodable block header at or after `from`, bounded
 /// by `end`. Used to bound a candidate reclaimed extent by the frame that
 /// follows it rather than by an arbitrary byte position.
+///
+/// A header always opens with [`crate::file::MAGIC_BYTES`], so candidate
+/// offsets are found by scanning bulk-read chunks for that first byte and
+/// decoding only there. A reclaimed prefix is zeros, which contain no candidate
+/// at all — without this filter a multi-gigabyte prefix would cost one
+/// header-sized read PER BYTE, which turns the diagnostic verifier into a hang
+/// on exactly the tight-space files it exists to inspect.
 #[cfg(feature = "std")]
 fn next_block_header(file: &dyn crate::fs::FsFile, from: u64, end: u64) -> Option<u64> {
+    const CHUNK: usize = 64 * 1024;
+    let lead = *crate::file::MAGIC_BYTES.first()?;
     let mut at = from;
     while at < end {
-        if block_header_at(file, at).is_some() {
-            return Some(at);
+        let want = usize::try_from(end - at).unwrap_or(CHUNK).min(CHUNK);
+        let chunk = crate::file::read_exact(file, at, want).ok()?;
+        // Candidates are located in the chunk but DECODED from the file at
+        // their absolute offset, so a header whose bytes run past the chunk end
+        // is still read in full — no chunk overlap is needed.
+        for (i, _) in chunk.iter().enumerate().filter(|&(_, &b)| b == lead) {
+            let offset = at.saturating_add(i as u64);
+            if block_header_at(file, offset).is_some() {
+                return Some(offset);
+            }
         }
-        at += 1;
+        at = at.saturating_add(want as u64);
     }
     None
 }
