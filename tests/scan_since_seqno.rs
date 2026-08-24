@@ -582,6 +582,42 @@ fn scan_since_deduplicates_identical_events_from_duplicated_tables() -> lsm_tree
     Ok(())
 }
 
+/// A range deletion does NOT suppress an entry at its own sequence number —
+/// suppression is strictly `entry.seqno < tombstone.seqno` — so the tree keeps
+/// such a write visible. A replay that applied the deletion last would drop it,
+/// so tied range deletions have to be emitted BEFORE the writes they cover.
+#[test]
+fn scan_since_replays_a_tied_range_tombstone_before_the_write_it_spares() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path())?;
+
+    // One seqno for both operations, which `apply_batch`-style callers may do.
+    tree.insert(b"k", b"v", 10);
+    tree.remove_range(b"a", b"z", 10);
+
+    assert_eq!(
+        tree.get(b"k", SeqNo::MAX)?.as_deref(),
+        Some(b"v".as_slice()),
+        "the tree keeps a write the tied range deletion does not suppress",
+    );
+
+    let kinds: Vec<_> = events(&tree, 0)?
+        .iter()
+        .map(|e| match e {
+            ScanSinceEvent::RangeTombstone { .. } => "range",
+            ScanSinceEvent::Insert { .. } => "insert",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["range", "insert"],
+        "the deletion must be replayed first, or the consumer drops a key the \
+         tree still serves",
+    );
+    Ok(())
+}
+
 /// Replay order must reproduce the tree's own precedence. Two sources can hold
 /// DIFFERENT values for one key at one sequence number — `apply_batch` takes a
 /// caller-chosen seqno and does not require it to be unique — and the tree

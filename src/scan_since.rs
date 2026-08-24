@@ -118,12 +118,19 @@ impl ScanSinceEvent {
     /// SOURCE first, so the value the tree serves is replayed last; deciding
     /// that by payload bytes would hand precedence to byte order.
     pub(crate) fn grouping_order(&self, other: &Self) -> core::cmp::Ordering {
+        // A RANGE DELETION sorts before everything at its own seqno, and that
+        // ordering survives into the emitted stream: suppression is strictly
+        // `entry.seqno < tombstone.seqno`, so the tree KEEPS an entry written at
+        // the tombstone's own seqno, and a replay that applied the deletion last
+        // would drop it. The remaining kinds only need a stable, deterministic
+        // order — they touch one key each, so their relative position at one
+        // seqno cannot change the state a consumer converges to.
         fn rank(e: &ScanSinceEvent) -> u8 {
             match e {
-                ScanSinceEvent::Insert { .. } => 0,
-                ScanSinceEvent::MergeOperand { .. } => 1,
-                ScanSinceEvent::PointTombstone { .. } => 2,
-                ScanSinceEvent::RangeTombstone { .. } => 3,
+                ScanSinceEvent::RangeTombstone { .. } => 0,
+                ScanSinceEvent::Insert { .. } => 1,
+                ScanSinceEvent::MergeOperand { .. } => 2,
+                ScanSinceEvent::PointTombstone { .. } => 3,
             }
         }
         fn payload(e: &ScanSinceEvent) -> (&Slice, Option<&Slice>) {
