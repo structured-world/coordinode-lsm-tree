@@ -2944,7 +2944,29 @@ fn repair_tree(
             reclaim_resurrectable(&*folder_fs, &table_base_folder, config.sync_mode)?;
         }
 
-        'dirent: for dirent in folder_fs.read_dir(&table_base_folder)? {
+        // ORDER the entries before recovering: `read_dir` order is
+        // FS-dependent, and duplicate-id resolution keeps the FIRST complete
+        // copy — so an unordered scan would rebuild different contents from the
+        // same directory across runs. Per id, the writer's own `id.to_string()`
+        // spelling is the canonical file and sorts first, so a foreign alternate
+        // spelling (`01` for id 1) can never displace it. Mirrors the blob-file
+        // scan.
+        let mut dirents = folder_fs.read_dir(&table_base_folder)?;
+        dirents.sort_by(|a, b| {
+            let key = |e: &crate::fs::FsDirEntry| {
+                let id = e.file_name.parse::<TableId>().ok();
+                (
+                    id.is_none(),
+                    id.unwrap_or(0),
+                    id.is_none_or(|id| e.file_name != id.to_string()),
+                )
+            };
+            key(a)
+                .cmp(&key(b))
+                .then_with(|| a.file_name.cmp(&b.file_name))
+        });
+
+        'dirent: for dirent in dirents {
             let crate::fs::FsDirEntry {
                 path: table_path,
                 file_name,

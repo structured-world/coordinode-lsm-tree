@@ -2362,6 +2362,181 @@ fn repair_orders_equal_seqno_tables_by_descending_id() -> crate::Result<()> {
     Ok(())
 }
 
+/// Delegates to `MemFs` but hands directory entries back in a FIXED order
+/// (ascending by name, or descending), so a test can pin a scan's input order
+/// instead of depending on the map iteration a backend happens to produce —
+/// `MemFs` hashes its paths, so its own order varies between processes.
+struct SortedDirFs(crate::fs::MemFs, bool);
+
+impl crate::fs::Fs for SortedDirFs {
+    fn open(
+        &self,
+        path: &std::path::Path,
+        options: &crate::fs::FsOpenOptions,
+    ) -> crate::io::Result<Box<dyn crate::fs::FsFile>> {
+        self.0.open(path, options)
+    }
+    fn remove_file(&self, path: &std::path::Path) -> crate::io::Result<()> {
+        self.0.remove_file(path)
+    }
+    fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> crate::io::Result<()> {
+        self.0.rename(from, to)
+    }
+    fn create_dir_all(&self, path: &std::path::Path) -> crate::io::Result<()> {
+        self.0.create_dir_all(path)
+    }
+    fn remove_dir_all(&self, path: &std::path::Path) -> crate::io::Result<()> {
+        self.0.remove_dir_all(path)
+    }
+    fn sync_directory(&self, path: &std::path::Path) -> crate::io::Result<()> {
+        self.0.sync_directory(path)
+    }
+    /// The whole point: the scan sees the entries in a pinned order.
+    fn read_dir(&self, path: &std::path::Path) -> crate::io::Result<Vec<crate::fs::FsDirEntry>> {
+        let mut entries = self.0.read_dir(path)?;
+        entries.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+        if self.1 {
+            entries.reverse();
+        }
+        Ok(entries)
+    }
+    fn metadata(&self, path: &std::path::Path) -> crate::io::Result<crate::fs::FsMetadata> {
+        self.0.metadata(path)
+    }
+    fn exists(&self, path: &std::path::Path) -> crate::io::Result<bool> {
+        self.0.exists(path)
+    }
+    fn capabilities(&self, path: &std::path::Path) -> crate::fs::FsCapabilities {
+        self.0.capabilities(path)
+    }
+    fn punch_hole(&self, path: &std::path::Path, offset: u64, len: u64) -> crate::io::Result<()> {
+        self.0.punch_hole(path, offset, len)
+    }
+    fn allocated_size(&self, path: &std::path::Path) -> crate::io::Result<Option<u64>> {
+        self.0.allocated_size(path)
+    }
+    fn extent_is_hole(
+        &self,
+        path: &std::path::Path,
+        offset: u64,
+        len: u64,
+    ) -> crate::io::Result<Option<bool>> {
+        self.0.extent_is_hole(path, offset, len)
+    }
+}
+
+/// Two spellings of one id (`1` and `01`) can hold different content, so which
+/// one survives decides what the rebuilt tree contains. Directory iteration
+/// order must not be that decision: the writer's own `{id}` spelling is the
+/// canonical file and always wins, as the blob-file scan already guarantees.
+/// Both iteration orders are exercised, since a backend's is arbitrary.
+#[test]
+fn repair_prefers_the_canonical_spelling_of_a_duplicated_id() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    for reversed in [false, true] {
+        let fs: Arc<dyn Fs> = Arc::new(SortedDirFs(MemFs::new(), reversed));
+        let root = std::path::absolute("/db")?;
+        let tables = root.join("tables");
+        fs.create_dir_all(&tables)?;
+
+        // Both files carry table id 1 and are structurally complete; only their
+        // contents (and names) differ.
+        for (name, key) in [("1", "canonical"), ("01", "alternate")] {
+            use crate::{InternalValue, ValueType};
+            let mut w = crate::table::Writer::new(tables.join(name), 1, 0, Arc::clone(&fs))?;
+            w.write(InternalValue::from_components(
+                key.as_bytes(),
+                b"v",
+                5,
+                ValueType::Value,
+            ))?;
+            assert!(w.finish()?.is_some(), "the SST is non-empty");
+        }
+
+        let config = Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&fs));
+        config.repair()?;
+
+        let tree = config.open()?;
+        assert!(
+            tree.get(b"canonical", crate::SeqNo::MAX)?.is_some(),
+            "the canonical `{{id}}` spelling must survive (reversed: {reversed})",
+        );
+        assert!(
+            tree.get(b"alternate", crate::SeqNo::MAX)?.is_none(),
+            "the alternate spelling must not displace it (reversed: {reversed})",
+        );
+    }
+    Ok(())
+}
+
+/// The hole evidence must cover the ZEROED BLOCK, not the file. A file-wide
+/// allocation total says nothing about where the missing bytes are — and on a
+/// filesystem with transparent compression an ordinary, fully-written file
+/// already reports fewer physical bytes than its length, so the file-wide test
+/// passes for a table that was never punched at all. Modelled here by a file
+/// that is sparse ELSEWHERE while the destroyed block is plain written zeros.
+#[test]
+fn repair_requires_the_hole_under_the_zeroed_block_itself() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    write_multiblock_sst(&sst, &fs)?;
+
+    let first_block_end = recover_sst(sst.clone(), &fs)?.punch_offset_for(b"k00050")?;
+    assert!(first_block_end > 0, "the fixture has a leading block");
+    let len =
+        crate::fs::FsFile::metadata(&*fs.open(&sst, &crate::fs::FsOpenOptions::new().read(true))?)?
+            .len;
+
+    // Destroyed by a WRITE of zeros: no hole under it.
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = fs.open(
+            &sst,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&vec![0u8; usize::try_from(first_block_end).unwrap_or(0)])?;
+    }
+    // The file is nonetheless sparse: a few bytes inside that block are
+    // physically unallocated while the block as a whole is not a hole. This
+    // stands in for the compressed-filesystem case, where allocation falls below
+    // length for reasons that do not make any particular extent a hole.
+    memfs.punch_hole(&sst, 0, 8)?;
+    assert!(
+        fs.allocated_size(&sst)?.is_some_and(|a| a < len),
+        "the fixture reports less allocated space than its length",
+    );
+
+    let config = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs);
+    let report = config.repair()?;
+    assert_eq!(
+        report.recovered, 0,
+        "the zeroed block has no hole under it, so it is damage: {report:?}",
+    );
+    Ok(())
+}
+
 /// A fresh id must not be one an orphaned `.restrict-bound` sidecar already
 /// names. The scan skips sidecars, so an id whose table is gone still has one
 /// lying beside it; publishing an UNRESTRICTED rewrite under that id makes a
