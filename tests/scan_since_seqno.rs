@@ -582,6 +582,26 @@ fn scan_since_deduplicates_identical_events_from_duplicated_tables() -> lsm_tree
     Ok(())
 }
 
+/// An entry written at the maximum sequence number must be delivered from an
+/// SST exactly as it is from a memtable. The watermark is derived from the
+/// data, so it IS `SeqNo::MAX` here, and an exclusive upper bound would drop
+/// the very entry that defined it — the event would be visible before a flush
+/// and vanish after one.
+#[test]
+fn scan_since_delivers_an_entry_at_the_maximum_seqno_from_an_sst() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path())?;
+
+    tree.insert(b"top", b"v", SeqNo::MAX);
+    let before_flush = events(&tree, 0)?.len();
+    assert_eq!(before_flush, 1, "the memtable delivers it");
+
+    tree.flush_active_memtable(0)?;
+    let got = events(&tree, 0)?;
+    assert_eq!(got.len(), 1, "the flushed SST must deliver it too: {got:?}");
+    Ok(())
+}
+
 /// Deduplication must not collapse events a single source genuinely holds
 /// more than once. A write batch may carry the same merge operand for a key
 /// twice; both are stored, both are applied on read, and both must reach a

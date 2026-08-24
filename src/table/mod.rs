@@ -6227,7 +6227,10 @@ impl Table {
     }
 
     /// Like [`Self::scan_since_seqno`] but also bounds the result above:
-    /// collects entries whose global seqno is in `[target_seqno, end_seqno)`.
+    /// collects entries whose global seqno is in `[target_seqno, end_seqno]`.
+    /// The upper bound is INCLUSIVE so that a watermark of [`SeqNo::MAX`] — the
+    /// value a scan derives when an entry sits at the maximum seqno — still
+    /// delivers the entry that defined it.
     /// The upper bound lets the tree-level scan pin a stable snapshot watermark
     /// so a concurrent write cannot leak in mid-scan.
     ///
@@ -6268,11 +6271,13 @@ impl Table {
         // the whole table. The clamp is intentional, hence saturating not checked.
         let local_end = end_seqno.saturating_sub(global_seqno);
 
-        // Empty window (e.g. a caught-up CDC poller whose target equals the
-        // current watermark): nothing can qualify, so skip walking the index
-        // entirely. Without this a legacy SST (no per-block seqno bounds) would
-        // load + filter every block to return nothing on every poll.
-        if local_target >= local_end {
+        // Empty window (a target ABOVE the watermark — e.g. a bulk-ingest offset
+        // that puts the whole table below the caller's target): nothing can
+        // qualify, so skip walking the index entirely. Without this a legacy SST
+        // (no per-block seqno bounds) would load + filter every block to return
+        // nothing on every poll. The bound is inclusive, so equality is a
+        // one-seqno window, not an empty one.
+        if local_target > local_end {
             return Ok(Vec::new());
         }
 
@@ -6302,7 +6307,7 @@ impl Table {
             if block_skip
                 && let Some((seqno_min, seqno_max)) =
                     self.seqno_bounds.bounds_for(handle.as_ref().offset().0)
-                && (seqno_max < local_target || seqno_min >= local_end)
+                && (seqno_max < local_target || seqno_min > local_end)
             {
                 continue;
             }
@@ -6323,7 +6328,7 @@ impl Table {
                 {
                     continue;
                 }
-                if value.key.seqno >= local_target && value.key.seqno < local_end {
+                if value.key.seqno >= local_target && value.key.seqno <= local_end {
                     value.key.seqno = apply_global_seqno(value.key.seqno, global_seqno);
                     out.push(value);
                 }

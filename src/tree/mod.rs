@@ -1828,11 +1828,7 @@ impl Tree {
         // SSTs.
         for table in version.iter_tables() {
             let mut source = Vec::new();
-            // `scan_seqno_range` upper bound is exclusive; `end_seqno` is the
-            // inclusive max, so add one (saturating for the MAX edge).
-            for entry in
-                table.scan_seqno_range(target_seqno, end_seqno.saturating_add(1), block_skip)?
-            {
+            for entry in table.scan_seqno_range(target_seqno, end_seqno, block_skip)? {
                 source.push(Self::map_event(entry, version, &resolve_indirection)?);
             }
             // Clamped to the view's tight-space restriction: the punched
