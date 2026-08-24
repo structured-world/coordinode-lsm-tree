@@ -2173,6 +2173,25 @@ fn salvage_guard_finds_punched_blocks_deep_in_a_surrendered_extent() -> crate::R
         !super::dropped_data_extent_is_zeroed(&*fs, &clean, &dropped)?,
         "an unpunched source must never be reported as punched",
     );
+
+    // Nor may DESTROYED bytes: a block zeroed by corruption reads exactly like
+    // a reclaimed one, and calling it a punch condemns an otherwise salvageable
+    // table as bound-lost. The hole is what separates them.
+    let destroyed = tables.join("2");
+    write_multiblock_sst(&destroyed, &fs)?;
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = fs.open(
+            &destroyed,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        file.seek(SeekFrom::Start(mid_off))?;
+        file.write_all(&vec![0u8; mid_size as usize])?;
+    }
+    assert!(
+        !super::dropped_data_extent_is_zeroed(&*fs, &destroyed, &dropped)?,
+        "zeros WRITTEN over a block are damage, not reclamation",
+    );
     Ok(())
 }
 

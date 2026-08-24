@@ -1559,7 +1559,26 @@ fn excised_extents(
             _ => merged.push((start, end)),
         }
     }
-    Ok(merged)
+    // Zeros are the SHAPE of a reclaim, not the proof: corruption that destroys
+    // a data block leaves the same read-as-zeros run, and calling that a punch
+    // condemns an otherwise salvageable table as bound-lost. A reclaim
+    // deallocates, so each run must cover an actual HOLE; a backend that cannot
+    // answer leaves it unproven, which keeps the zeros as damage.
+    //
+    // Probed at the run's MIDPOINT rather than over the whole span: a run is
+    // bounded by the neighbouring bytes that happen to be nonzero, so it can
+    // reach a byte or two into the allocated blocks around the hole, and
+    // demanding the entire span be unallocated would reject genuine punches.
+    // Only the presence of the hole matters here — the single caller asks
+    // whether the extent was reclaimed at all, not exactly where.
+    let mut proven = Vec::with_capacity(merged.len());
+    for (start, end) in merged {
+        let midpoint = start + (end - start) / 2;
+        if fs.extent_is_hole(source, midpoint, 1)? == Some(true) {
+            proven.push((start, end));
+        }
+    }
+    Ok(proven)
 }
 
 /// Whether the source SST's first data block reads as all zeros, the signature of
