@@ -1923,13 +1923,24 @@ impl Tree {
             merged.push((event, recency));
         }
 
-        // Finally, replay order: seqno, then oldest source first. `sort_by` is
-        // stable, so the grouping order above still decides between distinct
-        // events of one source — deterministic, and irrelevant to convergence
-        // since they touch different keys.
+        // Finally, replay order: seqno, then range deletions, then oldest
+        // source first. `sort_by` is stable, so the grouping order above still
+        // decides between distinct events of one source — deterministic, and
+        // irrelevant to convergence since they touch different keys.
+        //
+        // The range-deletion step comes BEFORE source recency, not after: a tied
+        // deletion does not suppress the writes it spans (suppression is
+        // strictly `entry.seqno < tombstone.seqno`), so the tree keeps them, and
+        // a replay that applied the deletion last would drop them. Ordering by
+        // recency first would do exactly that whenever the deletion sits in the
+        // newer source.
         merged.sort_by(|(a, a_recency), (b, b_recency)| {
+            fn deletion_first(e: &ScanSinceEvent) -> u8 {
+                u8::from(!matches!(e, ScanSinceEvent::RangeTombstone { .. }))
+            }
             a.seqno()
                 .cmp(&b.seqno())
+                .then_with(|| deletion_first(a).cmp(&deletion_first(b)))
                 .then_with(|| b_recency.cmp(a_recency))
         });
         merged.into_iter().map(|(event, _)| event).collect()

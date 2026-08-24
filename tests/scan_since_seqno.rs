@@ -618,6 +618,54 @@ fn scan_since_replays_a_tied_range_tombstone_before_the_write_it_spares() -> lsm
     Ok(())
 }
 
+/// The same tie, but with the two operations in DIFFERENT sources. Source
+/// recency decides the order of the remaining events at a seqno, and a range
+/// deletion sitting in the NEWER source would then be replayed after an insert
+/// from the older one — dropping a key the tree still serves, since suppression
+/// is strictly `entry.seqno < tombstone.seqno`.
+#[test]
+fn scan_since_replays_a_tied_range_tombstone_first_across_sources() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path())?;
+
+    tree.insert(b"k", b"v", 10);
+    tree.insert(b"a", b"v", 10);
+    tree.flush_active_memtable(0)?;
+    tree.remove_range(b"a", b"z", 10);
+    tree.flush_active_memtable(0)?;
+
+    assert_eq!(
+        tree.get(b"k", SeqNo::MAX)?.as_deref(),
+        Some(b"v".as_slice()),
+        "the tree keeps a write the tied range deletion does not suppress",
+    );
+    assert_eq!(
+        tree.get(b"a", SeqNo::MAX)?,
+        None,
+        "at the range's START key the newer source's own entry wins the tie \
+         instead, so the stream has to converge to a deletion there",
+    );
+
+    let all = events(&tree, 0)?;
+    let kinds: Vec<_> = all
+        .iter()
+        .map(|e| match e {
+            ScanSinceEvent::RangeTombstone { .. } => "range",
+            ScanSinceEvent::Insert { .. } => "insert",
+            ScanSinceEvent::PointTombstone { .. } => "point",
+            ScanSinceEvent::MergeOperand { .. } => "merge",
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["range", "insert", "insert", "point"],
+        "a tied range deletion is replayed first no matter which source holds \
+         it, or the consumer drops a key the tree still serves; the newer \
+         source's tied point deletion still lands last: {all:?}",
+    );
+    Ok(())
+}
+
 /// Replay order must reproduce the tree's own precedence. Two sources can hold
 /// DIFFERENT values for one key at one sequence number — `apply_batch` takes a
 /// caller-chosen seqno and does not require it to be unique — and the tree
