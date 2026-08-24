@@ -582,6 +582,42 @@ fn scan_since_deduplicates_identical_events_from_duplicated_tables() -> lsm_tree
     Ok(())
 }
 
+/// Merge operands are never collapsed across sources either. The read path
+/// applies EVERY physically stored operand for a key (it collects them without
+/// deduplicating by seqno), so two operands in two sources are two applications
+/// — even at the same caller-supplied seqno, which `apply_batch` does not
+/// require to be unique. A change feed that emitted one would diverge from the
+/// tree's own reads. Idempotent event kinds (a write, a deletion) still
+/// collapse: replaying them twice reaches the same state, and the read path
+/// shadows the copies anyway.
+#[test]
+fn scan_since_keeps_merge_operands_from_two_sources_at_one_seqno() -> lsm_tree::Result<()> {
+    use lsm_tree::WriteBatch;
+
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path())?;
+
+    // Two SEPARATE batches under the same caller-chosen seqno, flushed apart:
+    // each source legitimately holds one operand, and a read applies both.
+    for _ in 0..2 {
+        let mut batch = WriteBatch::new();
+        batch.merge(b"counter".as_slice(), b"+1".as_slice());
+        tree.apply_batch(batch, 10)?;
+        tree.flush_active_memtable(0)?;
+    }
+
+    let got = events(&tree, 0)?;
+    assert_eq!(
+        got.iter()
+            .filter(|e| matches!(e, ScanSinceEvent::MergeOperand { key, .. } if key.as_ref() == b"counter"))
+            .count(),
+        2,
+        "each source's operand is a separate application: collapsing them \
+         replays one merge where the tree applies two: {got:?}",
+    );
+    Ok(())
+}
+
 /// An entry written at the maximum sequence number must be delivered from an
 /// SST exactly as it is from a memtable. The watermark is derived from the
 /// data, so it IS `SeqNo::MAX` here, and an exclusive upper bound would drop

@@ -1846,20 +1846,27 @@ impl Tree {
     /// Merge per-source event lists into one replay-ordered stream.
     ///
     /// Replay order is increasing seqno across every source; the ordering's
-    /// payload tie-break makes byte-identical events adjacent. For each
-    /// distinct event the stream carries the HIGHEST multiplicity any SINGLE
-    /// source holds, which is exactly the count the source history applied:
+    /// payload tie-break makes byte-identical events adjacent. What happens to
+    /// byte-identical copies follows ONE rule: the stream must mirror what a
+    /// read of the same tree does, because a consumer replaying it has to reach
+    /// the state the tree itself serves.
     ///
-    /// - **Across sources, copies collapse.** One committed change can
-    ///   physically live in two published tables: a manifest-loss repair
-    ///   publishes every surviving SST as its own L0 run, including both the
-    ///   inputs and the outputs of a compaction that crashed before deleting
-    ///   its inputs. Point reads shadow such copies by seqno, but a flat
-    ///   enumeration would deliver the change twice to a consumer.
-    /// - **Within one source, repeats are preserved.** A key may hold the same
-    ///   merge operand twice at one seqno, and a consumer that applies it once
-    ///   diverges from the source. Two sources that each hold the pair are
-    ///   still the same pair, so the maximum (not the sum) is correct.
+    /// - **Merge operands are all kept.** The read path collects every
+    ///   physically stored operand for a key and applies them in order — it
+    ///   never deduplicates by seqno — so two operands are two applications
+    ///   whether they sit in one source or in two. Seqnos do not disambiguate
+    ///   here: [`AbstractTree::apply_batch`] takes a caller-chosen seqno and
+    ///   does not require it to be unique, and one batch may carry the same
+    ///   operand for a key twice.
+    /// - **Idempotent events collapse across sources.** A write, a deletion or
+    ///   a range deletion replayed twice reaches the same state, and the read
+    ///   path shadows the copies by seqno rather than compounding them. One
+    ///   committed change can physically live in two published tables — a
+    ///   manifest-loss repair publishes every surviving SST as its own L0 run,
+    ///   including both the inputs and the outputs of a compaction that crashed
+    ///   before deleting its inputs — and delivering it twice would be noise.
+    ///   Repeats WITHIN one source are still kept: they are separate entries
+    ///   the source genuinely holds.
     fn merge_source_events(sources: Vec<Vec<ScanSinceEvent>>) -> Vec<ScanSinceEvent> {
         // Per source, collapse equal neighbours into (event, count) runs.
         let mut runs: Vec<(ScanSinceEvent, usize)> = Vec::new();
@@ -1881,14 +1888,20 @@ impl Tree {
             runs.push((current, count));
         }
 
-        // Then merge the per-source runs, keeping the per-event maximum.
+        // Then merge the per-source runs: operands accumulate, idempotent
+        // events take the count a single source holds.
         runs.sort_by(|(a, _), (b, _)| ScanSinceEvent::replay_ordering(a, b));
         let mut merged = Vec::new();
         let mut iter = runs.into_iter().peekable();
         while let Some((event, mut count)) = iter.next() {
+            let accumulates = matches!(event, ScanSinceEvent::MergeOperand { .. });
             while let Some((next, other)) = iter.next_if(|(next, _)| *next == event) {
                 debug_assert_eq!(next, event, "next_if matched the same event");
-                count = count.max(other);
+                count = if accumulates {
+                    count.saturating_add(other)
+                } else {
+                    count.max(other)
+                };
             }
             for _ in 1..count {
                 merged.push(event.clone());
