@@ -3739,6 +3739,71 @@ fn repair_restores_the_original_when_re_restriction_faults_persistently() -> cra
 /// re-emits the straddling block's sub-bound rows with nothing to restrict them.
 /// Fail closed on the ambiguity.
 #[test]
+fn repair_salvages_a_sidecarless_sst_whose_leading_bytes_were_destroyed() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+        for i in 0..256u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                u64::from(i) + 1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Zeros WRITTEN over the leading bytes: no hole, so this is ordinary
+    // corruption of an unpunched table, and its later blocks are still
+    // recoverable.
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = fs.open(
+            &sst,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&[0u8; 128])?;
+    }
+
+    // Whole-file recovery fails (as in the punched case), routing repair to the
+    // salvage arm.
+    let fault = FaultFs::new(memfs.as_ref().clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .once(),
+    );
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.recovered, 1,
+        "destroyed leading bytes are not a lost punch bound: the readable blocks \
+         must still be salvaged rather than the whole table set aside: {report:?}",
+    );
+    Ok(())
+}
+
+#[test]
 fn repair_sets_aside_a_punched_sidecarless_sst_that_fails_recovery() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
     use crate::io::ErrorKind;

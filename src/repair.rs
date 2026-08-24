@@ -1596,7 +1596,15 @@ fn source_prefix_is_punched(
     }
     let n = usize::try_from(len).unwrap_or(PROBE).min(PROBE);
     let bytes = crate::file::read_exact(&*file, 0, n)?;
-    Ok(bytes.iter().all(|&b| b == 0))
+    if !bytes.iter().all(|&b| b == 0) {
+        return Ok(false);
+    }
+    // Zeros are not the evidence — corruption produces them too, and reading
+    // ordinary damage as a lost punch bound sets the whole table aside instead
+    // of salvaging the blocks that are still readable. A reclaim deallocates, so
+    // the probed extent must be a HOLE. The same rule the block-level punch
+    // classifier applies; a backend that cannot answer leaves it unproven.
+    Ok(fs.extent_is_hole(table_path, 0, n as u64)? == Some(true))
 }
 
 /// Re-imposes a tight-space restriction on a SALVAGED replacement SST, the single
