@@ -2607,9 +2607,6 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
                 .fs
                 .sync_directory_with(&blobs_folder, config.sync_mode)?;
 
-            if let Some(p) = &config.recovery_progress {
-                p.blob_file_recovered();
-            }
             blob_files.push(bf);
             rewrites.insert(
                 blob_id,
@@ -2671,9 +2668,6 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
             &blob_path, blob_id, checksum, 0, &config.fs, frontier,
         ) {
             Ok(bf) => {
-                if let Some(p) = &config.recovery_progress {
-                    p.blob_file_recovered();
-                }
                 if frontier > 0 {
                     // A punched-but-intact file: a stale handle below its
                     // frontier (a pre-relocation SST left behind by a crash)
@@ -4146,6 +4140,11 @@ fn repair_tree(
     let recovered_tables: Vec<Table> = recovered_tables.into_iter().map(|(t, _)| t).collect();
     if let Some(p) = &config.recovery_progress {
         p.tables_recovered_add(recovered_tables.len() as u64);
+        // Blob files count on the same rule and for the same reason: the
+        // reference filter above removes (and deletes) any the surviving tables
+        // do not point at, so counting one at recovery time would claim a
+        // recovery the rebuilt manifest does not hold.
+        p.blob_files_recovered_add(blob_file_list.len() as u64);
     }
 
     // Each recovered table becomes its own single-table L0 run. L0 permits

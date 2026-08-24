@@ -89,14 +89,18 @@ impl RecoveryProgress {
         }
     }
 
+    /// Blob files that reached the rebuilt manifest. Added once the surviving
+    /// reference set is final, since a file no table points at is dropped from
+    /// the manifest and removed.
+    pub(crate) fn blob_files_recovered_add(&self, n: u64) {
+        if n > 0 {
+            self.blob_files_recovered.fetch_add(n, Relaxed);
+        }
+    }
+
     /// One blob file recognized in the scan (by its numeric id).
     pub(crate) fn blob_file_discovered(&self) {
         self.blob_files_discovered.fetch_add(1, Relaxed);
-    }
-
-    /// One blob file recovered into the rebuilt manifest.
-    pub(crate) fn blob_file_recovered(&self) {
-        self.blob_files_recovered.fetch_add(1, Relaxed);
     }
 
     /// Publishes a salvage walk's per-block deltas (scanned / re-emitted /

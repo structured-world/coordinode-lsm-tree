@@ -8109,6 +8109,77 @@ fn repair_keeps_the_rewrite_source_in_place_until_the_manifest_is_committed() ->
 /// `blobs/`, it is an orphan the next open sweeps, and if that sweep hits the
 /// same removal failure the open fails while repair reported success.
 #[test]
+fn repair_counts_only_blob_files_that_reach_the_manifest() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let kv = || Some(KvSeparationOptions::default().separation_threshold(16));
+    let progress = Arc::new(crate::RecoveryProgress::default());
+
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(kv())
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        tree.insert(b"k0", alloc::vec![b'x'; 64], 0);
+        tree.flush_active_memtable(0)?;
+    }
+
+    // An intact blob file no SST points at, written under its OWN id (a byte
+    // copy would carry the original's id in its metadata and be rejected as a
+    // mismatch, never reaching the counter at all).
+    let orphan = root.join(crate::file::BLOBS_FOLDER).join("1");
+    let mut w = crate::vlog::blob_file::writer::Writer::new(&orphan, 1, 0, &*fs_dyn)?;
+    w.write(b"z", 9, &[b'z'; 300])?;
+    w.finish()?;
+
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .with_kv_separation(kv())
+    .with_recovery_progress(Arc::clone(&progress))
+    .repair()?;
+
+    let snap = progress.snapshot();
+    assert_eq!(
+        snap.blob_files_discovered, 2,
+        "both files are seen by the scan: {snap:?}",
+    );
+    assert_eq!(
+        snap.blob_files_recovered, 1,
+        "only the referenced file reaches the manifest, and the counter must \
+         say so rather than claim a recovery the reference filter undid: {snap:?}",
+    );
+    Ok(())
+}
+
+#[test]
 fn repair_fails_when_an_unreferenced_blob_cannot_be_removed() -> crate::Result<()> {
     use crate::AbstractTree;
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
