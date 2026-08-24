@@ -9249,6 +9249,75 @@ fn salvage_keeps_suppressing_a_boundary_key_across_a_whole_shadowed_block() -> c
     Ok(())
 }
 
+/// A lost block whose KEY RANGE is unknown (no index separator survived) must
+/// arm the suppression as unknown, not with the last key seen. Naming the
+/// previous surviving block's key instead suppresses a key nothing shadowed
+/// while the key the lost block really covered is republished from its older
+/// version.
+#[test]
+fn salvage_arms_an_unknown_boundary_when_the_lost_block_has_no_range() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{InternalValue, ValueType};
+
+    let dir = tempfile::tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let source = dir.path().join("source");
+    let dest = dir.path().join("dest");
+
+    // Block 1: `a`. Block 2: `k`'s newest version, lost with its index entry.
+    // Block 3: `k`'s older value — the version that must NOT come back.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(1);
+    writer.write(InternalValue::from_components(
+        b"a",
+        b"v",
+        1,
+        ValueType::Value,
+    ))?;
+    writer.write(InternalValue::new_tombstone(b"k".as_slice(), 10))?;
+    writer.write(InternalValue::from_components(
+        b"k",
+        b"old",
+        5,
+        ValueType::Value,
+    ))?;
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Smash the second block's header MAGIC so the physical walk cannot frame
+    // it. The index stays intact, so the walk still trusts the following
+    // handle's boundary and emits it — the block itself is recorded as a lost
+    // REGION by the gap probe, carrying no key range at all.
+    let second_off = {
+        let table = open(source.clone(), &fs)?;
+        let offsets: Vec<u64> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|kh| *kh.as_ref().offset())
+            .collect();
+        assert!(
+            offsets.len() >= 3,
+            "the fixture needs one block per entry, got {}",
+            offsets.len(),
+        );
+        usize::try_from(offsets.get(1).copied().unwrap_or_default()).unwrap_or(usize::MAX)
+    };
+    let mut bytes = std::fs::read(&source)?;
+    if let Some(b) = bytes.get_mut(second_off) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    let recovered = open(dest, &fs)?;
+    assert!(
+        recovered
+            .get(b"k", crate::SeqNo::MAX, crate::hash::hash64(b"k"))?
+            .is_none(),
+        "the lost region'\u{2019}s range is unknown, so the FOLLOWING block'\u{2019}s \
+         first key is the one it may have shadowed: {report:?}",
+    );
+    Ok(())
+}
+
 /// Suppression rewrites what the block CONTAINS, so the block can no longer be
 /// byte-copied: a verbatim append would carry the shadowed key's bytes into the
 /// recovered copy while the filtered entry list quietly claims it is gone.

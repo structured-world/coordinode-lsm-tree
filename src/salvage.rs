@@ -1426,6 +1426,10 @@ fn salvage_blocks(
     // separator), and then the next block's FIRST key is suppressed, since it is
     // the only one whose newer versions could have been in there.
     let mut lost_boundary: Option<Option<UserKey>> = None;
+    // The previous block's OWN separator (not the running `prev_end` bound):
+    // `None` when the walk framed that block without one, which is exactly the
+    // unknown-range case the boundary above encodes.
+    let mut prev_block_end: Option<UserKey> = None;
     let mut dropped_seen;
 
     // Enumerate the index handles first. A corrupt index entry stops the
@@ -1801,23 +1805,30 @@ fn salvage_blocks(
             columns_salvaged,
         );
         blocks_total += 1;
-        // Did the PREVIOUS iteration lose its block? `prev_end` then holds that
-        // block's last key (or `None` when its range was unknown), which is the
-        // only key this block may hold stale newer-version-shadowed entries for.
+        // Did the PREVIOUS iteration lose its block? Its OWN end key names the
+        // only key this block may hold shadowed entries for. `prev_end` is the
+        // running lower bound, which for a lost block whose range was unknown
+        // still holds an EARLIER block's key — an unrelated one — so the last
+        // block's own separator is what arms this, and its absence arms the
+        // unknown boundary that suppresses this block's first key instead.
         if dropped.len() > dropped_seen {
-            lost_boundary = Some(prev_end.clone());
+            lost_boundary = Some(prev_block_end.clone());
         }
         dropped_seen = dropped.len();
         let offset = *block_handle.offset();
         // A resynced-past region lying before this block shadows it just as a
-        // lost block would, and its own key range is unknown.
+        // lost block would, and its own key range is unknown by construction:
+        // the gap probe never framed it, so nothing named its keys.
         let mut passed_lost_region = false;
         while lost_regions.next_if(|start| *start < offset).is_some() {
             passed_lost_region = true;
         }
         if passed_lost_region {
-            lost_boundary = Some(prev_end.clone());
+            lost_boundary = Some(None);
         }
+        // For the NEXT iteration: this block's own separator, or `None` when the
+        // walk framed it without one.
+        prev_block_end.clone_from(&end_key);
 
         // Columnar source: a clean block is byte-copied verbatim — preserving its
         // PAX value sub-columns, zone map, and per-row seqnos without the transpose
