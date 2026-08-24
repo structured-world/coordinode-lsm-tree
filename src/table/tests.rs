@@ -1152,7 +1152,7 @@ fn punch_on_drop_refuses_a_hard_linked_table() -> crate::Result<()> {
     let table = recover(&plain, &paused_path, paused_checksum)?;
     let pause = crate::deletion_pause::DeletionPause::new_shared();
     table.install_deletion_pause(std::sync::Arc::clone(&pause));
-    let _guard = pause.acquire();
+    let guard = pause.acquire();
     let punch = table.punch_offset_for(b"k0128")?;
     table.mark_punch_on_drop(punch);
     drop(table);
@@ -1160,6 +1160,23 @@ fn punch_on_drop_refuses_a_hard_linked_table() -> crate::Result<()> {
         read_all(&plain, &paused_path)?,
         before,
         "an active checkpoint pause must defer the SST prefix reclaim",
+    );
+
+    // DEFERRED, not dropped: the view that carried the intent is gone, so the
+    // release must run the reclaim. Losing it would strand the prefix forever
+    // — exactly the space a tight-space compaction was reclaiming.
+    drop(guard);
+    let after = read_all(&plain, &paused_path)?;
+    assert!(
+        after
+            .get(..64)
+            .is_some_and(|head| head.iter().all(|&b| b == 0)),
+        "releasing the pause must run the deferred reclaim",
+    );
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "the deferred reclaim punches, it does not truncate",
     );
     Ok(())
 }

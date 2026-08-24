@@ -393,67 +393,80 @@ impl Drop for Inner {
             let off = self
                 .punch_on_drop
                 .load(core::sync::atomic::Ordering::Acquire);
-            // Reclaim only what this tree exclusively owns. A checkpoint
-            // hard-links SST files, and its captured manifest still records
-            // this file UNRESTRICTED under its original digest — punching a
-            // shared inode would zero those blocks inside the immutable
-            // checkpoint too. FAIL CLOSED on a shared link and on a probe
-            // that cannot answer, losing only reclaimable space; an
-            // IN-PROGRESS checkpoint is additionally excluded by the deletion
-            // pause (its window covers the link step, so a punch deferred by
-            // an active pause cannot race a link that is about to appear).
-            // Mirrors the delete path's truncate guard and the blob punch.
-            #[cfg(feature = "std")]
-            let exclusively_owned = {
-                let pause_active = self
-                    .deletion_pause
-                    .get()
-                    .is_some_and(|pause| pause.is_active());
-                !pause_active
-                    && match self.fs.hard_link_count(&self.path) {
-                        Ok(n) => n <= 1,
-                        Err(e) => {
-                            log::warn!(
-                                "Skipping tight-space punch of table {global_id:?} at {:?}: \
-                                 link-count probe failed: {e:?}",
-                                self.path,
-                            );
-                            false
-                        }
-                    }
-            };
-            #[cfg(not(feature = "std"))]
-            let exclusively_owned = true;
-            if off != u64::MAX && exclusively_owned {
-                use crate::table::block_index::BlockIndex;
-                let mut reclaimable: alloc::vec::Vec<(u64, u32)> = alloc::vec::Vec::new();
-                for handle in self.block_index.iter() {
-                    // Log why reclaim stopped instead of silently swallowing the
-                    // block-index read error (this is an integrity-sensitive path).
-                    let handle = match handle {
-                        Ok(handle) => handle,
-                        Err(e) => {
-                            log::warn!(
-                                "Failed to iterate block index while punching table {global_id:?} at {:?}: {e:?}",
-                                self.path,
-                            );
-                            return;
-                        }
-                    };
-                    let block_off = handle.offset().0;
-                    if block_off < off {
-                        reclaimable.push((block_off, handle.size()));
-                    }
-                }
-                for (block_off, size) in reclaimable.into_iter().rev() {
-                    if let Err(e) = self.fs.punch_hole(&self.path, block_off, u64::from(size)) {
+            if off == u64::MAX {
+                return;
+            }
+            use crate::table::block_index::BlockIndex;
+            let mut reclaimable: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+            for handle in self.block_index.iter() {
+                // Log why reclaim stopped instead of silently swallowing the
+                // block-index read error (this is an integrity-sensitive path).
+                let handle = match handle {
+                    Ok(handle) => handle,
+                    Err(e) => {
                         log::warn!(
-                            "Failed to punch tight-space data block at {block_off} of table {global_id:?} at {:?}; \
-                             stopping the reclaim to keep the hole pattern classifiable: {e:?}",
+                            "Failed to iterate block index while punching table {global_id:?} at {:?}: {e:?}",
                             self.path,
                         );
-                        break;
+                        return;
                     }
+                };
+                let block_off = handle.offset().0;
+                if block_off < off {
+                    reclaimable.push((block_off, u64::from(handle.size())));
+                }
+            }
+            reclaimable.reverse();
+
+            // An IN-PROGRESS checkpoint's window covers the link step, so a
+            // punch cannot race a link that is about to appear — but the intent
+            // lives in this view, which is dropping, so DEFER it onto the pause
+            // rather than lose it (the release re-probes and punches then).
+            #[cfg(feature = "std")]
+            if let Some(pause) = self.deletion_pause.get()
+                && pause.is_active()
+                && pause.try_enqueue_punch(
+                    Arc::clone(&self.fs),
+                    (*self.path).clone(),
+                    core::mem::take(&mut reclaimable),
+                )
+            {
+                log::trace!(
+                    "Deferred tight-space punch of table {global_id:?} at {:?} (checkpoint active)",
+                    self.path,
+                );
+                return;
+            }
+
+            // Reclaim only what this tree exclusively owns. A completed
+            // checkpoint hard-links SST files, and its captured manifest still
+            // records this file UNRESTRICTED under its original digest —
+            // punching a shared inode would zero those blocks inside the
+            // immutable checkpoint too. FAIL CLOSED on a shared link and on a
+            // probe that cannot answer, losing only reclaimable space. Mirrors
+            // the delete path's truncate guard and the blob punch.
+            #[cfg(feature = "std")]
+            match self.fs.hard_link_count(&self.path) {
+                Ok(n) if n <= 1 => {}
+                Ok(_) => return,
+                Err(e) => {
+                    log::warn!(
+                        "Skipping tight-space punch of table {global_id:?} at {:?}: \
+                         link-count probe failed: {e:?}",
+                        self.path,
+                    );
+                    return;
+                }
+            }
+
+            for (block_off, size) in reclaimable {
+                if let Err(e) = self.fs.punch_hole(&self.path, block_off, size) {
+                    log::warn!(
+                        "Failed to punch tight-space data block at {block_off} of table {global_id:?} at {:?}; \
+                         stopping the reclaim to keep the hole pattern classifiable: {e:?}",
+                        self.path,
+                    );
+                    break;
                 }
             }
         }

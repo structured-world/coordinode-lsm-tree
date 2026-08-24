@@ -245,41 +245,54 @@ impl Drop for Inner {
                 // holding the gate's write half, and if that drop releases the
                 // last Arc of an armed Inner, taking the read half here would
                 // self-deadlock.
-                let pause_active = self
-                    .deletion_pause
-                    .get()
-                    .is_some_and(|pause| pause.is_active());
-                let exclusively_owned = !pause_active
-                    && match self.fs.hard_link_count(&self.path) {
-                        Ok(n) => n <= 1,
+                //
+                // Deferral does not DISCARD the reclaim: the intent lives in
+                // this dropping view, so it is handed to the pause, which
+                // re-probes the link count and punches once the checkpoint's
+                // window closes.
+                if off != u64::MAX {
+                    let extent = match data_section_start(&*self.fs, &self.path) {
+                        Ok(data_start) if off > data_start => Some((data_start, off - data_start)),
+                        Ok(_) => None, // nothing consumed below the data start
                         Err(e) => {
                             log::warn!(
-                                "Skipping tight-space punch of blob file {:?} at {}: link-count probe failed: {e:?}",
+                                "Skipping tight-space punch of blob file {:?} at {}: could not read data section: {e:?}",
                                 self.id,
                                 self.path.display(),
                             );
-                            false
+                            None
                         }
                     };
-                if off != u64::MAX && exclusively_owned {
-                    match data_section_start(&*self.fs, &self.path) {
-                        Ok(data_start) if off > data_start => {
-                            if let Err(e) =
-                                self.fs.punch_hole(&self.path, data_start, off - data_start)
-                            {
-                                log::warn!(
-                                    "Failed to punch tight-space data [{data_start}, {off}) of blob file {:?} at {}: {e:?}",
-                                    self.id,
-                                    self.path.display(),
-                                );
-                            }
+                    if let Some((data_start, len)) = extent {
+                        let deferred = self.deletion_pause.get().is_some_and(|pause| {
+                            pause.is_active()
+                                && pause.try_enqueue_punch(
+                                    Arc::clone(&self.fs),
+                                    self.path.clone(),
+                                    alloc::vec![(data_start, len)],
+                                )
+                        });
+                        let exclusively_owned = !deferred
+                            && match self.fs.hard_link_count(&self.path) {
+                                Ok(n) => n <= 1,
+                                Err(e) => {
+                                    log::warn!(
+                                        "Skipping tight-space punch of blob file {:?} at {}: link-count probe failed: {e:?}",
+                                        self.id,
+                                        self.path.display(),
+                                    );
+                                    false
+                                }
+                            };
+                        if exclusively_owned
+                            && let Err(e) = self.fs.punch_hole(&self.path, data_start, len)
+                        {
+                            log::warn!(
+                                "Failed to punch tight-space data [{data_start}, {off}) of blob file {:?} at {}: {e:?}",
+                                self.id,
+                                self.path.display(),
+                            );
                         }
-                        Ok(_) => {} // nothing consumed below the data start
-                        Err(e) => log::warn!(
-                            "Skipping tight-space punch of blob file {:?} at {}: could not read data section: {e:?}",
-                            self.id,
-                            self.path.display(),
-                        ),
                     }
                 }
             }

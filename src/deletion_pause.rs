@@ -80,6 +80,26 @@ pub struct DeletionPause {
 struct QueuedDeletion {
     fs: Arc<dyn Fs>,
     path: PathBuf,
+    action: QueuedAction,
+}
+
+/// What the drain does with a queued path.
+#[cfg_attr(
+    not(feature = "std"),
+    allow(
+        dead_code,
+        reason = "no_std-capable deletion gate; only the std-gated checkpoint consumer acquires a pause, so under no_std nothing is ever queued"
+    )
+)]
+enum QueuedAction {
+    /// Unlink the file (an obsolete table or blob file).
+    Remove,
+    /// Punch the listed `(offset, len)` extents, in the given order: a
+    /// tight-space prefix reclaim whose view dropped during the pause. The
+    /// extents are ordered top-down by the producer and the drain stops at the
+    /// first failure, which keeps the resulting hole pattern classifiable for
+    /// a sidecar-less manifest repair.
+    Punch(Vec<(u64, u64)>),
 }
 
 impl core::fmt::Debug for DeletionPause {
@@ -123,6 +143,30 @@ impl DeletionPause {
     /// `false` if the pause is currently inactive (caller proceeds with
     /// the deletion as usual).
     pub fn try_enqueue(&self, fs: Arc<dyn Fs>, path: PathBuf) -> bool {
+        self.try_enqueue_action(fs, path, QueuedAction::Remove)
+    }
+
+    /// Tries to defer a tight-space prefix reclaim of `path` until the pause
+    /// releases. Returns `true` if it was queued (the caller must NOT punch),
+    /// `false` if the pause is inactive (the caller punches as usual).
+    ///
+    /// The intent lives in the view that is dropping, so without this the
+    /// reclaim would be lost outright — and the space it was reclaiming is
+    /// exactly what a tight-space compaction is short of. `extents` are punched
+    /// in the order given (top-down) once the checkpoint's window closes, and
+    /// only if the file is still exclusively owned then: a checkpoint that DID
+    /// link it during its window shares the inode, and punching would zero the
+    /// checkpoint's copy too.
+    pub(crate) fn try_enqueue_punch(
+        &self,
+        fs: Arc<dyn Fs>,
+        path: PathBuf,
+        extents: Vec<(u64, u64)>,
+    ) -> bool {
+        self.try_enqueue_action(fs, path, QueuedAction::Punch(extents))
+    }
+
+    fn try_enqueue_action(&self, fs: Arc<dyn Fs>, path: PathBuf, action: QueuedAction) -> bool {
         if !self.is_active() {
             return false;
         }
@@ -134,7 +178,7 @@ impl DeletionPause {
         if !self.is_active() {
             return false;
         }
-        queue.push(QueuedDeletion { fs, path });
+        queue.push(QueuedDeletion { fs, path, action });
         true
     }
 
@@ -229,13 +273,42 @@ impl Drop for Pause {
         };
 
         for item in drained {
-            if let Err(e) = item.fs.remove_file(&item.path) {
-                // Match the warning style used by Table/BlobFile Drop
-                // impls so log filters keep working.
-                log::warn!(
-                    "Failed to remove deferred deletion {}: {e:?}",
-                    item.path.display(),
-                );
+            match item.action {
+                QueuedAction::Remove => {
+                    if let Err(e) = item.fs.remove_file(&item.path) {
+                        // Match the warning style used by Table/BlobFile Drop
+                        // impls so log filters keep working.
+                        log::warn!(
+                            "Failed to remove deferred deletion {}: {e:?}",
+                            item.path.display(),
+                        );
+                    }
+                }
+                QueuedAction::Punch(extents) => {
+                    // Re-probe: the checkpoint whose pause this was may have
+                    // hard-linked the file during its window, and its captured
+                    // manifest records the file UNRESTRICTED. Fail closed on a
+                    // shared link and on a probe that cannot answer, losing
+                    // only reclaimable space (the last link's release frees it).
+                    if !item.fs.hard_link_count(&item.path).is_ok_and(|n| n <= 1) {
+                        log::debug!(
+                            "Skipping deferred tight-space punch of {}: the file is \
+                             hard-linked (or the link count is unknown)",
+                            item.path.display(),
+                        );
+                        continue;
+                    }
+                    for (offset, len) in extents {
+                        if let Err(e) = item.fs.punch_hole(&item.path, offset, len) {
+                            log::warn!(
+                                "Failed to punch deferred tight-space extent at {offset} of {}; \
+                                 stopping the reclaim to keep the hole pattern classifiable: {e:?}",
+                                item.path.display(),
+                            );
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
