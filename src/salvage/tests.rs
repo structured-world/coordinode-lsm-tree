@@ -8832,8 +8832,9 @@ fn blob_handle_rewrite_installs_the_relocated_size() -> crate::Result<()> {
     );
 
     let mut dropped = 0u64;
-    let out = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
+    let (out, carry) = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
     assert_eq!(dropped, 0, "the record survived, nothing drops");
+    assert!(carry.is_none(), "nothing was beheaded, nothing to suppress");
     let entry = out.first().expect("one rewritten entry");
     let rewritten = BlobIndirection::decode_from(&mut &entry.value[..])?;
     assert_eq!(
@@ -8845,6 +8846,89 @@ fn blob_handle_rewrite_installs_the_relocated_size() -> crate::Result<()> {
         rewritten.vhandle.on_disk_size, 61,
         "the on-disk size is the RE-EMITTED record's, not the source's: the \
          reader rejects a handle whose size disagrees with the frame header",
+    );
+    Ok(())
+}
+
+/// Losing a blob record removes the HEAD of a key's version chain, so the older
+/// versions behind it must go too: keeping them republishes an overwritten value
+/// as current, or undoes a newer write by exposing an older tombstone.
+#[test]
+fn blob_handle_rewrite_drops_older_versions_when_the_head_record_is_lost() -> crate::Result<()> {
+    use crate::blob_tree::handle::BlobIndirection;
+    use crate::coding::Encode;
+    use crate::vlog::ValueHandle;
+    use crate::{InternalValue, ValueType};
+
+    let indirection = |offset: u64| -> crate::Result<Vec<u8>> {
+        let mut value = Vec::new();
+        BlobIndirection {
+            vhandle: ValueHandle {
+                blob_file_id: 7,
+                offset,
+                on_disk_size: 64,
+            },
+            size: 100,
+        }
+        .encode_into(&mut value)?;
+        Ok(value)
+    };
+
+    // The salvaged replacement re-emitted NOTHING of the original: every
+    // handle into file 7 has lost its record.
+    let mut rewrite = crate::HashMap::default();
+    rewrite.insert(
+        7u64,
+        super::BlobFileRewrite::Remap {
+            new_id: 9,
+            offsets: crate::HashMap::default(),
+        },
+    );
+
+    // `k`'s newest version is the lost indirection; its older INLINE value sits
+    // right behind it, and `z` ends the run.
+    let entries = vec![
+        InternalValue::from_components(
+            b"k".to_vec(),
+            indirection(400)?,
+            10,
+            ValueType::Indirection,
+        ),
+        InternalValue::from_components(b"k".to_vec(), b"old".to_vec(), 5, ValueType::Value),
+        InternalValue::from_components(b"z".to_vec(), b"v".to_vec(), 1, ValueType::Value),
+    ];
+    let mut dropped = 0u64;
+    let (out, carry) = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
+    let keys: Vec<_> = out.iter().map(|e| e.key.user_key.to_vec()).collect();
+    assert_eq!(
+        keys,
+        vec![b"z".to_vec()],
+        "the beheaded key goes entirely; the next key is untouched",
+    );
+    assert_eq!(dropped, 2, "both the lost head and the version behind it");
+    assert!(
+        carry.is_none(),
+        "a surviving entry with a different key ended the run",
+    );
+
+    // The same chain, but the block ENDS inside it: the suppression has to
+    // continue into the next block.
+    let entries = vec![
+        InternalValue::from_components(
+            b"k".to_vec(),
+            indirection(400)?,
+            10,
+            ValueType::Indirection,
+        ),
+        InternalValue::from_components(b"k".to_vec(), b"old".to_vec(), 5, ValueType::Value),
+    ];
+    let mut dropped = 0u64;
+    let (out, carry) = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
+    assert!(out.is_empty(), "the whole block was one beheaded key");
+    assert_eq!(
+        carry.as_deref(),
+        Some(b"k".as_slice()),
+        "nothing proved the run ended, so the key keeps suppressing",
     );
     Ok(())
 }
@@ -9076,6 +9160,165 @@ fn salvage_drops_the_boundary_key_when_its_newest_version_is_lost() -> crate::Re
             .is_none(),
         "the older version of the boundary key must not be republished as \
          current when the newest version was lost",
+    );
+    assert!(
+        recovered
+            .get(b"a", crate::SeqNo::MAX, crate::hash::hash64(b"a"))?
+            .is_some(),
+        "unaffected keys are still recovered",
+    );
+    Ok(())
+}
+
+/// A version chain can span MORE than one surviving block. Clearing the
+/// suppression on the first block after the drop lets the second one publish an
+/// even older version of the same key, so the boundary has to hold until a
+/// surviving entry with a different key proves the run ended.
+#[test]
+fn salvage_keeps_suppressing_a_boundary_key_across_a_whole_shadowed_block() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{InternalValue, ValueType};
+
+    let dir = tempfile::tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let source = dir.path().join("source");
+    let dest = dir.path().join("dest");
+
+    // One entry per block: `k`'s newest version (a deletion) is block 1, and its
+    // two older values are blocks 2 and 3 — a chain of whole shadowed blocks.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(1);
+    writer.write(InternalValue::new_tombstone(b"k".as_slice(), 10))?;
+    writer.write(InternalValue::from_components(
+        b"k",
+        b"mid",
+        5,
+        ValueType::Value,
+    ))?;
+    writer.write(InternalValue::from_components(
+        b"k",
+        b"old",
+        1,
+        ValueType::Value,
+    ))?;
+    writer.write(InternalValue::from_components(
+        b"z",
+        b"v",
+        1,
+        ValueType::Value,
+    ))?;
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Corrupt the FIRST data block: the one holding `k`'s newest version.
+    let first_off = {
+        let table = open(source.clone(), &fs)?;
+        let offsets: Vec<u64> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|kh| *kh.as_ref().offset())
+            .collect();
+        assert!(
+            offsets.len() >= 4,
+            "the fixture needs one block per entry, got {}",
+            offsets.len(),
+        );
+        usize::try_from(offsets.first().copied().unwrap_or_default()).unwrap_or(usize::MAX)
+    };
+    let mut bytes = std::fs::read(&source)?;
+    if let Some(b) = bytes.get_mut(first_off + crate::table::block::Header::MIN_LEN + 1) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert_eq!(report.dropped.len(), 1, "one block is lost: {report:?}");
+
+    let recovered = open(dest, &fs)?;
+    assert!(
+        recovered
+            .get(b"k", crate::SeqNo::MAX, crate::hash::hash64(b"k"))?
+            .is_none(),
+        "the chain continues past the first surviving block, so every older \
+         version of the boundary key has to stay suppressed",
+    );
+    assert!(
+        recovered
+            .get(b"z", crate::SeqNo::MAX, crate::hash::hash64(b"z"))?
+            .is_some(),
+        "the key that ends the run is recovered",
+    );
+    Ok(())
+}
+
+/// A columnar source publishes its recovered blocks through its own branch, so
+/// it carries the same no-resurrection obligation: losing the block that held a
+/// key's newest version must not let the columnar path re-emit an older one.
+#[cfg(feature = "columnar")]
+#[test]
+fn salvage_drops_a_columnar_boundary_key_when_its_newest_version_is_lost() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{InternalValue, ValueType};
+
+    let dir = tempfile::tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let source = dir.path().join("source");
+    let dest = dir.path().join("dest");
+
+    // One entry per block, so `k`'s newest version (a deletion) is the whole of
+    // block 2 and its older value the whole of block 3.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_data_block_size(1);
+    writer.write(InternalValue::from_components(
+        b"a",
+        b"v",
+        1,
+        ValueType::Value,
+    ))?;
+    writer.write(InternalValue::new_tombstone(b"k".as_slice(), 10))?;
+    writer.write(InternalValue::from_components(
+        b"k",
+        b"old",
+        5,
+        ValueType::Value,
+    ))?;
+    writer.write(InternalValue::from_components(
+        b"z",
+        b"v",
+        1,
+        ValueType::Value,
+    ))?;
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    let second_off = {
+        let table = open(source.clone(), &fs)?;
+        let offsets: Vec<u64> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|kh| *kh.as_ref().offset())
+            .collect();
+        assert!(
+            offsets.len() >= 3,
+            "the fixture needs one block per entry, got {}",
+            offsets.len(),
+        );
+        usize::try_from(offsets.get(1).copied().unwrap_or_default()).unwrap_or(usize::MAX)
+    };
+    let mut bytes = std::fs::read(&source)?;
+    if let Some(b) = bytes.get_mut(second_off + crate::table::block::Header::MIN_LEN + 1) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert_eq!(report.dropped.len(), 1, "one block is lost: {report:?}");
+
+    let recovered = open(dest, &fs)?;
+    assert!(
+        recovered
+            .get(b"k", crate::SeqNo::MAX, crate::hash::hash64(b"k"))?
+            .is_none(),
+        "the columnar branch must suppress the boundary key too, or salvage \
+         republishes a value the deletion had removed",
     );
     assert!(
         recovered

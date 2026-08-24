@@ -1082,20 +1082,65 @@ fn entry_directory(path: &std::path::Path) -> &std::path::Path {
 /// When the range is unknown (`None`), the same is true of THIS block's first
 /// key — nothing else could have sat between them — so that key's entries go
 /// instead.
+/// Returns the retained entries and, when the block held NOTHING but the
+/// shadowed key, that key again: a block made up entirely of it does not prove
+/// the version run has ended, and the chain can continue into the next block,
+/// which would then publish an even older version. Suppression therefore holds
+/// until a surviving entry with a different key ends the run.
 fn suppress_shadowed_boundary(
     entries: Vec<crate::InternalValue>,
     boundary: Option<&UserKey>,
-) -> Vec<crate::InternalValue> {
+) -> (Vec<crate::InternalValue>, Option<UserKey>) {
     let Some(shadowed) = boundary
         .cloned()
         .or_else(|| entries.first().map(|e| e.key.user_key.clone()))
     else {
-        return entries;
+        return (entries, None);
     };
-    entries
+    let kept: Vec<_> = entries
         .into_iter()
         .filter(|e| e.key.user_key != shadowed)
-        .collect()
+        .collect();
+    let carry = kept.is_empty().then_some(shadowed);
+    (kept, carry)
+}
+
+/// Outcome of suppressing a boundary key inside a decoded columnar batch.
+#[cfg(feature = "columnar")]
+enum BoundarySuppression {
+    /// The key was not in this batch: the version run ended before it.
+    Unchanged,
+    /// The batch was NOTHING but the shadowed key; the run may continue, so the
+    /// key comes back to keep suppressing into the next block.
+    Emptied(UserKey),
+    /// The surviving rows, re-encoded.
+    Rebuilt(crate::table::columnar::ColumnBatch),
+}
+
+/// [`suppress_shadowed_boundary`] for a columnar block: the batch has to be
+/// rebuilt from its surviving rows, which value SUB-COLUMNS cannot round-trip —
+/// that exotic combination fails closed rather than publishing a resurrected
+/// version.
+#[cfg(feature = "columnar")]
+fn suppress_columnar_boundary(
+    batch: &crate::table::columnar::ColumnBatch,
+    boundary: Option<&UserKey>,
+) -> crate::Result<BoundarySuppression> {
+    let entries = crate::table::columnar::column_batch_to_entries(batch)?;
+    let before = entries.len();
+    let (kept, carry) = suppress_shadowed_boundary(entries, boundary);
+    if kept.len() == before {
+        return Ok(BoundarySuppression::Unchanged);
+    }
+    if let Some(key) = carry {
+        return Ok(BoundarySuppression::Emptied(key));
+    }
+    if batch.columns.len() > 4 {
+        return Err(crate::Error::FeatureUnsupported(
+            "boundary-key suppression in a columnar block with value sub-columns",
+        ));
+    }
+    crate::table::columnar::entries_to_column_batch(&kept).map(BoundarySuppression::Rebuilt)
 }
 
 fn classify_drop(
@@ -1130,15 +1175,31 @@ fn classify_drop(
 /// corrupt content — the caller drops the whole block, as everywhere else.
 /// Runs BEFORE blob-link derivation so the rewritten SST's
 /// `linked_blob_files` reflects the NEW handles.
+///
+/// Losing a record removes the HEAD of a key's version chain, so every older
+/// version of that key goes with it — otherwise the rewritten SST exposes an
+/// overwritten value, or undoes a newer one by exposing an older tombstone.
+/// Versions of a key are contiguous and ordered newest-first, so that is every
+/// following entry of the same key. Returns the surviving entries and, when the
+/// block ENDS inside such a suppressed run, the key to keep suppressing: the
+/// chain can continue into the next block.
 fn rewrite_block_indirections(
     entries: Vec<crate::InternalValue>,
     rewrite: &crate::HashMap<crate::vlog::BlobFileId, BlobFileRewrite>,
     dropped_entries: &mut u64,
-) -> crate::Result<Vec<crate::InternalValue>> {
+) -> crate::Result<(Vec<crate::InternalValue>, Option<UserKey>)> {
     use crate::coding::{Decode, Encode};
 
     let mut out = Vec::with_capacity(entries.len());
+    let mut headless: Option<UserKey> = None;
     for mut entry in entries {
+        if headless.as_ref() == Some(&entry.key.user_key) {
+            // An older version of a key whose newer one just went missing.
+            *dropped_entries += 1;
+            continue;
+        }
+        // A different key: the previous key's chain has ended.
+        headless = None;
         if entry.key.value_type != crate::ValueType::Indirection {
             out.push(entry);
             continue;
@@ -1148,33 +1209,34 @@ fn rewrite_block_indirections(
         match rewrite.get(&ind.vhandle.blob_file_id) {
             None => out.push(entry),
             Some(BlobFileRewrite::Remap { new_id, offsets }) => {
-                match offsets.get(&ind.vhandle.offset) {
-                    Some(&relocation) => {
-                        // ALL THREE fields: the replacement is a NEW file, so the
-                        // handle must name it; and a live read cross-checks the
-                        // handle's size against the frame header, so a stale size
-                        // from the source file would reject the salvaged record.
-                        ind.vhandle.blob_file_id = *new_id;
-                        ind.vhandle.offset = relocation.offset;
-                        ind.vhandle.on_disk_size = relocation.on_disk_size;
-                        let mut buf = Vec::new();
-                        ind.encode_into(&mut buf)?;
-                        entry.value = buf.into();
-                        out.push(entry);
-                    }
-                    None => *dropped_entries += 1,
+                if let Some(&relocation) = offsets.get(&ind.vhandle.offset) {
+                    // ALL THREE fields: the replacement is a NEW file, so the
+                    // handle must name it; and a live read cross-checks the
+                    // handle's size against the frame header, so a stale size
+                    // from the source file would reject the salvaged record.
+                    ind.vhandle.blob_file_id = *new_id;
+                    ind.vhandle.offset = relocation.offset;
+                    ind.vhandle.on_disk_size = relocation.on_disk_size;
+                    let mut buf = Vec::new();
+                    ind.encode_into(&mut buf)?;
+                    entry.value = buf.into();
+                    out.push(entry);
+                } else {
+                    *dropped_entries += 1;
+                    headless = Some(entry.key.user_key);
                 }
             }
             Some(BlobFileRewrite::DropBelow(frontier)) => {
                 if ind.vhandle.offset < *frontier {
                     *dropped_entries += 1;
+                    headless = Some(entry.key.user_key);
                 } else {
                     out.push(entry);
                 }
             }
         }
     }
-    Ok(out)
+    Ok((out, headless))
 }
 
 /// Decodes the [`crate::blob_tree::handle::BlobIndirection`] of every
@@ -1776,6 +1838,7 @@ fn salvage_blocks(
                         // entry round-trip as the unmasked columnar arm (the
                         // mask is already applied, so only surviving rows are
                         // transformed), with the same sub-column fail-closed.
+                        let mut rewrite_carry: Option<UserKey> = None;
                         let batch = match blob_rewrite {
                             Some(rw) => {
                                 if batch.columns.len() > 4 {
@@ -1793,13 +1856,17 @@ fn salvage_blocks(
                                         )
                                     });
                                 match step {
-                                    Ok(entries) if entries.is_empty() => {
+                                    Ok((entries, carry)) if entries.is_empty() => {
                                         // Every surviving record removed by the
                                         // rewrite: nothing to emit, nothing lost.
+                                        if let Some(key) = carry {
+                                            lost_boundary = Some(Some(key));
+                                        }
                                         prev_end = end_key.or(prev_end);
                                         continue;
                                     }
-                                    Ok(entries) => {
+                                    Ok((entries, carry)) => {
+                                        rewrite_carry = carry;
                                         match crate::table::columnar::entries_to_column_batch(
                                             &entries,
                                         ) {
@@ -1830,6 +1897,36 @@ fn salvage_blocks(
                             }
                             None => batch,
                         };
+                        // Boundary suppression on the delete-masked path too: a
+                        // lost block can have held the newest version of the key
+                        // this batch opens with, and the mask does not change that.
+                        let batch = match lost_boundary.take() {
+                            Some(boundary) => {
+                                match suppress_columnar_boundary(&batch, boundary.as_ref()) {
+                                    Ok(BoundarySuppression::Unchanged) => batch,
+                                    Ok(BoundarySuppression::Emptied(key)) => {
+                                        lost_boundary = Some(Some(key));
+                                        prev_end = end_key.or(prev_end);
+                                        continue;
+                                    }
+                                    Ok(BoundarySuppression::Rebuilt(batch)) => batch,
+                                    Err(e) => {
+                                        dropped.push(classify_drop(
+                                            &e,
+                                            offset,
+                                            prev_end.as_ref(),
+                                            end_key.as_ref(),
+                                        ));
+                                        prev_end = end_key.or(prev_end);
+                                        continue;
+                                    }
+                                }
+                            }
+                            None => batch,
+                        };
+                        if let Some(key) = rewrite_carry {
+                            lost_boundary = Some(Some(key));
+                        }
                         let rows = u64::from(batch.row_count);
                         // Indirections of the SURVIVING (unmasked) rows,
                         // BEFORE emit: an undecodable indirection is corrupt
@@ -1935,6 +2032,11 @@ fn salvage_blocks(
                                 // writes them (indirections live in the opaque
                                 // value column), so fail closed on the exotic
                                 // combination instead of silently dropping data.
+                                // A chain the rewrite beheads at this block's tail
+                                // continues into the next block, so its key is
+                                // handed on once this block's own suppression has
+                                // been applied.
+                                let mut rewrite_carry: Option<UserKey> = None;
                                 let (batch, entries) = match blob_rewrite {
                                     Some(rw) => {
                                         if batch.columns.len() > 4 {
@@ -1948,7 +2050,10 @@ fn salvage_blocks(
                                             rw,
                                             &mut entries_dropped_by_rewrite,
                                         ) {
-                                            Ok(entries) => entries,
+                                            Ok((entries, carry)) => {
+                                                rewrite_carry = carry;
+                                                entries
+                                            }
                                             Err(e) => {
                                                 dropped.push(classify_drop(
                                                     &e,
@@ -1963,6 +2068,9 @@ fn salvage_blocks(
                                         if entries.is_empty() {
                                             // Every record removed by the rewrite:
                                             // nothing to emit, nothing lost.
+                                            if let Some(key) = rewrite_carry {
+                                                lost_boundary = Some(Some(key));
+                                            }
                                             prev_end = end_key.or(prev_end);
                                             continue;
                                         }
@@ -1984,6 +2092,68 @@ fn salvage_blocks(
                                     }
                                     None => (batch, entries),
                                 };
+                                // Drop the entries a LOST block may have shadowed,
+                                // exactly as the row branch does below: versions of
+                                // one key are contiguous, so the key at this
+                                // boundary can have had newer versions inside the
+                                // block that went missing.
+                                let mut rebuilt_by_suppression = false;
+                                let (batch, entries) = match lost_boundary.take() {
+                                    Some(boundary) => {
+                                        let before = entries.len();
+                                        let (kept, carry) =
+                                            suppress_shadowed_boundary(entries, boundary.as_ref());
+                                        if let Some(key) = carry {
+                                            lost_boundary = Some(Some(key));
+                                        }
+                                        if kept.len() == before {
+                                            // Nothing was shadowed: the run ended
+                                            // before this block, so the decoded
+                                            // batch stands as-is.
+                                            (batch, kept)
+                                        } else if kept.is_empty() {
+                                            if let Some(key) = rewrite_carry {
+                                                lost_boundary = Some(Some(key));
+                                            }
+                                            prev_end = end_key.or(prev_end);
+                                            continue;
+                                        } else {
+                                            // The batch has to be rebuilt from the
+                                            // surviving rows, which value SUB-COLUMNS
+                                            // cannot round-trip — fail closed on that
+                                            // exotic combination rather than publish a
+                                            // resurrected version.
+                                            if batch.columns.len() > 4 {
+                                                return Err(crate::Error::FeatureUnsupported(
+                                                    "boundary-key suppression in a columnar \
+                                                     block with value sub-columns",
+                                                ));
+                                            }
+                                            match crate::table::columnar::entries_to_column_batch(
+                                                &kept,
+                                            ) {
+                                                Ok(rebuilt) => {
+                                                    rebuilt_by_suppression = true;
+                                                    (rebuilt, kept)
+                                                }
+                                                Err(e) => {
+                                                    dropped.push(classify_drop(
+                                                        &e,
+                                                        offset,
+                                                        prev_end.as_ref(),
+                                                        end_key.as_ref(),
+                                                    ));
+                                                    prev_end = end_key.or(prev_end);
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    None => (batch, entries),
+                                };
+                                if let Some(key) = rewrite_carry {
+                                    lost_boundary = Some(Some(key));
+                                }
                                 let rows = u64::from(batch.row_count);
                                 // Indirections BEFORE emit: an entry tagged as an
                                 // indirection whose value fails to decode is
@@ -2006,7 +2176,11 @@ fn salvage_blocks(
                                 // on this unmasked (resurrection opt-in) arm: the
                                 // re-encode keeps the recovered copy's layout
                                 // consistent with the degraded-bitmap path.
-                                let verbatim_source = if table.has_delete_bitmap_section() {
+                                // A suppressed boundary key rebuilt the batch, so the
+                                // block's raw bytes no longer describe it — re-encode.
+                                let verbatim_source = if table.has_delete_bitmap_section()
+                                    || rebuilt_by_suppression
+                                {
                                     None
                                 } else {
                                     sb.verbatim
@@ -2183,13 +2357,13 @@ fn salvage_blocks(
                             // reflect the NEW handles. An undecodable
                             // indirection is corrupt content — drop the block,
                             // like the link derivation below.
-                            let entries = match blob_rewrite {
+                            let (entries, rewrite_carry) = match blob_rewrite {
                                 Some(rw) => match rewrite_block_indirections(
                                     entries,
                                     rw,
                                     &mut entries_dropped_by_rewrite,
                                 ) {
-                                    Ok(entries) => entries,
+                                    Ok(pair) => pair,
                                     Err(e) => {
                                         dropped.push(classify_drop(
                                             &e,
@@ -2201,7 +2375,7 @@ fn salvage_blocks(
                                         continue;
                                     }
                                 },
-                                None => entries,
+                                None => (entries, None),
                             };
                             // Drop the entries a LOST block may have shadowed:
                             // versions of one key are contiguous, so the key at
@@ -2210,10 +2384,22 @@ fn salvage_blocks(
                             // older ones would republish them as current.
                             let entries = match lost_boundary.take() {
                                 Some(boundary) => {
-                                    suppress_shadowed_boundary(entries, boundary.as_ref())
+                                    let (kept, carry) =
+                                        suppress_shadowed_boundary(entries, boundary.as_ref());
+                                    // The run has not ended yet: keep suppressing
+                                    // into the next block.
+                                    if let Some(key) = carry {
+                                        lost_boundary = Some(Some(key));
+                                    }
+                                    kept
                                 }
                                 None => entries,
                             };
+                            // A chain the REWRITE beheaded at this block's tail
+                            // continues into the next one, so hand it the key.
+                            if let Some(key) = rewrite_carry {
+                                lost_boundary = Some(Some(key));
+                            }
                             if entries.is_empty() {
                                 // Every entry's record was removed by the
                                 // rewrite, or every one was shadowed by a lost
