@@ -9249,6 +9249,84 @@ fn salvage_keeps_suppressing_a_boundary_key_across_a_whole_shadowed_block() -> c
     Ok(())
 }
 
+/// Suppression rewrites what the block CONTAINS, so the block can no longer be
+/// byte-copied: a verbatim append would carry the shadowed key's bytes into the
+/// recovered copy while the filtered entry list quietly claims it is gone.
+#[test]
+fn salvage_does_not_byte_copy_a_block_it_suppressed_a_key_from() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{InternalValue, ValueType};
+
+    let dir = tempfile::tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let source = dir.path().join("source");
+    let dest = dir.path().join("dest");
+
+    // Block 1: `k`'s newest version, big enough to fill a block on its own and
+    // lost below. Block 2: `k`'s older value TOGETHER WITH `m`, so suppression
+    // leaves the block non-empty and the emit path still has something to write.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(100);
+    writer.write(InternalValue::from_components(
+        b"k",
+        [b'n'; 200],
+        10,
+        ValueType::Value,
+    ))?;
+    writer.write(InternalValue::from_components(
+        b"k",
+        b"old",
+        5,
+        ValueType::Value,
+    ))?;
+    writer.write(InternalValue::from_components(
+        b"m",
+        b"v",
+        1,
+        ValueType::Value,
+    ))?;
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    let first_off = {
+        let table = open(source.clone(), &fs)?;
+        let offsets: Vec<u64> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|kh| *kh.as_ref().offset())
+            .collect();
+        assert_eq!(
+            offsets.len(),
+            2,
+            "the fixture needs the lost version alone in block 1 and the \
+             shadowed one sharing block 2",
+        );
+        usize::try_from(offsets.first().copied().unwrap_or_default()).unwrap_or(usize::MAX)
+    };
+    let mut bytes = std::fs::read(&source)?;
+    if let Some(b) = bytes.get_mut(first_off + crate::table::block::Header::MIN_LEN + 1) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert_eq!(report.dropped.len(), 1, "one block is lost: {report:?}");
+
+    let recovered = open(dest, &fs)?;
+    assert!(
+        recovered
+            .get(b"k", crate::SeqNo::MAX, crate::hash::hash64(b"k"))?
+            .is_none(),
+        "a verbatim copy would carry the suppressed key'\u{2019}s bytes through \
+         untouched, republishing the version its newer one had replaced",
+    );
+    assert!(
+        recovered
+            .get(b"m", crate::SeqNo::MAX, crate::hash::hash64(b"m"))?
+            .is_some(),
+        "the block'\u{2019}s other key is still recovered",
+    );
+    Ok(())
+}
+
 /// A columnar source publishes its recovered blocks through its own branch, so
 /// it carries the same no-resurrection obligation: losing the block that held a
 /// key's newest version must not let the columnar path re-emit an older one.

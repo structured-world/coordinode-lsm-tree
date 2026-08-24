@@ -1113,8 +1113,11 @@ enum BoundarySuppression {
     /// The batch was NOTHING but the shadowed key; the run may continue, so the
     /// key comes back to keep suppressing into the next block.
     Emptied(UserKey),
-    /// The surviving rows, re-encoded.
-    Rebuilt(crate::table::columnar::ColumnBatch),
+    /// The surviving rows, re-encoded, with the row view the caller emits from.
+    Rebuilt(
+        crate::table::columnar::ColumnBatch,
+        Vec<crate::InternalValue>,
+    ),
 }
 
 /// [`suppress_shadowed_boundary`] for a columnar block: the batch has to be
@@ -1140,7 +1143,8 @@ fn suppress_columnar_boundary(
             "boundary-key suppression in a columnar block with value sub-columns",
         ));
     }
-    crate::table::columnar::entries_to_column_batch(&kept).map(BoundarySuppression::Rebuilt)
+    let rebuilt = crate::table::columnar::entries_to_column_batch(&kept)?;
+    Ok(BoundarySuppression::Rebuilt(rebuilt, kept))
 }
 
 fn classify_drop(
@@ -1422,7 +1426,7 @@ fn salvage_blocks(
     // separator), and then the next block's FIRST key is suppressed, since it is
     // the only one whose newer versions could have been in there.
     let mut lost_boundary: Option<Option<UserKey>> = None;
-    let mut dropped_seen = 0usize;
+    let mut dropped_seen;
 
     // Enumerate the index handles first. A corrupt index entry stops the
     // collection after reporting it: once the index stream desyncs, later
@@ -1766,6 +1770,22 @@ fn salvage_blocks(
     // while a block was dropped, reporting full coverage despite the loss.
     blocks_total += dropped.len();
 
+    // Those same pre-loop drops are the ONLY ones the per-iteration delta below
+    // cannot attribute to a position, so they are handled by offset instead:
+    // each lost DATA region shadows whichever item follows it in the walk, not
+    // the first one. Counting them as a delta would arm the suppression before
+    // the table's very first block and drop a key nothing had shadowed. An
+    // `index`-section drop names no data region — the handles it lost sit past
+    // the last enumerated one, so no item follows them to suppress.
+    let mut lost_regions: Vec<u64> = dropped
+        .iter()
+        .filter(|d| d.section == b"data")
+        .map(|d| d.offset)
+        .collect();
+    lost_regions.sort_unstable();
+    let mut lost_regions = lost_regions.into_iter().peekable();
+    dropped_seen = dropped.len();
+
     for (block_handle, end_key) in items {
         // Publish the previous iteration's outcome (top-of-loop so every
         // `continue` path is covered; the totals-vs-published delta form makes
@@ -1789,6 +1809,15 @@ fn salvage_blocks(
         }
         dropped_seen = dropped.len();
         let offset = *block_handle.offset();
+        // A resynced-past region lying before this block shadows it just as a
+        // lost block would, and its own key range is unknown.
+        let mut passed_lost_region = false;
+        while lost_regions.next_if(|start| *start < offset).is_some() {
+            passed_lost_region = true;
+        }
+        if passed_lost_region {
+            lost_boundary = Some(prev_end.clone());
+        }
 
         // Columnar source: a clean block is byte-copied verbatim — preserving its
         // PAX value sub-columns, zone map, and per-row seqnos without the transpose
@@ -1909,7 +1938,10 @@ fn salvage_blocks(
                                         prev_end = end_key.or(prev_end);
                                         continue;
                                     }
-                                    Ok(BoundarySuppression::Rebuilt(batch)) => batch,
+                                    Ok(BoundarySuppression::Rebuilt(batch, _)) => batch,
+                                    Err(e @ crate::Error::FeatureUnsupported(_)) => {
+                                        return Err(e);
+                                    }
                                     Err(e) => {
                                         dropped.push(classify_drop(
                                             &e,
@@ -2100,52 +2132,30 @@ fn salvage_blocks(
                                 let mut rebuilt_by_suppression = false;
                                 let (batch, entries) = match lost_boundary.take() {
                                     Some(boundary) => {
-                                        let before = entries.len();
-                                        let (kept, carry) =
-                                            suppress_shadowed_boundary(entries, boundary.as_ref());
-                                        if let Some(key) = carry {
-                                            lost_boundary = Some(Some(key));
-                                        }
-                                        if kept.len() == before {
-                                            // Nothing was shadowed: the run ended
-                                            // before this block, so the decoded
-                                            // batch stands as-is.
-                                            (batch, kept)
-                                        } else if kept.is_empty() {
-                                            if let Some(key) = rewrite_carry {
+                                        match suppress_columnar_boundary(&batch, boundary.as_ref())
+                                        {
+                                            Ok(BoundarySuppression::Unchanged) => (batch, entries),
+                                            Ok(BoundarySuppression::Emptied(key)) => {
                                                 lost_boundary = Some(Some(key));
+                                                prev_end = end_key.or(prev_end);
+                                                continue;
                                             }
-                                            prev_end = end_key.or(prev_end);
-                                            continue;
-                                        } else {
-                                            // The batch has to be rebuilt from the
-                                            // surviving rows, which value SUB-COLUMNS
-                                            // cannot round-trip — fail closed on that
-                                            // exotic combination rather than publish a
-                                            // resurrected version.
-                                            if batch.columns.len() > 4 {
-                                                return Err(crate::Error::FeatureUnsupported(
-                                                    "boundary-key suppression in a columnar \
-                                                     block with value sub-columns",
+                                            Ok(BoundarySuppression::Rebuilt(batch, kept)) => {
+                                                rebuilt_by_suppression = true;
+                                                (batch, kept)
+                                            }
+                                            Err(e @ crate::Error::FeatureUnsupported(_)) => {
+                                                return Err(e);
+                                            }
+                                            Err(e) => {
+                                                dropped.push(classify_drop(
+                                                    &e,
+                                                    offset,
+                                                    prev_end.as_ref(),
+                                                    end_key.as_ref(),
                                                 ));
-                                            }
-                                            match crate::table::columnar::entries_to_column_batch(
-                                                &kept,
-                                            ) {
-                                                Ok(rebuilt) => {
-                                                    rebuilt_by_suppression = true;
-                                                    (rebuilt, kept)
-                                                }
-                                                Err(e) => {
-                                                    dropped.push(classify_drop(
-                                                        &e,
-                                                        offset,
-                                                        prev_end.as_ref(),
-                                                        end_key.as_ref(),
-                                                    ));
-                                                    prev_end = end_key.or(prev_end);
-                                                    continue;
-                                                }
+                                                prev_end = end_key.or(prev_end);
+                                                continue;
                                             }
                                         }
                                     }
@@ -2384,12 +2394,20 @@ fn salvage_blocks(
                             // older ones would republish them as current.
                             let entries = match lost_boundary.take() {
                                 Some(boundary) => {
+                                    let before = entries.len();
                                     let (kept, carry) =
                                         suppress_shadowed_boundary(entries, boundary.as_ref());
                                     // The run has not ended yet: keep suppressing
                                     // into the next block.
                                     if let Some(key) = carry {
                                         lost_boundary = Some(Some(key));
+                                    }
+                                    if kept.len() != before {
+                                        // The block no longer contains what its
+                                        // bytes say: a verbatim copy would carry
+                                        // the suppressed key straight through,
+                                        // so re-emit the survivors row by row.
+                                        sb.verbatim = None;
                                     }
                                     kept
                                 }
