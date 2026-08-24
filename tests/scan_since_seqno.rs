@@ -581,3 +581,37 @@ fn scan_since_deduplicates_identical_events_from_duplicated_tables() -> lsm_tree
     );
     Ok(())
 }
+
+/// Deduplication must not collapse events a single source genuinely holds
+/// more than once. A write batch may carry the same merge operand for a key
+/// twice; both are stored, both are applied on read, and both must reach a
+/// consumer — replaying one merge where the source applied two diverges the
+/// replica. Identical copies across DIFFERENT sources are still collapsed
+/// (that is the post-repair case), so the rule is multiplicity per source,
+/// not global uniqueness.
+#[test]
+fn scan_since_keeps_a_merge_operand_a_single_source_holds_twice() -> lsm_tree::Result<()> {
+    use lsm_tree::WriteBatch;
+
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path())?;
+
+    // One batch, one key, the SAME operand twice: identical payload AND
+    // identical seqno, since a batch shares one.
+    let mut batch = WriteBatch::new();
+    batch.merge(b"counter".as_slice(), b"+1".as_slice());
+    batch.merge(b"counter".as_slice(), b"+1".as_slice());
+    tree.apply_batch(batch, 10)?;
+    tree.flush_active_memtable(0)?;
+
+    let got = events(&tree, 0)?;
+    assert_eq!(
+        got.iter()
+            .filter(|e| matches!(e, ScanSinceEvent::MergeOperand { key, .. } if key.as_ref() == b"counter"))
+            .count(),
+        2,
+        "both operands must reach the consumer: collapsing them replays the \
+         merge once where the source applied it twice: {got:?}",
+    );
+    Ok(())
+}

@@ -1782,73 +1782,124 @@ impl Tree {
             return Ok(Vec::new().into_iter());
         };
 
-        let mut events: Vec<ScanSinceEvent> = Vec::new();
+        // Events are gathered PER SOURCE, not into one flat list: copies of a
+        // change across two sources are the same change and collapse, but a
+        // single source may legitimately hold a byte-identical event more than
+        // once (a write batch may carry the same merge operand for a key
+        // twice; both are stored under the batch's shared seqno and both are
+        // applied on read). See `merge_source_events`.
+        let mut sources: Vec<Vec<ScanSinceEvent>> = Vec::new();
 
-        // Point entries: active + sealed memtables, then SSTs (block-skip).
+        let in_window = |seqno: SeqNo| seqno >= target_seqno && seqno <= end_seqno;
+        let range_tombstone_event = |rt: &RangeTombstone| {
+            in_window(rt.seqno).then(|| ScanSinceEvent::RangeTombstone {
+                start_key: rt.start.clone(),
+                end_key: rt.end.clone(),
+                seqno: rt.seqno,
+            })
+        };
+
+        // Active memtable.
+        let mut source = Vec::new();
         for entry in super_version.active_memtable.iter() {
-            if entry.key.seqno >= target_seqno && entry.key.seqno <= end_seqno {
-                events.push(Self::map_event(entry, version, &resolve_indirection)?);
+            if in_window(entry.key.seqno) {
+                source.push(Self::map_event(entry, version, &resolve_indirection)?);
             }
         }
+        for rt in super_version.active_memtable.range_tombstones_sorted() {
+            source.extend(range_tombstone_event(&rt));
+        }
+        sources.push(source);
+
+        // Sealed memtables.
         for memtable in super_version.sealed_memtables.iter() {
+            let mut source = Vec::new();
             for entry in memtable.iter() {
-                if entry.key.seqno >= target_seqno && entry.key.seqno <= end_seqno {
-                    events.push(Self::map_event(entry, version, &resolve_indirection)?);
+                if in_window(entry.key.seqno) {
+                    source.push(Self::map_event(entry, version, &resolve_indirection)?);
                 }
             }
+            for rt in memtable.range_tombstones_sorted() {
+                source.extend(range_tombstone_event(&rt));
+            }
+            sources.push(source);
         }
+
+        // SSTs.
         for table in version.iter_tables() {
+            let mut source = Vec::new();
             // `scan_seqno_range` upper bound is exclusive; `end_seqno` is the
             // inclusive max, so add one (saturating for the MAX edge).
             for entry in
                 table.scan_seqno_range(target_seqno, end_seqno.saturating_add(1), block_skip)?
             {
-                events.push(Self::map_event(entry, version, &resolve_indirection)?);
+                source.push(Self::map_event(entry, version, &resolve_indirection)?);
             }
-        }
-
-        // Range tombstones from the same sources, carrying their own seqno.
-        let mut push_range_tombstone = |rt: &RangeTombstone| {
-            if rt.seqno >= target_seqno && rt.seqno <= end_seqno {
-                events.push(ScanSinceEvent::RangeTombstone {
-                    start_key: rt.start.clone(),
-                    end_key: rt.end.clone(),
-                    seqno: rt.seqno,
-                });
-            }
-        };
-        for rt in super_version.active_memtable.range_tombstones_sorted() {
-            push_range_tombstone(&rt);
-        }
-        for memtable in super_version.sealed_memtables.iter() {
-            for rt in memtable.range_tombstones_sorted() {
-                push_range_tombstone(&rt);
-            }
-        }
-        for table in version.iter_tables() {
             // Clamped to the view's tight-space restriction: the punched
             // prefix's deletions are re-emitted by the slice output that
             // superseded it, so the raw list would duplicate those events.
             for rt in table.visible_range_tombstones() {
-                push_range_tombstone(&rt);
+                source.extend(range_tombstone_event(&rt));
             }
+            sources.push(source);
         }
 
-        // Replay order is increasing seqno across every source; the ordering's
-        // payload tie-break makes byte-identical copies adjacent so one dedup
-        // pass collapses them. One committed change can physically live in TWO
-        // published tables: a manifest-loss repair publishes every surviving
-        // SST as its own L0 run, including both the inputs and outputs of a
-        // compaction that crashed before deleting its inputs (or a tight-space
-        // input whose restriction sidecar failed to persist alongside the
-        // slice output that re-emitted its prefix). Point reads shadow such
-        // copies by seqno, but this enumeration would deliver the change twice
-        // to a CDC consumer. Distinct same-seqno events (one write batch spans
-        // many keys) differ in payload and are preserved.
-        events.sort_by(ScanSinceEvent::replay_ordering);
-        events.dedup();
+        Ok(Self::merge_source_events(sources).into_iter())
+    }
 
-        Ok(events.into_iter())
+    /// Merge per-source event lists into one replay-ordered stream.
+    ///
+    /// Replay order is increasing seqno across every source; the ordering's
+    /// payload tie-break makes byte-identical events adjacent. For each
+    /// distinct event the stream carries the HIGHEST multiplicity any SINGLE
+    /// source holds, which is exactly the count the source history applied:
+    ///
+    /// - **Across sources, copies collapse.** One committed change can
+    ///   physically live in two published tables: a manifest-loss repair
+    ///   publishes every surviving SST as its own L0 run, including both the
+    ///   inputs and the outputs of a compaction that crashed before deleting
+    ///   its inputs. Point reads shadow such copies by seqno, but a flat
+    ///   enumeration would deliver the change twice to a consumer.
+    /// - **Within one source, repeats are preserved.** A key may hold the same
+    ///   merge operand twice at one seqno, and a consumer that applies it once
+    ///   diverges from the source. Two sources that each hold the pair are
+    ///   still the same pair, so the maximum (not the sum) is correct.
+    fn merge_source_events(sources: Vec<Vec<ScanSinceEvent>>) -> Vec<ScanSinceEvent> {
+        // Per source, collapse equal neighbours into (event, count) runs.
+        let mut runs: Vec<(ScanSinceEvent, usize)> = Vec::new();
+        for mut source in sources {
+            source.sort_by(ScanSinceEvent::replay_ordering);
+            let mut iter = source.into_iter();
+            let Some(mut current) = iter.next() else {
+                continue;
+            };
+            let mut count = 1;
+            for event in iter {
+                if event == current {
+                    count += 1;
+                } else {
+                    runs.push((core::mem::replace(&mut current, event), count));
+                    count = 1;
+                }
+            }
+            runs.push((current, count));
+        }
+
+        // Then merge the per-source runs, keeping the per-event maximum.
+        runs.sort_by(|(a, _), (b, _)| ScanSinceEvent::replay_ordering(a, b));
+        let mut merged = Vec::new();
+        let mut iter = runs.into_iter().peekable();
+        while let Some((event, mut count)) = iter.next() {
+            while let Some((next, other)) = iter.next_if(|(next, _)| *next == event) {
+                debug_assert_eq!(next, event, "next_if matched the same event");
+                count = count.max(other);
+            }
+            for _ in 1..count {
+                merged.push(event.clone());
+            }
+            merged.push(event);
+        }
+        merged
     }
 
     /// Iterate change events with `seqno >= target_seqno`.
