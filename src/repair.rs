@@ -3824,21 +3824,16 @@ fn repair_tree(
         .map(|c| (c.table, c.complete))
         .collect();
 
-    // Newest first: higher sequence number nearer the L0 head, matching the
-    // ordering the merge reader expects for its newest-run-first short-circuit.
-    // Tie-broken by DESCENDING id: two tables can share a highest seqno (a
-    // caller may reuse an explicit seqno across separate flushed batches), and
-    // sorting by seqno alone would leave their order to the directory scan and
-    // the candidate map's iteration — so which run answers first would vary
-    // between runs of the same repair over the same files. Ids are allocated in
-    // increasing order, so the higher id is the later table and belongs nearer
-    // the L0 head.
-    recovered_tables.sort_by_key(|(t, _)| {
-        (
-            std::cmp::Reverse(t.get_highest_seqno()),
-            std::cmp::Reverse(t.id()),
-        )
-    });
+    // Newest first, by DESCENDING id — the only recency signal the files
+    // actually carry. Ids are allocated in increasing order, so a higher id is
+    // a later table and belongs nearer the L0 head, where the merge reader's
+    // newest-run-first short-circuit expects it. A table's highest seqno is NOT
+    // that signal: callers may assign seqnos explicitly, so an older table can
+    // top out above a newer one on an unrelated key, and ordering by it would
+    // then make repair serve the superseded value. Sorting by id is also total,
+    // so repeating a repair over the same files reproduces the same tree
+    // instead of inheriting the directory scan's order.
+    recovered_tables.sort_by_key(|(t, _)| std::cmp::Reverse(t.id()));
 
     // Fresh ids for copies published BESIDE their source (the blob-handle
     // rewrite). Starts one past the highest id ANY artifact in the table

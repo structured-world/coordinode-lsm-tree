@@ -2381,6 +2381,62 @@ fn repair_orders_equal_seqno_tables_by_descending_id() -> crate::Result<()> {
     Ok(())
 }
 
+/// A table's highest seqno is not a recency signal at all: callers may assign
+/// seqnos explicitly, so an older table can top out above a newer one on an
+/// unrelated key. Ordering L0 by it then puts the older table nearer the head
+/// and repair serves the superseded value for every key the two share.
+#[test]
+fn repair_orders_l0_by_table_recency_not_by_maximum_seqno() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+
+    // The OLDER table (id 0) carries a high maximum seqno from an unrelated
+    // key; the NEWER one (id 1) tops out lower. Both hold `k` at seqno 10 with
+    // different values — the newer table's value is what the tree must serve.
+    for (id, other_seqno, value) in [(0u64, 100u64, "stale"), (1, 50, "fresh")] {
+        let mut w = crate::table::Writer::new(tables.join(id.to_string()), id, 0, Arc::clone(&fs))?;
+        w.write(InternalValue::from_components(
+            b"k",
+            value.as_bytes(),
+            10,
+            ValueType::Value,
+        ))?;
+        // Keys ascend within an SST, so the unrelated key sorts after `k`.
+        w.write(InternalValue::from_components(
+            b"unrelated",
+            b"v",
+            other_seqno,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    let config = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs);
+    config.repair()?;
+
+    let tree = config.open()?;
+    assert_eq!(
+        tree.get(b"k", crate::SeqNo::MAX)?.as_deref(),
+        Some(b"fresh".as_slice()),
+        "the later table's value must win: a maximum seqno drawn from an \
+         unrelated key says nothing about which table is newer",
+    );
+    Ok(())
+}
+
 /// Delegates to `MemFs` but hands directory entries back in a FIXED order
 /// (ascending by name, or descending), so a test can pin a scan's input order
 /// instead of depending on the map iteration a backend happens to produce —
