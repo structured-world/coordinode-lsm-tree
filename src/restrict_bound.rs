@@ -52,6 +52,18 @@ pub fn sidecar_path(table_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// The table id a sidecar FILE NAME claims.
+///
+/// `None` when the name is not a sidecar, or names no numeric table. Both the
+/// live `{id}.restrict-bound` and its staging `{id}.restrict-bound.tmp` claim
+/// the id: an id whose sidecar survives must not be handed to a different
+/// table, or that table inherits a restriction belonging to another file.
+#[must_use]
+pub fn table_id_from_sidecar_name(file_name: &str) -> Option<u64> {
+    let stem = file_name.strip_suffix(".tmp").unwrap_or(file_name);
+    stem.strip_suffix(".restrict-bound")?.parse().ok()
+}
+
 /// The staging path the sidecar is written + synced to before its atomic rename
 /// onto [`sidecar_path`]. A crash between the temp write and the rename leaves
 /// this `{id}.restrict-bound.tmp` behind; tree recovery sweeps it (it is

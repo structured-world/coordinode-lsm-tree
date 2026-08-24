@@ -2362,6 +2362,185 @@ fn repair_orders_equal_seqno_tables_by_descending_id() -> crate::Result<()> {
     Ok(())
 }
 
+/// A fresh id must not be one an orphaned `.restrict-bound` sidecar already
+/// names. The scan skips sidecars, so an id whose table is gone still has one
+/// lying beside it; publishing an UNRESTRICTED rewrite under that id makes a
+/// later manifest-loss repair match the stale sidecar by id and restrict the
+/// replacement at an unrelated bound, silently dropping its prefix.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_does_not_publish_a_rewrite_under_an_id_a_sidecar_names() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let kv = || Some(KvSeparationOptions::default().separation_threshold(16));
+
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(kv())
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        for i in 0..8u32 {
+            tree.insert(format!("k{i:04}").as_bytes(), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // A corrupt blob frame forces the referencing table through the handle
+    // rewrite, which publishes its copy under a fresh id.
+    let blob_path = memfs
+        .read_dir(&root.join(crate::file::BLOBS_FOLDER))?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one blob file")
+        .path;
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let last = crate::vlog::BlobFileScanner::new(&blob_path, &*fs_dyn, 0)?
+            .last()
+            .expect("a last frame")?;
+        let flip_at = last.frame_end - 8;
+        let mut file = fs_dyn.open(
+            &blob_path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        let byte = crate::file::read_exact(&*file, flip_at, 1)?;
+        file.seek(SeekFrom::Start(flip_at))?;
+        file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
+    }
+
+    // An ORPHANED sidecar for table 1 — the id the rewrite would take next.
+    let tables = root.join("tables");
+    crate::restrict_bound::write(
+        &*fs_dyn,
+        &tables.join("1"),
+        None,
+        1,
+        b"k0004",
+        crate::fs::SyncMode::Normal,
+    )?;
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    // The stale sidecar cannot be cleaned up, so the id must not be handed out
+    // in the first place — clearing it is best-effort, but the collision is not.
+    let fault = crate::fs::FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        crate::fs::FaultRule::new(
+            crate::fs::FaultOp::RemoveFile,
+            crate::fs::Fault::Error(crate::io::ErrorKind::PermissionDenied),
+        )
+        .on_path("restrict-bound"),
+    );
+    Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .with_kv_separation(kv())
+    .repair()?;
+
+    // Whatever id the rewrite took, no surviving sidecar may name it: a later
+    // repair would restrict that table at a bound belonging to another file.
+    let published: Vec<_> = memfs
+        .read_dir(&tables)?
+        .into_iter()
+        .filter(|e| e.file_name.parse::<crate::TableId>().is_ok())
+        .map(|e| e.file_name)
+        .collect();
+    for e in memfs.read_dir(&tables)? {
+        let Some(id) = e.file_name.strip_suffix(".restrict-bound") else {
+            continue;
+        };
+        assert!(
+            !published.iter().any(|name| name == id),
+            "table {id} is published while a stale sidecar names it: a later \
+             repair would restrict it at an unrelated bound",
+        );
+    }
+    Ok(())
+}
+
+/// Zeros alone are not a reclaim. With no trustworthy sidecar, repair reads a
+/// clean zeroed prefix as the mark of a completed punch and restricts the table
+/// past it — but corruption that zeroes the leading data block leaves exactly
+/// that shape, and then the destroyed block AND the sub-bound rows of the first
+/// readable block are dropped while repair reports the table recovered. A punch
+/// leaves a physical hole, so the classifier must see one.
+#[test]
+fn repair_does_not_read_a_zeroed_leading_block_as_a_reclaim() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    write_multiblock_sst(&sst, &fs)?;
+
+    // Overwrite the first data block with zeros — no hole is punched, so the
+    // file stays fully allocated. No sidecar: nothing ever committed a
+    // restriction for this table.
+    let first_block_end = recover_sst(sst.clone(), &fs)?.punch_offset_for(b"k00050")?;
+    assert!(first_block_end > 0, "the fixture has a leading block");
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = fs.open(
+            &sst,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&vec![0u8; usize::try_from(first_block_end).unwrap_or(0)])?;
+    }
+    assert_eq!(
+        fs.allocated_size(&sst)?,
+        Some(
+            crate::fs::FsFile::metadata(
+                &*fs.open(&sst, &crate::fs::FsOpenOptions::new().read(true))?
+            )?
+            .len
+        ),
+        "the fixture must be fully allocated: zeros written, not punched",
+    );
+
+    let config = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs);
+    let report = config.repair()?;
+    assert_eq!(
+        report.recovered, 0,
+        "a table whose leading block was DESTROYED must not be published as a \
+         restricted view of its own suffix: {report:?}",
+    );
+    Ok(())
+}
+
 /// A committed restriction does not make every zero region a reclaimed one.
 /// The prefix punch runs highest-block-first and stops at its first failure, so
 /// a failure on the very first call leaves the table with NO hole at all — and

@@ -3792,14 +3792,32 @@ fn repair_tree(
     });
 
     // Fresh ids for copies published BESIDE their source (the blob-handle
-    // rewrite). Starts one past the highest id the scan saw, so a new name can
-    // never displace a file this repair still has to read. `None` = exhausted,
-    // which fails the repair at the point of use rather than reusing an id.
-    let mut next_table_id: Option<TableId> = recovered_tables
-        .iter()
-        .map(|(t, _)| t.id())
-        .max()
-        .map_or(Some(0), |max| max.checked_add(1));
+    // rewrite). Starts one past the highest id ANY artifact in the table
+    // folders claims, so a new name can never displace a file this repair still
+    // has to read — and never inherits the meaning of one it does not.
+    // Sidecars count: the scan skips them, so a `.restrict-bound` whose table
+    // is gone still names an id, and publishing an UNRESTRICTED rewrite under
+    // it would make a later manifest-loss repair match that sidecar by id and
+    // restrict the replacement at an unrelated bound, dropping its prefix.
+    // Clearing the sidecar is best-effort; not taking the id is not.
+    // `None` = exhausted, which fails the repair at the point of use rather
+    // than reusing an id.
+    let mut highest_claimed_id: Option<TableId> =
+        recovered_tables.iter().map(|(t, _)| t.id()).max();
+    for (table_base_folder, folder_fs) in config.all_tables_folders() {
+        if !folder_fs.exists(&table_base_folder)? {
+            continue;
+        }
+        for dirent in folder_fs.read_dir(&table_base_folder)? {
+            let claimed = crate::restrict_bound::table_id_from_sidecar_name(&dirent.file_name)
+                .or_else(|| dirent.file_name.parse::<TableId>().ok());
+            if let Some(id) = claimed {
+                highest_claimed_id = Some(highest_claimed_id.map_or(id, |max| max.max(id)));
+            }
+        }
+    }
+    let mut next_table_id: Option<TableId> =
+        highest_claimed_id.map_or(Some(0), |max| max.checked_add(1));
     // Sources whose rewritten copy is in the rebuilt manifest. Set aside only
     // after `persist_version` — until then they are the only copy of their
     // rows, and a crash must leave them where a retry looks for them.
