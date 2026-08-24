@@ -2246,6 +2246,43 @@ fn salvage_guard_ignores_zero_filled_values_inside_a_surrendered_extent() -> cra
     Ok(())
 }
 
+/// A sidecar only attests the restriction of the table it names. Standalone
+/// verification has no caller-supplied id, but the SST's own file name carries
+/// one — a checksum-valid sidecar recorded for a DIFFERENT id (copied, stale)
+/// must not silence a zeroed leading block, or destruction reads as reclaim and
+/// the file is pronounced healthy.
+#[test]
+fn verify_sst_file_rejects_a_sidecar_naming_another_table() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs, SyncMode};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    write_multiblock_sst(&sst, &fs)?;
+
+    // A sidecar for a DIFFERENT table id beside table 0, and a first data block
+    // destroyed by corruption (not a reclaim — nothing committed a restriction
+    // for this file).
+    crate::restrict_bound::write(&*fs, &sst, None, 7, b"k00050", SyncMode::Normal)?;
+    let punch = recover_sst(sst.clone(), &fs)?.punch_offset_for(b"k00050")?;
+    assert!(punch > 0, "the fixture has a leading block to destroy");
+    memfs.punch_hole(&sst, 0, punch)?;
+
+    let report = crate::verify::verify_sst_file_with_fs(&*fs, &sst);
+    assert!(
+        !report.is_ok(),
+        "a foreign sidecar must not let the zeroed prefix pass as reclaimed: \
+         errors {:?}, warnings {:?}",
+        report.errors,
+        report.warnings,
+    );
+    Ok(())
+}
+
 /// The standalone out-of-band verify must not condemn a healthy restricted
 /// punched SST: with a valid colocated sidecar attesting the committed
 /// restriction, the leading zeroed (punched) region is the reclaimed prefix

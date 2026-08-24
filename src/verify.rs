@@ -1260,10 +1260,13 @@ fn read_ecc_params_out_of_band(
 /// and every zero stays part of the walk, flagging loudly — zeroed-out data on
 /// an unrestricted table is destruction, not reclaim.
 ///
-/// `known_table_id`: when the caller knows the durable id, a sidecar recorded
-/// for a DIFFERENT id is ignored (a stale or foreign sidecar must not silence
-/// zeroed blocks of an unrelated table). A standalone tool has no id source,
-/// so a decodable colocated sidecar is accepted as-is there.
+/// `known_table_id`: a sidecar recorded for a DIFFERENT id is ignored — a
+/// stale or foreign sidecar must not silence zeroed blocks of an unrelated
+/// table. A standalone tool passes `None`, and the identity then comes from the
+/// SST's own file name (tables are stored under their numeric id). A name that
+/// carries no id leaves the sidecar unmatchable, and an unmatchable sidecar
+/// never skips: the zeros stay in the walk and flag, which is the fail-closed
+/// direction (destruction misread as reclaim would pronounce the file healthy).
 ///
 /// Best-effort: any probe or read failure falls back to `0` (the loud
 /// default). An ENCRYPTED sidecar with no provider reads as corrupt and also
@@ -1283,9 +1286,15 @@ fn restricted_data_start(
     // VALUE payload happens to end in zeros followed by the next real header,
     // moving the frontier past an intact block and making the verifier skip it
     // (and any corruption inside it) while still reporting OK.
+    // The caller's id when it has one, else the id the file name carries.
+    let expected_id = known_table_id.or_else(|| {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.parse::<crate::TableId>().ok())
+    });
     match crate::restrict_bound::read(fs, path, encryption) {
         Ok(crate::restrict_bound::SidecarRead::Present(sidecar_id, _))
-            if known_table_id.is_none_or(|id| id == sidecar_id) => {}
+            if expected_id == Some(sidecar_id) => {}
         _ => return 0,
     }
     let Ok(mut file) = fs.open(path, &crate::fs::FsOpenOptions::new().read(true)) else {
