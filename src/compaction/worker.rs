@@ -1793,6 +1793,10 @@ fn plan_merge_on_read(
         // that no longer line up with the verbatim-copied physical blocks. Relocating
         // it would alias the wrong rows; fall back to copy-on-write instead.
         || !source.delete_bitmap().is_empty()
+        // A tight-space restricted view renumbers for the same reason — `scan()`
+        // starts at its bound — and the relocation would additionally copy the
+        // punched prefix and publish it unrestricted.
+        || source.restrict_lower_bound().is_some()
     {
         return Ok(None);
     }

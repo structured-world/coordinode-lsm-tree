@@ -133,6 +133,46 @@ fn relocated_mor_table_passes_metadata_bounds_cross_check() -> crate::Result<()>
     Ok(())
 }
 
+/// A tight-space RESTRICTED view reads its live suffix only: `scan()` starts at
+/// the bound and numbers rows from zero, while the relocation copies the whole
+/// physical data section — punched prefix blocks included — and publishes the
+/// copy WITHOUT the restriction. The bitmap would then mask shifted rows and
+/// reads could reach the copied zero blocks, so block reuse must refuse and let
+/// the caller rewrite copy-on-write.
+#[cfg(feature = "columnar")]
+#[test]
+fn relocate_rejects_a_restricted_view() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let src_path = dir.path().join("src");
+
+    let mut writer = Writer::new(src_path.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    for i in 0..32u32 {
+        writer.write(InternalValue::from_components(
+            format!("k{i:04}").into_bytes(),
+            b"val",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+    let source = recover_at(&src_path, checksum, 0)?;
+    let restricted = source.reopen_restricted(crate::UserKey::from(&b"k0016"[..]))?;
+
+    let out_path = dir.path().join("out");
+    let mut bitmap = DeleteBitmap::new();
+    bitmap.insert(0);
+    let err = restricted
+        .relocate_columnar_with_deletes(&out_path, &StdFs, 1, &bitmap, SyncMode::Normal)
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::Error::FeatureUnsupported(_)),
+        "a restricted view must be rejected, got {err:?}",
+    );
+    Ok(())
+}
+
 #[test]
 fn relocate_rejects_row_major_segment() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;

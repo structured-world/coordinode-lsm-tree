@@ -62,9 +62,15 @@ impl Table {
             || self.metadata.ecc_unrecognized
             || !self.metadata.columnar
             || self.zone_map.is_empty()
+            // A tight-space RESTRICTED view reads its live suffix only, so its
+            // rows are numbered from the bound while this copies the whole
+            // physical section (punched prefix blocks included) and publishes it
+            // WITHOUT the restriction: the mask would land on shifted rows and
+            // reads could reach the copied zeros.
+            || self.restrict_lower_bound().is_some()
         {
             return Err(crate::Error::FeatureUnsupported(
-                "merge-on-read block reuse needs a non-encrypted, non-ECC columnar segment with a zone map",
+                "merge-on-read block reuse needs an unrestricted, non-encrypted, non-ECC columnar segment with a zone map",
             ));
         }
 
