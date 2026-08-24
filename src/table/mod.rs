@@ -2592,11 +2592,17 @@ impl Table {
             else {
                 continue;
             };
-            // Corrections are strictly increasing and non-overlapping; a
-            // regression would mean overlapping splices, so bail rather than
-            // underflow the gap.
+            // Corrections are strictly increasing and non-overlapping, so a
+            // regression means the block index is damaged (or restamped) — and
+            // it must ABORT for the same reason the index-read failure above
+            // does: stopping here would return a digest and an offset set that
+            // omit every later block, and the write loop's `predicted_offsets`
+            // guard would then silently skip any correctable fault it finds
+            // there, reporting a clean heal over known damage.
             let Some(gap) = write_offset.checked_sub(pos) else {
-                break;
+                return Err(crate::Error::InvalidHeader(
+                    "block index yields a heal correction below the position already consumed",
+                ));
             };
             consume(&mut rdr, &mut hasher, &mut buf, gap, true)?;
             hasher.update(&bytes);
@@ -3618,34 +3624,31 @@ impl Table {
     /// leading data block leaves the same read-as-zeros shape a completed punch
     /// does, and reading it as a reclaim would drop that block plus the
     /// sub-bound rows of the first readable one while reporting the table
-    /// recovered. A punch physically deallocates, so the file must ALSO report
-    /// less allocated space than its length. A backend that cannot answer the
-    /// probe leaves the punch unproven and the zeros are treated as damage —
-    /// which preserves the whole file for the operator instead of silently
-    /// publishing a truncated view of it.
+    /// recovered. A punch physically deallocates, so the block's OWN extent must
+    /// read as a hole. The probe is extent-local on purpose: a file-wide
+    /// allocation total cannot attribute the missing bytes to this block, and on
+    /// a filesystem with transparent compression an ordinary, fully-written file
+    /// already reports fewer physical bytes than its length. A backend that
+    /// cannot answer leaves the punch unproven and the zeros are treated as
+    /// damage — which preserves the whole file for the operator instead of
+    /// silently publishing a truncated view of it.
     ///
     /// # Errors
     ///
-    /// Propagates a block-index, positioned-read, or allocation-probe failure.
+    /// Propagates a block-index, positioned-read, or hole-probe failure.
     #[cfg(feature = "std")]
     pub(crate) fn has_punched_data_block(&self) -> crate::Result<bool> {
-        let sparse = match self.fs.allocated_size(&self.path)? {
-            Some(allocated) => {
-                allocated
-                    < crate::fs::FsFile::metadata(
-                        &*self.fs.open(&self.path, &FsOpenOptions::new().read(true))?,
-                    )?
-                    .len
-            }
-            None => false,
-        };
-        if !sparse {
-            return Ok(false);
-        }
         let file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
         for handle in self.block_index.iter() {
             let handle = handle?;
-            if Self::block_is_zeroed_in(&*file, &BlockHandle::new(handle.offset(), handle.size()))?
+            let block = BlockHandle::new(handle.offset(), handle.size());
+            if !Self::block_is_zeroed_in(&*file, &block)? {
+                continue;
+            }
+            if self
+                .fs
+                .extent_is_hole(&self.path, block.offset().0, u64::from(block.size()))?
+                == Some(true)
             {
                 return Ok(true);
             }
