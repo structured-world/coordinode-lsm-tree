@@ -996,6 +996,33 @@ impl Fs for MemFs {
         Ok(Some(len - punched))
     }
 
+    fn extent_is_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<Option<bool>> {
+        let state = read_state(&self.state)?;
+        if !state.files.contains_key(path) {
+            return Ok(None);
+        }
+        if len == 0 {
+            return Ok(Some(false));
+        }
+        // Covered iff every byte of the extent falls in some punched range.
+        // Ranges are recorded as written, so walk from `offset` and require an
+        // unbroken chain to reach the end.
+        let end = offset.saturating_add(len);
+        let ranges = state.punched.get(path).map_or(&[][..], Vec::as_slice);
+        let mut reached = offset;
+        let mut progressed = true;
+        while reached < end && progressed {
+            progressed = false;
+            for &(s, e) in ranges {
+                if s <= reached && e > reached {
+                    reached = e;
+                    progressed = true;
+                }
+            }
+        }
+        Ok(Some(reached >= end))
+    }
+
     fn sync_directory(&self, path: &Path) -> io::Result<()> {
         // The implicit root always exists: `ensure_parent_dir` accepts an
         // empty or `/` parent when creating files, and callers syncing a bare

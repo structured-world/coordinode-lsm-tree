@@ -462,6 +462,14 @@ impl Fs for StdFs {
     fn punch_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<()> {
         linux_caps::punch_hole(path, offset, len).map_err(io::Error::from)
     }
+
+    /// Linux: extent-local hole probe via `lseek(SEEK_DATA)`. Only this target
+    /// can punch, so only here can a hole exist to attribute; elsewhere the
+    /// trait default ("cannot tell") is also the truthful answer.
+    #[cfg(target_os = "linux")]
+    fn extent_is_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<Option<bool>> {
+        linux_caps::extent_is_hole(path, offset, len)
+    }
 }
 
 /// Shared by every backend that resolves paths against the host kernel's
@@ -1129,6 +1137,55 @@ mod linux_caps {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// Whether `[offset, offset + len)` is entirely unallocated, via
+    /// `lseek(SEEK_DATA)`: it returns the next byte at or after `offset` that is
+    /// backed by data, so the extent is a hole exactly when that byte lies at or
+    /// past its end. `ENXIO` means no data follows at all — a hole to EOF.
+    ///
+    /// Unlike a file-wide allocation total this attributes the hole to THIS
+    /// range, which is what tells a reclaimed data block from one destroyed by
+    /// corruption (both read as zeros).
+    #[cfg(target_pointer_width = "64")]
+    pub(super) fn extent_is_hole(path: &Path, offset: u64, len: u64) -> io::Result<Option<bool>> {
+        if len == 0 {
+            return Ok(Some(false));
+        }
+        let off = i64::try_from(offset)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset exceeds i64"))?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "extent end overflows"))?;
+        let f = File::open(path)?;
+        // SAFETY: `f` owns a valid readable fd for the duration of the call; the
+        // offset and whence are plain integers.
+        #[expect(unsafe_code, reason = "lseek(SEEK_DATA) FFI for an extent hole probe")]
+        let next_data = unsafe { libc::lseek(f.as_raw_fd(), off, libc::SEEK_DATA) };
+        if next_data < 0 {
+            let err = io::Error::last_os_error();
+            // No data at or after `offset`: the rest of the file is a hole.
+            if err.raw_os_error() == Some(libc::ENXIO) {
+                return Ok(Some(true));
+            }
+            // A filesystem without SEEK_DATA cannot answer; do not guess.
+            if matches!(err.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP)) {
+                return Ok(None);
+            }
+            return Err(err);
+        }
+        Ok(Some(u64::try_from(next_data).unwrap_or(u64::MAX) >= end))
+    }
+
+    /// 32-bit Linux: `punch_hole` is unsupported there, so no hole can exist to
+    /// attribute; "cannot tell" is the truthful answer.
+    #[cfg(not(target_pointer_width = "64"))]
+    pub(super) fn extent_is_hole(
+        _path: &Path,
+        _offset: u64,
+        _len: u64,
+    ) -> io::Result<Option<bool>> {
+        Ok(None)
     }
 
     /// 32-bit Linux: `punch_hole` capability is reported false, so this is

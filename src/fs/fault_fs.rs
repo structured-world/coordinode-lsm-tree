@@ -537,6 +537,15 @@ impl<F: Fs> Fs for FaultFs<F> {
         }
         self.inner.allocated_size(path)
     }
+
+    fn extent_is_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<Option<bool>> {
+        // Shares the `AllocatedSize` fault op: both are allocation probes, and a
+        // test arming one means "the backend cannot answer allocation questions".
+        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::AllocatedSize, Some(path)) {
+            return Err(fault_error(kind, FaultOp::AllocatedSize));
+        }
+        self.inner.extent_is_hole(path, offset, len)
+    }
 }
 
 /// A fault-injecting [`FsFile`] wrapping an inner handle.

@@ -253,6 +253,20 @@ impl Fs for IoUringFs {
         Ok(super::unix_allocated_size(path)?)
     }
 
+    fn extent_is_hole(
+        &self,
+        path: &Path,
+        offset: u64,
+        len: u64,
+    ) -> crate::io::Result<Option<bool>> {
+        // Same kernel, same probe as the std backend: this is a cold diagnostic
+        // path, so it goes through the shared `lseek(SEEK_DATA)` helper rather
+        // than the ring.
+        Ok(super::std_fs::linux_caps::extent_is_hole(
+            path, offset, len,
+        )?)
+    }
+
     fn sync_directory(&self, path: &Path) -> crate::io::Result<()> {
         let dir = File::open(path)?;
         if !dir.metadata()?.is_dir() {

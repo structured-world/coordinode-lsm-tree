@@ -377,6 +377,10 @@ impl Fs for CrashFs {
     fn allocated_size(&self, path: &Path) -> io::Result<Option<u64>> {
         self.inner.allocated_size(path)
     }
+
+    fn extent_is_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<Option<bool>> {
+        self.inner.extent_is_hole(path, offset, len)
+    }
 }
 
 /// A file handle that records its durable image on `fsync`.

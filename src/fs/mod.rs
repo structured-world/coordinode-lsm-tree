@@ -1150,6 +1150,33 @@ pub trait Fs: Send + Sync + 'static {
         let _ = path;
         Ok(None)
     }
+
+    /// Whether `[offset, offset + len)` of `path` is entirely a HOLE — an
+    /// unallocated range that reads back as zeros.
+    ///
+    /// This is the extent-local counterpart to [`allocated_size`](Self::allocated_size),
+    /// and the only one of the two that can attribute a hole to a specific
+    /// range. A file-wide allocation total says nothing about WHERE the missing
+    /// bytes are, and it is not even proof of a hole: a filesystem with
+    /// transparent compression reports an ordinary, fully-written file as using
+    /// fewer physical bytes than its length. Manifest repair uses this to tell a
+    /// reclaimed (punched) data block from one destroyed by corruption — both
+    /// read as zeros, and only the first may be skipped.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns `Ok(None)` ("cannot tell"). A backend that cannot answer leaves
+    /// the hole unproven, and a caller that needs the proof must treat the zeros
+    /// as content. Backends that support hole punching override it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the underlying probe fails on a backend that
+    /// supports it.
+    fn extent_is_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<Option<bool>> {
+        let _ = (path, offset, len);
+        Ok(None)
+    }
 }
 
 /// Bytes available to an unprivileged process on the filesystem backing
