@@ -1680,16 +1680,38 @@ fn restrict_salvaged_output(
                             config.encryption.as_deref(),
                             config.sync_mode,
                         )?,
-                        // Nothing to restore: the source never moved. Clear the
-                        // half-published output so the retry does not adopt an
-                        // unrestricted copy of a restricted table.
+                        // Nothing to restore: the source never moved. The output
+                        // MUST leave `tables/` though — it carries the
+                        // straddling block's sub-bound rows and has no valid
+                        // sidecar, so a scan that finds it adopts it
+                        // UNRESTRICTED and resurrects exactly the rows the
+                        // restriction hid. Removal first; a directory that
+                        // refuses it may still accept the rename that moves the
+                        // file out of the scan's way, and if neither works the
+                        // repair fails on THAT error — an undiscardable output
+                        // left in place is the one outcome that corrupts the
+                        // retry.
                         SalvageRollback::DiscardOutput => {
                             crate::restrict_bound::remove(folder_fs, table_path, config.sync_mode);
-                            if let Err(e) = folder_fs.remove_file(table_path) {
+                            if let Err(remove_err) = folder_fs.remove_file(table_path) {
                                 log::warn!(
-                                    "Failed to discard the unrestrictable salvage output {}: {e:?}",
+                                    "Failed to discard the unrestrictable salvage output {} \
+                                     ({remove_err:?}); moving it out of the scan instead",
                                     table_path.display(),
                                 );
+                                let (Some(base), Some(name)) = (
+                                    table_path.parent(),
+                                    table_path.file_name().and_then(|n| n.to_str()),
+                                ) else {
+                                    return Err(crate::Error::Unrecoverable);
+                                };
+                                quarantine_file(
+                                    folder_fs,
+                                    base,
+                                    table_path,
+                                    name,
+                                    config.sync_mode,
+                                )?;
                             }
                         }
                     }
@@ -3668,7 +3690,9 @@ fn repair_tree(
     // Sources whose rewritten copy is in the rebuilt manifest. Set aside only
     // after `persist_version` — until then they are the only copy of their
     // rows, and a crash must leave them where a retry looks for them.
-    let mut stale_table_originals: Vec<(PathBuf, String)> = Vec::new();
+    // Each entry carries the source's OWN backend: a per-level route stores its
+    // tables through a different `Fs`, where the primary one cannot see them.
+    let mut stale_table_originals: Vec<(Arc<dyn crate::fs::Fs>, PathBuf, String)> = Vec::new();
 
     // KV-separated (blob) trees additionally carry a blob-file list. Discover the
     // blob files from the `blobs/` folder (no manifest to filter against) and
@@ -3862,8 +3886,11 @@ fn repair_tree(
                         allow_resurrection,
                     )?;
                     kept.push((rewritten, false));
-                    stale_table_originals
-                        .push((path, format!("blob handles rewritten into table {new_id}")));
+                    stale_table_originals.push((
+                        Arc::clone(&fs),
+                        path,
+                        format!("blob handles rewritten into table {new_id}"),
+                    ));
                 }
                 Ok(SalvageOutcome::Unusable | SalvageOutcome::PunchedBoundLost) => {
                     set_aside_path(
@@ -4053,12 +4080,16 @@ fn repair_tree(
     // outside the manifest is an orphan the next open DELETES — so the
     // set-aside is what preserves them, and a failure to perform it fails the
     // repair rather than reporting success over a tree that loses them.
-    for (path, note) in stale_table_originals {
+    for (fs, path, note) in stale_table_originals {
         let (Some(base), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
         else {
             return Err(crate::Error::Unrecoverable);
         };
-        match quarantine_file(&*config.fs, base, &path, name, config.sync_mode) {
+        // Through the SOURCE's backend: a routed table lives in a namespace the
+        // primary `Fs` cannot see, where this rename would either fail
+        // `NotFound` (after the manifest already committed) or, worse, move a
+        // same-named file from the primary namespace.
+        match quarantine_file(&*fs, base, &path, name, config.sync_mode) {
             Ok(dest) => log::info!(
                 "repair: {note}; superseded source preserved at {}",
                 dest.display(),

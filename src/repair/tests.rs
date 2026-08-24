@@ -2253,6 +2253,61 @@ fn salvage_guard_ignores_zero_filled_values_inside_a_surrendered_extent() -> cra
 /// WITHOUT the sidecar the zeros stay part of the walk and flag loudly:
 /// zeroed-out data on an unrestricted table is destruction, not reclaim.
 #[test]
+fn verify_sst_file_skips_a_punched_prefix_within_a_read_budget() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs, SyncMode};
+    use crate::io::ErrorKind;
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    {
+        use crate::{InternalValue, ValueType};
+        let mut w =
+            crate::table::Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(256);
+        for i in 0..4096u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                vec![b'v'; 32],
+                u64::from(i) + 1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+    crate::restrict_bound::write(&*fs, &sst, None, 0, b"k04000", SyncMode::Normal)?;
+    let punch = recover_sst(sst.clone(), &fs)?.punch_offset_for(b"k04000")?;
+    assert!(
+        punch > 100_000,
+        "the fixture has a sizable reclaimed prefix"
+    );
+    memfs.punch_hole(&sst, 0, punch)?;
+
+    // The reclaimed prefix must be crossed in bulk reads, not one per byte: a
+    // production prefix is gigabytes, where a per-byte walk never finishes.
+    // The budget errors the (N+1)-th positioned read, so exceeding it fails the
+    // verification loudly instead of hanging the test.
+    let budget = FaultFs::new((*memfs).clone());
+    budget.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .skip(512),
+    );
+    let report = crate::verify::verify_sst_file_with_fs(&budget, &sst);
+    assert!(
+        report.is_ok(),
+        "crossing a {punch}-byte reclaimed prefix must stay well inside a \
+         512-read budget: errors {:?}, warnings {:?}",
+        report.errors,
+        report.warnings,
+    );
+    Ok(())
+}
+
+#[test]
 fn verify_sst_file_honors_a_restricted_punched_prefix() -> crate::Result<()> {
     use crate::fs::{Fs, MemFs, SyncMode};
     use std::sync::Arc;
@@ -7006,6 +7061,233 @@ fn repair_rewrites_a_restricted_table_that_references_a_reshaped_blob() -> crate
     assert!(
         tree.get(b"k0000", crate::SeqNo::MAX)?.is_none(),
         "the key below the restriction bound must stay hidden",
+    );
+    Ok(())
+}
+
+/// The post-commit set-aside of a rewritten source must use THAT source's
+/// backend. A per-level route stores its tables in a namespace the primary
+/// filesystem cannot see, so resolving the path through the primary one either
+/// fails (after the manifest has already committed, leaving the routed original
+/// as an orphan) or moves a same-named file from the wrong namespace.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_sets_aside_a_routed_rewrite_source_through_its_own_backend() -> crate::Result<()> {
+    use crate::config::LevelRoute;
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let hotfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let hot = std::path::absolute("/hot")?;
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .level_routes(vec![LevelRoute {
+            levels: 0..2,
+            path: hot.clone(),
+            fs: hotfs.clone(),
+        }])
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+
+    {
+        let tree = match config().open()? {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        for i in 0..8u32 {
+            tree.insert(format!("k{i:04}").as_bytes(), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let routed_source = hot.join("tables").join("0");
+    assert!(
+        hotfs.exists(&routed_source)?,
+        "the fixture's SST is on the routed tier",
+    );
+
+    // A corrupt blob frame salvages the blob, which forces the referencing
+    // table through the handle rewrite.
+    let blob_path = memfs
+        .read_dir(&root.join(crate::file::BLOBS_FOLDER))?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one blob file")
+        .path;
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let last = crate::vlog::BlobFileScanner::new(&blob_path, &*fs_dyn, 0)?
+            .last()
+            .expect("a last frame")?;
+        let flip_at = last.frame_end - 8;
+        let mut file = fs_dyn.open(
+            &blob_path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        let byte = crate::file::read_exact(&*file, flip_at, 1)?;
+        file.seek(SeekFrom::Start(flip_at))?;
+        file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
+    }
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    config().repair()?;
+    assert!(
+        !hotfs.exists(&routed_source)?,
+        "the rewritten source is set aside on the tier it lives on",
+    );
+    assert!(
+        hotfs.exists(&hot.join("repair-quarantine").join("0"))?,
+        "and it is preserved there, not lost",
+    );
+    config().open()?;
+    Ok(())
+}
+
+/// An output whose restriction could not be re-imposed must not stay in
+/// `tables/` under a numeric name. It carries the straddling block's sub-bound
+/// rows and has no sidecar, so a later repair adopts it UNRESTRICTED and
+/// resurrects exactly the rows the restriction hid. When it cannot be removed
+/// it must be moved out of the scan's way, and if that fails too the repair
+/// fails rather than leaving it discoverable.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_does_not_leave_an_unrestrictable_rewrite_in_the_scan() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let kv = || Some(KvSeparationOptions::default().separation_threshold(16));
+
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(kv())
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        for i in 0..8u32 {
+            tree.insert(format!("k{i:04}").as_bytes(), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // The compound state: a restricted source whose blob is SALVAGED (one
+    // corrupt frame), so every surviving record — including the sub-bound rows
+    // of the straddling block — is re-emitted through the handle rewrite.
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let blob_path = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one blob file")
+        .path;
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let last = crate::vlog::BlobFileScanner::new(&blob_path, &*fs_dyn, 0)?
+            .last()
+            .expect("a last frame")?;
+        let flip_at = last.frame_end - 8; // inside the last frame's payload
+        let mut file = fs_dyn.open(
+            &blob_path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        let byte = crate::file::read_exact(&*file, flip_at, 1)?;
+        file.seek(SeekFrom::Start(flip_at))?;
+        file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
+    }
+    let source = root.join("tables").join("0");
+    crate::restrict_bound::write(
+        &*fs_dyn,
+        &source,
+        None,
+        0,
+        b"k0001",
+        crate::fs::SyncMode::Normal,
+    )?;
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    // The copy's own sidecar cannot be written (so it would be adopted
+    // unrestricted) and it cannot be removed either.
+    let fault = FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("restrict-bound"),
+    );
+    fault.injector().arm(
+        FaultRule::new(
+            FaultOp::RemoveFile,
+            Fault::Error(ErrorKind::PermissionDenied),
+        )
+        .on_path("tables"),
+    );
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .with_kv_separation(kv())
+    .repair();
+    assert!(
+        result.is_err(),
+        "the failed restriction propagates: {result:?}"
+    );
+
+    // Whatever happened, the next scan must not find an unrestricted copy of
+    // the restricted table.
+    let config = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .with_kv_separation(kv());
+    config.repair()?;
+    let tree = match config.open()? {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+    };
+    assert!(
+        tree.get(b"k0000", crate::SeqNo::MAX)?.is_none(),
+        "the row below the restriction bound must stay hidden: an unrestrictable \
+         rewrite left in tables/ resurrects it",
     );
     Ok(())
 }
