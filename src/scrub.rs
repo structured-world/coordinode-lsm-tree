@@ -801,9 +801,9 @@ fn refresh_healed_checksum(
         None => 0,
     };
     let walk = crate::verify::verify_sst_file_with_context(
-        &*table.fs,
+        &table.fs,
         &table.path,
-        table.encryption.as_deref(),
+        table.encryption.as_ref(),
         Some(table.id()),
         data_start,
     );

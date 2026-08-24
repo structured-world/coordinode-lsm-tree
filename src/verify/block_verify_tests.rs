@@ -1521,7 +1521,8 @@ fn verify_sst_file_flags_a_corrupt_blob_link_count() {
     *bytes.get_mut(pos).expect("count prefix within the file") ^= 0xFF;
     std::fs::write(&sst_path, &bytes).unwrap();
 
-    let report = verify_sst_file_with_fs(&crate::fs::StdFs, &sst_path);
+    let fs: alloc::sync::Arc<dyn crate::fs::Fs> = alloc::sync::Arc::new(crate::fs::StdFs);
+    let report = verify_sst_file_with_fs(&fs, &sst_path);
     assert!(
         report.errors.iter().any(|e| matches!(
             e,

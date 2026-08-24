@@ -908,7 +908,8 @@ pub fn verify_kv_checksums(tree: &impl crate::AbstractTree) -> crate::Result<()>
 #[cfg(feature = "std")]
 #[must_use]
 pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
-    verify_sst_file_with_fs(&crate::fs::StdFs, path)
+    let fs: alloc::sync::Arc<dyn crate::fs::Fs> = alloc::sync::Arc::new(crate::fs::StdFs);
+    verify_sst_file_with_fs(&fs, path)
 }
 
 /// As [`verify_sst_file`], but reads `path` through the given filesystem.
@@ -917,7 +918,7 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
 /// before deciding whether to salvage it, rather than assuming `StdFs`.
 #[cfg(feature = "std")]
 pub(crate) fn verify_sst_file_with_fs(
-    fs: &dyn crate::fs::Fs,
+    fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
     path: &std::path::Path,
 ) -> BlockVerifyReport {
     verify_sst_file_with_context(fs, path, None, None, 0)
@@ -940,14 +941,14 @@ pub(crate) fn verify_sst_file_with_fs(
 /// `table_id = 0`).
 #[cfg(feature = "std")]
 pub(crate) fn verify_sst_file_with_context(
-    fs: &dyn crate::fs::Fs,
+    fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
     path: &std::path::Path,
-    encryption: Option<&dyn crate::encryption::EncryptionProvider>,
+    encryption: Option<&alloc::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
     known_table_id: Option<crate::TableId>,
     // Byte offset to start the DATA-section walk at: `0` for a normal table, the
     // punch offset for a tight-space RESTRICTED view (its `[0, data_start)` data
-    // blocks were hole-punched and read as zeros). The caller supplies it because
-    // this path-based walk has no `Table` to derive the restriction from.
+    // blocks were hole-punched and read as zeros). A caller holding the table
+    // supplies it directly; a standalone walk derives it below.
     data_start: u64,
 ) -> BlockVerifyReport {
     let table_id = known_table_id.unwrap_or(0);
@@ -972,7 +973,8 @@ pub(crate) fn verify_sst_file_with_context(
     // the scan and reports spurious corruption. Surface the indeterminacy and
     // skip the walk.
     let mut ecc_unrecognized = false;
-    let probe = match read_ecc_params_out_of_band(fs, path, encryption, known_table_id) {
+    let provider = encryption.map(|e| &**e);
+    let probe = match read_ecc_params_out_of_band(&**fs, path, provider, known_table_id) {
         Ok(p) => p,
         // Real file-open / SFA-trailer failure — preserve the underlying error
         // rather than collapsing it into the undeterminable message below.
@@ -1069,9 +1071,9 @@ pub(crate) fn verify_sst_file_with_context(
     // zero here would false-flag a healthy encrypted block just over the cap
     // as HeaderCorrupted and send the whole table to quarantine/salvage.
     let max_enc_overhead =
-        encryption.map_or(0u32, crate::encryption::EncryptionProvider::max_overhead);
+        provider.map_or(0u32, crate::encryption::EncryptionProvider::max_overhead);
     match scan_sst_blocks(
-        fs,
+        &**fs,
         path,
         table_id,
         max_enc_overhead,
@@ -1273,9 +1275,9 @@ fn read_ecc_params_out_of_band(
 /// falls back — encrypted restricted SSTs need the provider-carrying path.
 #[cfg(feature = "std")]
 fn restricted_data_start(
-    fs: &dyn crate::fs::Fs,
+    fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
     path: &std::path::Path,
-    encryption: Option<&dyn crate::encryption::EncryptionProvider>,
+    encryption: Option<&alloc::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
     known_table_id: Option<crate::TableId>,
 ) -> u64 {
     // The frontier is derived by WALKING THE FRAMES, never by searching for
@@ -1292,11 +1294,23 @@ fn restricted_data_start(
             .and_then(|n| n.to_str())
             .and_then(|n| n.parse::<crate::TableId>().ok())
     });
-    match crate::restrict_bound::read(fs, path, encryption) {
-        Ok(crate::restrict_bound::SidecarRead::Present(sidecar_id, _))
-            if expected_id == Some(sidecar_id) => {}
+    let bound = match crate::restrict_bound::read(&**fs, path, encryption.map(|e| &**e)) {
+        Ok(crate::restrict_bound::SidecarRead::Present(sidecar_id, bound))
+            if expected_id == Some(sidecar_id) =>
+        {
+            bound
+        }
         _ => return 0,
-    }
+    };
+    // Where that bound actually falls, read from the table's own index. This is
+    // the only authority on the frontier: a committed restriction does NOT make
+    // every zero region a reclaimed one, because the prefix punch runs
+    // highest-block-first and stops at its first failure — a failure on the very
+    // first call leaves no hole at all, and then the first zeros the walk meets
+    // are destroyed live data. The walk's answer is kept as an upper bound: the
+    // standalone path cannot know a custom comparator, so an index lookup that
+    // lands too high can never widen the skip beyond what the geometry shows.
+    let index_frontier = index_derived_frontier(fs, path, encryption, expected_id, &bound);
     let Ok(mut file) = fs.open(path, &crate::fs::FsOpenOptions::new().read(true)) else {
         return 0;
     };
@@ -1361,7 +1375,55 @@ fn restricted_data_start(
         offset = next;
     }
     // `data_pos` means no validated punched extent was found: nothing to skip.
-    if frontier == data_pos { 0 } else { frontier }
+    if frontier == data_pos {
+        return 0;
+    }
+    // Both answers bound the skip: the index says where the restriction ends,
+    // the walk says how far the reclaimed geometry actually reaches. Skipping
+    // past either would step over live data.
+    index_frontier.map_or(0, |from_index| from_index.min(frontier))
+}
+
+/// The offset the restriction `bound` maps to in this SST's block index, or
+/// `None` when the table cannot be opened (which is often the very reason it is
+/// being verified) — the caller then skips nothing.
+///
+/// Opened with the DEFAULT comparator: a standalone verification has no tree
+/// context. A custom-comparator tree can therefore land on a different block,
+/// which is why the caller uses this as one of two bounds rather than as the
+/// frontier outright.
+#[cfg(feature = "std")]
+fn index_derived_frontier(
+    fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
+    path: &std::path::Path,
+    encryption: Option<&alloc::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
+    table_id: Option<crate::TableId>,
+    bound: &[u8],
+) -> Option<u64> {
+    // Through the CALLER's filesystem, not `std::fs`: the table being verified
+    // may live on any backend.
+    let checksum =
+        crate::Checksum::from_raw(crate::repair::compute_table_checksum_from(&**fs, path, 0).ok()?);
+    let table = crate::table::Table::recover(
+        path.to_path_buf(),
+        checksum,
+        0,
+        0,
+        table_id.unwrap_or(0),
+        alloc::sync::Arc::new(crate::cache::Cache::with_capacity_bytes(1_000_000)),
+        None,
+        alloc::sync::Arc::clone(fs),
+        false,
+        false,
+        encryption.map(alloc::sync::Arc::clone),
+        #[cfg(zstd_any)]
+        None,
+        crate::comparator::default_comparator(),
+        #[cfg(feature = "metrics")]
+        alloc::sync::Arc::new(crate::metrics::Metrics::default()),
+    )
+    .ok()?;
+    table.punch_offset_for(bound).ok()
 }
 
 /// Decodes the block header at `offset`, or `None` when no frame starts there.
