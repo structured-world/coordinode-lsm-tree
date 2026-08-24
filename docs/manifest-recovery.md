@@ -335,30 +335,29 @@ record's new offset, and only entries whose record was lost are dropped — the
 lost key reads as absent afterwards, never as an error, and intact live data
 is never discarded over a reshaped dependency. The same rewrite drops a stale
 handle that points below a punched-but-intact blob file's frontier (a
-pre-relocation SST left behind by a crash). Two shapes still set a table
-aside, deterministically and with the original preserved: a table whose
-reference list cannot be read, and a *restricted* survivor whose blob
-dependency was reshaped (the rewrite would emit an unrestricted copy and
-resurrect its punched prefix).
+pre-relocation SST left behind by a crash). A *restricted* survivor is
+rewritten like any other, with its bound re-imposed on the copy through the
+single path every salvage output funnels through — the rewrite re-emits the
+straddling block, so an unrestricted copy would resurrect the rows the
+restriction hides. One shape still sets a table aside, deterministically and
+with the original preserved: a table whose reference list cannot be read.
 
-The blob publish and the table rewrites are separate steps, so the relocation
-is made **crash-consistent** explicitly. Before the replacement takes the
-canonical name, its offset remap is durably recorded in a `blobs/{id}.remap`
-sidecar (checksummed, written atomically); the replacement then validates as
-an ordinary intact blob on a retry, and the sidecar is what tells that retry
-the referencing tables still need rewriting. Each rewritten table is stamped
-per blob with a fingerprint of the remap it applied — salvage is
-deterministic over an unchanged source, so a retry recomputes the same value
-per blob and passes each table through only the remaps it does not carry yet
-(re-applying an applied map to relocated handles would drop live entries).
-The stamps are per blob rather than one whole-set value because the rewrite
-set can grow between attempts — a blob newly damaged before the retry must
-not un-recognize tables already rewritten for the earlier blobs. The
-sidecars are removed, strictly, after the table stage and
-before the manifest commit: a crash anywhere in between leaves either the
-sidecar (the retry re-adopts the remap) or a fully consistent tree, while a
-corrupt surviving sidecar fails the repair closed — the replacement alone
-cannot say where its records used to live.
+The blob publish and the table rewrites are separate steps, and the relocation
+is made **crash-consistent** by carrying nothing between runs. Each rewritten
+table is published under a FRESH id beside its untouched source, so a crashed
+attempt leaves the source exactly where the retry looks for it and the retry
+re-derives the same deterministic rewrite from the same inputs — there is no
+recorded remap for it to re-adopt and no stamp for it to recognize. Sources
+are set aside only AFTER the manifest commit, through the backend each was
+found under (a per-level route's tables live in their own namespace). A copy
+whose restriction could not be re-imposed is removed, or moved out of the scan
+when the directory refuses removal, so it can never be adopted later as an
+unrestricted table; if neither is possible the repair fails on that error.
+The one residue this leaves is a crash in the window between publishing a copy
+and committing the manifest: the retry then adopts both the source and that
+copy, which costs a duplicate L0 run of identical rows (compaction collapses
+it, and the change-feed enumeration deduplicates copies across sources) but
+never loses data.
 
 ## Delete-mask resolution
 
@@ -460,9 +459,10 @@ the commit, and unreferenced files are swept; the residual exposure is disk
 space held by orphans between a crash and the next open, not correctness.
 
 **Repair assumes an exclusive tree.** It runs single-threaded against a tree
-nobody else has open, and that assumption is currently procedural rather than
-enforced by a lock file. A concurrent writer during repair is undefined; the
-cross-process directory lock that would enforce it is tracked separately.
-Note that a lock addresses concurrency only — it is not a substitute for any
-of the crash-safety properties above, which must hold even for a single
-process that dies mid-repair.
+nobody else has open, and holds the cross-process directory lock for its whole
+duration (a second acquirer fails fast rather than interleaving). The lock is
+opt-out through configuration, and where it is disabled the assumption is
+procedural again and a concurrent writer is undefined. Note that a lock
+addresses concurrency only — it is not a substitute for any of the
+crash-safety properties above, which must hold even for a single process that
+dies mid-repair.
