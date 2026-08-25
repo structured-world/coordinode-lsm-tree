@@ -17,6 +17,11 @@
 //! ingested segments carry a *uniform per-segment* seqno (every local seqno is
 //! `0`, one `global_seqno` per table), so their visibility is segment-granular;
 //! flush-produced segments carry per-row seqnos, so a snapshot can straddle them.
+//! A projected seqno column is emitted in that EFFECTIVE (tree-global) space,
+//! which is what every other read surface speaks: the stored local value would
+//! read as `0` for an ingested row and name a commit the tree never had. The
+//! masking arithmetic still runs in local space (one subtraction per segment
+//! instead of one addition per row), so only the emitted column is translated.
 //! The visible columnar segments overlapping the range are grouped by key-range
 //! overlap:
 //!
@@ -275,6 +280,42 @@ impl ColumnarScan {
         matches!(self.lo, Bound::Unbounded) && matches!(self.hi, Bound::Unbounded)
     }
 
+    /// Rewrites a batch's seqno column from its segment's LOCAL space into the
+    /// tree's global one (`local + global`).
+    ///
+    /// A bulk-ingested segment stores every row at local seqno `0` and carries
+    /// its ordering in a per-segment `global_seqno`, so the stored column is not
+    /// a commit sequence number any other read surface would recognize. The
+    /// masking arithmetic elsewhere translates the THRESHOLD into local space
+    /// instead (cheaper, one subtraction per segment), which is why the column
+    /// itself still needs this before it reaches a caller. A zero offset leaves
+    /// the batch untouched.
+    fn globalize_seqnos(batch: &mut ColumnBatch, global: SeqNo) -> crate::Result<()> {
+        if global == 0 {
+            return Ok(());
+        }
+        let Some(col) = batch.columns.iter_mut().find(|c| c.column_id == COL_SEQNO) else {
+            return Ok(());
+        };
+        for row in 0..batch.row_count as usize {
+            let at = row * 8;
+            let bytes = col
+                .data
+                .get_mut(at..at + 8)
+                .ok_or(Error::InvalidHeader("columnar_scan: short seqno column"))?;
+            let local = u64::from_le_bytes(
+                (&*bytes)
+                    .try_into()
+                    .map_err(|_| Error::InvalidHeader("columnar_scan: short seqno column"))?,
+            );
+            let effective = local.checked_add(global).ok_or(Error::InvalidHeader(
+                "columnar_scan: effective seqno overflows",
+            ))?;
+            bytes.copy_from_slice(&effective.to_le_bytes());
+        }
+        Ok(())
+    }
+
     /// Singleton group: no cross-segment merge. When every row is visible and the
     /// range is unbounded, the per-SST projected scan streams verbatim (zero-copy
     /// column-skip). Otherwise a per-row mask drops rows that are seqno-invisible
@@ -295,6 +336,9 @@ impl ColumnarScan {
                 .table
                 .columnar_scan(&self.projection, self.predicate.as_ref())?;
             out.retain(|b| b.row_count > 0);
+            for batch in &mut out {
+                Self::globalize_seqnos(batch, seg.global)?;
+            }
             return Ok(out);
         }
 
@@ -377,6 +421,7 @@ impl ColumnarScan {
                 visible.columns.retain(|c| c.column_id != COL_USER_KEY);
             }
             if visible.row_count > 0 {
+                Self::globalize_seqnos(&mut visible, seg.global)?;
                 out.push(visible);
             }
         }
@@ -540,6 +585,7 @@ impl ColumnarScan {
                 visible.columns.retain(|c| c.column_id != pc);
             }
             if visible.row_count > 0 {
+                Self::globalize_seqnos(&mut visible, seg.global)?;
                 out.push(visible);
             }
         }
@@ -714,6 +760,22 @@ impl ColumnarScan {
         }
 
         let mut merged = take_rows(&combined, &kept)?;
+
+        // The union spans segments with DIFFERENT offsets, so no single one
+        // applies: write each surviving row's effective seqno — already computed
+        // for the dedup above — into the column, in the tree's global
+        // coordinates. Done before the predicate filter, while row `i` of
+        // `merged` still corresponds to `kept[i]`.
+        if let Some(col) = merged.columns.iter_mut().find(|c| c.column_id == COL_SEQNO) {
+            for (row, &i) in kept.iter().enumerate() {
+                let at = row * 8;
+                let bytes = col
+                    .data
+                    .get_mut(at..at + 8)
+                    .ok_or(Error::InvalidHeader("columnar_scan: short seqno column"))?;
+                bytes.copy_from_slice(&eff_at(i).to_le_bytes());
+            }
+        }
 
         // Apply the row predicate AFTER newest-version dedup: each surviving row is
         // now the newest visible version of its key, so a key whose newest version

@@ -1110,6 +1110,58 @@ fn tree_columnar_scan_suppresses_a_key_its_newest_row_deletes() {
     );
 }
 
+/// A bulk-ingested segment stores every row at LOCAL seqno 0 and takes its
+/// effective ordering from the segment's `global_seqno`, which is what tree
+/// visibility and every other read surface use. A projected seqno column must
+/// therefore be translated to that global coordinate — handing back the stored
+/// zero reports a commit sequence number the tree never had.
+#[test]
+fn tree_columnar_scan_projects_seqnos_in_global_coordinates() {
+    let folder = get_tmp_folder();
+    let any = open_columnar_any(folder.path());
+    // Two DISJOINT singletons: the first ingestion takes global seqno 0 on a
+    // fresh tree, so a second one is needed for a nonzero offset to exist.
+    ingest_segment(&any, &[(key(1), 10)]);
+    ingest_segment(&any, &[(key(9), 20)]);
+
+    let tree = standard(&any);
+    let version = tree.current_version();
+    let mut globals: Vec<u64> = version
+        .iter_tables()
+        .map(lsm_tree::Table::global_seqno)
+        .collect();
+    globals.sort_unstable();
+    assert!(
+        globals.last().is_some_and(|&g| g > 0),
+        "the second ingestion takes a nonzero global seqno, got {globals:?}",
+    );
+    drop(version);
+
+    let mut seqnos: Vec<u64> = Vec::new();
+    for batch in tree
+        .columnar_scan(&[COL_USER_KEY, COL_SEQNO], None, SeqNo::MAX, ..)
+        .expect("scan")
+    {
+        let batch = batch.expect("batch");
+        let seqno_col = batch
+            .columns
+            .iter()
+            .find(|c| c.column_id == COL_SEQNO)
+            .expect("seqno column projected");
+        for i in 0..batch.row_count as usize {
+            seqnos.push(u64::from_le_bytes(
+                seqno_col.data[i * 8..i * 8 + 8].try_into().unwrap(),
+            ));
+        }
+    }
+    seqnos.sort_unstable();
+    assert_eq!(
+        seqnos, globals,
+        "each row carries the EFFECTIVE seqno of its segment (local + global), \
+         not the stored local zero",
+    );
+}
+
 /// The same rule on the ZERO-COPY path: a segment with one version per key is
 /// streamed verbatim, and a key whose single row is a tombstone would ride
 /// straight through it.
