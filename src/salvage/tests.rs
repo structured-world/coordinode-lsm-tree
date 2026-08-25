@@ -9095,6 +9095,142 @@ fn salvage_reencodes_an_ecc_recovered_columnar_block() -> crate::Result<()> {
 /// current — a delete resurrects, or an overwritten value comes back. The
 /// boundary key's entries must be dropped with it unless resurrection is on.
 #[test]
+fn salvage_keeps_tied_seqno_merge_operands() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{InternalValue, ValueType};
+
+    let dir = tempfile::tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let source = dir.path().join("source");
+    let dest = dir.path().join("dest");
+
+    // One write batch adds several merge operands for a key, so they share the
+    // batch's seqno and a flush stores every one of them. The pair below sits in
+    // ONE block; `z` gets its own so a corruption elsewhere can trigger salvage.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(100);
+    writer.write(InternalValue::new_merge_operand(
+        b"k".as_slice(),
+        [b'A'; 64],
+        10,
+    ))?;
+    writer.write(InternalValue::new_merge_operand(
+        b"k".as_slice(),
+        [b'B'; 64],
+        10,
+    ))?;
+    writer.write(InternalValue::from_components(
+        b"z",
+        [b'z'; 128],
+        1,
+        ValueType::Value,
+    ))?;
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Corrupt the LAST block so salvage runs while the operand block is clean.
+    let last_off = {
+        let table = open(source.clone(), &fs)?;
+        let offsets: Vec<u64> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|kh| *kh.as_ref().offset())
+            .collect();
+        assert!(
+            offsets.len() >= 2,
+            "the fixture needs the operands and `z` in separate blocks, got {}",
+            offsets.len(),
+        );
+        usize::try_from(offsets.last().copied().unwrap_or_default()).unwrap_or(usize::MAX)
+    };
+    let mut bytes = std::fs::read(&source)?;
+    if let Some(b) = bytes.get_mut(last_off + crate::table::block::Header::MIN_LEN + 1) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert_eq!(
+        report.dropped.len(),
+        1,
+        "only `z`'s block is lost: {report:?}"
+    );
+
+    let recovered = open(dest, &fs)?;
+    let operands: Vec<_> = recovered
+        .scan()?
+        .filter_map(Result::ok)
+        .filter(|e| e.key.user_key.as_ref() == b"k")
+        .map(|e| e.value.to_vec())
+        .collect();
+    assert_eq!(
+        operands.len(),
+        2,
+        "both operands are valid input to the merge, so a clean block holding \
+         them must not be rejected as out of order: {operands:?}",
+    );
+    Ok(())
+}
+
+/// The same run can straddle a block boundary — the batch's operands do not have
+/// to land in one block — so the cross-edge check has to accept the tie too.
+#[test]
+fn salvage_keeps_tied_seqno_merge_operands_across_a_block_boundary() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{InternalValue, ValueType};
+
+    let dir = tempfile::tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let source = dir.path().join("source");
+    let dest = dir.path().join("dest");
+
+    // One entry per block, so the two operands sit on either side of an edge.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(1);
+    writer.write(InternalValue::new_merge_operand(b"k".as_slice(), b"A", 10))?;
+    writer.write(InternalValue::new_merge_operand(b"k".as_slice(), b"B", 10))?;
+    writer.write(InternalValue::from_components(
+        b"z",
+        b"v",
+        1,
+        ValueType::Value,
+    ))?;
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    let last_off = {
+        let table = open(source.clone(), &fs)?;
+        let offsets: Vec<u64> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|kh| *kh.as_ref().offset())
+            .collect();
+        assert_eq!(offsets.len(), 3, "one block per entry");
+        usize::try_from(offsets.last().copied().unwrap_or_default()).unwrap_or(usize::MAX)
+    };
+    let mut bytes = std::fs::read(&source)?;
+    if let Some(b) = bytes.get_mut(last_off + crate::table::block::Header::MIN_LEN + 1) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert_eq!(
+        report.dropped.len(),
+        1,
+        "only `z`'s block is lost: {report:?}"
+    );
+
+    let recovered = open(dest, &fs)?;
+    let operands = recovered
+        .scan()?
+        .filter_map(Result::ok)
+        .filter(|e| e.key.user_key.as_ref() == b"k")
+        .count();
+    assert_eq!(
+        operands, 2,
+        "the tie spanning the block edge is a valid run, not a violation",
+    );
+    Ok(())
+}
+
+#[test]
 fn salvage_drops_the_boundary_key_when_its_newest_version_is_lost() -> crate::Result<()> {
     use crate::table::Writer;
     use crate::{InternalValue, ValueType};

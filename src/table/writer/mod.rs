@@ -1819,18 +1819,36 @@ impl Writer {
         comparator: &crate::SharedComparator,
     ) -> crate::Result<()> {
         let err = || crate::Error::InvalidHeader("direct block entries out of internal-key order");
+        // A key's versions descend by seqno, with ONE legitimate tie: a single
+        // write batch may add several merge operands for a key, and they share
+        // the batch's seqno, so a flush stores them all at it. Rejecting that
+        // would make salvage drop an otherwise clean block — losing valid
+        // operands and changing the merged value the repaired tree serves.
+        // Every other equal-seqno pair stays a violation: for those kinds the
+        // internal key ties without a tie-breaker, so their order (and so the
+        // value a read serves) would not be reproducible.
+        let tied_operands = |a: &crate::InternalValue, b: &crate::InternalValue| {
+            a.key.value_type == crate::ValueType::MergeOperand
+                && b.key.value_type == crate::ValueType::MergeOperand
+        };
         if let (Some(prev), Some(first)) = (self.current_key.as_ref(), entries.first()) {
             match comparator.compare(prev.as_ref(), first.key.user_key.as_ref()) {
                 core::cmp::Ordering::Greater => return Err(err()),
-                // The same user key spans the block boundary: its versions
-                // must keep strictly decreasing seqnos across the edge, just
-                // like the in-block window check below. An untracked prior
-                // seqno cannot happen once a key was written (both write
+                // The same user key spans the block boundary: its versions must
+                // keep descending across the edge, just like the in-block window
+                // check below, and a tie is allowed only for the operand run
+                // above — which the edge does not have to break. An untracked
+                // prior seqno cannot happen once a key was written (both write
                 // paths record it), so treat it as a violation, not a pass.
                 core::cmp::Ordering::Equal
-                    if self
-                        .current_key_seqno
-                        .is_none_or(|prev_seqno| first.key.seqno >= prev_seqno) =>
+                    if self.current_key_seqno.is_none_or(|prev_seqno| {
+                        first.key.seqno > prev_seqno
+                            || (first.key.seqno == prev_seqno
+                                && !(first.key.value_type == crate::ValueType::MergeOperand
+                                    && self.previous_item.as_ref().is_some_and(|(_, vt)| {
+                                        *vt == crate::ValueType::MergeOperand
+                                    })))
+                    }) =>
                 {
                     return Err(err());
                 }
@@ -1844,6 +1862,8 @@ impl Writer {
             match comparator.compare(a.key.user_key.as_ref(), b.key.user_key.as_ref()) {
                 core::cmp::Ordering::Less => {}
                 core::cmp::Ordering::Equal if a.key.seqno > b.key.seqno => {}
+                core::cmp::Ordering::Equal if a.key.seqno == b.key.seqno && tied_operands(a, b) => {
+                }
                 _ => return Err(err()),
             }
         }
