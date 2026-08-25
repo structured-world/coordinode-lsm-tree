@@ -1059,6 +1059,110 @@ fn ingest_bytes_value(any: &AnyTree, k: &[u8], value: &[u8]) {
     ingest.finish().expect("finish");
 }
 
+/// A point tombstone is not a value: when it is a key's newest visible version
+/// the key is GONE, and the scan must drop the whole run rather than emit the
+/// tombstone row. Emitting it disagrees with the point read, and a caller that
+/// did not project the value-type column cannot even tell the row apart from a
+/// live one with an empty value.
+#[test]
+fn tree_columnar_scan_suppresses_a_key_its_newest_row_deletes() {
+    let folder = get_tmp_folder();
+    let tree = open_columnar(folder.path());
+
+    // One flushed segment holding both versions of `k1`: an older value and the
+    // newer deletion, plus an untouched neighbour.
+    tree.insert(key(1), b"v".to_vec(), 1);
+    tree.insert(key(2), b"v".to_vec(), 1);
+    tree.remove(key(1), 2);
+    tree.flush_active_memtable(0).expect("flush");
+
+    assert!(
+        tree.get(key(1), SeqNo::MAX).expect("get").is_none(),
+        "the point read reports the key as deleted",
+    );
+
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    for batch in tree
+        .columnar_scan(&[COL_USER_KEY], None, SeqNo::MAX, ..)
+        .expect("scan")
+    {
+        let batch = batch.expect("batch");
+        let key_col = batch
+            .columns
+            .iter()
+            .find(|c| c.column_id == COL_USER_KEY)
+            .expect("key column");
+        let rows = batch.row_count as usize;
+        let off = |i: usize| {
+            let b: [u8; 4] = key_col.data[i * 4..i * 4 + 4].try_into().unwrap();
+            u32::from_le_bytes(b) as usize
+        };
+        let payload = &key_col.data[(rows + 1) * 4..];
+        for i in 0..rows {
+            keys.push(payload[off(i)..off(i + 1)].to_vec());
+        }
+    }
+    assert_eq!(
+        keys,
+        vec![key(2)],
+        "the deleted key must not surface as a row while the point read calls \
+         it absent; the live neighbour still does",
+    );
+}
+
+/// The same rule on the ZERO-COPY path: a segment with one version per key is
+/// streamed verbatim, and a key whose single row is a tombstone would ride
+/// straight through it.
+#[test]
+fn tree_columnar_scan_suppresses_a_deleted_key_on_the_verbatim_path() {
+    let folder = get_tmp_folder();
+    let tree = open_columnar(folder.path());
+
+    // Distinct keys, one version each — the segment is provably unique, so the
+    // dedup path is skipped entirely.
+    tree.insert(key(1), b"v".to_vec(), 1);
+    tree.remove(key(2), 1);
+    tree.flush_active_memtable(0).expect("flush");
+
+    assert!(
+        tree.get(key(2), SeqNo::MAX).expect("get").is_none(),
+        "the point read reports the deleted key as absent",
+    );
+    assert_eq!(
+        scan_keys(&tree, SeqNo::MAX),
+        vec![key(1)],
+        "a tombstone must not stream through as a row just because its segment \
+         holds one version per key",
+    );
+}
+
+/// And on the OVERLAP path: the newest version wins across segments, so a newer
+/// segment's tombstone has to remove the key rather than be emitted.
+#[test]
+fn tree_columnar_scan_suppresses_a_deleted_key_across_overlapping_segments() {
+    let folder = get_tmp_folder();
+    let tree = open_columnar(folder.path());
+
+    // Two flushed segments over the SAME key range, so the scan row-merges them.
+    tree.insert(key(1), b"v".to_vec(), 1);
+    tree.insert(key(2), b"v".to_vec(), 1);
+    tree.flush_active_memtable(0).expect("flush");
+    tree.remove(key(1), 2);
+    tree.insert(key(2), b"w".to_vec(), 2);
+    tree.flush_active_memtable(0).expect("flush");
+
+    assert!(
+        tree.get(key(1), SeqNo::MAX).expect("get").is_none(),
+        "the point read reports the deleted key as absent",
+    );
+    assert_eq!(
+        scan_keys(&tree, SeqNo::MAX),
+        vec![key(2)],
+        "the newer segment's tombstone removes the key instead of surfacing as \
+         a row; the overwritten neighbour still yields its newest version",
+    );
+}
+
 /// A merge chain is not a version chain: the older rows are the merge's INPUTS,
 /// not data the newest row shadows. Newest-version-wins dedup would hand back
 /// the raw operand while a point read hands back the merged value, and it drops

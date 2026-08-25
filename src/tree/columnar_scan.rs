@@ -40,9 +40,15 @@
 //! compaction to keep files non-overlapping: as multi-segment columnar compaction
 //! reduces overlap, more of the scan takes the zero-cost singleton path.
 //!
-//! Deletes are expressed through each segment's positional delete-bitmap (applied
-//! inside [`Table::columnar_scan`](crate::Table::columnar_scan)); this scan does
-//! not interpret value-type tombstone rows. Memtable rows are not consulted —
+//! Deletes reach the scan two ways and both remove the key. A segment's
+//! positional delete-bitmap is applied inside
+//! [`Table::columnar_scan`](crate::Table::columnar_scan); a value-type TOMBSTONE
+//! is consumed here, when the newest visible version of a key is one — the key
+//! then yields no row at all, matching what a point read reports, instead of
+//! surfacing a row a caller who did not project the value-type column could not
+//! tell from a live one. Only a segment that RECORDS deletions pays for it: one
+//! whose metadata counts none keeps its columns untouched (and its zero-copy
+//! verbatim path). Memtable rows are not consulted —
 //! columnar data lives only in segments — and a visible non-columnar segment
 //! overlapping the range is rejected (a mixed-mode tree is unsupported here).
 
@@ -53,7 +59,7 @@ use alloc::{vec, vec::Vec};
 use crate::comparator::UserComparator;
 use crate::table::SeqnoVisibility;
 use crate::table::columnar::{
-    COL_SEQNO, COL_USER_KEY, ColumnBatch, TypeTag, bytes_column_row, fixed_u64_row,
+    COL_SEQNO, COL_USER_KEY, COL_VALUE_TYPE, ColumnBatch, TypeTag, bytes_column_row, fixed_u64_row,
 };
 use crate::table::columnar_predicate::{ColumnRangePredicate, filter_batch, take_rows};
 use crate::{Error, SeqNo, Table, Tree, UserKey};
@@ -275,7 +281,12 @@ impl ColumnarScan {
     /// (when the snapshot straddles the segment) or outside the requested range
     /// (when the segment only partially overlaps it).
     fn process_singleton(&self, seg: &Segment) -> crate::Result<Vec<ColumnBatch>> {
-        if seg.may_dup {
+        // A segment that RECORDS deletions takes the dedup path even when its
+        // keys are provably unique: a key whose single row is a tombstone would
+        // otherwise stream through verbatim and surface a key the point read
+        // calls absent. Deciding a run is where tombstones are consumed, and
+        // that lives there.
+        if seg.may_dup || seg.table.tombstone_count() > 0 || seg.table.weak_tombstone_count() > 0 {
             return self.process_singleton_dedup(seg);
         }
         let range_filter = !self.range_is_full();
@@ -405,6 +416,17 @@ impl ColumnarScan {
         {
             augmented.push(pc);
         }
+        // A deletion is what a key's newest row can BE, so deciding a run needs
+        // the value type — otherwise a tombstone decides the run and is emitted
+        // as a row while a point read calls the key absent, and a caller that did
+        // not project the type column cannot tell that row from a live one with
+        // an empty value. Decoded only for a segment that RECORDS deletions; one
+        // without them keeps its columns untouched.
+        let deletes = seg.table.tombstone_count() > 0 || seg.table.weak_tombstone_count() > 0;
+        let vt_projected = self.projection.contains(&COL_VALUE_TYPE);
+        if deletes && !vt_projected {
+            augmented.push(COL_VALUE_TYPE);
+        }
 
         // Visible iff `local < threshold` (the snapshot in this segment's local
         // seqno space); `Partial` guarantees the subtraction is in range.
@@ -428,6 +450,19 @@ impl ColumnarScan {
                 .ok_or(Error::InvalidHeader(
                     "columnar_scan: dedup batch missing the key column",
                 ))?;
+            let vt_col = if deletes {
+                Some(
+                    batch
+                        .columns
+                        .iter()
+                        .find(|c| c.column_id == COL_VALUE_TYPE)
+                        .ok_or(Error::InvalidHeader(
+                            "columnar_scan: dedup batch missing the value-type column",
+                        ))?,
+                )
+            } else {
+                None
+            };
             let seqno_col = if partial {
                 Some(
                     batch
@@ -463,9 +498,23 @@ impl ColumnarScan {
                     continue;
                 }
                 // First visible row of a new key run = the newest visible
-                // version. Deciding the run here (even when the range filter
-                // drops the row) also drops its older versions above.
+                // version. Deciding the run here (even when the range filter or
+                // a deletion drops the row) also drops its older versions above.
                 last_key = Some(key.to_vec());
+                if let Some(vt_col) = vt_col {
+                    let byte = *vt_col.data.get(row as usize).ok_or(Error::InvalidHeader(
+                        "columnar_scan: value-type column shorter than the row count",
+                    ))?;
+                    let value_type = crate::ValueType::try_from(byte)
+                        .map_err(|()| Error::InvalidTag(("ValueType", byte)))?;
+                    if value_type.is_tombstone() {
+                        // The key is GONE as of this row, so the run yields
+                        // nothing: emitting the tombstone would surface a key the
+                        // point read reports absent.
+                        mask.push(false);
+                        continue;
+                    }
+                }
                 mask.push(!range_filter || key_in_bounds(key, &self.lo, &self.hi, cmp));
             }
 
@@ -481,6 +530,9 @@ impl ColumnarScan {
             }
             if !seqno_projected {
                 visible.columns.retain(|c| c.column_id != COL_SEQNO);
+            }
+            if deletes && !vt_projected {
+                visible.columns.retain(|c| c.column_id != COL_VALUE_TYPE);
             }
             if let Some(pc) = predicate_col
                 && !predicate_col_projected
@@ -518,6 +570,17 @@ impl ColumnarScan {
             && !augmented.contains(&pc)
         {
             augmented.push(pc);
+        }
+        // Same rule as the singleton path: the newest version of a key can BE a
+        // deletion, and then the key yields nothing. Decoded only when a segment
+        // of this group records deletions.
+        let deletes = group
+            .segments
+            .iter()
+            .any(|s| s.table.tombstone_count() > 0 || s.table.weak_tombstone_count() > 0);
+        let vt_projected = self.projection.contains(&COL_VALUE_TYPE);
+        if deletes && !vt_projected {
+            augmented.push(COL_VALUE_TYPE);
         }
 
         // Concatenate every segment's visible rows into one batch, tracking each
@@ -609,6 +672,19 @@ impl ColumnarScan {
         // drop the shadowed older duplicates and any key outside the requested
         // range (a segment may only partially overlap it).
         let range_filter = !self.range_is_full();
+        let vt_col = if deletes {
+            Some(
+                combined
+                    .columns
+                    .iter()
+                    .find(|c| c.column_id == COL_VALUE_TYPE)
+                    .ok_or(Error::InvalidHeader(
+                        "columnar_scan: merged group missing the value-type column",
+                    ))?,
+            )
+        } else {
+            None
+        };
         let mut kept: Vec<u32> = Vec::with_capacity(order.len());
         let mut prev: Option<&[u8]> = None;
         for &i in &order {
@@ -621,6 +697,18 @@ impl ColumnarScan {
             prev = Some(key);
             if range_filter && !key_in_bounds(key, &self.lo, &self.hi, cmp) {
                 continue;
+            }
+            if let Some(vt_col) = vt_col {
+                let byte = *vt_col.data.get(i as usize).ok_or(Error::InvalidHeader(
+                    "columnar_scan: value-type column shorter than the row count",
+                ))?;
+                let value_type = crate::ValueType::try_from(byte)
+                    .map_err(|()| Error::InvalidTag(("ValueType", byte)))?;
+                // The newest version deletes the key, so the key yields nothing —
+                // the run is already decided, so the older versions stay dropped.
+                if value_type.is_tombstone() {
+                    continue;
+                }
             }
             kept.push(i);
         }
@@ -642,6 +730,9 @@ impl ColumnarScan {
         }
         if !seqno_projected {
             merged.columns.retain(|c| c.column_id != COL_SEQNO);
+        }
+        if deletes && !vt_projected {
+            merged.columns.retain(|c| c.column_id != COL_VALUE_TYPE);
         }
         if let Some(pc) = predicate_col
             && !predicate_col_projected
