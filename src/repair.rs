@@ -41,7 +41,7 @@
 //! advisory and re-learns reclaimable space over time without dropping data.
 
 use crate::{
-    Table, TableId,
+    SeqNo, Table, TableId, UserKey,
     config::{Config, TreeType},
     version::{BlobFileList, Level, Run, Version},
 };
@@ -77,6 +77,22 @@ pub struct RepairReport {
 
     /// Path and human-readable error for each unreadable file.
     pub unreadable_files: Vec<(PathBuf, String)>,
+
+    /// Key coverage the rebuilt manifest LOST, for every excluded table whose
+    /// metadata still parsed: `(path, first key, last key, highest seqno)`.
+    ///
+    /// Losing a table's bytes loses what it said about those keys. Older
+    /// versions of them survive in other tables and become visible again — a
+    /// value the lost table had overwritten, or a key its tombstone had
+    /// deleted. No repair can tell those apart without the lost bytes, and
+    /// deleting the range instead would destroy intact data (see
+    /// [`repair_with_resurrection`](Config::repair_with_resurrection)), so the
+    /// range is reported rather than acted on: within these bounds, at or below
+    /// the given sequence number, the tree may now serve a superseded value.
+    ///
+    /// Empty when nothing was excluded, and a table whose metadata was
+    /// unreadable contributes no entry (its coverage is unknowable).
+    pub lost_coverage: Vec<(PathBuf, UserKey, UserKey, SeqNo)>,
 
     /// Damaged blob files whose salvaged replacement IS installed in the
     /// rebuilt manifest: the canonical (installed) path plus a note on what
@@ -2813,6 +2829,20 @@ impl Config {
     /// reappear. Either setting yields a valid, openable tree; the flag is the
     /// ONLY recovery decision an operator makes.
     ///
+    /// The flag governs AMBIGUOUS VISIBILITY, not LOST BYTES. When a table (or
+    /// one of its blocks) cannot be read at all, what it said about its keys is
+    /// gone with it, and older versions of those keys survive in other tables:
+    /// a value it had overwritten, or a key its tombstone had deleted, becomes
+    /// visible again. Neither setting changes that, because nothing left on
+    /// disk distinguishes "this key was deleted" from "this key was simply
+    /// never rewritten". Deleting the lost range instead would destroy intact
+    /// data — a flushed table's key range routinely spans most of the keyspace
+    /// while its sequence numbers sit above every older level, so one corrupt
+    /// block would erase most of the tree, irreversibly, where the stale read
+    /// leaves every byte in place. The lost ranges are therefore REPORTED
+    /// rather than acted on; see
+    /// [`RepairReport::lost_coverage`](crate::RepairReport::lost_coverage).
+    ///
     /// # Errors
     ///
     /// Returns an error if the tables directory cannot be scanned or a transient
@@ -2951,6 +2981,11 @@ fn repair_tree(
     // (and is never added to two L0 runs). See `keep_best_candidate`.
     let mut recovered_by_id: crate::HashMap<TableId, TableCandidate> = crate::HashMap::default();
     let mut unreadable_files: Vec<(PathBuf, String)> = Vec::new();
+    // What each scanned table covers, captured while its metadata was readable.
+    // Joined against the exclusions at the end to report the coverage the
+    // rebuilt manifest lost.
+    let mut coverage_by_path: crate::HashMap<PathBuf, (UserKey, UserKey, SeqNo)> =
+        crate::HashMap::default();
 
     for (table_base_folder, folder_fs) in config.all_tables_folders() {
         if !folder_fs.exists(&table_base_folder)? {
@@ -3135,6 +3170,23 @@ fn repair_tree(
                 // off).
                 Err(e) => Err(e),
             };
+
+            // Remember what this table COVERS while its metadata is in hand. If
+            // it ends up excluded, that coverage is what the rebuilt manifest
+            // lost, and the report names it: older versions of those keys
+            // survive elsewhere and become visible again, which no repair can
+            // distinguish from "the key was simply never rewritten".
+            if let Ok(t) = &recovered {
+                let range = t.metadata.key_range.clone();
+                coverage_by_path.insert(
+                    table_path.clone(),
+                    (
+                        range.min().clone(),
+                        range.max().clone(),
+                        t.get_highest_seqno(),
+                    ),
+                );
+            }
 
             // Fail closed on a table whose bulk-ingest sequence offset cannot be
             // reconstructed. A bulk-ingested SST stores every entry at LOCAL seqno
@@ -4311,11 +4363,24 @@ fn repair_tree(
         );
     }
 
+    // Join the exclusions against the coverage captured during the scan. A
+    // table whose metadata never parsed contributes nothing: its coverage is
+    // unknowable, which the field documents.
+    let lost_coverage: Vec<(PathBuf, UserKey, UserKey, SeqNo)> = unreadable_files
+        .iter()
+        .filter_map(|(path, _)| {
+            coverage_by_path
+                .get(path)
+                .map(|(lo, hi, seqno)| (path.clone(), lo.clone(), hi.clone(), *seqno))
+        })
+        .collect();
+
     Ok(RepairReport {
         recovered,
         salvaged,
         unreadable: unreadable_files.len(),
         unreadable_files,
+        lost_coverage,
         blob_files_salvaged,
         method: "all-to-L0 with sequence-number ordering",
         warnings,

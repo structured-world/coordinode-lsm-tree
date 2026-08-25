@@ -381,6 +381,72 @@ fn highest_existing_version_id_none_when_no_versions_present() -> crate::Result<
 }
 
 /// A plain `repair()` (salvage off) must not BLESS an SST whose data block is
+/// Excluding a table loses what it said about its keys, and older versions of
+/// them survive elsewhere: a value it had overwritten, or a key its tombstone
+/// had deleted, becomes visible again. No repair can tell those apart without
+/// the lost bytes, so the report has to NAME the affected coverage — a caller
+/// that only sees "one file was unreadable" cannot tell which keys may now
+/// serve a superseded value.
+#[test]
+fn repair_reports_the_key_coverage_an_excluded_table_lost() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?;
+        for i in 0..8u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                b"v",
+                u64::from(i) + 1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Corrupt a data-block payload byte: metadata still parses, so the lost
+    // coverage IS knowable even though the rows are not.
+    let offset = sole_data_block_offset(&recover_table(sst.clone(), &fs)?);
+    let flip = usize::try_from(offset).unwrap_or(0) + 16;
+    let mut bytes = std::fs::read(&sst)?;
+    if let Some(b) = bytes.get_mut(flip) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&sst, &bytes)?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+    assert_eq!(report.unreadable, 1, "the damaged table is excluded");
+
+    let [(path, first, last, seqno)] = report.lost_coverage.as_slice() else {
+        panic!(
+            "the excluded table's coverage must be reported, got {:?}",
+            report.lost_coverage,
+        );
+    };
+    assert_eq!(path, &sst, "the entry names the excluded file");
+    assert_eq!(&**first, b"k00000", "first key of the lost range");
+    assert_eq!(&**last, b"k00007", "last key of the lost range");
+    assert_eq!(
+        *seqno, 8,
+        "the highest seqno the lost table held: at or below it, keys in that \
+         range may now serve a superseded value",
+    );
+    Ok(())
+}
+
 /// corrupt: whole-file recovery succeeds (the data section is read lazily), and
 /// the digest is freshly computed over the already-corrupt bytes, so keeping
 /// the table would launder the corruption — the rebuilt manifest counts it as
