@@ -319,15 +319,31 @@ impl DeletionPause {
         };
         match item.fs.hard_link_count(&item.path) {
             Ok(n) if n <= 1 => {
-                for &(offset, len) in extents {
+                let mut unreclaimed: Option<Vec<(u64, u64)>> = None;
+                for (at, &(offset, len)) in extents.iter().enumerate() {
                     if let Err(e) = item.fs.punch_hole(&item.path, offset, len) {
                         log::warn!(
                             "Failed to punch deferred tight-space extent at {offset} of {}; \
-                             stopping the reclaim to keep the hole pattern classifiable: {e:?}",
+                             stopping the reclaim to keep the hole pattern classifiable, \
+                             retaining it and the extents below it for a retry: {e:?}",
                             item.path.display(),
                         );
+                        // The pass stops here — punching below an unreclaimed
+                        // extent would break the top-down hole pattern a
+                        // sidecar-less repair reads. But the failure is often
+                        // transient, and dropping what is left would strand the
+                        // space with nothing able to free it, so the failed
+                        // extent and the untried remainder are retained.
+                        unreclaimed = extents.get(at..).map(<[(u64, u64)]>::to_vec);
                         break;
                     }
+                }
+                if let Some(rest) = unreclaimed {
+                    pending.lock().push(QueuedDeletion {
+                        fs: item.fs,
+                        path: item.path,
+                        action: QueuedAction::Punch(rest),
+                    });
                 }
             }
             // The file is gone (the table was retired while the pause was held),

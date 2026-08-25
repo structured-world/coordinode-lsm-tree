@@ -274,6 +274,63 @@ fn a_deferred_punch_survives_an_unprovable_link_count_and_is_retried() {
     );
 }
 
+/// A punch that FAILS mid-pass must not take the reclaim down with it. The pass
+/// stops (the hole pattern stays classifiable for a sidecar-less repair), but
+/// the failed extent and everything below it are retained: dropping them leaves
+/// the consumed prefix allocated with nothing left to free it, exactly as a
+/// discarded intent would.
+#[test]
+fn a_failed_punch_retains_the_extent_and_the_untried_remainder() {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    let mem = MemFs::new();
+    mem.create_dir_all(Path::new("/d")).unwrap();
+    let path = Path::new("/d/1").to_path_buf();
+    write_file(&mem, &path, &[b'x'; 4096]);
+    let faulty = Arc::new(FaultFs::new(mem.clone()));
+    let dyn_fs: Arc<dyn Fs> = faulty.clone();
+
+    // Three extents, top-down. The SECOND fails, so the first lands and the
+    // third is never attempted.
+    faulty.injector().arm(
+        FaultRule::new(
+            FaultOp::PunchHole,
+            Fault::Error(crate::io::ErrorKind::Interrupted),
+        )
+        .skip(1)
+        .once(),
+    );
+
+    let pause = DeletionPause::new_shared();
+    let guard = pause.acquire();
+    assert!(pause.try_enqueue_punch(
+        Arc::clone(&dyn_fs),
+        path,
+        vec![(3072, 1024), (2048, 1024), (1024, 1024)],
+    ));
+    drop(guard);
+
+    assert_eq!(
+        mem.punched_bytes(),
+        1024,
+        "the pass stops at the first failure, so only the top extent landed",
+    );
+    assert!(
+        pause.has_pending_reclaims(),
+        "the failed extent and the untried remainder are retained, or nothing \
+         would ever free that space",
+    );
+
+    // The fault is one-shot, so the retry completes what was held.
+    pause.retry_pending_reclaims();
+    assert_eq!(
+        mem.punched_bytes(),
+        3072,
+        "the retry reclaims the extents the failed pass left behind",
+    );
+    assert!(!pause.has_pending_reclaims(), "nothing left to retry");
+}
+
 #[test]
 fn nested_pauses_only_release_on_last_drop() {
     let fs = MemFs::new();
