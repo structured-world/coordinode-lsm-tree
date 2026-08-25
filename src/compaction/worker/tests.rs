@@ -167,6 +167,73 @@ fn tight_space_crash_after_first_slice_recovers_all_keys_on_reopen() -> crate::R
 /// itself: the manifest is the authority, so an open that finds a restricted
 /// table without its sidecar writes it.
 #[test]
+fn open_rewrites_a_sidecar_that_disagrees_with_the_manifest() -> crate::Result<()> {
+    use crate::fs::Fs;
+
+    let dir = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    let fs: Arc<dyn Fs> = Arc::new(mem.clone());
+    let reopened = tight_space_crash_and_reopen(
+        dir.path(),
+        Arc::clone(&fs),
+        |used| mem.set_capacity(used + used / 4),
+        || mem.punched_bytes(),
+    )?;
+
+    let version = reopened.current_version();
+    let Some(restricted) = version
+        .iter_tables()
+        .find(|t| t.restrict_lower_bound().is_some())
+    else {
+        panic!("the crashed tight-space slice must leave a restricted table");
+    };
+    let path = restricted.path.clone();
+    let table_id = restricted.id();
+    let Some(bound) = restricted.restrict_lower_bound().cloned() else {
+        panic!("the table was selected by having a restriction bound");
+    };
+
+    // A STALE sidecar: valid framing and the right table, but a LOWER bound
+    // than the manifest holds — the shape a second slice leaves when its own
+    // sidecar write fails. A manifest-loss repair honoring it would restrict
+    // less than reality and resurrect consumed rows.
+    let mut stale = bound.to_vec();
+    stale.truncate(bound.len().saturating_sub(1));
+    crate::restrict_bound::write(
+        &*fs,
+        &path,
+        None,
+        table_id,
+        &stale,
+        crate::fs::SyncMode::Normal,
+    )?;
+    drop(version);
+    drop(reopened);
+
+    let _tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(mem))
+    .open()?;
+
+    let crate::restrict_bound::SidecarRead::Present(id, recorded) =
+        crate::restrict_bound::read(&*fs, &path, None)?
+    else {
+        panic!("the sidecar must be present after the open");
+    };
+    assert_eq!(id, table_id, "the sidecar names its own table");
+    assert_eq!(
+        recorded,
+        bound.to_vec(),
+        "an existing sidecar that disagrees with the manifest is republished \
+         from the manifest, which is the authority on the bound",
+    );
+    Ok(())
+}
+
+#[test]
 fn open_rewrites_a_missing_restriction_sidecar() -> crate::Result<()> {
     use crate::fs::Fs;
 

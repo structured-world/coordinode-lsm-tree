@@ -4597,10 +4597,15 @@ impl Tree {
 
     /// Writes the `.restrict-bound` sidecar of every restricted table in
     /// `version` that has none, so the bound the manifest holds is recoverable
-    /// without it. A sidecar that already exists is left untouched: it was
-    /// written under the same bound, and rewriting it would churn the file on
-    /// every open. Failures propagate — an unrecoverable restriction is exactly
-    /// what this closes, so silently skipping it would keep the window open.
+    /// without it. An existing sidecar is REREAD rather than assumed good: its
+    /// mere presence proves nothing, and a repair that later trusts a corrupt
+    /// one derives a conservative bound (dropping up to one live block), while
+    /// a valid-but-STALE one — the shape a second slice leaves when its own
+    /// write fails — restricts LESS than reality and resurrects consumed rows.
+    /// A sidecar that already records this table and this bound is left alone,
+    /// so a healthy tree does not churn the file on every open. Failures
+    /// propagate — an unrecoverable restriction is exactly what this closes, so
+    /// silently skipping it would keep the window open.
     ///
     /// The sidecar is a filesystem artifact of the tight-space reclaim path, so
     /// this is a no-op without `std` — a build without it never writes one.
@@ -4613,12 +4618,22 @@ impl Tree {
             let Some(bound) = table.restrict_lower_bound() else {
                 continue;
             };
-            let sidecar = crate::restrict_bound::sidecar_path(&table.path);
-            if table.fs.metadata(&sidecar).is_ok() {
-                continue;
-            }
+            let recorded =
+                crate::restrict_bound::read(&*table.fs, &table.path, config.encryption.as_deref())?;
+            let state = match &recorded {
+                crate::restrict_bound::SidecarRead::Present(id, recorded_bound)
+                    if *id == table.metadata.id && recorded_bound.as_slice() == bound.as_ref() =>
+                {
+                    continue;
+                }
+                crate::restrict_bound::SidecarRead::Present(..) => {
+                    "disagrees with the manifest (stale bound or another table)"
+                }
+                crate::restrict_bound::SidecarRead::Corrupt => "unreadable",
+                crate::restrict_bound::SidecarRead::Missing => "absent",
+            };
             log::warn!(
-                "table {} carries a committed restriction with no sidecar; \
+                "table {} carries a committed restriction whose sidecar is {state}; \
                  republishing it from the manifest",
                 table.id(),
             );
