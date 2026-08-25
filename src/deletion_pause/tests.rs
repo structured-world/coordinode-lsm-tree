@@ -216,6 +216,64 @@ fn drain_does_not_steal_a_new_generation_queue() {
     );
 }
 
+/// A deferred prefix reclaim must not be DISCARDED when the drain cannot prove
+/// the file is exclusively ours — because a checkpoint linked it, or because the
+/// link-count probe failed. Unlinking the checkpoint only drops the link count;
+/// it does not free the prefix, since the live restricted table still holds that
+/// inode. The space would then stay allocated until an unrelated future
+/// compaction retires the table — under exactly the low-space condition that
+/// chose the tight-space path. The intent is kept and retried instead.
+///
+/// Driven through a failing probe: `MemFs` reports every path as
+/// singly-linked, so the shared-inode case cannot be built on it, and both cases
+/// take the same arm.
+#[test]
+fn a_deferred_punch_survives_an_unprovable_link_count_and_is_retried() {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    let mem = MemFs::new();
+    mem.create_dir_all(Path::new("/d")).unwrap();
+    let path = Path::new("/d/1").to_path_buf();
+    write_file(&mem, &path, &[b'x'; 4096]);
+    let faulty = Arc::new(FaultFs::new(mem.clone()));
+    let dyn_fs: Arc<dyn Fs> = faulty.clone();
+
+    faulty.injector().arm(FaultRule::new(
+        FaultOp::HardLinkCount,
+        Fault::Error(crate::io::ErrorKind::PermissionDenied),
+    ));
+
+    let pause = DeletionPause::new_shared();
+    let guard = pause.acquire();
+    assert!(pause.try_enqueue_punch(Arc::clone(&dyn_fs), path, vec![(0, 2048)]));
+
+    drop(guard);
+    assert_eq!(
+        mem.punched_bytes(),
+        0,
+        "an unprovable link count must not be punched through",
+    );
+    assert!(
+        pause.has_pending_reclaims(),
+        "the reclaim is retained, not discarded: nothing else would ever free \
+         the consumed prefix",
+    );
+
+    // The probe works again and the file is exclusively ours, so the retry
+    // performs the reclaim that was held.
+    faulty.injector().clear();
+    pause.retry_pending_reclaims();
+    assert_eq!(
+        mem.punched_bytes(),
+        2048,
+        "the retained reclaim runs once the file can be proven exclusive",
+    );
+    assert!(
+        !pause.has_pending_reclaims(),
+        "a completed reclaim is not retained",
+    );
+}
+
 #[test]
 fn nested_pauses_only_release_on_last_drop() {
     let fs = MemFs::new();

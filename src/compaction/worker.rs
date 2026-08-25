@@ -827,6 +827,11 @@ fn run_tight_space_compaction(
         return Ok(CompactionResult::nothing());
     }
 
+    // A reclaim a checkpoint's window forced the deletion pause to retain is
+    // space this very compaction is short of, so collect it before deciding
+    // anything: the checkpoint that blocked it has usually released by now.
+    opts.deletion_pause.retry_pending_reclaims();
+
     let latest = version_history_lock.latest_version();
     let Some(inputs) = payload
         .table_ids

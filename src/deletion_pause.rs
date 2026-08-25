@@ -58,6 +58,16 @@ pub struct DeletionPause {
     /// Paths queued for removal while at least one pause was active.
     queue: Mutex<Vec<QueuedDeletion>>,
 
+    /// Reclaims the drain could not perform because the file was still shared
+    /// (a checkpoint linked it) or the link count could not be read. They are
+    /// RETAINED rather than dropped: unlinking the checkpoint only decrements
+    /// the link count, and the live restricted table keeps holding the inode,
+    /// so nothing else would ever free the consumed prefix — the space would
+    /// stay allocated until an unrelated compaction retires the table, under
+    /// exactly the low-space condition that chose the tight-space path.
+    /// Retried by [`retry_pending_reclaims`](Self::retry_pending_reclaims).
+    pending_reclaims: Mutex<Vec<QueuedDeletion>>,
+
     /// Excludes a checkpoint's hard-link window from in-place file mutation
     /// (the ECC autoheal): a checkpoint that links an SST between the heal's
     /// link-count probe and its write-back would capture bytes the heal is
@@ -284,33 +294,73 @@ impl Drop for Pause {
                         );
                     }
                 }
-                QueuedAction::Punch(extents) => {
-                    // Re-probe: the checkpoint whose pause this was may have
-                    // hard-linked the file during its window, and its captured
-                    // manifest records the file UNRESTRICTED. Fail closed on a
-                    // shared link and on a probe that cannot answer, losing
-                    // only reclaimable space (the last link's release frees it).
-                    if !item.fs.hard_link_count(&item.path).is_ok_and(|n| n <= 1) {
-                        log::debug!(
-                            "Skipping deferred tight-space punch of {}: the file is \
-                             hard-linked (or the link count is unknown)",
-                            item.path.display(),
-                        );
-                        continue;
-                    }
-                    for (offset, len) in extents {
-                        if let Err(e) = item.fs.punch_hole(&item.path, offset, len) {
-                            log::warn!(
-                                "Failed to punch deferred tight-space extent at {offset} of {}; \
-                                 stopping the reclaim to keep the hole pattern classifiable: {e:?}",
-                                item.path.display(),
-                            );
-                            break;
-                        }
-                    }
+                QueuedAction::Punch(_) => {
+                    DeletionPause::reclaim_or_retain(item, &self.inner.pending_reclaims);
                 }
             }
         }
+    }
+}
+
+impl DeletionPause {
+    /// Punches `item`'s extents when the file is exclusively ours, or RETAINS
+    /// the intent for a later retry when it is not.
+    ///
+    /// A checkpoint that hard-linked the file during its window shares the
+    /// inode, and its captured manifest records the file UNRESTRICTED — punching
+    /// would zero the checkpoint's copy. A probe that cannot answer is treated
+    /// the same way. Neither case may DISCARD the reclaim: removing the
+    /// checkpoint only decrements the link count while the live restricted table
+    /// keeps holding the inode, so the consumed prefix would stay allocated with
+    /// nothing left to free it.
+    fn reclaim_or_retain(item: QueuedDeletion, pending: &Mutex<Vec<QueuedDeletion>>) {
+        let QueuedAction::Punch(extents) = &item.action else {
+            return;
+        };
+        match item.fs.hard_link_count(&item.path) {
+            Ok(n) if n <= 1 => {
+                for &(offset, len) in extents {
+                    if let Err(e) = item.fs.punch_hole(&item.path, offset, len) {
+                        log::warn!(
+                            "Failed to punch deferred tight-space extent at {offset} of {}; \
+                             stopping the reclaim to keep the hole pattern classifiable: {e:?}",
+                            item.path.display(),
+                        );
+                        break;
+                    }
+                }
+            }
+            // The file is gone (the table was retired while the pause was held),
+            // so the space it held is already back: nothing to retain.
+            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+            probe => {
+                log::debug!(
+                    "Deferring the tight-space punch of {} again: the file is hard-linked \
+                     (or the link count is unknown: {probe:?})",
+                    item.path.display(),
+                );
+                pending.lock().push(item);
+            }
+        }
+    }
+
+    /// Re-attempts every reclaim a drain had to retain, keeping the ones whose
+    /// file is still shared.
+    ///
+    /// Call it where the reclaimed space is needed — the tight-space compaction
+    /// path — and after a checkpoint releases, since that is when its links
+    /// usually disappear.
+    pub(crate) fn retry_pending_reclaims(&self) {
+        let retained = core::mem::take(&mut *self.pending_reclaims.lock());
+        for item in retained {
+            Self::reclaim_or_retain(item, &self.pending_reclaims);
+        }
+    }
+
+    /// Whether any reclaim is still waiting for its file to stop being shared.
+    #[cfg(test)]
+    pub(crate) fn has_pending_reclaims(&self) -> bool {
+        !self.pending_reclaims.lock().is_empty()
     }
 }
 
