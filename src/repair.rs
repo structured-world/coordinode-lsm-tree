@@ -90,9 +90,17 @@ pub struct RepairReport {
     /// range is reported rather than acted on: within these bounds, at or below
     /// the given sequence number, the tree may now serve a superseded value.
     ///
+    /// The sequence bound is `None` when the table's own sequence base lived in
+    /// the lost manifest — a bulk-ingested SST stores every entry at local
+    /// seqno `0` and takes its effective ordering from a manifest-only offset,
+    /// which is exactly why such a table is excluded. Reporting the on-disk
+    /// local maximum there would scope the affected history far too low, so the
+    /// bound is reported as unknown and the whole history of that key range has
+    /// to be treated as affected.
+    ///
     /// Empty when nothing was excluded, and a table whose metadata was
     /// unreadable contributes no entry (its coverage is unknowable).
-    pub lost_coverage: Vec<(PathBuf, UserKey, UserKey, SeqNo)>,
+    pub lost_coverage: Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)>,
 
     /// Damaged blob files whose salvaged replacement IS installed in the
     /// rebuilt manifest: the canonical (installed) path plus a note on what
@@ -2984,7 +2992,7 @@ fn repair_tree(
     // What each scanned table covers, captured while its metadata was readable.
     // Joined against the exclusions at the end to report the coverage the
     // rebuilt manifest lost.
-    let mut coverage_by_path: crate::HashMap<PathBuf, (UserKey, UserKey, SeqNo)> =
+    let mut coverage_by_path: crate::HashMap<PathBuf, (UserKey, UserKey, Option<SeqNo>)> =
         crate::HashMap::default();
 
     for (table_base_folder, folder_fs) in config.all_tables_folders() {
@@ -3178,13 +3186,20 @@ fn repair_tree(
             // distinguish from "the key was simply never rewritten".
             if let Ok(t) = &recovered {
                 let range = t.metadata.key_range.clone();
+                // The bound is UNKNOWN when the table's sequence base lived in
+                // the lost manifest: this open deliberately passes offset 0, so
+                // `get_highest_seqno` would report the on-disk LOCAL maximum
+                // (normally 0 for a bulk-ingested SST) and an operator scoping
+                // the affected history by it would stop far below the truth.
+                let seqno = (!has_unrecoverable_ingest_offset(
+                    t.metadata.bulk_ingested,
+                    t.metadata.item_count,
+                    t.max_local_seqno(),
+                ))
+                .then(|| t.get_highest_seqno());
                 coverage_by_path.insert(
                     table_path.clone(),
-                    (
-                        range.min().clone(),
-                        range.max().clone(),
-                        t.get_highest_seqno(),
-                    ),
+                    (range.min().clone(), range.max().clone(), seqno),
                 );
             }
 
@@ -4366,7 +4381,7 @@ fn repair_tree(
     // Join the exclusions against the coverage captured during the scan. A
     // table whose metadata never parsed contributes nothing: its coverage is
     // unknowable, which the field documents.
-    let lost_coverage: Vec<(PathBuf, UserKey, UserKey, SeqNo)> = unreadable_files
+    let lost_coverage: Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)> = unreadable_files
         .iter()
         .filter_map(|(path, _)| {
             coverage_by_path

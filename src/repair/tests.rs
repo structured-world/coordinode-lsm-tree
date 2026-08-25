@@ -381,6 +381,65 @@ fn highest_existing_version_id_none_when_no_versions_present() -> crate::Result<
 }
 
 /// A plain `repair()` (salvage off) must not BLESS an SST whose data block is
+/// A bulk-ingested SST stores every entry at LOCAL seqno 0 and keeps its real
+/// sequence base in the manifest alone, so a manifest-loss repair cannot know
+/// it — which is exactly why such a table is quarantined. Its coverage bound is
+/// therefore UNKNOWN, and reporting the on-disk local maximum (normally 0) as
+/// "the highest seqno it held" would send an operator scoping the possibly
+/// superseded history to a point far below the real one.
+#[test]
+fn repair_reports_an_unknown_seqno_bound_for_a_lost_ingest_offset() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_bulk_ingested(Some(true));
+        for i in 0..4u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                b"v",
+                0,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+    assert_eq!(
+        report.unreadable, 1,
+        "the table is quarantined: its sequence base is unrecoverable",
+    );
+
+    let [(path, first, last, seqno)] = report.lost_coverage.as_slice() else {
+        panic!(
+            "the quarantined table's coverage must be reported, got {:?}",
+            report.lost_coverage,
+        );
+    };
+    assert_eq!(path, &sst, "the entry names the quarantined file");
+    assert_eq!(&**first, b"k00000", "the key range IS knowable");
+    assert_eq!(&**last, b"k00003", "the key range IS knowable");
+    assert_eq!(
+        *seqno, None,
+        "the sequence bound is not: publishing the local maximum would scope \
+         the affected history far too low",
+    );
+    Ok(())
+}
+
 /// Excluding a table loses what it said about its keys, and older versions of
 /// them survive elsewhere: a value it had overwritten, or a key its tombstone
 /// had deleted, becomes visible again. No repair can tell those apart without
@@ -440,7 +499,8 @@ fn repair_reports_the_key_coverage_an_excluded_table_lost() -> crate::Result<()>
     assert_eq!(&**first, b"k00000", "first key of the lost range");
     assert_eq!(&**last, b"k00007", "last key of the lost range");
     assert_eq!(
-        *seqno, 8,
+        *seqno,
+        Some(8),
         "the highest seqno the lost table held: at or below it, keys in that \
          range may now serve a superseded value",
     );
