@@ -8,6 +8,34 @@ pub mod ingest;
 pub mod inner;
 pub mod sealed;
 
+/// Test seam for the CDC scan's memtable freeze: a hook fired while the scan
+/// holds the version-history write guard, so a test can prove a writer is
+/// actually excluded for that window instead of racing it.
+#[cfg(test)]
+pub mod scan_freeze_hook {
+    use alloc::boxed::Box;
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn Fn() + Send>;
+    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+
+    /// Installs `hook`, replacing any previous one. Each test runs in its own
+    /// process, so the static carries no cross-test state.
+    pub fn install(hook: Hook) {
+        #[expect(clippy::unwrap_used, reason = "test-only seam")]
+        HOOK.lock().unwrap().replace(hook);
+    }
+
+    /// Runs the installed hook, if any.
+    pub fn fire() {
+        #[expect(clippy::unwrap_used, reason = "test-only seam")]
+        let guard = HOOK.lock().unwrap();
+        if let Some(hook) = guard.as_ref() {
+            hook();
+        }
+    }
+}
+
 use crate::path::Path;
 use crate::{
     AbstractTree, Checksum, KvPair, SeqNo, SequenceNumberCounter, TableId, UserKey, UserValue,
@@ -1755,28 +1783,56 @@ impl Tree {
     where
         F: Fn(&Version, InternalValue) -> crate::Result<ScanSinceEvent>,
     {
-        let super_version = self.version_history.read().latest_version();
-        let version = &super_version.version;
-
-        // Stable upper watermark, captured once before walking any source: the
-        // highest seqno present across every source at scan start (in global
-        // coordinates — `Table::get_highest_seqno` already adds the offset).
-        // The active memtable is shared and mutable, so without this cap a
-        // write committed mid-scan could leak in and break the "consistent
-        // snapshot of changes in [target, watermark]" contract. The seqno
-        // counter is not a reliable bound here because callers may assign
-        // seqnos explicitly without advancing it, so derive it from the data.
-        let end_seqno = {
-            let active = super_version.active_memtable.get_highest_seqno();
-            let sealed = super_version
-                .sealed_memtables
-                .iter()
-                .map(|mt| mt.get_highest_seqno())
-                .max()
-                .flatten();
-            let tables = version.iter_tables().map(Table::get_highest_seqno).max();
-            active.max(sealed).max(tables)
+        // The active memtable is the one source a writer can still change, and
+        // the seqno cap alone does not exclude that: a caller may commit with an
+        // explicit seqno at or BELOW the cap (`apply_batch` takes the seqno from
+        // the caller), and a live lock-free walk would then see that write or
+        // miss it depending on where the node lands relative to the cursor —
+        // even splitting one batch. A consumer that advanced past the returned
+        // watermark would lose the change for good.
+        //
+        // So freeze it: writers hold the version-history READ guard for their
+        // whole insert (that is what keeps `rotate_memtable` from sealing
+        // mid-batch), so taking the WRITE guard excludes them. The cap and the
+        // active memtable's raw entries are captured under it; everything else —
+        // sealed memtables, tables — is immutable and needs no coordination.
+        //
+        // Mapping runs AFTER the guard drops: it resolves blob indirections,
+        // which reads a blob file, and no I/O may happen with writers blocked.
+        let (super_version, end_seqno, active_entries, active_range_tombstones) = {
+            let guard = self.version_history.write();
+            let super_version = guard.latest_version();
+            #[cfg(test)]
+            scan_freeze_hook::fire();
+            let end_seqno = {
+                let active = super_version.active_memtable.get_highest_seqno();
+                let sealed = super_version
+                    .sealed_memtables
+                    .iter()
+                    .map(|mt| mt.get_highest_seqno())
+                    .max()
+                    .flatten();
+                let tables = super_version
+                    .version
+                    .iter_tables()
+                    .map(Table::get_highest_seqno)
+                    .max();
+                active.max(sealed).max(tables)
+            };
+            let entries: Vec<InternalValue> = end_seqno.map_or_else(Vec::new, |cap| {
+                super_version
+                    .active_memtable
+                    .iter()
+                    .filter(|e| e.key.seqno >= target_seqno && e.key.seqno <= cap)
+                    .collect()
+            });
+            let rts = super_version.active_memtable.range_tombstones_sorted();
+            // Explicit: the guard must outlive the capture above, and writers
+            // resume the moment it goes.
+            drop(guard);
+            (super_version, end_seqno, entries, rts)
         };
+        let version = &super_version.version;
         // No entries anywhere ⇒ nothing qualifies, regardless of target.
         let Some(end_seqno) = end_seqno else {
             return Ok(Vec::new().into_iter());
@@ -1799,14 +1855,14 @@ impl Tree {
             })
         };
 
-        // Active memtable.
+        // Active memtable — mapped from the frozen capture above, not walked
+        // again: a second walk would reintroduce exactly the race the freeze
+        // closed.
         let mut source = Vec::new();
-        for entry in super_version.active_memtable.iter() {
-            if in_window(entry.key.seqno) {
-                source.push(Self::map_event(entry, version, &resolve_indirection)?);
-            }
+        for entry in active_entries {
+            source.push(Self::map_event(entry, version, &resolve_indirection)?);
         }
-        for rt in super_version.active_memtable.range_tombstones_sorted() {
+        for rt in active_range_tombstones {
             source.extend(range_tombstone_event(&rt));
         }
         sources.push(source);
@@ -2005,6 +2061,16 @@ impl Tree {
     /// connector, Debezium-style pipeline) replays the events in order to
     /// reconstruct the source's history. Superseded versions are not collapsed
     /// (a key written three times after the target yields three events).
+    ///
+    /// # Concurrency
+    ///
+    /// The result is a snapshot of the tree as of the call: the active memtable
+    /// is captured with writers excluded, so a batch committed concurrently is
+    /// either wholly in the result or wholly absent, never split across it. This
+    /// holds even for a caller-chosen sequence number at or below the reported
+    /// watermark, which the seqno bound alone would not exclude. Writers are
+    /// blocked only while that capture runs — the sealed memtables and SSTs the
+    /// scan then reads are immutable.
     ///
     /// # Block-skip
     ///
@@ -4755,6 +4821,10 @@ fn effective_lower_bound<'a>(
 
 #[cfg(test)]
 mod cardinality_tests;
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "test code")]
+mod scan_since_freeze_tests;
 
 #[cfg(all(test, feature = "metrics"))]
 mod cache_stats_tests;
