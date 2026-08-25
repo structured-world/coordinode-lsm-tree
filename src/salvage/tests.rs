@@ -2377,6 +2377,34 @@ fn open(path: std::path::PathBuf, fs: &Arc<dyn Fs>) -> crate::Result<Table> {
     open_with_id(path, fs, 0)
 }
 
+/// As [`open`] but under an explicit comparator, so a table whose key order is
+/// defined by a custom one recovers and reads consistently.
+fn open_with_comparator(
+    path: std::path::PathBuf,
+    fs: &Arc<dyn Fs>,
+    comparator: crate::comparator::SharedComparator,
+) -> crate::Result<Table> {
+    let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&**fs, &path)?);
+    Table::recover(
+        path,
+        checksum,
+        0,
+        0,
+        0,
+        Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+        Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8))),
+        Arc::clone(fs),
+        false,
+        false,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        comparator,
+        #[cfg(feature = "metrics")]
+        Arc::new(crate::Metrics::default()),
+    )
+}
+
 /// As [`open`] but under an explicit expected table id (the recover
 /// cross-checks it against the SST's stored `table_id`).
 fn open_with_id(
@@ -9088,12 +9116,97 @@ fn salvage_reencodes_an_ecc_recovered_columnar_block() -> crate::Result<()> {
     Ok(())
 }
 
-/// A key's MVCC versions are contiguous, so they can straddle a block
-/// boundary: the newest can be the last entry of one block and an older one the
-/// first entry of the next. When the block holding the newest version is
-/// dropped, emitting the next block as-is republishes the older version as
-/// current — a delete resurrects, or an overwritten value comes back. The
-/// boundary key's entries must be dropped with it unless resurrection is on.
+/// Boundary suppression decides what a key IS, so it has to ask the tree's
+/// comparator, not the bytes. Under a comparator that folds spellings together,
+/// the lost newest version can be spelled `A` while the older one that follows
+/// is spelled `a`: byte inequality keeps the older one and salvage republishes
+/// a version its newer one had replaced.
+#[test]
+fn salvage_suppresses_a_boundary_key_the_comparator_calls_equal() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{InternalValue, ValueType};
+
+    /// Folds ASCII case, so `A` and `a` are the SAME key.
+    struct CaseFolding;
+    impl crate::UserComparator for CaseFolding {
+        fn name(&self) -> &'static str {
+            "ascii-case-folding"
+        }
+        fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+            a.iter()
+                .map(u8::to_ascii_lowercase)
+                .cmp(b.iter().map(u8::to_ascii_lowercase))
+        }
+    }
+    let comparator: crate::comparator::SharedComparator = Arc::new(CaseFolding);
+
+    let dir = tempfile::tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let source = dir.path().join("source");
+    let dest = dir.path().join("dest");
+
+    // One entry per block. Under this comparator `K` and `k` are one key whose
+    // newest version (the deletion, spelled `K`) is block 1 and whose older
+    // value (spelled `k`) is block 2.
+    // The byte order happens to agree here (`K` < `k` < `z`), so the writer
+    // needs no special comparator — only the salvage below runs under one.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(1);
+    writer.write(InternalValue::new_tombstone(b"K".as_slice(), 10))?;
+    writer.write(InternalValue::from_components(
+        b"k",
+        b"old",
+        5,
+        ValueType::Value,
+    ))?;
+    writer.write(InternalValue::from_components(
+        b"z",
+        b"v",
+        1,
+        ValueType::Value,
+    ))?;
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Corrupt the FIRST block: the deletion is lost.
+    let first_off = {
+        let table = open_with_comparator(source.clone(), &fs, Arc::clone(&comparator))?;
+        let offsets: Vec<u64> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|kh| *kh.as_ref().offset())
+            .collect();
+        assert!(
+            offsets.len() >= 3,
+            "one block per entry, got {}",
+            offsets.len()
+        );
+        usize::try_from(offsets.first().copied().unwrap_or_default()).unwrap_or(usize::MAX)
+    };
+    let mut bytes = std::fs::read(&source)?;
+    if let Some(b) = bytes.get_mut(first_off + crate::table::block::Header::MIN_LEN + 1) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&source, &bytes)?;
+
+    let report = super::salvage_with_context(
+        &source,
+        dest.clone(),
+        &fs,
+        &comparator,
+        &super::SalvageOptions::default(),
+    )?;
+    assert_eq!(report.dropped.len(), 1, "one block is lost: {report:?}");
+
+    let recovered = open_with_comparator(dest, &fs, comparator)?;
+    assert!(
+        recovered
+            .get(b"k", crate::SeqNo::MAX, crate::hash::hash64(b"k"))?
+            .is_none(),
+        "the older spelling is the SAME key under this comparator, so it must \
+         be suppressed with it rather than republished",
+    );
+    Ok(())
+}
+
 #[test]
 fn salvage_keeps_tied_seqno_merge_operands() -> crate::Result<()> {
     use crate::table::Writer;
@@ -9230,6 +9343,12 @@ fn salvage_keeps_tied_seqno_merge_operands_across_a_block_boundary() -> crate::R
     Ok(())
 }
 
+/// A key's MVCC versions are contiguous, so they can straddle a block
+/// boundary: the newest can be the last entry of one block and an older one the
+/// first entry of the next. When the block holding the newest version is
+/// dropped, emitting the next block as-is republishes the older version as
+/// current — a delete resurrects, or an overwritten value comes back. The
+/// boundary key's entries must be dropped with it unless resurrection is on.
 #[test]
 fn salvage_drops_the_boundary_key_when_its_newest_version_is_lost() -> crate::Result<()> {
     use crate::table::Writer;

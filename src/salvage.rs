@@ -1087,9 +1087,14 @@ fn entry_directory(path: &std::path::Path) -> &std::path::Path {
 /// the version run has ended, and the chain can continue into the next block,
 /// which would then publish an even older version. Suppression therefore holds
 /// until a surviving entry with a different key ends the run.
+/// Keys are compared through the tree's COMPARATOR, not by bytes: a comparator
+/// may fold spellings together (case-insensitive, normalized, numeric), and the
+/// lost version can then be spelled differently from the older one that follows
+/// it. Byte inequality would keep that older version and republish it.
 fn suppress_shadowed_boundary(
     entries: Vec<crate::InternalValue>,
     boundary: Option<&UserKey>,
+    comparator: &crate::comparator::SharedComparator,
 ) -> (Vec<crate::InternalValue>, Option<UserKey>) {
     let Some(shadowed) = boundary
         .cloned()
@@ -1099,7 +1104,10 @@ fn suppress_shadowed_boundary(
     };
     let kept: Vec<_> = entries
         .into_iter()
-        .filter(|e| e.key.user_key != shadowed)
+        .filter(|e| {
+            comparator.compare(e.key.user_key.as_ref(), shadowed.as_ref())
+                != core::cmp::Ordering::Equal
+        })
         .collect();
     let carry = kept.is_empty().then_some(shadowed);
     (kept, carry)
@@ -1128,10 +1136,11 @@ enum BoundarySuppression {
 fn suppress_columnar_boundary(
     batch: &crate::table::columnar::ColumnBatch,
     boundary: Option<&UserKey>,
+    comparator: &crate::comparator::SharedComparator,
 ) -> crate::Result<BoundarySuppression> {
     let entries = crate::table::columnar::column_batch_to_entries(batch)?;
     let before = entries.len();
-    let (kept, carry) = suppress_shadowed_boundary(entries, boundary);
+    let (kept, carry) = suppress_shadowed_boundary(entries, boundary, comparator);
     if kept.len() == before {
         return Ok(BoundarySuppression::Unchanged);
     }
@@ -1942,7 +1951,11 @@ fn salvage_blocks(
                         // this batch opens with, and the mask does not change that.
                         let batch = match lost_boundary.take() {
                             Some(boundary) => {
-                                match suppress_columnar_boundary(&batch, boundary.as_ref()) {
+                                match suppress_columnar_boundary(
+                                    &batch,
+                                    boundary.as_ref(),
+                                    comparator,
+                                ) {
                                     Ok(BoundarySuppression::Unchanged) => batch,
                                     Ok(BoundarySuppression::Emptied(key)) => {
                                         lost_boundary = Some(Some(key));
@@ -2143,8 +2156,11 @@ fn salvage_blocks(
                                 let mut rebuilt_by_suppression = false;
                                 let (batch, entries) = match lost_boundary.take() {
                                     Some(boundary) => {
-                                        match suppress_columnar_boundary(&batch, boundary.as_ref())
-                                        {
+                                        match suppress_columnar_boundary(
+                                            &batch,
+                                            boundary.as_ref(),
+                                            comparator,
+                                        ) {
                                             Ok(BoundarySuppression::Unchanged) => (batch, entries),
                                             Ok(BoundarySuppression::Emptied(key)) => {
                                                 lost_boundary = Some(Some(key));
@@ -2406,8 +2422,11 @@ fn salvage_blocks(
                             let entries = match lost_boundary.take() {
                                 Some(boundary) => {
                                     let before = entries.len();
-                                    let (kept, carry) =
-                                        suppress_shadowed_boundary(entries, boundary.as_ref());
+                                    let (kept, carry) = suppress_shadowed_boundary(
+                                        entries,
+                                        boundary.as_ref(),
+                                        comparator,
+                                    );
                                     // The run has not ended yet: keep suppressing
                                     // into the next block.
                                     if let Some(key) = carry {
