@@ -113,9 +113,10 @@ impl Tree {
     /// # Errors
     ///
     /// Returns an error if a visible non-columnar segment overlaps `range` (a
-    /// mixed-mode tree is unsupported here), or — lazily, while iterating — on a
-    /// block read / decode failure or a layout mismatch between segments of an
-    /// overlapping group.
+    /// mixed-mode tree is unsupported here), if the tree carries a merge
+    /// operator (see below), or — lazily, while iterating — on a block read /
+    /// decode failure or a layout mismatch between segments of an overlapping
+    /// group.
     pub fn columnar_scan<R: RangeBounds<UserKey>>(
         &self,
         projection: &[u16],
@@ -123,6 +124,26 @@ impl Tree {
         seqno: SeqNo,
         range: R,
     ) -> crate::Result<ColumnarScan> {
+        // A merge chain is not a version chain: its older rows are the merge's
+        // INPUTS, not data the newest row shadows. The newest-version-wins dedup
+        // below would hand back the raw operand where a read hands back the
+        // merged value, and it drops the base row, so the consumer cannot
+        // resolve the chain itself either. Refuse instead of disagreeing with
+        // the read path.
+        //
+        // Gated on the OPERATOR rather than on the rows: without one the read
+        // path returns the newest entry unchanged — the raw operand — which is
+        // exactly what this scan yields, so nothing diverges. With one, no
+        // metadata says whether a segment holds operands, and finding out means
+        // decoding the value-type column of every batch, which would cost the
+        // zero-copy fast path on every scan of every tree that merges.
+        if self.config.merge_operator.is_some() {
+            return Err(Error::FeatureUnsupported(
+                "columnar scan of a tree with a merge operator: merge chains \
+                 would be returned unresolved",
+            ));
+        }
+
         let comparator = self.config.comparator.clone();
 
         // Owned bounds keep the returned iterator free of borrows from `range`.

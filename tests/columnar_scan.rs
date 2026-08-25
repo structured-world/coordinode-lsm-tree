@@ -1059,6 +1059,71 @@ fn ingest_bytes_value(any: &AnyTree, k: &[u8], value: &[u8]) {
     ingest.finish().expect("finish");
 }
 
+/// A merge chain is not a version chain: the older rows are the merge's INPUTS,
+/// not data the newest row shadows. Newest-version-wins dedup would hand back
+/// the raw operand while a point read hands back the merged value, and it drops
+/// the base row, so the consumer cannot even resolve the chain itself. The scan
+/// must refuse rather than disagree with the read path.
+#[test]
+fn tree_columnar_scan_refuses_a_tree_that_merges() {
+    use std::sync::Arc;
+
+    struct Append;
+    impl lsm_tree::MergeOperator for Append {
+        fn merge(
+            &self,
+            _key: &[u8],
+            base_value: Option<&[u8]>,
+            operands: &[&[u8]],
+        ) -> lsm_tree::Result<lsm_tree::UserValue> {
+            let mut out = base_value.unwrap_or(b"").to_vec();
+            for op in operands {
+                out.extend_from_slice(op);
+            }
+            Ok(out.into())
+        }
+    }
+
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(Append)))
+    .open()
+    .expect("open");
+    let tree = standard(&any);
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+    })
+    .expect("enable columnar + zone-map");
+
+    tree.insert(key(1), b"A".to_vec(), 1);
+    tree.merge(key(1), b"B".to_vec(), 2);
+    tree.flush_active_memtable(0).expect("flush");
+
+    assert_eq!(
+        tree.get(key(1), SeqNo::MAX)
+            .expect("get")
+            .as_deref()
+            .map(<[u8]>::to_vec),
+        Some(b"AB".to_vec()),
+        "the read path resolves the chain, which is the behaviour the scan \
+         would have to reproduce",
+    );
+
+    let err = tree
+        .columnar_scan(&[COL_USER_KEY, COL_VALUE], None, SeqNo::MAX, ..)
+        .err()
+        .expect("a merging tree must be refused, not served raw operands");
+    assert!(
+        matches!(err, Error::FeatureUnsupported(_)),
+        "the refusal names the unsupported combination, got {err:?}",
+    );
+}
+
 #[test]
 fn tree_columnar_scan_applies_predicate_after_newest_version_wins() {
     // MVCC + predicate ordering in the overlap-merge path: when a key's NEWEST
