@@ -1069,7 +1069,7 @@ pub(crate) fn verify_sst_file_with_context(
     // Encrypted blocks legitimately exceed the plaintext data_length cap by
     // up to the provider's AEAD overhead (mirroring `Block::from_file`); a
     // zero here would false-flag a healthy encrypted block just over the cap
-    // as HeaderCorrupted and send the whole table to quarantine/salvage.
+    // as HeaderCorrupted and send the whole table to salvage.
     let max_enc_overhead =
         provider.map_or(0u32, crate::encryption::EncryptionProvider::max_overhead);
     match scan_sst_blocks(

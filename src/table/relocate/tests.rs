@@ -95,7 +95,7 @@ fn relocate_reuses_blocks_and_masks_deleted_rows() -> crate::Result<()> {
 /// repair-time forgery cross-check) authenticates `descriptor#delete_bitmap_len`
 /// and `descriptor#delete_bitmap_hash` against the on-disk section. If the
 /// relocation copied the source's (absent-bitmap) descriptors verbatim, the
-/// check would flag the healthy table and `repair_with_salvage` would quarantine
+/// check would flag the healthy table and `repair_with_salvage` would drop
 /// it. The descriptors must be repointed to the appended bitmap.
 #[cfg(feature = "columnar")]
 #[test]
@@ -207,7 +207,7 @@ fn relocate_rejects_row_major_segment() -> crate::Result<()> {
 /// accounting verbatim — so the blob-link cross-check must derive its
 /// accounting from the UNMASKED physical rows. Deriving from the masked
 /// view marks a healthy relocated table corrupt, and repair-with-salvage
-/// would then quarantine it (its retained range tombstones make it
+/// would then drop it (its retained range tombstones make it
 /// unsalvageable).
 #[cfg(feature = "columnar")]
 #[test]

@@ -4507,6 +4507,50 @@ impl Tree {
                     continue;
                 }
 
+                // A `{id}.repair-tmp` is a replacement a manifest repair was
+                // building. If the manifest names its id, that repair committed
+                // and died before the swap, and this file — not the damaged one
+                // beside it — is what the manifest describes: finish the swap.
+                // If it does not, the repair never committed and the temp is
+                // garbage. Both answers come from the manifest alone, so an open
+                // resolves it exactly as a re-run of the repair would.
+                if let Some(tmp_id) = crate::file::table_id_from_repair_tmp_name(table_file_name) {
+                    if manifest_ids.contains(&tmp_id) {
+                        #[cfg(feature = "std")]
+                        {
+                            log::warn!(
+                                "Finishing a repair's pending swap of table {tmp_id}: {}",
+                                table_file_path.display()
+                            );
+                            crate::repair::commit_repair_tmp(
+                                folder_fs.as_ref(),
+                                &table_file_path,
+                                &table_base_folder.join(tmp_id.to_string()),
+                                config.sync_mode,
+                            )?;
+                        }
+                        // Without the repair module nothing here can finish the
+                        // swap, and sweeping the temp would destroy the only copy
+                        // of what the manifest names.
+                        #[cfg(not(feature = "std"))]
+                        {
+                            log::error!(
+                                "Table {tmp_id} exists only as an unpublished repair \
+                                 replacement; run a repair to finish it: {}",
+                                table_file_path.display()
+                            );
+                            return Err(crate::Error::Unrecoverable);
+                        }
+                    } else {
+                        log::warn!(
+                            "Removing abandoned repair replacement: {}",
+                            table_file_path.display()
+                        );
+                        Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                    }
+                    continue;
+                }
+
                 let table_id = table_file_name.parse::<TableId>().map_err(|e| {
                     log::error!("invalid table file name {table_file_name:?}: {e:?}");
                     crate::Error::Unrecoverable

@@ -24,6 +24,26 @@ pub const TABLES_FOLDER: &str = "tables";
 pub const BLOBS_FOLDER: &str = "blobs";
 pub const CURRENT_VERSION_FILE: &str = "current";
 
+/// Suffix of a table replacement a manifest repair has not published yet.
+///
+/// A repair builds the replacement under this name until the manifest that
+/// adopts it is durable. Recognized here rather than in `repair` so an open
+/// without that (std-only) module still classifies the name instead of failing
+/// on it.
+pub const REPAIR_TMP_SUFFIX: &str = ".repair-tmp";
+
+/// The table id a `{id}.repair-tmp` name claims, or `None` for any other name.
+///
+/// Only the EXACT shape is owned recovery state. A foreign name that merely
+/// contains the suffix (an operator's `5.repair-tmp.backup`) is not a temp and
+/// must never be swept or swapped as one.
+#[must_use]
+pub fn table_id_from_repair_tmp_name(file_name: &str) -> Option<crate::TableId> {
+    file_name
+        .strip_suffix(REPAIR_TMP_SUFFIX)
+        .and_then(|id| id.parse::<crate::TableId>().ok())
+}
+
 /// Reads bytes from a file at the given offset without changing the cursor.
 ///
 /// Uses [`FsFile::read_at`] (equivalent to `pread(2)`) so multiple threads

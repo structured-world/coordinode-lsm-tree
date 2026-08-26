@@ -725,7 +725,7 @@ impl Table {
     /// positional mask, so the caller treats it as carrying no keys.
     ///
     /// `pub(crate)` so the salvage walk ([`crate::salvage`]) can attempt each
-    /// data block individually and quarantine the ones that fail to load.
+    /// data block individually and drop the ones that fail to load.
     pub(crate) fn load_data_block(&self, handle: &BlockHandle) -> crate::Result<Option<DataBlock>> {
         // Columnar SSTs store each data block as a PAX `ColumnBatch`; reconstruct
         // the row entries on load so every row read path works unchanged.
@@ -6891,7 +6891,7 @@ impl Table {
         // STRUCTURAL signal (each decode reads its own section's bytes,
         // independent of the data blocks), so a corrupt DATA block does not
         // trip it. `block_layout` is excluded: it fails the open outright, so a
-        // relabel to it is quarantined by the failed recovery rather than
+        // relabel to it is rejected by the failed recovery rather than
         // salvaged.
         let mut rebuildable_section_degraded = false;
 
@@ -6972,7 +6972,7 @@ impl Table {
         // checksum/parity-valid but structurally broken BuRR payload) launders
         // the deletion metadata. Loading and parsing it here trips the
         // rebuildable-section degradation, which the salvage guard turns into a
-        // fail-closed quarantine. A live open (pin_filter, not salvage) keeps
+        // fail-closed refusal. A live open (pin_filter, not salvage) keeps
         // its exact prior behaviour.
         let pinned_filter_block = if pinned_filter_index.is_none() && (pin_filter || salvage) {
             let loaded = regions
@@ -7057,7 +7057,7 @@ impl Table {
                 // bit-rot: a re-stamped relabel produces a checksum-VALID block,
                 // so a broken payload checksum is real corruption, rebuilt from
                 // the recovered keys. A delete-free table with a bit-rotted
-                // filter must auto-repair, not quarantine, so salvaging
+                // filter must auto-repair, not fail closed, so salvaging
                 // continues without degrading.
                 Err(e) if salvage => {
                     if matches!(e, crate::Error::InvalidTag(_)) {
@@ -7448,7 +7448,7 @@ impl Table {
                 // A TRANSIENT locator read during salvage must PROPAGATE, not
                 // degrade: `rebuildable_section_degraded` makes `salvage_attempt`
                 // read a delete-free table as possibly hiding deletion metadata and
-                // fail the whole SST (`FeatureUnsupported`), quarantining an
+                // fail the whole SST (`FeatureUnsupported`), dropping an
                 // otherwise-salvageable table instead of retrying the retryable
                 // read. Mirrors the zone-map / seqno-bounds / delete-bitmap loaders.
                 // A non-salvage open keeps the best-effort accelerator behavior

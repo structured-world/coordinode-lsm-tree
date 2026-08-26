@@ -792,7 +792,7 @@ fn verify_sst_file_flags_a_duplicate_toc_section_name() {
 /// top-level index over filter partitions, same encoding as the data
 /// TLI), so a role map expecting Filter there flags a role mismatch on an
 /// intact file — and `repair_with_salvage` would grade the healthy table
-/// corrupt and quarantine or re-salvage it.
+/// corrupt and drop or re-salvage it.
 #[test]
 fn verify_sst_file_accepts_a_partitioned_filter() {
     use crate::InternalValue;

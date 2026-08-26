@@ -174,7 +174,7 @@ impl Table {
     /// Without patching the delete-bitmap descriptors, the copied values would
     /// still describe the SOURCE's (absent / different) bitmap, so
     /// `verify_metadata_bounds` would flag the healthy relocated table during
-    /// `repair_with_salvage`, refuse to re-emit it, and quarantine it.
+    /// `repair_with_salvage`, refuse to re-emit it, and drop it.
     fn repoint_meta_block(
         &self,
         src: &dyn FsFile,

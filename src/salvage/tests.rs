@@ -966,7 +966,7 @@ fn salvage_drops_the_tail_after_an_unframeable_oversized_handle() -> crate::Resu
 /// A forged `data` SFA-section length whose `pos + len` OVERFLOWS `u64` breaks
 /// the TOC tiling: the catalogue can no longer prove that no deletion section is
 /// concealed, so standalone salvage fails CLOSED, the same decision repair
-/// reaches by quarantining such a table. It must reject PROMPTLY (the coverage
+/// reaches by dropping such a table. It must reject PROMPTLY (the coverage
 /// check reads the TOC, never scans to the overflowed bound), so the hang the
 /// naive byte-at-a-time resync would suffer is avoided by refusing before the
 /// walk rather than by tiling to a rejected bound.
@@ -1018,8 +1018,8 @@ fn salvage_refuses_an_overflowing_data_section() -> crate::Result<()> {
 /// catalogue whose parsed table reports no deletion. Salvage re-derives the
 /// seqno bounds from the recovered entries, so it would discard that section
 /// and re-emit the suppressed rows as live. A genuinely rotted seqno-bounds
-/// section is indistinguishable from the relabel, so both fail closed; the
-/// operator recovers the quarantined original by hand.
+/// section is indistinguishable from the relabel, so both fail closed; those
+/// rows come back from a replica, a checkpoint plus journal replay, or a backup.
 #[test]
 fn salvage_refuses_a_corrupt_seqno_bounds_that_may_hide_a_deletion() -> crate::Result<()> {
     let dir = tempdir()?;
@@ -1067,8 +1067,7 @@ fn salvage_refuses_a_corrupt_seqno_bounds_that_may_hide_a_deletion() -> crate::R
 
     // Salvage fails closed: the seqno-bounds section did not decode and the
     // table exposes no deletion, so it may be a relabeled deletion salvage
-    // would discard — quarantine for manual recovery instead of resurrecting
-    // rows.
+    // would discard — refuse instead of resurrecting rows.
     let Err(err) = salvage_sst(&source, dest, &fs) else {
         panic!("a corrupt seqno-bounds section with no visible deletion must fail salvage");
     };
@@ -1082,7 +1081,7 @@ fn salvage_refuses_a_corrupt_seqno_bounds_that_may_hide_a_deletion() -> crate::R
 /// When BOTH meta mirrors decode under the expected id but DIVERGE (a forged,
 /// internally-consistent tail: `compression#data` re-stamped None -> Lz4,
 /// `meta_mid` untouched), the tail-first open decodes every data block under
-/// the wrong codec, drops them all, and repair would quarantine a table whose
+/// the wrong codec, drops them all, and repair would discard a table whose
 /// intact MID mirror recovers everything. Salvage must arbitrate the mirrors
 /// and keep the attempt that recovers more.
 #[cfg(feature = "lz4")]
@@ -2145,8 +2144,8 @@ fn verify_point_read_reachability_rejects_a_bucket_redirected_to_an_older_versio
 /// catalogue whose parsed table reports no deletion. Salvage re-derives the
 /// filter from the recovered keys, so it would discard that section and
 /// re-emit the suppressed rows as live. A genuinely rotted filter index is
-/// indistinguishable from the relabel, so both fail closed; the operator
-/// recovers the quarantined original by hand.
+/// indistinguishable from the relabel, so both fail closed; those rows come back
+/// from a replica, a checkpoint plus journal replay, or a backup.
 #[test]
 fn salvage_refuses_a_corrupt_filter_index_that_may_hide_a_deletion() -> crate::Result<()> {
     let dir = tempdir()?;
@@ -2202,7 +2201,7 @@ fn salvage_refuses_a_corrupt_filter_index_that_may_hide_a_deletion() -> crate::R
 
     // Salvage fails closed: the filter index did not decode and the table
     // exposes no deletion, so it may be a relabeled deletion salvage would
-    // discard — quarantine for manual recovery instead of resurrecting rows.
+    // discard — refuse instead of resurrecting rows.
     let Err(err) = salvage_sst(&source, dest, &fs) else {
         panic!("a corrupt filter index with no visible deletion must fail salvage");
     };
@@ -8315,7 +8314,7 @@ fn salvage_blob_file_drops_a_corrupt_record_and_keeps_the_rest() -> crate::Resul
 /// A blob file where EVERY record is corrupt salvages nothing: the report
 /// carries only drops, `salvaged_path` is `None`, and the empty destination
 /// placeholder the writer created is removed (a repair caller would otherwise
-/// re-quarantine a stray zero-record blob file in its place).
+/// re-reject a stray zero-record blob file in its place).
 #[test]
 fn salvage_blob_file_removes_the_empty_dest_when_nothing_is_recoverable() -> crate::Result<()> {
     let dir = tempdir()?;

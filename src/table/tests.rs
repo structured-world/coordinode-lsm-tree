@@ -5926,7 +5926,7 @@ fn write_columnar_batch_on_an_empty_batch_writes_no_block() -> crate::Result<()>
 /// A TRANSIENT locator-section read during a SALVAGE open must PROPAGATE, not
 /// degrade the section to `None`. The degradation sets `rebuildable_section_degraded`,
 /// which makes `salvage_attempt` read a delete-free table as possibly hiding
-/// deletion metadata and fail the whole SST (`FeatureUnsupported`), quarantining an
+/// deletion metadata and fail the whole SST (`FeatureUnsupported`), dropping an
 /// otherwise-salvageable table instead of retrying the retryable read. A non-salvage
 /// open keeps the best-effort accelerator behavior (degrade to the sorted-index
 /// path), so this only applies in salvage mode (#80).
@@ -6126,7 +6126,7 @@ fn recover_salvage_degrades_a_persistent_filter_index_read() -> crate::Result<()
         Ok(table) => table,
         Err(e) => panic!(
             "a persistent filter-index read in salvage mode must degrade the rebuildable \
-             section and recover the table, not propagate and quarantine it: {e:?}",
+             section and recover the table, not propagate and drop it: {e:?}",
         ),
     };
     // A bare success would also pass if the injected fault never fired; the

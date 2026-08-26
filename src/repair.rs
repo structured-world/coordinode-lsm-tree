@@ -239,363 +239,105 @@ fn highest_existing_version_id(
         .max())
 }
 
-/// Moves a file that does not belong in `tables/` (a non-table-id name) into a
-/// sibling `repair-quarantine/` directory, so a subsequent `Tree::open` — which
-/// rejects non-numeric names in `tables/` — succeeds. Returns the new path.
+/// Removes a file the rebuilt manifest does not name, together with any
+/// companion `.restrict-bound` sidecar, and makes the removal durable.
 ///
-/// Quarantine (move) rather than delete: the file was not created by repair, so
-/// it is preserved for the operator to inspect. The quarantine dir is a sibling
-/// of the table folder (same filesystem) so the move is a plain rename.
-fn quarantine_file(
+/// A repair has exactly two outcomes: a committed tree that opens, or an error.
+/// A file left behind is neither — `Tree::open` rejects a foreign name in
+/// `tables/` and sweeps an id the manifest does not reference, so a removal that
+/// cannot happen here becomes an open that fails. The removal is therefore not
+/// best-effort: a failure fails the repair.
+///
+/// The bytes are NOT preserved anywhere. Recovering the content of a damaged
+/// file is replication, checkpoint plus journal replay, or a backup; a directory
+/// hidden beside the tree recovers nothing and only makes a later run derive
+/// from a different world than the one it was handed.
+///
+/// Callers run this strictly AFTER the manifest commit. Until then every source
+/// is still the only copy of its rows, and a crash must leave the directory
+/// exactly as the retry expects to find it.
+///
+/// `NotFound` counts as done, so a retry finishes a sweep a crash interrupted.
+fn discard_unreferenced(
     fs: &dyn crate::fs::Fs,
-    table_base_folder: &std::path::Path,
-    src: &std::path::Path,
-    file_name: &str,
-    sync_mode: crate::fs::SyncMode,
-) -> crate::Result<PathBuf> {
-    let quarantine_dir = table_base_folder
-        .parent()
-        .unwrap_or(table_base_folder)
-        .join("repair-quarantine");
-    // Creating the quarantine directory adds its entry to the PARENT directory.
-    // That entry is durable only once the parent is synced: the later syncs
-    // cover the source directory and the quarantine directory itself, but not
-    // the parent that now names it, so without this a power loss after repair
-    // returns can drop the whole quarantine directory (and the only preserved
-    // copy of the original). Sync UNCONDITIONALLY, before the rename: a prior
-    // repair that created the directory but crashed before its own parent sync
-    // leaves the entry non-durable, so a retry that skipped the sync (seeing the
-    // directory already present) would move the source in without ever making
-    // the parent durable. A redundant fsync on an already-durable parent is
-    // cheap; skipping it risks losing the whole directory across a
-    // crashed-then-retried repair.
-    fs.create_dir_all(&quarantine_dir)?;
-    if let Some(quarantine_parent) = quarantine_dir.parent() {
-        fs.sync_directory_with(quarantine_parent, sync_mode)?;
-    }
-    // Preserve any EARLIER quarantine copy of the same table: `rename` replaces
-    // the destination on Unix, so a fixed `{file_name}` would move the new
-    // corrupt source over the only copy of a previously quarantined original
-    // set aside for inspection. Probe for a free `{file_name}` / `{file_name}.N`
-    // name instead. (A tiny check-then-rename window is acceptable: repair runs
-    // single-process against a downed tree.)
-    let dest = {
-        let mut candidate = quarantine_dir.join(file_name);
-        let mut n: u64 = 1;
-        while fs.exists(&candidate)? {
-            candidate = quarantine_dir.join(format!("{file_name}.{n}"));
-            n = n.checked_add(1).ok_or(crate::Error::Unrecoverable)?;
-        }
-        candidate
-    };
-    fs.rename(src, &dest)?;
-    // Everything after the first rename runs inside one fallible span so ANY
-    // failure — the sidecar's existence probe, the sidecar's rename, or the
-    // durability syncs — rolls the SST (and the sidecar, when it moved) back
-    // under `tables/`. Propagating with the table stranded in quarantine would
-    // mean the retried repair no longer discovers it and installs a manifest
-    // that omits it; a sync failure additionally means the move is not durably
-    // committed, so a later power loss could resurrect the source as an orphan
-    // the next open deletes. The rollback leaves both files exactly where a
-    // retry can find and re-quarantine them durably.
-    //
-    // Sidecar: a restricted SST carries its exact recovery bound in a sibling
-    // `.restrict-bound` file. Move it WITH the table: left behind in `tables/`,
-    // the next open's orphan sweep (the rebuilt manifest no longer names this
-    // id) deletes it, permanently stranding the quarantined punched file from
-    // its exact bound. Absent for unrestricted tables and for non-table
-    // quarantines (a rejected salvage replacement, a foreign file), a no-op
-    // there. Both sidecar and SST live in the same two directories, so the two
-    // syncs cover both.
-    //
-    // Sync ordering: a rename is durable only once BOTH affected directory
-    // entries are on disk. Sync the DESTINATION (quarantine) directory FIRST,
-    // then the source: if the source's deletion were made durable first, a
-    // power loss before the quarantine entry is durable would leave NEITHER
-    // name after reboot, destroying the only preserved original. This is the
-    // same ordering `restore_quarantined` uses for the inverse move.
-    let src_sidecar = crate::restrict_bound::sidecar_path(src);
-    let dest_sidecar = crate::restrict_bound::sidecar_path(&dest);
-    let commit_result = (|| -> crate::Result<()> {
-        if fs.exists(&src_sidecar)? {
-            fs.rename(&src_sidecar, &dest_sidecar)?;
-        }
-        fs.sync_directory_with(&quarantine_dir, sync_mode)?;
-        if let Some(src_dir) = src.parent() {
-            fs.sync_directory_with(src_dir, sync_mode)?;
-        }
-        Ok(())
-    })();
-    if let Err(e) = commit_result {
-        // Best-effort: undo BOTH moves and re-sync. The sidecar rollback is
-        // unconditional — a no-op rename failure (the sidecar never moved, or
-        // never existed) is harmless and ignored like the rest. A rollback that
-        // itself fails leaves nothing more we can safely do here; surface the
-        // original error.
-        let _ = fs.rename(&dest, src);
-        let _ = fs.rename(&dest_sidecar, &src_sidecar);
-        if let Some(src_dir) = src.parent() {
-            let _ = fs.sync_directory_with(src_dir, sync_mode);
-        }
-        let _ = fs.sync_directory_with(&quarantine_dir, sync_mode);
-        return Err(e);
-    }
-    Ok(dest)
-}
-
-/// Marker path naming WHY a quarantined file was set aside: its restriction
-/// bound was unrecoverable at `resurrection = off`. A resurrection repair
-/// reclaims marked files back into `tables/` (see [`reclaim_resurrectable`]),
-/// keeping the resurrection knob two-way — no manual file move between a
-/// default repair and a resurrection re-run. The marker is NEVER written for
-/// flag-independent quarantines (duplicates, corrupt files, bulk-ingest
-/// rejects, salvage byproducts), so a reclaim can never resurrect those.
-fn resurrectable_marker_path(quarantined: &std::path::Path) -> PathBuf {
-    let mut name = quarantined.file_name().unwrap_or_default().to_os_string();
-    name.push(".resurrectable");
-    quarantined.with_file_name(name)
-}
-
-/// Durably writes the resurrectable marker beside a freshly quarantined file.
-/// The CALLER must treat a failure as "the set-aside did not commit": roll the
-/// quarantine move back (restore the file to `tables/`) and propagate, so a
-/// retry re-runs the whole classification instead of leaving an UNMARKED
-/// set-aside that a resurrection repair could never reclaim.
-fn mark_resurrectable(
-    fs: &dyn crate::fs::Fs,
-    quarantined: &std::path::Path,
+    path: &std::path::Path,
     sync_mode: crate::fs::SyncMode,
 ) -> crate::Result<()> {
-    use std::io::Write;
-    let marker = resurrectable_marker_path(quarantined);
-    let mut file = fs.open(
-        &marker,
-        &crate::fs::FsOpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true),
-    )?;
-    file.write_all(b"resurrectable")?;
-    file.flush()?;
-    crate::fs::FsFile::sync_all_with(&*file, sync_mode)?;
-    drop(file);
-    if let Some(dir) = marker.parent() {
+    let remove = |target: &std::path::Path| -> crate::Result<()> {
+        match fs.remove_file(target) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    };
+    // Sidecar first: an SST removed while its `.restrict-bound` survives leaves a
+    // bound that a later run would match by id against an unrelated table. Most
+    // files have none (blob files never do), so probe before asking.
+    let sidecar = crate::restrict_bound::sidecar_path(path);
+    if fs.exists(&sidecar)? {
+        remove(&sidecar)?;
+    }
+    remove(path)?;
+    if let Some(dir) = path.parent() {
         fs.sync_directory_with(dir, sync_mode)?;
     }
     Ok(())
 }
 
-/// Returns marked resurrectable set-asides from `repair-quarantine/` to
-/// `tables/`, so a resurrection repair recovers them like any other punched
-/// file — the flag's two-way half (the marker is written by the flag-dependent
-/// set-aside sites). Only files bearing a `.resurrectable` marker move; the
-/// marker is consumed by the move. A collision-suffixed quarantine name
-/// (`{id}.N`) reclaims to its plain `{id}`; an occupied target skips the file
-/// (kept marked for a later run) rather than clobbering. Crash-safe by
-/// idempotence: a file either still sits marked in quarantine (retried next
-/// run) or already sits in `tables/` (recovered normally; its stale marker is
-/// swept here).
-#[cfg(feature = "std")]
-fn reclaim_resurrectable(
-    fs: &dyn crate::fs::Fs,
-    table_base_folder: &std::path::Path,
-    sync_mode: crate::fs::SyncMode,
-) -> crate::Result<()> {
-    let quarantine_dir = table_base_folder
-        .parent()
-        .unwrap_or(table_base_folder)
-        .join("repair-quarantine");
-    if !fs.exists(&quarantine_dir)? {
-        return Ok(());
-    }
-    for entry in fs.read_dir(&quarantine_dir)? {
-        let Some(data_name) = entry.file_name.strip_suffix(".resurrectable") else {
-            continue;
-        };
-        let marker = quarantine_dir.join(&entry.file_name);
-        let data = quarantine_dir.join(data_name);
-        if !fs.exists(&data)? {
-            // A crash between a previous reclaim's move and its marker removal:
-            // the file already went back and was recovered; sweep the leftover.
-            let _ = fs.remove_file(&marker);
-            continue;
-        }
-        // A collision-suffixed quarantine name ({id}.N) reclaims to plain {id}.
-        let id_part = data_name.split('.').next().unwrap_or(data_name);
-        if id_part.parse::<TableId>().is_err() {
-            continue;
-        }
-        let target = table_base_folder.join(id_part);
-        if fs.exists(&target)? {
-            log::warn!(
-                "not reclaiming {}: {} is already occupied; kept marked for a later run",
-                data.display(),
-                target.display(),
-            );
-            continue;
-        }
-        fs.rename(&data, &target)?;
-        // Everything after the rename runs inside one fallible span: a failure
-        // must NOT return with the SST sitting in `tables/` unreferenced by the
-        // previously installed manifest — a caller that reacts to the failed
-        // repair by simply REOPENING the tree would then have orphan cleanup
-        // delete the only recovered copy. On failure the file (and any moved
-        // sidecar) rolls BACK into quarantine, marker intact, where the next
-        // resurrection repair rediscovers it; quarantine — not `tables/` — is
-        // the retry-safe location for THIS flow precisely because the marker
-        // machinery re-scans it. The marker is consumed only AFTER both syncs,
-        // so a crash inside the span also leaves a marked, reclaimable file
-        // (the un-synced rename either rolls back with its directory, or the
-        // file lands in `tables/`, is recovered, and the stale marker is swept
-        // next run).
-        let data_sidecar = crate::restrict_bound::sidecar_path(&data);
-        let target_sidecar = crate::restrict_bound::sidecar_path(&target);
-        let commit = (|| -> crate::Result<()> {
-            // Bring a companion sidecar back too (present only when a
-            // corrupt-but-existing sidecar traveled with the quarantine move; a
-            // corrupt sidecar is ignored by recovery, so this is harmless
-            // bookkeeping).
-            if fs.exists(&data_sidecar)? {
-                let _ = fs.rename(&data_sidecar, &target_sidecar);
-            }
-            // Destination first, then source: the same crash ordering the
-            // quarantine / restore moves use — the reclaimed name must be
-            // durable before its quarantine entry's removal is.
-            fs.sync_directory_with(table_base_folder, sync_mode)?;
-            fs.sync_directory_with(&quarantine_dir, sync_mode)?;
-            Ok(())
-        })();
-        if let Err(e) = commit {
-            // Best-effort: undo both moves and re-sync; surface the original
-            // error. A rollback that itself fails leaves nothing more we can
-            // safely do here — the marker still names the file for the next run.
-            let _ = fs.rename(&target, &data);
-            let _ = fs.rename(&target_sidecar, &data_sidecar);
-            let _ = fs.sync_directory_with(&quarantine_dir, sync_mode);
-            let _ = fs.sync_directory_with(table_base_folder, sync_mode);
-            return Err(e);
-        }
-        let _ = fs.remove_file(&marker);
-        log::info!(
-            "reclaimed resurrectable set-aside {} -> {}",
-            data.display(),
-            target.display(),
-        );
-    }
-    Ok(())
+pub(crate) use crate::file::{REPAIR_TMP_SUFFIX, table_id_from_repair_tmp_name};
+
+/// `{id}` -> `{id}.repair-tmp`, the path a repair builds a replacement at.
+///
+/// The replacement CANNOT be built at `{id}` directly: that would either destroy
+/// the source before the manifest commit (a crash then loses the only copy) or,
+/// under a fresh id beside the source, leave both readable after a crash — and
+/// the retry, unable to tell a half-finished replacement from a real table,
+/// would rebuild BOTH into L0, applying every merge operand of that history
+/// twice. A name no scan adopts has neither problem: the source stays intact and
+/// authoritative until the commit, and a leftover temp is garbage.
+fn repair_tmp_path(table_path: &std::path::Path) -> PathBuf {
+    let mut name = table_path.file_name().unwrap_or_default().to_os_string();
+    name.push(REPAIR_TMP_SUFFIX);
+    table_path.with_file_name(name)
 }
 
-/// Moves a quarantined original back to its `table_path`, durably. The inverse of
-/// [`quarantine_file`], used when a TRANSIENT salvage failure must not strand the
-/// only copy in quarantine (which a retry, no longer finding it under `tables/`,
-/// would never rediscover). `rename` replaces any partial / salvaged output the
-/// aborted salvage left at `table_path`, and both affected directory entries are
-/// synced so the restore survives a power loss the same way the quarantine move
-/// does.
-fn restore_quarantined(
+/// Swaps a finished replacement onto the name the committed manifest gives it:
+/// `{id}.repair-tmp` becomes `{id}`, destroying the damaged source it replaces,
+/// with any companion `.restrict-bound` sidecar carried along.
+///
+/// Strictly POST-COMMIT. Before the commit the source is still the only copy of
+/// its rows and the manifest still names it; after it, the manifest names this
+/// content and the source is what the tree no longer references.
+///
+/// Sidecar first, and the sidecar's own removal-or-rename settled before the
+/// table moves: a table adopted at `{id}` while a STALE `{id}.restrict-bound`
+/// survives would be reopened restricted at an unrelated bound, silently hiding
+/// its prefix.
+pub(crate) fn commit_repair_tmp(
     fs: &dyn crate::fs::Fs,
-    quarantined: &std::path::Path,
+    tmp_path: &std::path::Path,
     table_path: &std::path::Path,
-    encryption: Option<&dyn crate::encryption::EncryptionProvider>,
     sync_mode: crate::fs::SyncMode,
 ) -> crate::Result<()> {
-    // Capture the companion sidecar's RAW bytes BEFORE anything moves: if the
-    // direct sidecar rename below fails after the SST is already restored, the
-    // bytes are re-published at the destination instead, so the exact bound is
-    // never stranded in quarantine (where the retried repair — which scans only
-    // `tables/` — would silently degrade the restored SST to the lossy
-    // geometry fallback). A TRANSIENT probe / read failure propagates while
-    // nothing has moved yet; a PERSISTENT one — or a file larger than any
-    // VALID sidecar encoding (an attacker-padded / corrupt file must not be
-    // trusted into a full-size allocation) — leaves no rescue copy, but the
-    // direct rename below (which never reads the content) may still succeed.
-    let quarantined_sidecar = crate::restrict_bound::sidecar_path(quarantined);
-    let sidecar_state: Option<(bool, Option<Vec<u8>>)> = if fs.exists(&quarantined_sidecar)? {
-        match read_raw_file(
-            fs,
-            &quarantined_sidecar,
-            crate::restrict_bound::max_encoded_len(encryption),
-        ) {
-            Ok(bytes) => Some((true, bytes)),
-            Err(e) if is_transient_io(&e) => return Err(e),
-            Err(_) => Some((true, None)),
-        }
-    } else {
-        None
-    };
-    fs.rename(quarantined, table_path)?;
-    // Restore the companion `.restrict-bound` sidecar too, mirroring the move
-    // `quarantine_file` made: a restored SST without its exact bound would fall
-    // back to a conservative punch-geometry bound on the next open. Both files
-    // share the same two directories, so the syncs below cover both.
-    //
-    // The SST is NEVER rolled back into quarantine on a sidecar failure: a
-    // pair stranded there is invisible to the retried repair entirely (a
-    // silent whole-table loss), while a restored SST with a degraded bound
-    // stays recoverable through the deterministic geometry path.
-    if let Some((_, bytes)) = sidecar_state {
-        let dest_sidecar = crate::restrict_bound::sidecar_path(table_path);
-        if let Err(rename_err) = fs.rename(&quarantined_sidecar, &dest_sidecar) {
-            match bytes {
-                Some(bytes) => {
-                    // Fallback: re-publish the captured bytes atomically at the
-                    // destination. A failure here propagates (the SST stays
-                    // restored; the retry handles the boundless punched table
-                    // deterministically).
-                    log::warn!(
-                        "restoring {}: sidecar rename failed ({rename_err}); re-publishing \
-                         the captured bytes instead",
-                        table_path.display(),
-                    );
-                    crate::restrict_bound::publish_raw(fs, table_path, &bytes, sync_mode)?;
-                    // Best-effort: drop the now-duplicated quarantine copy so a
-                    // stale bound cannot linger beside future quarantines.
-                    let _ = fs.remove_file(&quarantined_sidecar);
-                }
-                None => {
-                    // The sidecar could be neither read nor moved: its bound is
-                    // unrecoverable through any mechanism. Continue — the
-                    // restore itself succeeded, and the retry resolves the
-                    // boundless punched table deterministically (geometry
-                    // bound, or set-aside when the punch pattern is
-                    // ambiguous). Aborting here would change nothing the
-                    // retry could use.
-                    log::error!(
-                        "restoring {}: sidecar is unreadable and its rename failed \
-                         ({rename_err}); the exact restriction bound is lost",
-                        table_path.display(),
-                    );
-                }
-            }
+    let tmp_sidecar = crate::restrict_bound::sidecar_path(tmp_path);
+    let dest_sidecar = crate::restrict_bound::sidecar_path(table_path);
+    if fs.exists(&tmp_sidecar)? {
+        fs.rename(&tmp_sidecar, &dest_sidecar)?;
+    } else if fs.exists(&dest_sidecar)? {
+        // The replacement is unrestricted, so the source's bound describes bytes
+        // that are about to stop existing. Left in place it would reopen the
+        // replacement restricted at an unrelated bound and hide its prefix.
+        match fs.remove_file(&dest_sidecar) {
+            Ok(()) => {}
+            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
     }
-    if let Some(dst_dir) = table_path.parent() {
-        fs.sync_directory_with(dst_dir, sync_mode)?;
-    }
-    if let Some(src_dir) = quarantined.parent() {
-        fs.sync_directory_with(src_dir, sync_mode)?;
+    fs.rename(tmp_path, table_path)?;
+    if let Some(dir) = table_path.parent() {
+        fs.sync_directory_with(dir, sync_mode)?;
     }
     Ok(())
-}
-
-/// Reads a small file's complete contents, or `None` when the file exceeds
-/// `max_len` — the reported length is untrusted input, so it is validated
-/// BEFORE sizing the allocation. Used to capture sidecar bytes before a restore
-/// move so they can be re-published if the direct rename fails; an oversized
-/// file cannot be a valid sidecar and is not worth rescuing.
-#[cfg(feature = "std")]
-fn read_raw_file(
-    fs: &dyn crate::fs::Fs,
-    path: &std::path::Path,
-    max_len: u64,
-) -> crate::Result<Option<Vec<u8>>> {
-    let file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
-    let len = crate::fs::FsFile::metadata(&*file)?.len;
-    if len > max_len {
-        return Ok(None);
-    }
-    let n = usize::try_from(len).map_err(|_| crate::Error::Unrecoverable)?;
-    Ok(Some(crate::file::read_exact(&*file, 0, n)?.to_vec()))
 }
 
 /// Whether an error is an UNAMBIGUOUSLY TRANSIENT (retryable) I/O failure, as
@@ -636,7 +378,7 @@ fn is_transient_io(e: &crate::Error) -> bool {
 ///   Treat it as bulk-ingested ONLY when its entries carry the ingest signature
 ///   (present, and every LOCAL seqno 0), which a legacy bulk-ingest produces. A
 ///   legacy first-batch-at-seqno-0 flush matches too and is conservatively
-///   quarantined; the ambiguity is unavoidable without the flag.
+///   dropped; the ambiguity is unavoidable without the flag.
 fn has_unrecoverable_ingest_offset(
     bulk_ingested: Option<bool>,
     item_count: u64,
@@ -653,19 +395,16 @@ fn has_unrecoverable_ingest_offset(
 /// keys. Repair keeps the best copy per table id, so a duplicate id in another
 /// table folder can supersede an earlier DAMAGED copy.
 ///
-/// The physical location (`fs` / `base_folder` / `path` / `file_name`) travels
-/// with the candidate so that when a duplicate SUPERSEDES it, the loser's file
-/// can be quarantined out of `tables/`. The rebuilt manifest records only
-/// `id + checksum`, so two same-id files left in different folders would let
-/// recovery resolve the stale one by folder order and reopen it against the kept
-/// copy's mismatched checksum.
+/// The physical location (`fs` / `path`) travels with the candidate so that when
+/// a duplicate SUPERSEDES it, the loser's file can be removed from `tables/`. The
+/// rebuilt manifest records only `id + checksum`, so two same-id files left in
+/// different folders would let recovery resolve the stale one by folder order and
+/// reopen it against the kept copy's mismatched checksum.
 struct TableCandidate {
     table: Table,
     complete: bool,
     fs: Arc<dyn crate::fs::Fs>,
-    base_folder: PathBuf,
     path: PathBuf,
-    file_name: String,
 }
 
 /// Records `candidate` for `id`, keeping the BETTER of the existing and the new
@@ -675,9 +414,9 @@ struct TableCandidate {
 /// readable copy per id — so the first-seen stays.
 ///
 /// Returns the DISPLACED loser (the rejected new candidate, or the superseded old
-/// one) so the caller can quarantine its on-disk file; `None` when `id` was
+/// one) so the caller can record its file for removal; `None` when `id` was
 /// previously unseen (nothing displaced).
-#[must_use = "the displaced duplicate's file must be quarantined out of tables/"]
+#[must_use = "the displaced duplicate's file must be removed from tables/"]
 fn keep_best_candidate(
     map: &mut crate::HashMap<TableId, TableCandidate>,
     id: TableId,
@@ -721,15 +460,15 @@ fn remove_temp(config: &Config, temp: &std::path::Path) -> crate::Result<()> {
 /// Whether `a` and `b` name the SAME physical file — a symlink, junction, or
 /// case-insensitive alias resolving to one directory entry (two configured table
 /// folders pointing at the same location). Used so a repeated sighting of one SST
-/// through an alias is never quarantined as a "duplicate" (which would move the
+/// through an alias is never removed as a "duplicate" (which would destroy the
 /// kept copy and orphan the manifest entry).
 ///
 /// The two candidates must live in the SAME filesystem namespace for a path
 /// comparison to mean anything: a virtual (`MemFs`) table can sit at a path that
 /// also exists on the host filesystem, and canonicalizing both spellings through
-/// the host would call those distinct files aliases — the loser would then escape
-/// quarantine and a later reopen could resolve that leftover against the kept
-/// copy's manifest checksum. Backends advertise namespace identity through
+/// the host would call those distinct files aliases — the loser would then survive
+/// and a later reopen could resolve that leftover against the kept copy's
+/// manifest checksum. Backends advertise namespace identity through
 /// [`Fs::backend_id`](crate::fs::Fs::backend_id), whose `None` means "no shared
 /// namespace guarantee" and is therefore treated as DISTINCT.
 ///
@@ -738,7 +477,7 @@ fn remove_temp(config: &Config, temp: &std::path::Path) -> crate::Result<()> {
 /// canonicalize through the host, virtual ones compare paths literally — a
 /// host symlink must never alias two distinct virtual files. A probe that
 /// cannot decide answers `false` (distinct), so a genuine duplicate is still
-/// quarantined.
+/// removed.
 #[cfg(feature = "std")]
 fn same_physical_file(
     fs_a: &dyn crate::fs::Fs,
@@ -755,45 +494,34 @@ fn same_physical_file(
     // Alias resolution belongs to the BACKEND, not the host: canonicalizing a
     // virtual backend's paths through the host filesystem would let a host
     // symlink alias two unrelated virtual files, and the "duplicate" loser
-    // would escape quarantine. Kernel-backed backends canonicalize; virtual
-    // ones compare literally.
+    // would survive. Kernel-backed backends canonicalize; virtual ones compare
+    // literally.
     fs_a.same_file(a, b)
 }
 
-/// Quarantines a duplicate table file that lost to a better same-id copy, moving
-/// it out of `tables/` (so recovery cannot resolve it) and recording it as
-/// considered-but-not-referenced. A failed quarantine aborts the whole repair:
-/// leaving both same-id files in place would let recovery reopen the wrong one.
+/// Records a duplicate table file that lost to a better same-id copy: reported
+/// as considered-but-not-referenced, and removed once the manifest is durable so
+/// recovery can never resolve it instead of the kept copy.
 #[cfg(feature = "std")]
-fn quarantine_duplicate(
+fn discard_duplicate(
     loser: TableCandidate,
     unreadable_files: &mut Vec<(PathBuf, String)>,
-    sync_mode: crate::fs::SyncMode,
-) -> crate::Result<()> {
+    discard_after_commit: &mut Vec<(Arc<dyn crate::fs::Fs>, PathBuf, String)>,
+) {
     let TableCandidate {
-        table,
-        fs,
-        base_folder,
-        path,
-        file_name,
-        ..
+        table, fs, path, ..
     } = loser;
-    drop(table); // release the open file handle before the move
-    let dest = quarantine_file(&*fs, &base_folder, &path, &file_name, sync_mode)?;
-    unreadable_files.push((
-        path,
-        format!(
-            "duplicate table id superseded by another copy; quarantined to {}",
-            dest.display()
-        ),
-    ));
-    Ok(())
+    drop(table); // release the open file handle
+    let reason = "duplicate table id superseded by another copy";
+    discard_after_commit.push((fs, path.clone(), reason.to_string()));
+    unreadable_files.push((path, reason.to_string()));
 }
 
 /// Builds a [`TableCandidate`] from a recovered table plus its physical location,
-/// records it as the best copy for `id`, and quarantines any duplicate displaced
-/// by the decision. The one path every recovered table takes to enter the
-/// manifest, so a superseded same-id file is never left discoverable.
+/// records it as the best copy for `id`, and marks any duplicate displaced by
+/// the decision for post-commit removal. The one path every recovered table
+/// takes to enter the manifest, so a superseded same-id file is never left
+/// discoverable once the rebuild is durable.
 #[cfg(feature = "std")]
 #[expect(
     clippy::too_many_arguments,
@@ -802,45 +530,41 @@ fn quarantine_duplicate(
 fn record_best(
     map: &mut crate::HashMap<TableId, TableCandidate>,
     unreadable_files: &mut Vec<(PathBuf, String)>,
+    discard_after_commit: &mut Vec<(Arc<dyn crate::fs::Fs>, PathBuf, String)>,
     id: TableId,
     table: Table,
     complete: bool,
     fs: &Arc<dyn crate::fs::Fs>,
-    base_folder: &std::path::Path,
     path: &std::path::Path,
-    file_name: &str,
-    sync_mode: crate::fs::SyncMode,
-) -> crate::Result<()> {
+) {
     let candidate = TableCandidate {
         table,
         complete,
         fs: Arc::clone(fs),
-        base_folder: base_folder.to_path_buf(),
         path: path.to_path_buf(),
-        file_name: file_name.to_string(),
     };
     if let Some(loser) = keep_best_candidate(map, id, candidate) {
         // If the displaced copy physically ALIASES the kept one (same directory
         // entry via a symlink / junction / case-insensitive path), it is the SAME
-        // file — quarantining it would move the kept copy and orphan the manifest
-        // entry. Drop the loser's handle in place instead of quarantining.
+        // file — removing it would destroy the kept copy and orphan the manifest
+        // entry. Drop the loser's handle in place instead.
         let is_alias = map
             .get(&id)
             .is_some_and(|kept| same_physical_file(&*loser.fs, &loser.path, &*kept.fs, &kept.path));
-        if !is_alias {
-            quarantine_duplicate(loser, unreadable_files, sync_mode)?;
+        if is_alias {
+            return;
         }
+        discard_duplicate(loser, unreadable_files, discard_after_commit);
     }
-    Ok(())
 }
 
-/// Block-salvages a corrupt SST during repair: reads the ALREADY-QUARANTINED
-/// original (the caller performs the move, which frees `table_path`), writes a
-/// fresh SST holding its recoverable blocks into that path, and reopens it.
+/// Block-salvages a corrupt SST during repair: reads the UNTOUCHED original in
+/// place, writes a fresh SST holding its recoverable blocks to `table_path` (the
+/// unpublished `{id}.repair-tmp`), and reopens it.
 ///
-/// Returns `Ok(None)` when nothing was recoverable (the original stays in
-/// quarantine and the path is left empty), or `Err` when even salvage cannot
-/// open the source (its metadata / index / SFA trailer is itself unreadable).
+/// Returns `Ok(None)` when nothing was recoverable (the source is untouched and
+/// no replacement exists), or `Err` when even salvage cannot open the source
+/// (its metadata / index / SFA trailer is itself unreadable).
 /// Whether a freshly-recovered SST passes the salvage-mode block verify.
 ///
 /// One uniform path for encrypted and unencrypted tables: the out-of-band
@@ -876,7 +600,7 @@ fn block_verify_verdict(
     // Walk only the recovered view's LIVE data: for a tight-space RESTRICTED view
     // (a valid `.restrict-bound` sidecar was accepted) the `[0, punch_offset)`
     // prefix is hole-punched and reads as zeros, so starting at byte 0 would
-    // report those dead blocks as corruption and salvage would then quarantine an
+    // report those dead blocks as corruption and repair would then drop an
     // otherwise-healthy restricted SST. `punch_offset()` is `0` for a normal table.
     let data_start = table.punch_offset()?;
     let report = crate::verify::verify_sst_file_with_context(
@@ -1077,15 +801,16 @@ enum BlockVerifyVerdict {
 enum RepairKeepDecision {
     /// The table joins the rebuilt manifest as-is.
     Keep,
-    /// The table is routed through block salvage (quarantine + rewrite).
+    /// The table is routed through block salvage: its readable blocks are
+    /// rewritten into a fresh copy beside it.
     Salvage,
     /// The table can be neither trusted nor faithfully salvaged under the
-    /// active resurrection policy: it is EXCLUDED from the rebuilt manifest and
-    /// its file set aside (protecting it from the orphan cleanup a later open
-    /// runs) with this reason. The tree still opens; the excluded table is
-    /// re-admitted by recompaction or, where the reason allows, by enabling
-    /// resurrection.
-    Quarantine(&'static str),
+    /// active resurrection policy: it is EXCLUDED from the rebuilt manifest,
+    /// with this reason, and its file removed once that manifest is durable.
+    /// The tree still opens. Its rows come back through recompaction, a replica,
+    /// a checkpoint plus journal replay, or a backup — and, where the reason
+    /// says so, from a repair run WITH resurrection enabled instead.
+    Drop(&'static str),
 }
 
 /// Whether the on-disk TOC catalogue could HIDE a deletion section — see
@@ -1110,7 +835,7 @@ pub(crate) fn toc_may_hide_deletions(
         // A TRANSIENT open failure propagates (a retry could open the file and
         // prove no hidden section); a PERSISTENT one fails closed as catalogue
         // ambiguity — we cannot read the TOC to prove it hides no deletion
-        // section, so `true` quarantines rather than resurrecting masked rows.
+        // section, so `true` drops the table rather than resurrecting masked rows.
         Err(e) => {
             let err = crate::Error::Io(e);
             return if is_transient_io(&err) {
@@ -1193,12 +918,12 @@ fn verify_keep_decision(
                 // path and the recovery-failure salvage path funnel through.
                 //
                 // Probed BEFORE the salvage-off branch below on purpose: with
-                // salvage off the table quarantines either way, but this reason
+                // salvage off the table is dropped either way, but this reason
                 // is the accurate one — pointing that operator at a
-                // salvage-enabled repair would mislead (it quarantines the
+                // salvage-enabled repair would mislead (it drops the
                 // concealment case too, unless resurrection is enabled).
                 if toc_may_hide_deletions(folder_fs, table_path)? && !allow_resurrection {
-                    RepairKeepDecision::Quarantine(
+                    RepairKeepDecision::Drop(
                         "TOC corruption may hide deletion metadata (range tombstones \
                      / delete bitmap); its visibility is unrecoverable, so the table \
                      is excluded to avoid resurrecting masked rows. Enable \
@@ -1208,7 +933,7 @@ fn verify_keep_decision(
                 } else if salvage {
                     RepairKeepDecision::Salvage
                 } else {
-                    RepairKeepDecision::Quarantine(
+                    RepairKeepDecision::Drop(
                         "verification found corrupt data blocks; run a salvage-enabled \
                          repair to rewrite the readable blocks",
                     )
@@ -1234,13 +959,13 @@ fn verify_keep_decision(
                 if salvage && table.range_tombstones().is_empty() {
                     RepairKeepDecision::Salvage
                 } else if salvage {
-                    RepairKeepDecision::Quarantine(
+                    RepairKeepDecision::Drop(
                         "ECC descriptor unrecognized (the block walk cannot verify the \
                      table) and salvage cannot re-emit its range tombstones; the table \
                      is excluded (recompact it under a supported scheme to re-admit it)",
                     )
                 } else {
-                    RepairKeepDecision::Quarantine(
+                    RepairKeepDecision::Drop(
                         "ECC descriptor unrecognized (the block walk cannot verify the \
                      table); run a salvage-enabled repair to rewrite it under fresh, \
                      verifiable parity",
@@ -1257,13 +982,13 @@ enum SalvageOutcome {
     Salvaged(Table),
     /// Nothing was recoverable, or the replacement was rejected (an
     /// unreconstructible bulk-ingest offset); the caller records the table
-    /// unreadable. The original stays quarantined for inspection.
+    /// unreadable and removes its file once the manifest is durable.
     Unusable,
     /// The `reject_punched_without_bound` guard fired: a salvage-dropped data
     /// extent of the source reads as zeros (the hole-punch signature), so the
     /// source lost data to a punch whose bound is unrecoverable. The
-    /// unrestricted replacement was rejected and quarantined — installing it
-    /// would resurrect the reclaimed region's superseded rows.
+    /// unrestricted replacement was rejected and removed — installing it would
+    /// resurrect the reclaimed region's superseded rows.
     PunchedBoundLost,
 }
 
@@ -1272,14 +997,13 @@ enum SalvageOutcome {
 /// its policy surface grows.
 #[cfg(feature = "std")]
 struct TableSalvage<'a> {
-    /// The already-quarantined corrupt original (the salvage source). The
-    /// CALLER performs the quarantine move and aborts the whole repair when it
-    /// fails — a manifest omitting a still-in-place file would let the next
-    /// open's orphan cleanup delete the only copy. An error returned from the
-    /// salvage is therefore always post-quarantine: the original is safely
-    /// preserved, and the caller records the failure instead of aborting.
-    quarantined: &'a std::path::Path,
-    /// Where the recovered copy is written (the original table path).
+    /// The damaged original to read, UNTOUCHED and still at its own path. It is
+    /// never displaced first: the copy goes to a fresh name beside it, and the
+    /// source is removed only once the manifest names the copy. A salvage that
+    /// fails therefore leaves the directory exactly as it was found, and the
+    /// retry re-derives the same result from the same bytes.
+    source: &'a std::path::Path,
+    /// Where the recovered copy is written (a fresh, unused path).
     table_path: &'a std::path::Path,
     /// The durable table id (its file name).
     table_id: TableId,
@@ -1298,11 +1022,6 @@ struct TableSalvage<'a> {
     /// frontier); `None` on the plain corrupt-table salvage paths.
     blob_rewrite:
         Option<Arc<crate::HashMap<crate::vlog::BlobFileId, crate::salvage::BlobFileRewrite>>>,
-    /// Stamp the recovered copy with a FRESH identity (matching `table_path`'s
-    /// file name) instead of the source's, for the caller that publishes it
-    /// beside an untouched source. `None` keeps the source's identity, which is
-    /// what the in-place replacement paths need.
-    output_id: Option<TableId>,
 }
 
 fn try_salvage_table(
@@ -1312,19 +1031,18 @@ fn try_salvage_table(
     salvage: TableSalvage<'_>,
 ) -> crate::Result<SalvageOutcome> {
     let TableSalvage {
-        quarantined,
+        source,
         table_path,
         table_id,
         reject_punched_without_bound,
         blob_rewrite,
-        output_id,
     } = salvage;
     // Salvage under the tree's configured comparator + crypto/dictionary context
     // so the rewritten SST opens, orders, and decrypts / decompresses consistently
     // with the rest of the tree on reopen (the reopen below uses the same
     // `config.encryption` / `config.zstd_dictionary`).
     let report = crate::salvage::salvage_with_context(
-        quarantined,
+        source,
         table_path.to_path_buf(),
         fs,
         &config.comparator,
@@ -1353,7 +1071,10 @@ fn try_salvage_table(
             // prefix scans see the salvaged copy as definitely absent.
             prefix_extractor: config.prefix_extractor.clone(),
             blob_rewrite,
-            output_id,
+            // A repair replacement always keeps the SOURCE's identity: it is
+            // built at `{id}.repair-tmp` and swapped onto `{id}`, so the name it
+            // ends up under is the identity it was stamped with.
+            output_id: None,
             // Forward the caller's live-progress handle so the block walk
             // ticks per inspected / recovered block while it runs.
             progress: config.recovery_progress.clone(),
@@ -1370,20 +1091,17 @@ fn try_salvage_table(
         );
     }
     if reject_punched_without_bound
-        && dropped_data_extent_is_zeroed(&**fs, quarantined, &report.dropped)?
+        && dropped_data_extent_is_zeroed(&**fs, source, &report.dropped)?
     {
         // The source was punched but its bound is unrecoverable: the salvaged
         // replacement re-emits every intact block — including consumed,
         // superseded blocks a partial punch left inside the reclaimed prefix —
-        // with nothing to restrict them. Reject it: quarantine the fresh copy
-        // (see the bulk-ingest rejection below for why a plain remove is not
-        // enough) and let the caller set the table aside.
-        let base = table_path.parent().ok_or(crate::Error::Unrecoverable)?;
-        let name = table_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or(crate::Error::Unrecoverable)?;
-        quarantine_file(&**fs, base, table_path, name, config.sync_mode)?;
+        // with nothing to restrict them. Reject it: this copy is our own
+        // byproduct, holds nothing the untouched source does not, and no
+        // manifest will ever name it, so it is removed outright. A removal
+        // failure PROPAGATES — left behind, the numeric SST is an orphan the
+        // next open must delete, and that open would fail on the same error.
+        discard_unreferenced(&**fs, table_path, config.sync_mode)?;
         return Ok(SalvageOutcome::PunchedBoundLost);
     }
 
@@ -1395,7 +1113,7 @@ fn try_salvage_table(
         checksum,
         0,
         0,
-        output_id.unwrap_or(table_id),
+        table_id,
         config.cache.clone(),
         None,
         Arc::clone(fs),
@@ -1411,29 +1129,21 @@ fn try_salvage_table(
     // A salvaged copy of a bulk-ingested source still relies on the manifest-only
     // global_seqno offset the rebuilt manifest cannot recover: its entries stay at
     // local seqno 0, so installing it with offset 0 would silently mis-order and
-    // over-expose them. Treat it as unsalvageable — drop the freshly-written copy
-    // (a leftover reads back as a harmless orphan) and let the caller record it
-    // unreadable; the original stays set aside for inspection.
+    // over-expose them. Treat it as unsalvageable — remove the freshly-written
+    // copy and let the caller record the table unreadable.
     if has_unrecoverable_ingest_offset(
         table.metadata.bulk_ingested,
         table.metadata.item_count,
         table.max_local_seqno(),
     ) {
         drop(table);
-        // QUARANTINE the rejected replacement, don't try-and-forget its removal. A
-        // discarded `remove_file` error would leave the freshly-written numeric SST
-        // in `tables/`; repair would still install a manifest that omits it and
-        // report success, but the next open classifies it as an orphan and fails on
-        // the SAME persistent deletion, so the "repaired" tree cannot reopen. Moving
-        // it out of `tables/` makes it a non-orphan. A quarantine failure propagates:
-        // it is post-quarantine of the ORIGINAL (safely preserved), so the caller
-        // records it as unreadable rather than aborting.
-        let base = table_path.parent().ok_or(crate::Error::Unrecoverable)?;
-        let name = table_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or(crate::Error::Unrecoverable)?;
-        quarantine_file(&**fs, base, table_path, name, config.sync_mode)?;
+        // Remove the rejected replacement, and do NOT swallow the error. A
+        // discarded `remove_file` failure would leave the freshly-written
+        // numeric SST in `tables/`; repair would still install a manifest that
+        // omits it and report success, but the next open classifies it as an
+        // orphan and fails on the SAME persistent deletion, so the "repaired"
+        // tree cannot reopen. Propagating instead keeps the two outcomes intact.
+        discard_unreferenced(&**fs, table_path, config.sync_mode)?;
         return Ok(SalvageOutcome::Unusable);
     }
     Ok(SalvageOutcome::Salvaged(table))
@@ -1531,8 +1241,8 @@ fn excised_extents(
     // next dropped extent, or the data-section end. SST values are arbitrary
     // bytes, so a header-sized zero run INSIDE a damaged extent's payload is
     // otherwise indistinguishable from a punch by length alone, and a bare
-    // length test would quarantine an otherwise usable salvage as bound-lost
-    // under the default no-resurrection policy.
+    // length test would reject an otherwise usable salvage as bound-lost under
+    // the default no-resurrection policy.
     let header_decodes_at = |pos: u64| -> crate::Result<bool> {
         use crate::coding::Decode;
         let max = crate::table::block::Header::MAX_LEN as u64;
@@ -1664,30 +1374,17 @@ fn source_prefix_is_punched(
 /// sidecar would wrongly restrict the unpunched replacement on a later repair.
 ///
 /// ANY failure re-imposing the restriction (sidecar write or restricted reopen)
-/// restores the quarantined original to `table_path` before propagating, mirroring
-/// the salvage-error path. Otherwise the unpunched, sidecar-less salvaged
-/// replacement would be left in place, and a retry would recover it UNRESTRICTED
-/// and resurrect the sub-bound rows. This holds for a PERSISTENT failure
-/// (an ENOSPC on the sidecar write) as much as a transient one: the retry cannot
-/// re-derive the bound from a fresh unpunched output, so the punched original must
-/// be back in place for it to re-salvage and re-restrict from.
-#[cfg(feature = "std")]
-enum SalvageRollback<'a> {
-    /// The source was moved out of the way before the salvage ran: restore it
-    /// over `table_path` so a retry starts from the state it was found in.
-    Restore(&'a std::path::Path),
-    /// The source is untouched at its own path and the output was published
-    /// beside it under a fresh id: discard that output instead. The retry
-    /// re-derives the same rewrite from the same source.
-    DiscardOutput,
-}
-
+/// removes the half-finished replacement before propagating. It carries the
+/// straddling block's sub-bound rows with no valid sidecar, so a run that found
+/// it would adopt it UNRESTRICTED and resurrect exactly the rows the restriction
+/// hid. The source is untouched either way, so the retry re-salvages and
+/// re-restricts from it. This holds for a PERSISTENT failure (an ENOSPC on the
+/// sidecar write) as much as a transient one.
 #[cfg(feature = "std")]
 fn restrict_salvaged_output(
     folder_fs: &dyn crate::fs::Fs,
     config: &Config,
     table_path: &std::path::Path,
-    rollback: &SalvageRollback<'_>,
     salvaged: Table,
     restrict_bound: Option<crate::UserKey>,
     allow_resurrection: bool,
@@ -1707,65 +1404,19 @@ fn restrict_salvaged_output(
             match restricted {
                 Ok(table) => Ok(table),
                 Err(e) => {
-                    // Drop the salvaged handle's open file BEFORE restoring. The
-                    // restore renames the quarantined original back over
-                    // `table_path`, and a backend that rejects replacing an OPEN
-                    // destination (Windows; the deletion path closes handles for
-                    // this same reason) would fail the rename while `salvaged` still
-                    // holds `table_path` open. A failed restore leaves the unpunched
-                    // salvaged SST in place with no bound, so the next repair would
-                    // recover it UNRESTRICTED and resurrect the sub-bound rows.
+                    // Drop the salvaged handle's open file BEFORE removing it: a
+                    // backend that refuses to unlink an OPEN file (Windows; the
+                    // deletion path closes handles for this same reason) would
+                    // fail while `salvaged` still holds it.
                     drop(salvaged);
-                    // Restore on EVERY failure, transient or persistent: the
-                    // salvaged replacement sits at `table_path` unpunched with no
-                    // valid sidecar, so a retry that finds it there recovers it
-                    // UNRESTRICTED and resurrects the sub-bound rows. Putting the
-                    // punched original back lets the retry re-salvage and
-                    // re-restrict from a known state (a `rename` needs no free
-                    // space, so it survives the ENOSPC that may have caused `e`).
-                    match *rollback {
-                        SalvageRollback::Restore(quarantined) => restore_quarantined(
-                            folder_fs,
-                            quarantined,
-                            table_path,
-                            config.encryption.as_deref(),
-                            config.sync_mode,
-                        )?,
-                        // Nothing to restore: the source never moved. The output
-                        // MUST leave `tables/` though — it carries the
-                        // straddling block's sub-bound rows and has no valid
-                        // sidecar, so a scan that finds it adopts it
-                        // UNRESTRICTED and resurrects exactly the rows the
-                        // restriction hid. Removal first; a directory that
-                        // refuses it may still accept the rename that moves the
-                        // file out of the scan's way, and if neither works the
-                        // repair fails on THAT error — an undiscardable output
-                        // left in place is the one outcome that corrupts the
-                        // retry.
-                        SalvageRollback::DiscardOutput => {
-                            crate::restrict_bound::remove(folder_fs, table_path, config.sync_mode);
-                            if let Err(remove_err) = folder_fs.remove_file(table_path) {
-                                log::warn!(
-                                    "Failed to discard the unrestrictable salvage output {} \
-                                     ({remove_err:?}); moving it out of the scan instead",
-                                    table_path.display(),
-                                );
-                                let (Some(base), Some(name)) = (
-                                    table_path.parent(),
-                                    table_path.file_name().and_then(|n| n.to_str()),
-                                ) else {
-                                    return Err(crate::Error::Unrecoverable);
-                                };
-                                quarantine_file(
-                                    folder_fs,
-                                    base,
-                                    table_path,
-                                    name,
-                                    config.sync_mode,
-                                )?;
-                            }
-                        }
-                    }
+                    // Remove on EVERY failure, transient or persistent: the
+                    // replacement is unpunched with no valid sidecar, so a run
+                    // that adopted it would resurrect the sub-bound rows. The
+                    // source is untouched, so the retry re-salvages from it. A
+                    // removal that itself fails propagates THAT error — an
+                    // undiscardable half-finished replacement is the one thing
+                    // that could corrupt the retry.
+                    discard_unreferenced(folder_fs, table_path, config.sync_mode)?;
                     Err(e)
                 }
             }
@@ -1950,54 +1601,37 @@ fn derive_blob_frontier(
     }
 }
 
-/// Quarantines a recovered table the blob-dependency stage cannot publish and
-/// records the reason. Consumes the handle (released before the move); a
-/// failed quarantine aborts the repair — the file must not be both omitted
-/// from the manifest and left in place for the next open's orphan sweep.
+/// Records a recovered table the blob-dependency stage cannot publish: reported
+/// unreadable, and removed once the manifest is durable. Consumes the handle.
+///
+/// The file is NOT touched here. This stage runs before the commit, where the
+/// source is still the only copy of its rows and a crash must leave the
+/// directory exactly as a retry expects to find it.
 #[cfg(feature = "std")]
 fn set_aside_table(
     table: Table,
     reason: &str,
     unreadable_files: &mut Vec<(PathBuf, String)>,
-    sync_mode: crate::fs::SyncMode,
-) -> crate::Result<()> {
+    discard_after_commit: &mut Vec<(Arc<dyn crate::fs::Fs>, PathBuf, String)>,
+) {
     let path = (*table.path).clone();
-    let (Some(base), Some(name)) = (
-        path.parent().map(std::path::Path::to_path_buf),
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_string),
-    ) else {
-        return Err(crate::Error::Unrecoverable);
-    };
     let fs = table.fs.clone();
-    drop(table); // release the handle before the quarantine move
-    let dest = quarantine_file(&*fs, &base, &path, &name, sync_mode)?;
-    unreadable_files.push((path, format!("{reason}; set aside at {}", dest.display())));
-    Ok(())
+    drop(table); // release the handle
+    discard_after_commit.push((fs, path.clone(), reason.to_string()));
+    unreadable_files.push((path, reason.to_string()));
 }
 
-/// Same as [`set_aside_table`] for a source that is no longer open: a table
-/// left in `tables/` but outside the rebuilt manifest is an orphan the next
-/// open DELETES, so every unpublished file must be moved out of the way.
+/// Same as [`set_aside_table`] for a source that is no longer open.
 #[cfg(feature = "std")]
 fn set_aside_path(
-    fs: &dyn crate::fs::Fs,
-    base: &std::path::Path,
+    fs: &Arc<dyn crate::fs::Fs>,
     path: &std::path::Path,
     reason: &str,
     unreadable_files: &mut Vec<(PathBuf, String)>,
-    sync_mode: crate::fs::SyncMode,
-) -> crate::Result<()> {
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return Err(crate::Error::Unrecoverable);
-    };
-    let dest = quarantine_file(fs, base, path, name, sync_mode)?;
-    unreadable_files.push((
-        path.to_path_buf(),
-        format!("{reason}; set aside at {}", dest.display()),
-    ));
-    Ok(())
+    discard_after_commit: &mut Vec<(Arc<dyn crate::fs::Fs>, PathBuf, String)>,
+) {
+    discard_after_commit.push((Arc::clone(fs), path.to_path_buf(), reason.to_string()));
+    unreadable_files.push((path.to_path_buf(), reason.to_string()));
 }
 
 /// Whether every frame in `path`'s live data range (`[live_data_start, end)`)
@@ -2226,22 +1860,27 @@ struct BlobRecovery {
     /// failed repair leave tables pointing at a blob id that no longer
     /// exists, and the retry would set those tables aside as unrecoverable.
     stale: Vec<(PathBuf, String)>,
+    /// Files the rebuilt manifest will not name: a foreign name, a duplicate id,
+    /// a file whose metadata cannot be read. Removed AFTER the commit, for the
+    /// same reason `stale` is — the scan must leave the directory exactly as a
+    /// retry expects to find it.
+    discard: Vec<(PathBuf, String)>,
 }
 
 /// Discovers the blob files of a KV-separated tree for `repair` by scanning the
 /// single `blobs/` folder, with no manifest id list to filter against.
 ///
-/// Mirrors the table scan in [`repair_tree`]: a non-numeric name is quarantined
-/// out of `blobs/` (the reopened tree's blob recovery parses every name and
-/// would abort on a bad one); a blob file that cannot be checksummed or whose
-/// metadata is unreadable is reported and left in place (it reads back as a
-/// harmless orphan on the next open). The recovered checksum is the whole-file
+/// Mirrors the table scan in [`repair_tree`]: a non-numeric name is recorded for
+/// removal after the commit (the reopened tree's blob recovery parses every name
+/// and would abort on a bad one), as is a blob file that cannot be checksummed
+/// or whose metadata is unreadable. The recovered checksum is the whole-file
 /// XXH3-128 digest, identical to the one the blob writer accumulated via
 /// `ChecksummedWriter`, since blob files are written strictly sequentially.
 fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
     let blobs_folder = config.path.join(crate::file::BLOBS_FOLDER);
     let mut blob_files: Vec<crate::vlog::BlobFile> = Vec::new();
     let mut unreadable: UnreadableFiles = Vec::new();
+    let mut discard: Vec<(PathBuf, String)> = Vec::new();
     // How referencing SSTs' handles must be rewritten for the blob files this
     // scan RESHAPED: `Remap` for a file salvaged into a compacted copy,
     // `DropBelow` for an intact file recovered with a punched frontier. Empty
@@ -2263,6 +1902,7 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
             rewrites,
             frag,
             stale: stale_originals,
+            discard,
         });
     }
 
@@ -2285,8 +1925,8 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
 
         // A crashed earlier repair's in-progress blob salvage copy: it is
         // published by an atomic rename, so a surviving one is never
-        // referenced and never authoritative. Remove it rather than
-        // quarantining it as a foreign name (and re-salvage from the original
+        // referenced and never authoritative. Remove it here rather than
+        // classifying it as a foreign name (and re-salvage from the original
         // below if that file still fails validation). Both halves must parse
         // so a foreign name merely ending in the suffix is not treated as ours.
         if file_name
@@ -2306,24 +1946,11 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
 
         let Ok(blob_id) = file_name.parse::<crate::vlog::BlobFileId>() else {
             // A non-numeric name aborts the reopen's blob recovery (it parses
-            // every name in blobs/), so it MUST be moved out of the way. If the
-            // quarantine itself fails the bad name stays in place and the tree
-            // would not reopen, so fail the repair rather than report a false
-            // success.
-            let dest = quarantine_file(
-                &*config.fs,
-                &blobs_folder,
-                &blob_path,
-                &file_name,
-                config.sync_mode,
-            )?;
-            unreadable.push((
-                blob_path,
-                format!(
-                    "file name is not a blob id; quarantined to {}",
-                    dest.display()
-                ),
-            ));
+            // every name in blobs/), so it MUST go. It is removed after the
+            // commit, and a removal that fails then fails the repair — a bad
+            // name left in place is a tree that does not reopen.
+            discard.push((blob_path.clone(), "file name is not a blob id".to_string()));
+            unreadable.push((blob_path, "file name is not a blob id".to_string()));
             continue;
         };
         candidates.push((blob_id, blob_path, file_name));
@@ -2357,32 +1984,20 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
     let mut kept_paths: crate::HashMap<crate::vlog::BlobFileId, PathBuf> =
         crate::HashMap::default();
 
-    for (blob_id, blob_path, file_name) in candidates {
+    for (blob_id, blob_path, _file_name) in candidates {
         if let Some(kept) = kept_paths.get(&blob_id) {
             // A second directory entry for an already-recovered id. An ALIAS
             // (symlink / case-folded spelling of the SAME physical file) is
-            // skipped silently. A DISTINCT physical file must be quarantined:
-            // the manifest records one checksum per id, and a stale duplicate
-            // left in `blobs/` would race the kept file for reads on the next
-            // open (directory iteration order picks the physical file). Same
-            // fail-on-quarantine-failure policy as every other set-aside.
+            // skipped silently. A DISTINCT physical file must go: the manifest
+            // records one checksum per id, and a stale duplicate left in
+            // `blobs/` would race the kept file for reads on the next open
+            // (directory iteration order picks the physical file).
             if same_physical_file(&*config.fs, kept, &*config.fs, &blob_path) {
                 continue;
             }
-            let dest = quarantine_file(
-                &*config.fs,
-                &blobs_folder,
-                &blob_path,
-                &file_name,
-                config.sync_mode,
-            )?;
-            unreadable.push((
-                blob_path,
-                format!(
-                    "duplicate of blob file id {blob_id}; quarantined to {}",
-                    dest.display()
-                ),
-            ));
+            let reason = format!("duplicate of blob file id {blob_id}");
+            discard.push((blob_path.clone(), reason.clone()));
+            unreadable.push((blob_path, reason));
             continue;
         }
 
@@ -2397,27 +2012,18 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
         // Rebuilding with frontier 0 would instead leave a later relocation
         // scan starting inside the punched (zeroed) prefix. An unpunched file
         // short-circuits to 0 on its first (non-zero) data byte.
-        // Persistent per-file failure: QUARANTINE before recording unreadable,
-        // mirroring the unreadable-SST path. The rebuilt manifest omits this
-        // file, so a later `Tree::open` would orphan-clean (DELETE) it from
-        // `blobs/`, contradicting the report's promise that an operator can
-        // still investigate / salvage it. A FAILED quarantine aborts the whole
-        // repair (the file must not be both omitted and left in place).
-        let quarantine_unreadable = |blob_path: PathBuf,
-                                     file_name: &str,
-                                     e: &crate::Error,
-                                     unreadable: &mut UnreadableFiles|
-         -> crate::Result<()> {
-            let dest = quarantine_file(
-                &*config.fs,
-                &blobs_folder,
-                &blob_path,
-                file_name,
-                config.sync_mode,
-            )?;
-            unreadable.push((blob_path, format!("{e}; quarantined to {}", dest.display())));
-            Ok(())
-        };
+        // Persistent per-file failure: the rebuilt manifest omits this file, so
+        // it is recorded for removal after the commit and reported unreadable.
+        // The file must not be both omitted and left in place — that is a tree
+        // whose next open has an orphan to sweep and may fail doing it.
+        let discard_unreadable =
+            |blob_path: PathBuf,
+             e: &crate::Error,
+             unreadable: &mut UnreadableFiles,
+             discard: &mut Vec<(PathBuf, String)>| {
+                discard.push((blob_path.clone(), e.to_string()));
+                unreadable.push((blob_path, e.to_string()));
+            };
 
         let frontier = match derive_blob_frontier(&config.fs, &blob_path, blob_id) {
             Ok(BlobFrontier::Whole) => 0,
@@ -2474,7 +2080,7 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
             // mirroring the table-recovery path.
             Err(e) if is_transient_io(&e) => return Err(e),
             Err(e) => {
-                quarantine_unreadable(blob_path, &file_name, &e, &mut unreadable)?;
+                discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
                 continue;
             }
         };
@@ -2502,7 +2108,7 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
                 Ok(handle) => handle,
                 Err(e) if is_transient_io(&e) => return Err(e),
                 Err(e) => {
-                    quarantine_unreadable(blob_path, &file_name, &e, &mut unreadable)?;
+                    discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
                     continue;
                 }
             };
@@ -2516,7 +2122,7 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
                      {blob_id} — a renamed or swapped file; setting it aside",
                     blob_path.display(),
                 );
-                quarantine_unreadable(blob_path, &file_name, &e, &mut unreadable)?;
+                discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
                 continue;
             }
         }
@@ -2535,11 +2141,10 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
         // crash at any point before that commit therefore leaves the tree
         // exactly as it was found, and the retry re-derives everything from
         // the untouched original — no relocation record has to survive the
-        // crash, because nothing was relocated in place. The original is set
-        // aside only AFTER the commit: quarantining it earlier would make a
+        // crash, because nothing was relocated in place. The original is
+        // removed only AFTER the commit: removing it earlier would make a
         // crashed attempt leave SSTs referencing a blob id that no longer
-        // exists, and the retry would set those tables aside as
-        // unrecoverable.
+        // exists, and the retry would record those tables unrecoverable.
         let Some(live) = validate_blob_frames(config, &blob_path, blob_id, frontier)? else {
             let Some(new_id) = next_blob_id else {
                 log::error!(
@@ -2588,15 +2193,14 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
             })();
             let (bf, report) = match salvage {
                 Ok(Some(pair)) => pair,
-                // Nothing recoverable, or a persistent failure: the original is
-                // untouched at its canonical path, so preserve it in quarantine
-                // and report — exactly like any other unreadable blob.
+                // Nothing recoverable, or a persistent failure: report it and
+                // queue its removal — exactly like any other unreadable blob.
                 Ok(None) => {
                     remove_temp(config, &temp)?;
                     let e = crate::Error::InvalidHeader(
                         "blob value frames failed validation and no record was recoverable",
                     );
-                    quarantine_unreadable(blob_path, &file_name, &e, &mut unreadable)?;
+                    discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
                     continue;
                 }
                 Err(e) if is_transient_io(&e) => {
@@ -2610,14 +2214,14 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
                 }
                 Err(e) => {
                     remove_temp(config, &temp)?;
-                    quarantine_unreadable(blob_path, &file_name, &e, &mut unreadable)?;
+                    discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
                     continue;
                 }
             };
 
             // Take the fresh id's own (free) name: nothing is displaced, so
-            // there is no quarantine to unwind and no window in which a retry
-            // could mistake an unverified file for the live blob. Until the
+            // there is nothing to unwind and no window in which a retry could
+            // mistake an unverified file for the live blob. Until the
             // manifest names it, the replacement is an unreferenced file that
             // the next open's orphan sweep would remove.
             let new_path = blobs_folder.join(new_id.to_string());
@@ -2683,7 +2287,7 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
             // Same transient/persistent split as the frontier probe above.
             Err(e) if is_transient_io(&e) => return Err(e),
             Err(e) => {
-                quarantine_unreadable(blob_path, &file_name, &e, &mut unreadable)?;
+                discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
                 continue;
             }
         };
@@ -2727,7 +2331,7 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
             // Same transient/persistent split as the checksum read above.
             Err(e) if is_transient_io(&e) => return Err(e),
             Err(e) => {
-                quarantine_unreadable(blob_path, &file_name, &e, &mut unreadable)?;
+                discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
             }
         }
     }
@@ -2738,6 +2342,7 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
         rewrites,
         frag,
         stale: stale_originals,
+        discard,
     })
 }
 
@@ -2792,9 +2397,9 @@ impl Config {
     }
 
     /// Like [`repair`](Self::repair), but when an SST fails whole-file recovery
-    /// (`salvage = true`) it is block-salvaged instead of being left out: the
-    /// corrupt original is quarantined and a fresh SST holding its recoverable
-    /// blocks is written in its place and referenced by the rebuilt manifest.
+    /// (`salvage = true`) it is block-salvaged instead of being left out: a fresh
+    /// SST holding its recoverable blocks is built beside it, referenced by the
+    /// rebuilt manifest, and swapped onto its name once that manifest is durable.
     ///
     /// A salvaged table may be missing the key ranges of its corrupt blocks
     /// (reported per file via [`RepairReport::salvaged`]); use this only as a
@@ -2866,31 +2471,29 @@ impl Config {
     }
 }
 
-/// Completes the set-aside a previous repair committed but could not carry out.
+/// Completes the publication a previous repair committed but could not carry out.
 ///
-/// A repair publishes its replacements by committing the manifest and only THEN
-/// moves the superseded originals out of the way; a failure in that last step
-/// leaves both on disk with a durable, correct manifest naming the
-/// replacements. Rebuilding from that directory would salvage the damaged
-/// original again and rewrite its table again while keeping the previous
-/// rewrite too, so one history would enter L0 twice — and duplicated merge
-/// operands are applied twice on read.
+/// A repair publishes by committing the manifest and only THEN swapping its
+/// replacements onto their names and removing what the manifest no longer
+/// references; a failure in that last step leaves the directory half-published
+/// under a durable, correct manifest. Rebuilding from it instead would salvage
+/// the damaged original again while the previous replacement is still there, so
+/// one history would enter L0 twice — and duplicated merge operands are applied
+/// twice on read.
 ///
 /// The committed manifest is what resolves it. It is the tree's own authority
 /// on which files count: an `open()` sweeps everything it does not name as an
-/// orphan, so this applies the same rule before the scan runs — tables it does
-/// not reference are set aside (they hold rows an operator may want), blob
-/// files are removed (an unreferenced one holds nothing reachable). No state is
-/// carried between runs; this is derived from the durable manifest alone.
+/// orphan, so this applies the same rule before the scan runs — every table and
+/// blob file it does not reference is removed. No state is carried between
+/// runs; this is derived from the durable manifest alone.
 ///
 /// A manifest that does not load cleanly is exactly the case repair exists for,
 /// so it is not consulted at all then and the scan rebuilds from everything.
 ///
 /// # Errors
 ///
-/// Propagates a set-aside or removal failure: leaving a superseded file in
-/// place is what corrupts the rebuild, so the repair must fail rather than
-/// proceed past it.
+/// Propagates a removal failure: leaving a superseded file in place is what
+/// corrupts the rebuild, so the repair must fail rather than proceed past it.
 #[cfg(feature = "std")]
 fn sweep_superseded_by_committed_manifest(config: &Config) -> crate::Result<()> {
     let Ok(recovery) = crate::version::recovery::recover(
@@ -2914,26 +2517,37 @@ fn sweep_superseded_by_committed_manifest(config: &Config) -> crate::Result<()> 
             continue;
         }
         for dirent in folder_fs.read_dir(&table_base_folder)? {
+            if dirent.is_dir {
+                continue;
+            }
+            // A replacement a previous run committed but could not swap in. The
+            // manifest is the authority on what it is: if the manifest names its
+            // id, the swap is what remains of that run and is finished here; if
+            // not, the run never committed and the temp is garbage. Both answers
+            // come from the durable manifest alone.
+            if let Some(id) = table_id_from_repair_tmp_name(&dirent.file_name) {
+                let table_path = table_base_folder.join(id.to_string());
+                if referenced_tables.contains(&id) {
+                    commit_repair_tmp(&*folder_fs, &dirent.path, &table_path, config.sync_mode)?;
+                    log::info!(
+                        "repair: finished the pending swap of table {id} from a previous run",
+                    );
+                } else {
+                    discard_unreferenced(&*folder_fs, &dirent.path, config.sync_mode)?;
+                    log::info!("repair: dropped an abandoned replacement for table {id}");
+                }
+                continue;
+            }
             // Only files the scan would ADOPT as tables are swept here; a
             // foreign name is left to the scan's own classification.
             let Ok(id) = dirent.file_name.parse::<TableId>() else {
                 continue;
             };
-            if dirent.is_dir || referenced_tables.contains(&id) {
+            if referenced_tables.contains(&id) {
                 continue;
             }
-            let dest = quarantine_file(
-                &*folder_fs,
-                &table_base_folder,
-                &dirent.path,
-                &dirent.file_name,
-                config.sync_mode,
-            )?;
-            log::info!(
-                "repair: table {id} is superseded by the committed manifest; \
-                 set aside at {}",
-                dest.display(),
-            );
+            discard_unreferenced(&*folder_fs, &dirent.path, config.sync_mode)?;
+            log::info!("repair: table {id} is superseded by the committed manifest; removed");
         }
     }
 
@@ -2994,18 +2608,23 @@ fn repair_tree(
     // rebuilt manifest lost.
     let mut coverage_by_path: crate::HashMap<PathBuf, (UserKey, UserKey, Option<SeqNo>)> =
         crate::HashMap::default();
+    // Files the rebuilt manifest will not name: a foreign name, a duplicate id,
+    // a table no bound can make safe, a source a salvaged copy supersedes. They
+    // are removed AFTER the commit and not one moment earlier — the scan is
+    // read-only precisely so a crash leaves the directory as the retry expects
+    // to find it, and the retry then derives everything again from the same
+    // bytes. Each entry carries the backend that owns the file: a per-level
+    // route stores its tables through an `Fs` the primary one cannot see.
+    let mut discard_after_commit: Vec<(Arc<dyn crate::fs::Fs>, PathBuf, String)> = Vec::new();
+    // Replacements built at `{id}.repair-tmp`, swapped onto `{id}` once the
+    // manifest that adopts them is durable. Same ordering rule as the removals,
+    // for the same reason: before the commit the source is still the only copy
+    // of its rows and is what the manifest names.
+    let mut swap_after_commit: Vec<(Arc<dyn crate::fs::Fs>, PathBuf, PathBuf)> = Vec::new();
 
     for (table_base_folder, folder_fs) in config.all_tables_folders() {
         if !folder_fs.exists(&table_base_folder)? {
             continue;
-        }
-
-        // The two-way half of the resurrection knob: a prior default repair may
-        // have set punched-boundless files aside with a resurrectable marker;
-        // a resurrection repair returns them to `tables/` FIRST so the scan
-        // below recovers them greedily like any other punched file.
-        if allow_resurrection {
-            reclaim_resurrectable(&*folder_fs, &table_base_folder, config.sync_mode)?;
         }
 
         // ORDER the entries before recovering: `read_dir` order is
@@ -3045,25 +2664,26 @@ fn repair_tree(
             // Heal artifacts are not table files: `Tree::open` recognizes them
             // and PRESERVES the live `{id}.heal-attest` sidecar (the next scrub
             // reconciles a crashed digest refresh through it). Repair must not
-            // quarantine it, or a rebuild that fails before committing the
-            // manifest would strand the healed table under its stale pre-heal
-            // digest. Match the exact shapes recovery owns (numeric id + heal
-            // suffix); a foreign name merely containing the suffix falls through
-            // to the id parse below and is quarantined as before.
+            // remove it, or a rebuild that fails before committing the manifest
+            // would strand the healed table under its stale pre-heal digest.
+            // Match the exact shapes recovery owns (numeric id + heal suffix); a
+            // foreign name merely containing the suffix falls through to the id
+            // parse below and is classified there.
             let is_sidecar_artifact = file_name
                 .strip_suffix(".heal-attest")
                 .or_else(|| file_name.strip_suffix(".heal-attest.tmp"))
                 // The `.restrict-bound` sidecar (and its crashed `.tmp`) carries a
                 // punched SST's restriction bound; repair reads it FOR its SST (via
                 // `restrict_bound::read`), so the sidecar file itself is never a
-                // table and must not be parsed / quarantined as one.
+                // table and must not be parsed or classified as one.
                 .or_else(|| file_name.strip_suffix(".restrict-bound"))
                 .or_else(|| file_name.strip_suffix(".restrict-bound.tmp"))
                 .is_some_and(|id| id.parse::<TableId>().is_ok())
                 // {id}.healtmp-{n}: BOTH the id and the numeric sequence must
                 // parse, matching recovery's ownership check. A foreign name like
                 // `5.healtmp-backup` is NOT owned (recovery would fail its
-                // non-numeric name), so it must fall through to quarantine here.
+                // non-numeric name), so it must fall through to the foreign-name
+                // classification here.
                 || file_name.split_once(".healtmp-").is_some_and(|(id, seq)| {
                     id.parse::<TableId>().is_ok() && seq.parse::<u64>().is_ok()
                 });
@@ -3071,28 +2691,34 @@ fn repair_tree(
                 continue;
             }
 
+            // `{id}.repair-tmp` is a replacement a previous repair was building
+            // and never published: no manifest names it (one that did was
+            // swapped in before this scan started), and its source is whatever
+            // this scan finds under `{id}`. It is therefore garbage, and it is
+            // removed NOW rather than after the commit — this run needs the name
+            // free to build its own replacement. Removing it cannot lose rows:
+            // every row it holds came from a file this scan is about to read.
+            if table_id_from_repair_tmp_name(&file_name).is_some() {
+                discard_unreferenced(&*folder_fs, &table_path, config.sync_mode)?;
+                log::warn!(
+                    "repair: dropped an abandoned replacement {}",
+                    table_path.display(),
+                );
+                continue;
+            }
+
             let Ok(table_id) = file_name.parse::<TableId>() else {
                 // A non-numeric name cannot be a table id, and `Tree::open`
                 // rejects such a file outright (recovery parses every name in
-                // `tables/`). Leaving it in place would let repair report
-                // success while the tree still cannot reopen, so move it out of
-                // `tables/` into a sibling quarantine dir; report where it went.
-                // If the quarantine itself fails the bad name stays in place, so
-                // fail the repair rather than report a false success.
-                let dest = quarantine_file(
-                    &*folder_fs,
-                    &table_base_folder,
-                    &table_path,
-                    &file_name,
-                    config.sync_mode,
-                )?;
-                unreadable_files.push((
-                    table_path,
-                    format!(
-                        "file name is not a table id; quarantined to {}",
-                        dest.display()
-                    ),
+                // `tables/`). Leaving it there would let repair report success
+                // over a tree that still cannot reopen, so it is removed after
+                // the commit; a removal that fails then fails the repair.
+                discard_after_commit.push((
+                    Arc::clone(&folder_fs),
+                    table_path.clone(),
+                    "file name is not a table id".to_string(),
                 ));
+                unreadable_files.push((table_path, "file name is not a table id".to_string()));
                 continue;
             };
 
@@ -3107,29 +2733,23 @@ fn repair_tree(
                 // If this path physically ALIASES the retained copy (a symlink /
                 // junction / case-insensitive alias resolving to the same directory
                 // entry, e.g. two configured folders pointing at one location), it
-                // is the SAME file, not a genuine duplicate. Quarantining it would
-                // MOVE the kept copy and leave the manifest referencing a missing
-                // SST, so skip it IN PLACE.
+                // is the SAME file, not a genuine duplicate. Removing it would
+                // destroy the kept copy and leave the manifest referencing a
+                // missing SST, so skip it IN PLACE.
                 if same_physical_file(&*folder_fs, &table_path, &*existing.fs, &existing.path) {
                     continue;
                 }
-                // A genuine duplicate: quarantine it out of `tables/` so recovery
+                // A genuine duplicate: removed after the commit so recovery
                 // cannot later resolve it instead of the kept copy (the manifest
                 // records only id + checksum, not a path).
-                let dest = quarantine_file(
-                    &*folder_fs,
-                    &table_base_folder,
-                    &table_path,
-                    &file_name,
-                    config.sync_mode,
-                )?;
+                discard_after_commit.push((
+                    Arc::clone(&folder_fs),
+                    table_path.clone(),
+                    format!("duplicate of table {table_id}; a complete copy is already held"),
+                ));
                 unreadable_files.push((
                     table_path,
-                    format!(
-                        "duplicate table id; a complete copy is already held; \
-                         quarantined to {}",
-                        dest.display()
-                    ),
+                    "duplicate table id; a complete copy is already held".to_string(),
                 ));
                 continue;
             }
@@ -3209,34 +2829,21 @@ fn repair_tree(
             // ordering; the on-disk seqnos carry no trace of it. The rebuilt
             // manifest hard-codes offset 0, so keeping such a table would make its
             // entries appear OLDER than they are — visible to snapshots that never
-            // saw them and sorted into the wrong L0 order. Quarantine it instead of
+            // saw them and sorted into the wrong L0 order. Drop it instead of
             // silently corrupting MVCC (see `has_unrecoverable_ingest_offset`).
             if matches!(&recovered, Ok(t) if has_unrecoverable_ingest_offset(
                 t.metadata.bulk_ingested,
                 t.metadata.item_count,
                 t.max_local_seqno(),
             )) {
-                drop(recovered); // release the file handle before the move
-                match quarantine_file(
-                    &*folder_fs,
-                    &table_base_folder,
-                    &table_path,
-                    &file_name,
-                    config.sync_mode,
-                ) {
-                    Ok(dest) => unreadable_files.push((
-                        table_path,
-                        format!(
-                            "bulk-ingest sequence offset cannot be reconstructed from the SST; \
-                             quarantined to {}",
-                            dest.display()
-                        ),
-                    )),
-                    // A FAILED quarantine aborts the whole repair: a manifest
-                    // omitting a still-in-place file would let the next open's
-                    // orphan cleanup DELETE the only copy meant to be preserved.
-                    Err(e) => return Err(e),
-                }
+                drop(recovered); // release the file handle
+                let reason = "bulk-ingest sequence offset cannot be reconstructed from the SST";
+                discard_after_commit.push((
+                    Arc::clone(&folder_fs),
+                    table_path.clone(),
+                    reason.to_string(),
+                ));
+                unreadable_files.push((table_path, reason.to_string()));
                 continue;
             }
 
@@ -3282,7 +2889,7 @@ fn repair_tree(
                 // punched, the reopened view digests only the live suffix. Reading the
                 // dead prefix to decide is not just unnecessary — a persistently
                 // unreadable sector there would otherwise discard the exact bound and,
-                // with salvage off, quarantine the whole table despite its intact live
+                // with salvage off, drop the whole table despite its intact live
                 // suffix. `reopen_restricted` reads only from the punch offset up, so a
                 // genuinely unreadable SUFFIX still surfaces its error there.
                 if let Some(bound) = &sidecar_bound {
@@ -3329,12 +2936,16 @@ fn repair_tree(
                                 reason @ (DerivedRestriction::NoLiveData
                                 | DerivedRestriction::IrregularPunch),
                             ) => {
-                                // FLAG-DEPENDENT set-aside: resurrection would
-                                // have kept the readable region, so mark it
-                                // reclaimable — a NoLiveData table has nothing
-                                // either flag could keep, so it stays unmarked.
-                                let resurrectable =
-                                    matches!(reason, DerivedRestriction::IrregularPunch);
+                                // The flag decides this table's fate WITHIN this
+                                // run and nowhere else. Resurrection would have
+                                // kept the readable region; without it there is
+                                // no bound that separates consumed rows from
+                                // live ones, so the table is dropped. Nothing is
+                                // stashed for a later run to reconsider: a run
+                                // that stashed would hand the next one a
+                                // different directory than the one it derived
+                                // from, and the flag would stop being an input
+                                // and start being a state machine.
                                 let reason = match reason {
                                     DerivedRestriction::NoLiveData => {
                                         "fully hole-punched SST with no live data"
@@ -3342,51 +2953,17 @@ fn repair_tree(
                                     _ => {
                                         "partially punched SST with punch failures and no \
                                          trustworthy bound; the consumed/live boundary is \
-                                         unknowable (a resurrection repair reclaims it and \
-                                         keeps the readable region)"
+                                         unknowable (a resurrection repair keeps the readable \
+                                         region instead)"
                                     }
                                 };
                                 drop(table);
-                                crate::restrict_bound::remove(
-                                    &*folder_fs,
-                                    &table_path,
-                                    config.sync_mode,
-                                );
-                                match quarantine_file(
-                                    &*folder_fs,
-                                    &table_base_folder,
-                                    &table_path,
-                                    &file_name,
-                                    config.sync_mode,
-                                ) {
-                                    Ok(dest) => {
-                                        // An unmarked flag-dependent set-aside
-                                        // could never be reclaimed: on marker
-                                        // failure, undo the set-aside so a
-                                        // retry re-runs the classification.
-                                        if resurrectable
-                                            && let Err(e) = mark_resurrectable(
-                                                &*folder_fs,
-                                                &dest,
-                                                config.sync_mode,
-                                            )
-                                        {
-                                            restore_quarantined(
-                                                &*folder_fs,
-                                                &dest,
-                                                &table_path,
-                                                config.encryption.as_deref(),
-                                                config.sync_mode,
-                                            )?;
-                                            return Err(e);
-                                        }
-                                        unreadable_files.push((
-                                            table_path,
-                                            format!("{reason}; set aside at {}", dest.display()),
-                                        ));
-                                    }
-                                    Err(e) => return Err(e),
-                                }
+                                discard_after_commit.push((
+                                    Arc::clone(&folder_fs),
+                                    table_path.clone(),
+                                    reason.to_string(),
+                                ));
+                                unreadable_files.push((table_path, reason.to_string()));
                                 continue 'dirent;
                             }
                         }
@@ -3419,40 +2996,22 @@ fn repair_tree(
                             record_best(
                                 &mut recovered_by_id,
                                 &mut unreadable_files,
+                                &mut discard_after_commit,
                                 table_id,
                                 table,
                                 true,
                                 &folder_fs,
-                                &table_base_folder,
                                 &table_path,
-                                &file_name,
-                                config.sync_mode,
-                            )?;
+                            );
                         }
-                        RepairKeepDecision::Quarantine(reason) => {
+                        RepairKeepDecision::Drop(reason) => {
                             drop(table);
-                            // Quarantine (not leave-in-place): a later
-                            // `Tree::open` orphan-cleans table files the
-                            // rebuilt manifest does not reference, so an
-                            // unquarantined original would be DELETED.
-                            match quarantine_file(
-                                &*folder_fs,
-                                &table_base_folder,
-                                &table_path,
-                                &file_name,
-                                config.sync_mode,
-                            ) {
-                                Ok(dest) => unreadable_files.push((
-                                    table_path,
-                                    format!("{reason}; quarantined to {}", dest.display()),
-                                )),
-                                // A FAILED quarantine aborts the whole repair:
-                                // installing a manifest that omits the
-                                // still-in-place file would let the next
-                                // open's orphan cleanup DELETE the only copy
-                                // set aside for later inspection.
-                                Err(e) => return Err(e),
-                            }
+                            discard_after_commit.push((
+                                Arc::clone(&folder_fs),
+                                table_path.clone(),
+                                reason.to_string(),
+                            ));
+                            unreadable_files.push((table_path, reason.to_string()));
                         }
                         RepairKeepDecision::Salvage => {
                             // A tight-space RESTRICTED punched SST whose live suffix
@@ -3467,29 +3026,26 @@ fn repair_tree(
                             // manifest-loss repair honors it (the fresh file is
                             // unpunched). With resurrection on, the whole readable
                             // region is kept instead. The live suffix is never
-                            // discarded to a dead-end quarantine.
+                            // thrown away.
                             let restrict_bound = table.restrict_lower_bound().cloned();
                             drop(table);
-                            // Quarantine BEFORE salvage, aborting the repair
-                            // on failure: a manifest omitting a still-in-place
-                            // file would let the next open's orphan cleanup
-                            // delete the only copy. A salvage error AFTER a
-                            // successful move is recorded instead: the
-                            // original is safely preserved in quarantine.
-                            let quarantined = quarantine_file(
-                                &*folder_fs,
-                                &table_base_folder,
-                                &table_path,
-                                &file_name,
-                                config.sync_mode,
-                            )?;
+                            // The replacement is built at `{id}.repair-tmp` and
+                            // swapped onto `{id}` only after the manifest that
+                            // adopts it is durable. The source is never displaced
+                            // first: a crash would then leave the only copy
+                            // somewhere the retry does not scan, and the table's
+                            // keys would silently vanish from the rebuilt
+                            // manifest. Reading an untouched source and writing a
+                            // name no scan adopts also makes the retry repeat
+                            // exactly the same deterministic salvage.
+                            let output_path = repair_tmp_path(&table_path);
                             match try_salvage_table(
                                 config,
                                 &folder_fs,
                                 allow_resurrection,
                                 TableSalvage {
-                                    quarantined: &quarantined,
-                                    table_path: &table_path,
+                                    source: &table_path,
+                                    table_path: &output_path,
                                     table_id,
                                     // The bound (when any) comes from the
                                     // restricted view and is re-imposed below,
@@ -3497,7 +3053,6 @@ fn repair_tree(
                                     // on this arm.
                                     reject_punched_without_bound: false,
                                     blob_rewrite: None,
-                                    output_id: None,
                                 },
                             ) {
                                 Ok(SalvageOutcome::Salvaged(salvaged)) => {
@@ -3507,8 +3062,7 @@ fn repair_tree(
                                     let table = restrict_salvaged_output(
                                         &*folder_fs,
                                         config,
-                                        &table_path,
-                                        &SalvageRollback::Restore(&quarantined),
+                                        &output_path,
                                         salvaged,
                                         restrict_bound.clone(),
                                         allow_resurrection,
@@ -3516,50 +3070,46 @@ fn repair_tree(
                                     record_best(
                                         &mut recovered_by_id,
                                         &mut unreadable_files,
+                                        &mut discard_after_commit,
                                         table_id,
                                         table,
                                         false,
                                         &folder_fs,
-                                        &table_base_folder,
                                         &table_path,
-                                        &file_name,
-                                        config.sync_mode,
-                                    )?;
+                                    );
+                                    swap_after_commit.push((
+                                        Arc::clone(&folder_fs),
+                                        output_path,
+                                        table_path,
+                                    ));
                                 }
                                 Ok(SalvageOutcome::Unusable | SalvageOutcome::PunchedBoundLost) => {
-                                    unreadable_files.push((
-                                        table_path,
-                                        "verify found corrupt blocks; nothing salvageable"
-                                            .to_string(),
+                                    let reason = "verify found corrupt blocks; nothing salvageable";
+                                    discard_after_commit.push((
+                                        Arc::clone(&folder_fs),
+                                        table_path.clone(),
+                                        reason.to_string(),
                                     ));
+                                    unreadable_files.push((table_path, reason.to_string()));
+                                }
+                                // A TRANSIENT I/O salvage failure is retryable, and
+                                // nothing has moved: the source is untouched, so the
+                                // retry re-derives the same salvage from it. A
+                                // STRUCTURAL failure is genuine unsalvageability.
+                                Err(salvage_err) if is_transient_io(&salvage_err) => {
+                                    return Err(salvage_err);
                                 }
                                 Err(salvage_err) => {
-                                    // A TRANSIENT I/O salvage failure is retryable:
-                                    // committing a manifest that omits the table
-                                    // would lose it permanently (the original is in
-                                    // quarantine, which the next repair won't
-                                    // rediscover). Restore the original to its path
-                                    // and abort the whole repair so a retry can
-                                    // salvage it. A STRUCTURAL failure is genuine
-                                    // unsalvageability: record it (the original
-                                    // stays set aside for inspection).
-                                    if is_transient_io(&salvage_err) {
-                                        restore_quarantined(
-                                            &*folder_fs,
-                                            &quarantined,
-                                            &table_path,
-                                            config.encryption.as_deref(),
-                                            config.sync_mode,
-                                        )?;
-                                        return Err(salvage_err);
-                                    }
-                                    unreadable_files.push((
-                                        table_path,
-                                        format!(
-                                            "verify found corrupt blocks; salvage failed \
-                                             ({salvage_err})"
-                                        ),
+                                    let reason = format!(
+                                        "verify found corrupt blocks; salvage failed \
+                                         ({salvage_err})"
+                                    );
+                                    discard_after_commit.push((
+                                        Arc::clone(&folder_fs),
+                                        table_path.clone(),
+                                        reason.clone(),
                                     ));
+                                    unreadable_files.push((table_path, reason));
                                 }
                             }
                         }
@@ -3586,69 +3136,51 @@ fn repair_tree(
                             record_best(
                                 &mut recovered_by_id,
                                 &mut unreadable_files,
+                                &mut discard_after_commit,
                                 table_id,
                                 table,
                                 true,
                                 &folder_fs,
-                                &table_base_folder,
                                 &table_path,
-                                &file_name,
-                                config.sync_mode,
-                            )?;
+                            );
                         }
                         // `Salvage` is unreachable with the flag off, but a
                         // defensive fallthrough beats a panic in a repair path.
-                        decision @ (RepairKeepDecision::Quarantine(_)
-                        | RepairKeepDecision::Salvage) => {
+                        decision @ (RepairKeepDecision::Drop(_) | RepairKeepDecision::Salvage) => {
                             let reason = match decision {
-                                RepairKeepDecision::Quarantine(reason) => reason,
+                                RepairKeepDecision::Drop(reason) => reason,
                                 _ => {
                                     "verification found corrupt data blocks; run a \
                                      salvage-enabled repair to rewrite the readable blocks"
                                 }
                             };
                             drop(table);
-                            // Quarantine (not leave-in-place): a later
-                            // `Tree::open` orphan-cleans table files the rebuilt
-                            // manifest does not reference, so an unquarantined
-                            // original would be DELETED. A failed quarantine
-                            // aborts the whole repair for the same reason as the
-                            // salvage arm.
-                            match quarantine_file(
-                                &*folder_fs,
-                                &table_base_folder,
-                                &table_path,
-                                &file_name,
-                                config.sync_mode,
-                            ) {
-                                Ok(dest) => unreadable_files.push((
-                                    table_path,
-                                    format!("{reason}; quarantined to {}", dest.display()),
-                                )),
-                                Err(e) => return Err(e),
-                            }
+                            discard_after_commit.push((
+                                Arc::clone(&folder_fs),
+                                table_path.clone(),
+                                reason.to_string(),
+                            ));
+                            unreadable_files.push((table_path, reason.to_string()));
                         }
                     }
                 }
                 Err(e) if salvage => {
                     // A TRANSIENT recovery failure (Io) is retryable and must NOT
-                    // be routed through salvage: quarantining the healthy SST and
-                    // salvaging it would, for a range-tombstone table, fail
-                    // deterministically with FeatureUnsupported (a non-Io error
-                    // recorded as unsalvageable), committing a manifest without the
-                    // table — turning a one-shot read failure into permanent loss.
-                    // Propagate the I/O error BEFORE moving the file so a retry
-                    // re-recovers it, mirroring the verification / salvage-error
-                    // paths.
+                    // be routed through salvage: salvaging a healthy SST would,
+                    // for a range-tombstone table, fail deterministically with
+                    // FeatureUnsupported (a non-Io error recorded as
+                    // unsalvageable), committing a manifest without the table —
+                    // turning a one-shot read failure into permanent loss.
+                    // Propagate the I/O error so a retry re-recovers it,
+                    // mirroring the verification / salvage-error paths.
                     if is_transient_io(&e) {
                         return Err(e);
                     }
                     // A tight-space-punched SST that fails whole-file recovery still
                     // carries its restriction in the `.restrict-bound` sidecar, but
                     // recovery produced no `Table` to read the bound from. Read it
-                    // directly BEFORE quarantining moves the SST (the sidecar is a
-                    // sibling file, so its bound is captured while both are in place),
-                    // and re-impose it on the salvaged output below, exactly as the
+                    // directly from the sibling sidecar and re-impose it on the
+                    // salvaged output below, exactly as the
                     // verification-failure arm does. A TRANSIENT sidecar read
                     // propagates; anything else leaves no trustworthy bound, so the
                     // salvaged output stays unrestricted (a genuinely unpunched SST).
@@ -3678,63 +3210,27 @@ fn repair_tree(
                         && !allow_resurrection
                         && source_prefix_is_punched(&*folder_fs, &table_path)?
                     {
-                        match quarantine_file(
-                            &*folder_fs,
-                            &table_base_folder,
-                            &table_path,
-                            &file_name,
-                            config.sync_mode,
-                        ) {
-                            Ok(dest) => {
-                                // FLAG-DEPENDENT set-aside: mark it so a
-                                // resurrection repair reclaims and salvages it.
-                                // On marker failure, undo the set-aside so a
-                                // retry re-runs the classification instead of
-                                // leaving an unreclaimable file.
-                                if let Err(e) =
-                                    mark_resurrectable(&*folder_fs, &dest, config.sync_mode)
-                                {
-                                    restore_quarantined(
-                                        &*folder_fs,
-                                        &dest,
-                                        &table_path,
-                                        config.encryption.as_deref(),
-                                        config.sync_mode,
-                                    )?;
-                                    return Err(e);
-                                }
-                                crate::restrict_bound::remove(
-                                    &*folder_fs,
-                                    &table_path,
-                                    config.sync_mode,
-                                );
-                                unreadable_files.push((
-                                    table_path,
-                                    format!(
-                                        "punched SST with no recoverable restriction bound \
-                                         (missing / corrupt sidecar and failed recovery); set \
-                                         aside to {} (a resurrection repair reclaims it)",
-                                        dest.display()
-                                    ),
-                                ));
-                            }
-                            Err(e) => return Err(e),
-                        }
+                        // The flag decides this within THIS run: with
+                        // resurrection on, the same source salvages and keeps
+                        // its readable region. Nothing is stashed for a later
+                        // run to reconsider.
+                        let reason = "punched SST with no recoverable restriction bound \
+                                      (missing / corrupt sidecar and failed recovery); a \
+                                      resurrection repair keeps its readable region instead";
+                        discard_after_commit.push((
+                            Arc::clone(&folder_fs),
+                            table_path.clone(),
+                            reason.to_string(),
+                        ));
+                        unreadable_files.push((table_path, reason.to_string()));
                         continue;
                     }
                     // Whole-file recovery failed structurally; try block-level
-                    // salvage: the corrupt original is quarantined and a fresh SST
-                    // holding its recoverable blocks is written in its place. A
-                    // FAILED quarantine aborts the repair (the `?`): a manifest
-                    // omitting a still-in-place file would let the next open's
-                    // orphan cleanup delete the only copy.
-                    let quarantined = quarantine_file(
-                        &*folder_fs,
-                        &table_base_folder,
-                        &table_path,
-                        &file_name,
-                        config.sync_mode,
-                    )?;
+                    // salvage. The recoverable blocks go into `{id}.repair-tmp`,
+                    // which is swapped onto `{id}` only once the manifest that
+                    // adopts it is durable — so a crash mid-repair leaves the
+                    // directory exactly as the retry expects to find it.
+                    let output_path = repair_tmp_path(&table_path);
                     // Fail closed when the salvage walk reveals a punched source
                     // with no recoverable bound: the pre-salvage first-bytes
                     // probe above catches a punched FIRST block, but a partial
@@ -3747,12 +3243,11 @@ fn repair_tree(
                         &folder_fs,
                         allow_resurrection,
                         TableSalvage {
-                            quarantined: &quarantined,
-                            table_path: &table_path,
+                            source: &table_path,
+                            table_path: &output_path,
                             table_id,
                             reject_punched_without_bound: reject_punched,
                             blob_rewrite: None,
-                            output_id: None,
                         },
                     ) {
                         Ok(SalvageOutcome::Salvaged(salvaged)) => {
@@ -3762,8 +3257,7 @@ fn repair_tree(
                             let table = restrict_salvaged_output(
                                 &*folder_fs,
                                 config,
-                                &table_path,
-                                &SalvageRollback::Restore(&quarantined),
+                                &output_path,
                                 salvaged,
                                 restrict_bound,
                                 allow_resurrection,
@@ -3771,71 +3265,60 @@ fn repair_tree(
                             record_best(
                                 &mut recovered_by_id,
                                 &mut unreadable_files,
+                                &mut discard_after_commit,
                                 table_id,
                                 table,
                                 false,
                                 &folder_fs,
-                                &table_base_folder,
                                 &table_path,
-                                &file_name,
-                                config.sync_mode,
-                            )?;
+                            );
+                            swap_after_commit.push((
+                                Arc::clone(&folder_fs),
+                                output_path,
+                                table_path,
+                            ));
                         }
                         Ok(SalvageOutcome::Unusable) => {
-                            unreadable_files.push((
-                                table_path,
-                                format!(
-                                    "unrecoverable ({e}); original quarantined, nothing salvageable"
-                                ),
+                            let reason = format!("unrecoverable ({e}); nothing salvageable");
+                            discard_after_commit.push((
+                                Arc::clone(&folder_fs),
+                                table_path.clone(),
+                                reason.clone(),
                             ));
+                            unreadable_files.push((table_path, reason));
                         }
                         Ok(SalvageOutcome::PunchedBoundLost) => {
-                            // FLAG-DEPENDENT set-aside: mark the quarantined
-                            // ORIGINAL (the punched source; the rejected
-                            // salvage byproduct stays unmarked) so a
-                            // resurrection repair reclaims and re-salvages it.
-                            // On marker failure, undo the set-aside so a retry
-                            // re-runs the classification.
-                            if let Err(marker_err) =
-                                mark_resurrectable(&*folder_fs, &quarantined, config.sync_mode)
-                            {
-                                restore_quarantined(
-                                    &*folder_fs,
-                                    &quarantined,
-                                    &table_path,
-                                    config.encryption.as_deref(),
-                                    config.sync_mode,
-                                )?;
-                                return Err(marker_err);
-                            }
-                            unreadable_files.push((
-                                table_path,
-                                format!(
-                                    "punched SST with no recoverable restriction bound \
-                                     (missing / corrupt sidecar and failed recovery, punched \
-                                     extents found during salvage); set aside ({e}); a \
-                                     resurrection repair reclaims it"
-                                ),
+                            // The flag decides this within THIS run: with
+                            // resurrection on the same source salvages and keeps
+                            // its readable region.
+                            let reason = format!(
+                                "punched SST with no recoverable restriction bound \
+                                 (missing / corrupt sidecar and failed recovery, punched \
+                                 extents found during salvage): {e}; a resurrection repair \
+                                 keeps its readable region instead"
+                            );
+                            discard_after_commit.push((
+                                Arc::clone(&folder_fs),
+                                table_path.clone(),
+                                reason.clone(),
                             ));
+                            unreadable_files.push((table_path, reason));
+                        }
+                        // Transient I/O salvage failure: nothing moved, so the
+                        // retry re-derives the same salvage from the untouched
+                        // source. A structural failure is recorded.
+                        Err(salvage_err) if is_transient_io(&salvage_err) => {
+                            return Err(salvage_err);
                         }
                         Err(salvage_err) => {
-                            // Transient I/O salvage failure: restore the original
-                            // and abort so a retry can recover it (see the sibling
-                            // salvage arm above). A structural failure is recorded.
-                            if is_transient_io(&salvage_err) {
-                                restore_quarantined(
-                                    &*folder_fs,
-                                    &quarantined,
-                                    &table_path,
-                                    config.encryption.as_deref(),
-                                    config.sync_mode,
-                                )?;
-                                return Err(salvage_err);
-                            }
-                            unreadable_files.push((
-                                table_path,
-                                format!("recovery failed ({e}); salvage failed ({salvage_err})"),
+                            let reason =
+                                format!("recovery failed ({e}); salvage failed ({salvage_err})");
+                            discard_after_commit.push((
+                                Arc::clone(&folder_fs),
+                                table_path.clone(),
+                                reason.clone(),
                             ));
+                            unreadable_files.push((table_path, reason));
                         }
                     }
                 }
@@ -3849,26 +3332,17 @@ fn repair_tree(
                     if is_transient_io(&e) {
                         return Err(e);
                     }
-                    // QUARANTINE before recording unreadable: the rebuilt manifest
-                    // omits this file, so a later `Tree::open` would orphan-clean
-                    // (DELETE) it from `tables/`, contradicting the report's promise
-                    // that an operator can still investigate / recover it. Moving it
-                    // to the repair quarantine preserves it. A FAILED quarantine
-                    // aborts the whole repair (the file must not be both omitted and
-                    // left in place).
-                    match quarantine_file(
-                        &*folder_fs,
-                        &table_base_folder,
-                        &table_path,
-                        &file_name,
-                        config.sync_mode,
-                    ) {
-                        Ok(dest) => unreadable_files.push((
-                            table_path,
-                            format!("{e}; quarantined to {}", dest.display()),
-                        )),
-                        Err(qe) => return Err(qe),
-                    }
+                    // The rebuilt manifest omits this file, so it is removed once
+                    // that manifest is durable: a file both omitted and left in
+                    // place is an orphan the next open must sweep, and an open
+                    // that cannot sweep it fails.
+                    let reason = e.to_string();
+                    discard_after_commit.push((
+                        Arc::clone(&folder_fs),
+                        table_path.clone(),
+                        reason.clone(),
+                    ));
+                    unreadable_files.push((table_path, reason));
                 }
             }
         }
@@ -3877,7 +3351,7 @@ fn repair_tree(
     // Collect the best copy per id, carrying each candidate's completeness so
     // `salvaged` can be derived from the tables that actually make the
     // manifest — after the blob-dependency filtering below, not before (a
-    // salvaged table quarantined for an unrecoverable blob dependency must not
+    // salvaged table dropped for an unrecoverable blob dependency must not
     // count, or `salvaged` could exceed `recovered`). A lossy copy superseded
     // by a complete duplicate is likewise already gone from the candidates.
     let mut recovered_tables: Vec<(Table, bool)> = recovered_by_id
@@ -3895,40 +3369,6 @@ fn repair_tree(
     // so repeating a repair over the same files reproduces the same tree
     // instead of inheriting the directory scan's order.
     recovered_tables.sort_by_key(|(t, _)| std::cmp::Reverse(t.id()));
-
-    // Fresh ids for copies published BESIDE their source (the blob-handle
-    // rewrite). Starts one past the highest id ANY artifact in the table
-    // folders claims, so a new name can never displace a file this repair still
-    // has to read — and never inherits the meaning of one it does not.
-    // Sidecars count: the scan skips them, so a `.restrict-bound` whose table
-    // is gone still names an id, and publishing an UNRESTRICTED rewrite under
-    // it would make a later manifest-loss repair match that sidecar by id and
-    // restrict the replacement at an unrelated bound, dropping its prefix.
-    // Clearing the sidecar is best-effort; not taking the id is not.
-    // `None` = exhausted, which fails the repair at the point of use rather
-    // than reusing an id.
-    let mut highest_claimed_id: Option<TableId> =
-        recovered_tables.iter().map(|(t, _)| t.id()).max();
-    for (table_base_folder, folder_fs) in config.all_tables_folders() {
-        if !folder_fs.exists(&table_base_folder)? {
-            continue;
-        }
-        for dirent in folder_fs.read_dir(&table_base_folder)? {
-            let claimed = crate::restrict_bound::table_id_from_sidecar_name(&dirent.file_name)
-                .or_else(|| dirent.file_name.parse::<TableId>().ok());
-            if let Some(id) = claimed {
-                highest_claimed_id = Some(highest_claimed_id.map_or(id, |max| max.max(id)));
-            }
-        }
-    }
-    let mut next_table_id: Option<TableId> =
-        highest_claimed_id.map_or(Some(0), |max| max.checked_add(1));
-    // Sources whose rewritten copy is in the rebuilt manifest. Set aside only
-    // after `persist_version` — until then they are the only copy of their
-    // rows, and a crash must leave them where a retry looks for them.
-    // Each entry carries the source's OWN backend: a per-level route stores its
-    // tables through a different `Fs`, where the primary one cannot see them.
-    let mut stale_table_originals: Vec<(Arc<dyn crate::fs::Fs>, PathBuf, String)> = Vec::new();
 
     // KV-separated (blob) trees additionally carry a blob-file list. Discover the
     // blob files from the `blobs/` folder (no manifest to filter against) and
@@ -3960,6 +3400,14 @@ fn repair_tree(
         blob_rewrites = recovery.rewrites;
         blob_frag = recovery.frag;
         stale_blob_originals = recovery.stale;
+        // Foreign names, duplicates and unreadable blob files: same post-commit
+        // removal as the superseded originals (see `BlobRecovery::discard`).
+        discard_after_commit.extend(
+            recovery
+                .discard
+                .into_iter()
+                .map(|(path, note)| (Arc::clone(&config.fs), path, note)),
+        );
         let map: crate::HashMap<crate::vlog::BlobFileId, crate::vlog::BlobFile> =
             recovery.files.into_iter().map(|bf| (bf.id(), bf)).collect();
         (TreeType::Blob, BlobFileList::new(map))
@@ -4005,8 +3453,8 @@ fn repair_tree(
                         table,
                         &format!("blob-file reference list unreadable ({e})"),
                         &mut unreadable_files,
-                        config.sync_mode,
-                    )?;
+                        &mut discard_after_commit,
+                    );
                     continue;
                 }
             };
@@ -4024,8 +3472,8 @@ fn repair_tree(
                     table,
                     &format!("blob file {} is not recoverable", l.blob_file_id),
                     &mut unreadable_files,
-                    config.sync_mode,
-                )?;
+                    &mut discard_after_commit,
+                );
                 continue;
             }
             // Whether this table's handles must be rewritten: any reference to
@@ -4055,8 +3503,8 @@ fn repair_tree(
                                 table,
                                 &format!("blob handles unreadable ({e})"),
                                 &mut unreadable_files,
-                                config.sync_mode,
-                            )?;
+                                &mut discard_after_commit,
+                            );
                             continue;
                         }
                     }
@@ -4071,27 +3519,17 @@ fn repair_tree(
             // longer exists. The rewritten table counts as salvaged (its
             // content may be lossy relative to the original).
             //
-            // The copy is published under a FRESH id beside its untouched
-            // source, and the source is set aside only AFTER the manifest
-            // commit. Moving it first would open a window in which a crash
-            // leaves the only copy in `repair-quarantine/`, which the retry
-            // (it scans `tables/`) never looks at: the table's keys would
-            // silently vanish from the rebuilt manifest. Nothing has to be
-            // carried across runs to make this repeatable — the rewrite reads
-            // an untouched source and writes a separate output, so a retry
-            // simply redoes the same deterministic rewrite from the same
-            // inputs.
+            // The copy is built at `{id}.repair-tmp` — a name no scan adopts —
+            // and swapped onto `{id}` only AFTER the manifest commit. Displacing
+            // the source first would open a window in which a crash leaves no
+            // readable copy where the retry looks, and publishing the copy under
+            // a name the scan DOES adopt would leave a crash with both readable,
+            // so the retry would rebuild one history into L0 twice. Nothing is
+            // carried across runs: the rewrite reads an untouched source, and a
+            // leftover temp is garbage the retry replaces.
             let source_id = table.id();
             let path = (*table.path).clone();
-            let Some(base) = path.parent().map(std::path::Path::to_path_buf) else {
-                return Err(crate::Error::Unrecoverable);
-            };
-            let Some(new_id) = next_table_id else {
-                log::error!("repair: table ids exhausted; cannot rewrite blob handles");
-                return Err(crate::Error::Unrecoverable);
-            };
-            next_table_id = new_id.checked_add(1);
-            let output_path = base.join(new_id.to_string());
+            let output_path = repair_tmp_path(&path);
             // A RESTRICTED source's bound must be re-imposed on the copy: the
             // rewrite re-emits the straddling block's sub-bound rows, which the
             // restriction hides, so an unrestricted copy would resurrect them.
@@ -4103,12 +3541,11 @@ fn repair_tree(
                 &fs,
                 allow_resurrection,
                 TableSalvage {
-                    quarantined: &path,
+                    source: &path,
                     table_path: &output_path,
                     table_id: source_id,
                     reject_punched_without_bound: false,
                     blob_rewrite: Some(Arc::clone(&blob_rewrites)),
-                    output_id: Some(new_id),
                 },
             ) {
                 Ok(SalvageOutcome::Salvaged(rewritten)) => {
@@ -4116,27 +3553,21 @@ fn repair_tree(
                         &*fs,
                         config,
                         &output_path,
-                        &SalvageRollback::DiscardOutput,
                         rewritten,
                         restrict_bound,
                         allow_resurrection,
                     )?;
                     kept.push((rewritten, false));
-                    stale_table_originals.push((
-                        Arc::clone(&fs),
-                        path,
-                        format!("blob handles rewritten into table {new_id}"),
-                    ));
+                    swap_after_commit.push((Arc::clone(&fs), output_path, path));
                 }
                 Ok(SalvageOutcome::Unusable | SalvageOutcome::PunchedBoundLost) => {
                     set_aside_path(
-                        &*fs,
-                        &base,
+                        &fs,
                         &path,
                         "blob-handle rewrite produced nothing",
                         &mut unreadable_files,
-                        config.sync_mode,
-                    )?;
+                        &mut discard_after_commit,
+                    );
                 }
                 // A retryable failure leaves the source where it was found, so
                 // the retry re-derives the same rewrite from it; nothing to
@@ -4144,13 +3575,12 @@ fn repair_tree(
                 Err(e) if is_transient_io(&e) => return Err(e),
                 Err(e) => {
                     set_aside_path(
-                        &*fs,
-                        &base,
+                        &fs,
                         &path,
                         &format!("blob-handle rewrite failed ({e})"),
                         &mut unreadable_files,
-                        config.sync_mode,
-                    )?;
+                        &mut discard_after_commit,
+                    );
                 }
             }
         }
@@ -4279,34 +3709,51 @@ fn repair_tree(
         }
     }
 
-    // POST-COMMIT cleanup. The manifest is durable and names the salvaged
-    // replacements, so the damaged originals they superseded are now
-    // unreferenced and can be set aside for the operator. This runs AFTER the
-    // commit on purpose: until then those originals are what the tables the
-    // rewrite had not reached still point at, so moving one earlier would let
-    // a failed repair leave a table referencing a blob id that no longer
-    // exists — and the retry would set that table aside as unrecoverable.
+    // POST-COMMIT, step one: swap every finished replacement onto the name the
+    // committed manifest gives it, destroying the damaged source it replaces.
+    // Before this the manifest was not durable and the sources were the only
+    // copies; after it the manifest describes exactly these bytes. A crash
+    // between the commit and a swap leaves `{id}` damaged with `{id}.repair-tmp`
+    // beside it — which the next run resolves from the committed manifest alone
+    // (see `sweep_superseded_by_committed_manifest`), not from anything this run
+    // remembered.
+    //
+    // NOT best-effort: the manifest already names this content, so a swap that
+    // does not happen is a tree whose next open finds the damaged file under the
+    // manifest's checksum and fails.
+    for (fs, tmp_path, table_path) in swap_after_commit {
+        if let Err(e) = commit_repair_tmp(&*fs, &tmp_path, &table_path, config.sync_mode) {
+            log::error!(
+                "repair: cannot swap the replacement {} onto {} ({e}); failing the \
+                 repair — the committed manifest names the replacement's content",
+                tmp_path.display(),
+                table_path.display(),
+            );
+            return Err(e);
+        }
+    }
+
+    // POST-COMMIT, step two. The manifest is durable and names the salvaged
+    // replacements, so the damaged originals they superseded are unreferenced
+    // and are removed. This runs AFTER the commit on purpose: until then those
+    // originals are what the tables the rewrite had not reached still point at,
+    // so removing one earlier would let a failed repair leave a table
+    // referencing a blob id that no longer exists — and the retry would then
+    // record that table unrecoverable.
     //
     // NOT best-effort. A superseded original left in `blobs/` is outside the
     // committed manifest, so the next open classifies it as an orphan and
-    // removes it — and if the directory refuses the removal the way it just
-    // refused the rename, that open FAILS. Reporting a successful repair for a
-    // tree that will not open is the one outcome recovery must never produce,
-    // so the failure propagates: the manifest is already durable, and a retry
-    // once the filesystem is fixed finishes the set-aside on the same inputs.
+    // removes it — and if the directory refuses the removal now, that open
+    // FAILS. Reporting a successful repair for a tree that will not open is the
+    // one outcome recovery must never produce, so the failure propagates: the
+    // manifest is already durable, and a retry once the filesystem is fixed
+    // finishes the sweep on the same inputs.
     for (path, note) in stale_blob_originals {
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let blobs_folder = config.path.join(crate::file::BLOBS_FOLDER);
-        match quarantine_file(&*config.fs, &blobs_folder, &path, name, config.sync_mode) {
-            Ok(dest) => blob_files_salvaged.push((
-                path,
-                format!("{note}; original preserved at {}", dest.display()),
-            )),
+        match discard_unreferenced(&*config.fs, &path, config.sync_mode) {
+            Ok(()) => blob_files_salvaged.push((path, format!("{note}; original removed"))),
             Err(e) => {
                 log::error!(
-                    "repair: cannot set aside the superseded blob original {} ({e}); \
+                    "repair: cannot remove the superseded blob original {} ({e}); \
                      failing the repair — left in blobs/ it is an orphan the next \
                      open must remove, and that removal would hit the same error",
                     path.display(),
@@ -4316,30 +3763,19 @@ fn repair_tree(
         }
     }
 
-    // Same rule for the SST sources whose rewritten copy the manifest now
-    // names: they are unreferenced from here on, and a file left in `tables/`
-    // outside the manifest is an orphan the next open DELETES — so the
-    // set-aside is what preserves them, and a failure to perform it fails the
-    // repair rather than reporting success over a tree that loses them.
-    for (fs, path, note) in stale_table_originals {
-        let (Some(base), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
-        else {
-            return Err(crate::Error::Unrecoverable);
-        };
-        // Through the SOURCE's backend: a routed table lives in a namespace the
-        // primary `Fs` cannot see, where this rename would either fail
-        // `NotFound` (after the manifest already committed) or, worse, move a
-        // same-named file from the primary namespace.
-        match quarantine_file(&*fs, base, &path, name, config.sync_mode) {
-            Ok(dest) => log::info!(
-                "repair: {note}; superseded source preserved at {}",
-                dest.display(),
-            ),
+    // Everything the scan classified out of the rebuilt tree: a foreign name, a
+    // duplicate id, a table or blob file no bound could make safe. The scan
+    // itself touched nothing, so until this point a crash left the directory
+    // exactly as the retry expects to find it; from here the manifest is
+    // durable and these files are what the tree no longer references.
+    for (fs, path, note) in discard_after_commit {
+        match discard_unreferenced(&*fs, &path, config.sync_mode) {
+            Ok(()) => log::info!("repair: {} removed ({note})", path.display()),
             Err(e) => {
                 log::error!(
-                    "repair: cannot set aside the superseded table {} ({e}); \
-                     failing the repair — left in tables/ it is an orphan the next \
-                     open must remove, and that removal would hit the same error",
+                    "repair: cannot remove {} ({e}); failing the repair — left in \
+                     place it is a file the next open must reject or sweep, and it \
+                     would hit the same error",
                     path.display(),
                 );
                 return Err(e);

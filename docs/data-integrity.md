@@ -252,7 +252,7 @@ inspection, or rollback to a known-good point.
 - **`salvage::salvage_sst(src, dest, &fs) -> SalvageReport`** (also
   `tools/sst-dump salvage <file> <dest>`): block-granular salvage of a single
   SST. Re-emit every block that passes its checksum (and ECC) into a fresh,
-  fully-valid file, quarantine the corrupt ones, and report the key range each
+  fully-valid file, drop the corrupt ones, and report the key range each
   dropped, so one bad block costs only its own keys instead of the whole file. A
   columnar segment with a damaged sidecar degrades conservatively: a torn
   sub-column drops just its block. A delete-bearing segment whose positional

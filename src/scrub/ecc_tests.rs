@@ -581,7 +581,7 @@ fn corrupt_parity_trailer_byte(
 /// state the reconcile tests need — a manifest digest that matches damaged
 /// bytes exactly (as when the damage lands before the digest is first
 /// recorded) — which `Config::repair()` deliberately refuses to produce: its
-/// block verification quarantines a table whose data blocks do not verify
+/// block verification drops a table whose data blocks do not verify
 /// rather than blessing a laundered digest.
 fn rebuild_manifest_over_current_bytes(dir: &std::path::Path) -> crate::Result<()> {
     use crate::version::{Level, Run, Version};

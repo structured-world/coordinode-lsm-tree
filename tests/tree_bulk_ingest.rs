@@ -206,12 +206,12 @@ fn blob_tree_copy() -> lsm_tree::Result<()> {
 
 /// End-to-end: a bulk-ingested table relies on a manifest-only `global_seqno`
 /// offset for its effective MVCC ordering, so manifest repair (which cannot
-/// recover that offset from the SST) must FAIL CLOSED and quarantine it rather
-/// than register it with offset 0 and silently age its entries. This exercises
-/// the real ingest path (which flags the SST `descriptor#bulk_ingested`) plus
-/// repair, guarding the ingest → flag → quarantine chain end to end.
+/// recover that offset from the SST) must FAIL CLOSED and drop it rather than
+/// register it with offset 0 and silently age its entries. This exercises the
+/// real ingest path (which flags the SST `descriptor#bulk_ingested`) plus
+/// repair, guarding the ingest → flag → drop chain end to end.
 #[test]
-fn repair_quarantines_a_bulk_ingested_table() -> lsm_tree::Result<()> {
+fn repair_drops_a_bulk_ingested_table() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let seqno = SequenceNumberCounter::default();
     let visible_seqno = SequenceNumberCounter::default();
@@ -252,7 +252,7 @@ fn repair_quarantines_a_bulk_ingested_table() -> lsm_tree::Result<()> {
     );
     assert_eq!(
         report.unreadable, 1,
-        "the bulk-ingested table is quarantined: {:?}",
+        "the bulk-ingested table is dropped: {:?}",
         report.unreadable_files,
     );
     assert!(
@@ -262,7 +262,7 @@ fn repair_quarantines_a_bulk_ingested_table() -> lsm_tree::Result<()> {
     );
     assert!(
         !ingested_sst.exists(),
-        "the quarantined SST must be moved out of tables/ ({}), not left in place",
+        "the dropped SST must be removed from tables/ ({}), not left in place",
         ingested_sst.display(),
     );
 

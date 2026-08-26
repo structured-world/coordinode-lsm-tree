@@ -2,7 +2,7 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 //! Block-granular SST salvage: recover the readable blocks of an SST whose
-//! whole-file verification fails, quarantining the corrupted ones.
+//! whole-file verification fails, dropping the corrupted ones.
 //!
 //! Where [`crate::repair`] rebuilds the manifest *around* unreadable SSTs and
 //! [`crate::verify`] reports per-block health read-only, salvage walks an SST
@@ -64,7 +64,7 @@ pub struct SalvageOptions {
     /// rather than in its place. `None` (the default) keeps the source's
     /// identity, which is what an in-place replacement needs. The destination
     /// file name must match: an SST whose stamped id disagrees with its name is
-    /// quarantined on open.
+    /// rejected on open.
     pub output_id: Option<crate::TableId>,
     /// Opt-in to salvaging a delete-bearing columnar SST whose positional
     /// delete bitmap cannot be applied (the bitmap section is unreadable, or a
@@ -374,7 +374,7 @@ pub(crate) fn salvage_with_context(
     // expected id but disagree in ANY field, neither is provably genuine: an
     // internally-consistent forged tail (a changed compression tag, a changed
     // columnar descriptor) would make the tail-first open mis-decode every
-    // healthy data block and drop it — repair would then quarantine a table
+    // healthy data block and drop it — repair would then discard a table
     // whose intact MID mirror recovers everything. Since no copy can be
     // proven authoritative, run the walk under BOTH mirror orders and keep
     // the attempt that recovers more.
@@ -625,7 +625,7 @@ fn publish_from_temp(
             // an existing destination by contract, so a probe-then-rename
             // fallback would silently overwrite a racing creator's file). A
             // crash between the claim and the rename leaves an empty `dest`
-            // that recovery quarantines as unreadable, while the temp copy
+            // that recovery reports unreadable, while the temp copy
             // still holds the content for a re-derive.
             match fs.open(
                 dest,
@@ -850,8 +850,9 @@ fn salvage_attempt(
     // degrades it. Salvage re-derives every such section from the recovered
     // entries, so it would DISCARD the relabeled deletion and re-emit the
     // suppressed rows as live. A genuinely rotted section is indistinguishable
-    // from the relabel, so both fail closed; the operator recovers the
-    // quarantined original by hand. The signal is purely STRUCTURAL (each
+    // from the relabel, so both fail closed; the rows come back from a replica,
+    // a checkpoint plus journal replay, or a backup. The signal is purely
+    // STRUCTURAL (each
     // section decodes its own bytes, independent of the data blocks), so a
     // corrupt DATA block still salvages. A table that DOES carry a visible
     // deletion (a delete bitmap; range tombstones were rejected above) is
@@ -873,7 +874,7 @@ fn salvage_attempt(
     // checksum) leaves the parsed table reporting no deletion while every
     // remaining block still passes its byte-level checks: the relabel guard
     // above only catches a re-roled block whose catalogue stays perfectly tiled.
-    // Repair routes such a table to quarantine via this same check, but the
+    // Repair drops such a table via this same check, but the
     // standalone `salvage_sst` / CLI path never runs the repair verifier, so a
     // positional walk here would re-emit the suppressed rows as live. A read
     // structural ambiguity grades closed, a transient read PROPAGATES (see
@@ -994,9 +995,9 @@ fn salvage_attempt(
         Ok(walk) => walk,
         Err(e) => {
             // A `write` / `finish` failure after `Writer::new` created `dest`
-            // leaves a partial SST there. Remove it before propagating: in the
-            // repair path `dest` is the original table path, so a leftover
-            // fragment would be re-opened and re-quarantined on every later run.
+            // leaves a partial SST there. Remove it before propagating: a
+            // leftover fragment is a file every later run would re-open and
+            // re-reject.
             discard_partial(fs, &dest);
             return Err(e);
         }
@@ -1041,10 +1042,9 @@ struct SalvageWalk {
 }
 
 /// Best-effort removal of a destination salvage could not complete (an empty or
-/// partially-written SST). A repair caller writes the salvaged copy straight
-/// into the original table path, so a leftover fragment there would be
-/// re-quarantined on the next run; failure is logged, not propagated, so the
-/// original error stays the one the caller sees.
+/// partially-written SST). A leftover fragment is a file the next run would
+/// re-open and re-reject; failure is logged, not propagated, so the original
+/// error stays the one the caller sees.
 fn discard_partial(fs: &alloc::sync::Arc<dyn crate::fs::Fs>, dest: &std::path::Path) {
     if let Err(e) = fs.remove_file(dest) {
         log::warn!(
@@ -3113,7 +3113,7 @@ pub fn salvage_blob_file(
             Some(dest)
         }
         // Nothing recoverable: `BlobWriter::new` created `dest`, so remove the
-        // empty placeholder a repair caller would otherwise re-quarantine.
+        // empty placeholder a repair caller would otherwise re-reject.
         Ok(()) => {
             drop(writer);
             discard_partial(fs, &dest);

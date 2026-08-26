@@ -52,15 +52,28 @@ therefore **derived by scanning the artifacts themselves**, the way `fsck`
 rebuilds a block bitmap by walking inodes instead of trusting the stored one.
 Three rules follow, and every branch of the algorithm obeys them.
 
+**A run has exactly two outcomes: a tree that opens, or an error.** There is no
+third state, no directory of things for someone to deal with later, and no step
+that ends in "fix this by hand". Every file the rebuilt manifest does not name is
+removed before the run reports success — a foreign name, a duplicate id, a table
+no bound can make safe, a source its replacement supersedes — because a file left
+behind is an orphan the next open must sweep, and an open that cannot sweep it
+does not open. A removal the filesystem refuses is therefore an error, not a
+warning: reporting success over a tree that will not open is the one outcome
+recovery must never produce. Recovering the *content* of a damaged file is
+replication, a checkpoint plus journal replay, or a backup; it is never a copy
+this engine hides beside the tree.
+
 **The manifest commit is the only act that makes anything live.** A repair
 prepares its results and then publishes them with a single atomic
-`persist_version`; nothing it writes before that is reachable. Consequently a
-repair never overwrites an existing table or blob-file id — a salvaged
-replacement is a *new* id, and the originals stay where they were. A crash at
-any earlier point therefore leaves the tree byte-for-byte as it was found,
-plus unreferenced files that the next open's orphan sweep removes. This is the
-copy-on-write discipline, not a journal: the old tree stays intact until the
-root pointer moves.
+`persist_version`; nothing it writes before that is reachable, and nothing it
+writes before that displaces a source. A replacement is built under a name no
+scan adopts (`{id}.repair-tmp` for a table, a fresh id for a blob file) and only
+swapped onto the name the manifest gives it afterwards. A crash at any earlier
+point therefore leaves the tree byte-for-byte as it was found, plus unpublished
+files a later run discards — so the retry re-derives the same answer from the
+same bytes. This is the copy-on-write discipline, not a journal: the old tree
+stays intact until the root pointer moves.
 
 **Durable intermediate state, if it exists at all, records absolute facts —
 never deltas.** A journal replays block *contents* because only absolute
@@ -107,7 +120,7 @@ flowchart TD
     RNB -->|yes| RDER{allow_resurrection?}
     RDER -->|no| RPAT{Zeroed blocks form<br/>a clean prefix?}
     RPAT -->|yes| RCONS[Bound = first readable block's end;<br/>drop the straddling block]
-    RPAT -->|no| RIRR[Set aside, marked resurrectable:<br/>punch failures made the bound unknowable]
+    RPAT -->|no| RIRR[Dropped:<br/>punch failures made the bound unknowable]
     RDER -->|yes| RGREEDY[Bound = first readable block<br/>past the last hole;<br/>keep the readable region]
 
     REXACT --> REOPEN[Reopen restricted;<br/>live suffix always kept]
@@ -172,10 +185,9 @@ higher-offset blocks and then hit a failure (or a crash) before reaching the
 lower ones. Any readable block may then equally be an intact-but-consumed
 block the pass never reached, so no geometry bound can separate consumed data
 from live: anchoring anywhere either resurrects superseded rows or discards
-live ones. With resurrection disabled such a table
-is *set aside* (its bound is genuinely unrecoverable); enabling resurrection
-keeps the whole readable region past the last hole, accepting the re-exposure
-by contract. The reclaim itself punches top-down and stops at the first
+live ones. With resurrection disabled such a table is *dropped* (its bound is
+genuinely unrecoverable); enabling resurrection keeps the whole readable region
+past the last hole, accepting the re-exposure by contract. The reclaim itself punches top-down and stops at the first
 failure, so any failure (or crash mid-reclaim) leaves intact blocks strictly
 below the zeroed ones — always the detectable irregular pattern, never
 intact-but-consumed blocks masquerading as a live suffix above a clean prefix.
@@ -185,16 +197,15 @@ construction (no scheme can detect zero evidence), and the committed slice
 output shadows that unrestricted survivor until a later compaction rewrites
 it.
 
-**Flag-dependent set-asides stay reclaimable — the knob is two-way.** Every
-set-aside whose *only* cause is the disabled resurrection flag (an irregular
-punch, or a punched sidecar-less source whose whole-file recovery also failed)
-is written with a `.resurrectable` marker beside it in the quarantine
-directory. A later repair run *with* resurrection first returns every marked
-file to the tables folder and then recovers it through the normal scan, so
-switching the flag never requires a manual file move in either direction.
-Unmarked quarantine content — duplicates, corrupt files, bulk-ingest rejects,
-salvage byproducts — is never reclaimed: those exclusions do not depend on the
-flag.
+**The flag is an input to the run, not a state machine across runs.** A drop
+whose *only* cause is the disabled resurrection flag (an irregular punch, or a
+punched sidecar-less source whose whole-file recovery also failed) is decided by
+the run that reads those bytes, and its file goes with the decision. Nothing is
+stashed for a later run to reconsider: a run that stashed would hand the next one
+a different directory than the one it derived from, and every later report would
+describe a world the operator never handed the engine. Choosing to keep an
+ambiguous region means running the repair *with* resurrection, on a directory no
+default run has already repaired.
 
 Whenever a bound is known or derivable, the table is recovered restricted; its
 live suffix is never thrown away to avoid the ambiguous prefix. This holds even
@@ -204,8 +215,7 @@ result restricted to the bound and re-records its sidecar, so a later
 manifest-loss repair honors it. The readable part of the suffix survives; only
 the corrupt blocks are lost, and nothing below the bound is resurrected. Only
 the irregular-punch state above — where no live suffix can even be delimited —
-sets a table aside, and the resurrection flag still recovers its readable
-region.
+drops a table, and the resurrection flag still recovers its readable region.
 
 **Verification runs on every repair; the salvage flag only picks the remedy.**
 Whole-file recovery is lazy on the data section and the manifest digest is
@@ -319,11 +329,11 @@ unpunched file, the metadata counters — item count, uncompressed byte total,
 key range — match the scanned frames (blob GC's dead-file arithmetic trusts
 those counters, so an understated total could reclaim a file whose uncounted
 frames are still referenced). A file that fails any of these is never blessed
-as-is. It is **salvaged**: the
-original moves to quarantine (preserved), every record whose checksum verifies
+as-is. It is **salvaged**: every record whose checksum verifies
 — decompressed and re-compressed for a compressed file, proving the content
-round-trips — is re-emitted into a compacted replacement under the canonical
-name, and the per-record offset relocation is retained. Records after the
+round-trips — is re-emitted into a compacted replacement under a fresh id, and
+the per-record offset relocation is retained; the damaged original is removed
+once the manifest naming the replacement is durable. Records after the
 first damaged frame are conservatively surrendered (their boundaries are
 unprovable); a dictionary-compressed file is the one shape blob salvage cannot
 re-emit, and such a file is set aside whole with its referencing tables.

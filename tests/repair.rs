@@ -269,11 +269,11 @@ fn repair_reports_non_table_id_filename_as_unreadable() -> lsm_tree::Result<()> 
         report.unreadable_files[0].1,
     );
 
-    // The junk must no longer sit in `tables/` — repair quarantines it so the
-    // tree reopens cleanly WITHOUT any manual cleanup.
+    // The junk must no longer sit in `tables/` — repair removes it so the tree
+    // reopens cleanly WITHOUT any manual cleanup.
     assert!(
         !dir.path().join("tables").join("not-a-table-id").exists(),
-        "non-table-id file must be moved out of tables/ by repair",
+        "non-table-id file must be removed from tables/ by repair",
     );
     let tree = Config::new(
         dir.path(),
@@ -431,7 +431,10 @@ fn repair_reports_unopenable_file_as_unreadable() -> lsm_tree::Result<()> {
 }
 
 #[test]
-fn repair_fails_when_a_bad_filename_cannot_be_quarantined() -> lsm_tree::Result<()> {
+fn repair_fails_when_a_bad_filename_cannot_be_removed() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+    use lsm_tree::io::ErrorKind;
+
     let dir = lsm_tree::get_tmp_folder();
     let big = |i: u64| format!("{i:08}").repeat(512);
 
@@ -453,35 +456,44 @@ fn repair_fails_when_a_bad_filename_cannot_be_quarantined() -> lsm_tree::Result<
     nuke_manifest(dir.path())?;
 
     // A non-numeric name in blobs/ would make the reopened tree's blob recovery
-    // (which parses every name) abort, so repair must quarantine it.
+    // (which parses every name) abort, so repair must remove it.
     std::fs::write(dir.path().join("blobs").join("not-a-blob-id"), b"junk")?;
-    // Block the quarantine: occupy the `repair-quarantine` directory path with a
-    // regular file so the rename's `create_dir_all` fails. Repair must then abort
-    // rather than report success while leaving the un-quarantined name in place
-    // (which would make the tree unopenable).
-    std::fs::write(dir.path().join("repair-quarantine"), b"blocker")?;
+    // Refuse the removal, exactly as the next open's sweep of that same name
+    // would be refused. Repair must fail rather than report success over a tree
+    // whose reopen the leftover name aborts.
+    let fault = FaultFs::new(StdFs);
+    fault.injector().arm(
+        FaultRule::new(
+            FaultOp::RemoveFile,
+            Fault::Error(ErrorKind::PermissionDenied),
+        )
+        .on_path("not-a-blob-id"),
+    );
 
     let result = Config::new(
         dir.path(),
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
+    .with_fs(fault)
     .with_kv_separation(Some(KvSeparationOptions::default()))
     .repair();
 
     assert!(
         result.is_err(),
-        "repair must fail when it cannot quarantine a bad filename, got {result:?}",
+        "repair must fail when it cannot remove a bad filename, got {result:?}",
     );
 
     Ok(())
 }
 
 #[test]
-fn repair_fails_when_a_bad_table_filename_cannot_be_quarantined() -> lsm_tree::Result<()> {
-    // Sibling of the blob-side test above, covering the standard `tables/`
-    // quarantine path so the false-success regression cannot slip back for
-    // standard trees.
+fn repair_fails_when_a_bad_table_filename_cannot_be_removed() -> lsm_tree::Result<()> {
+    // Sibling of the blob-side test above, covering `tables/` so the
+    // false-success regression cannot slip back for standard trees.
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+    use lsm_tree::io::ErrorKind;
+
     let dir = lsm_tree::get_tmp_folder();
 
     {
@@ -501,23 +513,29 @@ fn repair_fails_when_a_bad_table_filename_cannot_be_quarantined() -> lsm_tree::R
     nuke_manifest(dir.path())?;
 
     // A non-numeric name in tables/ would make the reopened tree's recovery
-    // (which parses every name) abort, so repair must quarantine it.
+    // (which parses every name) abort, so repair must remove it.
     std::fs::write(dir.path().join("tables").join("not-a-table-id"), b"junk")?;
-    // Block the quarantine by occupying the `repair-quarantine` directory path
-    // with a regular file. Repair must abort rather than report success while
-    // leaving the un-quarantined name in place.
-    std::fs::write(dir.path().join("repair-quarantine"), b"blocker")?;
+    // Refuse that removal, exactly as the next open's sweep would be refused.
+    let fault = FaultFs::new(StdFs);
+    fault.injector().arm(
+        FaultRule::new(
+            FaultOp::RemoveFile,
+            Fault::Error(ErrorKind::PermissionDenied),
+        )
+        .on_path("not-a-table-id"),
+    );
 
     let result = Config::new(
         dir.path(),
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
+    .with_fs(fault)
     .repair();
 
     assert!(
         result.is_err(),
-        "repair must fail when it cannot quarantine a bad table filename, got {result:?}",
+        "repair must fail when it cannot remove a bad table filename, got {result:?}",
     );
 
     Ok(())
@@ -834,14 +852,13 @@ fn repair_with_salvage_reports_an_unopenable_sst_as_unreadable() -> lsm_tree::Re
     Ok(())
 }
 
-/// Ordinary `repair()` (salvage disabled) must QUARANTINE a structurally
-/// unreadable SST before publishing the manifest, not leave it under its numeric
-/// name in `tables/`: the rebuilt manifest omits it, so the next `Tree::open`
-/// would orphan-clean (DELETE) it — contradicting the report's promise that an
-/// operator can still investigate / recover it. The file must be moved out of
-/// `tables/` (into the repair quarantine).
+/// Ordinary `repair()` (salvage disabled) must not leave a structurally
+/// unreadable SST under its numeric name: the rebuilt manifest omits it, so it
+/// becomes an orphan the next `Tree::open` has to sweep — and an open that
+/// cannot sweep it does not open. The repair removes it once its manifest is
+/// durable, and reports what was lost.
 #[test]
-fn repair_quarantines_an_unreadable_sst_before_publishing() -> lsm_tree::Result<()> {
+fn repair_removes_an_unreadable_sst_it_could_not_publish() -> lsm_tree::Result<()> {
     let dir = lsm_tree::get_tmp_folder();
     {
         let tree = Config::new(
@@ -879,12 +896,12 @@ fn repair_quarantines_an_unreadable_sst_before_publishing() -> lsm_tree::Result<
     assert_eq!(report.unreadable, 1, "it is reported unreadable");
     assert!(
         !victim.exists(),
-        "the unreadable SST must be MOVED out of tables/ (quarantined), not left to be \
-         orphan-deleted on the next open",
+        "the unreadable SST must not be left in tables/ for the next open to \
+         trip over",
     );
-    assert!(
-        report.unreadable_files[0].1.contains("quarantined to"),
-        "the reason records the quarantine destination: {:?}",
+    assert_eq!(
+        report.unreadable_files[0].0, victim,
+        "the report names the file that was dropped: {:?}",
         report.unreadable_files,
     );
     Ok(())
@@ -1222,7 +1239,7 @@ fn repair_with_salvage_corrupt_filter_in_encrypted_sst_is_rewritten() -> lsm_tre
     Ok(())
 }
 
-/// `repair_with_salvage` must NOT quarantine and rewrite a HEALTHY encrypted
+/// `repair_with_salvage` must NOT condemn and rewrite a HEALTHY encrypted
 /// SST: the block-verify gate has to be encryption-aware (the out-of-band
 /// file walk cannot decode an encrypted meta block, so it would misreport
 /// every encrypted table as corrupt and salvage it on every repair).
@@ -1259,7 +1276,7 @@ fn repair_with_salvage_healthy_encrypted_sst_remains_untouched() -> lsm_tree::Re
     .repair_with_salvage(true)?;
     assert_eq!(
         report.salvaged, 0,
-        "a healthy encrypted SST is not quarantined + rewritten: {:?}",
+        "a healthy encrypted SST is not condemned + rewritten: {:?}",
         report.unreadable_files,
     );
     assert_eq!(
@@ -1350,14 +1367,13 @@ fn repair_prefers_an_intact_duplicate_over_a_lossy_salvage() -> lsm_tree::Result
 }
 
 /// When the same table id exists intact in two configured folders, repair keeps
-/// ONE and must QUARANTINE the duplicate out of `tables/`. The rebuilt manifest
-/// records only `id + checksum` (no path), so a duplicate left in place would let
-/// the reopened tree resolve the wrong file for that id by folder order — and
-/// reopen it against the kept copy's mismatched checksum. The primary is scanned
-/// first, so it wins; the routed (cold) duplicate must land in `cold/`'s
-/// `repair-quarantine`, not stay under `cold/tables`.
+/// ONE and removes the duplicate. The rebuilt manifest records only
+/// `id + checksum` (no path), so a duplicate left in place would let the reopened
+/// tree resolve the wrong file for that id by folder order — and reopen it
+/// against the kept copy's mismatched checksum. The primary is scanned first, so
+/// it wins; the routed (cold) duplicate goes.
 #[test]
-fn repair_quarantines_a_duplicate_table_file() -> lsm_tree::Result<()> {
+fn repair_removes_a_duplicate_table_file() -> lsm_tree::Result<()> {
     use lsm_tree::config::LevelRoute;
     use lsm_tree::fs::StdFs;
     use std::sync::Arc;
@@ -1402,8 +1418,8 @@ fn repair_quarantines_a_duplicate_table_file() -> lsm_tree::Result<()> {
     .repair_with_salvage(true)?;
 
     assert_eq!(report.recovered, 1, "one table recovered: {report:?}");
-    // The primary (first-scanned) copy stays; the routed duplicate is moved OUT of
-    // `cold/tables` into `cold/repair-quarantine`, so recovery can't resolve it.
+    // The primary (first-scanned) copy stays; the routed duplicate is gone, so
+    // recovery cannot resolve it for that id.
     assert!(
         primary.join("tables").join(&id_name).exists(),
         "the kept copy stays under the primary's tables/",
@@ -1412,10 +1428,6 @@ fn repair_quarantines_a_duplicate_table_file() -> lsm_tree::Result<()> {
         !cold.join("tables").join(&id_name).exists(),
         "the duplicate must NOT remain under cold/tables (recovery would resolve it \
          for the id and reopen against a mismatched checksum): {report:?}",
-    );
-    assert!(
-        cold.join("repair-quarantine").join(&id_name).exists(),
-        "the duplicate must be quarantined into cold/repair-quarantine: {report:?}",
     );
     Ok(())
 }
@@ -1428,7 +1440,7 @@ fn repair_quarantines_a_duplicate_table_file() -> lsm_tree::Result<()> {
 /// the kept SST survives and stays recovered (#69).
 #[cfg(unix)]
 #[test]
-fn repair_does_not_quarantine_an_aliased_copy_of_the_kept_sst() -> lsm_tree::Result<()> {
+fn repair_does_not_remove_an_aliased_copy_of_the_kept_sst() -> lsm_tree::Result<()> {
     use lsm_tree::config::LevelRoute;
     use lsm_tree::fs::StdFs;
     use std::sync::Arc;
@@ -1475,13 +1487,13 @@ fn repair_does_not_quarantine_an_aliased_copy_of_the_kept_sst() -> lsm_tree::Res
     assert_eq!(report.recovered, 1, "one table recovered: {report:?}");
     // The aliased sighting is skipped in place, never recorded as a failure: it is
     // the SAME physical file as the kept copy, so reporting it unreadable /
-    // quarantined would misrepresent a healthy table as damaged.
+    // dropped would misrepresent a healthy table as damaged.
     assert_eq!(
         report.unreadable, 0,
         "the aliased sighting must not be reported unreadable: {:?}",
         report.unreadable_files,
     );
-    // The aliased sighting was skipped in place, NOT quarantined: the kept file
+    // The aliased sighting was skipped in place, NOT removed: the kept file
     // still exists under its (single, shared) tables directory.
     assert!(
         primary.join("tables").join(&id_name).exists(),
@@ -1568,7 +1580,7 @@ fn repair_excludes_tables_referencing_an_unrecoverable_blob_file() -> lsm_tree::
 }
 
 /// `salvaged` is documented as a subset of `recovered`, so a block-salvaged
-/// table that the blob-dependency filter later quarantines (its referenced
+/// table that the blob-dependency filter later drops (its referenced
 /// blob file is unrecoverable) must not be counted: reporting it as salvaged
 /// while `recovered` is 0 falsely tells an operator that data was restored.
 #[test]
@@ -1594,8 +1606,7 @@ fn repair_report_drops_salvaged_count_for_blob_filtered_tables() -> lsm_tree::Re
     }
 
     // The SST is block-corrupt (so repair block-salvages it) AND its blob
-    // files are wrecked (so the dependency filter quarantines the salvaged
-    // copy).
+    // files are wrecked (so the dependency filter drops the salvaged copy).
     let ssts = sorted_sst_paths(dir.path());
     corrupt_data_region(ssts.first().expect("an SST to corrupt"))?;
     let blobs = dir.path().join("blobs");
@@ -1623,7 +1634,7 @@ fn repair_report_drops_salvaged_count_for_blob_filtered_tables() -> lsm_tree::Re
     );
     assert_eq!(
         report.salvaged, 0,
-        "salvaged is a subset of recovered, so a quarantined salvage must not \
+        "salvaged is a subset of recovered, so a dropped salvage must not \
          count: {report:?}",
     );
     // The live counters follow the same rule: a candidate displaced by
