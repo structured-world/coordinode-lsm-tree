@@ -107,6 +107,54 @@ fn patrol_scrub_on_clean_non_ecc_tree_reads_blocks_without_findings() {
     assert!(report.is_ok());
 }
 
+/// The scrub publishes into a caller's progress handle: the `Scrubbing` phase
+/// while it runs, byte totals from the tables' own metadata, per-block scan
+/// counters, and `Done` on completion — the same observation seam a repair
+/// uses, so a UI thread polls one handle for either operation.
+#[test]
+fn patrol_scrub_publishes_progress_into_the_shared_handle() {
+    use crate::{RecoveryPhase, RecoveryProgress};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let AnyTree::Standard(tree) = standard_tree(dir.path()) else {
+        unreachable!("standard tree configured");
+    };
+    for i in 0u64..500 {
+        tree.insert(format!("key-{i:06}"), format!("v{i:06}"), i);
+    }
+    tree.flush_active_memtable(500).expect("flush");
+    let expected_bytes: u64 = tree
+        .current_version()
+        .iter_tables()
+        .map(|t| t.metadata.file_size)
+        .sum();
+
+    let progress = Arc::new(RecoveryProgress::default());
+    let report = patrol_scrub(
+        &tree,
+        &PatrolScrubOptions::default().progress(Arc::clone(&progress)),
+    );
+    assert!(report.is_ok());
+
+    let snap = progress.snapshot();
+    assert_eq!(
+        snap.phase,
+        RecoveryPhase::Done,
+        "a finished scrub ends Done"
+    );
+    assert_eq!(snap.bytes_total, expected_bytes);
+    assert_eq!(
+        snap.bytes_processed, expected_bytes,
+        "every scanned SST counted toward the percentage",
+    );
+    assert_eq!(
+        usize::try_from(snap.blocks_scanned).expect("block count fits usize"),
+        report.blocks_scanned,
+        "the handle mirrors the report's block count",
+    );
+}
+
 #[test]
 fn patrol_scrub_empty_tree_scans_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");

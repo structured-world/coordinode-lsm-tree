@@ -829,3 +829,100 @@ fn scan_since_replays_one_source_operands_in_application_order() -> lsm_tree::Re
     );
     Ok(())
 }
+
+/// The range-scoped scan delivers point events only for keys inside the
+/// bounds, range deletions when their span overlaps them, and skips SSTs
+/// whose key range cannot intersect — the presence-check primitive for
+/// reconciling an external WAL against `RepairReport::lost_coverage` without
+/// walking the whole store.
+#[test]
+fn scan_since_in_range_scopes_events_to_the_key_range() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path())?;
+
+    // Two disjoint SSTs: only the [d..f] one intersects the queried range.
+    tree.insert(b"a", b"v", 1);
+    tree.insert(b"b", b"v", 2);
+    tree.flush_active_memtable(0)?;
+    tree.insert(b"d", b"v", 3);
+    tree.insert(b"e", b"v", 4);
+    tree.insert(b"f", b"v", 5);
+    tree.flush_active_memtable(0)?;
+    // Memtable entries on both sides of the bound, plus a range deletion
+    // straddling INTO the scope from below.
+    tree.insert(b"c", b"v", 6);
+    tree.insert(b"g", b"v", 7);
+    tree.remove_range(b"b", b"e", 8);
+
+    let got: Vec<_> = tree
+        .scan_since_seqno_in_range(0, b"d".as_slice()..=b"f".as_slice())?
+        .collect();
+
+    let keys: Vec<Vec<u8>> = got
+        .iter()
+        .filter_map(|e| match e {
+            ScanSinceEvent::Insert { key, .. } => Some(key.to_vec()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        vec![b"d".to_vec(), b"e".to_vec(), b"f".to_vec()],
+        "point events outside [d, f] must not be delivered: {got:?}",
+    );
+    assert!(
+        got.iter().any(|e| matches!(
+            e,
+            ScanSinceEvent::RangeTombstone { start_key, end_key, seqno: 8 }
+                if start_key.as_ref() == b"b" && end_key.as_ref() == b"e"
+        )),
+        "a range deletion overlapping the scope affects replay inside it and \
+         must be delivered: {got:?}",
+    );
+    // A range deletion wholly OUTSIDE the scope stays out.
+    tree.remove_range(b"x", b"z", 9);
+    let got: Vec<_> = tree
+        .scan_since_seqno_in_range(0, b"d".as_slice()..=b"f".as_slice())?
+        .collect();
+    assert!(
+        !got.iter()
+            .any(|e| matches!(e, ScanSinceEvent::RangeTombstone { seqno: 9, .. })),
+        "a range deletion that cannot reach the scope is noise: {got:?}",
+    );
+    Ok(())
+}
+
+/// The blob-tree variant resolves KV-separated values inside the scope
+/// exactly like the unscoped scan.
+#[test]
+fn blob_scan_since_in_range_scopes_and_resolves() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_blob_tree(folder.path())?;
+
+    let big = vec![b'x'; 8_192];
+    tree.insert(b"a", big.as_slice(), 1);
+    tree.insert(b"m", big.as_slice(), 2);
+    tree.insert(b"z", big.as_slice(), 3);
+    tree.flush_active_memtable(0)?;
+
+    let got: Vec<_> = tree
+        .scan_since_seqno_in_range(0, b"m".as_slice()..=b"m".as_slice())?
+        .collect();
+    let [
+        ScanSinceEvent::Insert {
+            key,
+            value,
+            seqno: 2,
+        },
+    ] = got.as_slice()
+    else {
+        panic!("exactly the in-scope key, resolved: {got:?}");
+    };
+    assert_eq!(key.as_ref(), b"m");
+    assert_eq!(
+        value.as_ref(),
+        big.as_slice(),
+        "the KV-separated value must be resolved from the blob file",
+    );
+    Ok(())
+}

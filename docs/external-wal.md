@@ -140,6 +140,51 @@ The strict boundary still covers the crash window in step 1 of
 not yet flushed is, by definition, absent from the SSTs, so its seqno is above
 your trim watermark `W` and the replay step covers it exactly once.
 
+## 4. Replay after repair
+
+A manifest repair (`Config::repair*`, or the one-call
+`Config::open_or_repair`) can REGRESS persisted state below your trim
+watermark `W`: a table the repair had to exclude loses every version it held,
+including versions at or below `W` — while `get_highest_persisted_seqno()`
+stays high because neighbouring tables survived. The standard `seqno > W` tail
+replay from section 3 does not cover such a mid-history hole, and blindly
+widening the replay would double-fold merge operands that DID survive. After
+any repair, derive the obligation from the report instead:
+
+1. **Ask the report.** `RepairReport::wal_replay_scope()` aggregates
+   `lost_coverage`:
+   - `TailOnly` — nothing was excluded; run the section 3 replay unchanged.
+   - `LostUpTo(b)` — in addition to the tail, replay every RETAINED record
+     whose key falls inside a `lost_coverage` range and whose seqno is at or
+     below `b`.
+   - `FullHistory` — same, with no seqno filter: an excluded table's sequence
+     base died with the manifest, so no bound scopes the damage.
+2. **Puts and deletes replay blindly.** Re-applying one at its original seqno
+   reproduces the same MVCC version, and a surviving NEWER version still wins
+   by seqno — over-replay inside the lost ranges is harmless for them.
+3. **Merge operands need a presence check.** An operand that survived the
+   repair and is replayed again is folded twice. Collect the surviving
+   operands inside each lost range with
+   `scan_since_seqno_in_range(0, range)` (it skips every SST outside the
+   range, so this is proportional to the damage, not the store), build the
+   multiset of `(key, seqno, operand bytes)` it delivers, and re-apply only
+   the WAL records NOT covered by that multiset (decrement on match). The
+   scan's event stream mirrors the read path — an operand appears once per
+   application the tree will make — which is exactly the set to subtract.
+4. **Replay order**: tail and lost-range records alike in increasing seqno
+   order, each with its original operation, exactly as in section 3.
+
+**Retention is what makes this recoverable.** Records at or below `W` were
+trimmable under section 2, and a trimmed record inside a lost range is gone
+from both the engine and the log — that is precisely the loss
+`lost_coverage` reports. A deployment that wants repairs to be lossless must
+ARCHIVE trimmed segments (a retention window) instead of deleting them at the
+watermark, and `wal_replay_scope()` tells it how deep the archive must reach:
+up to `b` for `LostUpTo(b)`, unbounded for `FullHistory`.
+
+Run the replay BEFORE publishing your visible watermark, so readers never
+observe the repaired-but-not-yet-reconciled state.
+
 ## Executable companion
 
 This recipe is not only specified here; it is executed and self-verified in the
@@ -161,7 +206,12 @@ test rather than silently diverge from the prose:
   recovered state is byte-for-byte a non-crashed run's. Its contract guards
   prove a wrong recovery is *detectably* wrong: collapsing ops to `insert`,
   re-applying a merge at or below `W`, or replaying from the raw persisted
-  maximum instead of `W` each make the recovery diverge.
+  maximum instead of `W` each make the recovery diverge. Section 4 has its own
+  pair there: `repair_and_reconciled_replay_recover_identical_state` runs a
+  crash that also destroys a flushed SST through `open_or_repair` plus the
+  documented reconciliation and reproduces the non-crashed state, and
+  `blindly_replaying_lost_range_merges_double_counts` proves that skipping the
+  survivor subtraction double-folds a surviving merge operand.
 
 Keep this spec and that proof in sync: a change to the contract should update
 both.

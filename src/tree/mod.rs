@@ -1775,6 +1775,68 @@ impl Tree {
     where
         F: Fn(&Version, InternalValue) -> crate::Result<ScanSinceEvent>,
     {
+        self.scan_since_seqno_scoped(target_seqno, block_skip, resolve_indirection, None)
+    }
+
+    /// As [`Self::scan_since_seqno_with`], optionally scoped to a key range
+    /// (in the tree comparator's order): point events are delivered only for
+    /// keys INSIDE the bounds, range tombstones when their span OVERLAPS them
+    /// (a tombstone reaching into the range affects replay within it), and
+    /// SSTs whose key range cannot intersect the bounds are skipped without
+    /// being read — which is what makes a post-repair reconciliation over
+    /// [`RepairReport::lost_coverage`](crate::RepairReport) affordable.
+    pub(crate) fn scan_since_seqno_scoped<F>(
+        &self,
+        target_seqno: SeqNo,
+        block_skip: bool,
+        resolve_indirection: F,
+        key_range: Option<&(Bound<UserKey>, Bound<UserKey>)>,
+    ) -> crate::Result<alloc::vec::IntoIter<ScanSinceEvent>>
+    where
+        F: Fn(&Version, InternalValue) -> crate::Result<ScanSinceEvent>,
+    {
+        use core::cmp::Ordering;
+
+        let cmp = self.config.comparator.clone();
+        let in_key_range = |key: &[u8]| -> bool {
+            let Some((lo, hi)) = key_range else {
+                return true;
+            };
+            (match lo {
+                Bound::Included(b) => cmp.compare(key, b.as_ref()) != Ordering::Less,
+                Bound::Excluded(b) => cmp.compare(key, b.as_ref()) == Ordering::Greater,
+                Bound::Unbounded => true,
+            }) && (match hi {
+                Bound::Included(b) => cmp.compare(key, b.as_ref()) != Ordering::Greater,
+                Bound::Excluded(b) => cmp.compare(key, b.as_ref()) == Ordering::Less,
+                Bound::Unbounded => true,
+            })
+        };
+        // A range tombstone covers `[start, end)`; it is delivered when that
+        // span overlaps the scope, since a deletion reaching into the range
+        // affects replay within it.
+        let rt_in_range = |rt: &RangeTombstone| -> bool {
+            let Some((lo, hi)) = key_range else {
+                return true;
+            };
+            (match lo {
+                // `rt.end` is EXCLUSIVE: the tombstone reaches keys strictly
+                // below it, so it clears the lower bound only when its end is
+                // ABOVE the bound key (for an excluded bound this over-includes
+                // the touching case, which is harmless: replaying an extra
+                // idempotent deletion event cannot corrupt a consumer).
+                Bound::Included(b) | Bound::Excluded(b) => {
+                    cmp.compare(rt.end.as_ref(), b.as_ref()) == Ordering::Greater
+                }
+                Bound::Unbounded => true,
+            }) && (match hi {
+                Bound::Included(b) => {
+                    cmp.compare(rt.start.as_ref(), b.as_ref()) != Ordering::Greater
+                }
+                Bound::Excluded(b) => cmp.compare(rt.start.as_ref(), b.as_ref()) == Ordering::Less,
+                Bound::Unbounded => true,
+            })
+        };
         // The active memtable is the one source a writer can still change, and
         // the seqno cap alone does not exclude that: a caller may commit with an
         // explicit seqno at or BELOW the cap (`apply_batch` takes the seqno from
@@ -1847,15 +1909,30 @@ impl Tree {
             })
         };
 
+        // The scope bounds as borrowed slices, for SST key-range pruning.
+        fn as_ref_bound(b: &Bound<UserKey>) -> Bound<&[u8]> {
+            match b {
+                Bound::Included(k) => Bound::Included(k.as_ref()),
+                Bound::Excluded(k) => Bound::Excluded(k.as_ref()),
+                Bound::Unbounded => Bound::Unbounded,
+            }
+        }
+        let ref_bounds = key_range.map(|(lo, hi)| (as_ref_bound(lo), as_ref_bound(hi)));
+
         // Active memtable — mapped from the frozen capture above, not walked
         // again: a second walk would reintroduce exactly the race the freeze
         // closed.
         let mut source = Vec::new();
         for entry in active_entries {
+            if !in_key_range(&entry.key.user_key) {
+                continue;
+            }
             source.push(Self::map_event(entry, version, &resolve_indirection)?);
         }
         for rt in active_range_tombstones {
-            source.extend(range_tombstone_event(&rt));
+            if rt_in_range(&rt) {
+                source.extend(range_tombstone_event(&rt));
+            }
         }
         sources.push(source);
 
@@ -1865,27 +1942,43 @@ impl Tree {
         for memtable in super_version.sealed_memtables.iter().rev() {
             let mut source = Vec::new();
             for entry in memtable.iter() {
-                if in_window(entry.key.seqno) {
+                if in_window(entry.key.seqno) && in_key_range(&entry.key.user_key) {
                     source.push(Self::map_event(entry, version, &resolve_indirection)?);
                 }
             }
             for rt in memtable.range_tombstones_sorted() {
-                source.extend(range_tombstone_event(&rt));
+                if rt_in_range(&rt) {
+                    source.extend(range_tombstone_event(&rt));
+                }
             }
             sources.push(source);
         }
 
-        // SSTs.
+        // SSTs. A table whose key range cannot intersect the scope is skipped
+        // without a single block read — the point of the scoped variant.
         for table in version.iter_tables() {
+            if let Some(bounds) = &ref_bounds
+                && !table
+                    .metadata
+                    .key_range
+                    .overlaps_with_bounds_cmp(bounds, cmp.as_ref())
+            {
+                continue;
+            }
             let mut source = Vec::new();
             for entry in table.scan_seqno_range(target_seqno, end_seqno, block_skip)? {
+                if !in_key_range(&entry.key.user_key) {
+                    continue;
+                }
                 source.push(Self::map_event(entry, version, &resolve_indirection)?);
             }
             // Clamped to the view's tight-space restriction: the punched
             // prefix's deletions are re-emitted by the slice output that
             // superseded it, so the raw list would duplicate those events.
             for rt in table.visible_range_tombstones() {
-                source.extend(range_tombstone_event(&rt));
+                if rt_in_range(&rt) {
+                    source.extend(range_tombstone_event(&rt));
+                }
             }
             sources.push(source);
         }
@@ -2153,6 +2246,47 @@ impl Tree {
                 "scan_since_seqno on KV-separated values requires the blob-tree scan path",
             ))
         })
+    }
+
+    /// Range-scoped variant of [`Self::scan_since_seqno`]: delivers only
+    /// events whose key falls within `range` (in the tree comparator's
+    /// order); range-deletion events are delivered when their span OVERLAPS
+    /// it, since a tombstone reaching into the range affects replay within
+    /// it. SSTs whose key range cannot intersect the bounds are skipped
+    /// without a single block read.
+    ///
+    /// This is the presence-check primitive for reconciling an external
+    /// write-ahead log after a repair: [`RepairReport::lost_coverage`] names
+    /// the affected key ranges, and deciding which retained WAL records to
+    /// re-apply (in particular, which merge operands SURVIVED and must not be
+    /// folded twice) only needs the events inside those ranges. See
+    /// `docs/external-wal.md` § Replay after repair.
+    ///
+    /// [`RepairReport::lost_coverage`]: crate::RepairReport::lost_coverage
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal version-history lock is poisoned.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::scan_since_seqno`].
+    pub fn scan_since_seqno_in_range<K: AsRef<[u8]>, R: RangeBounds<K>>(
+        &self,
+        target_seqno: SeqNo,
+        range: R,
+    ) -> crate::Result<impl Iterator<Item = ScanSinceEvent> + use<K, R>> {
+        let bounds = range_to_user_bounds(&range);
+        self.scan_since_seqno_scoped(
+            target_seqno,
+            true,
+            |_version, _entry| {
+                Err(crate::Error::FeatureUnsupported(
+                    "scan_since_seqno on KV-separated values requires the blob-tree scan path",
+                ))
+            },
+            Some(&bounds),
+        )
     }
 
     /// Update the live [`crate::runtime_config::RuntimeConfig`].

@@ -209,6 +209,57 @@ fn discard_unreferenced_removes_the_restriction_sidecar_too() -> crate::Result<(
     Ok(())
 }
 
+/// The WAL replay scope is a pure derivation of `lost_coverage`: nothing lost
+/// means the standard tail replay suffices; a single unknown seqno bound
+/// poisons the whole aggregate (no bound scopes that range's damage); bounded
+/// losses aggregate to the HIGHEST bound, since a record at or below any
+/// range's bound may need replaying and the WAL archive must reach the
+/// deepest one.
+#[test]
+fn wal_replay_scope_derives_from_lost_coverage() {
+    let report = |lost: Vec<(
+        std::path::PathBuf,
+        crate::UserKey,
+        crate::UserKey,
+        Option<u64>,
+    )>| {
+        super::RepairReport {
+            recovered: 0,
+            salvaged: 0,
+            unreadable: 0,
+            unreadable_files: Vec::new(),
+            lost_coverage: lost,
+            blob_files_salvaged: Vec::new(),
+            method: "test",
+            warnings: Vec::new(),
+        }
+    };
+    let entry = |bound: Option<u64>| {
+        (
+            std::path::PathBuf::from("tables/0"),
+            crate::UserKey::from(b"a".as_slice()),
+            crate::UserKey::from(b"z".as_slice()),
+            bound,
+        )
+    };
+
+    assert_eq!(
+        report(Vec::new()).wal_replay_scope(),
+        super::WalReplayScope::TailOnly,
+        "no loss: the tail replay is sufficient",
+    );
+    assert_eq!(
+        report(vec![entry(Some(40)), entry(Some(70))]).wal_replay_scope(),
+        super::WalReplayScope::LostUpTo(70),
+        "bounded losses aggregate to the highest bound",
+    );
+    assert_eq!(
+        report(vec![entry(Some(40)), entry(None)]).wal_replay_scope(),
+        super::WalReplayScope::FullHistory,
+        "one unknown bound means no seqno scopes the damage",
+    );
+}
+
 /// The swap replaces the damaged source with the replacement the committed
 /// manifest describes, and carries the replacement's own sidecar onto the final
 /// name — a replacement adopted at `{id}` beside the SOURCE's stale sidecar
@@ -9752,6 +9803,233 @@ fn repair_discards_an_uncommitted_repair_replacement() -> crate::Result<()> {
     assert!(
         !memfs.exists(&tmp)?,
         "the unpublished replacement is garbage and is swept",
+    );
+    Ok(())
+}
+
+/// A standard tree with data flushed and its manifest (version snapshots +
+/// `current`) removed — the manifest-loss fixture the progress / entry-point
+/// tests below repair.
+fn standard_tree_without_manifest(
+    memfs: &std::sync::Arc<crate::fs::MemFs>,
+    root: &std::path::Path,
+) -> crate::Result<()> {
+    use crate::fs::Fs;
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+
+    {
+        let crate::AnyTree::Standard(tree) = Config::new(
+            root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .open()?
+        else {
+            panic!("expected a standard tree");
+        };
+        tree.insert(b"k", b"v", 1);
+        tree.flush_active_memtable(0)?;
+    }
+    for e in memfs.read_dir(root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+    Ok(())
+}
+
+/// The progress handle reports the phase and the byte totals of a live
+/// repair: the totals come from an upfront listing with the same skips as the
+/// scan, so a completed run has taken up exactly what it announced, and a
+/// successful run ends in the `Done` phase.
+#[test]
+fn repair_publishes_phase_and_byte_progress() -> crate::Result<()> {
+    use crate::fs::MemFs;
+    use crate::{Config, RecoveryPhase, RecoveryProgress, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    standard_tree_without_manifest(&memfs, &root)?;
+
+    let progress = Arc::new(RecoveryProgress::default());
+    assert_eq!(progress.snapshot().phase, RecoveryPhase::Idle);
+
+    Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .with_recovery_progress(Arc::clone(&progress))
+    .repair()?;
+
+    let snap = progress.snapshot();
+    assert_eq!(
+        snap.phase,
+        RecoveryPhase::Done,
+        "a successful run ends Done"
+    );
+    assert!(
+        snap.bytes_total > 0,
+        "the upfront listing published a total"
+    );
+    assert_eq!(
+        snap.bytes_processed, snap.bytes_total,
+        "a completed run took up exactly what it announced",
+    );
+    assert_eq!(snap.tables_recovered, 1, "the flushed SST was recovered");
+    Ok(())
+}
+
+/// A cancel requested through the progress handle aborts the repair with the
+/// dedicated error BEFORE anything is committed — the scan is read-only, so
+/// the directory is left exactly as a retry (with a fresh handle) expects.
+#[test]
+fn repair_cancel_aborts_before_commit_and_a_retry_succeeds() -> crate::Result<()> {
+    use crate::fs::MemFs;
+    use crate::{Config, RecoveryProgress, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    standard_tree_without_manifest(&memfs, &root)?;
+
+    let config = |memfs: &Arc<MemFs>| {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+    };
+
+    let progress = Arc::new(RecoveryProgress::default());
+    progress.request_cancel();
+    let result = config(&memfs)
+        .with_recovery_progress(Arc::clone(&progress))
+        .repair();
+    assert!(
+        matches!(result, Err(crate::Error::Cancelled)),
+        "a requested cancel must surface as the dedicated error: {result:?}",
+    );
+
+    // Nothing was committed: the retry re-derives the same rebuild.
+    let report = config(&memfs).repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "the retry rebuilds from untouched bytes"
+    );
+    Ok(())
+}
+
+/// `open_or_repair` is the one-call recovery entry point: a healthy store
+/// opens with no report, a structurally broken one is repaired per the policy
+/// and opened, and the report carries the WAL replay obligation.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn open_or_repair_repairs_a_structural_failure_only() -> crate::Result<()> {
+    use crate::fs::MemFs;
+    use crate::{AbstractTree, Config, RepairPolicy, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    standard_tree_without_manifest(&memfs, &root)?;
+
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+    };
+
+    // Broken manifest: repaired per the policy, then opened.
+    let (tree, repaired) = config().open_or_repair(RepairPolicy::default().salvage(true))?;
+    let report = repaired.expect("a manifest-loss open only succeeds after a repair");
+    assert_eq!(report.recovered, 1);
+    assert_eq!(
+        report.wal_replay_scope(),
+        super::WalReplayScope::TailOnly,
+        "nothing was lost, so the WAL replays its tail as usual",
+    );
+    assert_eq!(
+        tree.get(b"k", u64::MAX)?.as_deref(),
+        Some(b"v".as_ref()),
+        "the repaired tree serves the flushed write",
+    );
+    drop(tree);
+
+    // Healthy store: no repair, no report.
+    let (tree, repaired) = config().open_or_repair(RepairPolicy::default())?;
+    assert!(repaired.is_none(), "a healthy open must not repair");
+    assert_eq!(tree.get(b"k", u64::MAX)?.as_deref(), Some(b"v".as_ref()));
+    Ok(())
+}
+
+/// A TRANSIENT I/O failure is returned for a retry, never "repaired": a
+/// repair would rebuild the manifest around files a healthy retry could still
+/// read. Proven by the manifest generation staying untouched.
+#[test]
+fn open_or_repair_propagates_transient_io_without_repairing() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{Config, RepairPolicy, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    standard_tree_without_manifest(&memfs, &root)?;
+    // Re-establish a valid manifest so only the injected fault stands in the
+    // open's way.
+    Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs.clone())
+    .repair()?;
+    let manifest_names: Vec<String> = memfs
+        .read_dir(&root)?
+        .into_iter()
+        .filter(|e| e.file_name.starts_with('v'))
+        .map(|e| e.file_name)
+        .collect();
+
+    let fault = FaultFs::new((*memfs).clone());
+    fault
+        .injector()
+        .arm(FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::WouldBlock)).on_path("current"));
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .open_or_repair(RepairPolicy::default().salvage(true));
+    assert!(
+        matches!(result, Err(crate::Error::Io(ref e)) if e.kind().is_transient()),
+        "a transient hiccup must propagate for a retry: {:?}",
+        result.map(|_| "opened"),
+    );
+
+    // No repair ran: the manifest generation is untouched.
+    let after: Vec<String> = memfs
+        .read_dir(&root)?
+        .into_iter()
+        .filter(|e| e.file_name.starts_with('v'))
+        .map(|e| e.file_name)
+        .collect();
+    assert_eq!(
+        manifest_names, after,
+        "repairing a transient failure would have rewritten the manifest",
     );
     Ok(())
 }

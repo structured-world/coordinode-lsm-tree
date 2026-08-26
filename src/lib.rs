@@ -506,9 +506,9 @@ pub use encryption::Aes256GcmProvider;
 pub use background_deleter::BackgroundDeleter;
 pub use pinnable_slice::PinnableSlice;
 #[cfg(feature = "std")]
-pub use recovery_progress::{RecoveryProgress, RecoveryProgressSnapshot};
+pub use recovery_progress::{RecoveryPhase, RecoveryProgress, RecoveryProgressSnapshot};
 #[cfg(feature = "std")]
-pub use repair::RepairReport;
+pub use repair::{RepairPolicy, RepairReport, WalReplayScope};
 pub use write_batch::WriteBatch;
 
 pub use {

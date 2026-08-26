@@ -22,6 +22,17 @@ pub enum Error {
     /// Some required files could not be recovered from disk
     Unrecoverable,
 
+    /// The operation was aborted on a caller's cooperative cancellation
+    /// request ([`RecoveryProgress::request_cancel`]).
+    ///
+    /// A repair cancelled BEFORE its manifest commit left the directory
+    /// untouched (the scan is read-only), so a retry re-derives everything
+    /// from the same bytes; a cancel requested after the commit is ignored
+    /// rather than reported, since the rebuilt manifest is already durable.
+    ///
+    /// [`RecoveryProgress::request_cancel`]: crate::RecoveryProgress::request_cancel
+    Cancelled,
+
     /// The read resolved into an extent that was physically EXCISED — a
     /// hole-punched region that reads back as zeros.
     ///

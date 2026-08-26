@@ -277,6 +277,49 @@ impl BlobTree {
                 Ok(ScanSinceEvent::Insert { key, value, seqno })
             })
     }
+
+    /// Range-scoped variant of [`Self::scan_since_seqno`], with the same
+    /// contract as
+    /// [`Tree::scan_since_seqno_in_range`](crate::Tree::scan_since_seqno_in_range):
+    /// point events only for keys inside `range`, range deletions when their
+    /// span overlaps it, and index SSTs outside the bounds skipped unread.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal version-history lock is poisoned.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::scan_since_seqno`].
+    pub fn scan_since_seqno_in_range<K: AsRef<[u8]>, R: core::ops::RangeBounds<K>>(
+        &self,
+        target_seqno: SeqNo,
+        range: R,
+    ) -> crate::Result<impl Iterator<Item = ScanSinceEvent> + use<K, R>> {
+        let bounds = crate::tree::range_to_user_bounds(&range);
+        self.index.scan_since_seqno_scoped(
+            target_seqno,
+            true,
+            |version, entry| {
+                let seqno = entry.key.seqno;
+                let (key, value) = resolve_value_handle(
+                    self.id(),
+                    self.blobs_folder.as_path(),
+                    &self.index.config.cache,
+                    version,
+                    entry,
+                    #[cfg(zstd_any)]
+                    self.index
+                        .config
+                        .kv_separation_opts
+                        .as_ref()
+                        .and_then(|o| o.zstd_dictionary.as_deref()),
+                )?;
+                Ok(ScanSinceEvent::Insert { key, value, seqno })
+            },
+            Some(&bounds),
+        )
+    }
 }
 
 impl crate::abstract_tree::sealed::Sealed for BlobTree {}

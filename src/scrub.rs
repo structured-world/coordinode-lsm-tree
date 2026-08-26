@@ -183,6 +183,14 @@ pub struct PatrolScrubOptions {
     /// via [`HealHints`](crate::heal_hints::HealHints). Requires the `page_ecc`
     /// feature; without it the flag is inert (there is no parity to heal from).
     pub heal_in_place: bool,
+
+    /// Live-progress handle a UI thread can poll while the scrub runs (the
+    /// same observation seam a repair uses; see
+    /// [`RecoveryProgress`](crate::RecoveryProgress)). The scrub publishes the
+    /// [`Scrubbing`](crate::RecoveryPhase::Scrubbing) phase, byte totals over
+    /// the scanned SSTs, per-block scan counters, and applied corrections as
+    /// healed blocks. `None` (the default) publishes nothing.
+    pub progress: Option<std::sync::Arc<crate::RecoveryProgress>>,
 }
 
 impl Default for PatrolScrubOptions {
@@ -191,6 +199,7 @@ impl Default for PatrolScrubOptions {
             parallelism: 1,
             throttle: None,
             heal_in_place: false,
+            progress: None,
         }
     }
 }
@@ -215,6 +224,13 @@ impl PatrolScrubOptions {
     #[must_use]
     pub const fn heal_in_place(mut self, enable: bool) -> Self {
         self.heal_in_place = enable;
+        self
+    }
+
+    /// Attaches a live-progress handle (see [`progress`](Self::progress)).
+    #[must_use]
+    pub fn progress(mut self, progress: std::sync::Arc<crate::RecoveryProgress>) -> Self {
+        self.progress = Some(progress);
         self
     }
 }
@@ -281,13 +297,39 @@ pub fn patrol_scrub(
     let version = tree.current_version();
     let tables: Vec<crate::table::Table> = version.iter_tables().cloned().collect();
 
+    if let Some(p) = &options.progress {
+        p.set_phase(crate::RecoveryPhase::Scrubbing);
+        // Byte totals from the tables' own metadata — no extra stat calls.
+        // Display-only sum, saturating for the same reason as the repair's.
+        p.set_bytes_total(
+            tables
+                .iter()
+                .fold(0u64, |acc, t| acc.saturating_add(t.metadata.file_size)),
+        );
+    }
+    // Publishes one scanned SST's deltas: the file counts as taken up, its
+    // blocks as scanned, and applied corrections as healed blocks.
+    let publish = |table: &crate::table::Table, partial: &PatrolScrubReport| {
+        if let Some(p) = &options.progress {
+            p.add_bytes_processed(table.metadata.file_size);
+            p.add_blocks(
+                partial.blocks_scanned as u64,
+                0,
+                0,
+                partial.corrections_applied as u64,
+            );
+        }
+    };
+
     let workers = options.parallelism.max(1).min(tables.len().max(1));
 
     // Sequential fast path: no thread spawn, deterministic table order.
     if workers <= 1 {
         let mut report = PatrolScrubReport::default();
         for (idx, table) in tables.iter().enumerate() {
-            report.merge(scan_and_reconcile(tree, table, options));
+            let partial = scan_and_reconcile(tree, table, options);
+            publish(table, &partial);
+            report.merge(partial);
             // Inter-SST pause only; skip the sleep after the final table so a
             // finished scrub returns promptly instead of idling one extra
             // throttle interval.
@@ -296,6 +338,9 @@ pub fn patrol_scrub(
             {
                 std::thread::sleep(delay);
             }
+        }
+        if let Some(p) = &options.progress {
+            p.set_phase(crate::RecoveryPhase::Done);
         }
         return report;
     }
@@ -308,7 +353,9 @@ pub fn patrol_scrub(
                     let mut local = PatrolScrubReport::default();
                     let mut idx = cursor.fetch_add(1, Ordering::Relaxed);
                     while let Some(table) = tables.get(idx) {
-                        local.merge(scan_and_reconcile(tree, table, options));
+                        let partial = scan_and_reconcile(tree, table, options);
+                        publish(table, &partial);
+                        local.merge(partial);
                         // Claim the next SST first; only pause if this worker
                         // still has another table, so no worker sleeps after its
                         // final SST.
@@ -337,6 +384,9 @@ pub fn patrol_scrub(
     let mut report = PatrolScrubReport::default();
     for partial in partials {
         report.merge(partial);
+    }
+    if let Some(p) = &options.progress {
+        p.set_phase(crate::RecoveryPhase::Done);
     }
     report
 }

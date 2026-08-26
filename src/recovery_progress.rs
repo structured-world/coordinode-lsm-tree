@@ -50,6 +50,60 @@ pub struct RecoveryProgress {
     blocks_healed: AtomicU64,
     kvs_recovered: AtomicU64,
     columns_recovered: AtomicU64,
+    /// Encoded [`RecoveryPhase`]; see [`RecoveryPhase::from_u8`].
+    phase: portable_atomic::AtomicU8,
+    bytes_total: AtomicU64,
+    bytes_processed: AtomicU64,
+    /// Cooperative cancellation flag; see [`Self::request_cancel`].
+    cancel: portable_atomic::AtomicBool,
+}
+
+/// Which stage of a recovery operation is currently running.
+///
+/// Published through [`RecoveryProgress`] as the work proceeds, for progress
+/// display; stages are coarse on purpose (the counters carry the fine grain).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RecoveryPhase {
+    /// No operation has started on this handle yet.
+    #[default]
+    Idle = 0,
+    /// Finishing a previous run's committed-but-unswapped replacements and
+    /// removing files its manifest no longer references.
+    PendingSwaps = 1,
+    /// Scanning and recovering SSTs (salvage runs inside this phase; its
+    /// per-block counters show the fine grain).
+    ScanningTables = 2,
+    /// Recovering and, where needed, salvaging blob files.
+    RecoveringBlobFiles = 3,
+    /// Durably committing the rebuilt manifest.
+    Committing = 4,
+    /// Post-commit swaps and removal of superseded files.
+    Cleanup = 5,
+    /// A patrol scrub is walking the tree (see
+    /// [`PatrolScrubOptions::progress`](crate::scrub::PatrolScrubOptions)).
+    Scrubbing = 6,
+    /// The operation completed successfully. A failed run leaves the phase
+    /// where it stopped (the call's own error carries the verdict), which
+    /// tells a display exactly which stage failed.
+    Done = 7,
+}
+
+impl RecoveryPhase {
+    /// Decodes the atomic representation; unknown values (impossible within
+    /// one build) read as [`RecoveryPhase::Idle`].
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::PendingSwaps,
+            2 => Self::ScanningTables,
+            3 => Self::RecoveringBlobFiles,
+            4 => Self::Committing,
+            5 => Self::Cleanup,
+            6 => Self::Scrubbing,
+            7 => Self::Done,
+            _ => Self::Idle,
+        }
+    }
 }
 
 impl RecoveryProgress {
@@ -71,7 +125,29 @@ impl RecoveryProgress {
             blocks_healed: self.blocks_healed.load(Relaxed),
             kvs_recovered: self.kvs_recovered.load(Relaxed),
             columns_recovered: self.columns_recovered.load(Relaxed),
+            phase: RecoveryPhase::from_u8(self.phase.load(Relaxed)),
+            bytes_total: self.bytes_total.load(Relaxed),
+            bytes_processed: self.bytes_processed.load(Relaxed),
         }
+    }
+
+    /// Requests cooperative cancellation of the operation this handle is
+    /// attached to. The running repair observes the flag at file boundaries
+    /// and aborts with [`Error::Cancelled`](crate::Error::Cancelled) — before
+    /// its manifest commit the abort leaves the directory untouched for a
+    /// retry (the scan is read-only), while an abort requested after the
+    /// commit is ignored: the manifest already names the rebuilt state, and
+    /// stopping mid-cleanup would leave work the next open must redo anyway.
+    /// Idempotent; there is no un-cancel (use a fresh handle for a new run).
+    pub fn request_cancel(&self) {
+        self.cancel.store(true, Relaxed);
+    }
+
+    /// Whether [`request_cancel`](Self::request_cancel) was called on this
+    /// handle.
+    #[must_use]
+    pub fn is_cancel_requested(&self) -> bool {
+        self.cancel.load(Relaxed)
     }
 
     /// One table file recognized in the scan (by its numeric id).
@@ -130,6 +206,30 @@ impl RecoveryProgress {
             self.columns_recovered.fetch_add(columns, Relaxed);
         }
     }
+
+    /// Publishes the stage the operation is in.
+    pub(crate) fn set_phase(&self, phase: RecoveryPhase) {
+        self.phase.store(phase as u8, Relaxed);
+    }
+
+    /// Publishes the total on-disk bytes the operation expects to take up,
+    /// from an upfront directory listing.
+    pub(crate) fn set_bytes_total(&self, total: u64) {
+        self.bytes_total.store(total, Relaxed);
+    }
+
+    /// Adds bytes the operation has taken up (a file counts when its
+    /// processing STARTS, so the percentage lags by at most one file).
+    /// Display-only counter: saturating, since clamping at `u64::MAX` merely
+    /// freezes the display while a checked overflow would fail the recovery
+    /// over a progress number.
+    pub(crate) fn add_bytes_processed(&self, n: u64) {
+        if n > 0 {
+            let _ = self
+                .bytes_processed
+                .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(n)));
+        }
+    }
 }
 
 /// A point-in-time copy of [`RecoveryProgress`], returned by
@@ -157,4 +257,14 @@ pub struct RecoveryProgressSnapshot {
     pub kvs_recovered: u64,
     /// Value sub-columns carried by recovered columnar blocks.
     pub columns_recovered: u64,
+    /// The stage the operation is currently in.
+    pub phase: RecoveryPhase,
+    /// Total on-disk bytes the operation expects to take up (from an upfront
+    /// directory listing; `0` until published, or when no handle-aware
+    /// operation ran).
+    pub bytes_total: u64,
+    /// Bytes taken up so far (a file counts when its processing starts).
+    /// `bytes_processed as f64 / bytes_total as f64` is the display
+    /// percentage once `bytes_total` is non-zero.
+    pub bytes_processed: u64,
 }

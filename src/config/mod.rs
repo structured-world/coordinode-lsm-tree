@@ -361,6 +361,10 @@ impl KvSeparationOptions {
 }
 
 /// Tree configuration builder
+// Clone: every shared handle is `Arc`-backed, so a clone is a cheap second
+// reference to the same backends — which is what lets `open_or_repair` retry
+// an `open(self)` after a repair.
+#[derive(Clone)]
 pub struct Config {
     /// Folder path
     #[doc(hidden)]

@@ -118,6 +118,61 @@ pub struct RepairReport {
     pub warnings: Vec<&'static str>,
 }
 
+/// What an external write-ahead log must replay after this repair, derived
+/// from [`RepairReport::lost_coverage`] by
+/// [`RepairReport::wal_replay_scope`].
+///
+/// A repair can REGRESS persisted state below the WAL's trim watermark `W`
+/// (a dropped or salvaged table loses versions at or below `W`, while
+/// [`get_highest_persisted_seqno`] stays high because neighbouring tables
+/// survived), so the standard `seqno > W` tail replay is not always
+/// sufficient. See `docs/external-wal.md` § Replay after repair for the full
+/// recipe, including why a merge operand needs a presence check
+/// ([`scan_since_seqno_in_range`]) while a put / delete may be re-applied
+/// blindly.
+///
+/// [`get_highest_persisted_seqno`]: crate::AbstractTree::get_highest_persisted_seqno
+/// [`scan_since_seqno_in_range`]: crate::Tree::scan_since_seqno_in_range
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalReplayScope {
+    /// Nothing was excluded: the standard tail replay (`seqno > W`) is
+    /// sufficient.
+    TailOnly,
+    /// Coverage was lost at or below this sequence number. In addition to the
+    /// tail, replay every RETAINED record whose key falls inside a
+    /// [`RepairReport::lost_coverage`] range and whose seqno is at or below
+    /// this bound (presence-checking merge operands).
+    LostUpTo(SeqNo),
+    /// At least one excluded table's sequence base was itself lost with the
+    /// manifest, so no seqno bound scopes the damage: the whole retained
+    /// history of the affected ranges must be replayed.
+    FullHistory,
+}
+
+impl RepairReport {
+    /// Derives the WAL replay obligation from
+    /// [`lost_coverage`](Self::lost_coverage): [`WalReplayScope::TailOnly`]
+    /// when nothing was lost, [`WalReplayScope::FullHistory`] when any lost
+    /// table's seqno bound is unknown, else [`WalReplayScope::LostUpTo`] the
+    /// highest lost bound. The per-range detail (which KEYS are affected)
+    /// stays in `lost_coverage`; this is the aggregate a WAL uses to decide
+    /// how far back its archive must reach.
+    #[must_use]
+    pub fn wal_replay_scope(&self) -> WalReplayScope {
+        let mut ceiling: Option<SeqNo> = None;
+        for (_, _, _, bound) in &self.lost_coverage {
+            match bound {
+                None => return WalReplayScope::FullHistory,
+                Some(b) => ceiling = Some(ceiling.map_or(*b, |c| c.max(*b))),
+            }
+        }
+        match ceiling {
+            None => WalReplayScope::TailOnly,
+            Some(b) => WalReplayScope::LostUpTo(b),
+        }
+    }
+}
+
 /// Streams `path` from byte `start` to end through XXH3-128. `start == 0`
 /// reproduces the whole-file digest a normal write accumulates; a non-zero
 /// `start` digests only the LIVE suffix of a tight-space RESTRICTED table,
@@ -2113,8 +2168,14 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
             continue;
         }
 
+        // Pre-commit file boundary: safe to abort, and the file counts toward
+        // the progress percentage as soon as its processing starts.
+        check_cancel(config)?;
         if let Some(p) = &config.recovery_progress {
             p.blob_file_discovered();
+            if let Ok(meta) = config.fs.metadata(&blob_path) {
+                p.add_bytes_processed(meta.len);
+            }
         }
 
         // A tight-space-punched blob records its live-data frontier only in
@@ -2581,6 +2642,94 @@ impl Config {
     ) -> crate::Result<RepairReport> {
         repair_tree(self, salvage, allow_resurrection)
     }
+
+    /// Opens the tree, and when the open fails STRUCTURALLY, repairs per
+    /// `policy` and opens again — the one-call recovery entry point for a
+    /// caller that pairs the engine with an external write-ahead log.
+    ///
+    /// `Ok((tree, None))` is a healthy open. `Ok((tree, Some(report)))` is an
+    /// open that succeeded only after a repair; the caller MUST then consult
+    /// [`RepairReport::wal_replay_scope`] before its WAL replay, since the
+    /// repair may have regressed persisted state below the log's trim
+    /// watermark (see `docs/external-wal.md` § Replay after repair).
+    ///
+    /// A TRANSIENT I/O failure is returned as-is, never "repaired": a repair
+    /// would rebuild the manifest around files a healthy retry could still
+    /// read, turning a hiccup into data loss. A held directory lock
+    /// ([`Error::Locked`](crate::Error::Locked)) is likewise returned — the
+    /// repair would contend on the same lock.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a transient-I/O or lock failure from the open, any repair
+    /// failure, and a failure of the post-repair open.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use lsm_tree::{Config, RepairPolicy, SequenceNumberCounter};
+    ///
+    /// let config = Config::new(
+    ///     "/var/lib/mydb",
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// );
+    /// let (tree, repaired) = config.open_or_repair(RepairPolicy::default().salvage(true))?;
+    /// if let Some(report) = repaired {
+    ///     println!("repaired; WAL must replay {:?}", report.wal_replay_scope());
+    /// }
+    /// # Ok::<_, lsm_tree::Error>(())
+    /// ```
+    pub fn open_or_repair(
+        self,
+        policy: RepairPolicy,
+    ) -> crate::Result<(crate::AnyTree, Option<RepairReport>)> {
+        let retry = self.clone();
+        match self.open() {
+            Ok(tree) => Ok((tree, None)),
+            Err(e) if is_transient_io(&e) => Err(e),
+            Err(e @ crate::Error::Locked(_)) => Err(e),
+            Err(_) => {
+                let report =
+                    retry.repair_with_resurrection(policy.salvage, policy.allow_resurrection)?;
+                let tree = retry.open()?;
+                Ok((tree, Some(report)))
+            }
+        }
+    }
+}
+
+/// Which repair capabilities [`Config::open_or_repair`] may engage.
+///
+/// Consulted when the open fails structurally. The default engages none of
+/// them — the plain [`Config::repair`], which drops what it cannot recover
+/// whole.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RepairPolicy {
+    /// Block-salvage SSTs / blob files that fail whole-file recovery instead
+    /// of leaving them out (see [`Config::repair_with_salvage`]).
+    pub salvage: bool,
+    /// Keep ambiguous data (a lost restriction bound, an unauthenticated
+    /// delete mask) instead of dropping it (see
+    /// [`Config::repair_with_resurrection`]).
+    pub allow_resurrection: bool,
+}
+
+impl RepairPolicy {
+    /// Enables block-level salvage (see [`Self::salvage`]).
+    #[must_use]
+    pub const fn salvage(mut self, enable: bool) -> Self {
+        self.salvage = enable;
+        self
+    }
+
+    /// Enables resurrection of ambiguous data (see
+    /// [`Self::allow_resurrection`]).
+    #[must_use]
+    pub const fn allow_resurrection(mut self, enable: bool) -> Self {
+        self.allow_resurrection = enable;
+        self
+    }
 }
 
 /// Completes the publication a previous repair committed but could not carry out.
@@ -2730,6 +2879,65 @@ fn sweep_superseded_by_committed_manifest(config: &Config) -> crate::Result<()> 
 
 /// Core repair routine. Separated from the [`Config::repair`] entry point so the
 /// logic is testable against a borrowed config.
+/// Surfaces a caller's cooperative cancellation
+/// ([`RecoveryProgress::request_cancel`](crate::RecoveryProgress::request_cancel))
+/// as [`Error::Cancelled`](crate::Error::Cancelled). Consulted at file
+/// boundaries, and ONLY before the manifest commit: the pre-commit scan is
+/// read-only, so an abort there leaves the directory exactly as a retry
+/// expects, while aborting the post-commit swaps or removals would leave work
+/// the next open must redo anyway.
+fn check_cancel(config: &Config) -> crate::Result<()> {
+    if let Some(p) = &config.recovery_progress
+        && p.is_cancel_requested()
+    {
+        return Err(crate::Error::Cancelled);
+    }
+    Ok(())
+}
+
+/// Publishes the repair's byte total (every file in the table folders, plus
+/// the blob folder for a KV-separated tree) to the progress handle, if any.
+/// Best-effort on purpose: a file that cannot be stat'ed is left out of the
+/// total rather than failing the repair over a display number — the scan
+/// itself will classify it.
+fn publish_recovery_bytes_total(config: &Config) {
+    let Some(progress) = &config.recovery_progress else {
+        return;
+    };
+    let mut total: u64 = 0;
+    let mut add_folder = |folder: &std::path::Path, fs: &dyn crate::fs::Fs| {
+        let Ok(true) = fs.exists(folder) else {
+            return;
+        };
+        let Ok(dirents) = fs.read_dir(folder) else {
+            return;
+        };
+        for dirent in dirents {
+            // Same skips as the scan loops, so `bytes_processed` can reach
+            // `bytes_total` exactly.
+            if dirent.is_dir
+                || dirent.file_name == ".DS_Store"
+                || dirent.file_name.starts_with("._")
+            {
+                continue;
+            }
+            if let Ok(meta) = fs.metadata(&dirent.path) {
+                // Display-only sum: clamping at u64::MAX merely freezes the
+                // percentage, while a checked overflow would fail the repair
+                // over a progress number.
+                total = total.saturating_add(meta.len);
+            }
+        }
+    };
+    for (folder, fs) in config.all_tables_folders() {
+        add_folder(&folder, &*fs);
+    }
+    if config.kv_separation_opts.is_some() {
+        add_folder(&config.path.join(crate::file::BLOBS_FOLDER), &*config.fs);
+    }
+    progress.set_bytes_total(total);
+}
+
 fn repair_tree(
     config: &Config,
     salvage: bool,
@@ -2745,10 +2953,23 @@ fn repair_tree(
     let _directory_lock =
         crate::config::acquire_directory_lock(&*config.fs, &config.path, config.directory_lock)?;
 
+    if let Some(p) = &config.recovery_progress {
+        p.set_phase(crate::RecoveryPhase::PendingSwaps);
+    }
+    check_cancel(config)?;
+
     // Finish the previous run's outstanding cleanup first. See
     // `sweep_superseded_by_committed_manifest`.
     #[cfg(feature = "std")]
     sweep_superseded_by_committed_manifest(config)?;
+
+    // Byte totals for the progress percentage, from an upfront listing —
+    // before the scan phase starts, so `bytes_processed / bytes_total` is
+    // meaningful from the first processed file.
+    publish_recovery_bytes_total(config);
+    if let Some(p) = &config.recovery_progress {
+        p.set_phase(crate::RecoveryPhase::ScanningTables);
+    }
 
     // Best recovered copy per table id: a complete recovery beats a lossy salvage,
     // so a duplicate id across aliased / routed table folders keeps only the best
@@ -2814,6 +3035,16 @@ fn repair_tree(
             // https://en.wikipedia.org/wiki/.DS_Store
             if is_dir || file_name == ".DS_Store" || file_name.starts_with("._") {
                 continue;
+            }
+
+            // Pre-commit file boundary: safe to abort (the scan is read-only),
+            // and the file counts toward the progress percentage as soon as
+            // its processing starts. Best-effort stat, like the total.
+            check_cancel(config)?;
+            if let Some(p) = &config.recovery_progress
+                && let Ok(meta) = folder_fs.metadata(&table_path)
+            {
+                p.add_bytes_processed(meta.len);
             }
 
             // One grammar decides what each name IS (`TableDirEntry`, shared
@@ -3542,6 +3773,9 @@ fn repair_tree(
     // Removed only after `persist_version`, for the same reason.
     let mut unreferenced_blob_files: Vec<PathBuf> = Vec::new();
     let (tree_type, mut blob_file_list) = if config.kv_separation_opts.is_some() {
+        if let Some(p) = &config.recovery_progress {
+            p.set_phase(crate::RecoveryPhase::RecoveringBlobFiles);
+        }
         let recovery = recover_blob_files(config)?;
         unreadable_files.extend(recovery.unreadable);
         blob_rewrites = recovery.rewrites;
@@ -3825,6 +4059,12 @@ fn repair_tree(
     // file's stale count below its whole-file metadata totals forever.
     let version = Version::from_levels(version_id, tree_type, levels, blob_file_list, blob_frag);
 
+    // From here on the run is COMMITTING and then cleaning up: cancellation is
+    // no longer consulted (see `check_cancel`).
+    if let Some(p) = &config.recovery_progress {
+        p.set_phase(crate::RecoveryPhase::Committing);
+    }
+
     // Persist with the tree's own runtime config, not defaults: it drives the
     // manifest framing (checksum algorithm, page ECC, footer mirror, manifest
     // KV checksums), so defaulting it would rewrite a recovered tree's manifest
@@ -3855,6 +4095,10 @@ fn repair_tree(
             Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
+    }
+
+    if let Some(p) = &config.recovery_progress {
+        p.set_phase(crate::RecoveryPhase::Cleanup);
     }
 
     // POST-COMMIT, step one: swap every finished replacement onto the name the
@@ -3975,6 +4219,12 @@ fn repair_tree(
                 .map(|(lo, hi, seqno)| (path.clone(), lo.clone(), hi.clone(), *seqno))
         })
         .collect();
+
+    // Success only: a failed run leaves the phase where it stopped, which
+    // tells a progress display exactly which stage failed.
+    if let Some(p) = &config.recovery_progress {
+        p.set_phase(crate::RecoveryPhase::Done);
+    }
 
     Ok(RepairReport {
         recovered,
