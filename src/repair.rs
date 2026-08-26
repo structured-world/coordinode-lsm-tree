@@ -1441,6 +1441,7 @@ struct BlobLiveTotals {
 
 /// What a blob file's punch-geometry walk proved about its live data.
 #[cfg(feature = "std")]
+#[derive(Debug)]
 enum BlobFrontier {
     /// No punched prefix: the whole file is live.
     Whole,
@@ -1531,6 +1532,26 @@ fn derive_blob_frontier(
         Ok(data_end)
     };
 
+    // Whether a zero run was physically RECLAIMED rather than merely zeroed.
+    // Zeros are not the evidence: ordinary corruption produces exactly the same
+    // bytes, and reading damage as geometry drops every handle below a
+    // fabricated frontier — or, for a wholly zeroed section, removes a file
+    // whose records were only damaged. A punch deallocates, so the run must
+    // read back as a hole. The same rule the SST classifiers apply.
+    //
+    // Probed at the run's MIDPOINT: the run is bounded by the neighbouring
+    // non-zero bytes, so it can reach into the allocated blocks around the
+    // hole, and demanding the whole span be unallocated would reject genuine
+    // punches. A backend that cannot answer leaves the run unproven, which
+    // keeps the zeros classified as damage.
+    let is_reclaimed = |from: u64, to: u64| -> crate::Result<bool> {
+        if to <= from {
+            return Ok(false);
+        }
+        let midpoint = from + (to - from) / 2;
+        Ok(fs.extent_is_hole(path, midpoint, 1)? == Some(true))
+    };
+
     // Fast path: an unpunched file's first frame magic (non-zero) sits at the
     // data start.
     if skip_zeros(data_start)? == data_start {
@@ -1552,16 +1573,22 @@ fn derive_blob_frontier(
     let mut anchored: u64 = 0;
     loop {
         let run_end = skip_zeros(pos)?;
+        // An UNRECLAIMED run is destroyed content, not geometry: stop at the
+        // last proven frontier and let validation surface the damage exactly as
+        // it would on an unpunched file.
+        if !is_reclaimed(pos, run_end)? {
+            return Ok(committed(anchored));
+        }
         if run_end >= data_end {
             // Zeros to the section end. Only a completed relocation when
             // NOTHING was anchored below them: reclaim punches the consumed
             // prefix top-down from the data start, so a zeroed tail that
             // FOLLOWS intact anchored frames cannot be punch geometry — it is
             // destroyed data. Reporting it as consumed would drop a file whose
-            // live frames are still referenced (and set aside every table
-            // pointing at it); keeping the anchored frontier instead lets the
-            // damaged suffix surface through validation, exactly as the same
-            // damage would on an unpunched file.
+            // live frames are still referenced (and every table pointing at
+            // it); keeping the anchored frontier instead lets the damaged
+            // suffix surface through validation, exactly as the same damage
+            // would on an unpunched file.
             return Ok(if anchored == 0 {
                 BlobFrontier::FullyConsumed
             } else {

@@ -9000,6 +9000,118 @@ fn a_retry_handles_damage_that_appeared_after_the_failed_attempt() -> crate::Res
     Ok(())
 }
 
+/// Zeros are not a reclaim. Corruption that zeroes the leading blob records
+/// leaves exactly the shape a completed punch does — a zeroed prefix with a
+/// valid frame at its end — so a structure-only classifier promotes it to a
+/// frontier, drops every handle below the fabricated bound, and reports the
+/// repair a success. A punch DEALLOCATES, so the run must be a proven hole.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_zeroed_blob_prefix_without_a_hole_is_not_a_frontier() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    blob_tree_without_manifest(&memfs, &root)?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let blob_path = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one blob file")
+        .path;
+
+    // Overwrite the first two records with zeros WITHOUT punching: the file
+    // stays fully allocated, so the zeros are damage, not geometry.
+    let frontier =
+        crate::vlog::BlobFileScanner::new(&blob_path, &*(memfs.clone() as Arc<dyn Fs>), 0)?
+            .nth(1)
+            .expect("a second frame")?
+            .frame_end;
+    let data_start = {
+        let mut file = memfs.open(&blob_path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut file)?;
+        reader
+            .toc()
+            .section(b"data")
+            .expect("blob file has a data section")
+            .pos()
+    };
+    {
+        let mut file = memfs.open(
+            &blob_path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        file.seek(SeekFrom::Start(data_start))?;
+        file.write_all(&vec![
+            0u8;
+            usize::try_from(frontier - data_start).unwrap_or(0)
+        ])?;
+        file.sync_all()?;
+    }
+
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let derived = super::derive_blob_frontier(&fs, &blob_path, 0)?;
+    assert!(
+        matches!(derived, super::BlobFrontier::Whole),
+        "allocated zeros are corruption the validation scan must surface, not a \
+         frontier that silently drops the handles below it, got {derived:?}",
+    );
+    Ok(())
+}
+
+/// The same rule at the extreme: a data section zeroed end to end by corruption
+/// must not read as a completed relocation, which REMOVES the file (and every
+/// table referencing it) while its records were merely damaged.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_wholly_zeroed_blob_section_without_holes_is_not_fully_consumed() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    blob_tree_without_manifest(&memfs, &root)?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let blob_path = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one blob file")
+        .path;
+
+    let (data_start, data_len) = {
+        let mut file = memfs.open(&blob_path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut file)?;
+        let data = reader
+            .toc()
+            .section(b"data")
+            .expect("blob file has a data section");
+        (data.pos(), data.len())
+    };
+    {
+        let mut file = memfs.open(
+            &blob_path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        file.seek(SeekFrom::Start(data_start))?;
+        file.write_all(&vec![0u8; usize::try_from(data_len).unwrap_or(0)])?;
+        file.sync_all()?;
+    }
+
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let derived = super::derive_blob_frontier(&fs, &blob_path, 0)?;
+    assert!(
+        matches!(derived, super::BlobFrontier::Whole),
+        "a fully allocated zeroed section is destroyed data, not a relocation \
+         whose file removal lagged a crash, got {derived:?}",
+    );
+    Ok(())
+}
+
 /// Builds a one-blob tree with its manifest removed, ready for a repair.
 #[expect(clippy::expect_used, reason = "test code")]
 fn blob_tree_without_manifest(
