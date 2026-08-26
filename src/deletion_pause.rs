@@ -295,7 +295,8 @@ impl Drop for Pause {
                     }
                 }
                 QueuedAction::Punch(_) => {
-                    DeletionPause::reclaim_or_retain(item, &self.inner.pending_reclaims);
+                    self.inner
+                        .reclaim_or_retain(item, &self.inner.pending_reclaims);
                 }
             }
         }
@@ -313,10 +314,19 @@ impl DeletionPause {
     /// checkpoint only decrements the link count while the live restricted table
     /// keeps holding the inode, so the consumed prefix would stay allocated with
     /// nothing left to free it.
-    fn reclaim_or_retain(item: QueuedDeletion, pending: &Mutex<Vec<QueuedDeletion>>) {
+    ///
+    /// The probe and the punch run inside ONE mutation window. A queued reclaim
+    /// holds no live version object, so — unlike a table's or blob file's `Drop`
+    /// — nothing else keeps a checkpoint out of the gap between them: a
+    /// checkpoint starting after the probe read `1` would hard-link the file and
+    /// then watch the punch zero the inode its immutable snapshot shares. The
+    /// window excludes every checkpoint generation across the whole sequence.
+    fn reclaim_or_retain(&self, item: QueuedDeletion, pending: &Mutex<Vec<QueuedDeletion>>) {
         let QueuedAction::Punch(extents) = &item.action else {
             return;
         };
+        #[cfg(feature = "std")]
+        let _mutation = self.enter_mutation_window();
         match item.fs.hard_link_count(&item.path) {
             Ok(n) if n <= 1 => {
                 let mut unreclaimed: Option<Vec<(u64, u64)>> = None;
@@ -369,7 +379,7 @@ impl DeletionPause {
     pub(crate) fn retry_pending_reclaims(&self) {
         let retained = core::mem::take(&mut *self.pending_reclaims.lock());
         for item in retained {
-            Self::reclaim_or_retain(item, &self.pending_reclaims);
+            self.reclaim_or_retain(item, &self.pending_reclaims);
         }
     }
 

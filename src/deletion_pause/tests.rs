@@ -274,6 +274,59 @@ fn a_deferred_punch_survives_an_unprovable_link_count_and_is_retried() {
     );
 }
 
+/// A deferred reclaim probes the link count and then punches. Unlike a table's
+/// `Drop`, the queued item holds no live version whose lifetime keeps a
+/// checkpoint out of that gap: a checkpoint starting between the probe and the
+/// punch hard-links the file, and the punch then zeroes the inode its supposedly
+/// immutable snapshot shares. The whole probe-and-punch sequence must therefore
+/// run inside the mutation window a checkpoint's link window excludes.
+#[test]
+fn a_deferred_punch_waits_for_an_open_checkpoint_link_window() {
+    use std::sync::mpsc;
+
+    let mem = MemFs::new();
+    mem.create_dir_all(Path::new("/d")).unwrap();
+    let path = Path::new("/d/1").to_path_buf();
+    write_file(&mem, &path, &[b'x'; 4096]);
+    let dyn_fs: Arc<dyn Fs> = Arc::new(mem.clone());
+
+    let pause = DeletionPause::new_shared();
+    let guard = pause.acquire();
+    assert!(pause.try_enqueue_punch(Arc::clone(&dyn_fs), path, vec![(0, 2048)]));
+    // The pause released with the probe unavailable would retain the reclaim;
+    // here the file IS exclusive, so retain it by holding the pause instead and
+    // driving the retry explicitly below.
+    let checkpoint = pause.enter_link_window();
+
+    let retrier = Arc::clone(&pause);
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let handle = std::thread::spawn(move || {
+        drop(guard); // releases the pause: the drain retries the reclaim
+        retrier.retry_pending_reclaims();
+        done_tx.send(()).ok();
+    });
+
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .is_err(),
+        "a deferred punch must not run while a checkpoint's link window is open",
+    );
+    assert_eq!(
+        mem.punched_bytes(),
+        0,
+        "and it must not have punched the inode the checkpoint is linking",
+    );
+
+    drop(checkpoint);
+    handle.join().expect("the retry thread finishes");
+    assert_eq!(
+        mem.punched_bytes(),
+        2048,
+        "once the link window closes the reclaim runs",
+    );
+}
+
 /// A punch that FAILS mid-pass must not take the reclaim down with it. The pass
 /// stops (the hole pattern stays classifiable for a sidecar-less repair), but
 /// the failed extent and everything below it are retained: dropping them leaves
