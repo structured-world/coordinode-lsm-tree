@@ -1196,17 +1196,25 @@ fn classify_drop(
 /// following entry of the same key. Returns the surviving entries and, when the
 /// block ENDS inside such a suppressed run, the key to keep suppressing: the
 /// chain can continue into the next block.
+///
+/// "The same key" is the tree's COMPARATOR's answer, not byte equality: under a
+/// comparator that folds spellings together, an older version spelled `a` is the
+/// same key as the headless `A` and must go with it.
 fn rewrite_block_indirections(
     entries: Vec<crate::InternalValue>,
     rewrite: &crate::HashMap<crate::vlog::BlobFileId, BlobFileRewrite>,
     dropped_entries: &mut u64,
+    comparator: &crate::comparator::SharedComparator,
 ) -> crate::Result<(Vec<crate::InternalValue>, Option<UserKey>)> {
     use crate::coding::{Decode, Encode};
 
     let mut out = Vec::with_capacity(entries.len());
     let mut headless: Option<UserKey> = None;
     for mut entry in entries {
-        if headless.as_ref() == Some(&entry.key.user_key) {
+        if headless.as_ref().is_some_and(|h| {
+            comparator.compare(entry.key.user_key.as_ref(), h.as_ref())
+                == core::cmp::Ordering::Equal
+        }) {
             // An older version of a key whose newer one just went missing.
             *dropped_entries += 1;
             continue;
@@ -1902,6 +1910,7 @@ fn salvage_blocks(
                                             entries,
                                             rw,
                                             &mut entries_dropped_by_rewrite,
+                                            comparator,
                                         )
                                     });
                                 match step {
@@ -2105,6 +2114,7 @@ fn salvage_blocks(
                                             entries,
                                             rw,
                                             &mut entries_dropped_by_rewrite,
+                                            comparator,
                                         ) {
                                             Ok((entries, carry)) => {
                                                 rewrite_carry = carry;
@@ -2399,6 +2409,7 @@ fn salvage_blocks(
                                     entries,
                                     rw,
                                     &mut entries_dropped_by_rewrite,
+                                    comparator,
                                 ) {
                                     Ok(pair) => pair,
                                     Err(e) => {

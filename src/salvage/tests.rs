@@ -8859,7 +8859,12 @@ fn blob_handle_rewrite_installs_the_relocated_size() -> crate::Result<()> {
     );
 
     let mut dropped = 0u64;
-    let (out, carry) = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
+    let (out, carry) = super::rewrite_block_indirections(
+        entries,
+        &rewrite,
+        &mut dropped,
+        &crate::comparator::default_comparator(),
+    )?;
     assert_eq!(dropped, 0, "the record survived, nothing drops");
     assert!(carry.is_none(), "nothing was beheaded, nothing to suppress");
     let entry = out.first().expect("one rewritten entry");
@@ -8925,7 +8930,12 @@ fn blob_handle_rewrite_drops_older_versions_when_the_head_record_is_lost() -> cr
         InternalValue::from_components(b"z".to_vec(), b"v".to_vec(), 1, ValueType::Value),
     ];
     let mut dropped = 0u64;
-    let (out, carry) = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
+    let (out, carry) = super::rewrite_block_indirections(
+        entries,
+        &rewrite,
+        &mut dropped,
+        &crate::comparator::default_comparator(),
+    )?;
     let keys: Vec<_> = out.iter().map(|e| e.key.user_key.to_vec()).collect();
     assert_eq!(
         keys,
@@ -8950,7 +8960,12 @@ fn blob_handle_rewrite_drops_older_versions_when_the_head_record_is_lost() -> cr
         InternalValue::from_components(b"k".to_vec(), b"old".to_vec(), 5, ValueType::Value),
     ];
     let mut dropped = 0u64;
-    let (out, carry) = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
+    let (out, carry) = super::rewrite_block_indirections(
+        entries,
+        &rewrite,
+        &mut dropped,
+        &crate::comparator::default_comparator(),
+    )?;
     assert!(out.is_empty(), "the whole block was one beheaded key");
     assert_eq!(
         carry.as_deref(),
@@ -9202,6 +9217,86 @@ fn salvage_suppresses_a_boundary_key_the_comparator_calls_equal() -> crate::Resu
             .is_none(),
         "the older spelling is the SAME key under this comparator, so it must \
          be suppressed with it rather than republished",
+    );
+    Ok(())
+}
+
+/// The blob-handle rewrite suppresses the same way, and must ask the same
+/// question. Losing a key's newest record removes the HEAD of its version
+/// chain, so every older version goes with it — and under a comparator that
+/// folds spellings together, `A` and `a` are one key. Byte equality keeps the
+/// older `a`, republishing a value its newer version had already replaced (or
+/// undoing a deletion).
+#[test]
+fn the_blob_rewrite_suppresses_a_chain_the_comparator_calls_one_key() -> crate::Result<()> {
+    use crate::coding::Encode;
+    use crate::{InternalValue, ValueType};
+
+    /// Folds ASCII case, so `A` and `a` are the SAME key.
+    struct CaseFolding;
+    impl crate::UserComparator for CaseFolding {
+        fn name(&self) -> &'static str {
+            "ascii-case-folding"
+        }
+        fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+            a.iter()
+                .map(u8::to_ascii_lowercase)
+                .cmp(b.iter().map(u8::to_ascii_lowercase))
+        }
+    }
+    let comparator: crate::comparator::SharedComparator = Arc::new(CaseFolding);
+
+    let indirection = |offset: u64| -> crate::Result<Vec<u8>> {
+        let ind = crate::blob_tree::handle::BlobIndirection {
+            vhandle: crate::vlog::ValueHandle {
+                blob_file_id: 7,
+                offset,
+                on_disk_size: 16,
+            },
+            size: 16,
+        };
+        let mut buf = Vec::new();
+        ind.encode_into(&mut buf)?;
+        Ok(buf)
+    };
+
+    // `A` (newest) points at a record the salvage LOST; `a` (older, same key
+    // under this comparator) points at one that survived.
+    let entries = vec![
+        InternalValue::from_components(b"A", indirection(100)?, 10, ValueType::Indirection),
+        InternalValue::from_components(b"a", indirection(200)?, 5, ValueType::Indirection),
+        InternalValue::from_components(b"z", indirection(200)?, 1, ValueType::Indirection),
+    ];
+
+    // The remap holds only offset 200: the record behind `A` is gone.
+    let mut offsets = crate::HashMap::default();
+    offsets.insert(
+        200u64,
+        super::BlobRecordRelocation {
+            offset: 300,
+            on_disk_size: 16,
+        },
+    );
+    let mut rewrite = crate::HashMap::default();
+    rewrite.insert(7u64, super::BlobFileRewrite::Remap { new_id: 9, offsets });
+
+    let mut dropped = 0u64;
+    let (kept, carry) =
+        super::rewrite_block_indirections(entries, &rewrite, &mut dropped, &comparator)?;
+
+    let keys: Vec<_> = kept.iter().map(|e| e.key.user_key.to_vec()).collect();
+    assert_eq!(
+        keys,
+        vec![b"z".to_vec()],
+        "`a` is the same key as the headless `A`, so it goes with it",
+    );
+    assert_eq!(
+        dropped, 2,
+        "both the lost head and its orphaned older version"
+    );
+    assert!(
+        carry.is_none(),
+        "a surviving different key ended the run inside this block",
     );
     Ok(())
 }
