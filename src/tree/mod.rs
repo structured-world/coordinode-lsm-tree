@@ -2018,22 +2018,23 @@ impl Tree {
     ///   Repeats WITHIN one source are still kept: they are separate entries
     ///   the source genuinely holds.
     fn merge_source_events(sources: Vec<Vec<ScanSinceEvent>>) -> Vec<ScanSinceEvent> {
-        // Per source, collapse equal neighbours into (event, count) runs, each
-        // tagged with its source's recency (0 = newest) and the position the
-        // source itself gives the run.
+        // Per source, collapse equal neighbours into runs, each tagged with
+        // its source's recency (0 = newest) and the position of EVERY copy it
+        // carries.
         //
-        // The POSITION is what keeps an order-sensitive merge operator correct:
-        // a source applies the operands of one batch in the order they were
-        // added, all at one seqno, and grouping them by payload would replay
-        // them in a different order — an append or a list push then converges
-        // somewhere the tree never was. Grouping still SORTS (equal events have
-        // to meet), so each run remembers where its earliest member sat, and the
-        // final ordering below restores it.
+        // The POSITIONS are what keep an order-sensitive merge operator
+        // correct: a source applies the operands of one batch in the order
+        // they were added, all at one seqno, and grouping them by payload
+        // would replay them in a different order — an append or a list push
+        // then converges somewhere the tree never was. Grouping still SORTS
+        // (equal events have to meet), so each run remembers where each of its
+        // members sat: one shared position would fold a repeated operand's
+        // copies onto its twin's slot and replay `B, A, B` as `A, B, B`.
         struct Run {
             event: ScanSinceEvent,
-            count: usize,
             recency: usize,
-            position: usize,
+            /// Original scan position of every copy, ascending.
+            positions: Vec<usize>,
         }
         let mut runs: Vec<Run> = Vec::new();
         for (recency, source) in sources.into_iter().enumerate() {
@@ -2041,66 +2042,74 @@ impl Tree {
                 source.into_iter().enumerate().collect();
             indexed.sort_by(|(_, a), (_, b)| ScanSinceEvent::grouping_order(a, b));
             let mut iter = indexed.into_iter();
-            let Some((mut position, mut current)) = iter.next() else {
+            let Some((position, mut current)) = iter.next() else {
                 continue;
             };
-            let mut count = 1;
+            let mut positions = alloc::vec![position];
             for (index, event) in iter {
                 if event == current {
-                    count += 1;
-                    position = position.min(index);
+                    positions.push(index);
                 } else {
+                    positions.sort_unstable();
                     runs.push(Run {
                         event: core::mem::replace(&mut current, event),
-                        count,
                         recency,
-                        position,
+                        positions: core::mem::replace(&mut positions, alloc::vec![index]),
                     });
-                    count = 1;
-                    position = index;
                 }
             }
+            positions.sort_unstable();
             runs.push(Run {
                 event: current,
-                count,
                 recency,
-                position,
+                positions,
             });
         }
 
-        // Merge the per-source runs: operands accumulate, idempotent events take
-        // the count a single source holds. A collapsed event keeps the recency
-        // of the NEWEST source holding it, which is the position the tree's own
-        // precedence gives it.
+        // Merge the per-source runs. Operands are never collapsed — every copy
+        // is an application the read path makes, so each keeps ITS source's
+        // recency and ITS scan position, and the replay order below (oldest
+        // source first, then position) applies them exactly as the tree does.
+        // Idempotent events collapse across sources to the count a single
+        // source holds; the collapsed event keeps the recency of the NEWEST
+        // source holding it (and that source's positions), which is the slot
+        // the tree's own precedence gives it.
         runs.sort_by(|a, b| ScanSinceEvent::grouping_order(&a.event, &b.event));
         let mut merged: Vec<(ScanSinceEvent, usize, usize)> = Vec::new();
         let mut iter = runs.into_iter().peekable();
-        while let Some(Run {
-            event,
-            mut count,
-            mut recency,
-            mut position,
-        }) = iter.next()
-        {
-            let accumulates = matches!(event, ScanSinceEvent::MergeOperand { .. });
+        while let Some(run) = iter.next() {
+            if matches!(run.event, ScanSinceEvent::MergeOperand { .. }) {
+                // Equal operand runs from OTHER sources follow as their own
+                // iterations and emit their own copies — no draining here.
+                for &position in &run.positions {
+                    merged.push((run.event.clone(), run.recency, position));
+                }
+                continue;
+            }
+            let Run {
+                event,
+                mut recency,
+                mut positions,
+            } = run;
+            let mut count = positions.len();
             while let Some(other) = iter.next_if(|next| next.event == event) {
                 debug_assert_eq!(other.event, event, "next_if matched the same event");
-                count = if accumulates {
-                    count.saturating_add(other.count)
-                } else {
-                    count.max(other.count)
-                };
-                // The newest source decides both the replay slot and the
-                // position within it, so the two stay consistent.
+                count = count.max(other.positions.len());
                 if other.recency < recency {
                     recency = other.recency;
-                    position = other.position;
+                    positions = other.positions;
                 }
             }
-            for _ in 1..count {
+            // The winning source may hold fewer copies than the count another
+            // source did; the extras repeat its last position (they are
+            // byte-identical, so their relative order carries no information).
+            while positions.len() < count {
+                let last = positions.last().copied().unwrap_or_default();
+                positions.push(last);
+            }
+            for &position in positions.iter().take(count) {
                 merged.push((event.clone(), recency, position));
             }
-            merged.push((event, recency, position));
         }
 
         // Finally, replay order: seqno, then range deletions, then oldest source

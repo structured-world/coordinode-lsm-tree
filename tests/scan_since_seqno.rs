@@ -830,6 +830,41 @@ fn scan_since_replays_one_source_operands_in_application_order() -> lsm_tree::Re
     Ok(())
 }
 
+/// A REPEATED operand interleaved with a different one (`B, A, B`) must keep
+/// every copy at its own application position: grouping the identical copies
+/// onto one shared position would replay `A, B, B`, and an order-sensitive
+/// merge operator (string append, list push) then converges somewhere the
+/// tree never was.
+#[test]
+fn scan_since_keeps_interleaved_duplicate_operands_in_application_order() -> lsm_tree::Result<()> {
+    use lsm_tree::WriteBatch;
+
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path())?;
+
+    let mut batch = WriteBatch::new();
+    batch.merge(b"k".as_slice(), b"B".as_slice());
+    batch.merge(b"k".as_slice(), b"A".as_slice());
+    batch.merge(b"k".as_slice(), b"B".as_slice());
+    tree.apply_batch(batch, 10)?;
+
+    let got = events(&tree, 0)?;
+    let operands: Vec<_> = got
+        .iter()
+        .filter_map(|e| match e {
+            ScanSinceEvent::MergeOperand { operand, .. } => Some(operand.to_vec()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        operands,
+        vec![b"B".to_vec(), b"A".to_vec(), b"B".to_vec()],
+        "each copy replays at its own position — the duplicate must not be \
+         folded onto its twin's slot: {got:?}",
+    );
+    Ok(())
+}
+
 /// The range-scoped scan delivers point events only for keys inside the
 /// bounds, range deletions when their span overlaps them, and skips SSTs
 /// whose key range cannot intersect — the presence-check primitive for
