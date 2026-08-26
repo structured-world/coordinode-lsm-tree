@@ -4513,6 +4513,7 @@ impl Tree {
                                     &table_file_path,
                                     &table_base_folder.join(tmp_id.to_string()),
                                     config.sync_mode,
+                                    recovery.restrictions.contains_key(&tmp_id),
                                 )?;
                             } else {
                                 log::warn!(

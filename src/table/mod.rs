@@ -3714,14 +3714,21 @@ impl Table {
     /// leading data block leaves the same read-as-zeros shape a completed punch
     /// does, and reading it as a reclaim would drop that block plus the
     /// sub-bound rows of the first readable one while reporting the table
-    /// recovered. A punch physically deallocates, so the block's OWN extent must
-    /// read as a hole. The probe is extent-local on purpose: a file-wide
-    /// allocation total cannot attribute the missing bytes to this block, and on
-    /// a filesystem with transparent compression an ordinary, fully-written file
-    /// already reports fewer physical bytes than its length. A backend that
-    /// cannot answer leaves the punch unproven and the zeros are treated as
-    /// damage — which preserves the whole file for the operator instead of
-    /// silently publishing a truncated view of it.
+    /// recovered. A punch physically deallocates, so the zeroed region must
+    /// carry an actual hole. The probe is run-local on purpose: consecutive
+    /// zeroed blocks coalesce into one run (bounded by readable blocks, so the
+    /// hole is attributed to the zeros and not to the file at large — a
+    /// file-wide allocation total attributes nothing, and on a filesystem with
+    /// transparent compression an ordinary, fully-written file already reports
+    /// fewer physical bytes than its length), and the run is asked whether it
+    /// CONTAINS a hole rather than whether it wholly IS one: the reclaim
+    /// punches per block with arbitrary, unaligned extents, and the filesystem
+    /// deallocates only the wholly-contained pages while zero-filling the
+    /// edges — so every block-boundary page stays allocated and a whole-extent
+    /// probe would reject genuine punches. A backend that cannot answer leaves
+    /// the punch unproven and the zeros are treated as damage — which
+    /// preserves the whole file for the operator instead of silently
+    /// publishing a truncated view of it.
     ///
     /// # Errors
     ///
@@ -3729,19 +3736,36 @@ impl Table {
     #[cfg(feature = "std")]
     pub(crate) fn has_punched_data_block(&self) -> crate::Result<bool> {
         let file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
+        // [start, end) of the current run of consecutive zeroed blocks.
+        let mut run: Option<(u64, u64)> = None;
         for handle in self.block_index.iter() {
             let handle = handle?;
             let block = BlockHandle::new(handle.offset(), handle.size());
-            if !Self::block_is_zeroed_in(&*file, &block)? {
+            if Self::block_is_zeroed_in(&*file, &block)? {
+                let start = block.offset().0;
+                let end = start + u64::from(block.size());
+                run = Some(match run {
+                    Some((run_start, _)) => (run_start, end),
+                    None => (start, end),
+                });
                 continue;
             }
-            if self
-                .fs
-                .extent_is_hole(&self.path, block.offset().0, u64::from(block.size()))?
-                == Some(true)
+            if let Some((start, end)) = run.take()
+                && self
+                    .fs
+                    .extent_contains_hole(&self.path, start, end - start)?
+                    == Some(true)
             {
                 return Ok(true);
             }
+        }
+        if let Some((start, end)) = run
+            && self
+                .fs
+                .extent_contains_hole(&self.path, start, end - start)?
+                == Some(true)
+        {
+            return Ok(true);
         }
         Ok(false)
     }
@@ -6383,16 +6407,24 @@ impl Table {
         // non-ingested table `global_seqno` is 0 and both translations are
         // no-ops.
         let global_seqno = self.global_seqno();
+        // An upper bound BELOW the ingest base excludes the whole table: every
+        // effective seqno here is >= `global_seqno`. Checked BEFORE the
+        // saturating translation, because both bounds would clamp to local 0
+        // and `[0, 0]` is a valid one-seqno window that matches every stored
+        // row of a bulk-ingested table (all at local 0) — returning entries
+        // whose translated-back seqno exceeds the caller's inclusive bound.
+        if end_seqno < global_seqno {
+            return Ok(Vec::new());
+        }
         // Here the saturating clamp to 0 is the INTENDED result, not the silent
         // overflow-masking the point-read path avoids: a lower bound below the
         // offset means "start at the table's first entry", so clamping the
         // translated lower bound to 0 is exactly right.
         let local_target = target_seqno.saturating_sub(global_seqno);
         // Upper bound in local coords. `SeqNo::MAX` (the unbounded case) maps to
-        // `MAX - global_seqno`, still far above any reachable local seqno, so every
-        // entry passes (effectively unbounded); a real watermark below the offset
-        // clamps to 0, which (via the empty-window check below) correctly excludes
-        // the whole table. The clamp is intentional, hence saturating not checked.
+        // `MAX - global_seqno`, still far above any reachable local seqno, so
+        // every entry passes (effectively unbounded); a bound below the offset
+        // returned above already.
         let local_end = end_seqno.saturating_sub(global_seqno);
 
         // Empty window (a target ABOVE the watermark — e.g. a bulk-ingest offset

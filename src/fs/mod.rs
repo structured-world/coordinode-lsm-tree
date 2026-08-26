@@ -1177,6 +1177,34 @@ pub trait Fs: Send + Sync + 'static {
         let _ = (path, offset, len);
         Ok(None)
     }
+
+    /// Whether `[offset, offset + len)` CONTAINS a filesystem hole —
+    /// `Some(true)` if any part of the range is unallocated, `Some(false)` if
+    /// the whole range is backed by allocated blocks, `None` if the backend
+    /// cannot tell.
+    ///
+    /// The companion of [`extent_is_hole`](Self::extent_is_hole) for punches
+    /// whose extents are NOT filesystem-block-aligned: `punch_hole` on such a
+    /// range deallocates only the wholly-contained blocks and zero-fills the
+    /// edges, so the punched range is a hole in its interior while its
+    /// boundary pages stay allocated — an `extent_is_hole` over the full range
+    /// answers `false` there. Manifest repair probes a zeroed run with this to
+    /// prove the run was reclaimed rather than destroyed; the implicit
+    /// all-files-end-in-a-hole EOF state must NOT count as a contained hole.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns `Ok(None)` ("cannot tell"), leaving the punch unproven exactly
+    /// like the default [`extent_is_hole`](Self::extent_is_hole).
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the underlying probe fails on a backend that
+    /// supports it.
+    fn extent_contains_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<Option<bool>> {
+        let _ = (path, offset, len);
+        Ok(None)
+    }
 }
 
 /// Bytes available to an unprivileged process on the filesystem backing

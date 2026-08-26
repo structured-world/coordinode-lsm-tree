@@ -546,6 +546,14 @@ impl<F: Fs> Fs for FaultFs<F> {
         }
         self.inner.extent_is_hole(path, offset, len)
     }
+
+    fn extent_contains_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<Option<bool>> {
+        // Same allocation-probe fault op as `extent_is_hole`, for the same reason.
+        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::AllocatedSize, Some(path)) {
+            return Err(fault_error(kind, FaultOp::AllocatedSize));
+        }
+        self.inner.extent_contains_hole(path, offset, len)
+    }
 }
 
 /// A fault-injecting [`FsFile`] wrapping an inner handle.

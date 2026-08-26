@@ -381,6 +381,10 @@ impl Fs for CrashFs {
     fn extent_is_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<Option<bool>> {
         self.inner.extent_is_hole(path, offset, len)
     }
+
+    fn extent_contains_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<Option<bool>> {
+        self.inner.extent_contains_hole(path, offset, len)
+    }
 }
 
 /// A file handle that records its durable image on `fsync`.

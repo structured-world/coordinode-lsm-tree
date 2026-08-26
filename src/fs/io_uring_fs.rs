@@ -264,6 +264,16 @@ impl Fs for IoUringFs {
         Fs::extent_is_hole(&super::StdFs, path, offset, len)
     }
 
+    fn extent_contains_hole(
+        &self,
+        path: &Path,
+        offset: u64,
+        len: u64,
+    ) -> crate::io::Result<Option<bool>> {
+        // Same delegation as `extent_is_hole`, for the same reason.
+        Fs::extent_contains_hole(&super::StdFs, path, offset, len)
+    }
+
     fn sync_directory(&self, path: &Path) -> crate::io::Result<()> {
         let dir = File::open(path)?;
         if !dir.metadata()?.is_dir() {

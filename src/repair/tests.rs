@@ -227,7 +227,7 @@ fn commit_repair_tmp_replaces_the_source_and_carries_its_sidecar() -> crate::Res
     std::fs::write(&tmp, b"replacement")?;
     std::fs::write(crate::restrict_bound::sidecar_path(&tmp), b"fresh-bound")?;
 
-    commit_repair_tmp(&StdFs, &tmp, &sst, SyncMode::Normal)?;
+    commit_repair_tmp(&StdFs, &tmp, &sst, SyncMode::Normal, true)?;
 
     assert_eq!(
         std::fs::read(&sst)?,
@@ -260,12 +260,47 @@ fn commit_repair_tmp_clears_a_stale_sidecar_when_the_replacement_has_none() -> c
     let tmp = repair_tmp_path(&sst);
     std::fs::write(&tmp, b"replacement")?;
 
-    commit_repair_tmp(&StdFs, &tmp, &sst, SyncMode::Normal)?;
+    commit_repair_tmp(&StdFs, &tmp, &sst, SyncMode::Normal, false)?;
 
     assert_eq!(std::fs::read(&sst)?, b"replacement");
     assert!(
         !StdFs.exists(&sidecar)?,
         "an unrestricted replacement must not inherit the source's bound",
+    );
+    Ok(())
+}
+
+/// A retry of an INTERRUPTED swap: the first attempt moved the replacement's
+/// sidecar onto the destination and crashed before the table rename, leaving
+/// no temp sidecar. That state is byte-identical to "unrestricted replacement
+/// beside the source's stale sidecar", so without the manifest's verdict the
+/// retry would delete the replacement's own sidecar — and the restricted
+/// replacement (a fresh unpunched copy whose sub-bound rows are physically
+/// present) would be adopted unrestricted, resurrecting them.
+#[test]
+fn commit_repair_tmp_keeps_the_moved_sidecar_on_a_retried_swap() -> crate::Result<()> {
+    use crate::fs::SyncMode;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("7");
+    std::fs::write(&sst, b"damaged")?;
+    let tmp = repair_tmp_path(&sst);
+    std::fs::write(&tmp, b"replacement")?;
+    // The interrupted first attempt already moved the replacement's sidecar.
+    let dest_sidecar = crate::restrict_bound::sidecar_path(&sst);
+    std::fs::write(&dest_sidecar, b"fresh-bound")?;
+
+    // The committed manifest restricts this id — the retry's only way to know
+    // the destination sidecar is the replacement's, not stale source metadata.
+    commit_repair_tmp(&StdFs, &tmp, &sst, SyncMode::Normal, true)?;
+
+    assert_eq!(std::fs::read(&sst)?, b"replacement");
+    assert_eq!(
+        std::fs::read(&dest_sidecar)?,
+        b"fresh-bound",
+        "the replacement's already-moved sidecar must survive the retried swap",
     );
     Ok(())
 }
@@ -2510,62 +2545,72 @@ fn repair_prefers_the_canonical_spelling_of_a_duplicated_id() -> crate::Result<(
     Ok(())
 }
 
-/// The hole evidence must cover the ZEROED BLOCK, not the file. A file-wide
-/// allocation total says nothing about where the missing bytes are — and on a
-/// filesystem with transparent compression an ordinary, fully-written file
-/// already reports fewer physical bytes than its length, so the file-wide test
-/// passes for a table that was never punched at all. Modelled here by a file
-/// that is sparse ELSEWHERE while the destroyed block is plain written zeros.
+/// The punch evidence is a hole CONTAINED IN the zeroed run itself — never a
+/// file-wide allocation total (which attributes nothing, and runs below the
+/// file length on a transparently compressing filesystem anyway). A run
+/// destroyed by a WRITE of zeros carries no hole and is damage; the same
+/// zeros with a hole inside the run are a proven reclaim — that hole covers
+/// only part of the run on purpose, because a real `punch_hole` of an
+/// unaligned block extent deallocates just the wholly-contained pages and
+/// leaves the zero-filled edges allocated, so demanding the whole run (or
+/// each block) be a hole would reject every genuine punch.
 #[test]
-fn repair_requires_the_hole_under_the_zeroed_block_itself() -> crate::Result<()> {
+fn repair_requires_a_hole_inside_the_zeroed_run() -> crate::Result<()> {
     use crate::fs::{Fs, MemFs};
     use crate::{Config, SequenceNumberCounter};
     use std::sync::Arc;
 
+    let build = |memfs: &Arc<MemFs>| -> crate::Result<(std::path::PathBuf, u64)> {
+        let fs: Arc<dyn Fs> = memfs.clone();
+        let root = std::path::absolute("/db")?;
+        let tables = root.join("tables");
+        fs.create_dir_all(&tables)?;
+        let sst = tables.join("0");
+        write_multiblock_sst(&sst, &fs)?;
+        let first_block_end = recover_sst(sst.clone(), &fs)?.punch_offset_for(b"k00050")?;
+        assert!(first_block_end > 0, "the fixture has a leading block");
+        // Zero the leading block by a WRITE — the shape both damage and a
+        // punch read back as.
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = fs.open(
+                &sst,
+                &crate::fs::FsOpenOptions::new().read(true).write(true),
+            )?;
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(&vec![0u8; usize::try_from(first_block_end).unwrap_or(0)])?;
+        }
+        Ok((sst, first_block_end))
+    };
+    let repair = |memfs: Arc<MemFs>| -> crate::Result<super::RepairReport> {
+        Config::new(
+            std::path::absolute("/db")?,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs)
+        .repair()
+    };
+
+    // No hole anywhere: the zeros are damage, never a punch.
     let memfs = Arc::new(MemFs::new());
-    let fs: Arc<dyn Fs> = memfs.clone();
-    let root = std::path::absolute("/db")?;
-    let tables = root.join("tables");
-    fs.create_dir_all(&tables)?;
-    let sst = tables.join("0");
-    write_multiblock_sst(&sst, &fs)?;
-
-    let first_block_end = recover_sst(sst.clone(), &fs)?.punch_offset_for(b"k00050")?;
-    assert!(first_block_end > 0, "the fixture has a leading block");
-    let len =
-        crate::fs::FsFile::metadata(&*fs.open(&sst, &crate::fs::FsOpenOptions::new().read(true))?)?
-            .len;
-
-    // Destroyed by a WRITE of zeros: no hole under it.
-    {
-        use std::io::{Seek, SeekFrom, Write};
-        let mut file = fs.open(
-            &sst,
-            &crate::fs::FsOpenOptions::new().read(true).write(true),
-        )?;
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(&vec![0u8; usize::try_from(first_block_end).unwrap_or(0)])?;
-    }
-    // The file is nonetheless sparse: a few bytes inside that block are
-    // physically unallocated while the block as a whole is not a hole. This
-    // stands in for the compressed-filesystem case, where allocation falls below
-    // length for reasons that do not make any particular extent a hole.
-    memfs.punch_hole(&sst, 0, 8)?;
-    assert!(
-        fs.allocated_size(&sst)?.is_some_and(|a| a < len),
-        "the fixture reports less allocated space than its length",
-    );
-
-    let config = Config::new(
-        &root,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .with_shared_fs(memfs);
-    let report = config.repair()?;
+    build(&memfs)?;
+    let report = repair(memfs)?;
     assert_eq!(
         report.recovered, 0,
-        "the zeroed block has no hole under it, so it is damage: {report:?}",
+        "a zeroed run with no hole inside it is damage: {report:?}",
+    );
+
+    // A hole inside the run — covering only a slice of it, like a real
+    // unaligned punch — proves the reclaim, and the table recovers restricted
+    // instead of being condemned.
+    let memfs = Arc::new(MemFs::new());
+    let (sst, first_block_end) = build(&memfs)?;
+    memfs.punch_hole(&sst, first_block_end / 2, 8)?;
+    let report = repair(memfs)?;
+    assert_eq!(
+        report.recovered, 1,
+        "a hole contained in the zeroed run proves the punch: {report:?}",
     );
     Ok(())
 }
@@ -3955,7 +4000,7 @@ fn commit_repair_tmp_propagates_a_failed_swap() -> crate::Result<()> {
     ));
 
     assert!(
-        commit_repair_tmp(&fs, &tmp, &sst, SyncMode::Normal).is_err(),
+        commit_repair_tmp(&fs, &tmp, &sst, SyncMode::Normal, false).is_err(),
         "a failed swap must not be swallowed",
     );
     assert!(

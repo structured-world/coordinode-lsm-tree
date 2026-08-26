@@ -313,16 +313,34 @@ fn repair_tmp_path(table_path: &std::path::Path) -> PathBuf {
 /// table moves: a table adopted at `{id}` while a STALE `{id}.restrict-bound`
 /// survives would be reopened restricted at an unrelated bound, silently hiding
 /// its prefix.
+///
+/// `manifest_restricted` is whether the COMMITTED manifest restricts this id.
+/// It disambiguates a retry of an interrupted swap: with the sidecar step
+/// preceding the table rename, a crash between them leaves the replacement's
+/// sidecar already at the destination and no temp sidecar — a state that is
+/// byte-identical to "unrestricted replacement beside the source's stale
+/// sidecar". Only the manifest can tell them apart, and it is the authority
+/// for the bound anyway.
 pub(crate) fn commit_repair_tmp(
     fs: &dyn crate::fs::Fs,
     tmp_path: &std::path::Path,
     table_path: &std::path::Path,
     sync_mode: crate::fs::SyncMode,
+    manifest_restricted: bool,
 ) -> crate::Result<()> {
     let tmp_sidecar = crate::restrict_bound::sidecar_path(tmp_path);
     let dest_sidecar = crate::restrict_bound::sidecar_path(table_path);
     if fs.exists(&tmp_sidecar)? {
         fs.rename(&tmp_sidecar, &dest_sidecar)?;
+    } else if manifest_restricted {
+        // The manifest restricts this id, so a sidecar already at the
+        // destination is NOT the source's stale metadata — it is the
+        // replacement's own sidecar, moved by an interrupted earlier attempt.
+        // Deleting it would adopt a restricted replacement unrestricted on the
+        // next scan (the fresh copy is unpunched, so no geometry re-derives
+        // the bound) and resurrect the straddling block's sub-bound rows.
+        // Keep it; a missing or disagreeing sidecar is republished from the
+        // manifest by the next open.
     } else if fs.exists(&dest_sidecar)? {
         // The replacement is unrestricted, so the source's bound describes bytes
         // that are about to stop existing. Left in place it would reopen the
@@ -1362,16 +1380,17 @@ fn excised_extents(
     // deallocates, so each run must cover an actual HOLE; a backend that cannot
     // answer leaves it unproven, which keeps the zeros as damage.
     //
-    // Probed at the run's MIDPOINT rather than over the whole span: a run is
-    // bounded by the neighbouring bytes that happen to be nonzero, so it can
-    // reach a byte or two into the allocated blocks around the hole, and
-    // demanding the entire span be unallocated would reject genuine punches.
+    // Probed as CONTAINS-a-hole over the run rather than whole-span-is-a-hole
+    // or a single midpoint byte: the reclaim punches per block with unaligned
+    // extents, so the filesystem deallocates only the wholly-contained pages
+    // and leaves zero-filled boundary pages allocated — the whole span is
+    // never a hole, and a midpoint byte can land on one of those allocated
+    // boundary pages. Any hole inside the zeroed run is attributable to it.
     // Only the presence of the hole matters here — the single caller asks
     // whether the extent was reclaimed at all, not exactly where.
     let mut proven = Vec::with_capacity(merged.len());
     for (start, end) in merged {
-        let midpoint = start + (end - start) / 2;
-        if fs.extent_is_hole(source, midpoint, 1)? == Some(true) {
+        if fs.extent_contains_hole(source, start, end - start)? == Some(true) {
             proven.push((start, end));
         }
     }
@@ -1417,10 +1436,12 @@ fn source_prefix_is_punched(
     }
     // Zeros are not the evidence — corruption produces them too, and reading
     // ordinary damage as a lost punch bound sets the whole table aside instead
-    // of salvaging the blocks that are still readable. A reclaim deallocates, so
-    // the probed extent must be a HOLE. The same rule the block-level punch
-    // classifier applies; a backend that cannot answer leaves it unproven.
-    Ok(fs.extent_is_hole(table_path, 0, n as u64)? == Some(true))
+    // of salvaging the blocks that are still readable. A reclaim deallocates,
+    // so the probed window must carry a HOLE — contains-a-hole, the same rule
+    // the block-level punch classifier applies (an unaligned punch keeps its
+    // zero-filled edges allocated); a backend that cannot answer leaves it
+    // unproven.
+    Ok(fs.extent_contains_hole(table_path, 0, n as u64)? == Some(true))
 }
 
 /// Re-imposes a tight-space restriction on a SALVAGED replacement SST, the single
@@ -1602,17 +1623,18 @@ fn derive_blob_frontier(
     // whose records were only damaged. A punch deallocates, so the run must
     // read back as a hole. The same rule the SST classifiers apply.
     //
-    // Probed at the run's MIDPOINT: the run is bounded by the neighbouring
-    // non-zero bytes, so it can reach into the allocated blocks around the
-    // hole, and demanding the whole span be unallocated would reject genuine
-    // punches. A backend that cannot answer leaves the run unproven, which
-    // keeps the zeros classified as damage.
+    // Probed as CONTAINS-a-hole over the run: the run is bounded by the
+    // neighbouring non-zero bytes (so demanding the whole span be unallocated
+    // would reject genuine punches), and the punch's zero-filled edge pages
+    // stay allocated on a real filesystem (so a single midpoint byte can land
+    // on an allocated page even inside a genuine reclaim). A backend that
+    // cannot answer leaves the run unproven, which keeps the zeros classified
+    // as damage.
     let is_reclaimed = |from: u64, to: u64| -> crate::Result<bool> {
         if to <= from {
             return Ok(false);
         }
-        let midpoint = from + (to - from) / 2;
-        Ok(fs.extent_is_hole(path, midpoint, 1)? == Some(true))
+        Ok(fs.extent_contains_hole(path, from, to - from)? == Some(true))
     };
 
     // Fast path: an unpunched file's first frame magic (non-zero) sits at the
@@ -2640,7 +2662,13 @@ fn sweep_superseded_by_committed_manifest(config: &Config) -> crate::Result<()> 
                     None => false,
                 };
                 if published {
-                    commit_repair_tmp(&*folder_fs, &dirent.path, &table_path, config.sync_mode)?;
+                    commit_repair_tmp(
+                        &*folder_fs,
+                        &dirent.path,
+                        &table_path,
+                        config.sync_mode,
+                        recovery.restrictions.contains_key(&id),
+                    )?;
                     log::info!(
                         "repair: finished the pending swap of table {id} from a previous run",
                     );
@@ -2744,7 +2772,10 @@ fn repair_tree(
     // manifest that adopts them is durable. Same ordering rule as the removals,
     // for the same reason: before the commit the source is still the only copy
     // of its rows and is what the manifest names.
-    let mut swap_after_commit: Vec<(Arc<dyn crate::fs::Fs>, PathBuf, PathBuf)> = Vec::new();
+    // (fs, temp path, final path, replacement is restricted): the last flag
+    // rides along so a retried swap can tell an already-moved replacement
+    // sidecar from a stale source one (see `commit_repair_tmp`).
+    let mut swap_after_commit: Vec<(Arc<dyn crate::fs::Fs>, PathBuf, PathBuf, bool)> = Vec::new();
 
     for (table_base_folder, folder_fs) in config.all_tables_folders() {
         if !folder_fs.exists(&table_base_folder)? {
@@ -3165,6 +3196,7 @@ fn repair_tree(
                                         restrict_bound.clone(),
                                         allow_resurrection,
                                     )?;
+                                    let restricted = table.restrict_lower_bound().is_some();
                                     record_best(
                                         &mut recovered_by_id,
                                         &mut unreadable_files,
@@ -3179,6 +3211,7 @@ fn repair_tree(
                                         Arc::clone(&folder_fs),
                                         output_path,
                                         table_path,
+                                        restricted,
                                     ));
                                 }
                                 Ok(SalvageOutcome::Unusable | SalvageOutcome::PunchedBoundLost) => {
@@ -3364,6 +3397,7 @@ fn repair_tree(
                                 restrict_bound,
                                 allow_resurrection,
                             )?;
+                            let restricted = table.restrict_lower_bound().is_some();
                             record_best(
                                 &mut recovered_by_id,
                                 &mut unreadable_files,
@@ -3378,6 +3412,7 @@ fn repair_tree(
                                 Arc::clone(&folder_fs),
                                 output_path,
                                 table_path,
+                                restricted,
                             ));
                         }
                         Ok(SalvageOutcome::Unusable) => {
@@ -3669,8 +3704,9 @@ fn repair_tree(
                         restrict_bound,
                         allow_resurrection,
                     )?;
+                    let restricted = rewritten.restrict_lower_bound().is_some();
                     kept.push((rewritten, false));
-                    swap_after_commit.push((Arc::clone(&fs), output_path, path));
+                    swap_after_commit.push((Arc::clone(&fs), output_path, path, restricted));
                 }
                 Ok(SalvageOutcome::Unusable | SalvageOutcome::PunchedBoundLost) => {
                     set_aside_path(
@@ -3833,8 +3869,10 @@ fn repair_tree(
     // NOT best-effort: the manifest already names this content, so a swap that
     // does not happen is a tree whose next open finds the damaged file under the
     // manifest's checksum and fails.
-    for (fs, tmp_path, table_path) in swap_after_commit {
-        if let Err(e) = commit_repair_tmp(&*fs, &tmp_path, &table_path, config.sync_mode) {
+    for (fs, tmp_path, table_path, restricted) in swap_after_commit {
+        if let Err(e) =
+            commit_repair_tmp(&*fs, &tmp_path, &table_path, config.sync_mode, restricted)
+        {
             log::error!(
                 "repair: cannot swap the replacement {} onto {} ({e}); failing the \
                  repair — the committed manifest names the replacement's content",

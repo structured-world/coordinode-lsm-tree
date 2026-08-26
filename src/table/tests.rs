@@ -1099,6 +1099,84 @@ fn punch_on_drop_refuses_a_hard_linked_table() -> crate::Result<()> {
     Ok(())
 }
 
+/// Proving a punch must ask whether the zeroed run CONTAINS a hole, not
+/// whether each block's own extent wholly IS one: `punch_hole` on an
+/// unaligned block extent zero-fills the edge pages and deallocates only the
+/// wholly-contained ones, so on a real filesystem every punched block keeps
+/// allocated zeros at its boundaries. A whole-extent probe then rejects the
+/// genuine punch, and a manifest-loss repair misclassifies the reclaimed SST
+/// as damage — discarding its intact live suffix or salvaging it without the
+/// required bound.
+#[cfg(feature = "std")]
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn punched_run_with_allocated_edges_still_proves_the_punch() -> crate::Result<()> {
+    use crate::fs::Fs;
+    use std::io::{Seek, SeekFrom, Write};
+
+    let memfs = crate::fs::MemFs::new();
+    let fs: Arc<dyn Fs> = Arc::new(memfs.clone());
+    let root = std::path::absolute("/db")?;
+    fs.create_dir_all(&root)?;
+
+    let path = root.join("0");
+    let mut writer = Writer::new(path.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(256);
+    for i in 0..256u32 {
+        writer.write(crate::InternalValue::from_components(
+            format!("k{i:04}").into_bytes(),
+            b"v",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = {
+        #[cfg(feature = "metrics")]
+        let metrics = Arc::new(Metrics::default());
+        let mut params = test_recover_params(path.clone(), checksum);
+        params.descriptor_table = None;
+        params.fs = Arc::clone(&fs);
+        #[cfg(feature = "metrics")]
+        {
+            params.metrics = metrics;
+        }
+        Table::recover(params)?
+    };
+    let punch_off = table.punch_offset_for(b"k0128")?;
+    assert!(punch_off > 64, "the fixture has a punchable prefix");
+
+    // The reclaim's read-back shape: the whole prefix reads as zeros...
+    {
+        let mut file = fs.open(
+            &path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&vec![
+            0u8;
+            usize::try_from(punch_off).expect("small fixture")
+        ])?;
+    }
+    // ...but zeros alone are damage, not proof.
+    assert!(
+        !table.has_punched_data_block()?,
+        "zeros without a hole are corruption, never a punch",
+    );
+
+    // The filesystem's unaligned-punch behavior: only a small interior range
+    // of the zeroed run is actually deallocated — no data block's own extent
+    // is wholly a hole (its boundary pages stay allocated, zero-filled).
+    let mid = punch_off / 2;
+    memfs.punch_hole(&path, mid - 8, 16)?;
+    assert!(
+        table.has_punched_data_block()?,
+        "a hole contained in the zeroed run proves the punch even though no \
+         block's whole extent is one",
+    );
+    Ok(())
+}
+
 /// A reclaim blocked by a COMPLETED checkpoint's surviving hard link must be
 /// RETAINED, not discarded. The pause is no longer active (so the deferred
 /// queue is not an option), yet the dropping view holds the only record of the
@@ -2854,6 +2932,49 @@ fn table_return_global_seqno() -> crate::Result<()> {
         table.get(b"abc", 2 * SEQNO, hash64(b"abc"))?.unwrap(),
     );
 
+    Ok(())
+}
+
+/// A bulk-ingested table's whole content sits at effective seqno
+/// `global_seqno` (every row is stored at local 0). An upper bound BELOW that
+/// base must therefore return nothing — but both translated bounds saturate
+/// to local 0, and `[0, 0]` is a valid one-seqno window that matches every
+/// stored row, so without an explicit base check the scan returned rows whose
+/// translated-back seqno exceeds the caller's inclusive upper bound.
+#[test]
+fn scan_seqno_range_returns_nothing_below_a_bulk_ingest_base() -> crate::Result<()> {
+    use crate::ValueType::Value;
+    use crate::fs::StdFs;
+
+    const BASE: SeqNo = 100;
+
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("ingested");
+    let mut writer = crate::table::Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    writer.write(InternalValue::from_components("abc", "abc", 0, Value))?;
+    let _trailer = writer.finish()?;
+
+    let table = {
+        let mut params = test_recover_params(file, crate::Checksum::from_raw(0));
+        params.global_seqno = BASE;
+        params.cache = Arc::new(crate::Cache::with_capacity_bytes(0));
+        crate::Table::recover(params)?
+    };
+
+    // The window [0, 50] ends below the base: no effective seqno of this
+    // table can fall inside it.
+    assert_eq!(
+        table.scan_seqno_range(0, BASE / 2, true)?,
+        Vec::new(),
+        "an upper bound below the ingest base must exclude the whole table",
+    );
+    // Sanity: a window that DOES reach the base still returns the row, at its
+    // effective (translated) seqno.
+    assert_eq!(
+        table.scan_seqno_range(0, BASE, true)?,
+        vec![InternalValue::from_components("abc", "abc", BASE, Value)],
+        "a window covering the base returns the row at its effective seqno",
+    );
     Ok(())
 }
 

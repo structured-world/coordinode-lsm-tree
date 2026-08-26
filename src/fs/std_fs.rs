@@ -470,6 +470,14 @@ impl Fs for StdFs {
     fn extent_is_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<Option<bool>> {
         Ok(linux_caps::extent_is_hole(path, offset, len)?)
     }
+
+    /// Linux: contained-hole probe via `lseek(SEEK_HOLE)` (see the trait docs —
+    /// an unaligned punch leaves its zero-filled edges allocated, so the
+    /// whole-range probe above answers `false` on a genuinely punched range).
+    #[cfg(target_os = "linux")]
+    fn extent_contains_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<Option<bool>> {
+        Ok(linux_caps::extent_contains_hole(path, offset, len)?)
+    }
 }
 
 /// Shared by every backend that resolves paths against the host kernel's
@@ -1177,10 +1185,67 @@ mod linux_caps {
         Ok(Some(u64::try_from(next_data).unwrap_or(u64::MAX) >= end))
     }
 
+    /// As [`extent_is_hole`], but answers whether the range CONTAINS a hole:
+    /// `lseek(SEEK_HOLE)` finds the next hole at or after `offset`, and a
+    /// result before the range end proves a contained hole. The implicit
+    /// every-file-ends-in-a-hole EOF state is excluded by clamping the range
+    /// end to the file length — a fully allocated file seeks to EOF, which is
+    /// never below the clamped end.
+    #[cfg(target_pointer_width = "64")]
+    pub(super) fn extent_contains_hole(
+        path: &Path,
+        offset: u64,
+        len: u64,
+    ) -> io::Result<Option<bool>> {
+        if len == 0 {
+            return Ok(Some(false));
+        }
+        let off = i64::try_from(offset)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset exceeds i64"))?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "extent end overflows"))?;
+        let f = File::open(path)?;
+        let file_len = f.metadata()?.len();
+        // SAFETY: `f` owns a valid readable fd for the duration of the call; the
+        // offset and whence are plain integers.
+        #[expect(
+            unsafe_code,
+            reason = "lseek(SEEK_HOLE) FFI for a contained-hole probe"
+        )]
+        let next_hole = unsafe { libc::lseek(f.as_raw_fd(), off, libc::SEEK_HOLE) };
+        if next_hole < 0 {
+            let err = io::Error::last_os_error();
+            // Offset at or past EOF: nothing of the range is backed by the
+            // file, so no hole INSIDE it can be attributed.
+            if err.raw_os_error() == Some(libc::ENXIO) {
+                return Ok(Some(false));
+            }
+            // A filesystem without SEEK_HOLE cannot answer; do not guess.
+            if matches!(err.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP)) {
+                return Ok(None);
+            }
+            return Err(err);
+        }
+        Ok(Some(
+            u64::try_from(next_hole).unwrap_or(u64::MAX) < end.min(file_len),
+        ))
+    }
+
     /// 32-bit Linux: `punch_hole` is unsupported there, so no hole can exist to
     /// attribute; "cannot tell" is the truthful answer.
     #[cfg(not(target_pointer_width = "64"))]
     pub(super) fn extent_is_hole(
+        _path: &Path,
+        _offset: u64,
+        _len: u64,
+    ) -> io::Result<Option<bool>> {
+        Ok(None)
+    }
+
+    /// 32-bit Linux: as [`extent_is_hole`] — no punch support, "cannot tell".
+    #[cfg(not(target_pointer_width = "64"))]
+    pub(super) fn extent_contains_hole(
         _path: &Path,
         _offset: u64,
         _len: u64,
