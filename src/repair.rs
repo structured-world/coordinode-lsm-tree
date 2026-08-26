@@ -2573,6 +2573,18 @@ fn sweep_superseded_by_committed_manifest(config: &Config) -> crate::Result<()> 
             if referenced_tables.contains(&id) {
                 continue;
             }
+            // Unreferenced bare-id files are removed even though one COULD be a
+            // compaction input whose referenced output turns out corrupt below.
+            // Deliberate, not an oversight: an output carries the SAME seqnos as
+            // its inputs, so letting the scan adopt both would put one history
+            // into L0 twice, and version collapse would then gather a key's
+            // merge operands from both copies — applying each operand twice and
+            // silently serving a wrong value. An honest loss (reported via
+            // `lost_coverage`) beats that corruption; the sweep also only
+            // applies the tree's own rule, since any successful open removes
+            // the same orphans. Content a corrupt referenced file lost comes
+            // back from a replica, a checkpoint plus journal replay, or a
+            // backup — never from resurrected orphans.
             discard_unreferenced(&*folder_fs, &dirent.path, config.sync_mode)?;
             log::info!("repair: table {id} is superseded by the committed manifest; removed");
         }
