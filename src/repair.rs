@@ -2688,65 +2688,55 @@ fn repair_tree(
                 continue;
             }
 
-            // Heal artifacts are not table files: `Tree::open` recognizes them
-            // and PRESERVES the live `{id}.heal-attest` sidecar (the next scrub
-            // reconciles a crashed digest refresh through it). Repair must not
-            // remove it, or a rebuild that fails before committing the manifest
-            // would strand the healed table under its stale pre-heal digest.
-            // Match the exact shapes recovery owns (numeric id + heal suffix); a
-            // foreign name merely containing the suffix falls through to the id
-            // parse below and is classified there.
-            let is_sidecar_artifact = file_name
-                .strip_suffix(".heal-attest")
-                .or_else(|| file_name.strip_suffix(".heal-attest.tmp"))
-                // The `.restrict-bound` sidecar (and its crashed `.tmp`) carries a
-                // punched SST's restriction bound; repair reads it FOR its SST (via
-                // `restrict_bound::read`), so the sidecar file itself is never a
-                // table and must not be parsed or classified as one.
-                .or_else(|| file_name.strip_suffix(".restrict-bound"))
-                .or_else(|| file_name.strip_suffix(".restrict-bound.tmp"))
-                .is_some_and(|id| id.parse::<TableId>().is_ok())
-                // {id}.healtmp-{n}: BOTH the id and the numeric sequence must
-                // parse, matching recovery's ownership check. A foreign name like
-                // `5.healtmp-backup` is NOT owned (recovery would fail its
-                // non-numeric name), so it must fall through to the foreign-name
-                // classification here.
-                || file_name.split_once(".healtmp-").is_some_and(|(id, seq)| {
-                    id.parse::<TableId>().is_ok() && seq.parse::<u64>().is_ok()
-                });
-            if is_sidecar_artifact {
-                continue;
-            }
-
-            // `{id}.repair-tmp` is a replacement a previous repair was building
-            // and never published: no manifest names it (one that did was
-            // swapped in before this scan started), and its source is whatever
-            // this scan finds under `{id}`. It is therefore garbage, and it is
-            // removed NOW rather than after the commit — this run needs the name
-            // free to build its own replacement. Removing it cannot lose rows:
-            // every row it holds came from a file this scan is about to read.
-            if table_id_from_repair_tmp_name(&file_name).is_some() {
-                discard_unreferenced(&*folder_fs, &table_path, config.sync_mode)?;
-                log::warn!(
-                    "repair: dropped an abandoned replacement {}",
-                    table_path.display(),
-                );
-                continue;
-            }
-
-            let Ok(table_id) = file_name.parse::<TableId>() else {
-                // A non-numeric name cannot be a table id, and `Tree::open`
-                // rejects such a file outright (recovery parses every name in
+            // One grammar decides what each name IS (`TableDirEntry`, shared
+            // with `Tree::open`'s sweep so the two can never disagree on
+            // ownership); this match is the repair scan's POLICY for each kind.
+            use crate::file::TableDirEntry;
+            let table_id = match TableDirEntry::classify(&file_name) {
+                // Sidecar artifacts are not table files, and repair must not
+                // remove the live ones: `Tree::open` PRESERVES a live
+                // `{id}.heal-attest` (the next scrub reconciles a crashed digest
+                // refresh through it), and the `.restrict-bound` bound is read
+                // FOR its SST via `restrict_bound::read` — removing either would
+                // strand its table. The disposable `.tmp` shapes are left to the
+                // open's own sweep.
+                TableDirEntry::HealAttest(_)
+                | TableDirEntry::HealAttestTmp(_)
+                | TableDirEntry::HealTmp(_)
+                | TableDirEntry::RestrictBound(_)
+                | TableDirEntry::RestrictBoundTmp(_) => continue,
+                // `{id}.repair-tmp` is a replacement a previous repair was
+                // building and never published: no manifest names it (one that
+                // did was swapped in before this scan started), and its source
+                // is whatever this scan finds under `{id}`. It is therefore
+                // garbage, and it is removed NOW rather than after the commit —
+                // this run needs the name free to build its own replacement.
+                // Removing it cannot lose rows: every row it holds came from a
+                // file this scan is about to read.
+                TableDirEntry::RepairTmp(_) => {
+                    discard_unreferenced(&*folder_fs, &table_path, config.sync_mode)?;
+                    log::warn!(
+                        "repair: dropped an abandoned replacement {}",
+                        table_path.display(),
+                    );
+                    continue;
+                }
+                // A foreign name cannot be a table id, and `Tree::open` rejects
+                // such a file outright (recovery parses every name in
                 // `tables/`). Leaving it there would let repair report success
                 // over a tree that still cannot reopen, so it is removed after
                 // the commit; a removal that fails then fails the repair.
-                discard_after_commit.push((
-                    Arc::clone(&folder_fs),
-                    table_path.clone(),
-                    "file name is not a table id".to_string(),
-                ));
-                unreadable_files.push((table_path, "file name is not a table id".to_string()));
-                continue;
+                TableDirEntry::Foreign => {
+                    set_aside_path(
+                        &folder_fs,
+                        &table_path,
+                        "file name is not a table id",
+                        &mut unreadable_files,
+                        &mut discard_after_commit,
+                    );
+                    continue;
+                }
+                TableDirEntry::Table(id) => id,
             };
 
             if let Some(p) = &config.recovery_progress {
@@ -2769,15 +2759,13 @@ fn repair_tree(
                 // A genuine duplicate: removed after the commit so recovery
                 // cannot later resolve it instead of the kept copy (the manifest
                 // records only id + checksum, not a path).
-                discard_after_commit.push((
-                    Arc::clone(&folder_fs),
-                    table_path.clone(),
-                    format!("duplicate of table {table_id}; a complete copy is already held"),
-                ));
-                unreadable_files.push((
-                    table_path,
-                    "duplicate table id; a complete copy is already held".to_string(),
-                ));
+                set_aside_path(
+                    &folder_fs,
+                    &table_path,
+                    "duplicate table id; a complete copy is already held",
+                    &mut unreadable_files,
+                    &mut discard_after_commit,
+                );
                 continue;
             }
 
@@ -2864,13 +2852,13 @@ fn repair_tree(
                 t.max_local_seqno(),
             )) {
                 drop(recovered); // release the file handle
-                let reason = "bulk-ingest sequence offset cannot be reconstructed from the SST";
-                discard_after_commit.push((
-                    Arc::clone(&folder_fs),
-                    table_path.clone(),
-                    reason.to_string(),
-                ));
-                unreadable_files.push((table_path, reason.to_string()));
+                set_aside_path(
+                    &folder_fs,
+                    &table_path,
+                    "bulk-ingest sequence offset cannot be reconstructed from the SST",
+                    &mut unreadable_files,
+                    &mut discard_after_commit,
+                );
                 continue;
             }
 
@@ -2985,12 +2973,13 @@ fn repair_tree(
                                     }
                                 };
                                 drop(table);
-                                discard_after_commit.push((
-                                    Arc::clone(&folder_fs),
-                                    table_path.clone(),
-                                    reason.to_string(),
-                                ));
-                                unreadable_files.push((table_path, reason.to_string()));
+                                set_aside_path(
+                                    &folder_fs,
+                                    &table_path,
+                                    reason,
+                                    &mut unreadable_files,
+                                    &mut discard_after_commit,
+                                );
                                 continue 'dirent;
                             }
                         }
@@ -3033,12 +3022,13 @@ fn repair_tree(
                         }
                         RepairKeepDecision::Drop(reason) => {
                             drop(table);
-                            discard_after_commit.push((
-                                Arc::clone(&folder_fs),
-                                table_path.clone(),
-                                reason.to_string(),
-                            ));
-                            unreadable_files.push((table_path, reason.to_string()));
+                            set_aside_path(
+                                &folder_fs,
+                                &table_path,
+                                reason,
+                                &mut unreadable_files,
+                                &mut discard_after_commit,
+                            );
                         }
                         RepairKeepDecision::Salvage => {
                             // A tight-space RESTRICTED punched SST whose live suffix
@@ -3112,12 +3102,13 @@ fn repair_tree(
                                 }
                                 Ok(SalvageOutcome::Unusable | SalvageOutcome::PunchedBoundLost) => {
                                     let reason = "verify found corrupt blocks; nothing salvageable";
-                                    discard_after_commit.push((
-                                        Arc::clone(&folder_fs),
-                                        table_path.clone(),
-                                        reason.to_string(),
-                                    ));
-                                    unreadable_files.push((table_path, reason.to_string()));
+                                    set_aside_path(
+                                        &folder_fs,
+                                        &table_path,
+                                        reason,
+                                        &mut unreadable_files,
+                                        &mut discard_after_commit,
+                                    );
                                 }
                                 // A TRANSIENT I/O salvage failure is retryable, and
                                 // nothing has moved: the source is untouched, so the
@@ -3131,12 +3122,13 @@ fn repair_tree(
                                         "verify found corrupt blocks; salvage failed \
                                          ({salvage_err})"
                                     );
-                                    discard_after_commit.push((
-                                        Arc::clone(&folder_fs),
-                                        table_path.clone(),
-                                        reason.clone(),
-                                    ));
-                                    unreadable_files.push((table_path, reason));
+                                    set_aside_path(
+                                        &folder_fs,
+                                        &table_path,
+                                        &reason,
+                                        &mut unreadable_files,
+                                        &mut discard_after_commit,
+                                    );
                                 }
                             }
                         }
@@ -3182,12 +3174,13 @@ fn repair_tree(
                                 }
                             };
                             drop(table);
-                            discard_after_commit.push((
-                                Arc::clone(&folder_fs),
-                                table_path.clone(),
-                                reason.to_string(),
-                            ));
-                            unreadable_files.push((table_path, reason.to_string()));
+                            set_aside_path(
+                                &folder_fs,
+                                &table_path,
+                                reason,
+                                &mut unreadable_files,
+                                &mut discard_after_commit,
+                            );
                         }
                     }
                 }
@@ -3244,12 +3237,13 @@ fn repair_tree(
                         let reason = "punched SST with no recoverable restriction bound \
                                       (missing / corrupt sidecar and failed recovery); a \
                                       resurrection repair keeps its readable region instead";
-                        discard_after_commit.push((
-                            Arc::clone(&folder_fs),
-                            table_path.clone(),
-                            reason.to_string(),
-                        ));
-                        unreadable_files.push((table_path, reason.to_string()));
+                        set_aside_path(
+                            &folder_fs,
+                            &table_path,
+                            reason,
+                            &mut unreadable_files,
+                            &mut discard_after_commit,
+                        );
                         continue;
                     }
                     // Whole-file recovery failed structurally; try block-level
@@ -3307,12 +3301,13 @@ fn repair_tree(
                         }
                         Ok(SalvageOutcome::Unusable) => {
                             let reason = format!("unrecoverable ({e}); nothing salvageable");
-                            discard_after_commit.push((
-                                Arc::clone(&folder_fs),
-                                table_path.clone(),
-                                reason.clone(),
-                            ));
-                            unreadable_files.push((table_path, reason));
+                            set_aside_path(
+                                &folder_fs,
+                                &table_path,
+                                &reason,
+                                &mut unreadable_files,
+                                &mut discard_after_commit,
+                            );
                         }
                         Ok(SalvageOutcome::PunchedBoundLost) => {
                             // The flag decides this within THIS run: with
@@ -3324,12 +3319,13 @@ fn repair_tree(
                                  extents found during salvage): {e}; a resurrection repair \
                                  keeps its readable region instead"
                             );
-                            discard_after_commit.push((
-                                Arc::clone(&folder_fs),
-                                table_path.clone(),
-                                reason.clone(),
-                            ));
-                            unreadable_files.push((table_path, reason));
+                            set_aside_path(
+                                &folder_fs,
+                                &table_path,
+                                &reason,
+                                &mut unreadable_files,
+                                &mut discard_after_commit,
+                            );
                         }
                         // Transient I/O salvage failure: nothing moved, so the
                         // retry re-derives the same salvage from the untouched
@@ -3340,12 +3336,13 @@ fn repair_tree(
                         Err(salvage_err) => {
                             let reason =
                                 format!("recovery failed ({e}); salvage failed ({salvage_err})");
-                            discard_after_commit.push((
-                                Arc::clone(&folder_fs),
-                                table_path.clone(),
-                                reason.clone(),
-                            ));
-                            unreadable_files.push((table_path, reason));
+                            set_aside_path(
+                                &folder_fs,
+                                &table_path,
+                                &reason,
+                                &mut unreadable_files,
+                                &mut discard_after_commit,
+                            );
                         }
                     }
                 }
@@ -3364,12 +3361,13 @@ fn repair_tree(
                     // place is an orphan the next open must sweep, and an open
                     // that cannot sweep it fails.
                     let reason = e.to_string();
-                    discard_after_commit.push((
-                        Arc::clone(&folder_fs),
-                        table_path.clone(),
-                        reason.clone(),
-                    ));
-                    unreadable_files.push((table_path, reason));
+                    set_aside_path(
+                        &folder_fs,
+                        &table_path,
+                        &reason,
+                        &mut unreadable_files,
+                        &mut discard_after_commit,
+                    );
                 }
             }
         }

@@ -4407,161 +4407,117 @@ impl Tree {
                     continue;
                 }
 
-                // An in-place heal detaches a hard-linked SST through a
-                // `{id}.healtmp-{n}` copy that is renamed over the live path;
-                // a hard crash between its creation and the rename leaves the
-                // artifact behind. It is never referenced by any manifest, so
-                // sweep it instead of failing the id parse below. Only the
-                // EXACT artifact shape (numeric id, numeric sequence) is owned
-                // cleanup state — a foreign name that merely contains
-                // `.healtmp` (an operator backup like `0.healtmp.backup`) must
-                // fall through to the id parse and fail recovery unharmed,
-                // never be deleted.
-                if let Some((id_part, seq_part)) = table_file_name.split_once(".healtmp-")
-                    && id_part.parse::<TableId>().is_ok()
-                    && seq_part.parse::<u64>().is_ok()
-                {
-                    log::warn!(
-                        "Removing abandoned heal copy: {}",
-                        table_file_path.display()
-                    );
-                    Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
-                    continue;
-                }
-
-                // A `{id}.heal-attest.tmp` is a crashed sidecar-publish temp: the
-                // attestation was written + synced to this temp for an atomic
-                // rename onto `{id}.heal-attest`, but the process died before the
-                // rename. It is disposable: either the live sidecar it would have
-                // replaced still bridges the crash window, or the heal is re-run,
-                // so sweep it like the healtmp copies. Checked BEFORE the
-                // `.heal-attest` skip because that suffix is a prefix of this one.
-                if table_file_name
-                    .strip_suffix(".heal-attest.tmp")
-                    .is_some_and(|id| id.parse::<TableId>().is_ok())
-                {
-                    log::warn!(
-                        "Removing abandoned heal-attest temp: {}",
-                        table_file_path.display()
-                    );
-                    Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
-                    continue;
-                }
-
-                // A `{id}.heal-attest` sidecar records that an in-place heal
-                // corrected `{id}` but its manifest digest refresh may not have
-                // landed; the next scrub consumes it to reconcile. It is never a
-                // table file, so never parse it as an id. Only the EXACT shape
-                // (numeric id + exact suffix) is owned; a foreign name merely
-                // containing `.heal-attest` falls through to the id parse and
-                // fails recovery unharmed.
-                if let Some(attest_id) = table_file_name
-                    .strip_suffix(".heal-attest")
-                    .and_then(|id| id.parse::<TableId>().ok())
-                {
+                // One grammar decides what each name IS (`TableDirEntry`, shared
+                // with the repair scan so the two can never disagree on
+                // ownership); this match is the open's POLICY for each kind.
+                let table_id = match crate::file::TableDirEntry::classify(table_file_name) {
+                    // An in-place heal's detach copy, renamed over the live path
+                    // on success: a survivor is a crash leftover no manifest ever
+                    // references. Sweep it.
+                    crate::file::TableDirEntry::HealTmp(_) => {
+                        log::warn!(
+                            "Removing abandoned heal copy: {}",
+                            table_file_path.display()
+                        );
+                        Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                        continue;
+                    }
+                    // A crashed attestation publish: either the live sidecar it
+                    // would have replaced still bridges the crash window, or the
+                    // heal is re-run. Disposable.
+                    crate::file::TableDirEntry::HealAttestTmp(_) => {
+                        log::warn!(
+                            "Removing abandoned heal-attest temp: {}",
+                            table_file_path.display()
+                        );
+                        Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                        continue;
+                    }
                     // A LIVE table's pending attestation is preserved (the next
-                    // scrub reconciles a crashed refresh through it). But if its
-                    // SST is absent from the manifest, the table was retired
-                    // (compacted away, its file unlinked) while the sidecar
-                    // lingered: nothing can ever reconcile a table that no longer
-                    // exists, so sweep the orphan rather than leak the directory
-                    // entry and re-process it on every future recovery.
-                    if !manifest_ids.contains(&attest_id) {
-                        log::warn!(
-                            "Removing orphaned heal attestation (its table is gone): {}",
-                            table_file_path.display()
-                        );
-                        Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
-                    }
-                    continue;
-                }
-
-                // A `{id}.restrict-bound.tmp` is a crashed sidecar-publish temp
-                // (written + synced for an atomic rename onto `{id}.restrict-bound`
-                // that never landed). Disposable — sweep it. Checked BEFORE the
-                // `.restrict-bound` skip because that suffix is a prefix of this one.
-                if table_file_name
-                    .strip_suffix(".restrict-bound.tmp")
-                    .is_some_and(|id| id.parse::<TableId>().is_ok())
-                {
-                    log::warn!(
-                        "Removing abandoned restrict-bound temp: {}",
-                        table_file_path.display()
-                    );
-                    Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
-                    continue;
-                }
-
-                // A `{id}.restrict-bound` sidecar records the exact tight-space
-                // restriction bound of a hole-punched `{id}`, so manifest repair
-                // can recover the restriction. It is never a table file, so never
-                // parse it as an id. A LIVE table's sidecar is preserved (repair
-                // needs it); an ORPHAN one (its SST retired from the manifest) is
-                // swept so a reused id cannot later pick up a stale restriction.
-                // Only the EXACT shape (numeric id + exact suffix) is owned; a
-                // foreign name merely containing the suffix falls through unharmed.
-                if let Some(bound_id) = table_file_name
-                    .strip_suffix(".restrict-bound")
-                    .and_then(|id| id.parse::<TableId>().ok())
-                {
-                    if !manifest_ids.contains(&bound_id) {
-                        log::warn!(
-                            "Removing orphaned restrict-bound sidecar (its table is gone): {}",
-                            table_file_path.display()
-                        );
-                        Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
-                    }
-                    continue;
-                }
-
-                // A `{id}.repair-tmp` is a replacement a manifest repair was
-                // building. If the manifest names its id, that repair committed
-                // and died before the swap, and this file — not the damaged one
-                // beside it — is what the manifest describes: finish the swap.
-                // If it does not, the repair never committed and the temp is
-                // garbage. Both answers come from the manifest alone, so an open
-                // resolves it exactly as a re-run of the repair would.
-                if let Some(tmp_id) = crate::file::table_id_from_repair_tmp_name(table_file_name) {
-                    if manifest_ids.contains(&tmp_id) {
-                        #[cfg(feature = "std")]
-                        {
+                    // scrub reconciles a crashed digest refresh through it). One
+                    // whose SST left the manifest is unreconcilable forever:
+                    // sweep the orphan rather than re-process it on every open.
+                    crate::file::TableDirEntry::HealAttest(attest_id) => {
+                        if !manifest_ids.contains(&attest_id) {
                             log::warn!(
-                                "Finishing a repair's pending swap of table {tmp_id}: {}",
+                                "Removing orphaned heal attestation (its table is gone): {}",
                                 table_file_path.display()
                             );
-                            crate::repair::commit_repair_tmp(
-                                folder_fs.as_ref(),
-                                &table_file_path,
-                                &table_base_folder.join(tmp_id.to_string()),
-                                config.sync_mode,
-                            )?;
+                            Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
                         }
-                        // Without the repair module nothing here can finish the
-                        // swap, and sweeping the temp would destroy the only copy
-                        // of what the manifest names.
-                        #[cfg(not(feature = "std"))]
-                        {
-                            log::error!(
-                                "Table {tmp_id} exists only as an unpublished repair \
-                                 replacement; run a repair to finish it: {}",
-                                table_file_path.display()
-                            );
-                            return Err(crate::Error::Unrecoverable);
-                        }
-                    } else {
+                        continue;
+                    }
+                    // A crashed bound publish. Disposable.
+                    crate::file::TableDirEntry::RestrictBoundTmp(_) => {
                         log::warn!(
-                            "Removing abandoned repair replacement: {}",
+                            "Removing abandoned restrict-bound temp: {}",
                             table_file_path.display()
                         );
                         Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                        continue;
                     }
-                    continue;
-                }
-
-                let table_id = table_file_name.parse::<TableId>().map_err(|e| {
-                    log::error!("invalid table file name {table_file_name:?}: {e:?}");
-                    crate::Error::Unrecoverable
-                })?;
+                    // A LIVE table's restriction bound is preserved (manifest
+                    // repair reads it); an ORPHAN one is swept so a reused id
+                    // cannot later pick up a stale restriction.
+                    crate::file::TableDirEntry::RestrictBound(bound_id) => {
+                        if !manifest_ids.contains(&bound_id) {
+                            log::warn!(
+                                "Removing orphaned restrict-bound sidecar (its table is gone): {}",
+                                table_file_path.display()
+                            );
+                            Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                        }
+                        continue;
+                    }
+                    // A repair's unpublished replacement. If the manifest names
+                    // its id, that repair committed and died before the swap, and
+                    // this file — not the damaged one beside it — is what the
+                    // manifest describes: finish the swap. Otherwise the repair
+                    // never committed and the temp is garbage. Both answers come
+                    // from the manifest alone, so an open resolves it exactly as
+                    // a re-run of the repair would.
+                    crate::file::TableDirEntry::RepairTmp(tmp_id) => {
+                        if manifest_ids.contains(&tmp_id) {
+                            #[cfg(feature = "std")]
+                            {
+                                log::warn!(
+                                    "Finishing a repair's pending swap of table {tmp_id}: {}",
+                                    table_file_path.display()
+                                );
+                                crate::repair::commit_repair_tmp(
+                                    folder_fs.as_ref(),
+                                    &table_file_path,
+                                    &table_base_folder.join(tmp_id.to_string()),
+                                    config.sync_mode,
+                                )?;
+                            }
+                            // Without the repair module nothing here can finish
+                            // the swap, and sweeping the temp would destroy the
+                            // only copy of what the manifest names.
+                            #[cfg(not(feature = "std"))]
+                            {
+                                log::error!(
+                                    "Table {tmp_id} exists only as an unpublished repair \
+                                     replacement; run a repair to finish it: {}",
+                                    table_file_path.display()
+                                );
+                                return Err(crate::Error::Unrecoverable);
+                            }
+                        } else {
+                            log::warn!(
+                                "Removing abandoned repair replacement: {}",
+                                table_file_path.display()
+                            );
+                            Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                        }
+                        continue;
+                    }
+                    crate::file::TableDirEntry::Foreign => {
+                        log::error!("invalid table file name {table_file_name:?}");
+                        return Err(crate::Error::Unrecoverable);
+                    }
+                    crate::file::TableDirEntry::Table(id) => id,
+                };
 
                 // Remove from map to prevent duplicate recovery if the same
                 // table file exists in multiple scanned folders.
