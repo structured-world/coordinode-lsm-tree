@@ -36,6 +36,35 @@ pub mod scan_freeze_hook {
     }
 }
 
+/// Test seam for range-deletion writes: fired by `remove_range` between
+/// obtaining the active memtable and inserting the tombstone, so a test can
+/// prove the version-history read guard spans the whole insert — the CDC
+/// scan's writer exclusion (see `scan_freeze_hook`) depends on that.
+#[cfg(test)]
+pub mod range_write_hook {
+    use alloc::boxed::Box;
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn Fn() + Send>;
+    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+
+    /// Installs `hook`, replacing any previous one. Each test runs in its own
+    /// process, so the static carries no cross-test state.
+    pub fn install(hook: Hook) {
+        #[expect(clippy::unwrap_used, reason = "test-only seam")]
+        HOOK.lock().unwrap().replace(hook);
+    }
+
+    /// Runs the installed hook, if any.
+    pub fn fire() {
+        #[expect(clippy::unwrap_used, reason = "test-only seam")]
+        let guard = HOOK.lock().unwrap();
+        if let Some(hook) = guard.as_ref() {
+            hook();
+        }
+    }
+}
+
 use crate::path::Path;
 use crate::{
     AbstractTree, Checksum, KvPair, SeqNo, SequenceNumberCounter, TableId, UserKey, UserValue,
@@ -1723,9 +1752,21 @@ impl AbstractTree for Tree {
     }
 
     fn remove_range<K: Into<UserKey>>(&self, start: K, end: K, seqno: SeqNo) -> u64 {
-        let memtable = Arc::clone(&self.version_history.read().latest_version().active_memtable);
+        // The read guard is held through the insert, like `append_entry`: the
+        // CDC scan's capture (write side of this lock) must exclude every
+        // in-flight memtable write, or a backdated range deletion could land
+        // after the capture yet below the returned watermark and be lost; the
+        // guard also keeps a concurrent `rotate_memtable()` from sealing the
+        // memtable mid-insert.
+        let history = self.version_history.read();
 
-        memtable.insert_range_tombstone(start.into(), end.into(), seqno)
+        #[cfg(test)]
+        range_write_hook::fire();
+
+        history
+            .latest_version()
+            .active_memtable
+            .insert_range_tombstone(start.into(), end.into(), seqno)
     }
 }
 
