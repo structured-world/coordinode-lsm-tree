@@ -387,6 +387,29 @@ impl AbstractTree for BlobTree {
         self.index.current_version()
     }
 
+    #[cfg(feature = "std")]
+    fn refresh_table_checksum(
+        &self,
+        table_id: crate::TableId,
+        checksum: crate::checksum::Checksum,
+        expected_restriction: Option<&crate::UserKey>,
+    ) -> crate::Result<crate::abstract_tree::ChecksumRefreshOutcome> {
+        // Tables live in the index tree's version; blob files carry no
+        // manifest digest.
+        self.index
+            .refresh_table_checksum(table_id, checksum, expected_restriction)
+    }
+
+    fn sync_mode(&self) -> crate::fs::SyncMode {
+        // SSTs live in the index tree; its durability mode governs them.
+        self.index.sync_mode()
+    }
+
+    fn prefix_extractor(&self) -> Option<alloc::sync::Arc<dyn crate::prefix::PrefixExtractor>> {
+        // The prefix filter is built over the index tree's SST keys.
+        self.index.prefix_extractor()
+    }
+
     fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
         // Forward the index tree's compaction state (the default impl would
         // always report idle), and mark value bytes as NOT user values: large
@@ -900,24 +923,32 @@ impl AbstractTree for BlobTree {
         let tables = result
             .into_iter()
             .map(|(table_id, checksum)| -> crate::Result<Table> {
-                Table::recover(
+                let mut params = crate::table::RecoverParams::new(
                     table_folder.join(table_id.to_string()),
                     checksum,
-                    0,
-                    self.index.id,
                     table_id,
-                    self.index.config.cache.clone(),
-                    self.index.config.descriptor_table.clone(),
                     level_fs.clone(),
-                    pin_filter,
-                    pin_index,
-                    self.index.config.encryption.clone(),
-                    #[cfg(zstd_any)]
-                    self.index.config.zstd_dictionary.clone(),
                     self.index.config.comparator.clone(),
-                    #[cfg(feature = "metrics")]
-                    self.index.metrics.clone(),
-                )
+                    self.index.config.cache.clone(),
+                );
+                params.tree_id = self.index.id;
+                params
+                    .descriptor_table
+                    .clone_from(&self.index.config.descriptor_table);
+                params.pin_filter = pin_filter;
+                params.pin_index = pin_index;
+                params.encryption.clone_from(&self.index.config.encryption);
+                #[cfg(zstd_any)]
+                {
+                    params
+                        .zstd_dictionary
+                        .clone_from(&self.index.config.zstd_dictionary);
+                }
+                #[cfg(feature = "metrics")]
+                {
+                    params.metrics = self.index.metrics.clone();
+                }
+                Table::recover(params)
             })
             .collect::<crate::Result<Vec<_>>>()?;
 

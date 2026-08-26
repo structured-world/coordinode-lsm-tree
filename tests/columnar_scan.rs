@@ -551,6 +551,111 @@ fn tree_columnar_scan_masks_per_row_seqno_when_snapshot_straddles_segment() {
     assert_eq!(scan_keys(&tree, SeqNo::MAX), vec![key(0), key(1), key(2)]);
 }
 
+/// Reads a bytes column's row values (offset-table layout: `(rows+1)` u32
+/// offsets, then the payload).
+fn bytes_rows(col: &Column, rows: usize) -> Vec<Vec<u8>> {
+    let off = |i: usize| {
+        let b: [u8; 4] = col.data[i * 4..i * 4 + 4].try_into().unwrap();
+        u32::from_le_bytes(b) as usize
+    };
+    let payload = &col.data[(rows + 1) * 4..];
+    (0..rows)
+        .map(|i| payload[off(i)..off(i + 1)].to_vec())
+        .collect()
+}
+
+#[test]
+fn tree_columnar_scan_singleton_segment_dedups_overwritten_key() {
+    // A flush-produced columnar segment holds every MVCC version of an
+    // overwritten key. A SINGLETON segment (no overlapping neighbor) must still
+    // return one row per key — the newest visible version — exactly like the
+    // overlapping-merge path does.
+    let folder = get_tmp_folder();
+    let tree = open_columnar(folder.path());
+    tree.insert(key(0), b"old".to_vec(), 1);
+    tree.insert(key(1), b"only".to_vec(), 2);
+    tree.insert(key(0), b"new".to_vec(), 3); // overwrite k0
+    tree.flush_active_memtable(0).expect("flush");
+
+    // All-visible scan: each key exactly once, k0 at its newest value.
+    let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for batch in tree
+        .columnar_scan(&[COL_USER_KEY, COL_VALUE], None, SeqNo::MAX, ..)
+        .expect("scan")
+    {
+        let batch = batch.expect("batch");
+        let rows = batch.row_count as usize;
+        let key_col = batch
+            .columns
+            .iter()
+            .find(|c| c.column_id == COL_USER_KEY)
+            .expect("key column");
+        let val_col = batch
+            .columns
+            .iter()
+            .find(|c| c.column_id == COL_VALUE)
+            .expect("value column");
+        got.extend(
+            bytes_rows(key_col, rows)
+                .into_iter()
+                .zip(bytes_rows(val_col, rows)),
+        );
+    }
+    assert_eq!(
+        got,
+        vec![(key(0), b"new".to_vec()), (key(1), b"only".to_vec()),],
+        "singleton segment dedups an overwritten key to its newest version"
+    );
+
+    // A snapshot straddling the segment sees k0's OLD version (the newest one
+    // visible below the snapshot) — once, not zero or two times.
+    assert_eq!(
+        scan_keys(&tree, 2),
+        vec![key(0)],
+        "straddling snapshot keeps the newest VISIBLE version, once"
+    );
+}
+
+#[test]
+fn tree_columnar_scan_singleton_predicate_runs_after_dedup() {
+    // The newest version of k0 fails the predicate while its shadowed older
+    // version matches: the key must be dropped, not resurrected through the
+    // older matching version. Mirrors the overlapping-merge path's
+    // predicate-after-dedup ordering.
+    let folder = get_tmp_folder();
+    let tree = open_columnar(folder.path());
+    tree.insert(key(0), b"match".to_vec(), 1);
+    tree.insert(key(1), b"match".to_vec(), 2);
+    tree.insert(key(0), b"zzz-miss".to_vec(), 3); // newest k0 fails the predicate
+    tree.flush_active_memtable(0).expect("flush");
+
+    let pred = ColumnRangePredicate {
+        column_id: COL_VALUE,
+        lower: Some(b"match".to_vec()),
+        upper: Some(b"match".to_vec()),
+    };
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    for batch in tree
+        .columnar_scan(&[COL_USER_KEY], Some(&pred), SeqNo::MAX, ..)
+        .expect("scan")
+    {
+        let batch = batch.expect("batch");
+        let rows = batch.row_count as usize;
+        let key_col = batch
+            .columns
+            .iter()
+            .find(|c| c.column_id == COL_USER_KEY)
+            .expect("key column");
+        got.extend(bytes_rows(key_col, rows));
+    }
+    assert_eq!(
+        got,
+        vec![key(1)],
+        "a key whose newest version fails the predicate is dropped, not \
+         served from a shadowed older matching version"
+    );
+}
+
 #[test]
 fn tree_columnar_scan_applies_delete_bitmap_masking() {
     // A columnar segment carrying a positional delete-bitmap (built by relocating
@@ -952,6 +1057,227 @@ fn ingest_bytes_value(any: &AnyTree, k: &[u8], value: &[u8]) {
     let mut ingest = any.ingestion().expect("ingestion");
     ingest.write_columnar_batch(&batch).expect("write");
     ingest.finish().expect("finish");
+}
+
+/// A point tombstone is not a value: when it is a key's newest visible version
+/// the key is GONE, and the scan must drop the whole run rather than emit the
+/// tombstone row. Emitting it disagrees with the point read, and a caller that
+/// did not project the value-type column cannot even tell the row apart from a
+/// live one with an empty value.
+#[test]
+fn tree_columnar_scan_suppresses_a_key_its_newest_row_deletes() {
+    let folder = get_tmp_folder();
+    let tree = open_columnar(folder.path());
+
+    // One flushed segment holding both versions of `k1`: an older value and the
+    // newer deletion, plus an untouched neighbour.
+    tree.insert(key(1), b"v".to_vec(), 1);
+    tree.insert(key(2), b"v".to_vec(), 1);
+    tree.remove(key(1), 2);
+    tree.flush_active_memtable(0).expect("flush");
+
+    assert!(
+        tree.get(key(1), SeqNo::MAX).expect("get").is_none(),
+        "the point read reports the key as deleted",
+    );
+
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    for batch in tree
+        .columnar_scan(&[COL_USER_KEY], None, SeqNo::MAX, ..)
+        .expect("scan")
+    {
+        let batch = batch.expect("batch");
+        let key_col = batch
+            .columns
+            .iter()
+            .find(|c| c.column_id == COL_USER_KEY)
+            .expect("key column");
+        let rows = batch.row_count as usize;
+        let off = |i: usize| {
+            let b: [u8; 4] = key_col.data[i * 4..i * 4 + 4].try_into().unwrap();
+            u32::from_le_bytes(b) as usize
+        };
+        let payload = &key_col.data[(rows + 1) * 4..];
+        for i in 0..rows {
+            keys.push(payload[off(i)..off(i + 1)].to_vec());
+        }
+    }
+    assert_eq!(
+        keys,
+        vec![key(2)],
+        "the deleted key must not surface as a row while the point read calls \
+         it absent; the live neighbour still does",
+    );
+}
+
+/// A bulk-ingested segment stores every row at LOCAL seqno 0 and takes its
+/// effective ordering from the segment's `global_seqno`, which is what tree
+/// visibility and every other read surface use. A projected seqno column must
+/// therefore be translated to that global coordinate — handing back the stored
+/// zero reports a commit sequence number the tree never had.
+#[test]
+fn tree_columnar_scan_projects_seqnos_in_global_coordinates() {
+    let folder = get_tmp_folder();
+    let any = open_columnar_any(folder.path());
+    // Two DISJOINT singletons: the first ingestion takes global seqno 0 on a
+    // fresh tree, so a second one is needed for a nonzero offset to exist.
+    ingest_segment(&any, &[(key(1), 10)]);
+    ingest_segment(&any, &[(key(9), 20)]);
+
+    let tree = standard(&any);
+    let version = tree.current_version();
+    let mut globals: Vec<u64> = version
+        .iter_tables()
+        .map(lsm_tree::Table::global_seqno)
+        .collect();
+    globals.sort_unstable();
+    assert!(
+        globals.last().is_some_and(|&g| g > 0),
+        "the second ingestion takes a nonzero global seqno, got {globals:?}",
+    );
+    drop(version);
+
+    let mut seqnos: Vec<u64> = Vec::new();
+    for batch in tree
+        .columnar_scan(&[COL_USER_KEY, COL_SEQNO], None, SeqNo::MAX, ..)
+        .expect("scan")
+    {
+        let batch = batch.expect("batch");
+        let seqno_col = batch
+            .columns
+            .iter()
+            .find(|c| c.column_id == COL_SEQNO)
+            .expect("seqno column projected");
+        for i in 0..batch.row_count as usize {
+            seqnos.push(u64::from_le_bytes(
+                seqno_col.data[i * 8..i * 8 + 8].try_into().unwrap(),
+            ));
+        }
+    }
+    seqnos.sort_unstable();
+    assert_eq!(
+        seqnos, globals,
+        "each row carries the EFFECTIVE seqno of its segment (local + global), \
+         not the stored local zero",
+    );
+}
+
+/// The same rule on the ZERO-COPY path: a segment with one version per key is
+/// streamed verbatim, and a key whose single row is a tombstone would ride
+/// straight through it.
+#[test]
+fn tree_columnar_scan_suppresses_a_deleted_key_on_the_verbatim_path() {
+    let folder = get_tmp_folder();
+    let tree = open_columnar(folder.path());
+
+    // Distinct keys, one version each — the segment is provably unique, so the
+    // dedup path is skipped entirely.
+    tree.insert(key(1), b"v".to_vec(), 1);
+    tree.remove(key(2), 1);
+    tree.flush_active_memtable(0).expect("flush");
+
+    assert!(
+        tree.get(key(2), SeqNo::MAX).expect("get").is_none(),
+        "the point read reports the deleted key as absent",
+    );
+    assert_eq!(
+        scan_keys(&tree, SeqNo::MAX),
+        vec![key(1)],
+        "a tombstone must not stream through as a row just because its segment \
+         holds one version per key",
+    );
+}
+
+/// And on the OVERLAP path: the newest version wins across segments, so a newer
+/// segment's tombstone has to remove the key rather than be emitted.
+#[test]
+fn tree_columnar_scan_suppresses_a_deleted_key_across_overlapping_segments() {
+    let folder = get_tmp_folder();
+    let tree = open_columnar(folder.path());
+
+    // Two flushed segments over the SAME key range, so the scan row-merges them.
+    tree.insert(key(1), b"v".to_vec(), 1);
+    tree.insert(key(2), b"v".to_vec(), 1);
+    tree.flush_active_memtable(0).expect("flush");
+    tree.remove(key(1), 2);
+    tree.insert(key(2), b"w".to_vec(), 2);
+    tree.flush_active_memtable(0).expect("flush");
+
+    assert!(
+        tree.get(key(1), SeqNo::MAX).expect("get").is_none(),
+        "the point read reports the deleted key as absent",
+    );
+    assert_eq!(
+        scan_keys(&tree, SeqNo::MAX),
+        vec![key(2)],
+        "the newer segment's tombstone removes the key instead of surfacing as \
+         a row; the overwritten neighbour still yields its newest version",
+    );
+}
+
+/// A merge chain is not a version chain: the older rows are the merge's INPUTS,
+/// not data the newest row shadows. Newest-version-wins dedup would hand back
+/// the raw operand while a point read hands back the merged value, and it drops
+/// the base row, so the consumer cannot even resolve the chain itself. The scan
+/// must refuse rather than disagree with the read path.
+#[test]
+fn tree_columnar_scan_refuses_a_tree_that_merges() {
+    use std::sync::Arc;
+
+    struct Append;
+    impl lsm_tree::MergeOperator for Append {
+        fn merge(
+            &self,
+            _key: &[u8],
+            base_value: Option<&[u8]>,
+            operands: &[&[u8]],
+        ) -> lsm_tree::Result<lsm_tree::UserValue> {
+            let mut out = base_value.unwrap_or(b"").to_vec();
+            for op in operands {
+                out.extend_from_slice(op);
+            }
+            Ok(out.into())
+        }
+    }
+
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(Append)))
+    .open()
+    .expect("open");
+    let tree = standard(&any);
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+    })
+    .expect("enable columnar + zone-map");
+
+    tree.insert(key(1), b"A".to_vec(), 1);
+    tree.merge(key(1), b"B".to_vec(), 2);
+    tree.flush_active_memtable(0).expect("flush");
+
+    assert_eq!(
+        tree.get(key(1), SeqNo::MAX)
+            .expect("get")
+            .as_deref()
+            .map(<[u8]>::to_vec),
+        Some(b"AB".to_vec()),
+        "the read path resolves the chain, which is the behaviour the scan \
+         would have to reproduce",
+    );
+
+    let err = tree
+        .columnar_scan(&[COL_USER_KEY, COL_VALUE], None, SeqNo::MAX, ..)
+        .err()
+        .expect("a merging tree must be refused, not served raw operands");
+    assert!(
+        matches!(err, Error::FeatureUnsupported(_)),
+        "the refusal names the unsupported combination, got {err:?}",
+    );
 }
 
 #[test]

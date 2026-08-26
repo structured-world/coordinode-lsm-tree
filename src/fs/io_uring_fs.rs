@@ -219,6 +219,14 @@ impl Fs for IoUringFs {
         std::fs::remove_dir_all(path).map_err(crate::io::Error::from)
     }
 
+    fn same_file(&self, a: &Path, b: &Path) -> bool {
+        // Kernel-backed namespace, same contract as the std backend.
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(ca), Ok(cb)) => ca == cb,
+            _ => false,
+        }
+    }
+
     fn rename(&self, from: &Path, to: &Path) -> crate::io::Result<()> {
         std::fs::rename(from, to).map_err(crate::io::Error::from)
     }
@@ -236,6 +244,24 @@ impl Fs for IoUringFs {
         // Free-space probe is a cold-path stat; delegate to the shared statvfs
         // helper (this backend is Linux-only, so libc statvfs is available).
         super::statvfs_available_space(path).map_err(crate::io::Error::from)
+    }
+
+    fn allocated_size(&self, path: &Path) -> crate::io::Result<Option<u64>> {
+        // Cold-path stat; the shared unix helper reads `st_blocks` (this backend
+        // is Linux-only, so `std::fs::metadata` is available). A stat failure
+        // propagates as `Err` rather than being masked as `None` (unpunched).
+        Ok(super::unix_allocated_size(path)?)
+    }
+
+    fn extent_is_hole(
+        &self,
+        path: &Path,
+        offset: u64,
+        len: u64,
+    ) -> crate::io::Result<Option<bool>> {
+        // Same kernel, same probe as the std backend: this is a cold diagnostic
+        // path, so it delegates there rather than going through the ring.
+        Fs::extent_is_hole(&super::StdFs, path, offset, len)
     }
 
     fn sync_directory(&self, path: &Path) -> crate::io::Result<()> {
@@ -323,6 +349,11 @@ impl FsFile for IoUringFile {
             is_dir: m.is_dir(),
             is_file: m.is_file(),
         })
+    }
+
+    fn hard_link_count(&self) -> crate::io::Result<u64> {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(self.file.metadata()?.nlink())
     }
 
     fn set_len(&self, size: u64) -> crate::io::Result<()> {

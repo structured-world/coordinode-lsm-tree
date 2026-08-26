@@ -1,4 +1,7 @@
-#[expect(clippy::expect_used, clippy::indexing_slicing)]
+#[expect(clippy::expect_used)]
+// The only slice indexing here lives in a zstd-gated case, so the expectation
+// would go unfulfilled in a build without it.
+#[cfg_attr(feature = "zstd", expect(clippy::indexing_slicing))]
 mod tests {
     use crate::comparator::default_comparator;
     use crate::{

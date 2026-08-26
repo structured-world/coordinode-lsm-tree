@@ -347,6 +347,22 @@ fn sync_directory_is_noop() -> io::Result<()> {
     Ok(())
 }
 
+/// File creation accepts an empty, `/`, or missing parent as the implicit
+/// root, so syncing that root's directory entry must succeed too: callers
+/// syncing a bare relative file's new entry pass `.` (an empty
+/// `Path::parent` is not a syncable name on any backend), and rejecting it
+/// makes them discard a file they just wrote successfully.
+#[test]
+fn sync_directory_accepts_the_implicit_root() -> io::Result<()> {
+    let fs = MemFs::new();
+    let opts = FsOpenOptions::new().write(true).create(true);
+    drop(fs.open(Path::new("bare"), &opts)?);
+    fs.sync_directory(Path::new("."))?;
+    fs.sync_directory(Path::new(""))?;
+    fs.sync_directory(Path::new("/"))?;
+    Ok(())
+}
+
 #[test]
 fn file_metadata_and_set_len() -> io::Result<()> {
     let fs = MemFs::new();

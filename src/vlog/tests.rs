@@ -8,7 +8,7 @@ fn vlog_recovery_missing_blob_file_returns_unrecoverable() {
     let dir = tempfile::tempdir().unwrap();
     let result = recover_blob_files(
         dir.path(),
-        &[(0, Checksum::from_raw(0))],
+        &[(0, Checksum::from_raw(0), 0)],
         0,
         None,
         &(Arc::new(crate::fs::StdFs) as Arc<dyn crate::fs::Fs>),
@@ -38,12 +38,37 @@ fn vlog_recovery_nonexistent_folder_with_ids_returns_unrecoverable() {
     let missing = dir.path().join("no_such_dir");
     let result = recover_blob_files(
         &missing,
-        &[(0, Checksum::from_raw(0))],
+        &[(0, Checksum::from_raw(0), 0)],
         0,
         None,
         &(Arc::new(crate::fs::StdFs) as Arc<dyn crate::fs::Fs>),
     );
     assert!(matches!(result, Err(crate::Error::Unrecoverable)));
+}
+
+/// A crashed manifest repair leaves its in-progress salvage copy behind. It
+/// is published by an atomic rename, so a surviving one was never referenced
+/// by any manifest: recovery must sweep it like any other orphan rather than
+/// abort on a name that is not a blob id, which would leave the tree
+/// unopenable until an operator intervened.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn vlog_recovery_sweeps_a_crashed_salvage_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let leftover = dir.path().join("7.salvage-tmp");
+    std::fs::write(&leftover, b"partial salvage copy").unwrap();
+
+    let (blob_files, orphans) = recover_blob_files(
+        dir.path(),
+        &[],
+        0,
+        None,
+        &(Arc::new(crate::fs::StdFs) as Arc<dyn crate::fs::Fs>),
+    )
+    .expect("a repair's own leftover must not make the tree unopenable");
+
+    assert!(blob_files.is_empty(), "the leftover is not a blob file");
+    assert_eq!(orphans, vec![leftover], "it is swept as an orphan");
 }
 
 #[test]

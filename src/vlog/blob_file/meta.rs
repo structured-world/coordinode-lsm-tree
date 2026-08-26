@@ -40,13 +40,21 @@ macro_rules! read_u128 {
 
 pub const METADATA_HEADER_MAGIC: &[u8] = b"META";
 
+/// The one accepted blob-file metadata version. The writer stamps it and
+/// `decode_from` rejects anything else: there is a single readable on-disk
+/// format (per-frame header CRC), never a compat range. Under the V5 disk
+/// contract this is the blob-file meta version, distinct from the tree format
+/// version.
+pub const META_VERSION: u8 = 4;
+
 // Note: `pub` for crate-internal use; parent `vlog` module is NOT
 // exported from `lib.rs`, so this struct is not public API.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Metadata {
     pub id: BlobFileId,
 
-    /// Blob file format version (3 = V3, 4 = V4 with header CRC).
+    /// Blob file format version. Always [`META_VERSION`] (the only readable
+    /// format, with per-frame header CRC); `decode_from` rejects anything else.
     pub version: u8,
 
     pub created_at: u128,
@@ -184,12 +192,14 @@ impl Metadata {
                 .ok_or(crate::Error::InvalidHeader("BlobFileMeta"))?
         };
 
-        // Reject unknown versions early to catch corrupted or
-        // future-incompatible metadata before downstream code
-        // misinterprets header fields.
-        match version {
-            3 | 4 => {}
-            _ => return Err(crate::Error::InvalidHeader("BlobFileMeta")),
+        // Exactly one blob-file format is readable (V5-only on-disk contract):
+        // [`META_VERSION`] is what the current writer stamps. Anything else,
+        // including the retired version 3, is corruption or an unsupported file,
+        // never a compat case. Covered end-to-end by
+        // `tests::test_blob_file_meta_retired_version_rejected`, which serializes a
+        // version-3 block through the production encoder and asserts this rejection.
+        if version != META_VERSION {
+            return Err(crate::Error::InvalidHeader("BlobFileMeta"));
         }
 
         let id = read_u64!(block, b"id", &cmp);

@@ -119,6 +119,34 @@ fn parse_restrictions_section(
     Ok(map)
 }
 
+/// Parses the optional `blob_restrictions` section: `count: u32 |
+/// repeat(blob file id: u64, live-data frontier: u64)`. The blob analogue of
+/// [`parse_restrictions_section`], read under the same strictness — a lost or
+/// lowered frontier would make integrity checks hash the reclaimed (zeroed)
+/// prefix and condemn a healthy blob file. Absent section is handled by the
+/// caller (legitimate: no blob prefix was ever reclaimed).
+fn parse_blob_restrictions_section(
+    mut bytes: &[u8],
+) -> crate::Result<crate::HashMap<BlobFileId, u64>> {
+    const ERR: crate::Error = crate::Error::InvalidHeader("blob_restrictions section");
+    let r = &mut bytes;
+    let count = r.read_u32::<LittleEndian>().map_err(|_| ERR)?;
+    let mut map = crate::HashMap::default();
+    for _ in 0..count {
+        let id = r.read_u64::<LittleEndian>().map_err(|_| ERR)?;
+        let frontier = r.read_u64::<LittleEndian>().map_err(|_| ERR)?;
+        // Reject a duplicate id for the same reason the table section does: a
+        // second entry could silently lower an already-advanced frontier.
+        if map.insert(id, frontier).is_some() {
+            return Err(ERR);
+        }
+    }
+    if !r.is_empty() {
+        return Err(ERR);
+    }
+    Ok(map)
+}
+
 /// Reads and validates the CURRENT version pointer file.
 ///
 /// The file format is: `version_id: u64 | checksum: u128 | checksum_type: u8`
@@ -283,10 +311,20 @@ pub struct Recovery {
     pub blob_file_ids: Vec<(BlobFileId, Checksum)>,
     pub gc_stats: crate::blob_tree::FragmentationMap,
     /// Per-table tight-space key-range lower bounds recovered from the snapshot
-    /// `restrictions` section and advanced by replayed edits. A table id present
-    /// here is rebuilt as a restricted view ([`super::Version::from_recovery`]);
-    /// stale entries for tables no longer in the layout are simply never applied.
+    /// `restrictions` section and REPLACED wholesale by each replayed edit
+    /// (every edit carries its version's full set). A table id present here is
+    /// rebuilt as a restricted view ([`super::Version::from_recovery`]); a
+    /// lifted restriction is absent from the next edit's set and so dropped.
     pub restrictions: crate::HashMap<TableId, crate::UserKey>,
+    /// Per-blob-file live-data frontiers recovered from the snapshot and
+    /// REPLACED wholesale by each replayed edit (`blob file id → first live
+    /// byte`). A blob file present here had its consumed prefix reclaimed in
+    /// place, so its recorded checksum covers only the suffix from this
+    /// offset. The blob analogue of [`Self::restrictions`]; wholesale
+    /// replacement (never a merge) matters here because blob ids are reused,
+    /// so a removed file's stale frontier must not attach to a later file
+    /// under the same id.
+    pub blob_restrictions: crate::HashMap<BlobFileId, u64>,
     /// Per-section counters describing how many records were dropped
     /// during this recovery. Always zero under
     /// [`ManifestRecoveryMode::AbsoluteConsistency`] (any corruption
@@ -373,21 +411,30 @@ impl Recovery {
             self.gc_stats = crate::blob_tree::FragmentationMap::decode_from(&mut &bytes[..])?;
         }
 
-        // Tight-space restrictions advance per slice: each edit lists the
-        // straddling input's new (higher) lower bound, so a later edit overwrites
-        // the earlier bound for the same table. A monotonicity (no-regression)
-        // check would be COMPARATOR-RELATIVE — "advancing" is defined by the
-        // tree's configured comparator, not byte order — but the comparator is not
-        // plumbed into recovery, so a byte-order check would wrongly reject valid
-        // advances (or miss real regressions) under a custom/reverse comparator.
-        // The edit log is framing-checksummed, so a corrupt/reordered edit is
-        // already rejected upstream; the comparator-independent duplicate guard
-        // lives in `parse_restrictions_section` for the snapshot path.
-        // Entries for tables later dropped from the layout are simply never
-        // applied by `from_recovery`, and the next snapshot rewrite drops them.
-        for (id, key) in &edit.restrictions {
-            self.restrictions.insert(*id, key.clone());
-        }
+        // Tight-space restrictions REPLACE wholesale: the encoder derives every
+        // edit's `restrictions` / `blob_restrictions` by iterating the new
+        // version's tables / blob files, so each edit carries the FULL current
+        // set, not a delta. Replacing both advances a bound per slice (the
+        // later full set carries the higher bound) AND drops a lifted one (its
+        // entry is simply absent). Merging instead would let a removed
+        // restricted blob file's frontier outlive it and attach to an
+        // unrelated whole file added later under the same id — blob ids are
+        // reused (the id counter reseeds from the maximum live id) — making
+        // integrity checks hash only that file's suffix. A monotonicity
+        // (no-regression) check would be COMPARATOR-RELATIVE — "advancing" is
+        // defined by the tree's configured comparator, not byte order — but
+        // the comparator is not plumbed into recovery, so a byte-order check
+        // would wrongly reject valid advances (or miss real regressions) under
+        // a custom/reverse comparator. The edit log is framing-checksummed, so
+        // a corrupt/reordered edit is already rejected upstream; the
+        // comparator-independent duplicate guard lives in
+        // `parse_restrictions_section` for the snapshot path.
+        self.restrictions = edit
+            .restrictions
+            .iter()
+            .map(|(id, key)| (*id, key.clone()))
+            .collect();
+        self.blob_restrictions = edit.blob_restrictions.iter().copied().collect();
 
         self.curr_version_id = edit.new_version_id;
         Ok(())
@@ -1193,6 +1240,15 @@ pub fn recover(
         crate::HashMap::default()
     };
 
+    // The blob analogue, read under the same strictness: a lost frontier would
+    // make integrity checks hash a reclaimed (zeroed) prefix and condemn a
+    // healthy blob file.
+    let blob_restrictions = if archive.section("blob_restrictions").is_some() {
+        parse_blob_restrictions_section(&archive.read_section("blob_restrictions")?)?
+    } else {
+        crate::HashMap::default()
+    };
+
     let mut recovery = Recovery {
         tree_type: {
             if archive.section("tree_type").is_none() {
@@ -1214,6 +1270,7 @@ pub fn recover(
         blob_file_ids,
         gc_stats,
         restrictions,
+        blob_restrictions,
         stats: RecoveryStats {
             tables_dropped_to_tail,
             tables_dropped_to_corruption,

@@ -551,6 +551,14 @@ pub struct Config {
     /// satisfy it vacuously.
     pub(crate) directory_lock: bool,
 
+    /// Shared live-progress counters the repair / salvage paths tick while
+    /// they run, or `None` (the default) to skip publishing. Set via
+    /// [`Config::with_recovery_progress`]; observed by polling
+    /// [`RecoveryProgress::snapshot`](crate::RecoveryProgress::snapshot) from
+    /// another thread.
+    #[cfg(feature = "std")]
+    pub(crate) recovery_progress: Option<Arc<crate::RecoveryProgress>>,
+
     /// Edit-log size (bytes) past which the next manifest persist rotates: it
     /// writes a fresh full snapshot and starts an empty log instead of appending
     /// another [`VersionEdit`](crate::version::edit::VersionEdit). Bounds both
@@ -617,6 +625,15 @@ pub struct Config {
     /// `cfg(test)`, never compiled into release builds.
     #[cfg(all(test, feature = "std"))]
     pub(crate) fail_tight_after_first_slice: Arc<core::sync::atomic::AtomicBool>,
+
+    /// Test-only failpoint: when armed, a tight-space relocation fails at the
+    /// restricted-blob reopen step of its current slice — after the slice's
+    /// outputs were finalized but before the install — so the pre-install
+    /// rollback (retract the finalized-but-unreferenced outputs) can be
+    /// exercised deterministically. Behind `cfg(test)`, never compiled into
+    /// release builds.
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) fail_tight_blob_reopen: Arc<core::sync::atomic::AtomicBool>,
 
     /// Pre-trained zstd dictionary for dictionary compression.
     ///
@@ -733,6 +750,8 @@ impl Default for Config {
             manifest_recovery_mode: ManifestRecoveryMode::AbsoluteConsistency,
             sync_mode: SyncMode::Normal,
             directory_lock: true,
+            #[cfg(feature = "std")]
+            recovery_progress: None,
             manifest_log_rotate_bytes: 1024 * 1024,
             compaction_rate_limit: 0,
 
@@ -747,6 +766,8 @@ impl Default for Config {
             fail_one_subcompaction: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             #[cfg(all(test, feature = "std"))]
             fail_tight_after_first_slice: Arc::new(core::sync::atomic::AtomicBool::new(false)),
+            #[cfg(all(test, feature = "std"))]
+            fail_tight_blob_reopen: Arc::new(core::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -1192,6 +1213,39 @@ impl Config {
     #[must_use]
     pub fn with_directory_lock(mut self, enabled: bool) -> Self {
         self.directory_lock = enabled;
+        self
+    }
+
+    /// Wires shared live-progress counters into the repair / salvage paths.
+    ///
+    /// A repair over a large store streams every SST and blob file and can run
+    /// for a long time; the handle set here is ticked as files are discovered
+    /// and blocks / rows are recovered, so another thread can poll
+    /// [`RecoveryProgress::snapshot`](crate::RecoveryProgress::snapshot) while
+    /// [`Config::repair`] (or a salvage it triggers) runs. Without it, repair
+    /// publishes no progress (zero overhead).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use lsm_tree::{Config, RecoveryProgress, SequenceNumberCounter};
+    /// use std::sync::Arc;
+    ///
+    /// let progress = Arc::new(RecoveryProgress::default());
+    /// let config = Config::new(
+    ///     "my-tree",
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .with_recovery_progress(progress.clone());
+    /// // spawn the repair, then poll `progress.snapshot()` elsewhere
+    /// let report = config.repair()?;
+    /// # Ok::<_, lsm_tree::Error>(())
+    /// ```
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn with_recovery_progress(mut self, progress: Arc<crate::RecoveryProgress>) -> Self {
+        self.recovery_progress = Some(progress);
         self
     }
 

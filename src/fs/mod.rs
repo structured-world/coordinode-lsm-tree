@@ -456,6 +456,33 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     /// Returns an I/O error if metadata cannot be retrieved.
     fn metadata(&self) -> io::Result<FsMetadata>;
 
+    /// Returns the number of directory entries (hard links) referring to this
+    /// file's underlying object.
+    ///
+    /// In-place mutation paths consult this before writing through a path:
+    /// a count above 1 means another name (typically a checkpoint) shares the
+    /// same bytes, and writing in place would silently rewrite that snapshot
+    /// too.
+    ///
+    /// Backends with no hard-link concept ([`MemFs`], whose
+    /// [`Fs::hard_link`] copies) override this to return 1. The Unix file
+    /// backends report the real count from the inode's link field (`StdFs` via
+    /// `nlink`, the raw `io_uring` backend via `statx` `stx_nlink`). Backends that
+    /// CAN share inodes but cannot determine the count keep the default error, so
+    /// in-place mutation paths fail closed (treat the file as shared) instead
+    /// of overwriting a snapshot through an unrecognized link.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the link count cannot be retrieved; the
+    /// default returns [`ErrorKind::Unsupported`](crate::io::ErrorKind).
+    fn hard_link_count(&self) -> io::Result<u64> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "hard-link count unavailable",
+        ))
+    }
+
     /// Truncates or extends the file to the specified length.
     ///
     /// # Errors
@@ -724,10 +751,33 @@ pub trait Fs: Send + Sync + 'static {
     /// Returns an I/O error if the directory cannot be removed.
     fn remove_dir_all(&self, path: &Path) -> io::Result<()>;
 
+    /// Whether `a` and `b` name the SAME physical file within this backend's
+    /// namespace (aliases: symlinked spellings, `..` traversals, case folding).
+    ///
+    /// The default is literal path equality — correct for virtual backends
+    /// ([`MemFs`]), whose distinct path strings are distinct files by
+    /// construction; resolving them through the HOST filesystem would let a
+    /// host symlink alias two unrelated virtual files. Kernel-backed backends
+    /// ([`StdFs`]) override this with host canonicalization. A probe that
+    /// cannot decide must answer `false` (treat as distinct): callers use
+    /// `true` to skip duplicate handling, so a false positive lets a real
+    /// duplicate escape.
+    fn same_file(&self, a: &Path, b: &Path) -> bool {
+        a == b
+    }
+
     /// Renames a file from `from` to `to`.
     ///
-    /// If `to` already exists as a regular file, it is atomically replaced.
-    /// This is required by [`rewrite_atomic`](crate::file::rewrite_atomic)
+    /// If `to` already exists as a regular file, it is atomically replaced —
+    /// on EVERY supported platform. `std::fs::rename` (the [`StdFs`] backend)
+    /// honors this on Windows too via replace-existing semantics; only a
+    /// destination DIRECTORY fails there, and a destination file that other
+    /// handles hold open is still replaceable because the standard library
+    /// opens files with full sharing (including delete). Every temp-then-rename
+    /// publish in the crate (version pointers, restriction sidecars, heal
+    /// attestations, detached heal copies, salvaged blobs) relies on this
+    /// contract; implementations must preserve it. This is required by
+    /// [`rewrite_atomic`](crate::file::rewrite_atomic)
     /// for crash-safe version pointer updates.
     ///
     /// lsm-tree only renames files (table files, version pointers), never
@@ -749,6 +799,12 @@ pub trait Fs: Send + Sync + 'static {
     ///
     /// On platforms that do not support directory fsync (e.g. Windows),
     /// this may be a no-op.
+    ///
+    /// Implementations must accept `.` (the current / implicit root
+    /// directory): callers syncing the new entry of a bare relative file pass
+    /// it, because an empty [`Path::parent`] is not a syncable name. A
+    /// backend that admits a file creation must be able to sync the entry it
+    /// created.
     ///
     /// # Errors
     ///
@@ -1067,6 +1123,60 @@ pub trait Fs: Send + Sync + 'static {
         let _ = path;
         Ok(u64::MAX)
     }
+
+    /// Physically ALLOCATED bytes of the file at `path` (blocks actually backed
+    /// by storage), or `None` when the backend cannot report it.
+    ///
+    /// Differs from the file's logical length ([`FsMetadata::len`]) when the
+    /// file is SPARSE: a hole-punched range (via [`punch_hole`](Self::punch_hole))
+    /// frees physical blocks while the logical length is unchanged, so
+    /// `allocated_size < len`. Manifest repair uses this to recognize a
+    /// tight-space-punched SST (whose consumed prefix data blocks were reclaimed)
+    /// that a rebuilt manifest would otherwise open as an unrestricted table,
+    /// letting reads traverse the punched (zero-reading) blocks and fail.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns `Ok(None)` ("cannot tell"): a backend that does not track physical
+    /// allocation (and thus never punches) reports nothing, and repair treats the
+    /// file as unpunched — its current behaviour. Backends that support hole
+    /// punching override it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the underlying probe fails on a backend that
+    /// supports it.
+    fn allocated_size(&self, path: &Path) -> io::Result<Option<u64>> {
+        let _ = path;
+        Ok(None)
+    }
+
+    /// Whether `[offset, offset + len)` of `path` is entirely a HOLE — an
+    /// unallocated range that reads back as zeros.
+    ///
+    /// This is the extent-local counterpart to [`allocated_size`](Self::allocated_size),
+    /// and the only one of the two that can attribute a hole to a specific
+    /// range. A file-wide allocation total says nothing about WHERE the missing
+    /// bytes are, and it is not even proof of a hole: a filesystem with
+    /// transparent compression reports an ordinary, fully-written file as using
+    /// fewer physical bytes than its length. Manifest repair uses this to tell a
+    /// reclaimed (punched) data block from one destroyed by corruption — both
+    /// read as zeros, and only the first may be skipped.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns `Ok(None)` ("cannot tell"). A backend that cannot answer leaves
+    /// the hole unproven, and a caller that needs the proof must treat the zeros
+    /// as content. Backends that support hole punching override it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the underlying probe fails on a backend that
+    /// supports it.
+    fn extent_is_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<Option<bool>> {
+        let _ = (path, offset, len);
+        Ok(None)
+    }
 }
 
 /// Bytes available to an unprivileged process on the filesystem backing
@@ -1121,6 +1231,24 @@ pub(crate) fn statvfs_available_space(path: &Path) -> std::io::Result<u64> {
 pub(crate) fn unix_volume_id(path: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(path).ok().map(|m| m.dev())
+}
+
+/// Physically allocated bytes of `path` via `stat(2)`'s `st_blocks`
+/// (`blocks * 512`, the POSIX-fixed block unit — unrelated to the filesystem's
+/// I/O block size). Less than the logical length for a sparse / hole-punched
+/// file. Shared by the std and `io_uring` (libc) backends.
+///
+/// A stat FAILURE is PROPAGATED as `Err`, never mapped to `None`: manifest
+/// repair reads `Ok(None)` as "allocation-unaware backend" and hence "unpunched",
+/// so swallowing the error on a genuinely punched file would drop its restriction
+/// and expose the zeroed prefix. Every unix file has `st_blocks`, so a successful
+/// stat always yields `Ok(Some(_))`.
+#[cfg(all(unix, feature = "std"))]
+pub(crate) fn unix_allocated_size(path: &Path) -> std::io::Result<Option<u64>> {
+    use std::os::unix::fs::MetadataExt;
+    // `st_blocks` is always in 512-byte units per POSIX, regardless of the
+    // filesystem block size; multiply to bytes. `blocks()` is u64.
+    Ok(Some(std::fs::metadata(path)?.blocks() * 512))
 }
 
 /// Streamed independent copy of `src` to `dst` through `fs`'s own [`Fs::open`].

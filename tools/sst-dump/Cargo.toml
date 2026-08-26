@@ -30,8 +30,10 @@ path = "src/main.rs"
 # (verify_sst_file, ParsedMeta-style helpers as they are added).
 # `lz4` + `zstd` features enabled because real production SSTs are
 # usually compressed; without them the tool refuses to walk
-# compressed blocks.
-lsm-tree = { package = "coordinode-lsm-tree", path = "../..", features = ["lz4", "zstd", "encryption"] }
+# compressed blocks. `page_ecc` so the ECC parity trailers of protected
+# SSTs are genuinely VERIFIED rather than skipped with a warning — a
+# forensics tool must not silently report OK over unverifiable parity.
+lsm-tree = { package = "coordinode-lsm-tree", path = "../..", features = ["lz4", "zstd", "encryption", "page_ecc"] }
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]

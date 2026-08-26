@@ -386,7 +386,7 @@ fn run_single(
         // the host actually delivered and let the dashboard show
         // the absolute trend.
         github_entries.push(serde_json::json!({
-            "name": benchmark_name.clone(),
+            "name": benchmark_name,
             "value": s.ops_per_sec,
             "unit": "ops/sec",
             "extra": format!(

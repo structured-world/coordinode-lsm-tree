@@ -216,6 +216,174 @@ fn drain_does_not_steal_a_new_generation_queue() {
     );
 }
 
+/// A deferred prefix reclaim must not be DISCARDED when the drain cannot prove
+/// the file is exclusively ours — because a checkpoint linked it, or because the
+/// link-count probe failed. Unlinking the checkpoint only drops the link count;
+/// it does not free the prefix, since the live restricted table still holds that
+/// inode. The space would then stay allocated until an unrelated future
+/// compaction retires the table — under exactly the low-space condition that
+/// chose the tight-space path. The intent is kept and retried instead.
+///
+/// Driven through a failing probe: `MemFs` reports every path as
+/// singly-linked, so the shared-inode case cannot be built on it, and both cases
+/// take the same arm.
+#[test]
+fn a_deferred_punch_survives_an_unprovable_link_count_and_is_retried() {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    let mem = MemFs::new();
+    mem.create_dir_all(Path::new("/d")).unwrap();
+    let path = Path::new("/d/1").to_path_buf();
+    write_file(&mem, &path, &[b'x'; 4096]);
+    let faulty = Arc::new(FaultFs::new(mem.clone()));
+    let dyn_fs: Arc<dyn Fs> = faulty.clone();
+
+    faulty.injector().arm(FaultRule::new(
+        FaultOp::HardLinkCount,
+        Fault::Error(crate::io::ErrorKind::PermissionDenied),
+    ));
+
+    let pause = DeletionPause::new_shared();
+    let guard = pause.acquire();
+    assert!(pause.try_enqueue_punch(Arc::clone(&dyn_fs), path, vec![(0, 2048)]));
+
+    drop(guard);
+    assert_eq!(
+        mem.punched_bytes(),
+        0,
+        "an unprovable link count must not be punched through",
+    );
+    assert!(
+        pause.has_pending_reclaims(),
+        "the reclaim is retained, not discarded: nothing else would ever free \
+         the consumed prefix",
+    );
+
+    // The probe works again and the file is exclusively ours, so the retry
+    // performs the reclaim that was held.
+    faulty.injector().clear();
+    pause.retry_pending_reclaims();
+    assert_eq!(
+        mem.punched_bytes(),
+        2048,
+        "the retained reclaim runs once the file can be proven exclusive",
+    );
+    assert!(
+        !pause.has_pending_reclaims(),
+        "a completed reclaim is not retained",
+    );
+}
+
+/// A deferred reclaim probes the link count and then punches. Unlike a table's
+/// `Drop`, the queued item holds no live version whose lifetime keeps a
+/// checkpoint out of that gap: a checkpoint starting between the probe and the
+/// punch hard-links the file, and the punch then zeroes the inode its supposedly
+/// immutable snapshot shares. The whole probe-and-punch sequence must therefore
+/// run inside the mutation window a checkpoint's link window excludes.
+#[test]
+fn a_deferred_punch_waits_for_an_open_checkpoint_link_window() {
+    use std::sync::mpsc;
+
+    let mem = MemFs::new();
+    mem.create_dir_all(Path::new("/d")).unwrap();
+    let path = Path::new("/d/1").to_path_buf();
+    write_file(&mem, &path, &[b'x'; 4096]);
+    let dyn_fs: Arc<dyn Fs> = Arc::new(mem.clone());
+
+    let pause = DeletionPause::new_shared();
+    let guard = pause.acquire();
+    assert!(pause.try_enqueue_punch(Arc::clone(&dyn_fs), path, vec![(0, 2048)]));
+    // The pause released with the probe unavailable would retain the reclaim;
+    // here the file IS exclusive, so retain it by holding the pause instead and
+    // driving the retry explicitly below.
+    let checkpoint = pause.enter_link_window();
+
+    let retrier = Arc::clone(&pause);
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let handle = std::thread::spawn(move || {
+        drop(guard); // releases the pause: the drain retries the reclaim
+        retrier.retry_pending_reclaims();
+        done_tx.send(()).ok();
+    });
+
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .is_err(),
+        "a deferred punch must not run while a checkpoint's link window is open",
+    );
+    assert_eq!(
+        mem.punched_bytes(),
+        0,
+        "and it must not have punched the inode the checkpoint is linking",
+    );
+
+    drop(checkpoint);
+    assert!(handle.join().is_ok(), "the retry thread finishes");
+    assert_eq!(
+        mem.punched_bytes(),
+        2048,
+        "once the link window closes the reclaim runs",
+    );
+}
+
+/// A punch that FAILS mid-pass must not take the reclaim down with it. The pass
+/// stops (the hole pattern stays classifiable for a sidecar-less repair), but
+/// the failed extent and everything below it are retained: dropping them leaves
+/// the consumed prefix allocated with nothing left to free it, exactly as a
+/// discarded intent would.
+#[test]
+fn a_failed_punch_retains_the_extent_and_the_untried_remainder() {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    let mem = MemFs::new();
+    mem.create_dir_all(Path::new("/d")).unwrap();
+    let path = Path::new("/d/1").to_path_buf();
+    write_file(&mem, &path, &[b'x'; 4096]);
+    let faulty = Arc::new(FaultFs::new(mem.clone()));
+    let dyn_fs: Arc<dyn Fs> = faulty.clone();
+
+    // Three extents, top-down. The SECOND fails, so the first lands and the
+    // third is never attempted.
+    faulty.injector().arm(
+        FaultRule::new(
+            FaultOp::PunchHole,
+            Fault::Error(crate::io::ErrorKind::Interrupted),
+        )
+        .skip(1)
+        .once(),
+    );
+
+    let pause = DeletionPause::new_shared();
+    let guard = pause.acquire();
+    assert!(pause.try_enqueue_punch(
+        Arc::clone(&dyn_fs),
+        path,
+        vec![(3072, 1024), (2048, 1024), (1024, 1024)],
+    ));
+    drop(guard);
+
+    assert_eq!(
+        mem.punched_bytes(),
+        1024,
+        "the pass stops at the first failure, so only the top extent landed",
+    );
+    assert!(
+        pause.has_pending_reclaims(),
+        "the failed extent and the untried remainder are retained, or nothing \
+         would ever free that space",
+    );
+
+    // The fault is one-shot, so the retry completes what was held.
+    pause.retry_pending_reclaims();
+    assert_eq!(
+        mem.punched_bytes(),
+        3072,
+        "the retry reclaims the extents the failed pass left behind",
+    );
+    assert!(!pause.has_pending_reclaims(), "nothing left to retry");
+}
+
 #[test]
 fn nested_pauses_only_release_on_last_drop() {
     let fs = MemFs::new();

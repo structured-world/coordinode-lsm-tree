@@ -917,3 +917,68 @@ fn column_batch_match_entries_rejects_a_zero_row_block() {
         "expected an empty-block InvalidHeader, got {err:?}",
     );
 }
+
+#[test]
+fn zone_stats_records_per_bytes_column_ranges_and_omits_fixed_columns() {
+    // A columnar block's zone map must carry one entry PER Bytes column (the
+    // user-key column AND the value column), each with the raw-byte min / max
+    // over its rows — not just a single synthetic key-range column. The fixed
+    // seqno and value-type columns have no comparable encoding and are omitted,
+    // so a block-skip over them stays conservative.
+    let batch = entries_to_column_batch(&[
+        entry(b"alpha", 3, ValueType::Value, b"mval"),
+        entry(b"gamma", 2, ValueType::Value, b"aval"),
+        entry(b"omega", 1, ValueType::Value, b"zval"),
+    ])
+    .expect("three-row batch");
+
+    let stats = batch.zone_stats();
+
+    // Exactly the two Bytes columns (user key = 0, value = 3), in column order;
+    // the fixed seqno (1) and value-type (2) columns are absent.
+    let ids: Vec<u32> = stats.iter().map(|s| s.column_id).collect();
+    assert_eq!(
+        ids,
+        vec![u32::from(COL_USER_KEY), u32::from(COL_VALUE)],
+        "only the Bytes columns get a zone-map entry, in column order",
+    );
+
+    let key_stat = &stats[0];
+    assert_eq!(
+        key_stat.min, b"alpha",
+        "user-key min is the first sorted key"
+    );
+    assert_eq!(
+        key_stat.max, b"omega",
+        "user-key max is the last sorted key"
+    );
+    assert_eq!(key_stat.row_count, 3);
+    assert_eq!(key_stat.null_count, 0);
+    // Bytes wire tag (see `TypeTag::to_wire`).
+    assert_eq!(key_stat.type_tag, 1);
+
+    let val_stat = &stats[1];
+    assert_eq!(
+        val_stat.min, b"aval",
+        "value min is the byte-wise minimum value, independent of key order",
+    );
+    assert_eq!(
+        val_stat.max, b"zval",
+        "value max is the byte-wise maximum value",
+    );
+    assert_eq!(val_stat.row_count, 3);
+    assert_eq!(val_stat.null_count, 0);
+
+    // The value column's range enables a non-key block-skip: a predicate whose
+    // value band is entirely below the block minimum proves the block holds no
+    // match, which the old single-column (key-only) map could never do.
+    let below = crate::table::columnar_predicate::ColumnRangePredicate {
+        column_id: COL_VALUE,
+        lower: None,
+        upper: Some(b"aaaa".to_vec()),
+    };
+    assert!(
+        below.can_skip_block(&stats),
+        "a value-column predicate below the block's value range skips the block",
+    );
+}

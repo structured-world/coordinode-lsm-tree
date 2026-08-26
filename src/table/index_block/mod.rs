@@ -147,6 +147,27 @@ impl IndexBlock {
         )
     }
 
+    /// Validates the binary index against the sequentially derived restart
+    /// heads (see [`Decoder::verify_binary_index`]): the sequential decode
+    /// never reads the pointers, so a forged pointer passes every
+    /// entry-level cross-check while index seeks trust it and can start at
+    /// the wrong restart head.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when a pointer disagrees with its
+    /// restart head; [`crate::Error::InvalidTrailer`] on a malformed trailer.
+    #[cfg_attr(
+        not(feature = "std"),
+        allow(
+            dead_code,
+            reason = "reconcile-gate check; the verify/scrub consumers are std-gated"
+        )
+    )]
+    pub(crate) fn verify_binary_index(&self) -> crate::Result<()> {
+        Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::verify_binary_index(&self.inner)
+    }
+
     /// Parses the block trailer once and returns the reusable
     /// [`DecoderMeta`], so repeated lookups can build decoders via
     /// [`Self::iter_with_meta`] without re-parsing.

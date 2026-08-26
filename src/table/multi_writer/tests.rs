@@ -105,24 +105,14 @@ fn clip_preserves_rt_covering_gap_between_output_tables() -> crate::Result<()> {
     let mut total_rts = 0;
 
     for (table_id, checksum) in &results {
-        let table = crate::Table::recover(
+        let table = crate::Table::recover(crate::table::RecoverParams::new(
             base_path.join(table_id.to_string()),
             *checksum,
-            0,
-            0,
             *table_id,
-            cache.clone(),
-            None,
             Arc::new(StdFs),
-            false,
-            false,
-            None,
-            #[cfg(zstd_any)]
-            None,
             comparator.clone(),
-            #[cfg(feature = "metrics")]
-            Arc::new(crate::Metrics::default()),
-        )?;
+            cache.clone(),
+        ))?;
         total_rts += table.range_tombstones().len();
     }
 
@@ -197,24 +187,14 @@ fn clip_rt_spanning_next_table_does_not_overlap_key_ranges() -> crate::Result<()
 
     let mut tables = Vec::new();
     for (table_id, checksum) in &results {
-        tables.push(crate::Table::recover(
+        tables.push(crate::Table::recover(crate::table::RecoverParams::new(
             base_path.join(table_id.to_string()),
             *checksum,
-            0,
-            0,
             *table_id,
-            cache.clone(),
-            None,
             Arc::new(StdFs),
-            false,
-            false,
-            None,
-            #[cfg(zstd_any)]
-            None,
             comparator.clone(),
-            #[cfg(feature = "metrics")]
-            Arc::new(crate::Metrics::default()),
-        )?);
+            cache.clone(),
+        ))?);
     }
 
     // Key ranges must be disjoint: table1.max < table2.min
@@ -315,24 +295,14 @@ fn locator_section_round_trips_through_writer() -> crate::Result<()> {
             let results = mw.finish()?;
             assert_eq!(results.len(), 1, "single output table expected");
             let (table_id, checksum) = results[0];
-            crate::Table::recover(
+            crate::Table::recover(crate::table::RecoverParams::new(
                 base.join(table_id.to_string()),
                 checksum,
-                0,
-                0,
                 table_id,
-                Arc::new(crate::Cache::with_capacity_bytes(1 << 20)),
-                None,
                 Arc::new(StdFs),
-                false,
-                false,
-                None,
-                #[cfg(zstd_any)]
-                None,
                 Arc::new(crate::DefaultUserComparator),
-                #[cfg(feature = "metrics")]
-                Arc::new(crate::Metrics::default()),
-            )
+                Arc::new(crate::Cache::with_capacity_bytes(1 << 20)),
+            ))
         };
 
     // 1) Enabled (auto widths): section present, every key recovers.

@@ -27,7 +27,7 @@ use core::sync::atomic::AtomicBool;
 
 pub fn recover_blob_files(
     folder: &Path,
-    ids: &[(BlobFileId, Checksum)],
+    ids: &[(BlobFileId, Checksum, u64)],
     tree_id: TreeId,
     descriptor_table: Option<&Arc<DescriptorTable>>,
     fs: &Arc<dyn Fs>,
@@ -83,6 +83,20 @@ pub fn recover_blob_files(
             continue;
         }
 
+        // `{id}.salvage-tmp`: a manifest repair's in-progress blob salvage
+        // copy. It is published by an atomic rename, so one that survives is
+        // always from a crashed repair and never referenced by any manifest —
+        // sweep it like any other orphan instead of failing the name parse
+        // (which would leave the tree unopenable until an operator intervened).
+        // Both halves must parse so a foreign name that merely ends in the
+        // suffix is NOT treated as ours.
+        if let Some(id_part) = file_name.strip_suffix(".salvage-tmp")
+            && id_part.parse::<BlobFileId>().is_ok()
+        {
+            orphaned_blob_files.push(dirent.path.clone());
+            continue;
+        }
+
         let blob_file_id = file_name.parse::<BlobFileId>().map_err(|e| {
             log::error!("invalid blob file name {file_name:?}: {e:?}");
             crate::Error::Unrecoverable
@@ -90,7 +104,9 @@ pub fn recover_blob_files(
 
         let blob_file_path = &dirent.path;
 
-        if let Some(&(_, checksum)) = ids.iter().find(|(id, _)| id == &blob_file_id) {
+        if let Some(&(_, checksum, live_data_start)) =
+            ids.iter().find(|(id, _, _)| id == &blob_file_id)
+        {
             log::trace!(
                 "Recovering blob file #{blob_file_id:?} from {}",
                 blob_file_path.display(),
@@ -135,6 +151,7 @@ pub fn recover_blob_files(
                 is_deleted: AtomicBool::new(false),
                 punch_on_drop: portable_atomic::AtomicU64::new(u64::MAX),
                 checksum,
+                live_data_start,
                 file_accessor,
                 tree_id,
                 fs: fs.clone(),
@@ -198,6 +215,26 @@ pub fn recover_blob_file(
     tree_id: TreeId,
     fs: &Arc<dyn Fs>,
 ) -> crate::Result<BlobFile> {
+    recover_blob_file_from(path, id, checksum, tree_id, fs, 0)
+}
+
+/// As [`recover_blob_file`], but for a view whose consumed prefix below
+/// `live_data_start` was reclaimed by a tight-space relocation: `checksum`
+/// covers only `[live_data_start, end)`, and integrity checks hash from there
+/// rather than over the punched (zeroed) prefix. `live_data_start = 0` is a
+/// whole, unreclaimed file.
+///
+/// # Errors
+///
+/// Propagates any error from opening or parsing the blob file.
+pub fn recover_blob_file_from(
+    path: &Path,
+    id: BlobFileId,
+    checksum: Checksum,
+    tree_id: TreeId,
+    fs: &Arc<dyn Fs>,
+    live_data_start: u64,
+) -> crate::Result<BlobFile> {
     let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
 
     // Same meta-section read as `recover_blob_files`' per-id branch above.
@@ -222,6 +259,7 @@ pub fn recover_blob_file(
         is_deleted: AtomicBool::new(false),
         punch_on_drop: portable_atomic::AtomicU64::new(u64::MAX),
         checksum,
+        live_data_start,
         file_accessor: FileAccessor::File(file),
         tree_id,
         fs: fs.clone(),

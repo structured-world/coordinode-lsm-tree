@@ -83,6 +83,17 @@ impl Version {
             }
         }
 
+        // Per-blob-file live-data frontiers, the blob analogue of the table
+        // restrictions above: a relocated blob file's recorded checksum covers
+        // only `[frontier, end)` because its consumed prefix is punched out.
+        let mut blob_restrictions = Vec::new();
+        for bf in self.blob_files.iter() {
+            let frontier = bf.live_data_start();
+            if frontier > 0 {
+                blob_restrictions.push((bf.id(), frontier));
+            }
+        }
+
         Ok(VersionEdit {
             new_version_id: self.id(),
             changed_levels,
@@ -90,6 +101,7 @@ impl Version {
             removed_blob_file_ids,
             gc_stats,
             restrictions,
+            blob_restrictions,
         })
     }
 }

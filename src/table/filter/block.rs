@@ -38,6 +38,17 @@ impl FilterBlock {
     pub fn size(&self) -> usize {
         self.0.size()
     }
+
+    /// Whether the decoded payload is the empty "no filter installed" sentinel
+    /// (see [`maybe_contains_hash`](Self::maybe_contains_hash)). The read path
+    /// treats this permissively, but a verifier deciding whether to trust the
+    /// bytes must distinguish it from a real filter — a present-but-empty full
+    /// filter on a table with keys is anomalous (the writer omits the section
+    /// rather than emitting an empty one).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.data.is_empty()
+    }
 }
 
 #[cfg(test)]

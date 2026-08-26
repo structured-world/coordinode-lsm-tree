@@ -165,6 +165,25 @@ impl RangeTombstone {
             .then_with(|| other.seqno.cmp(&self.seqno))
             .then_with(|| comparator.compare(&self.end, &other.end))
     }
+
+    /// The `(start, seqno)` of the tombstone an RT-ONLY table records its
+    /// synthetic sentinel entry from: the `(seqno, start)`-minimal tombstone.
+    ///
+    /// The writer emits a weak-tombstone sentinel at this key/seqno ONLY when
+    /// the table has no real KV items (to force a valid index). Its seqno is
+    /// RT-derived and lies OUTSIDE the recorded KV seqno range, so any consumer
+    /// reconstructing the table's KV bounds from the decoded entries must
+    /// exclude the entry that matches it. `None` for an empty tombstone list.
+    ///
+    /// Ties on `(seqno, start)` keep the first, matching the writer's strict-`<`
+    /// update. Ordering is lexicographic on `start`, as the writer uses.
+    #[must_use]
+    pub(crate) fn sentinel(tombstones: &[Self]) -> Option<(&UserKey, SeqNo)> {
+        tombstones
+            .iter()
+            .min_by(|a, b| a.seqno.cmp(&b.seqno).then_with(|| a.start.cmp(&b.start)))
+            .map(|rt| (&rt.start, rt.seqno))
+    }
 }
 
 /// Ordered by `(start asc, seqno desc, end asc)`.

@@ -94,6 +94,71 @@ fn line_value(text: &str, label: &str) -> Option<String> {
     })
 }
 
+/// A Page-ECC SST must have its parity actually VERIFIED by the tool (the
+/// build enables `page_ecc`), and the verdict must surface the warning
+/// channel: a `warnings:` line is always printed, and a clean ECC SST shows
+/// zero warnings. Without the feature every ECC SST silently reported OK
+/// while its parity was skipped (a `ParityUnverifiable` warning that the
+/// output never showed).
+#[test]
+fn verify_ecc_sst_verifies_parity_and_reports_warnings() {
+    use lsm_tree::runtime_config::EccScheme;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+    .page_ecc(true)
+    .ecc_scheme(EccScheme::ReedSolomon {
+        data_shards: 8,
+        parity_shards: 2,
+    })
+    .open()
+    .expect("open ecc tree");
+    for i in 0u64..200 {
+        tree.insert(format!("key-{i:06}"), format!("value-{i}"), 1 + i);
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    drop(tree);
+    let tables = dir.path().join("tables");
+    let sst = std::fs::read_dir(&tables)
+        .expect("tables dir")
+        .filter_map(Result::ok)
+        .find(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .expect("at least one SST")
+        .path();
+
+    let out = Command::new(SST_DUMP_BIN)
+        .arg(&sst)
+        .arg("verify")
+        .output()
+        .expect("spawn sst-dump");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "expected exit 0 on a clean ECC SST; stdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(
+        line_value(&stdout, "status"),
+        Some("OK".to_owned()),
+        "expected status=OK in output; got:\n{stdout}",
+    );
+    // warnings=0 pins BOTH halves: the line exists (the warning channel is
+    // surfaced, nothing is silently dropped) AND it is zero (the build
+    // carries the ECC codecs, so no ParityUnverifiable was emitted and the
+    // parity trailers were genuinely checked).
+    assert_eq!(
+        line_value(&stdout, "warnings"),
+        Some("0".to_owned()),
+        "expected warnings=0 (parity verified, channel surfaced); got:\n{stdout}",
+    );
+}
+
 #[test]
 fn verify_tampered_sst_exits_nonzero_with_corrupt() {
     let (_dir, sst) = build_one_sst();

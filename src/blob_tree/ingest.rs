@@ -221,26 +221,59 @@ impl<'a> BlobIngestion<'a> {
         let created_tables = results
             .into_iter()
             .map(|(table_id, checksum)| -> crate::Result<Table> {
-                Table::recover(
+                let mut params = crate::table::RecoverParams::new(
                     table_folder.join(table_id.to_string()),
                     checksum,
-                    global_seqno,
-                    index.id,
                     table_id,
-                    index.config.cache.clone(),
-                    index.config.descriptor_table.clone(),
                     self.table.level_fs.clone(),
-                    false,
-                    false,
-                    index.config.encryption.clone(),
-                    #[cfg(zstd_any)]
-                    index.config.zstd_dictionary.clone(),
                     index.config.comparator.clone(),
-                    #[cfg(feature = "metrics")]
-                    index.metrics.clone(),
-                )
+                    index.config.cache.clone(),
+                );
+                params.global_seqno = global_seqno;
+                params.tree_id = index.id;
+                params
+                    .descriptor_table
+                    .clone_from(&index.config.descriptor_table);
+                params.encryption.clone_from(&index.config.encryption);
+                #[cfg(zstd_any)]
+                {
+                    params
+                        .zstd_dictionary
+                        .clone_from(&index.config.zstd_dictionary);
+                }
+                #[cfg(feature = "metrics")]
+                {
+                    params.metrics = index.metrics.clone();
+                }
+                Table::recover(params)
             })
             .collect::<crate::Result<Vec<_>>>()?;
+
+        // Bind every ingested table to the tree BEFORE the version edit makes
+        // it reachable — see the same step in the standard tree's ingest.
+        // Without it an ingested SST can never queue itself for a healing
+        // rewrite, and its in-place heal can race a checkpoint hard-link.
+        for table in &created_tables {
+            table.bind_to_tree(&crate::table::TableSinks {
+                deletion_pause: &index.deletion_pause,
+                heal_hints: &index.heal_hints,
+                #[cfg(feature = "std")]
+                background_deleter: Some(&index.background_deleter),
+            });
+        }
+        // The blob files this ingestion wrote become reachable through the same
+        // version edit, so they carry the same obligation: an unbound file's
+        // `Drop` can unlink it while a checkpoint is capturing, and a
+        // tight-space prefix punch can zero bytes the checkpoint has already
+        // hard-linked.
+        for blob_file in &blob_files {
+            blob_file.bind_to_tree(&crate::table::TableSinks {
+                deletion_pause: &index.deletion_pause,
+                heal_hints: &index.heal_hints,
+                #[cfg(feature = "std")]
+                background_deleter: Some(&index.background_deleter),
+            });
+        }
 
         // Upgrade the version with our ingested tables and blob files, using
         // the global_seqno we allocated earlier. This ensures the version,
@@ -282,3 +315,6 @@ impl<'a> BlobIngestion<'a> {
         &self.tree.index
     }
 }
+
+#[cfg(test)]
+mod tests;

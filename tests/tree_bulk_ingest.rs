@@ -203,3 +203,68 @@ fn blob_tree_copy() -> lsm_tree::Result<()> {
 
     Ok(())
 }
+
+/// End-to-end: a bulk-ingested table relies on a manifest-only `global_seqno`
+/// offset for its effective MVCC ordering, so manifest repair (which cannot
+/// recover that offset from the SST) must FAIL CLOSED and drop it rather than
+/// register it with offset 0 and silently age its entries. This exercises the
+/// real ingest path (which flags the SST `descriptor#bulk_ingested`) plus
+/// repair, guarding the ingest → flag → drop chain end to end.
+#[test]
+fn repair_drops_a_bulk_ingested_table() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let seqno = SequenceNumberCounter::default();
+    let visible_seqno = SequenceNumberCounter::default();
+
+    {
+        let tree = Config::new(&folder, seqno.clone(), visible_seqno.clone()).open()?;
+        let mut ingestion = tree.ingestion()?;
+        for x in 0..64u64 {
+            ingestion.write(x.to_be_bytes(), b"v")?;
+        }
+        ingestion.finish()?;
+    }
+
+    // The ingested SST on disk before repair. Quarantine must MOVE it out of
+    // tables/ (not merely omit it from the rebuilt manifest), or the next open's
+    // orphan cleanup would delete the only copy of the preserved original.
+    let ingested_sst = std::fs::read_dir(folder.path().join("tables"))?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .expect("the ingest produced a numerically-named SST file");
+
+    // The ingest allocated a nonzero global_seqno (a manifest-only offset the
+    // SST does not carry), so repair cannot reconstruct it.
+    assert!(
+        seqno.get() > 0,
+        "the ingest allocated a global_seqno offset"
+    );
+
+    let report = Config::new(&folder, seqno, visible_seqno).repair()?;
+    assert_eq!(
+        report.recovered, 0,
+        "the bulk-ingested table must not be recovered with a lost offset: {report:?}",
+    );
+    assert_eq!(
+        report.unreadable, 1,
+        "the bulk-ingested table is dropped: {:?}",
+        report.unreadable_files,
+    );
+    assert!(
+        report.unreadable_files[0].1.contains("sequence offset"),
+        "the reason names the unrecoverable ingest offset: {:?}",
+        report.unreadable_files,
+    );
+    assert!(
+        !ingested_sst.exists(),
+        "the dropped SST must be removed from tables/ ({}), not left in place",
+        ingested_sst.display(),
+    );
+
+    Ok(())
+}

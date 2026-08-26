@@ -14,6 +14,7 @@ use std::io::{BufReader, Read, Seek};
 /// Archive reader
 pub struct Reader {
     toc: Toc,
+    toc_pos: u64,
 }
 
 impl Reader {
@@ -35,7 +36,10 @@ impl Reader {
             trailer.toc_len,
             trailer.toc_checksum,
         )?;
-        Ok(Self { toc })
+        Ok(Self {
+            toc,
+            toc_pos: trailer.toc_pos,
+        })
     }
 
     /// Creates a new [`Reader`] from a reader.
@@ -51,12 +55,24 @@ impl Reader {
             trailer.toc_len,
             trailer.toc_checksum,
         )?;
-        Ok(Self { toc })
+        Ok(Self {
+            toc,
+            toc_pos: trailer.toc_pos,
+        })
     }
 
     /// Lists the table of contents.
     #[must_use]
     pub fn toc(&self) -> &Toc {
         &self.toc
+    }
+
+    /// File offset where the TOC begins — the end of the last section's
+    /// payload region. The writer emits sections strictly back-to-back, so
+    /// the named entries must exactly tile `[0, toc_pos())`; a verifier uses
+    /// this bound to detect an omitted (re-stamped-away) TOC entry.
+    #[must_use]
+    pub fn toc_pos(&self) -> u64 {
+        self.toc_pos
     }
 }

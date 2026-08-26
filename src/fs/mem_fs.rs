@@ -509,6 +509,12 @@ impl FsFile for MemFile {
         })
     }
 
+    // MemFs has no inode concept ([`Fs::hard_link`] copies), so a file can
+    // never share its bytes with another name: the count is exactly 1.
+    fn hard_link_count(&self) -> io::Result<u64> {
+        Ok(1)
+    }
+
     fn set_len(&self, size: u64) -> io::Result<()> {
         if !self.writable {
             return Err(io::Error::other("set_len requires write access"));
@@ -973,7 +979,60 @@ impl Fs for MemFs {
         }
     }
 
+    fn allocated_size(&self, path: &Path) -> io::Result<Option<u64>> {
+        let state = read_state(&self.state)?;
+        let Some(data) = state.files.get(path) else {
+            return Ok(None);
+        };
+        // Physically-backed bytes = logical length minus the bytes punched out of
+        // it (clipped to the current length), mirroring `stored_bytes`. A punched
+        // file reports `allocated < len`; a never-punched file reports `len`. The
+        // subtraction never underflows: `clipped_punched_len` clips to `len`.
+        let len = lock(data)?.len() as u64;
+        let punched = state
+            .punched
+            .get(path)
+            .map_or(0, |ranges| clipped_punched_len(ranges, len));
+        Ok(Some(len - punched))
+    }
+
+    fn extent_is_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<Option<bool>> {
+        let state = read_state(&self.state)?;
+        if !state.files.contains_key(path) {
+            return Ok(None);
+        }
+        if len == 0 {
+            return Ok(Some(false));
+        }
+        // Covered iff every byte of the extent falls in some punched range.
+        // Ranges are recorded as written, so walk from `offset` and require an
+        // unbroken chain to reach the end.
+        let end = offset.saturating_add(len);
+        let ranges = state.punched.get(path).map_or(&[][..], Vec::as_slice);
+        let mut reached = offset;
+        let mut progressed = true;
+        while reached < end && progressed {
+            progressed = false;
+            for &(s, e) in ranges {
+                if s <= reached && e > reached {
+                    reached = e;
+                    progressed = true;
+                }
+            }
+        }
+        Ok(Some(reached >= end))
+    }
+
     fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        // The implicit root always exists: `ensure_parent_dir` accepts an
+        // empty or `/` parent when creating files, and callers syncing a bare
+        // relative file's new entry name that root `.` (an empty
+        // `Path::parent` is not a syncable name on any backend). Rejecting
+        // these spellings would fail the sync of an entry whose creation this
+        // backend just allowed.
+        if path.as_os_str().is_empty() || path == Path::new(".") || path == Path::new("/") {
+            return Ok(());
+        }
         // Durability is a no-op, but validate the path is an existing directory.
         let state = read_state(&self.state)?;
         if !state.dirs.contains(path) {
@@ -1061,6 +1120,25 @@ impl Fs for MemFs {
                 .punch_hole_supported
                 .load(portable_atomic::Ordering::Relaxed),
             ..FsCapabilities::default()
+        }
+    }
+
+    /// `MemFs` has no inode concept — [`Fs::hard_link`] produces an independent
+    /// COPY — so a file's bytes are never shared with another name and the
+    /// count is exactly `1` (matching this backend's
+    /// [`FsFile::hard_link_count`]). Answering instead of inheriting the
+    /// `Unsupported` default matters for the in-place reclaim paths: they fail
+    /// closed on an unanswerable probe, so an unimplemented count would
+    /// silently disable every hole punch on this backend.
+    fn hard_link_count(&self, path: &Path) -> io::Result<u64> {
+        let state = read_state(&self.state)?;
+        if state.files.contains_key(path) {
+            Ok(1)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("file not found: {}", path.display()),
+            ))
         }
     }
 

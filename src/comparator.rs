@@ -92,6 +92,35 @@ pub trait UserComparator: Send + Sync + core::panic::RefUnwindSafe + 'static {
     }
 }
 
+/// Whether two user keys are the SAME key — the single identity relation the
+/// whole engine uses.
+///
+/// Identity is byte equality, and that is not a shortcut for ordering: the
+/// [`UserComparator`] contract requires `compare(a, b) == Equal` to imply `a`
+/// and `b` are byte-identical, so for any valid comparator the two relations are
+/// the same one. Asking the comparator here would answer the same question at
+/// the cost of a dynamic dispatch per entry on the read path.
+///
+/// The invariant is not a convention that could be relaxed. Filters and the
+/// locator index are built over `hash64(user_key)` of the RAW bytes, so a
+/// comparator that equated two different spellings would make a point lookup
+/// for one of them hash to an entry the other never wrote — a false negative no
+/// identity relation chosen here could repair. An engine cannot hash an
+/// equivalence class it cannot enumerate.
+///
+/// Every place that decides "is this the same key as the previous one?" — MVCC
+/// version collapsing on reads and in compaction, the writer's key count, the
+/// row cache, the CDC event ordering, and salvage's suppression of a beheaded
+/// version chain — goes through here, so the answer is stated once.
+// `inline(always)`: the body is one slice compare, and this sits in the read
+// path's per-entry loop — a call here would cost more than the comparison.
+#[expect(clippy::inline_always, reason = "one slice compare on the read path")]
+#[inline(always)]
+#[must_use]
+pub fn same_user_key(a: &[u8], b: &[u8]) -> bool {
+    a == b
+}
+
 /// Default comparator using lexicographic byte ordering.
 ///
 /// This is the comparator used when no custom comparator is configured,

@@ -17,14 +17,22 @@
 //! ingested segments carry a *uniform per-segment* seqno (every local seqno is
 //! `0`, one `global_seqno` per table), so their visibility is segment-granular;
 //! flush-produced segments carry per-row seqnos, so a snapshot can straddle them.
+//! A projected seqno column is emitted in that EFFECTIVE (tree-global) space,
+//! which is what every other read surface speaks: the stored local value would
+//! read as `0` for an ingested row and name a commit the tree never had. The
+//! masking arithmetic still runs in local space (one subtraction per segment
+//! instead of one addition per row), so only the emitted column is translated.
 //! The visible columnar segments overlapping the range are grouped by key-range
 //! overlap:
 //!
 //! - A **singleton** group (a segment whose key range overlaps no other) whose
-//!   rows are all visible streams its
+//!   rows are all visible AND provably one-version-per-key (the writer's
+//!   distinct-key count equals its row count) streams its
 //!   [`Table::columnar_scan`](crate::Table::columnar_scan) batches verbatim —
 //!   zero-copy column-skip, no key decode, no row gather. A singleton the
-//!   snapshot straddles gets a per-row seqno mask first.
+//!   snapshot straddles gets a per-row seqno mask first, and one that can hold
+//!   several versions of a key (an overwritten key in a flush / compaction
+//!   product) additionally gets per-key newest-visible dedup.
 //! - An **overlapping** group is row-merged: the projection is augmented with the
 //!   intrinsic key + seqno columns, each segment's rows are visibility-masked and
 //!   tagged with their effective seqno, the union is sorted by `(key asc,
@@ -37,9 +45,15 @@
 //! compaction to keep files non-overlapping: as multi-segment columnar compaction
 //! reduces overlap, more of the scan takes the zero-cost singleton path.
 //!
-//! Deletes are expressed through each segment's positional delete-bitmap (applied
-//! inside [`Table::columnar_scan`](crate::Table::columnar_scan)); this scan does
-//! not interpret value-type tombstone rows. Memtable rows are not consulted —
+//! Deletes reach the scan two ways and both remove the key. A segment's
+//! positional delete-bitmap is applied inside
+//! [`Table::columnar_scan`](crate::Table::columnar_scan); a value-type TOMBSTONE
+//! is consumed here, when the newest visible version of a key is one — the key
+//! then yields no row at all, matching what a point read reports, instead of
+//! surfacing a row a caller who did not project the value-type column could not
+//! tell from a live one. Only a segment that RECORDS deletions pays for it: one
+//! whose metadata counts none keeps its columns untouched (and its zero-copy
+//! verbatim path). Memtable rows are not consulted —
 //! columnar data lives only in segments — and a visible non-columnar segment
 //! overlapping the range is rejected (a mixed-mode tree is unsupported here).
 
@@ -50,7 +64,7 @@ use alloc::{vec, vec::Vec};
 use crate::comparator::UserComparator;
 use crate::table::SeqnoVisibility;
 use crate::table::columnar::{
-    COL_SEQNO, COL_USER_KEY, ColumnBatch, TypeTag, bytes_column_row, fixed_u64_row,
+    COL_SEQNO, COL_USER_KEY, COL_VALUE_TYPE, ColumnBatch, TypeTag, bytes_column_row, fixed_u64_row,
 };
 use crate::table::columnar_predicate::{ColumnRangePredicate, filter_batch, take_rows};
 use crate::{Error, SeqNo, Table, Tree, UserKey};
@@ -66,6 +80,12 @@ struct Segment {
     global: SeqNo,
     /// Whether every row is visible at the snapshot, or visibility is per-row.
     visibility: SeqnoVisibility,
+    /// Whether this segment can physically hold several MVCC versions of one
+    /// key (a flush / compaction product with an overwritten key). Proven
+    /// unique only when the writer's distinct-key count equals the row count;
+    /// legacy tables without the count are conservatively assumed to carry
+    /// duplicates. Gates the singleton path's per-key newest-visible dedup.
+    may_dup: bool,
 }
 
 /// One key-disjoint group of segments: either a single segment (streamed
@@ -104,9 +124,10 @@ impl Tree {
     /// # Errors
     ///
     /// Returns an error if a visible non-columnar segment overlaps `range` (a
-    /// mixed-mode tree is unsupported here), or — lazily, while iterating — on a
-    /// block read / decode failure or a layout mismatch between segments of an
-    /// overlapping group.
+    /// mixed-mode tree is unsupported here), if the tree carries a merge
+    /// operator (see below), or — lazily, while iterating — on a block read /
+    /// decode failure or a layout mismatch between segments of an overlapping
+    /// group.
     pub fn columnar_scan<R: RangeBounds<UserKey>>(
         &self,
         projection: &[u16],
@@ -114,6 +135,26 @@ impl Tree {
         seqno: SeqNo,
         range: R,
     ) -> crate::Result<ColumnarScan> {
+        // A merge chain is not a version chain: its older rows are the merge's
+        // INPUTS, not data the newest row shadows. The newest-version-wins dedup
+        // below would hand back the raw operand where a read hands back the
+        // merged value, and it drops the base row, so the consumer cannot
+        // resolve the chain itself either. Refuse instead of disagreeing with
+        // the read path.
+        //
+        // Gated on the OPERATOR rather than on the rows: without one the read
+        // path returns the newest entry unchanged — the raw operand — which is
+        // exactly what this scan yields, so nothing diverges. With one, no
+        // metadata says whether a segment holds operands, and finding out means
+        // decoding the value-type column of every batch, which would cost the
+        // zero-copy fast path on every scan of every tree that merges.
+        if self.config.merge_operator.is_some() {
+            return Err(Error::FeatureUnsupported(
+                "columnar scan of a tree with a merge operator: merge chains \
+                 would be returned unresolved",
+            ));
+        }
+
         let comparator = self.config.comparator.clone();
 
         // Owned bounds keep the returned iterator free of borrows from `range`.
@@ -141,11 +182,23 @@ impl Tree {
                 ));
             }
             let key_range = &table.metadata.key_range;
+            // `key_count == item_count` proves the segment holds one version per
+            // key, so the verbatim path can return its rows untouched. The count
+            // the writer recorded and the duplicate-free claim read here rest on
+            // the SAME identity relation the read path uses to collapse versions
+            // (`comparator::same_user_key`), so a segment this calls unique is
+            // one a normal read would also return whole. `None` (a legacy
+            // segment that recorded no count) proves nothing and dedups.
+            let may_dup = table
+                .metadata
+                .key_count
+                .is_none_or(|k| k != table.metadata.item_count);
             segments.push(Segment {
                 min: key_range.min().clone(),
                 max: key_range.max().clone(),
                 global: table.global_seqno(),
                 visibility,
+                may_dup,
                 table: table.clone(),
             });
         }
@@ -234,18 +287,65 @@ impl ColumnarScan {
         matches!(self.lo, Bound::Unbounded) && matches!(self.hi, Bound::Unbounded)
     }
 
+    /// Rewrites a batch's seqno column from its segment's LOCAL space into the
+    /// tree's global one (`local + global`).
+    ///
+    /// A bulk-ingested segment stores every row at local seqno `0` and carries
+    /// its ordering in a per-segment `global_seqno`, so the stored column is not
+    /// a commit sequence number any other read surface would recognize. The
+    /// masking arithmetic elsewhere translates the THRESHOLD into local space
+    /// instead (cheaper, one subtraction per segment), which is why the column
+    /// itself still needs this before it reaches a caller. A zero offset leaves
+    /// the batch untouched.
+    fn globalize_seqnos(batch: &mut ColumnBatch, global: SeqNo) -> crate::Result<()> {
+        if global == 0 {
+            return Ok(());
+        }
+        let Some(col) = batch.columns.iter_mut().find(|c| c.column_id == COL_SEQNO) else {
+            return Ok(());
+        };
+        for row in 0..batch.row_count as usize {
+            let at = row * 8;
+            let bytes = col
+                .data
+                .get_mut(at..at + 8)
+                .ok_or(Error::InvalidHeader("columnar_scan: short seqno column"))?;
+            let local = u64::from_le_bytes(
+                (&*bytes)
+                    .try_into()
+                    .map_err(|_| Error::InvalidHeader("columnar_scan: short seqno column"))?,
+            );
+            let effective = local.checked_add(global).ok_or(Error::InvalidHeader(
+                "columnar_scan: effective seqno overflows",
+            ))?;
+            bytes.copy_from_slice(&effective.to_le_bytes());
+        }
+        Ok(())
+    }
+
     /// Singleton group: no cross-segment merge. When every row is visible and the
     /// range is unbounded, the per-SST projected scan streams verbatim (zero-copy
     /// column-skip). Otherwise a per-row mask drops rows that are seqno-invisible
     /// (when the snapshot straddles the segment) or outside the requested range
     /// (when the segment only partially overlaps it).
     fn process_singleton(&self, seg: &Segment) -> crate::Result<Vec<ColumnBatch>> {
+        // A segment that RECORDS deletions takes the dedup path even when its
+        // keys are provably unique: a key whose single row is a tombstone would
+        // otherwise stream through verbatim and surface a key the point read
+        // calls absent. Deciding a run is where tombstones are consumed, and
+        // that lives there.
+        if seg.may_dup || seg.table.tombstone_count() > 0 || seg.table.weak_tombstone_count() > 0 {
+            return self.process_singleton_dedup(seg);
+        }
         let range_filter = !self.range_is_full();
         if seg.visibility == SeqnoVisibility::All && !range_filter {
             let mut out = seg
                 .table
                 .columnar_scan(&self.projection, self.predicate.as_ref())?;
             out.retain(|b| b.row_count > 0);
+            for batch in &mut out {
+                Self::globalize_seqnos(batch, seg.global)?;
+            }
             return Ok(out);
         }
 
@@ -328,6 +428,171 @@ impl ColumnarScan {
                 visible.columns.retain(|c| c.column_id != COL_USER_KEY);
             }
             if visible.row_count > 0 {
+                Self::globalize_seqnos(&mut visible, seg.global)?;
+                out.push(visible);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Singleton whose segment can physically hold several MVCC versions of one
+    /// key (`Segment::may_dup`): every version is a physical row, so the scan
+    /// must keep only the newest VISIBLE version per key instead of streaming
+    /// the segment verbatim. Rows are stored in internal-key order (key
+    /// ascending, seqno descending within a key), so within each key run the
+    /// invisible too-new versions come first and the first visible row is the
+    /// newest visible version; a run can span batch boundaries, so the last
+    /// kept key carries across batches. The predicate runs AFTER dedup
+    /// (mirroring [`Self::merge_group`]): a key whose newest version fails the
+    /// predicate is dropped, never served from an older matching version —
+    /// which also rules out predicate-driven zone-map block-skip here.
+    fn process_singleton_dedup(&self, seg: &Segment) -> crate::Result<Vec<ColumnBatch>> {
+        // Decode the columns the dedup needs even when the caller did not
+        // project them (dropped again at the end): the key column always, the
+        // seqno column when the snapshot straddles the segment, the predicate
+        // column for the after-dedup filter.
+        let key_projected = self.projection.contains(&COL_USER_KEY);
+        let seqno_projected = self.projection.contains(&COL_SEQNO);
+        let partial = seg.visibility == SeqnoVisibility::Partial;
+        let mut augmented = self.projection.clone();
+        if !key_projected {
+            augmented.push(COL_USER_KEY);
+        }
+        if partial && !seqno_projected {
+            augmented.push(COL_SEQNO);
+        }
+        let predicate_col = self.predicate.as_ref().map(|p| p.column_id);
+        let predicate_col_projected = predicate_col.is_some_and(|c| self.projection.contains(&c));
+        if let Some(pc) = predicate_col
+            && !augmented.contains(&pc)
+        {
+            augmented.push(pc);
+        }
+        // A deletion is what a key's newest row can BE, so deciding a run needs
+        // the value type — otherwise a tombstone decides the run and is emitted
+        // as a row while a point read calls the key absent, and a caller that did
+        // not project the type column cannot tell that row from a live one with
+        // an empty value. Decoded only for a segment that RECORDS deletions; one
+        // without them keeps its columns untouched.
+        let deletes = seg.table.tombstone_count() > 0 || seg.table.weak_tombstone_count() > 0;
+        let vt_projected = self.projection.contains(&COL_VALUE_TYPE);
+        if deletes && !vt_projected {
+            augmented.push(COL_VALUE_TYPE);
+        }
+
+        // Visible iff `local < threshold` (the snapshot in this segment's local
+        // seqno space); `Partial` guarantees the subtraction is in range.
+        let threshold = self.seqno.saturating_sub(seg.global);
+        let range_filter = !self.range_is_full();
+        let cmp = self.comparator.as_ref();
+
+        let mut out = Vec::new();
+        // The user key of the last key run whose newest visible version was
+        // already emitted (or deliberately dropped by the range filter) —
+        // owned, because a run can span batch boundaries.
+        let mut last_key: Option<alloc::vec::Vec<u8>> = None;
+        for batch in seg.table.columnar_scan(&augmented, None)? {
+            if batch.row_count == 0 {
+                continue;
+            }
+            let key_col = batch
+                .columns
+                .iter()
+                .find(|c| c.column_id == COL_USER_KEY)
+                .ok_or(Error::InvalidHeader(
+                    "columnar_scan: dedup batch missing the key column",
+                ))?;
+            let vt_col = if deletes {
+                Some(
+                    batch
+                        .columns
+                        .iter()
+                        .find(|c| c.column_id == COL_VALUE_TYPE)
+                        .ok_or(Error::InvalidHeader(
+                            "columnar_scan: dedup batch missing the value-type column",
+                        ))?,
+                )
+            } else {
+                None
+            };
+            let seqno_col = if partial {
+                Some(
+                    batch
+                        .columns
+                        .iter()
+                        .find(|c| c.column_id == COL_SEQNO)
+                        .ok_or(Error::InvalidHeader(
+                            "columnar_scan: dedup batch missing the seqno column",
+                        ))?,
+                )
+            } else {
+                None
+            };
+
+            let mut mask = Vec::with_capacity(batch.row_count as usize);
+            for row in 0..batch.row_count {
+                let visible = match seqno_col {
+                    Some(seqno_col) => fixed_u64_row(&seqno_col.data, row)? < threshold,
+                    None => true,
+                };
+                if !visible {
+                    mask.push(false);
+                    continue;
+                }
+                let key = bytes_column_row(&key_col.data, batch.row_count, row)?;
+                if last_key
+                    .as_deref()
+                    .is_some_and(|p| cmp.compare(p, key) == core::cmp::Ordering::Equal)
+                {
+                    // A later visible version of an already-decided key run —
+                    // shadowed by the newest visible version above it.
+                    mask.push(false);
+                    continue;
+                }
+                // First visible row of a new key run = the newest visible
+                // version. Deciding the run here (even when the range filter or
+                // a deletion drops the row) also drops its older versions above.
+                last_key = Some(key.to_vec());
+                if let Some(vt_col) = vt_col {
+                    let byte = *vt_col.data.get(row as usize).ok_or(Error::InvalidHeader(
+                        "columnar_scan: value-type column shorter than the row count",
+                    ))?;
+                    let value_type = crate::ValueType::try_from(byte)
+                        .map_err(|()| Error::InvalidTag(("ValueType", byte)))?;
+                    if value_type.is_tombstone() {
+                        // The key is GONE as of this row, so the run yields
+                        // nothing: emitting the tombstone would surface a key the
+                        // point read reports absent.
+                        mask.push(false);
+                        continue;
+                    }
+                }
+                mask.push(!range_filter || key_in_bounds(key, &self.lo, &self.hi, cmp));
+            }
+
+            let mut visible = filter_batch(&batch, &mask);
+            // The predicate runs on the deduped survivors only (see doc).
+            if let Some(pred) = self.predicate.as_ref() {
+                let pred_mask = pred.matching_rows(&visible);
+                visible = filter_batch(&visible, &pred_mask);
+            }
+            // Match the singleton contract: yield exactly the projected columns.
+            if !key_projected {
+                visible.columns.retain(|c| c.column_id != COL_USER_KEY);
+            }
+            if !seqno_projected {
+                visible.columns.retain(|c| c.column_id != COL_SEQNO);
+            }
+            if deletes && !vt_projected {
+                visible.columns.retain(|c| c.column_id != COL_VALUE_TYPE);
+            }
+            if let Some(pc) = predicate_col
+                && !predicate_col_projected
+            {
+                visible.columns.retain(|c| c.column_id != pc);
+            }
+            if visible.row_count > 0 {
+                Self::globalize_seqnos(&mut visible, seg.global)?;
                 out.push(visible);
             }
         }
@@ -358,6 +623,17 @@ impl ColumnarScan {
             && !augmented.contains(&pc)
         {
             augmented.push(pc);
+        }
+        // Same rule as the singleton path: the newest version of a key can BE a
+        // deletion, and then the key yields nothing. Decoded only when a segment
+        // of this group records deletions.
+        let deletes = group
+            .segments
+            .iter()
+            .any(|s| s.table.tombstone_count() > 0 || s.table.weak_tombstone_count() > 0);
+        let vt_projected = self.projection.contains(&COL_VALUE_TYPE);
+        if deletes && !vt_projected {
+            augmented.push(COL_VALUE_TYPE);
         }
 
         // Concatenate every segment's visible rows into one batch, tracking each
@@ -449,6 +725,19 @@ impl ColumnarScan {
         // drop the shadowed older duplicates and any key outside the requested
         // range (a segment may only partially overlap it).
         let range_filter = !self.range_is_full();
+        let vt_col = if deletes {
+            Some(
+                combined
+                    .columns
+                    .iter()
+                    .find(|c| c.column_id == COL_VALUE_TYPE)
+                    .ok_or(Error::InvalidHeader(
+                        "columnar_scan: merged group missing the value-type column",
+                    ))?,
+            )
+        } else {
+            None
+        };
         let mut kept: Vec<u32> = Vec::with_capacity(order.len());
         let mut prev: Option<&[u8]> = None;
         for &i in &order {
@@ -462,10 +751,38 @@ impl ColumnarScan {
             if range_filter && !key_in_bounds(key, &self.lo, &self.hi, cmp) {
                 continue;
             }
+            if let Some(vt_col) = vt_col {
+                let byte = *vt_col.data.get(i as usize).ok_or(Error::InvalidHeader(
+                    "columnar_scan: value-type column shorter than the row count",
+                ))?;
+                let value_type = crate::ValueType::try_from(byte)
+                    .map_err(|()| Error::InvalidTag(("ValueType", byte)))?;
+                // The newest version deletes the key, so the key yields nothing —
+                // the run is already decided, so the older versions stay dropped.
+                if value_type.is_tombstone() {
+                    continue;
+                }
+            }
             kept.push(i);
         }
 
-        let mut merged = take_rows(&combined, &kept);
+        let mut merged = take_rows(&combined, &kept)?;
+
+        // The union spans segments with DIFFERENT offsets, so no single one
+        // applies: write each surviving row's effective seqno — already computed
+        // for the dedup above — into the column, in the tree's global
+        // coordinates. Done before the predicate filter, while row `i` of
+        // `merged` still corresponds to `kept[i]`.
+        if let Some(col) = merged.columns.iter_mut().find(|c| c.column_id == COL_SEQNO) {
+            for (row, &i) in kept.iter().enumerate() {
+                let at = row * 8;
+                let bytes = col
+                    .data
+                    .get_mut(at..at + 8)
+                    .ok_or(Error::InvalidHeader("columnar_scan: short seqno column"))?;
+                bytes.copy_from_slice(&eff_at(i).to_le_bytes());
+            }
+        }
 
         // Apply the row predicate AFTER newest-version dedup: each surviving row is
         // now the newest visible version of its key, so a key whose newest version
@@ -482,6 +799,9 @@ impl ColumnarScan {
         }
         if !seqno_projected {
             merged.columns.retain(|c| c.column_id != COL_SEQNO);
+        }
+        if deletes && !vt_projected {
+            merged.columns.retain(|c| c.column_id != COL_VALUE_TYPE);
         }
         if let Some(pc) = predicate_col
             && !predicate_col_projected

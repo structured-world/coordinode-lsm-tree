@@ -247,7 +247,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
         loop {
             let should_take = self.inner.peek().is_some_and(|peeked| {
                 if let Ok(peeked) = peeked {
-                    peeked.key.user_key == user_key
+                    crate::comparator::same_user_key(&peeked.key.user_key, &user_key)
                 } else {
                     true
                 }
@@ -364,7 +364,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
         loop {
             let Some(next) = self.inner.next_if(|kv| {
                 if let Ok(kv) = kv {
-                    let expired = kv.key.user_key == key;
+                    let expired = crate::comparator::same_user_key(&kv.key.user_key, key);
 
                     if expired && let Some(watcher) = &mut self.dropped_callback {
                         watcher.on_dropped(kv);
