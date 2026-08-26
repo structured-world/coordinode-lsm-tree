@@ -9052,7 +9052,7 @@ fn a_zeroed_blob_prefix_without_a_hole_is_not_a_frontier() -> crate::Result<()> 
         file.sync_all()?;
     }
 
-    let fs: Arc<dyn Fs> = memfs.clone();
+    let fs: Arc<dyn Fs> = memfs;
     let derived = super::derive_blob_frontier(&fs, &blob_path, 0)?;
     assert!(
         matches!(derived, super::BlobFrontier::Whole),
@@ -9102,7 +9102,7 @@ fn a_wholly_zeroed_blob_section_without_holes_is_not_fully_consumed() -> crate::
         file.sync_all()?;
     }
 
-    let fs: Arc<dyn Fs> = memfs.clone();
+    let fs: Arc<dyn Fs> = memfs;
     let derived = super::derive_blob_frontier(&fs, &blob_path, 0)?;
     assert!(
         matches!(derived, super::BlobFrontier::Whole),

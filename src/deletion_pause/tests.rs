@@ -319,7 +319,7 @@ fn a_deferred_punch_waits_for_an_open_checkpoint_link_window() {
     );
 
     drop(checkpoint);
-    handle.join().expect("the retry thread finishes");
+    assert!(handle.join().is_ok(), "the retry thread finishes");
     assert_eq!(
         mem.punched_bytes(),
         2048,
