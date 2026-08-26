@@ -1087,14 +1087,12 @@ fn entry_directory(path: &std::path::Path) -> &std::path::Path {
 /// the version run has ended, and the chain can continue into the next block,
 /// which would then publish an even older version. Suppression therefore holds
 /// until a surviving entry with a different key ends the run.
-/// Keys are compared through the tree's COMPARATOR, not by bytes: a comparator
-/// may fold spellings together (case-insensitive, normalized, numeric), and the
-/// lost version can then be spelled differently from the older one that follows
-/// it. Byte inequality would keep that older version and republish it.
+/// Which entries are the shadowed key's is the engine's one identity relation
+/// (see [`crate::comparator::same_user_key`]) — the same question the read path
+/// answers when it groups a key's versions, asked the same way.
 fn suppress_shadowed_boundary(
     entries: Vec<crate::InternalValue>,
     boundary: Option<&UserKey>,
-    comparator: &crate::comparator::SharedComparator,
 ) -> (Vec<crate::InternalValue>, Option<UserKey>) {
     let Some(shadowed) = boundary
         .cloned()
@@ -1104,10 +1102,7 @@ fn suppress_shadowed_boundary(
     };
     let kept: Vec<_> = entries
         .into_iter()
-        .filter(|e| {
-            comparator.compare(e.key.user_key.as_ref(), shadowed.as_ref())
-                != core::cmp::Ordering::Equal
-        })
+        .filter(|e| !crate::comparator::same_user_key(&e.key.user_key, &shadowed))
         .collect();
     let carry = kept.is_empty().then_some(shadowed);
     (kept, carry)
@@ -1136,11 +1131,10 @@ enum BoundarySuppression {
 fn suppress_columnar_boundary(
     batch: &crate::table::columnar::ColumnBatch,
     boundary: Option<&UserKey>,
-    comparator: &crate::comparator::SharedComparator,
 ) -> crate::Result<BoundarySuppression> {
     let entries = crate::table::columnar::column_batch_to_entries(batch)?;
     let before = entries.len();
-    let (kept, carry) = suppress_shadowed_boundary(entries, boundary, comparator);
+    let (kept, carry) = suppress_shadowed_boundary(entries, boundary);
     if kept.len() == before {
         return Ok(BoundarySuppression::Unchanged);
     }
@@ -1197,24 +1191,23 @@ fn classify_drop(
 /// block ENDS inside such a suppressed run, the key to keep suppressing: the
 /// chain can continue into the next block.
 ///
-/// "The same key" is the tree's COMPARATOR's answer, not byte equality: under a
-/// comparator that folds spellings together, an older version spelled `a` is the
-/// same key as the headless `A` and must go with it.
+/// "The same key" is the engine's one identity relation (see
+/// [`crate::comparator::same_user_key`]), the same question the read path
+/// answers when it groups a key's versions.
 fn rewrite_block_indirections(
     entries: Vec<crate::InternalValue>,
     rewrite: &crate::HashMap<crate::vlog::BlobFileId, BlobFileRewrite>,
     dropped_entries: &mut u64,
-    comparator: &crate::comparator::SharedComparator,
 ) -> crate::Result<(Vec<crate::InternalValue>, Option<UserKey>)> {
     use crate::coding::{Decode, Encode};
 
     let mut out = Vec::with_capacity(entries.len());
     let mut headless: Option<UserKey> = None;
     for mut entry in entries {
-        if headless.as_ref().is_some_and(|h| {
-            comparator.compare(entry.key.user_key.as_ref(), h.as_ref())
-                == core::cmp::Ordering::Equal
-        }) {
+        if headless
+            .as_ref()
+            .is_some_and(|h| crate::comparator::same_user_key(&entry.key.user_key, h))
+        {
             // An older version of a key whose newer one just went missing.
             *dropped_entries += 1;
             continue;
@@ -1910,7 +1903,6 @@ fn salvage_blocks(
                                             entries,
                                             rw,
                                             &mut entries_dropped_by_rewrite,
-                                            comparator,
                                         )
                                     });
                                 match step {
@@ -1960,11 +1952,7 @@ fn salvage_blocks(
                         // this batch opens with, and the mask does not change that.
                         let batch = match lost_boundary.take() {
                             Some(boundary) => {
-                                match suppress_columnar_boundary(
-                                    &batch,
-                                    boundary.as_ref(),
-                                    comparator,
-                                ) {
+                                match suppress_columnar_boundary(&batch, boundary.as_ref()) {
                                     Ok(BoundarySuppression::Unchanged) => batch,
                                     Ok(BoundarySuppression::Emptied(key)) => {
                                         lost_boundary = Some(Some(key));
@@ -2114,7 +2102,6 @@ fn salvage_blocks(
                                             entries,
                                             rw,
                                             &mut entries_dropped_by_rewrite,
-                                            comparator,
                                         ) {
                                             Ok((entries, carry)) => {
                                                 rewrite_carry = carry;
@@ -2166,11 +2153,8 @@ fn salvage_blocks(
                                 let mut rebuilt_by_suppression = false;
                                 let (batch, entries) = match lost_boundary.take() {
                                     Some(boundary) => {
-                                        match suppress_columnar_boundary(
-                                            &batch,
-                                            boundary.as_ref(),
-                                            comparator,
-                                        ) {
+                                        match suppress_columnar_boundary(&batch, boundary.as_ref())
+                                        {
                                             Ok(BoundarySuppression::Unchanged) => (batch, entries),
                                             Ok(BoundarySuppression::Emptied(key)) => {
                                                 lost_boundary = Some(Some(key));
@@ -2409,7 +2393,6 @@ fn salvage_blocks(
                                     entries,
                                     rw,
                                     &mut entries_dropped_by_rewrite,
-                                    comparator,
                                 ) {
                                     Ok(pair) => pair,
                                     Err(e) => {
@@ -2433,11 +2416,8 @@ fn salvage_blocks(
                             let entries = match lost_boundary.take() {
                                 Some(boundary) => {
                                     let before = entries.len();
-                                    let (kept, carry) = suppress_shadowed_boundary(
-                                        entries,
-                                        boundary.as_ref(),
-                                        comparator,
-                                    );
+                                    let (kept, carry) =
+                                        suppress_shadowed_boundary(entries, boundary.as_ref());
                                     // The run has not ended yet: keep suppressing
                                     // into the next block.
                                     if let Some(key) = carry {

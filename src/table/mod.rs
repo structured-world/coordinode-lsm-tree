@@ -4038,7 +4038,10 @@ impl Table {
                 }
                 prev_internal = Some((entry.key.user_key.clone(), entry.key.seqno));
 
-                if prev_key.as_ref() == Some(&entry.key.user_key) {
+                if prev_key
+                    .as_ref()
+                    .is_some_and(|p| crate::comparator::same_user_key(p, &entry.key.user_key))
+                {
                     continue;
                 }
                 // Require the probe to return the NEWEST version, not merely
@@ -4232,7 +4235,10 @@ impl Table {
             for entry in entries {
                 // Blocks are sorted by key then descending seqno, so a key's
                 // older versions are always adjacent — one probe per key.
-                if prev_key.as_deref() == Some(entry.key.user_key.as_ref()) {
+                if prev_key
+                    .as_deref()
+                    .is_some_and(|p| crate::comparator::same_user_key(p, &entry.key.user_key))
+                {
                     continue;
                 }
                 let user_key = entry.key.user_key.to_vec();

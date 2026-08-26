@@ -2043,7 +2043,14 @@ impl Tree {
                     // later scan position replays FIRST. Distinct keys at one
                     // seqno touch different state, so their relative order is
                     // free — keep it deterministic by scan position.
-                    if a.key() == b.key() {
+                    //
+                    // Identity is the engine's one relation (byte equality, see
+                    // `same_user_key`), which is what the read path this mirrors
+                    // uses to group a key's versions. Asking the comparator here
+                    // would answer the same question — its contract makes
+                    // `Equal` imply byte equality — while letting the two paths
+                    // disagree the moment a comparator broke that.
+                    if crate::comparator::same_user_key(a.key(), b.key()) {
                         b_pos.cmp(a_pos)
                     } else {
                         a_pos.cmp(b_pos)

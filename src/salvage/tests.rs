@@ -2376,34 +2376,6 @@ fn open(path: std::path::PathBuf, fs: &Arc<dyn Fs>) -> crate::Result<Table> {
     open_with_id(path, fs, 0)
 }
 
-/// As [`open`] but under an explicit comparator, so a table whose key order is
-/// defined by a custom one recovers and reads consistently.
-fn open_with_comparator(
-    path: std::path::PathBuf,
-    fs: &Arc<dyn Fs>,
-    comparator: crate::comparator::SharedComparator,
-) -> crate::Result<Table> {
-    let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&**fs, &path)?);
-    Table::recover(
-        path,
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
-        Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8))),
-        Arc::clone(fs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        comparator,
-        #[cfg(feature = "metrics")]
-        Arc::new(crate::Metrics::default()),
-    )
-}
-
 /// As [`open`] but under an explicit expected table id (the recover
 /// cross-checks it against the SST's stored `table_id`).
 fn open_with_id(
@@ -8859,12 +8831,7 @@ fn blob_handle_rewrite_installs_the_relocated_size() -> crate::Result<()> {
     );
 
     let mut dropped = 0u64;
-    let (out, carry) = super::rewrite_block_indirections(
-        entries,
-        &rewrite,
-        &mut dropped,
-        &crate::comparator::default_comparator(),
-    )?;
+    let (out, carry) = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
     assert_eq!(dropped, 0, "the record survived, nothing drops");
     assert!(carry.is_none(), "nothing was beheaded, nothing to suppress");
     let entry = out.first().expect("one rewritten entry");
@@ -8930,12 +8897,7 @@ fn blob_handle_rewrite_drops_older_versions_when_the_head_record_is_lost() -> cr
         InternalValue::from_components(b"z".to_vec(), b"v".to_vec(), 1, ValueType::Value),
     ];
     let mut dropped = 0u64;
-    let (out, carry) = super::rewrite_block_indirections(
-        entries,
-        &rewrite,
-        &mut dropped,
-        &crate::comparator::default_comparator(),
-    )?;
+    let (out, carry) = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
     let keys: Vec<_> = out.iter().map(|e| e.key.user_key.to_vec()).collect();
     assert_eq!(
         keys,
@@ -8960,12 +8922,7 @@ fn blob_handle_rewrite_drops_older_versions_when_the_head_record_is_lost() -> cr
         InternalValue::from_components(b"k".to_vec(), b"old".to_vec(), 5, ValueType::Value),
     ];
     let mut dropped = 0u64;
-    let (out, carry) = super::rewrite_block_indirections(
-        entries,
-        &rewrite,
-        &mut dropped,
-        &crate::comparator::default_comparator(),
-    )?;
+    let (out, carry) = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
     assert!(out.is_empty(), "the whole block was one beheaded key");
     assert_eq!(
         carry.as_deref(),
@@ -9130,40 +9087,24 @@ fn salvage_reencodes_an_ecc_recovered_columnar_block() -> crate::Result<()> {
     Ok(())
 }
 
-/// Boundary suppression decides what a key IS, so it has to ask the tree's
-/// comparator, not the bytes. Under a comparator that folds spellings together,
-/// the lost newest version can be spelled `A` while the older one that follows
-/// is spelled `a`: byte inequality keeps the older one and salvage republishes
-/// a version its newer one had replaced.
+/// Salvage decides key identity the way the rest of the engine does, so a
+/// version whose bytes differ is a DIFFERENT key and survives the loss of its
+/// neighbour. That is not a shortcut for ordering: a comparator that called two
+/// different spellings equal would break point lookups outright — filters and
+/// the locator hash the raw bytes — which is why the trait's contract forbids
+/// it, and why every path can share one relation.
 #[test]
-fn salvage_suppresses_a_boundary_key_the_comparator_calls_equal() -> crate::Result<()> {
+fn salvage_suppresses_only_the_shadowed_key_itself() -> crate::Result<()> {
     use crate::table::Writer;
     use crate::{InternalValue, ValueType};
-
-    /// Folds ASCII case, so `A` and `a` are the SAME key.
-    struct CaseFolding;
-    impl crate::UserComparator for CaseFolding {
-        fn name(&self) -> &'static str {
-            "ascii-case-folding"
-        }
-        fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
-            a.iter()
-                .map(u8::to_ascii_lowercase)
-                .cmp(b.iter().map(u8::to_ascii_lowercase))
-        }
-    }
-    let comparator: crate::comparator::SharedComparator = Arc::new(CaseFolding);
 
     let dir = tempfile::tempdir()?;
     let fs: Arc<dyn Fs> = Arc::new(StdFs);
     let source = dir.path().join("source");
     let dest = dir.path().join("dest");
 
-    // One entry per block. Under this comparator `K` and `k` are one key whose
-    // newest version (the deletion, spelled `K`) is block 1 and whose older
-    // value (spelled `k`) is block 2.
-    // The byte order happens to agree here (`K` < `k` < `z`), so the writer
-    // needs no special comparator — only the salvage below runs under one.
+    // One entry per block: a deletion for `K` in block 1, then a DIFFERENT key
+    // `k` in block 2 (a byte-distinct key, hence a distinct key), then `z`.
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(1);
     writer.write(InternalValue::new_tombstone(b"K".as_slice(), 10))?;
     writer.write(InternalValue::from_components(
@@ -9180,9 +9121,9 @@ fn salvage_suppresses_a_boundary_key_the_comparator_calls_equal() -> crate::Resu
     ))?;
     assert!(writer.finish()?.is_some(), "source SST is non-empty");
 
-    // Corrupt the FIRST block: the deletion is lost.
+    // Corrupt the FIRST block: the deletion of `K` is lost.
     let first_off = {
-        let table = open_with_comparator(source.clone(), &fs, Arc::clone(&comparator))?;
+        let table = open_with_id(source.clone(), &fs, 0)?;
         let offsets: Vec<u64> = table
             .data_block_handles()
             .filter_map(Result::ok)
@@ -9201,50 +9142,27 @@ fn salvage_suppresses_a_boundary_key_the_comparator_calls_equal() -> crate::Resu
     }
     std::fs::write(&source, &bytes)?;
 
-    let report = super::salvage_with_context(
-        &source,
-        dest.clone(),
-        &fs,
-        &comparator,
-        &super::SalvageOptions::default(),
-    )?;
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
     assert_eq!(report.dropped.len(), 1, "one block is lost: {report:?}");
 
-    let recovered = open_with_comparator(dest, &fs, comparator)?;
+    let recovered = open_with_id(dest, &fs, 0)?;
     assert!(
         recovered
             .get(b"k", crate::SeqNo::MAX, crate::hash::hash64(b"k"))?
-            .is_none(),
-        "the older spelling is the SAME key under this comparator, so it must \
-         be suppressed with it rather than republished",
+            .is_some(),
+        "`k` is a different key from the lost `K`: its own newest version is \
+         intact and must survive",
     );
     Ok(())
 }
 
-/// The blob-handle rewrite suppresses the same way, and must ask the same
-/// question. Losing a key's newest record removes the HEAD of its version
-/// chain, so every older version goes with it — and under a comparator that
-/// folds spellings together, `A` and `a` are one key. Byte equality keeps the
-/// older `a`, republishing a value its newer version had already replaced (or
-/// undoing a deletion).
+/// The blob-handle rewrite suppresses a beheaded chain the same way, and asks
+/// the same question: losing a key's newest record takes every OLDER version of
+/// THAT key with it, and leaves a different key alone.
 #[test]
-fn the_blob_rewrite_suppresses_a_chain_the_comparator_calls_one_key() -> crate::Result<()> {
+fn the_blob_rewrite_suppresses_only_the_beheaded_key() -> crate::Result<()> {
     use crate::coding::Encode;
     use crate::{InternalValue, ValueType};
-
-    /// Folds ASCII case, so `A` and `a` are the SAME key.
-    struct CaseFolding;
-    impl crate::UserComparator for CaseFolding {
-        fn name(&self) -> &'static str {
-            "ascii-case-folding"
-        }
-        fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
-            a.iter()
-                .map(u8::to_ascii_lowercase)
-                .cmp(b.iter().map(u8::to_ascii_lowercase))
-        }
-    }
-    let comparator: crate::comparator::SharedComparator = Arc::new(CaseFolding);
 
     let indirection = |offset: u64| -> crate::Result<Vec<u8>> {
         let ind = crate::blob_tree::handle::BlobIndirection {
@@ -9260,15 +9178,15 @@ fn the_blob_rewrite_suppresses_a_chain_the_comparator_calls_one_key() -> crate::
         Ok(buf)
     };
 
-    // `A` (newest) points at a record the salvage LOST; `a` (older, same key
-    // under this comparator) points at one that survived.
+    // `a` (newest) points at a record the salvage LOST, and its own older
+    // version follows; `z` is a different key whose record survived.
     let entries = vec![
-        InternalValue::from_components(b"A", indirection(100)?, 10, ValueType::Indirection),
+        InternalValue::from_components(b"a", indirection(100)?, 10, ValueType::Indirection),
         InternalValue::from_components(b"a", indirection(200)?, 5, ValueType::Indirection),
         InternalValue::from_components(b"z", indirection(200)?, 1, ValueType::Indirection),
     ];
 
-    // The remap holds only offset 200: the record behind `A` is gone.
+    // The remap holds only offset 200: the record behind `a`'s newest is gone.
     let mut offsets = crate::HashMap::default();
     offsets.insert(
         200u64,
@@ -9281,14 +9199,13 @@ fn the_blob_rewrite_suppresses_a_chain_the_comparator_calls_one_key() -> crate::
     rewrite.insert(7u64, super::BlobFileRewrite::Remap { new_id: 9, offsets });
 
     let mut dropped = 0u64;
-    let (kept, carry) =
-        super::rewrite_block_indirections(entries, &rewrite, &mut dropped, &comparator)?;
+    let (kept, carry) = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
 
     let keys: Vec<_> = kept.iter().map(|e| e.key.user_key.to_vec()).collect();
     assert_eq!(
         keys,
         vec![b"z".to_vec()],
-        "`a` is the same key as the headless `A`, so it goes with it",
+        "the beheaded key's older version goes with it; a different key stays",
     );
     assert_eq!(
         dropped, 2,

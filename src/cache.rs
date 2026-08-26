@@ -313,7 +313,9 @@ impl Cache {
         }
         let key: CacheKey = (TAG_ROW, id.tree_id(), id.table_id(), key_hash).into();
         match self.data.get(&key)? {
-            Item::Row(iv) if &*iv.key.user_key == user_key => Some(iv),
+            Item::Row(iv) if crate::comparator::same_user_key(&iv.key.user_key, user_key) => {
+                Some(iv)
+            }
             // Hash collision (a different key hashed to this slot) or a foreign
             // item kind: treat as a miss so the caller does the real lookup.
             _ => None,

@@ -1004,8 +1004,14 @@ impl Writer {
             self.meta.weak_tombstone_reclaimable_count += 1;
         }
 
-        // NOTE: Check if we visit a new key
-        if Some(&user_key) != self.current_key.as_ref() {
+        // NOTE: Check if we visit a new key. Identity is the engine's one
+        // relation — see `same_user_key`; the filter registered just below hashes
+        // these same raw bytes, which is why it can be nothing else.
+        if !self
+            .current_key
+            .as_ref()
+            .is_some_and(|c| crate::comparator::same_user_key(c, &user_key))
+        {
             self.meta.key_count += 1;
             self.current_key = Some(user_key.clone());
 
@@ -1674,7 +1680,11 @@ impl Writer {
             {
                 self.meta.weak_tombstone_reclaimable_count += 1;
             }
-            if Some(user_key) != self.current_key.as_ref() {
+            if !self
+                .current_key
+                .as_ref()
+                .is_some_and(|c| crate::comparator::same_user_key(c, user_key))
+            {
                 self.meta.key_count += 1;
                 self.current_key = Some(user_key.clone());
                 if self.bloom_policy.is_active() {
