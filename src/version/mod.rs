@@ -171,23 +171,7 @@ impl Level {
     }
 
     pub fn aggregate_key_range(&self) -> KeyRange {
-        if self.run_count() == 1 {
-            #[expect(
-                clippy::expect_used,
-                reason = "we check for run_count, so the first run must exist"
-            )]
-            self.runs
-                .first()
-                .expect("should exist")
-                .aggregate_key_range()
-        } else {
-            let key_ranges = self
-                .iter()
-                .map(|x| Run::aggregate_key_range(x))
-                .collect::<Vec<_>>();
-
-            KeyRange::aggregate(key_ranges.iter())
-        }
+        self.aggregate_key_range_cmp(&crate::comparator::DefaultUserComparator)
     }
 
     /// Like [`Self::aggregate_key_range`], but uses a custom comparator for key ordering.
@@ -197,7 +181,10 @@ impl Level {
     /// `first().min()` and `last().max()` yield the true extremes under the
     /// configured comparator. The cross-run aggregation then uses `aggregate_cmp`
     /// to find the global min/max.
-    pub fn aggregate_key_range_cmp(&self, cmp: &dyn crate::comparator::UserComparator) -> KeyRange {
+    pub fn aggregate_key_range_cmp<C: crate::comparator::UserComparator + ?Sized>(
+        &self,
+        cmp: &C,
+    ) -> KeyRange {
         if self.run_count() == 1 {
             #[expect(
                 clippy::expect_used,
