@@ -9596,3 +9596,244 @@ fn blob_recovery_propagates_a_transient_checksum_failure() -> crate::Result<()> 
     );
     Ok(())
 }
+
+/// A crash BEFORE the manifest commit leaves `{id}.repair-tmp` beside the
+/// source the still-current manifest describes. The manifest names that id in
+/// this state too, so id membership alone cannot tell an unpublished build
+/// from a committed swap — and renaming the temp (possibly truncated mid-write)
+/// over the source would destroy the one file the manifest actually names. The
+/// open must recognize that the manifest's checksum describes the SOURCE,
+/// discard the temp, and serve the source untouched.
+#[test]
+fn open_discards_an_uncommitted_repair_replacement() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::io::Write;
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+    };
+
+    {
+        let crate::AnyTree::Standard(tree) = config().open()? else {
+            panic!("expected a standard tree");
+        };
+        tree.insert(b"k", b"v", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    // The mid-build crash: a temp no committed manifest describes.
+    let sst = root.join("tables").join("0");
+    let tmp = super::repair_tmp_path(&sst);
+    {
+        let mut file = memfs.open(&tmp, &FsOpenOptions::new().write(true).create_new(true))?;
+        file.write_all(b"half-built garbage")?;
+    }
+
+    let crate::AnyTree::Standard(tree) = config().open()? else {
+        panic!("expected a standard tree");
+    };
+    assert_eq!(
+        tree.get(b"k", u64::MAX)?.as_deref(),
+        Some(b"v".as_ref()),
+        "the source the manifest describes must survive the leftover temp",
+    );
+    assert!(
+        !memfs.exists(&tmp)?,
+        "the unpublished replacement is garbage and is swept",
+    );
+    Ok(())
+}
+
+/// The same crash state resolved by a RE-RUN of the repair instead of an open:
+/// the pre-scan sweep must not swap the unpublished temp in either — the
+/// manifest checksum describes the source, so the temp is dropped and the
+/// repair re-derives everything from the untouched source.
+#[test]
+fn repair_discards_an_uncommitted_repair_replacement() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::io::Write;
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+    };
+
+    {
+        let crate::AnyTree::Standard(tree) = config().open()? else {
+            panic!("expected a standard tree");
+        };
+        tree.insert(b"k", b"v", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    let sst = root.join("tables").join("0");
+    let tmp = super::repair_tmp_path(&sst);
+    {
+        let mut file = memfs.open(&tmp, &FsOpenOptions::new().write(true).create_new(true))?;
+        file.write_all(b"half-built garbage")?;
+    }
+
+    let report = config().repair()?;
+    assert_eq!(
+        report.unreadable, 0,
+        "nothing is damaged: the source is intact and the temp is not a table",
+    );
+
+    let crate::AnyTree::Standard(tree) = config().open()? else {
+        panic!("expected a standard tree");
+    };
+    assert_eq!(
+        tree.get(b"k", u64::MAX)?.as_deref(),
+        Some(b"v".as_ref()),
+        "the intact source must survive the repair re-run",
+    );
+    assert!(
+        !memfs.exists(&tmp)?,
+        "the unpublished replacement is garbage and is swept",
+    );
+    Ok(())
+}
+
+/// Manifest-loss repair orders L0 by the persisted recency key, not by raw
+/// table id. A compaction output's id is allocated when the compaction starts
+/// writing, while a newer flush with a LOWER id can install first (and an
+/// intra-L0 output is appended at the BACK of L0 regardless of its id), so id
+/// order would put the output's OLDER content in front — and a read at a
+/// caller-chosen tied seqno would serve the superseded value.
+#[test]
+fn repair_orders_l0_by_recency_key_not_table_id() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{AbstractTree, Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    // Table 2: a flush — the NEWER write of `k` at the tied seqno.
+    {
+        let mut w = Writer::new(tables.join("2"), 2, 0, Arc::clone(&fs))?;
+        w.write(InternalValue::from_components(
+            b"k",
+            b"new",
+            10,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "the flush table is non-empty");
+    }
+    // Table 5: an intra-L0 compaction output of OLDER flushes (recency 1),
+    // carrying the superseded write of `k` at the same caller-chosen seqno.
+    {
+        let mut w = Writer::new(tables.join("5"), 5, 0, Arc::clone(&fs))?.use_recency(Some(1));
+        w.write(InternalValue::from_components(
+            b"k",
+            b"old",
+            10,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "the output table is non-empty");
+    }
+
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+    };
+    config().repair()?;
+
+    let crate::AnyTree::Standard(tree) = config().open()? else {
+        panic!("expected a standard tree");
+    };
+    assert_eq!(
+        tree.get(b"k", u64::MAX)?.as_deref(),
+        Some(b"new".as_ref()),
+        "the flush's newer write must shadow the compaction output's superseded \
+         one, exactly as the live tree ordered them",
+    );
+    Ok(())
+}
+
+/// The counterpart committed case: a repair that dies AFTER `persist_version`
+/// but before the swap leaves a temp the committed manifest DOES describe (its
+/// entry carries the replacement's digest). The next open must finish that
+/// swap, not discard the only copy of what the manifest names.
+#[cfg(feature = "lz4")]
+#[test]
+fn open_finishes_a_committed_repair_swap() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    blob_tree_without_manifest(&memfs, &root)?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    punch_and_corrupt_blob(&memfs, &blobs.join("0"))?;
+
+    let config = |fs: Arc<dyn Fs>| {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+
+    // The blob rewrite publishes the referencing table's replacement at
+    // `{id}.repair-tmp` and swaps it only after the commit; failing the swap's
+    // rename persistently is the post-commit crash. Rename faults match the
+    // DESTINATION path, which for the swap is the table's own name.
+    let fault = FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("tables/0"),
+    );
+    assert!(
+        config(Arc::new(fault)).repair().is_err(),
+        "a swap the filesystem refuses must fail the repair after its commit",
+    );
+    let tmp = super::repair_tmp_path(&root.join("tables").join("0"));
+    assert!(
+        memfs.exists(&tmp)?,
+        "the committed replacement is still at its temp name",
+    );
+
+    // The open resolves it from the committed manifest alone: the entry's
+    // digest matches the temp, so the swap is finished, not discarded.
+    let tree = config(memfs.clone()).open()?;
+    assert!(
+        !memfs.exists(&tmp)?,
+        "the pending swap is finished by the open",
+    );
+    // Records 0-1 are punched and the last is corrupt, so a mid-range key is
+    // a guaranteed survivor of the salvage.
+    assert!(
+        tree.get(b"k0004", u64::MAX)?.is_some(),
+        "the salvaged content the manifest describes is served",
+    );
+    Ok(())
+}

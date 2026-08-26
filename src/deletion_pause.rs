@@ -370,6 +370,24 @@ impl DeletionPause {
         }
     }
 
+    /// Retains a reclaim that cannot be punched RIGHT NOW — a COMPLETED
+    /// checkpoint still hard-links the file, or the link probe cannot answer —
+    /// so [`Self::retry_pending_reclaims`] finishes it once the link is gone.
+    ///
+    /// Deliberately a bare queue push, with no probe and no punch: the caller
+    /// is a `Drop` impl, which must not block on the mutation gate (a
+    /// checkpoint dropping its captured version holds the gate's write half,
+    /// and that very drop can be what releases the caller's last `Arc`). The
+    /// retry re-probes under the gate.
+    #[cfg(feature = "std")]
+    pub(crate) fn retain_reclaim(&self, fs: Arc<dyn Fs>, path: PathBuf, extents: Vec<(u64, u64)>) {
+        self.pending_reclaims.lock().push(QueuedDeletion {
+            fs,
+            path,
+            action: QueuedAction::Punch(extents),
+        });
+    }
+
     /// Re-attempts every reclaim a drain had to retain, keeping the ones whose
     /// file is still shared.
     ///

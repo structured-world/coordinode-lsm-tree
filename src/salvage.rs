@@ -958,6 +958,11 @@ fn salvage_attempt(
         table.has_zone_map(),
         table.has_seqno_bounds(),
     )
+    // The copy carries the SOURCE's content, so it sorts at the source's L0
+    // position during manifest repair. Pinned explicitly (not just mirrored):
+    // a copy published under a FRESH id would otherwise fall back to that new
+    // id and claim a recency its content does not have.
+    .use_recency(Some(table.l0_recency()))
     .use_sync_mode(options.sync_mode)
     // The extractor is configuration (never persisted in the SST), so
     // the rebuilt filter only carries the source's prefix hashes when

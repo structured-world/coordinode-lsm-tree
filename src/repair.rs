@@ -340,6 +340,50 @@ pub(crate) fn commit_repair_tmp(
     Ok(())
 }
 
+/// Decides whether a leftover `{id}.repair-tmp` is the file the committed
+/// manifest describes. The manifest names `id` in BOTH crash cases — after the
+/// commit (the entry describes the replacement) and before it (the entry still
+/// describes the source) — so id membership alone cannot tell a committed swap
+/// from an abandoned build, and swapping the latter in would destroy the file
+/// the manifest actually names (a mid-build crash even leaves the temp
+/// truncated). The entry's checksum can tell them apart: only a committed
+/// repair recorded the temp's digest — the live-suffix digest for a restricted
+/// replacement, whose punch offset comes from the temp's own index. A temp
+/// that does not even open is the mid-build crash; only transient I/O
+/// propagates for a retry.
+#[cfg(feature = "std")]
+pub(crate) fn repair_tmp_is_published(
+    config: &Config,
+    fs: &Arc<dyn crate::fs::Fs>,
+    tmp_path: &std::path::Path,
+    table_id: TableId,
+    manifest_checksum: crate::Checksum,
+    restriction: Option<&crate::UserKey>,
+) -> crate::Result<bool> {
+    let Some(bound) = restriction else {
+        let digest = compute_table_checksum(&**fs, tmp_path)?;
+        return Ok(crate::Checksum::from_raw(digest) == manifest_checksum);
+    };
+    let table = match crate::table::Table::recover(repair_recover_params(
+        config,
+        tmp_path.to_path_buf(),
+        manifest_checksum,
+        table_id,
+        Arc::clone(fs),
+    )) {
+        Ok(table) => table,
+        Err(e) if is_transient_io(&e) => return Err(e),
+        Err(_) => return Ok(false),
+    };
+    let punch_offset = match table.punch_offset_for(bound.as_ref()) {
+        Ok(offset) => offset,
+        Err(e) if is_transient_io(&e) => return Err(e),
+        Err(_) => return Ok(false),
+    };
+    let digest = compute_table_checksum_from(&**fs, tmp_path, punch_offset)?;
+    Ok(crate::Checksum::from_raw(digest) == manifest_checksum)
+}
+
 /// Recover params for a repair's TRANSIENT table open: the tree's configured
 /// comparator / crypto / dictionary context (so the table decodes consistently
 /// with how it was written), and everything else neutral — tree id 0 and no
@@ -2558,6 +2602,15 @@ fn sweep_superseded_by_committed_manifest(config: &Config) -> crate::Result<()> 
         .flatten()
         .map(|t| t.id)
         .collect();
+    // For temp-swap resolution: the manifest's per-table checksum is what
+    // distinguishes a committed replacement from an abandoned build.
+    let manifest_checksums: crate::HashMap<TableId, crate::Checksum> = recovery
+        .table_ids
+        .iter()
+        .flatten()
+        .flatten()
+        .map(|t| (t.id, t.checksum))
+        .collect();
     for (table_base_folder, folder_fs) in config.all_tables_folders() {
         if !folder_fs.exists(&table_base_folder)? {
             continue;
@@ -2566,14 +2619,27 @@ fn sweep_superseded_by_committed_manifest(config: &Config) -> crate::Result<()> 
             if dirent.is_dir {
                 continue;
             }
-            // A replacement a previous run committed but could not swap in. The
-            // manifest is the authority on what it is: if the manifest names its
-            // id, the swap is what remains of that run and is finished here; if
-            // not, the run never committed and the temp is garbage. Both answers
-            // come from the durable manifest alone.
+            // A replacement a previous run built. The manifest is the authority
+            // on what it is — but the manifest names the id in BOTH crash cases
+            // (before the commit its entry still describes the SOURCE), so the
+            // entry's checksum is what decides: only a committed run recorded
+            // the temp's digest, and swapping an uncommitted build in would
+            // destroy the source the manifest names. Both answers still come
+            // from the durable manifest alone.
             if let Some(id) = table_id_from_repair_tmp_name(&dirent.file_name) {
                 let table_path = table_base_folder.join(id.to_string());
-                if referenced_tables.contains(&id) {
+                let published = match manifest_checksums.get(&id) {
+                    Some(&manifest_checksum) => repair_tmp_is_published(
+                        config,
+                        &folder_fs,
+                        &dirent.path,
+                        id,
+                        manifest_checksum,
+                        recovery.restrictions.get(&id),
+                    )?,
+                    None => false,
+                };
+                if published {
                     commit_repair_tmp(&*folder_fs, &dirent.path, &table_path, config.sync_mode)?;
                     log::info!(
                         "repair: finished the pending swap of table {id} from a previous run",
@@ -3399,16 +3465,22 @@ fn repair_tree(
         .map(|c| (c.table, c.complete))
         .collect();
 
-    // Newest first, by DESCENDING id — the only recency signal the files
-    // actually carry. Ids are allocated in increasing order, so a higher id is
-    // a later table and belongs nearer the L0 head, where the merge reader's
-    // newest-run-first short-circuit expects it. A table's highest seqno is NOT
-    // that signal: callers may assign seqnos explicitly, so an older table can
-    // top out above a newer one on an unrelated key, and ordering by it would
-    // then make repair serve the superseded value. Sorting by id is also total,
-    // so repeating a repair over the same files reproduces the same tree
-    // instead of inheriting the directory scan's order.
-    recovered_tables.sort_by_key(|(t, _)| std::cmp::Reverse(t.id()));
+    // Newest first, by DESCENDING recency key. For a flush / ingest table that
+    // key is its own id (ids are allocated in increasing order and flushes are
+    // serialized, so a higher id is later content). A COMPACTION output's own
+    // id is NOT that signal: the id is allocated when the compaction starts
+    // writing, while newer flushes with lower ids can install first, and an
+    // intra-L0 output is appended at the BACK of L0 regardless of its id — so
+    // outputs persist their newest INPUT's recency in meta (`recency`) and
+    // sort by it, with id as the tie-break (equal recency means one descends
+    // from the other, and the higher id is the superseding copy). A table's
+    // highest seqno is NOT the signal either: callers may assign seqnos
+    // explicitly, so an older table can top out above a newer one on an
+    // unrelated key. The key is total, so repeating a repair over the same
+    // files reproduces the same tree instead of inheriting the directory
+    // scan's order.
+    recovered_tables
+        .sort_by_key(|(t, _)| (std::cmp::Reverse(t.l0_recency()), std::cmp::Reverse(t.id())));
 
     // KV-separated (blob) trees additionally carry a blob-file list. Discover the
     // blob files from the `blobs/` folder (no manifest to filter against) and

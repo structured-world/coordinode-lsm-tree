@@ -422,13 +422,17 @@ impl Drop for Inner {
             // punch cannot race a link that is about to appear — but the intent
             // lives in this view, which is dropping, so DEFER it onto the pause
             // rather than lose it (the release re-probes and punches then).
+            // The extents are CLONED into the enqueue (not moved): a pause
+            // released between the `is_active` check and the enqueue's own
+            // re-check returns `false`, and the reclaim must then still be in
+            // hand for the immediate path below.
             #[cfg(feature = "std")]
             if let Some(pause) = self.deletion_pause.get()
                 && pause.is_active()
                 && pause.try_enqueue_punch(
                     Arc::clone(&self.fs),
                     (*self.path).clone(),
-                    core::mem::take(&mut reclaimable),
+                    reclaimable.clone(),
                 )
             {
                 log::trace!(
@@ -443,29 +447,53 @@ impl Drop for Inner {
             // records this file UNRESTRICTED under its original digest —
             // punching a shared inode would zero those blocks inside the
             // immutable checkpoint too. FAIL CLOSED on a shared link and on a
-            // probe that cannot answer, losing only reclaimable space. Mirrors
-            // the delete path's truncate guard and the blob punch.
+            // probe that cannot answer — but RETAIN the reclaim rather than
+            // discard it: this dropping view holds its only record, the link
+            // disappears when the checkpoint is deleted, and only
+            // `retry_pending_reclaims` can free the consumed prefix then.
+            // Mirrors the delete path's truncate guard and the blob punch.
             #[cfg(feature = "std")]
             match self.fs.hard_link_count(&self.path) {
                 Ok(n) if n <= 1 => {}
-                Ok(_) => return,
-                Err(e) => {
-                    log::warn!(
-                        "Skipping tight-space punch of table {global_id:?} at {:?}: \
-                         link-count probe failed: {e:?}",
+                Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {
+                    // The file is gone (retired): its space is already back.
+                    return;
+                }
+                probe => {
+                    log::debug!(
+                        "Retaining tight-space punch of table {global_id:?} at {:?} for a retry: \
+                         the file is hard-linked (or the link count is unknown: {probe:?})",
                         self.path,
                     );
+                    if let Some(pause) = self.deletion_pause.get() {
+                        pause.retain_reclaim(
+                            Arc::clone(&self.fs),
+                            (*self.path).clone(),
+                            reclaimable,
+                        );
+                    }
                     return;
                 }
             }
 
-            for (block_off, size) in reclaimable {
+            for (at, &(block_off, size)) in reclaimable.iter().enumerate() {
                 if let Err(e) = self.fs.punch_hole(&self.path, block_off, size) {
                     log::warn!(
                         "Failed to punch tight-space data block at {block_off} of table {global_id:?} at {:?}; \
                          stopping the reclaim to keep the hole pattern classifiable: {e:?}",
                         self.path,
                     );
+                    // The pass stops here (punching below an unreclaimed extent
+                    // would break the top-down hole pattern a sidecar-less
+                    // repair reads), but the failure is often transient: the
+                    // failed extent and the untried remainder are retained for
+                    // the same retry rather than discarded.
+                    #[cfg(feature = "std")]
+                    if let Some(pause) = self.deletion_pause.get()
+                        && let Some(rest) = reclaimable.get(at..).map(<[(u64, u64)]>::to_vec)
+                    {
+                        pause.retain_reclaim(Arc::clone(&self.fs), (*self.path).clone(), rest);
+                    }
                     break;
                 }
             }

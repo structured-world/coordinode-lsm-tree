@@ -545,6 +545,17 @@ impl Table {
         self.metadata.id
     }
 
+    /// The table's L0 recency key for manifest repair: the persisted `recency`
+    /// meta (a compaction output's highest INPUT recency), falling back to the
+    /// table's own id (a flush / ingest table, or one written before the key
+    /// existed). Higher = newer content; repair orders recovered L0 runs by it
+    /// because a compaction output's own id is allocated at write start and
+    /// says nothing about where its content belongs.
+    #[must_use]
+    pub(crate) fn l0_recency(&self) -> TableId {
+        self.metadata.recency.unwrap_or(self.metadata.id)
+    }
+
     /// This segment's positional delete-bitmap (rows deleted by position),
     /// loaded on open. Empty when the segment has no materialized deletes, in
     /// which case a scan applies no mask.

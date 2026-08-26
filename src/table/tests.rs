@@ -925,13 +925,14 @@ fn verify_blob_links_rejects_an_undercounted_suffix_id_on_a_restricted_view() ->
     Ok(())
 }
 
-/// An `Fs` that forwards to `MemFs` but reports every file as HARD-LINKED, so
-/// the punch path's shared-inode guard can be exercised (MemFs copies on
+/// An `Fs` that forwards to `MemFs` but reports the CONFIGURED hard-link count
+/// for every file, so the punch path's shared-inode guard can be exercised —
+/// including a checkpoint's link later disappearing (MemFs copies on
 /// `hard_link`, so its real count is always 1, and `StdFs` cannot punch on
 /// non-Linux hosts).
 #[cfg(feature = "std")]
 #[derive(Clone)]
-struct SharedInodeFs(crate::fs::MemFs);
+struct SharedInodeFs(crate::fs::MemFs, Arc<core::sync::atomic::AtomicU64>);
 
 #[cfg(feature = "std")]
 impl crate::fs::Fs for SharedInodeFs {
@@ -972,9 +973,9 @@ impl crate::fs::Fs for SharedInodeFs {
     fn punch_hole(&self, path: &std::path::Path, offset: u64, len: u64) -> crate::io::Result<()> {
         self.0.punch_hole(path, offset, len)
     }
-    /// The whole point: every file looks shared with a checkpoint link.
+    /// The whole point: every file reports the configured link count.
     fn hard_link_count(&self, _path: &std::path::Path) -> crate::io::Result<u64> {
-        Ok(2)
+        Ok(self.1.load(core::sync::atomic::Ordering::Acquire))
     }
 }
 
@@ -990,7 +991,10 @@ fn punch_on_drop_refuses_a_hard_linked_table() -> crate::Result<()> {
     use crate::fs::Fs;
 
     let memfs = crate::fs::MemFs::new();
-    let shared: Arc<dyn Fs> = Arc::new(SharedInodeFs(memfs.clone()));
+    let shared: Arc<dyn Fs> = Arc::new(SharedInodeFs(
+        memfs.clone(),
+        Arc::new(core::sync::atomic::AtomicU64::new(2)),
+    ));
     let plain: Arc<dyn Fs> = Arc::new(memfs);
     let root = std::path::absolute("/db")?;
     shared.create_dir_all(&root)?;
@@ -1091,6 +1095,85 @@ fn punch_on_drop_refuses_a_hard_linked_table() -> crate::Result<()> {
         after.len(),
         before.len(),
         "the deferred reclaim punches, it does not truncate",
+    );
+    Ok(())
+}
+
+/// A reclaim blocked by a COMPLETED checkpoint's surviving hard link must be
+/// RETAINED, not discarded. The pause is no longer active (so the deferred
+/// queue is not an option), yet the dropping view holds the only record of the
+/// reclaim: deleting the checkpoint later frees the link, and only
+/// `retry_pending_reclaims` can finish the punch then — nothing else would
+/// ever free the consumed prefix, which is exactly the space the tight-space
+/// path was reclaiming.
+#[cfg(feature = "std")]
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn punch_on_drop_retains_the_reclaim_while_a_checkpoint_link_survives() -> crate::Result<()> {
+    use crate::fs::Fs;
+
+    let links = Arc::new(core::sync::atomic::AtomicU64::new(2));
+    let fs: Arc<dyn Fs> = Arc::new(SharedInodeFs(crate::fs::MemFs::new(), Arc::clone(&links)));
+    let root = std::path::absolute("/db")?;
+    fs.create_dir_all(&root)?;
+
+    let path = root.join("0");
+    let mut writer = Writer::new(path.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(256);
+    for i in 0..256u32 {
+        writer.write(crate::InternalValue::from_components(
+            format!("k{i:04}").into_bytes(),
+            b"v",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = {
+        #[cfg(feature = "metrics")]
+        let metrics = Arc::new(Metrics::default());
+        let mut params = test_recover_params(path.clone(), checksum);
+        params.descriptor_table = None;
+        params.fs = Arc::clone(&fs);
+        #[cfg(feature = "metrics")]
+        {
+            params.metrics = metrics;
+        }
+        Table::recover(params)?
+    };
+    let pause = crate::deletion_pause::DeletionPause::new_shared();
+    table.install_deletion_pause(Arc::clone(&pause));
+    let punch = table.punch_offset_for(b"k0128")?;
+    assert!(punch > 0, "the fixture has a punchable prefix");
+    table.mark_punch_on_drop(punch);
+    drop(table);
+
+    // The checkpoint's link survives, so no byte may be punched yet — but the
+    // intent must be retained rather than discarded.
+    assert!(
+        pause.has_pending_reclaims(),
+        "a reclaim blocked by a completed checkpoint's link must be retained \
+         for a retry, not discarded",
+    );
+
+    // The checkpoint is deleted: its link disappears, and the retry finishes
+    // the reclaim.
+    links.store(1, core::sync::atomic::Ordering::Release);
+    pause.retry_pending_reclaims();
+    assert!(
+        !pause.has_pending_reclaims(),
+        "an exclusively-owned file's retained reclaim is finished by the retry",
+    );
+    let after = {
+        let file = fs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let len = crate::fs::FsFile::metadata(&*file)?.len;
+        crate::file::read_exact(&*file, 0, usize::try_from(len).unwrap_or(0))?.to_vec()
+    };
+    assert!(
+        after
+            .get(..64)
+            .is_some_and(|head| head.iter().all(|&b| b == 0)),
+        "the retried reclaim punches the consumed prefix",
     );
     Ok(())
 }

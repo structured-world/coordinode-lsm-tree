@@ -272,26 +272,50 @@ impl Drop for Inner {
                                     alloc::vec![(data_start, len)],
                                 )
                         });
-                        let exclusively_owned = !deferred
-                            && match self.fs.hard_link_count(&self.path) {
+                        // A shared inode (a COMPLETED checkpoint's surviving
+                        // link), an unanswerable probe, or a failed punch does
+                        // not DISCARD the reclaim: this dropping view holds its
+                        // only record, so it is RETAINED for
+                        // `retry_pending_reclaims` — mirroring the table-prefix
+                        // punch. A bare retention, never a blocking re-probe:
+                        // this is a Drop impl (see `retain_reclaim`).
+                        if !deferred {
+                            let exclusively_owned = match self.fs.hard_link_count(&self.path) {
                                 Ok(n) => n <= 1,
+                                Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {
+                                    // The file is gone: its space is already back.
+                                    return;
+                                }
                                 Err(e) => {
-                                    log::warn!(
-                                        "Skipping tight-space punch of blob file {:?} at {}: link-count probe failed: {e:?}",
+                                    log::debug!(
+                                        "Retaining tight-space punch of blob file {:?} at {} for a retry: link-count probe failed: {e:?}",
                                         self.id,
                                         self.path.display(),
                                     );
                                     false
                                 }
                             };
-                        if exclusively_owned
-                            && let Err(e) = self.fs.punch_hole(&self.path, data_start, len)
-                        {
-                            log::warn!(
-                                "Failed to punch tight-space data [{data_start}, {off}) of blob file {:?} at {}: {e:?}",
-                                self.id,
-                                self.path.display(),
-                            );
+                            let punch_failed = exclusively_owned
+                                && match self.fs.punch_hole(&self.path, data_start, len) {
+                                    Ok(()) => false,
+                                    Err(e) => {
+                                        log::warn!(
+                                            "Failed to punch tight-space data [{data_start}, {off}) of blob file {:?} at {}; retaining it for a retry: {e:?}",
+                                            self.id,
+                                            self.path.display(),
+                                        );
+                                        true
+                                    }
+                                };
+                            if (!exclusively_owned || punch_failed)
+                                && let Some(pause) = self.deletion_pause.get()
+                            {
+                                pause.retain_reclaim(
+                                    Arc::clone(&self.fs),
+                                    self.path.clone(),
+                                    alloc::vec![(data_start, len)],
+                                );
+                            }
                         }
                     }
                 }

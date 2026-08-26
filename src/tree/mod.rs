@@ -8,63 +8,6 @@ pub mod ingest;
 pub mod inner;
 pub mod sealed;
 
-/// Test seam for the CDC scan's memtable freeze: a hook fired while the scan
-/// holds the version-history write guard, so a test can prove a writer is
-/// actually excluded for that window instead of racing it.
-#[cfg(test)]
-pub mod scan_freeze_hook {
-    use alloc::boxed::Box;
-    use std::sync::Mutex;
-
-    type Hook = Box<dyn Fn() + Send>;
-    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
-
-    /// Installs `hook`, replacing any previous one. Each test runs in its own
-    /// process, so the static carries no cross-test state.
-    pub fn install(hook: Hook) {
-        #[expect(clippy::unwrap_used, reason = "test-only seam")]
-        HOOK.lock().unwrap().replace(hook);
-    }
-
-    /// Runs the installed hook, if any.
-    pub fn fire() {
-        #[expect(clippy::unwrap_used, reason = "test-only seam")]
-        let guard = HOOK.lock().unwrap();
-        if let Some(hook) = guard.as_ref() {
-            hook();
-        }
-    }
-}
-
-/// Test seam for range-deletion writes: fired by `remove_range` between
-/// obtaining the active memtable and inserting the tombstone, so a test can
-/// prove the version-history read guard spans the whole insert — the CDC
-/// scan's writer exclusion (see `scan_freeze_hook`) depends on that.
-#[cfg(test)]
-pub mod range_write_hook {
-    use alloc::boxed::Box;
-    use std::sync::Mutex;
-
-    type Hook = Box<dyn Fn() + Send>;
-    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
-
-    /// Installs `hook`, replacing any previous one. Each test runs in its own
-    /// process, so the static carries no cross-test state.
-    pub fn install(hook: Hook) {
-        #[expect(clippy::unwrap_used, reason = "test-only seam")]
-        HOOK.lock().unwrap().replace(hook);
-    }
-
-    /// Runs the installed hook, if any.
-    pub fn fire() {
-        #[expect(clippy::unwrap_used, reason = "test-only seam")]
-        let guard = HOOK.lock().unwrap();
-        if let Some(hook) = guard.as_ref() {
-            hook();
-        }
-    }
-}
-
 use crate::path::Path;
 use crate::{
     AbstractTree, Checksum, KvPair, SeqNo, SequenceNumberCounter, TableId, UserKey, UserValue,
@@ -1761,7 +1704,7 @@ impl AbstractTree for Tree {
         let history = self.version_history.read();
 
         #[cfg(test)]
-        range_write_hook::fire();
+        inner::TestHooks::fire(&self.test_hooks.range_write);
 
         history
             .latest_version()
@@ -1852,7 +1795,7 @@ impl Tree {
             let guard = self.version_history.write();
             let super_version = guard.latest_version();
             #[cfg(test)]
-            scan_freeze_hook::fire();
+            inner::TestHooks::fire(&self.test_hooks.scan_freeze);
             let end_seqno = {
                 let active = super_version.active_memtable.get_highest_seqno();
                 let sealed = super_version
@@ -4263,6 +4206,9 @@ impl Tree {
 
             #[cfg(feature = "metrics")]
             metrics,
+
+            #[cfg(test)]
+            test_hooks: inner::TestHooks::default(),
         };
 
         // Install the pause on every recovered table / blob file so their
@@ -4430,7 +4376,18 @@ impl Tree {
                 }
             }
 
-            for dirent in folder_fs.read_dir(table_base_folder)? {
+            // Pending repair swaps resolve FIRST: a committed swap's `{id}` file
+            // is the superseded source until the rename lands, so adopting it
+            // before the temp entry is processed would hand this session a
+            // handle onto bytes the finished swap then replaces on disk.
+            let mut dirents = folder_fs.read_dir(table_base_folder)?;
+            dirents.sort_by_key(|e| {
+                !matches!(
+                    crate::file::TableDirEntry::classify(&e.file_name),
+                    crate::file::TableDirEntry::RepairTmp(_)
+                )
+            });
+            for dirent in dirents {
                 let crate::fs::FsDirEntry {
                     path: table_file_path,
                     file_name,
@@ -4518,17 +4475,35 @@ impl Tree {
                         }
                         continue;
                     }
-                    // A repair's unpublished replacement. If the manifest names
-                    // its id, that repair committed and died before the swap, and
-                    // this file — not the damaged one beside it — is what the
-                    // manifest describes: finish the swap. Otherwise the repair
-                    // never committed and the temp is garbage. Both answers come
-                    // from the manifest alone, so an open resolves it exactly as
-                    // a re-run of the repair would.
+                    // A repair's replacement still at its temp name. The manifest
+                    // is the authority on what it is — but it names the id in
+                    // BOTH crash cases (before the commit its entry still
+                    // describes the SOURCE beside the temp), so the entry's
+                    // checksum decides: only a committed repair recorded the
+                    // temp's digest, and it died before the swap — this file is
+                    // what the manifest describes, so the swap is finished.
+                    // Any other temp is an abandoned build (possibly truncated
+                    // mid-write), and swapping it in would destroy the source
+                    // the manifest names: it is garbage. An open resolves this
+                    // exactly as a re-run of the repair would, from the durable
+                    // manifest alone.
                     crate::file::TableDirEntry::RepairTmp(tmp_id) => {
-                        if manifest_ids.contains(&tmp_id) {
-                            #[cfg(feature = "std")]
-                            {
+                        #[cfg(feature = "std")]
+                        {
+                            let published = match table_map.get(&tmp_id) {
+                                Some(&(_, manifest_checksum, _)) => {
+                                    crate::repair::repair_tmp_is_published(
+                                        config,
+                                        folder_fs,
+                                        &table_file_path,
+                                        tmp_id,
+                                        manifest_checksum,
+                                        recovery.restrictions.get(&tmp_id),
+                                    )?
+                                }
+                                None => false,
+                            };
+                            if published {
                                 log::warn!(
                                     "Finishing a repair's pending swap of table {tmp_id}: {}",
                                     table_file_path.display()
@@ -4539,12 +4514,21 @@ impl Tree {
                                     &table_base_folder.join(tmp_id.to_string()),
                                     config.sync_mode,
                                 )?;
+                            } else {
+                                log::warn!(
+                                    "Removing abandoned repair replacement: {}",
+                                    table_file_path.display()
+                                );
+                                Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
                             }
-                            // Without the repair module nothing here can finish
-                            // the swap, and sweeping the temp would destroy the
-                            // only copy of what the manifest names.
-                            #[cfg(not(feature = "std"))]
-                            {
+                        }
+                        // Without the repair module nothing here can verify or
+                        // finish a swap the manifest may describe, and sweeping
+                        // the temp could destroy the only copy of what the
+                        // manifest names.
+                        #[cfg(not(feature = "std"))]
+                        {
+                            if manifest_ids.contains(&tmp_id) {
                                 log::error!(
                                     "Table {tmp_id} exists only as an unpublished repair \
                                      replacement; run a repair to finish it: {}",
@@ -4552,7 +4536,6 @@ impl Tree {
                                 );
                                 return Err(crate::Error::Unrecoverable);
                             }
-                        } else {
                             log::warn!(
                                 "Removing abandoned repair replacement: {}",
                                 table_file_path.display()

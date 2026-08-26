@@ -94,6 +94,17 @@ pub(super) fn prepare_table_writer(
         opts.mvcc_gc_watermark,
     );
 
+    // The outputs' L0 recency key: the newest input's recency. An output's own
+    // id is allocated HERE, at write start, while newer flushes with lower ids
+    // can still install before this compaction commits — so the id must not
+    // stand in for content recency when manifest repair rebuilds L0 from the
+    // files alone.
+    let recency = version
+        .iter_tables()
+        .filter(|t| payload.table_ids.contains(&t.id()))
+        .map(crate::table::Table::l0_recency)
+        .max();
+
     let mut table_writer = MultiWriter::new(
         table_base_folder,
         opts.table_id_generator.clone(),
@@ -102,6 +113,7 @@ pub(super) fn prepare_table_writer(
         level_fs,
     )?
     .set_comparator(opts.config.comparator.clone())
+    .use_recency(recency)
     // Compaction consumes input tables, so clip RTs to each output table's key range.
     .use_clip_range_tombstones();
 

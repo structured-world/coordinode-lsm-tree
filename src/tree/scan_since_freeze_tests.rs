@@ -36,30 +36,33 @@ fn a_concurrent_write_cannot_land_while_the_scan_captures_the_memtable() {
 
     // Fired while the scan holds the write guard: a writer started HERE must
     // still be blocked when we check, because the guard excludes it.
-    super::scan_freeze_hook::install(Box::new(move || {
-        let writer_tree = Arc::clone(&writer_tree);
-        let done_tx = done_tx.clone();
-        let started_tx = started_tx.clone();
-        std::thread::spawn(move || {
-            started_tx.send(()).ok();
-            let mut batch = WriteBatch::new();
-            // Backdated: at the cap, so the seqno bound would NOT exclude it.
-            batch.insert("a", "concurrent");
-            batch.insert("z", "concurrent");
-            writer_tree.apply_batch(batch, 10).expect("apply");
-            done_tx.send(()).ok();
-        });
-        // The writer has entered `apply_batch`; it cannot complete while this
-        // hook runs, since the scan holds the guard its insert needs.
-        started_rx.recv().expect("writer thread started");
-        assert!(
-            done_rx
-                .recv_timeout(std::time::Duration::from_millis(250))
-                .is_err(),
-            "a writer must not be able to commit while the scan captures the \
+    super::inner::TestHooks::install(
+        &tree_for_hook.test_hooks.scan_freeze,
+        Box::new(move || {
+            let writer_tree = Arc::clone(&writer_tree);
+            let done_tx = done_tx.clone();
+            let started_tx = started_tx.clone();
+            std::thread::spawn(move || {
+                started_tx.send(()).ok();
+                let mut batch = WriteBatch::new();
+                // Backdated: at the cap, so the seqno bound would NOT exclude it.
+                batch.insert("a", "concurrent");
+                batch.insert("z", "concurrent");
+                writer_tree.apply_batch(batch, 10).expect("apply");
+                done_tx.send(()).ok();
+            });
+            // The writer has entered `apply_batch`; it cannot complete while this
+            // hook runs, since the scan holds the guard its insert needs.
+            started_rx.recv().expect("writer thread started");
+            assert!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_millis(250))
+                    .is_err(),
+                "a writer must not be able to commit while the scan captures the \
              active memtable — its entries would land mid-walk",
-        );
-    }));
+            );
+        }),
+    );
 
     let events: Vec<_> = tree_for_hook
         .scan_since_seqno(0)
@@ -107,10 +110,13 @@ fn a_range_deletion_holds_the_write_exclusion_guard_through_its_insert() {
     // Fired between `remove_range` obtaining the memtable and inserting the
     // tombstone: park the writer there so the test can inspect the lock state
     // at the exact point the insert is about to run.
-    super::range_write_hook::install(Box::new(move || {
-        started_tx.send(()).ok();
-        gate_rx.recv().expect("gate released");
-    }));
+    super::inner::TestHooks::install(
+        &tree.test_hooks.range_write,
+        Box::new(move || {
+            started_tx.send(()).ok();
+            gate_rx.recv().expect("gate released");
+        }),
+    );
 
     let writer_tree = Arc::clone(&tree);
     let writer = std::thread::spawn(move || {

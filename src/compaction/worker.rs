@@ -1236,6 +1236,23 @@ fn run_tight_space_compaction(
                                 view.id(),
                             ),
                         },
+                        // On a LATER slice of the same input, this failure leaves
+                        // the PREVIOUS slice's sidecar in place — valid but
+                        // stale (a lower bound). Deliberately left there: a
+                        // manifest-loss repair before the next open then
+                        // restricts to that lower bound and republishes only the
+                        // newly consumed interval beside the slice output — the
+                        // same already-tolerated duplication class as a FIRST
+                        // slice's failure (whole unpunched input republished),
+                        // and strictly less of it. REMOVING the stale sidecar
+                        // gains nothing and can lose data: the punch geometry
+                        // re-derives the SAME lower bound (the holes end where
+                        // that slice punched), while a backend that cannot
+                        // prove holes then classifies the zeroed prefix as
+                        // damage and salvage drops live rows the slice output
+                        // does not carry. With the manifest alive, the next
+                        // open replaces a DISAGREEING sidecar from the
+                        // manifest's bound, which closes this window.
                         Err(e) => log::error!(
                             "tight-space could not write the restrict-bound sidecar for \
                              table {} after committing its restriction: {e}; leaving the \

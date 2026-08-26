@@ -124,6 +124,13 @@ pub struct MultiWriter {
     /// [`Writer::use_bulk_ingested`]).
     bulk_ingested: bool,
 
+    /// L0 recency key stamped on every successor [`Writer`], preserved across
+    /// rotation (see [`Writer::use_recency`]): a compaction sets its inputs'
+    /// highest recency so manifest repair can place each output where its
+    /// content belongs, not where its id falls. `None` (flush / ingest) omits
+    /// the key — the table's own id is its recency.
+    recency: Option<TableId>,
+
     /// Delete strategy applied to every successor [`Writer`], preserved across
     /// rotation. Under copy-on-write the writers persist no delete-bitmap; under
     /// merge-on-read / adaptive a populated bitmap is written.
@@ -211,6 +218,7 @@ impl MultiWriter {
             use_zone_map: false,
             use_columnar: false,
             bulk_ingested: false,
+            recency: None,
             delete_strategy: crate::config::DeleteStrategy::default(),
             disable_cow_on_sst: false,
             locator_entry: crate::config::LocatorPolicyEntry::None,
@@ -598,6 +606,15 @@ impl MultiWriter {
         self
     }
 
+    /// Stamps the L0 recency key on this and every rotated successor writer
+    /// (see [`Writer::use_recency`]).
+    #[must_use]
+    pub(crate) fn use_recency(mut self, recency: Option<TableId>) -> Self {
+        self.recency = recency;
+        self.writer = self.writer.use_recency(recency);
+        self
+    }
+
     /// Sets the delete strategy for this and every rotated successor writer.
     #[must_use]
     pub fn delete_strategy(mut self, strategy: crate::config::DeleteStrategy) -> Self {
@@ -673,6 +690,7 @@ impl MultiWriter {
         new_writer = new_writer.use_zone_map(self.use_zone_map);
         new_writer = new_writer.use_columnar(self.use_columnar);
         new_writer = new_writer.use_bulk_ingested(Some(self.bulk_ingested));
+        new_writer = new_writer.use_recency(self.recency);
         new_writer = new_writer.delete_strategy(self.delete_strategy);
         new_writer = new_writer.use_disable_cow(self.disable_cow_on_sst);
         new_writer = new_writer.use_locator(self.locator_entry);

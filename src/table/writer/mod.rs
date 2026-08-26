@@ -297,6 +297,17 @@ pub struct Writer {
     /// Default `Some(false)`.
     bulk_ingested: Option<bool>,
 
+    /// Recency key for manifest repair's L0 ordering: the highest
+    /// [`Table::l0_recency`](crate::table::Table::l0_recency) among this
+    /// table's compaction INPUTS. A compaction output's own id says nothing
+    /// about how new its CONTENT is (the id is allocated when the compaction
+    /// starts writing, while newer flushes with lower ids can install first,
+    /// and an intra-L0 output is appended at the BACK of L0 regardless of its
+    /// id), so repair orders recovered tables by this key instead. `None` —
+    /// a flush / ingest table, whose own id IS its recency — omits the
+    /// on-disk key. Persisted as `recency`.
+    recency: Option<TableId>,
+
     /// Pre-trained zstd dictionary for dictionary compression
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
@@ -442,6 +453,7 @@ impl Writer {
             use_zone_map: false,
             use_columnar: false,
             bulk_ingested: Some(false),
+            recency: None,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -766,6 +778,10 @@ impl Writer {
             // manifest-only global_seqno offset. A legacy source of unknown
             // provenance (`None`) re-emits unflagged (we do not guess).
             .use_bulk_ingested(meta.bulk_ingested)
+            // A rewrite keeps the source's L0 recency key: the copy carries the
+            // same content, so it belongs at the same position (a `None` source
+            // falls back to its own id, which the same-id copy shares).
+            .use_recency(meta.recency)
             .use_zone_map(has_zone_map)
             // A source with a seqno_bounds section keeps its seqno-scoped
             // block-skip: the writer re-derives the per-block ranges from
@@ -901,6 +917,18 @@ impl Writer {
     pub(crate) fn use_bulk_ingested(mut self, bulk_ingested: Option<bool>) -> Self {
         self.assert_not_started("use_bulk_ingested");
         self.bulk_ingested = bulk_ingested;
+        self
+    }
+
+    /// Sets the recency key (see [`Self::recency`] field): the highest
+    /// `l0_recency` among a compaction's inputs, so manifest repair can place
+    /// this output where its CONTENT belongs in L0 instead of where its id
+    /// falls. `None` (the default) is a flush / ingest table, whose own id is
+    /// its recency.
+    #[must_use]
+    pub(crate) fn use_recency(mut self, recency: Option<TableId>) -> Self {
+        self.assert_not_started("use_recency");
+        self.recency = recency;
         self
     }
 
@@ -2356,6 +2384,7 @@ impl Writer {
             initial_level: self.initial_level,
             use_columnar: self.use_columnar,
             bulk_ingested: self.bulk_ingested,
+            recency: self.recency,
             range_tombstone_count,
             // Record the count that corresponds to the delete_bitmap section
             // ACTUALLY written above, via the single `writes_delete_bitmap`
@@ -2604,6 +2633,10 @@ struct MetaSectionParams<'a> {
     /// Bulk-ingest provenance: `Some(_)` writes `descriptor#bulk_ingested`,
     /// `None` omits it (unknown provenance, preserving a legacy SST's absence).
     bulk_ingested: Option<bool>,
+    /// L0 recency key: `Some(_)` writes `recency` (a compaction output whose
+    /// content position differs from its id), `None` omits it (a flush /
+    /// ingest table, whose own id is its recency).
+    recency: Option<TableId>,
     range_tombstone_count: u64,
     /// Number of positions in this table's delete bitmap. Recorded so a reader
     /// can AUTHENTICATE the bitmap's presence: the section itself is optional
@@ -2838,6 +2871,15 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
     // of order, then the whole list is sorted below.
     if let Some(flag) = p.bulk_ingested {
         meta_items.push(meta("descriptor#bulk_ingested", &[u8::from(flag)]));
+    }
+
+    // L0 recency key: emitted ONLY for a table whose content position differs
+    // from its id (a compaction output). Absence means "my own id is my
+    // recency" — a flush / ingest table, or any table from before this key
+    // existed, for which that id order matches what manifest repair assumed
+    // all along.
+    if let Some(recency) = p.recency {
+        meta_items.push(meta("recency", &recency.to_le_bytes()));
     }
 
     // Test-only legacy simulation: drop the bitmap-content hash so the file

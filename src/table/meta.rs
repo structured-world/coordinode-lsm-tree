@@ -173,6 +173,15 @@ pub struct ParsedMeta {
     /// have been bulk-ingested), since it cannot reconstruct the offset from the
     /// SST alone.
     pub bulk_ingested: Option<bool>,
+
+    /// L0 recency key from the optional `recency` property: the highest
+    /// recency among this table's compaction INPUTS. A compaction output's own
+    /// id says nothing about how new its content is (ids are allocated at
+    /// write start, and an intra-L0 output is appended at the BACK of L0), so
+    /// manifest repair orders L0 by this key. `None` — a flush / ingest table,
+    /// or one from before this key existed — means the table's own id is its
+    /// recency (see [`Table::l0_recency`](crate::table::Table::l0_recency)).
+    pub recency: Option<TableId>,
 }
 
 macro_rules! read_u8 {
@@ -551,6 +560,7 @@ impl ParsedMeta {
         let delete_bitmap_len = read_opt_u64(b"descriptor#delete_bitmap_len")?;
         let delete_bitmap_hash = read_opt_u128(b"descriptor#delete_bitmap_hash")?;
         let key_count = read_opt_u64(b"key_count")?;
+        let recency = read_opt_u64(b"recency")?;
 
         Ok(Self {
             id,
@@ -581,6 +591,7 @@ impl ParsedMeta {
             index_block_restart_interval,
             columnar,
             bulk_ingested,
+            recency,
         })
     }
 }

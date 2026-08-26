@@ -86,3 +86,78 @@ fn recover_blob_file_on_non_blob_file_errors() {
     // `BlobFile` is not `Debug`, so assert on the boolean rather than the value.
     assert!(result.is_err(), "recovering a non-blob file must fail");
 }
+
+/// The blob twin of the table-prefix rule: a reclaim whose link probe cannot
+/// answer (or that reports a COMPLETED checkpoint's surviving link) while the
+/// deletion pause is inactive must be RETAINED for `retry_pending_reclaims`,
+/// not discarded — the dropping view holds the only record of the reclaim,
+/// and nothing else would ever free the consumed prefix once it is gone.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn blob_punch_on_drop_retains_the_reclaim_when_the_link_probe_cannot_answer() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+
+    let memfs = MemFs::new();
+    let root = std::path::absolute("/blobs")?;
+    memfs.create_dir_all(&root)?;
+    let path = root.join("0");
+    {
+        let fs_dyn: Arc<dyn Fs> = Arc::new(memfs.clone());
+        let mut w = super::blob_file::writer::Writer::new(path.clone(), 0, 0, &*fs_dyn)?;
+        w.write(b"a", 1, &[b'x'; 64])?;
+        w.write(b"b", 2, &[b'y'; 64])?;
+        w.finish()?;
+    }
+    // The consumed prefix ends where the second frame begins.
+    let first_frame_end = super::BlobFileScanner::new(&path, &memfs, 0)?
+        .next()
+        .expect("first frame")?
+        .frame_end;
+
+    let fault = FaultFs::new(memfs.clone());
+    let injector = fault.injector();
+    injector.arm(FaultRule::new(
+        FaultOp::HardLinkCount,
+        Fault::Error(ErrorKind::PermissionDenied),
+    ));
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    let blob = recover_blob_file(&path, 0, Checksum::from_raw(0), 0, &fs)?;
+    let pause = crate::deletion_pause::DeletionPause::new_shared();
+    blob.install_deletion_pause(Arc::clone(&pause));
+    blob.mark_punch_on_drop(first_frame_end);
+    drop(blob);
+
+    assert!(
+        pause.has_pending_reclaims(),
+        "a blob reclaim whose link probe cannot answer must be retained for a \
+         retry, not discarded",
+    );
+
+    // The probe recovers (the checkpoint is gone): the retry finishes the
+    // reclaim.
+    injector.clear();
+    pause.retry_pending_reclaims();
+    assert!(
+        !pause.has_pending_reclaims(),
+        "an exclusively-owned blob file's retained reclaim is finished by the retry",
+    );
+    let data_start = {
+        let mut file = memfs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut file)?;
+        reader
+            .toc()
+            .section(b"data")
+            .expect("blob file has a data section")
+            .pos()
+    };
+    let punched_len = usize::try_from(first_frame_end - data_start).expect("small fixture");
+    let file = memfs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
+    let prefix = crate::file::read_exact(&*file, data_start, punched_len)?;
+    assert!(
+        prefix.iter().all(|&b| b == 0),
+        "the retried reclaim punches the consumed data prefix",
+    );
+    Ok(())
+}
