@@ -182,6 +182,13 @@ impl Tree {
                 ));
             }
             let key_range = &table.metadata.key_range;
+            // `key_count == item_count` proves the segment holds one version per
+            // key, so the verbatim path can return its rows untouched. The count
+            // the writer recorded and the duplicate-free claim read here rest on
+            // the SAME identity relation the read path uses to collapse versions
+            // (`comparator::same_user_key`), so a segment this calls unique is
+            // one a normal read would also return whole. `None` (a legacy
+            // segment that recorded no count) proves nothing and dedups.
             let may_dup = table
                 .metadata
                 .key_count
