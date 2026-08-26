@@ -9806,11 +9806,13 @@ fn open_finishes_a_committed_repair_swap() -> crate::Result<()> {
     // The blob rewrite publishes the referencing table's replacement at
     // `{id}.repair-tmp` and swaps it only after the commit; failing the swap's
     // rename persistently is the post-commit crash. Rename faults match the
-    // DESTINATION path, which for the swap is the table's own name.
+    // DESTINATION path — the table's own name, spelled with the platform's
+    // separators (a literal "tables/0" would never match on Windows).
+    let swap_dest = root.join("tables").join("0");
     let fault = FaultFs::new((*memfs).clone());
     fault.injector().arm(
         FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::PermissionDenied))
-            .on_path("tables/0"),
+            .on_path(swap_dest.to_string_lossy().into_owned()),
     );
     assert!(
         config(Arc::new(fault)).repair().is_err(),
