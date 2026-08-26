@@ -133,12 +133,16 @@ impl RecoveryProgress {
 
     /// Requests cooperative cancellation of the operation this handle is
     /// attached to. The running repair observes the flag at file boundaries
-    /// and aborts with [`Error::Cancelled`](crate::Error::Cancelled) — before
-    /// its manifest commit the abort leaves the directory untouched for a
-    /// retry (the scan is read-only), while an abort requested after the
-    /// commit is ignored: the manifest already names the rebuilt state, and
-    /// stopping mid-cleanup would leave work the next open must redo anyway.
-    /// Idempotent; there is no un-cancel (use a fresh handle for a new run).
+    /// (and once more just before its manifest commit) and aborts with
+    /// [`Error::Cancelled`](crate::Error::Cancelled). A pre-commit abort
+    /// removes any blob replacements the run had already published under
+    /// fresh ids, so it leaves nothing behind except unpublished
+    /// `{id}.repair-tmp` staging copies — which the retry itself overwrites
+    /// (the scan is otherwise read-only, so the directory is exactly what the
+    /// retry expects). An abort requested after the commit is ignored: the
+    /// manifest already names the rebuilt state, and stopping mid-cleanup
+    /// would leave work the next open must redo anyway. Idempotent; there is
+    /// no un-cancel (use a fresh handle for a new run).
     pub fn request_cancel(&self) {
         self.cancel.store(true, Relaxed);
     }

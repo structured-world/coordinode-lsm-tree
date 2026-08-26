@@ -152,13 +152,16 @@ widening the replay would double-fold merge operands that DID survive. After
 any repair, derive the obligation from the report instead:
 
 1. **Ask the report.** `RepairReport::wal_replay_scope()` aggregates
-   `lost_coverage`:
-   - `TailOnly` — nothing was excluded; run the section 3 replay unchanged.
+   `lost_coverage` (which covers excluded tables AND kept lossy salvaged
+   copies — a copy that dropped corrupt blocks lost data inside its bounds
+   too) and `unknowable_losses`:
+   - `TailOnly` — nothing was lost; run the section 3 replay unchanged.
    - `LostUpTo(b)` — in addition to the tail, replay every RETAINED record
      whose key falls inside a `lost_coverage` range and whose seqno is at or
      below `b`.
-   - `FullHistory` — same, with no seqno filter: an excluded table's sequence
-     base died with the manifest, so no bound scopes the damage.
+   - `FullHistory` — same, with no seqno filter: a loss whose sequence base
+     died with the manifest, or an excluded table whose coverage never
+     parsed (`unknowable_losses`), leaves no bound that scopes the damage.
 2. **Puts and deletes replay blindly.** Re-applying one at its original seqno
    reproduces the same MVCC version, and a surviving NEWER version still wins
    by seqno — over-replay inside the lost ranges is harmless for them.

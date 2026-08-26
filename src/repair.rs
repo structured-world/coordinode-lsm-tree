@@ -98,9 +98,24 @@ pub struct RepairReport {
     /// bound is reported as unknown and the whole history of that key range has
     /// to be treated as affected.
     ///
-    /// Empty when nothing was excluded, and a table whose metadata was
-    /// unreadable contributes no entry (its coverage is unknowable).
+    /// A KEPT salvaged copy contributes an entry too: it dropped corrupt
+    /// blocks (or blob records), so within ITS bounds a superseded value may
+    /// likewise now be served, even though the table itself is in the
+    /// manifest.
+    ///
+    /// Empty when nothing was lost. A table whose metadata was unreadable
+    /// contributes no entry here — its coverage is unknowable, and it is
+    /// listed in [`unknowable_losses`](Self::unknowable_losses) instead.
     pub lost_coverage: Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)>,
+
+    /// Excluded table files whose loss cannot be scoped at all: their
+    /// metadata never parsed, so neither the affected key range nor a seqno
+    /// bound is derivable. Any entry here forces
+    /// [`wal_replay_scope`](Self::wal_replay_scope) to
+    /// [`WalReplayScope::FullHistory`], since no bound can prove a retained
+    /// record is NOT affected. Blob files are not listed: losing blob content
+    /// surfaces through the referencing tables, which the other fields cover.
+    pub unknowable_losses: Vec<PathBuf>,
 
     /// Damaged blob files whose salvaged replacement IS installed in the
     /// rebuilt manifest: the canonical (installed) path plus a note on what
@@ -151,14 +166,20 @@ pub enum WalReplayScope {
 
 impl RepairReport {
     /// Derives the WAL replay obligation from
-    /// [`lost_coverage`](Self::lost_coverage): [`WalReplayScope::TailOnly`]
-    /// when nothing was lost, [`WalReplayScope::FullHistory`] when any lost
-    /// table's seqno bound is unknown, else [`WalReplayScope::LostUpTo`] the
-    /// highest lost bound. The per-range detail (which KEYS are affected)
-    /// stays in `lost_coverage`; this is the aggregate a WAL uses to decide
-    /// how far back its archive must reach.
+    /// [`lost_coverage`](Self::lost_coverage) and
+    /// [`unknowable_losses`](Self::unknowable_losses):
+    /// [`WalReplayScope::TailOnly`] when nothing was lost,
+    /// [`WalReplayScope::FullHistory`] when any loss is unscopable (an
+    /// unknown seqno bound, or an excluded table whose coverage never
+    /// parsed), else [`WalReplayScope::LostUpTo`] the highest lost bound. The
+    /// per-range detail (which KEYS are affected) stays in `lost_coverage`;
+    /// this is the aggregate a WAL uses to decide how far back its archive
+    /// must reach.
     #[must_use]
     pub fn wal_replay_scope(&self) -> WalReplayScope {
+        if !self.unknowable_losses.is_empty() {
+            return WalReplayScope::FullHistory;
+        }
         let mut ceiling: Option<SeqNo> = None;
         for (_, _, _, bound) in &self.lost_coverage {
             match bound {
@@ -2168,9 +2189,20 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
             continue;
         }
 
-        // Pre-commit file boundary: safe to abort, and the file counts toward
-        // the progress percentage as soon as its processing starts.
-        check_cancel(config)?;
+        // Pre-commit file boundary: safe to abort — after removing the blob
+        // replacements this run already PUBLISHED under fresh ids. Unlike the
+        // read-only table scan, a successful blob salvage renames its copy to
+        // a normal numeric name before the commit, and leaving those behind
+        // on a cancel would make the retry re-create each one beside its
+        // orphan — under tight disk space exactly the sequence that fails.
+        if let Err(e) = check_cancel(config) {
+            remove_published_blob_replacements(
+                config,
+                &blobs_folder,
+                rewrites.values().filter_map(remap_replacement_id),
+            )?;
+            return Err(e);
+        }
         if let Some(p) = &config.recovery_progress {
             p.blob_file_discovered();
             if let Ok(meta) = config.fs.metadata(&blob_path) {
@@ -2653,11 +2685,15 @@ impl Config {
     /// repair may have regressed persisted state below the log's trim
     /// watermark (see `docs/external-wal.md` § Replay after repair).
     ///
-    /// A TRANSIENT I/O failure is returned as-is, never "repaired": a repair
-    /// would rebuild the manifest around files a healthy retry could still
-    /// read, turning a hiccup into data loss. A held directory lock
-    /// ([`Error::Locked`](crate::Error::Locked)) is likewise returned — the
-    /// repair would contend on the same lock.
+    /// Only failures that positively identify repairable on-disk structural
+    /// damage engage the repair (see `is_repairable_structural`). Everything
+    /// else is returned as-is: a TRANSIENT I/O failure (a repair would
+    /// rebuild the manifest around files a healthy retry could still read), a
+    /// held directory lock ([`Error::Locked`](crate::Error::Locked) — the
+    /// repair would contend on the same lock), and every CONFIGURATION
+    /// mismatch (wrong comparator, level route, dictionary, or encryption
+    /// key) — repairing under a wrong configuration would rebuild, and could
+    /// drop, perfectly healthy data.
     ///
     /// # Errors
     ///
@@ -2687,15 +2723,61 @@ impl Config {
         let retry = self.clone();
         match self.open() {
             Ok(tree) => Ok((tree, None)),
-            Err(e) if is_transient_io(&e) => Err(e),
-            Err(e @ crate::Error::Locked(_)) => Err(e),
-            Err(_) => {
+            Err(e) if is_repairable_structural(&e) => {
                 let report =
                     retry.repair_with_resurrection(policy.salvage, policy.allow_resurrection)?;
                 let tree = retry.open()?;
                 Ok((tree, Some(report)))
             }
+            Err(e) => Err(e),
         }
+    }
+}
+
+/// Whether an `open` failure positively identifies repairable ON-DISK
+/// structural damage — the only class [`Config::open_or_repair`] may answer
+/// with a repair.
+///
+/// Everything else propagates: transient I/O (a retry could still read the
+/// files a repair would rebuild around), a held directory lock (the repair
+/// would contend on the same lock), and every CONFIGURATION mismatch — a
+/// wrong comparator, level route, zstd dictionary, or an encryption key
+/// surfacing as a decrypt failure. Those are reversible by fixing the call,
+/// while a repair under the wrong configuration rebuilds — and can drop —
+/// perfectly healthy data (e.g. re-ordering SSTs under a mistyped comparator,
+/// or salvage discarding every block it cannot decrypt with the wrong key).
+/// Fail closed: an unlisted (including future) error is NOT repaired.
+fn is_repairable_structural(e: &crate::Error) -> bool {
+    use crate::Error;
+    match e {
+        // Data-shape I/O kinds are structural: a missing file (the manifest
+        // itself, or a file it names), malformed bytes (the manifest-loss
+        // open surfaces "current missing but artifacts present" as
+        // InvalidData), or a truncated read. Any other I/O kind is
+        // environment, and transient kinds are retried by the caller.
+        Error::Io(io) => matches!(
+            io.kind(),
+            crate::io::ErrorKind::NotFound
+                | crate::io::ErrorKind::InvalidData
+                | crate::io::ErrorKind::UnexpectedEof
+        ),
+        Error::Unrecoverable
+        | Error::InvalidVersion(_)
+        | Error::Decompress(_)
+        | Error::Excised { .. }
+        | Error::ChecksumMismatch { .. }
+        | Error::HeaderCrcMismatch { .. }
+        | Error::InvalidTag(_)
+        | Error::InvalidTrailer
+        | Error::InvalidHeader(_)
+        | Error::DecompressedSizeTooLarge { .. }
+        | Error::ManifestFrameChecksumMismatch { .. }
+        | Error::ManifestFooterInvalid(_)
+        | Error::ManifestSectionInvalid(_)
+        | Error::TornManifestEditLog { .. }
+        | Error::RangeTombstoneDecode { .. }
+        | Error::PageEccUnrecoverable { .. } => true,
+        _ => false,
     }
 }
 
@@ -2757,13 +2839,24 @@ impl RepairPolicy {
 /// corrupts the rebuild, so the repair must fail rather than proceed past it.
 #[cfg(feature = "std")]
 fn sweep_superseded_by_committed_manifest(config: &Config) -> crate::Result<()> {
-    let Ok(recovery) = crate::version::recovery::recover(
+    let recovery = match crate::version::recovery::recover(
         &config.path,
         &*config.fs,
         crate::config::ManifestRecoveryMode::AbsoluteConsistency,
         config.encryption.clone(),
-    ) else {
-        return Ok(());
+    ) {
+        Ok(recovery) => recovery,
+        // A one-shot read fault on an otherwise healthy manifest must NOT be
+        // read as "no committed manifest exists": the repair would then scan
+        // and republish every file, and with an unfinished compaction's inputs
+        // and outputs both on disk the rebuilt L0 applies duplicate merge
+        // operands — where the authoritative manifest would have named which
+        // files are live. Propagate for a retry.
+        Err(e) if is_transient_io(&e) => return Err(e),
+        // A manifest that does not load cleanly is exactly the case repair
+        // exists for: nothing committed to consult, the scan rebuilds from
+        // everything.
+        Err(_) => return Ok(()),
     };
 
     let referenced_tables: crate::HashSet<TableId> = recovery
@@ -2879,6 +2972,49 @@ fn sweep_superseded_by_committed_manifest(config: &Config) -> crate::Result<()> 
 
 /// Core repair routine. Separated from the [`Config::repair`] entry point so the
 /// logic is testable against a borrowed config.
+/// Removes the fresh-id blob replacements a cancelled run already published
+/// (each [`BlobFileRewrite::Remap`] names one), so a pre-commit abort leaves
+/// nothing behind that a retry would have to re-create beside an orphan —
+/// under tight disk space exactly the sequence that fails. `NotFound` is
+/// success (a concurrent sweep, or an in-place rewrite that published no
+/// file); any other removal failure propagates, since an undiscardable
+/// leftover is precisely what the cancel guarantee promises not to leave.
+///
+/// [`BlobFileRewrite::Remap`]: crate::salvage::BlobFileRewrite::Remap
+fn remove_published_blob_replacements(
+    config: &Config,
+    blobs_folder: &std::path::Path,
+    replacement_ids: impl IntoIterator<Item = crate::vlog::BlobFileId>,
+) -> crate::Result<()> {
+    let mut removed = false;
+    for id in replacement_ids {
+        match config.fs.remove_file(&blobs_folder.join(id.to_string())) {
+            Ok(()) => removed = true,
+            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if removed {
+        config
+            .fs
+            .sync_directory_with(blobs_folder, config.sync_mode)?;
+    }
+    Ok(())
+}
+
+/// The fresh id a [`BlobFileRewrite::Remap`] published its replacement under;
+/// `None` for an in-place `DropBelow`, which created no file.
+///
+/// [`BlobFileRewrite::Remap`]: crate::salvage::BlobFileRewrite::Remap
+fn remap_replacement_id(
+    rewrite: &crate::salvage::BlobFileRewrite,
+) -> Option<crate::vlog::BlobFileId> {
+    match rewrite {
+        crate::salvage::BlobFileRewrite::Remap { new_id, .. } => Some(*new_id),
+        crate::salvage::BlobFileRewrite::DropBelow(_) => None,
+    }
+}
+
 /// Surfaces a caller's cooperative cancellation
 /// ([`RecoveryProgress::request_cancel`](crate::RecoveryProgress::request_cancel))
 /// as [`Error::Cancelled`](crate::Error::Cancelled). Consulted at file
@@ -3764,6 +3900,9 @@ fn repair_tree(
         crate::vlog::BlobFileId,
         crate::salvage::BlobFileRewrite,
     > = crate::HashMap::default();
+    // Fresh-id blob replacements this run published; removed if the run is
+    // cancelled at the last pre-commit boundary.
+    let mut published_blob_replacement_ids: Vec<crate::vlog::BlobFileId> = Vec::new();
     let mut blob_files_salvaged: Vec<(PathBuf, String)> = Vec::new();
     let mut blob_frag = crate::blob_tree::FragmentationMap::default();
     // Damaged blob originals whose replacement is in the rebuilt manifest.
@@ -3780,6 +3919,12 @@ fn repair_tree(
         unreadable_files.extend(recovery.unreadable);
         blob_rewrites = recovery.rewrites;
         blob_frag = recovery.frag;
+        // The fresh-id files this run published, captured before the map is
+        // shared: the last cancellation boundary removes them on an abort.
+        published_blob_replacement_ids = blob_rewrites
+            .values()
+            .filter_map(remap_replacement_id)
+            .collect();
         stale_blob_originals = recovery.stale;
         // Foreign names, duplicates and unreadable blob files: same post-commit
         // removal as the superseded originals (see `BlobRecovery::discard`).
@@ -4016,6 +4161,32 @@ fn repair_tree(
         .iter()
         .filter(|(_, complete)| !complete)
         .count();
+    // A KEPT salvaged copy is lossy too: it dropped corrupt blocks (or blob
+    // records), and nothing in `unreadable_files` names it, so without an
+    // entry here `wal_replay_scope()` would answer `TailOnly` while older
+    // persisted changes were in fact lost. The copy's own metadata scopes the
+    // loss exactly like an excluded table's would: its key range, and its
+    // highest seqno — with the same unknown-bound rule for a source whose
+    // ingest offset died with the manifest.
+    let salvaged_coverage: Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)> = recovered_tables
+        .iter()
+        .filter(|(_, complete)| !complete)
+        .map(|(t, _)| {
+            let range = t.metadata.key_range.clone();
+            let bound = (!has_unrecoverable_ingest_offset(
+                t.metadata.bulk_ingested,
+                t.metadata.item_count,
+                t.max_local_seqno(),
+            ))
+            .then(|| t.get_highest_seqno());
+            (
+                (*t.path).clone(),
+                range.min().clone(),
+                range.max().clone(),
+                bound,
+            )
+        })
+        .collect();
     let recovered_tables: Vec<Table> = recovered_tables.into_iter().map(|(t, _)| t).collect();
     if let Some(p) = &config.recovery_progress {
         p.tables_recovered_add(recovered_tables.len() as u64);
@@ -4059,8 +4230,21 @@ fn repair_tree(
     // file's stale count below its whole-file metadata totals forever.
     let version = Version::from_levels(version_id, tree_type, levels, blob_file_list, blob_frag);
 
-    // From here on the run is COMMITTING and then cleaning up: cancellation is
-    // no longer consulted (see `check_cancel`).
+    // The LAST cancellation boundary: per-file checks only run before a file
+    // starts, so a cancel requested during the final file's verification or
+    // salvage would otherwise be silently outrun by the commit. From here on
+    // the run is COMMITTING and then cleaning up, and cancellation is no
+    // longer consulted (see `check_cancel`). The abort first removes the blob
+    // replacements this run already published under fresh ids (see the blob
+    // scan's boundary for why they must not be left behind).
+    if let Err(e) = check_cancel(config) {
+        remove_published_blob_replacements(
+            config,
+            &config.path.join(crate::file::BLOBS_FOLDER),
+            published_blob_replacement_ids,
+        )?;
+        return Err(e);
+    }
     if let Some(p) = &config.recovery_progress {
         p.set_phase(crate::RecoveryPhase::Committing);
     }
@@ -4208,17 +4392,27 @@ fn repair_tree(
         );
     }
 
-    // Join the exclusions against the coverage captured during the scan. A
-    // table whose metadata never parsed contributes nothing: its coverage is
-    // unknowable, which the field documents.
-    let lost_coverage: Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)> = unreadable_files
-        .iter()
-        .filter_map(|(path, _)| {
-            coverage_by_path
-                .get(path)
-                .map(|(lo, hi, seqno)| (path.clone(), lo.clone(), hi.clone(), *seqno))
-        })
-        .collect();
+    // Join the exclusions against the coverage captured during the scan, plus
+    // an entry per KEPT lossy salvage (see `salvaged_coverage`). An excluded
+    // TABLE whose metadata never parsed has unknowable coverage — recorded
+    // separately so `wal_replay_scope()` can force the full-history
+    // obligation instead of silently answering as if nothing was lost. Blob
+    // files stay out of that set: losing blob content surfaces through the
+    // referencing tables (a lossy handle rewrite, or their exclusion), which
+    // ARE covered above.
+    let blobs_folder = config.path.join(crate::file::BLOBS_FOLDER);
+    let mut lost_coverage: Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)> = Vec::new();
+    let mut unknowable_losses: Vec<PathBuf> = Vec::new();
+    for (path, _) in &unreadable_files {
+        match coverage_by_path.get(path) {
+            Some((lo, hi, seqno)) => {
+                lost_coverage.push((path.clone(), lo.clone(), hi.clone(), *seqno));
+            }
+            None if !path.starts_with(&blobs_folder) => unknowable_losses.push(path.clone()),
+            None => {}
+        }
+    }
+    lost_coverage.extend(salvaged_coverage);
 
     // Success only: a failed run leaves the phase where it stopped, which
     // tells a progress display exactly which stage failed.
@@ -4232,6 +4426,7 @@ fn repair_tree(
         unreadable: unreadable_files.len(),
         unreadable_files,
         lost_coverage,
+        unknowable_losses,
         blob_files_salvaged,
         method: "all-to-L0 with sequence-number ordering",
         warnings,

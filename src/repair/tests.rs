@@ -229,6 +229,7 @@ fn wal_replay_scope_derives_from_lost_coverage() {
             unreadable: 0,
             unreadable_files: Vec::new(),
             lost_coverage: lost,
+            unknowable_losses: Vec::new(),
             blob_files_salvaged: Vec::new(),
             method: "test",
             warnings: Vec::new(),
@@ -257,6 +258,15 @@ fn wal_replay_scope_derives_from_lost_coverage() {
         report(vec![entry(Some(40)), entry(None)]).wal_replay_scope(),
         super::WalReplayScope::FullHistory,
         "one unknown bound means no seqno scopes the damage",
+    );
+    let mut with_unknowable = report(vec![entry(Some(40))]);
+    with_unknowable
+        .unknowable_losses
+        .push(std::path::PathBuf::from("tables/9"));
+    assert_eq!(
+        with_unknowable.wal_replay_scope(),
+        super::WalReplayScope::FullHistory,
+        "an exclusion whose coverage never parsed cannot be scoped by any bound",
     );
 }
 
@@ -9843,6 +9853,197 @@ fn standard_tree_without_manifest(
     Ok(())
 }
 
+/// A KEPT salvaged copy is a loss too: it dropped corrupt blocks, so within
+/// its bounds a superseded value may now be served — yet nothing in
+/// `unreadable_files` names it. Without its own `lost_coverage` entry,
+/// `wal_replay_scope()` would answer `TailOnly` and the documented WAL
+/// reconciliation would skip the lost changes entirely.
+#[test]
+fn lossy_salvage_contributes_lost_coverage() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    // Several small blocks so salvage keeps the readable remainder.
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+        for i in 0..64u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                7,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Corrupt ONE interior data block: salvage keeps the table minus it.
+    let offsets: alloc::vec::Vec<u64> = recover_table(sst.clone(), &fs)?
+        .data_block_handles()
+        .filter_map(Result::ok)
+        .map(|kh| *kh.as_ref().offset())
+        .collect();
+    let Some(corrupt) = offsets.get(1).copied() else {
+        panic!("need several blocks, got {offsets:?}");
+    };
+    let flip = usize::try_from(corrupt).unwrap_or(0) + 16;
+    let mut bytes = std::fs::read(&sst)?;
+    if let Some(b) = bytes.get_mut(flip) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&sst, &bytes)?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair_with_salvage(true)?;
+    assert_eq!(report.salvaged, 1, "the table survives as a lossy copy");
+    assert_eq!(report.recovered, 1, "the lossy copy joins the manifest");
+    assert_eq!(report.unreadable, 0, "{:?}", report.unreadable_files);
+    let [(_, lo, hi, bound)] = report.lost_coverage.as_slice() else {
+        panic!(
+            "the kept lossy copy must contribute a lost-coverage entry: {:?}",
+            report.lost_coverage,
+        );
+    };
+    assert!(
+        lo.as_ref() <= b"k00000".as_slice() && hi.as_ref() >= b"k00063".as_slice(),
+        "the entry scopes at least the copy's key range: [{lo:?}, {hi:?}]",
+    );
+    assert_eq!(*bound, Some(7), "the loss is bounded by the copy's seqnos");
+    assert_eq!(
+        report.wal_replay_scope(),
+        super::WalReplayScope::LostUpTo(7),
+        "the WAL must be told how deep the loss reaches",
+    );
+    Ok(())
+}
+
+/// An excluded table file whose metadata never parsed cannot be scoped at
+/// all — neither key range nor seqno bound. It must surface in
+/// `unknowable_losses` and force the FULL-HISTORY replay obligation, because
+/// no bound can prove a retained record is unaffected.
+#[test]
+fn unparseable_exclusion_forces_full_history_replay() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::{Config, SequenceNumberCounter};
+    use std::io::Write;
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    standard_tree_without_manifest(&memfs, &root)?;
+    // A numeric-named file the scan must treat as a table, with nothing
+    // parseable inside.
+    {
+        let mut file = memfs.open(
+            &root.join("tables").join("7"),
+            &FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        file.write_all(b"not a table at all")?;
+    }
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .repair()?;
+    assert_eq!(report.recovered, 1, "the healthy table is kept");
+    assert_eq!(report.unreadable, 1, "{:?}", report.unreadable_files);
+    assert_eq!(
+        report.unknowable_losses.len(),
+        1,
+        "the unparseable exclusion is recorded as unscopable: {report:?}",
+    );
+    assert_eq!(
+        report.wal_replay_scope(),
+        super::WalReplayScope::FullHistory,
+        "no bound can prove a retained record unaffected",
+    );
+    Ok(())
+}
+
+/// A transient read fault while probing the committed manifest must propagate
+/// for a retry, not be read as "no manifest exists": the repair would then
+/// rebuild from a directory scan, and with an unfinished compaction's inputs
+/// and outputs both on disk the rebuilt L0 applies duplicate merge operands —
+/// where the authoritative manifest would have named which files are live.
+#[test]
+fn repair_propagates_a_transient_manifest_probe_failure() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    // A HEALTHY store: data flushed, manifest committed.
+    {
+        let crate::AnyTree::Standard(tree) = Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .open()?
+        else {
+            panic!("expected a standard tree");
+        };
+        tree.insert(b"k", b"v", 1);
+        tree.flush_active_memtable(0)?;
+    }
+    let manifest_names: Vec<String> = memfs
+        .read_dir(&root)?
+        .into_iter()
+        .filter(|e| e.file_name.starts_with('v') || e.file_name == "current")
+        .map(|e| e.file_name)
+        .collect();
+
+    // `WouldBlock`, not `Interrupted`: std's buffered reads transparently
+    // retry EINTR, so a permanently armed Interrupted would spin forever.
+    let fault = FaultFs::new((*memfs).clone());
+    fault
+        .injector()
+        .arm(FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::WouldBlock)).on_path("current"));
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair();
+    assert!(
+        matches!(result, Err(crate::Error::Io(ref e)) if e.kind().is_transient()),
+        "a transient probe fault must surface for a retry, not trigger a \
+         manifest-loss rebuild: {:?}",
+        result.map(|r| r.recovered),
+    );
+
+    // Nothing was rebuilt: the manifest generation is untouched.
+    let after: Vec<String> = memfs
+        .read_dir(&root)?
+        .into_iter()
+        .filter(|e| e.file_name.starts_with('v') || e.file_name == "current")
+        .map(|e| e.file_name)
+        .collect();
+    assert_eq!(
+        manifest_names, after,
+        "a rebuild would have written a fresh manifest generation",
+    );
+    Ok(())
+}
+
 /// The progress handle reports the phase and the byte totals of a live
 /// repair: the totals come from an upfront listing with the same skips as the
 /// scan, so a completed run has taken up exactly what it announced, and a
@@ -9884,6 +10085,245 @@ fn repair_publishes_phase_and_byte_progress() -> crate::Result<()> {
         "a completed run took up exactly what it announced",
     );
     assert_eq!(snap.tables_recovered, 1, "the flushed SST was recovered");
+    Ok(())
+}
+
+/// Which filesystem event fires a [`HookFs`] hook.
+enum HookOn {
+    /// The first `open` of a path containing the needle — the deterministic
+    /// stand-in for "a cancel arrives while a file is being processed" (the
+    /// per-file boundary has already passed by the time the file is opened).
+    Open,
+    /// The first `rename` whose DESTINATION contains the needle — the moment
+    /// a repair publishes a replacement under its final name.
+    RenameTo,
+}
+
+/// An `Fs` that forwards to [`MemFs`] and fires a hook once, on the event
+/// [`HookOn`] selects.
+struct HookFs {
+    inner: crate::fs::MemFs,
+    on: HookOn,
+    needle: String,
+    fired: std::sync::atomic::AtomicBool,
+    hook: Box<dyn Fn() + Send + Sync>,
+}
+
+impl HookFs {
+    fn fire_once(&self) {
+        if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            (self.hook)();
+        }
+    }
+}
+
+impl crate::fs::Fs for HookFs {
+    fn open(
+        &self,
+        path: &std::path::Path,
+        options: &crate::fs::FsOpenOptions,
+    ) -> crate::io::Result<Box<dyn crate::fs::FsFile>> {
+        if matches!(self.on, HookOn::Open) && path.to_string_lossy().contains(&self.needle) {
+            self.fire_once();
+        }
+        self.inner.open(path, options)
+    }
+    fn remove_file(&self, path: &std::path::Path) -> crate::io::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> crate::io::Result<()> {
+        if matches!(self.on, HookOn::RenameTo) && to.to_string_lossy().contains(&self.needle) {
+            self.fire_once();
+        }
+        self.inner.rename(from, to)
+    }
+    fn create_dir_all(&self, path: &std::path::Path) -> crate::io::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn remove_dir_all(&self, path: &std::path::Path) -> crate::io::Result<()> {
+        self.inner.remove_dir_all(path)
+    }
+    fn sync_directory(&self, path: &std::path::Path) -> crate::io::Result<()> {
+        self.inner.sync_directory(path)
+    }
+    fn read_dir(&self, path: &std::path::Path) -> crate::io::Result<Vec<crate::fs::FsDirEntry>> {
+        self.inner.read_dir(path)
+    }
+    fn metadata(&self, path: &std::path::Path) -> crate::io::Result<crate::fs::FsMetadata> {
+        self.inner.metadata(path)
+    }
+    fn exists(&self, path: &std::path::Path) -> crate::io::Result<bool> {
+        self.inner.exists(path)
+    }
+    fn capabilities(&self, path: &std::path::Path) -> crate::fs::FsCapabilities {
+        self.inner.capabilities(path)
+    }
+    // Defaulted trait methods MemFs overrides must forward too, or the
+    // wrapper silently downgrades the backend (e.g. `extent_is_hole` answers
+    // "cannot tell" and a punched blob classifies as damage).
+    fn create_dir(&self, path: &std::path::Path) -> crate::io::Result<()> {
+        self.inner.create_dir(path)
+    }
+    fn sync_directory_with(
+        &self,
+        path: &std::path::Path,
+        mode: crate::fs::SyncMode,
+    ) -> crate::io::Result<()> {
+        self.inner.sync_directory_with(path, mode)
+    }
+    fn same_file(&self, a: &std::path::Path, b: &std::path::Path) -> bool {
+        self.inner.same_file(a, b)
+    }
+    fn hard_link(&self, src: &std::path::Path, dst: &std::path::Path) -> crate::io::Result<()> {
+        self.inner.hard_link(src, dst)
+    }
+    fn backend_id(&self) -> Option<u64> {
+        self.inner.backend_id()
+    }
+    fn volume_id(&self, path: &std::path::Path) -> Option<u64> {
+        self.inner.volume_id(path)
+    }
+    fn punch_hole(&self, path: &std::path::Path, offset: u64, len: u64) -> crate::io::Result<()> {
+        self.inner.punch_hole(path, offset, len)
+    }
+    fn truncate_file(&self, path: &std::path::Path) -> crate::io::Result<()> {
+        self.inner.truncate_file(path)
+    }
+    fn hard_link_count(&self, path: &std::path::Path) -> crate::io::Result<u64> {
+        self.inner.hard_link_count(path)
+    }
+    fn available_space(&self, path: &std::path::Path) -> crate::io::Result<u64> {
+        self.inner.available_space(path)
+    }
+    fn allocated_size(&self, path: &std::path::Path) -> crate::io::Result<Option<u64>> {
+        self.inner.allocated_size(path)
+    }
+    fn extent_is_hole(
+        &self,
+        path: &std::path::Path,
+        offset: u64,
+        len: u64,
+    ) -> crate::io::Result<Option<bool>> {
+        self.inner.extent_is_hole(path, offset, len)
+    }
+    fn extent_contains_hole(
+        &self,
+        path: &std::path::Path,
+        offset: u64,
+        len: u64,
+    ) -> crate::io::Result<Option<bool>> {
+        self.inner.extent_contains_hole(path, offset, len)
+    }
+}
+
+/// A cancel that lands while the LAST file is being processed must still
+/// abort the repair: per-file boundaries only run before a file starts, so
+/// without a final boundary before the commit the request would be silently
+/// outrun and the repair would return success.
+#[test]
+fn repair_cancel_during_the_final_file_still_aborts_before_commit() -> crate::Result<()> {
+    use crate::fs::MemFs;
+    use crate::{Config, RecoveryProgress, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    standard_tree_without_manifest(&memfs, &root)?;
+
+    let progress = Arc::new(RecoveryProgress::default());
+    // The cancel fires when the single SST is OPENED — after its per-file
+    // boundary, during its processing.
+    let hook_progress = Arc::clone(&progress);
+    let fs = HookFs {
+        inner: (*memfs).clone(),
+        on: HookOn::Open,
+        needle: "tables".into(),
+        fired: std::sync::atomic::AtomicBool::new(false),
+        hook: Box::new(move || hook_progress.request_cancel()),
+    };
+
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fs)
+    .with_recovery_progress(Arc::clone(&progress))
+    .repair();
+    assert!(
+        matches!(result, Err(crate::Error::Cancelled)),
+        "a cancel during the final file must abort before the commit: {:?}",
+        result.map(|r| r.recovered),
+    );
+
+    // Nothing was committed: a retry with a fresh handle rebuilds normally.
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .repair()?;
+    assert_eq!(report.recovered, 1);
+    Ok(())
+}
+
+/// A cancelled run must not leave behind the blob replacement it already
+/// PUBLISHED under a fresh id: unlike the read-only table scan, a successful
+/// blob salvage renames its copy to a normal numeric name before the commit,
+/// and an orphan left by the abort would force the retry to build yet
+/// another replacement beside it — under tight disk space exactly the
+/// sequence that fails.
+#[test]
+fn repair_cancel_removes_published_blob_replacements() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, KvSeparationOptions, RecoveryProgress, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    blob_tree_without_manifest(&memfs, &root)?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    punch_and_corrupt_blob(&memfs, &blobs.join("0"))?;
+
+    // The cancel fires the moment the salvaged replacement is PUBLISHED
+    // (renamed onto its fresh id `1`) — after the blob's own file boundary.
+    let progress = Arc::new(RecoveryProgress::default());
+    let hook_progress = Arc::clone(&progress);
+    let replacement = blobs.join("1");
+    let fs = HookFs {
+        inner: (*memfs).clone(),
+        on: HookOn::RenameTo,
+        needle: replacement.to_string_lossy().into_owned(),
+        fired: std::sync::atomic::AtomicBool::new(false),
+        hook: Box::new(move || hook_progress.request_cancel()),
+    };
+
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fs)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .with_recovery_progress(Arc::clone(&progress))
+    .repair();
+    assert!(
+        matches!(result, Err(crate::Error::Cancelled)),
+        "the cancel lands before the commit and must abort: {:?}",
+        result.map(|r| r.recovered),
+    );
+    assert!(
+        !memfs.exists(&replacement)?,
+        "the published replacement must be removed by the abort — an orphan \
+         here makes the retry build a second copy beside it",
+    );
+    assert!(
+        memfs.exists(&blobs.join("0"))?,
+        "the damaged original stays for the retry to re-salvage",
+    );
     Ok(())
 }
 

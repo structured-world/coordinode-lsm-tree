@@ -736,3 +736,54 @@ fn u64_comparator_range_scan_multi_table_run() -> lsm_tree::Result<()> {
 
     Ok(())
 }
+
+/// A comparator mismatch is a CONFIGURATION error, not on-disk damage:
+/// `open_or_repair` must return it untouched instead of "repairing" — a
+/// repair under the wrong ordering would re-sort or drop healthy SSTs and
+/// overwrite the manifest that still names the correct comparator.
+#[test]
+fn open_or_repair_propagates_a_comparator_mismatch_without_repairing() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+
+    {
+        let cmp: SharedComparator = Arc::new(ReverseComparator);
+        let tree = Config::new(&folder, Default::default(), Default::default())
+            .comparator(cmp)
+            .open()?;
+        tree.insert("a", "1", 0);
+        tree.flush_active_memtable(1)?;
+    }
+    let manifest_names = || -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&folder)
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with('v') || n == "current")
+            .collect();
+        names.sort();
+        names
+    };
+    let before = manifest_names();
+
+    let cmp: SharedComparator = Arc::new(U64BigEndianComparator);
+    let result = Config::new(&folder, Default::default(), Default::default())
+        .comparator(cmp)
+        .open_or_repair(lsm_tree::RepairPolicy::default().salvage(true));
+    assert!(
+        matches!(result, Err(lsm_tree::Error::ComparatorMismatch { .. })),
+        "the reversible configuration error must propagate, never repair: {:?}",
+        result.map(|_| "opened"),
+    );
+    assert_eq!(
+        before,
+        manifest_names(),
+        "a repair would have rewritten the manifest generation",
+    );
+
+    // The correct configuration still opens the untouched store.
+    let cmp: SharedComparator = Arc::new(ReverseComparator);
+    let tree = Config::new(&folder, Default::default(), Default::default())
+        .comparator(cmp)
+        .open()?;
+    assert_eq!(tree.get("a", 2)?, Some("1".as_bytes().into()));
+    Ok(())
+}
