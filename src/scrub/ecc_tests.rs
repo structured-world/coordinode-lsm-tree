@@ -593,24 +593,22 @@ fn rebuild_manifest_over_current_bytes(dir: &std::path::Path) -> crate::Result<(
         crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &sst_path)?);
     #[cfg(feature = "metrics")]
     let metrics = Arc::new(crate::Metrics::default());
-    let table = crate::table::Table::recover(
-        sst_path,
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(crate::Cache::with_capacity_bytes(1_000_000)),
-        None,
-        Arc::clone(&fs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
+    let table = {
+        #[cfg_attr(not(feature = "metrics"), expect(unused_mut))]
+        let mut params = crate::table::RecoverParams::new(
+            sst_path,
+            checksum,
+            0,
+            Arc::clone(&fs),
+            crate::comparator::default_comparator(),
+            Arc::new(crate::Cache::with_capacity_bytes(1_000_000)),
+        );
         #[cfg(feature = "metrics")]
-        metrics,
-    )?;
+        {
+            params.metrics = metrics;
+        }
+        crate::table::Table::recover(params)?
+    };
 
     // Remove the prior snapshots so the hand-built one is the newest.
     let mut next_version_id = 0u64;

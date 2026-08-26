@@ -1269,24 +1269,16 @@ fn recover_table(
 ) -> crate::Result<crate::table::Table> {
     use std::sync::Arc;
     let checksum = crate::Checksum::from_raw(super::compute_table_checksum(&**fs, &path)?);
-    crate::table::Table::recover(
+    let mut params = crate::table::RecoverParams::new(
         path,
         checksum,
         0,
-        0,
-        0,
-        Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
-        Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8))),
         Arc::clone(fs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
         crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::new(crate::Metrics::default()),
-    )
+        Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+    );
+    params.descriptor_table = Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8)));
+    crate::table::Table::recover(params)
 }
 
 /// The offset of the SOLE data block in `table`, panicking if there is not
@@ -1523,26 +1515,18 @@ fn recover_sst(
     fs: &std::sync::Arc<dyn crate::fs::Fs>,
 ) -> crate::Result<crate::Table> {
     let checksum = crate::Checksum::from_raw(compute_table_checksum(&**fs, &path)?);
-    crate::Table::recover(
+    let mut params = crate::table::RecoverParams::new(
         path,
         checksum,
         0,
-        0,
-        0,
-        std::sync::Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
-        Some(std::sync::Arc::new(
-            crate::descriptor_table::DescriptorTable::new(8),
-        )),
         std::sync::Arc::clone(fs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
         crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        std::sync::Arc::new(crate::Metrics::default()),
-    )
+        std::sync::Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+    );
+    params.descriptor_table = Some(std::sync::Arc::new(
+        crate::descriptor_table::DescriptorTable::new(8),
+    ));
+    crate::Table::recover(params)
 }
 
 /// A tight-space-PUNCHED SST records its restriction bound only in the manifest.
@@ -5612,24 +5596,14 @@ fn repair_with_salvage_preserves_the_file_name_id_over_a_forged_tail_meta_id() -
     // salvage.
     let offset = {
         let checksum = crate::Checksum::from_raw(compute_table_checksum(&*fs, &sst)?);
-        let table = crate::table::Table::recover(
+        let table = crate::table::Table::recover(crate::table::RecoverParams::new(
             sst.clone(),
             checksum,
-            0,
-            0,
             7,
-            Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
-            None,
             Arc::clone(&fs),
-            false,
-            false,
-            None,
-            #[cfg(zstd_any)]
-            None,
             crate::comparator::default_comparator(),
-            #[cfg(feature = "metrics")]
-            Arc::new(crate::Metrics::default()),
-        )?;
+            Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+        ))?;
         let offsets: alloc::vec::Vec<u64> = table
             .data_block_handles()
             .filter_map(Result::ok)

@@ -2384,24 +2384,16 @@ fn open_with_id(
     table_id: crate::TableId,
 ) -> crate::Result<Table> {
     let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&**fs, &path)?);
-    Table::recover(
+    let mut params = crate::table::RecoverParams::new(
         path,
         checksum,
-        0,
-        0,
         table_id,
-        Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
-        Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8))),
         Arc::clone(fs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
         default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::new(crate::Metrics::default()),
-    )
+        Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+    );
+    params.descriptor_table = Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8)));
+    Table::recover(params)
 }
 
 /// As [`open`] but threads an encryption provider so a keyed SST recovers.
@@ -2412,24 +2404,17 @@ fn open_encrypted(
     encryption: Arc<dyn crate::encryption::EncryptionProvider>,
 ) -> crate::Result<Table> {
     let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&**fs, &path)?);
-    Table::recover(
+    let mut params = crate::table::RecoverParams::new(
         path,
         checksum,
         0,
-        0,
-        0,
-        Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
-        Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8))),
         Arc::clone(fs),
-        false,
-        false,
-        Some(encryption),
-        #[cfg(zstd_any)]
-        None,
         default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::new(crate::Metrics::default()),
-    )
+        Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+    );
+    params.descriptor_table = Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8)));
+    params.encryption = Some(encryption);
+    Table::recover(params)
 }
 
 /// A reopen of a salvaged SST: recover it and return its live item count.
@@ -6947,26 +6932,25 @@ fn corrupt_second_data_block(
     #[cfg(zstd_any)] zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
 ) -> crate::Result<()> {
     let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&**fs, source)?);
-    let table = Table::recover(
-        source.to_path_buf(),
-        checksum,
-        0,
-        0,
+    let table = {
         // Open under the source's table id so an encrypted index (AAD binds the
         // id) decrypts when reading the block offsets.
-        table_id,
-        Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
-        Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8))),
-        Arc::clone(fs),
-        false,
-        false,
-        encryption,
+        let mut params = crate::table::RecoverParams::new(
+            source.to_path_buf(),
+            checksum,
+            table_id,
+            Arc::clone(fs),
+            default_comparator(),
+            Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+        );
+        params.descriptor_table = Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8)));
+        params.encryption = encryption;
         #[cfg(zstd_any)]
-        zstd_dictionary,
-        default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::new(crate::Metrics::default()),
-    )?;
+        {
+            params.zstd_dictionary = zstd_dictionary;
+        }
+        Table::recover(params)?
+    };
     let offsets: alloc::vec::Vec<u64> = table
         .data_block_handles()
         .filter_map(Result::ok)
@@ -7054,24 +7038,19 @@ fn salvage_recovers_an_encrypted_sst_with_the_provider() -> crate::Result<()> {
     // The salvaged copy reopens UNDER ENCRYPTION (a plaintext copy would fail the
     // encrypted reopen) and holds exactly the recovered entries.
     let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &dest)?);
-    let reopened = Table::recover(
-        dest,
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
-        Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8))),
-        Arc::clone(&fs),
-        false,
-        false,
-        Some(Arc::clone(&enc)),
-        #[cfg(zstd_any)]
-        None,
-        default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::new(crate::Metrics::default()),
-    )?;
+    let reopened = {
+        let mut params = crate::table::RecoverParams::new(
+            dest,
+            checksum,
+            0,
+            Arc::clone(&fs),
+            default_comparator(),
+            Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+        );
+        params.descriptor_table = Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8)));
+        params.encryption = Some(Arc::clone(&enc));
+        Table::recover(params)?
+    };
     assert_eq!(
         reopened.metadata.item_count, report.entries_salvaged,
         "the encrypted salvaged copy reopens with exactly the recovered entries",
@@ -7150,23 +7129,19 @@ fn salvage_recovers_a_dictionary_sst_with_the_dictionary() -> crate::Result<()> 
 
     // The salvaged copy reopens UNDER THE DICTIONARY with the recovered entries.
     let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &dest)?);
-    let reopened = Table::recover(
-        dest,
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
-        Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8))),
-        Arc::clone(&fs),
-        false,
-        false,
-        None,
-        Some(Arc::clone(&dict)),
-        default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::new(crate::Metrics::default()),
-    )?;
+    let reopened = {
+        let mut params = crate::table::RecoverParams::new(
+            dest,
+            checksum,
+            0,
+            Arc::clone(&fs),
+            default_comparator(),
+            Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+        );
+        params.descriptor_table = Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8)));
+        params.zstd_dictionary = Some(Arc::clone(&dict));
+        Table::recover(params)?
+    };
     assert_eq!(
         reopened.metadata.item_count, report.entries_salvaged,
         "the dictionary salvaged copy reopens with exactly the recovered entries",
@@ -7261,24 +7236,19 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
 
     // The recovered copy reopens under the same table id + encryption.
     let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &dest)?);
-    let reopened = Table::recover(
-        dest,
-        checksum,
-        0,
-        0,
-        TID,
-        Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
-        Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8))),
-        Arc::clone(&fs),
-        false,
-        false,
-        Some(Arc::clone(&enc)),
-        #[cfg(zstd_any)]
-        None,
-        default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::new(crate::Metrics::default()),
-    )?;
+    let reopened = {
+        let mut params = crate::table::RecoverParams::new(
+            dest,
+            checksum,
+            TID,
+            Arc::clone(&fs),
+            default_comparator(),
+            Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+        );
+        params.descriptor_table = Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8)));
+        params.encryption = Some(Arc::clone(&enc));
+        Table::recover(params)?
+    };
     assert_eq!(
         reopened.metadata.item_count, report.entries_salvaged,
         "the recovered copy reopens under the same table id with the recovered entries",

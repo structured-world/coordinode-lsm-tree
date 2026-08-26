@@ -704,24 +704,32 @@ impl StandardCompaction {
             .finish()?
             .into_iter()
             .map(|(table_id, checksum)| -> crate::Result<Table> {
-                Table::recover(
+                let mut params = crate::table::RecoverParams::new(
                     table_base_folder.join(table_id.to_string()),
                     checksum,
-                    0,
-                    opts.tree_id,
                     table_id,
-                    opts.config.cache.clone(),
-                    opts.config.descriptor_table.clone(),
                     level_fs.clone(),
-                    pin_filter,
-                    pin_index,
-                    opts.config.encryption.clone(),
-                    #[cfg(zstd_any)]
-                    opts.config.zstd_dictionary.clone(),
                     opts.config.comparator.clone(),
-                    #[cfg(feature = "metrics")]
-                    opts.metrics.clone(),
-                )
+                    opts.config.cache.clone(),
+                );
+                params.tree_id = opts.tree_id;
+                params
+                    .descriptor_table
+                    .clone_from(&opts.config.descriptor_table);
+                params.pin_filter = pin_filter;
+                params.pin_index = pin_index;
+                params.encryption.clone_from(&opts.config.encryption);
+                #[cfg(zstd_any)]
+                {
+                    params
+                        .zstd_dictionary
+                        .clone_from(&opts.config.zstd_dictionary);
+                }
+                #[cfg(feature = "metrics")]
+                {
+                    params.metrics = opts.metrics.clone();
+                }
+                Table::recover(params)
             })
             .collect::<crate::Result<Vec<_>>>()
     }

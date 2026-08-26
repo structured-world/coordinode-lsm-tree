@@ -14,6 +14,23 @@ use crate::{config::BloomConstructionPolicy, fs::StdFs, hash::hash64};
 use tempfile::tempdir;
 use test_log::test;
 
+/// Recover params for the common test shape: table id 0, `StdFs`, the default
+/// comparator, a small cache, and a pooled descriptor table. Tests tweak the
+/// returned params for whatever they exercise (pinning, encryption, a custom
+/// fs or dictionary).
+fn test_recover_params(file_path: PathBuf, checksum: Checksum) -> RecoverParams {
+    let mut params = RecoverParams::new(
+        file_path,
+        checksum,
+        0,
+        Arc::new(StdFs),
+        crate::comparator::default_comparator(),
+        Arc::new(Cache::with_capacity_bytes(1_000_000)),
+    );
+    params.descriptor_table = Some(Arc::new(DescriptorTable::new(10)));
+    params
+}
+
 fn test_with_table(
     items: &[InternalValue],
     f: impl Fn(Table) -> crate::Result<()>,
@@ -72,24 +89,19 @@ fn test_with_table_impl(
             #[cfg(feature = "metrics")]
             let metrics = Arc::new(Metrics::default());
 
-            let table = Table::recover(
-                file.clone(),
-                checksum,
-                0,
-                0,
-                0,
-                Arc::new(Cache::with_capacity_bytes(1_000_000)),
-                Some(Arc::new(DescriptorTable::new(10))),
-                Arc::new(StdFs),
-                false,
-                false,
-                None,
+            let table = {
+                #[cfg_attr(not(zstd_any), expect(unused_mut))]
+                let mut params = test_recover_params(file.clone(), checksum);
                 #[cfg(zstd_any)]
-                zstd_dictionary.clone(),
-                crate::comparator::default_comparator(),
+                {
+                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                }
                 #[cfg(feature = "metrics")]
-                metrics,
-            )?;
+                {
+                    params.metrics = metrics;
+                }
+                Table::recover(params)?
+            };
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
@@ -108,24 +120,19 @@ fn test_with_table_impl(
             #[cfg(feature = "metrics")]
             let metrics = Arc::new(Metrics::default());
 
-            let table = Table::recover(
-                file.clone(),
-                checksum,
-                0,
-                0,
-                0,
-                Arc::new(Cache::with_capacity_bytes(1_000_000)),
-                Some(Arc::new(DescriptorTable::new(10))),
-                Arc::new(StdFs),
-                true,
-                false,
-                None,
+            let table = {
+                let mut params = test_recover_params(file.clone(), checksum);
+                params.pin_filter = true;
                 #[cfg(zstd_any)]
-                zstd_dictionary.clone(),
-                crate::comparator::default_comparator(),
+                {
+                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                }
                 #[cfg(feature = "metrics")]
-                metrics,
-            )?;
+                {
+                    params.metrics = metrics;
+                }
+                Table::recover(params)?
+            };
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
@@ -144,24 +151,19 @@ fn test_with_table_impl(
             #[cfg(feature = "metrics")]
             let metrics = Arc::new(Metrics::default());
 
-            let table = Table::recover(
-                file.clone(),
-                checksum,
-                0,
-                0,
-                0,
-                Arc::new(Cache::with_capacity_bytes(1_000_000)),
-                Some(Arc::new(DescriptorTable::new(10))),
-                Arc::new(StdFs),
-                false,
-                true,
-                None,
+            let table = {
+                let mut params = test_recover_params(file.clone(), checksum);
+                params.pin_index = true;
                 #[cfg(zstd_any)]
-                zstd_dictionary.clone(),
-                crate::comparator::default_comparator(),
+                {
+                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                }
                 #[cfg(feature = "metrics")]
-                metrics,
-            )?;
+                {
+                    params.metrics = metrics;
+                }
+                Table::recover(params)?
+            };
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
@@ -180,24 +182,20 @@ fn test_with_table_impl(
             #[cfg(feature = "metrics")]
             let metrics = Arc::new(Metrics::default());
 
-            let table = Table::recover(
-                file.clone(),
-                checksum,
-                0,
-                0,
-                0,
-                Arc::new(Cache::with_capacity_bytes(1_000_000)),
-                Some(Arc::new(DescriptorTable::new(10))),
-                Arc::new(StdFs),
-                true,
-                true,
-                None,
+            let table = {
+                let mut params = test_recover_params(file.clone(), checksum);
+                params.pin_filter = true;
+                params.pin_index = true;
                 #[cfg(zstd_any)]
-                zstd_dictionary.clone(),
-                crate::comparator::default_comparator(),
+                {
+                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                }
                 #[cfg(feature = "metrics")]
-                metrics,
-            )?;
+                {
+                    params.metrics = metrics;
+                }
+                Table::recover(params)?
+            };
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
@@ -216,24 +214,21 @@ fn test_with_table_impl(
             #[cfg(feature = "metrics")]
             let metrics = Arc::new(Metrics::default());
 
-            let table = Table::recover(
-                file.clone(),
-                checksum,
-                0,
-                0,
-                0,
-                Arc::new(Cache::with_capacity_bytes(1_000_000)),
-                None,
-                Arc::new(StdFs),
-                true,
-                true,
-                None,
+            let table = {
+                let mut params = test_recover_params(file.clone(), checksum);
+                params.descriptor_table = None;
+                params.pin_filter = true;
+                params.pin_index = true;
                 #[cfg(zstd_any)]
-                zstd_dictionary.clone(),
-                crate::comparator::default_comparator(),
+                {
+                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                }
                 #[cfg(feature = "metrics")]
-                metrics,
-            )?;
+                {
+                    params.metrics = metrics;
+                }
+                Table::recover(params)?
+            };
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
@@ -275,24 +270,19 @@ fn test_with_table_impl(
             #[cfg(feature = "metrics")]
             let metrics = Arc::new(Metrics::default());
 
-            let table = Table::recover(
-                file.clone(),
-                checksum,
-                0,
-                0,
-                0,
-                Arc::new(Cache::with_capacity_bytes(1_000_000)),
-                Some(Arc::new(DescriptorTable::new(10))),
-                Arc::new(StdFs),
-                false,
-                false,
-                None,
+            let table = {
+                #[cfg_attr(not(zstd_any), expect(unused_mut))]
+                let mut params = test_recover_params(file.clone(), checksum);
                 #[cfg(zstd_any)]
-                zstd_dictionary.clone(),
-                crate::comparator::default_comparator(),
+                {
+                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                }
                 #[cfg(feature = "metrics")]
-                metrics,
-            )?;
+                {
+                    params.metrics = metrics;
+                }
+                Table::recover(params)?
+            };
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
@@ -310,24 +300,19 @@ fn test_with_table_impl(
             #[cfg(feature = "metrics")]
             let metrics = Arc::new(Metrics::default());
 
-            let table = Table::recover(
-                file.clone(),
-                checksum,
-                0,
-                0,
-                0,
-                Arc::new(Cache::with_capacity_bytes(1_000_000)),
-                Some(Arc::new(DescriptorTable::new(10))),
-                Arc::new(StdFs),
-                true,
-                false,
-                None,
+            let table = {
+                let mut params = test_recover_params(file.clone(), checksum);
+                params.pin_filter = true;
                 #[cfg(zstd_any)]
-                zstd_dictionary.clone(),
-                crate::comparator::default_comparator(),
+                {
+                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                }
                 #[cfg(feature = "metrics")]
-                metrics,
-            )?;
+                {
+                    params.metrics = metrics;
+                }
+                Table::recover(params)?
+            };
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
@@ -345,24 +330,19 @@ fn test_with_table_impl(
             #[cfg(feature = "metrics")]
             let metrics = Arc::new(Metrics::default());
 
-            let table = Table::recover(
-                file.clone(),
-                checksum,
-                0,
-                0,
-                0,
-                Arc::new(Cache::with_capacity_bytes(1_000_000)),
-                Some(Arc::new(DescriptorTable::new(10))),
-                Arc::new(StdFs),
-                false,
-                true,
-                None,
+            let table = {
+                let mut params = test_recover_params(file.clone(), checksum);
+                params.pin_index = true;
                 #[cfg(zstd_any)]
-                zstd_dictionary.clone(),
-                crate::comparator::default_comparator(),
+                {
+                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                }
                 #[cfg(feature = "metrics")]
-                metrics,
-            )?;
+                {
+                    params.metrics = metrics;
+                }
+                Table::recover(params)?
+            };
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
@@ -381,24 +361,20 @@ fn test_with_table_impl(
             #[cfg(feature = "metrics")]
             let metrics = Arc::new(Metrics::default());
 
-            let table = Table::recover(
-                file.clone(),
-                checksum,
-                0,
-                0,
-                0,
-                Arc::new(Cache::with_capacity_bytes(1_000_000)),
-                Some(Arc::new(DescriptorTable::new(10))),
-                Arc::new(StdFs),
-                true,
-                true,
-                None,
+            let table = {
+                let mut params = test_recover_params(file.clone(), checksum);
+                params.pin_filter = true;
+                params.pin_index = true;
                 #[cfg(zstd_any)]
-                zstd_dictionary.clone(),
-                crate::comparator::default_comparator(),
+                {
+                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                }
                 #[cfg(feature = "metrics")]
-                metrics,
-            )?;
+                {
+                    params.metrics = metrics;
+                }
+                Table::recover(params)?
+            };
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
@@ -417,24 +393,21 @@ fn test_with_table_impl(
             #[cfg(feature = "metrics")]
             let metrics = Arc::new(Metrics::default());
 
-            let table = Table::recover(
-                file,
-                checksum,
-                0,
-                0,
-                0,
-                Arc::new(Cache::with_capacity_bytes(1_000_000)),
-                None,
-                Arc::new(StdFs),
-                true,
-                true,
-                None,
+            let table = {
+                let mut params = test_recover_params(file, checksum);
+                params.descriptor_table = None;
+                params.pin_filter = true;
+                params.pin_index = true;
                 #[cfg(zstd_any)]
-                zstd_dictionary,
-                crate::comparator::default_comparator(),
+                {
+                    params.zstd_dictionary = zstd_dictionary;
+                }
                 #[cfg(feature = "metrics")]
-                metrics,
-            )?;
+                {
+                    params.metrics = metrics;
+                }
+                Table::recover(params)?
+            };
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
@@ -517,24 +490,15 @@ fn block_layout_section_roundtrips_for_large_zstd_blocks() {
 
     #[cfg(feature = "metrics")]
     let metrics = Arc::new(Metrics::default());
-    let table = Table::recover(
-        file,
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(4_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        false,
-        false,
-        None,
-        None,
-        crate::comparator::default_comparator(),
+    let table = {
+        let mut params = test_recover_params(file, checksum);
+        params.cache = Arc::new(Cache::with_capacity_bytes(4_000_000));
         #[cfg(feature = "metrics")]
-        metrics,
-    )
-    .unwrap();
+        {
+            params.metrics = metrics;
+        }
+        Table::recover(params).unwrap()
+    };
 
     assert!(
         table.regions.block_layout.is_some(),
@@ -576,24 +540,15 @@ fn block_layout_section_roundtrips_for_large_zstd_blocks() {
 
     #[cfg(feature = "metrics")]
     let small_metrics = Arc::new(Metrics::default());
-    let small_table = Table::recover(
-        small_file,
-        small_checksum,
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(4_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        false,
-        false,
-        None,
-        None,
-        crate::comparator::default_comparator(),
+    let small_table = {
+        let mut params = test_recover_params(small_file, small_checksum);
+        params.cache = Arc::new(Cache::with_capacity_bytes(4_000_000));
         #[cfg(feature = "metrics")]
-        small_metrics,
-    )
-    .unwrap();
+        {
+            params.metrics = small_metrics;
+        }
+        Table::recover(params).unwrap()
+    };
 
     assert!(
         small_table.regions.block_layout.is_none(),
@@ -792,24 +747,11 @@ fn metadata_bounds_accept_a_legacy_bitmap_when_digest_authenticated() -> crate::
     writer.delete_bitmap_mut().insert(3);
     assert!(writer.finish()?.is_some(), "legacy SST is non-empty");
 
-    let table = Table::recover(
-        file,
-        crate::Checksum::from_raw(0),
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(1_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::clone(&fs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        Default::default(),
-    )?;
+    let table = {
+        let mut params = test_recover_params(file, crate::Checksum::from_raw(0));
+        params.fs = Arc::clone(&fs);
+        Table::recover(params)?
+    };
     assert!(
         table.verify_metadata_bounds(false).is_err(),
         "repair (no matching digest) keeps failing closed on the \
@@ -926,7 +868,7 @@ fn restricted_view_clamps_visible_range_tombstones() -> crate::Result<()> {
 #[test]
 fn verify_blob_links_rejects_an_undercounted_suffix_id_on_a_restricted_view() -> crate::Result<()> {
     use crate::blob_tree::handle::BlobIndirection;
-    use crate::cache::Cache;
+
     use crate::coding::Encode;
     use crate::table::Writer;
     use crate::vlog::ValueHandle;
@@ -964,26 +906,8 @@ fn verify_blob_links_rejects_an_undercounted_suffix_id_on_a_restricted_view() ->
         w.finish()?.expect("the SST is non-empty").1
     };
 
-    let recover = || -> crate::Result<Table> {
-        Table::recover(
-            file.clone(),
-            checksum,
-            0,
-            0,
-            0,
-            Arc::new(Cache::with_capacity_bytes(1_000_000)),
-            Some(Arc::new(DescriptorTable::new(10))),
-            Arc::new(StdFs),
-            false,
-            false,
-            None,
-            #[cfg(zstd_any)]
-            None,
-            crate::comparator::default_comparator(),
-            #[cfg(feature = "metrics")]
-            Arc::new(crate::metrics::Metrics::default()),
-        )
-    };
+    let recover =
+        || -> crate::Result<Table> { Table::recover(test_recover_params(file.clone(), checksum)) };
 
     // Baseline: the unrestricted exact check already rejects the bad section.
     assert!(
@@ -1088,24 +1012,14 @@ fn punch_on_drop_refuses_a_hard_linked_table() -> crate::Result<()> {
     let recover = |fs: &Arc<dyn Fs>, path: &std::path::Path, checksum| -> crate::Result<Table> {
         #[cfg(feature = "metrics")]
         let metrics = Arc::new(Metrics::default());
-        Table::recover(
-            path.to_path_buf(),
-            checksum,
-            0,
-            0,
-            0,
-            Arc::new(Cache::with_capacity_bytes(1_000_000)),
-            None,
-            Arc::clone(fs),
-            false,
-            false,
-            None,
-            #[cfg(zstd_any)]
-            None,
-            crate::comparator::default_comparator(),
-            #[cfg(feature = "metrics")]
-            metrics,
-        )
+        let mut params = test_recover_params(path.to_path_buf(), checksum);
+        params.descriptor_table = None;
+        params.fs = Arc::clone(fs);
+        #[cfg(feature = "metrics")]
+        {
+            params.metrics = metrics;
+        }
+        Table::recover(params)
     };
     let read_all = |fs: &Arc<dyn Fs>, path: &std::path::Path| -> crate::Result<Vec<u8>> {
         let file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
@@ -1493,24 +1407,15 @@ fn recover_adaptive_table(
 
     #[cfg(feature = "metrics")]
     let metrics = Arc::new(Metrics::default());
-    let table = Table::recover(
-        path,
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(1_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
+    let table = {
+        #[cfg_attr(not(feature = "metrics"), expect(unused_mut))]
+        let mut params = test_recover_params(path, checksum);
         #[cfg(feature = "metrics")]
-        metrics,
-    )?;
+        {
+            params.metrics = metrics;
+        }
+        Table::recover(params)?
+    };
     Ok((table, dir))
 }
 
@@ -2114,24 +2019,12 @@ fn plan_block_tasks_propagates_a_faulted_bloom_probe() -> crate::Result<()> {
         writer.finish()?.unwrap().1
     };
 
-    let table = Table::recover(
-        file,
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(1_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::clone(&fs),
-        false, // do not pin index
-        false, // do not pin filter: partition blocks read lazily
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::new(Metrics::default()),
-    )?;
+    let table = {
+        let mut params = test_recover_params(file, checksum);
+        // Do not pin: partition blocks read lazily.
+        params.fs = Arc::clone(&fs);
+        Table::recover(params)?
+    };
 
     // Recovery is done (its reads passed cleanly); now fail the NEXT positional
     // read of the table file: the filter partition block `check_bloom` loads.
@@ -2185,24 +2078,14 @@ fn plan_block_tasks_propagates_a_faulted_index_read() -> crate::Result<()> {
         writer.finish()?.unwrap().1
     };
 
-    let table = Table::recover(
-        file,
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(1_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::clone(&fs),
-        true,  // pin filter: keep check_bloom off disk
-        false, // do not pin index: partition blocks read lazily
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::new(Metrics::default()),
-    )?;
+    let table = {
+        let mut params = test_recover_params(file, checksum);
+        params.fs = Arc::clone(&fs);
+        // Pin the filter (keeps check_bloom off disk) but not the index:
+        // partition blocks read lazily.
+        params.pin_filter = true;
+        Table::recover(params)?
+    };
 
     // Recovery is done; fail the next positional read of the table file, which
     // the block-index walk performs.
@@ -2254,24 +2137,11 @@ fn plan_block_tasks_returns_none_for_a_table_above_the_snapshot() -> crate::Resu
         writer.finish()?.unwrap().1
     };
 
-    let table = Table::recover(
-        file,
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(1_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::clone(&fs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::new(Metrics::default()),
-    )?;
+    let table = {
+        let mut params = test_recover_params(file, checksum);
+        params.fs = Arc::clone(&fs);
+        Table::recover(params)?
+    };
 
     // Recovery is done; fail ANY further positional read of the table file. The
     // above-snapshot guard must short-circuit before any bloom or index read, so
@@ -2704,23 +2574,13 @@ fn table_read_fuzz_1() -> crate::Result<()> {
 
     let _trailer = writer.finish().unwrap();
 
-    let table = crate::Table::recover(
-        file,
-        crate::Checksum::from_raw(0),
-        0,
-        0,
-        0,
-        Arc::new(crate::Cache::with_capacity_bytes(0)),
-        Some(Arc::new(crate::DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        true,
-        true,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-    )
-    .unwrap();
+    let table = {
+        let mut params = test_recover_params(file, crate::Checksum::from_raw(0));
+        params.cache = Arc::new(crate::Cache::with_capacity_bytes(0));
+        params.pin_filter = true;
+        params.pin_index = true;
+        crate::Table::recover(params).unwrap()
+    };
 
     let item_count_usize = table.metadata.item_count as usize;
     assert_eq!(item_count_usize, items.len());
@@ -2784,25 +2644,13 @@ fn table_partitioned_index() -> crate::Result<()> {
 
     let _trailer = writer.finish().unwrap();
 
-    let table = crate::Table::recover(
-        file,
-        crate::Checksum::from_raw(0),
-        0,
-        0,
-        0,
-        Arc::new(crate::Cache::with_capacity_bytes(0)),
-        Some(Arc::new(crate::DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        true,
-        true,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::default(),
-    )
-    .unwrap();
+    let table = {
+        let mut params = test_recover_params(file, crate::Checksum::from_raw(0));
+        params.cache = Arc::new(crate::Cache::with_capacity_bytes(0));
+        params.pin_filter = true;
+        params.pin_index = true;
+        crate::Table::recover(params).unwrap()
+    };
 
     assert!(
         table.regions.index.is_some(),
@@ -2852,25 +2700,14 @@ fn table_global_seqno() -> crate::Result<()> {
 
     let _trailer = writer.finish().unwrap();
 
-    let table = crate::Table::recover(
-        file,
-        crate::Checksum::from_raw(0),
-        7,
-        0,
-        0,
-        Arc::new(crate::Cache::with_capacity_bytes(0)),
-        Some(Arc::new(crate::DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        true,
-        true,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::default(),
-    )
-    .unwrap();
+    let table = {
+        let mut params = test_recover_params(file, crate::Checksum::from_raw(0));
+        params.global_seqno = 7;
+        params.cache = Arc::new(crate::Cache::with_capacity_bytes(0));
+        params.pin_filter = true;
+        params.pin_index = true;
+        crate::Table::recover(params).unwrap()
+    };
 
     // global seqno is 7, so a1 is = 8 -> can not be read by snapshot=8
     assert!(table.get(b"a1", 8, hash64(b"a1"))?.is_none());
@@ -2916,24 +2753,14 @@ fn table_return_global_seqno() -> crate::Result<()> {
 
     let _trailer = writer.finish()?;
 
-    let table = crate::Table::recover(
-        file,
-        crate::Checksum::from_raw(0),
-        SEQNO,
-        0,
-        0,
-        Arc::new(crate::Cache::with_capacity_bytes(0)),
-        Some(Arc::new(crate::DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        true,
-        true,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::default(),
-    )?;
+    let table = {
+        let mut params = test_recover_params(file, crate::Checksum::from_raw(0));
+        params.global_seqno = SEQNO;
+        params.cache = Arc::new(crate::Cache::with_capacity_bytes(0));
+        params.pin_filter = true;
+        params.pin_index = true;
+        crate::Table::recover(params)?
+    };
 
     // On disk: seqno = 0. Effective global seqno: 0 + SEQNO = SEQNO.
     // Snapshot = 2 * SEQNO is above the effective seqno, so the read sees the item.
@@ -3086,7 +2913,6 @@ fn load_block_range_tombstone_metrics() -> crate::Result<()> {
     use crate::{
         CompressionType,
         cache::Cache,
-        descriptor_table::DescriptorTable,
         range_tombstone::RangeTombstone,
         table::{block::BlockType, util::load_block},
     };
@@ -3118,27 +2944,18 @@ fn load_block_range_tombstone_metrics() -> crate::Result<()> {
 
     let metrics = Arc::new(crate::metrics::Metrics::default());
 
-    let table = Table::recover(
-        file,
-        checksum,
-        0,
-        0,
-        0,
+    let table = {
         // Recovery bypasses load_block() (reads via Block::from_file() directly),
         // so it intentionally does NOT increment block-load metrics — consistent
         // with how filter and index recovery reads are handled.
-        Arc::new(Cache::with_capacity_bytes(10_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
+        let mut params = test_recover_params(file, checksum);
+        params.cache = Arc::new(Cache::with_capacity_bytes(10_000_000));
         #[cfg(feature = "metrics")]
-        metrics.clone(),
-    )?;
+        {
+            params.metrics = metrics.clone();
+        }
+        Table::recover(params)?
+    };
 
     let rt_handle = table
         .regions
@@ -3212,7 +3029,6 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
     use crate::{
         CompressionType,
         cache::Cache,
-        descriptor_table::DescriptorTable,
         table::{block::BlockType, util::load_block},
     };
 
@@ -3234,24 +3050,15 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
     #[cfg(feature = "metrics")]
     let metrics = Arc::new(crate::metrics::Metrics::default());
 
-    let table = Table::recover(
-        file,
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(10_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
+    let table = {
+        let mut params = test_recover_params(file, checksum);
+        params.cache = Arc::new(Cache::with_capacity_bytes(10_000_000));
         #[cfg(feature = "metrics")]
-        metrics.clone(),
-    )?;
+        {
+            params.metrics = metrics.clone();
+        }
+        Table::recover(params)?
+    };
 
     let table_id = table.global_id();
 
@@ -3314,7 +3121,6 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
 fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<()> {
     use crate::{
         Cache, InternalValue,
-        descriptor_table::DescriptorTable,
         fs::StdFs,
         heal_hints::HealHints,
         table::{
@@ -3347,24 +3153,15 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
 
     #[cfg(feature = "metrics")]
     let metrics = Arc::new(crate::metrics::Metrics::default());
-    let table = Table::recover(
-        file.clone(),
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(10_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
+    let table = {
+        let mut params = test_recover_params(file.clone(), checksum);
+        params.cache = Arc::new(Cache::with_capacity_bytes(10_000_000));
         #[cfg(feature = "metrics")]
-        metrics.clone(),
-    )?;
+        {
+            params.metrics = metrics.clone();
+        }
+        Table::recover(params)?
+    };
 
     let table_id = table.global_id();
     let compression = table.metadata.data_block_compression;
@@ -3524,25 +3321,10 @@ fn recover_table_on(
     checksum: crate::Checksum,
     fs: Arc<dyn crate::fs::Fs>,
 ) -> Table {
-    Table::recover(
-        file.to_path_buf(),
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(crate::Cache::with_capacity_bytes(10_000_000)),
-        Some(Arc::new(crate::descriptor_table::DescriptorTable::new(10))),
-        fs,
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::new(crate::metrics::Metrics::default()),
-    )
-    .expect("recover table")
+    let mut params = test_recover_params(file.to_path_buf(), checksum);
+    params.cache = Arc::new(crate::Cache::with_capacity_bytes(10_000_000));
+    params.fs = fs;
+    Table::recover(params).expect("recover table")
 }
 
 /// The first data block's file offset in `table`.
@@ -4296,24 +4078,12 @@ fn two_level_index_scan_skips_empty_child_partition() -> crate::Result<()> {
     }
     writer.finish()?;
 
-    let table = crate::Table::recover(
-        file,
-        crate::Checksum::from_raw(0),
-        0,
-        0,
-        0,
-        Arc::new(crate::Cache::with_capacity_bytes(0)),
-        Some(Arc::new(crate::DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        true,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::default(),
-    )?;
+    let table = {
+        let mut params = test_recover_params(file, crate::Checksum::from_raw(0));
+        params.cache = Arc::new(crate::Cache::with_capacity_bytes(0));
+        params.pin_filter = true;
+        crate::Table::recover(params)?
+    };
 
     assert!(
         table.regions.index.is_some(),
@@ -4744,24 +4514,15 @@ fn build_and_recover(
 
     #[cfg(feature = "metrics")]
     let metrics = Arc::new(Metrics::default());
-    let table = Table::recover(
-        path,
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(1_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
+    let table = {
+        #[cfg_attr(not(feature = "metrics"), expect(unused_mut))]
+        let mut params = test_recover_params(path, checksum);
         #[cfg(feature = "metrics")]
-        metrics,
-    )?;
+        {
+            params.metrics = metrics;
+        }
+        Table::recover(params)?
+    };
     Ok((table, dir))
 }
 
@@ -4895,24 +4656,13 @@ fn zone_map_corrupt_section_falls_back_instead_of_failing_open() -> crate::Resul
     let recover = || -> crate::Result<Table> {
         #[cfg(feature = "metrics")]
         let metrics = Arc::new(Metrics::default());
-        Table::recover(
-            file.clone(),
-            checksum,
-            0,
-            0,
-            0,
-            Arc::new(Cache::with_capacity_bytes(1_000_000)),
-            Some(Arc::new(DescriptorTable::new(10))),
-            Arc::new(StdFs),
-            false,
-            false,
-            None,
-            #[cfg(zstd_any)]
-            None,
-            crate::comparator::default_comparator(),
-            #[cfg(feature = "metrics")]
-            metrics,
-        )
+        #[cfg_attr(not(feature = "metrics"), expect(unused_mut))]
+        let mut params = test_recover_params(file.clone(), checksum);
+        #[cfg(feature = "metrics")]
+        {
+            params.metrics = metrics;
+        }
+        Table::recover(params)
     };
 
     // First open: the zone-map section is present and populated.
@@ -4986,24 +4736,13 @@ fn recover_test_table_with_id(
 ) -> crate::Result<Table> {
     #[cfg(feature = "metrics")]
     let metrics = Arc::new(Metrics::default());
-    Table::recover(
-        file.to_path_buf(),
-        checksum,
-        0,
-        0,
-        table_id,
-        Arc::new(Cache::with_capacity_bytes(1_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        metrics,
-    )
+    let mut params = test_recover_params(file.to_path_buf(), checksum);
+    params.table_id = table_id;
+    #[cfg(feature = "metrics")]
+    {
+        params.metrics = metrics;
+    }
+    Table::recover(params)
 }
 
 /// A retired table reclaims its `.restrict-bound` sidecar on drop, so a
@@ -5358,24 +5097,14 @@ fn unshare_for_heal_preserves_unpunched_blocks_of_a_restricted_table() -> crate:
         let (_, checksum) = writer.finish()?.expect("table written");
         #[cfg(feature = "metrics")]
         let metrics = Arc::new(Metrics::default());
-        Table::recover(
-            path,
-            checksum,
-            0,
-            0,
-            0,
-            Arc::new(Cache::with_capacity_bytes(1_000_000)),
-            None,
-            Arc::clone(&fs),
-            false,
-            false,
-            None,
-            #[cfg(zstd_any)]
-            None,
-            crate::comparator::default_comparator(),
-            #[cfg(feature = "metrics")]
-            metrics,
-        )
+        let mut params = test_recover_params(path, checksum);
+        params.descriptor_table = None;
+        params.fs = Arc::clone(&fs);
+        #[cfg(feature = "metrics")]
+        {
+            params.metrics = metrics;
+        }
+        Table::recover(params)
     };
 
     let all_zero = |path: &std::path::Path, off: u64, len: usize| -> crate::Result<bool> {
@@ -5961,24 +5690,11 @@ fn recover_salvage_propagates_a_transient_locator_read() -> crate::Result<()> {
     // Resolve the locator section's byte offset from a clean (Live) open.
     let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &sst)?);
     let loc_offset = {
-        let live = Table::recover(
-            sst.clone(),
-            checksum,
-            0,
-            0,
-            0,
-            Arc::new(Cache::with_capacity_bytes(1 << 20)),
-            Some(Arc::new(DescriptorTable::new(8))),
-            Arc::clone(&fs),
-            false,
-            false,
-            None,
-            #[cfg(zstd_any)]
-            None,
-            crate::comparator::default_comparator(),
-            #[cfg(feature = "metrics")]
-            Arc::new(Metrics::default()),
-        )?;
+        let live = {
+            let mut params = test_recover_params(sst.clone(), checksum);
+            params.fs = Arc::clone(&fs);
+            Table::recover(params)?
+        };
         live.regions
             .locator
             .expect("the multi-block SST carries a locator section")
@@ -5997,28 +5713,17 @@ fn recover_salvage_propagates_a_transient_locator_read() -> crate::Result<()> {
     );
     let faulted: Arc<dyn crate::fs::Fs> = Arc::new(fault);
 
-    let result = Table::recover_inner(
-        sst,
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(1 << 20)),
-        Some(Arc::new(DescriptorTable::new(8))),
-        Arc::clone(&faulted),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::new(Metrics::default()),
-        RecoveryMode::Salvage {
-            expected_id: None,
-            prefer_mid_meta: false,
-        },
-    );
+    let result = {
+        let mut params = test_recover_params(sst, checksum);
+        params.fs = Arc::clone(&faulted);
+        Table::recover_inner(
+            params,
+            RecoveryMode::Salvage {
+                expected_id: None,
+                prefer_mid_meta: false,
+            },
+        )
+    };
     injector.clear();
 
     assert!(
@@ -6062,24 +5767,11 @@ fn recover_salvage_degrades_a_persistent_filter_index_read() -> crate::Result<()
     // from a clean (Live) open.
     let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &sst)?);
     let tli_offset = {
-        let live = Table::recover(
-            sst.clone(),
-            checksum,
-            0,
-            0,
-            0,
-            Arc::new(Cache::with_capacity_bytes(1 << 20)),
-            Some(Arc::new(DescriptorTable::new(8))),
-            Arc::clone(&fs),
-            false,
-            false,
-            None,
-            #[cfg(zstd_any)]
-            None,
-            crate::comparator::default_comparator(),
-            #[cfg(feature = "metrics")]
-            Arc::new(Metrics::default()),
-        )?;
+        let live = {
+            let mut params = test_recover_params(sst.clone(), checksum);
+            params.fs = Arc::clone(&fs);
+            Table::recover(params)?
+        };
         live.regions
             .filter_tli
             .expect("the partitioned-filter SST carries a filter_tli section")
@@ -6098,28 +5790,17 @@ fn recover_salvage_degrades_a_persistent_filter_index_read() -> crate::Result<()
     );
     let faulted: Arc<dyn crate::fs::Fs> = Arc::new(fault);
 
-    let result = Table::recover_inner(
-        sst,
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(1 << 20)),
-        Some(Arc::new(DescriptorTable::new(8))),
-        Arc::clone(&faulted),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::new(Metrics::default()),
-        RecoveryMode::Salvage {
-            expected_id: None,
-            prefer_mid_meta: false,
-        },
-    );
+    let result = {
+        let mut params = test_recover_params(sst, checksum);
+        params.fs = Arc::clone(&faulted);
+        Table::recover_inner(
+            params,
+            RecoveryMode::Salvage {
+                expected_id: None,
+                prefer_mid_meta: false,
+            },
+        )
+    };
     injector.clear();
 
     let recovered = match result {

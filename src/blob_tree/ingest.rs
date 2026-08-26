@@ -221,24 +221,31 @@ impl<'a> BlobIngestion<'a> {
         let created_tables = results
             .into_iter()
             .map(|(table_id, checksum)| -> crate::Result<Table> {
-                Table::recover(
+                let mut params = crate::table::RecoverParams::new(
                     table_folder.join(table_id.to_string()),
                     checksum,
-                    global_seqno,
-                    index.id,
                     table_id,
-                    index.config.cache.clone(),
-                    index.config.descriptor_table.clone(),
                     self.table.level_fs.clone(),
-                    false,
-                    false,
-                    index.config.encryption.clone(),
-                    #[cfg(zstd_any)]
-                    index.config.zstd_dictionary.clone(),
                     index.config.comparator.clone(),
-                    #[cfg(feature = "metrics")]
-                    index.metrics.clone(),
-                )
+                    index.config.cache.clone(),
+                );
+                params.global_seqno = global_seqno;
+                params.tree_id = index.id;
+                params
+                    .descriptor_table
+                    .clone_from(&index.config.descriptor_table);
+                params.encryption.clone_from(&index.config.encryption);
+                #[cfg(zstd_any)]
+                {
+                    params
+                        .zstd_dictionary
+                        .clone_from(&index.config.zstd_dictionary);
+                }
+                #[cfg(feature = "metrics")]
+                {
+                    params.metrics = index.metrics.clone();
+                }
+                Table::recover(params)
             })
             .collect::<crate::Result<Vec<_>>>()?;
 

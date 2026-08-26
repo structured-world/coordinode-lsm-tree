@@ -1404,25 +1404,16 @@ fn index_derived_frontier(
     // may live on any backend.
     let checksum =
         crate::Checksum::from_raw(crate::repair::compute_table_checksum_from(&**fs, path, 0).ok()?);
-    let table = crate::table::Table::recover(
+    let mut params = crate::table::RecoverParams::new(
         path.to_path_buf(),
         checksum,
-        0,
-        0,
         table_id.unwrap_or(0),
-        alloc::sync::Arc::new(crate::cache::Cache::with_capacity_bytes(1_000_000)),
-        None,
         alloc::sync::Arc::clone(fs),
-        false,
-        false,
-        encryption.map(alloc::sync::Arc::clone),
-        #[cfg(zstd_any)]
-        None,
         crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        alloc::sync::Arc::new(crate::metrics::Metrics::default()),
-    )
-    .ok()?;
+        alloc::sync::Arc::new(crate::cache::Cache::with_capacity_bytes(1_000_000)),
+    );
+    params.encryption = encryption.map(alloc::sync::Arc::clone);
+    let table = crate::table::Table::recover(params).ok()?;
     table.punch_offset_for(bound).ok()
 }
 

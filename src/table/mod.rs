@@ -126,6 +126,85 @@ pub(crate) enum RecoveryMode {
     },
 }
 
+/// Everything [`Table::recover`] needs, with the context a caller does not care
+/// about defaulted by [`RecoverParams::new`].
+///
+/// A params struct rather than positional arguments on purpose: the old
+/// signature carried three integers and two booleans in a row, so a transposed
+/// `tree_id`/`table_id` or `pin_filter`/`pin_index` compiled cleanly and
+/// surfaced only as misbehavior at runtime. Named fields make every call state
+/// what it passes.
+pub struct RecoverParams {
+    /// Where the SST lives.
+    pub file_path: PathBuf,
+    /// The table's whole-file checksum, from the manifest (or freshly computed
+    /// by a repair scan).
+    pub checksum: Checksum,
+    /// Bulk-ingest sequence offset from the manifest; `0` for a table whose
+    /// intrinsic seqnos are authoritative.
+    pub global_seqno: SeqNo,
+    /// Owning tree, keying shared caches; `0` for a transient open that must
+    /// not pollute them.
+    pub tree_id: TreeId,
+    /// The table's durable id (its file name / manifest entry).
+    pub table_id: TableId,
+    /// Block cache.
+    pub cache: Arc<Cache>,
+    /// Descriptor table for pooled file handles; `None` opens per read.
+    pub descriptor_table: Option<Arc<DescriptorTable>>,
+    /// Filesystem the file is reachable through.
+    pub fs: Arc<dyn Fs>,
+    /// Pin the filter blocks in memory on open.
+    pub pin_filter: bool,
+    /// Pin the index blocks in memory on open.
+    pub pin_index: bool,
+    /// At-rest encryption provider, matching how the table was written.
+    pub encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
+    /// zstd dictionary, matching how the table was written.
+    #[cfg(zstd_any)]
+    pub zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
+    /// The tree's key ordering.
+    pub comparator: SharedComparator,
+    /// Metrics sink.
+    #[cfg(feature = "metrics")]
+    pub metrics: Arc<Metrics>,
+}
+
+impl RecoverParams {
+    /// Params for recovering the table at `file_path`, with every contextual
+    /// field at its neutral default: no ingest offset, tree id `0` (a transient
+    /// open that must not pollute shared caches), no descriptor table, nothing
+    /// pinned, no encryption, no dictionary. Callers set what differs.
+    #[must_use]
+    pub fn new(
+        file_path: PathBuf,
+        checksum: Checksum,
+        table_id: TableId,
+        fs: Arc<dyn Fs>,
+        comparator: SharedComparator,
+        cache: Arc<Cache>,
+    ) -> Self {
+        Self {
+            file_path,
+            checksum,
+            global_seqno: 0,
+            tree_id: 0,
+            table_id,
+            cache,
+            descriptor_table: None,
+            fs,
+            pin_filter: false,
+            pin_index: false,
+            encryption: None,
+            #[cfg(zstd_any)]
+            zstd_dictionary: None,
+            comparator,
+            #[cfg(feature = "metrics")]
+            metrics: Arc::new(Metrics::default()),
+        }
+    }
+}
+
 /// Cached outcome of the heal's lazy hard-link probe/detach (see
 /// [`Table::ensure_unshared_for_write`]): the probe and copy run at most
 /// once per scan, and only when a write-back is actually needed.
@@ -6618,27 +6697,25 @@ impl Table {
     /// A corrupt delete-bitmap fails recovery rather than silently resurrecting
     /// deleted rows; see [`Self::recover_inner`] for the salvage variant that
     /// degrades to "all rows live" instead.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "recovery requires many context parameters"
-    )]
-    pub fn recover(
-        file_path: PathBuf,
-        checksum: Checksum,
-        global_seqno: SeqNo,
-        tree_id: TreeId,
-        table_id: TableId,
-        cache: Arc<Cache>,
-        descriptor_table: Option<Arc<DescriptorTable>>,
-        fs: Arc<dyn Fs>,
-        pin_filter: bool,
-        pin_index: bool,
-        encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
-        #[cfg(zstd_any)] zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
-        comparator: SharedComparator,
-        #[cfg(feature = "metrics")] metrics: Arc<Metrics>,
-    ) -> crate::Result<Self> {
-        Self::recover_inner(
+    pub fn recover(params: RecoverParams) -> crate::Result<Self> {
+        Self::recover_inner(params, RecoveryMode::Live)
+    }
+
+    /// Recovers a table, optionally in **salvage mode** (see [`RecoveryMode`]).
+    ///
+    /// In salvage mode a corrupt or truncated delete-bitmap degrades to empty
+    /// ("all rows live, pending recompaction") and a delete-bitmap with an
+    /// unreadable zone map is ignored rather than erroring, so a columnar
+    /// segment with a damaged sidecar still opens and its data blocks can be
+    /// recovered. Normal recovery ([`RecoveryMode::Live`]) fails closed on
+    /// both, to avoid resurrecting deleted rows. Used by [`crate::salvage`].
+    #[expect(clippy::too_many_lines, reason = "recovery is inherently complex")]
+    pub(crate) fn recover_inner(params: RecoverParams, mode: RecoveryMode) -> crate::Result<Self> {
+        use core::sync::atomic::AtomicBool;
+        use meta::ParsedMeta;
+        use regions::ParsedRegions;
+
+        let RecoverParams {
             file_path,
             checksum,
             global_seqno,
@@ -6655,43 +6732,7 @@ impl Table {
             comparator,
             #[cfg(feature = "metrics")]
             metrics,
-            RecoveryMode::Live,
-        )
-    }
-
-    /// Recovers a table, optionally in **salvage mode** (see [`RecoveryMode`]).
-    ///
-    /// In salvage mode a corrupt or truncated delete-bitmap degrades to empty
-    /// ("all rows live, pending recompaction") and a delete-bitmap with an
-    /// unreadable zone map is ignored rather than erroring, so a columnar
-    /// segment with a damaged sidecar still opens and its data blocks can be
-    /// recovered. Normal recovery ([`RecoveryMode::Live`]) fails closed on
-    /// both, to avoid resurrecting deleted rows. Used by [`crate::salvage`].
-    #[expect(
-        clippy::too_many_arguments,
-        clippy::too_many_lines,
-        reason = "recovery requires many context parameters and is inherently complex"
-    )]
-    pub(crate) fn recover_inner(
-        file_path: PathBuf,
-        checksum: Checksum,
-        global_seqno: SeqNo,
-        tree_id: TreeId,
-        table_id: TableId,
-        cache: Arc<Cache>,
-        descriptor_table: Option<Arc<DescriptorTable>>,
-        fs: Arc<dyn Fs>,
-        pin_filter: bool,
-        pin_index: bool,
-        encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
-        #[cfg(zstd_any)] zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
-        comparator: SharedComparator,
-        #[cfg(feature = "metrics")] metrics: Arc<Metrics>,
-        mode: RecoveryMode,
-    ) -> crate::Result<Self> {
-        use core::sync::atomic::AtomicBool;
-        use meta::ParsedMeta;
-        use regions::ParsedRegions;
+        } = params;
 
         let salvage = matches!(mode, RecoveryMode::Salvage { .. });
 
@@ -7636,24 +7677,30 @@ impl Table {
         let restricted_checksum = crate::Checksum::from_raw(
             crate::repair::compute_table_checksum_from(&*self.fs, &self.path, punch_offset)?,
         );
-        let reopened = Self::recover(
-            (*self.path).clone(),
-            restricted_checksum,
-            self.global_seqno,
-            self.tree_id,
-            self.metadata.id,
-            self.cache.clone(),
-            None,
-            self.fs.clone(),
-            self.pinned_filter_size() > 0,
-            self.pinned_block_index_size() > 0,
-            self.encryption.clone(),
+        let reopened = {
+            let mut params = RecoverParams::new(
+                (*self.path).clone(),
+                restricted_checksum,
+                self.metadata.id,
+                self.fs.clone(),
+                self.comparator.clone(),
+                self.cache.clone(),
+            );
+            params.global_seqno = self.global_seqno;
+            params.tree_id = self.tree_id;
+            params.pin_filter = self.pinned_filter_size() > 0;
+            params.pin_index = self.pinned_block_index_size() > 0;
+            params.encryption.clone_from(&self.encryption);
             #[cfg(zstd_any)]
-            self.zstd_dictionary.clone(),
-            self.comparator.clone(),
+            {
+                params.zstd_dictionary.clone_from(&self.zstd_dictionary);
+            }
             #[cfg(feature = "metrics")]
-            self.metrics.clone(),
-        )?;
+            {
+                params.metrics = self.metrics.clone();
+            }
+            Self::recover(params)?
+        };
         // The reopened `Inner` is DISTINCT from this one, so it starts without
         // the tree-installed shared gates. Carry them forward, or the restricted
         // view would lose them: without the checkpoint deletion pause a

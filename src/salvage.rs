@@ -788,42 +788,39 @@ fn salvage_attempt(
         Ok(c) => crate::Checksum::from_raw(c),
         Err(_) => crate::Checksum::from_raw(0),
     };
-    let cache = Arc::new(crate::cache::Cache::with_capacity_bytes(8 * 1024 * 1024));
-    let descriptor = Arc::new(crate::descriptor_table::DescriptorTable::new(64));
-    #[cfg(feature = "metrics")]
-    let metrics = Arc::new(crate::Metrics::default());
-
-    let table = crate::table::Table::recover_inner(
-        source.to_path_buf(),
-        checksum,
-        0,
-        0,
-        // The source's table id: encrypted block AAD binds it, so an encrypted
-        // source only decrypts when opened under the same id (`0` for the legacy
-        // standalone / unencrypted path).
-        options.table_id,
-        cache,
-        Some(descriptor),
-        Arc::clone(fs),
-        false,
-        false,
-        // Decrypt / decompress the source with the caller's context: without it an
-        // encrypted or dictionary-compressed source cannot be read at all.
-        options.encryption.clone(),
+    let table = {
+        let mut params = crate::table::RecoverParams::new(
+            source.to_path_buf(),
+            checksum,
+            // The source's table id: encrypted block AAD binds it, so an
+            // encrypted source only decrypts when opened under the same id
+            // (`0` for the legacy standalone / unencrypted path).
+            options.table_id,
+            Arc::clone(fs),
+            comparator.clone(),
+            Arc::new(crate::cache::Cache::with_capacity_bytes(8 * 1024 * 1024)),
+        );
+        params.descriptor_table = Some(Arc::new(crate::descriptor_table::DescriptorTable::new(64)));
+        // Decrypt / decompress the source with the caller's context: without it
+        // an encrypted or dictionary-compressed source cannot be read at all.
+        params.encryption.clone_from(&options.encryption);
         #[cfg(zstd_any)]
-        options.zstd_dictionary.clone(),
-        comparator.clone(),
-        #[cfg(feature = "metrics")]
-        metrics,
-        // Salvage mode: a corrupt delete-bitmap / missing zone map degrades to
-        // "all rows live" instead of failing, so a damaged sidecar still
-        // opens. A caller-known durable id (repair) keeps the meta id
-        // cross-check live, so a forged tail id falls back to the MID mirror.
-        crate::table::RecoveryMode::Salvage {
-            expected_id: options.expected_stored_id,
-            prefer_mid_meta,
-        },
-    )?;
+        {
+            params.zstd_dictionary.clone_from(&options.zstd_dictionary);
+        }
+        crate::table::Table::recover_inner(
+            params,
+            // Salvage mode: a corrupt delete-bitmap / missing zone map degrades
+            // to "all rows live" instead of failing, so a damaged sidecar still
+            // opens. A caller-known durable id (repair) keeps the meta id
+            // cross-check live, so a forged tail id falls back to the MID
+            // mirror.
+            crate::table::RecoveryMode::Salvage {
+                expected_id: options.expected_stored_id,
+                prefer_mid_meta,
+            },
+        )?
+    };
 
     // Fail closed on range tombstones, present OR hidden: the positional walk
     // re-emits only point entries, so salvaging an SST that carries range

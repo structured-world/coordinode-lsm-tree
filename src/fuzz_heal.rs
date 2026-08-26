@@ -190,24 +190,16 @@ fn recover(
     encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
 ) -> crate::Result<Table> {
     let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&**fs, path)?);
-    Table::recover(
+    let mut params = crate::table::RecoverParams::new(
         path.to_path_buf(),
         checksum,
         0,
-        0,
-        0,
-        Arc::new(crate::Cache::with_capacity_bytes(1 << 20)),
-        None,
         Arc::clone(fs),
-        false,
-        false,
-        encryption,
-        #[cfg(zstd_any)]
-        None,
         crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::new(crate::Metrics::default()),
-    )
+        Arc::new(crate::Cache::with_capacity_bytes(1 << 20)),
+    );
+    params.encryption = encryption;
+    Table::recover(params)
 }
 
 /// Recovers and fully scans the SST, checking every yielded entry against the

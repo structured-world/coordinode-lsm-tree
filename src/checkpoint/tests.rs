@@ -93,24 +93,18 @@ fn checkpoint_binds_restrict_sidecar_to_captured_view_not_live_file() -> crate::
 
     // Recover, then build the restricted VIEW at k00100 (no punch needed here:
     // reopen_restricted reads the live suffix digest off the whole file).
-    let table = Table::recover(
-        sst.clone(),
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(1_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::clone(&fs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::new(crate::Metrics::default()),
-    )?;
+    let table = {
+        let mut params = crate::table::RecoverParams::new(
+            sst.clone(),
+            checksum,
+            0,
+            Arc::clone(&fs),
+            crate::comparator::default_comparator(),
+            Arc::new(Cache::with_capacity_bytes(1_000_000)),
+        );
+        params.descriptor_table = Some(Arc::new(DescriptorTable::new(10)));
+        Table::recover(params)?
+    };
     let restricted = table.reopen_restricted(b"k00100".to_vec().into())?;
 
     // A STALE live sidecar with a DIFFERENT bound beside the SOURCE SST: the copy

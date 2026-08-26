@@ -340,6 +340,36 @@ pub(crate) fn commit_repair_tmp(
     Ok(())
 }
 
+/// Recover params for a repair's TRANSIENT table open: the tree's configured
+/// comparator / crypto / dictionary context (so the table decodes consistently
+/// with how it was written), and everything else neutral — tree id 0 and no
+/// descriptor table keep the open from polluting shared caches keyed by the
+/// real tree id, and global seqno 0 because a recovered table's intrinsic
+/// sequence numbers are authoritative (there is no ingestion-time offset).
+#[cfg(feature = "std")]
+fn repair_recover_params(
+    config: &Config,
+    file_path: PathBuf,
+    checksum: crate::Checksum,
+    table_id: TableId,
+    fs: Arc<dyn crate::fs::Fs>,
+) -> crate::table::RecoverParams {
+    let mut params = crate::table::RecoverParams::new(
+        file_path,
+        checksum,
+        table_id,
+        fs,
+        config.comparator.clone(),
+        config.cache.clone(),
+    );
+    params.encryption.clone_from(&config.encryption);
+    #[cfg(zstd_any)]
+    {
+        params.zstd_dictionary.clone_from(&config.zstd_dictionary);
+    }
+    params
+}
+
 /// Whether an error is an UNAMBIGUOUSLY TRANSIENT (retryable) I/O failure, as
 /// opposed to one a re-read cannot fix.
 ///
@@ -1108,24 +1138,13 @@ fn try_salvage_table(
     // Reopen the freshly-written (clean) salvaged SST so it joins the rebuilt
     // manifest like any cleanly-recovered table.
     let checksum = crate::Checksum::from_raw(compute_table_checksum(&**fs, table_path)?);
-    let table = Table::recover(
+    let table = Table::recover(repair_recover_params(
+        config,
         table_path.to_path_buf(),
         checksum,
-        0,
-        0,
         table_id,
-        config.cache.clone(),
-        None,
         Arc::clone(fs),
-        false,
-        false,
-        config.encryption.clone(),
-        #[cfg(zstd_any)]
-        config.zstd_dictionary.clone(),
-        config.comparator.clone(),
-        #[cfg(feature = "metrics")]
-        Arc::new(crate::metrics::Metrics::default()),
-    )?;
+    ))?;
     // A salvaged copy of a bulk-ingested source still relies on the manifest-only
     // global_seqno offset the rebuilt manifest cannot recover: its entries stay at
     // local seqno 0, so installing it with offset 0 would silently mis-order and
@@ -2787,31 +2806,15 @@ fn repair_tree(
             // the whole table unreadable — which the next open's orphan cleanup
             // would then delete. Table::recover would fail on the same bytes, so
             // skip it; block salvage opens with a placeholder digest and drops
-            // only the unreadable blocks. global_seqno = 0: a recovered table's
-            // intrinsic sequence numbers are authoritative; there is no
-            // ingestion-time translation offset. tree_id = 0 and
-            // descriptor_table = None keep the transient open from polluting any
-            // shared cache keyed by the real tree id (the tree reopens fresh
-            // after repair).
+            // only the unreadable blocks.
             let recovered = match compute_table_checksum(&*folder_fs, &table_path) {
-                Ok(c) => Table::recover(
+                Ok(c) => Table::recover(repair_recover_params(
+                    config,
                     table_path.clone(),
                     crate::Checksum::from_raw(c),
-                    0,
-                    0,
                     table_id,
-                    config.cache.clone(),
-                    None,
                     folder_fs.clone(),
-                    false,
-                    false,
-                    config.encryption.clone(),
-                    #[cfg(zstd_any)]
-                    config.zstd_dictionary.clone(),
-                    config.comparator.clone(),
-                    #[cfg(feature = "metrics")]
-                    Arc::new(crate::metrics::Metrics::default()),
-                ),
+                )),
                 // A TRANSIENT read (flaky I/O) while hashing is retryable:
                 // recording it unreadable commits a manifest without the
                 // still-in-place file, which the next open's orphan cleanup then

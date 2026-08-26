@@ -458,24 +458,31 @@ impl<'a> Ingestion<'a> {
         let created_tables = results
             .into_iter()
             .map(|(table_id, checksum)| -> crate::Result<Table> {
-                Table::recover(
+                let mut params = crate::table::RecoverParams::new(
                     self.folder.join(table_id.to_string()),
                     checksum,
-                    global_seqno,
-                    self.tree.id,
                     table_id,
-                    self.tree.config.cache.clone(),
-                    self.tree.config.descriptor_table.clone(),
                     self.level_fs.clone(),
-                    false,
-                    false,
-                    self.tree.config.encryption.clone(),
-                    #[cfg(zstd_any)]
-                    self.tree.config.zstd_dictionary.clone(),
                     self.tree.config.comparator.clone(),
-                    #[cfg(feature = "metrics")]
-                    self.tree.metrics.clone(),
-                )
+                    self.tree.config.cache.clone(),
+                );
+                params.global_seqno = global_seqno;
+                params.tree_id = self.tree.id;
+                params
+                    .descriptor_table
+                    .clone_from(&self.tree.config.descriptor_table);
+                params.encryption.clone_from(&self.tree.config.encryption);
+                #[cfg(zstd_any)]
+                {
+                    params
+                        .zstd_dictionary
+                        .clone_from(&self.tree.config.zstd_dictionary);
+                }
+                #[cfg(feature = "metrics")]
+                {
+                    params.metrics = self.tree.metrics.clone();
+                }
+                Table::recover(params)
             })
             .collect::<crate::Result<Vec<_>>>()?;
 

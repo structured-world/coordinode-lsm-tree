@@ -943,24 +943,32 @@ impl AbstractTree for Tree {
         let tables = result
             .into_iter()
             .map(|(table_id, checksum)| -> crate::Result<Table> {
-                Table::recover(
+                let mut params = crate::table::RecoverParams::new(
                     folder.join(table_id.to_string()),
                     checksum,
-                    0,
-                    self.id,
                     table_id,
-                    self.config.cache.clone(),
-                    self.config.descriptor_table.clone(),
                     level_fs.clone(),
-                    pin_filter,
-                    pin_index,
-                    self.config.encryption.clone(),
-                    #[cfg(zstd_any)]
-                    self.config.zstd_dictionary.clone(),
                     self.config.comparator.clone(),
-                    #[cfg(feature = "metrics")]
-                    self.metrics.clone(),
-                )
+                    self.config.cache.clone(),
+                );
+                params.tree_id = self.id;
+                params
+                    .descriptor_table
+                    .clone_from(&self.config.descriptor_table);
+                params.pin_filter = pin_filter;
+                params.pin_index = pin_index;
+                params.encryption.clone_from(&self.config.encryption);
+                #[cfg(zstd_any)]
+                {
+                    params
+                        .zstd_dictionary
+                        .clone_from(&self.config.zstd_dictionary);
+                }
+                #[cfg(feature = "metrics")]
+                {
+                    params.metrics = self.metrics.clone();
+                }
+                Table::recover(params)
             })
             .collect::<crate::Result<Vec<_>>>()?;
 
@@ -4525,24 +4533,31 @@ impl Tree {
                     let pin_filter = config.filter_block_pinning_policy.get(level_idx.into());
                     let pin_index = config.index_block_pinning_policy.get(level_idx.into());
 
-                    let table = Table::recover(
-                        table_file_path,
-                        checksum,
-                        global_seqno,
-                        tree_id,
-                        table_id,
-                        config.cache.clone(),
-                        config.descriptor_table.clone(),
-                        folder_fs.clone(),
-                        pin_filter,
-                        pin_index,
-                        config.encryption.clone(),
+                    let table = {
+                        let mut params = crate::table::RecoverParams::new(
+                            table_file_path,
+                            checksum,
+                            table_id,
+                            folder_fs.clone(),
+                            config.comparator.clone(),
+                            config.cache.clone(),
+                        );
+                        params.global_seqno = global_seqno;
+                        params.tree_id = tree_id;
+                        params.descriptor_table.clone_from(&config.descriptor_table);
+                        params.pin_filter = pin_filter;
+                        params.pin_index = pin_index;
+                        params.encryption.clone_from(&config.encryption);
                         #[cfg(zstd_any)]
-                        config.zstd_dictionary.clone(),
-                        config.comparator.clone(),
+                        {
+                            params.zstd_dictionary.clone_from(&config.zstd_dictionary);
+                        }
                         #[cfg(feature = "metrics")]
-                        metrics.clone(),
-                    )?;
+                        {
+                            params.metrics = metrics.clone();
+                        }
+                        Table::recover(params)?
+                    };
 
                     tables.push(table);
                     recovered_table_ids.insert(table_id);

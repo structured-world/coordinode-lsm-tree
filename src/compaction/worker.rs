@@ -1873,24 +1873,34 @@ fn run_merge_on_read_relocation(
         opts.config.sync_mode,
     )?;
 
-    let relocated = Table::recover(
-        new_path,
-        checksum,
-        0,
-        opts.tree_id,
-        new_id,
-        opts.config.cache.clone(),
-        opts.config.descriptor_table.clone(),
-        level_fs,
-        opts.config.filter_block_pinning_policy.get(dst_lvl),
-        opts.config.index_block_pinning_policy.get(dst_lvl),
-        opts.config.encryption.clone(),
+    let relocated = {
+        let mut params = crate::table::RecoverParams::new(
+            new_path,
+            checksum,
+            new_id,
+            level_fs,
+            opts.config.comparator.clone(),
+            opts.config.cache.clone(),
+        );
+        params.tree_id = opts.tree_id;
+        params
+            .descriptor_table
+            .clone_from(&opts.config.descriptor_table);
+        params.pin_filter = opts.config.filter_block_pinning_policy.get(dst_lvl);
+        params.pin_index = opts.config.index_block_pinning_policy.get(dst_lvl);
+        params.encryption.clone_from(&opts.config.encryption);
         #[cfg(zstd_any)]
-        opts.config.zstd_dictionary.clone(),
-        opts.config.comparator.clone(),
+        {
+            params
+                .zstd_dictionary
+                .clone_from(&opts.config.zstd_dictionary);
+        }
         #[cfg(feature = "metrics")]
-        opts.metrics.clone(),
-    )?;
+        {
+            params.metrics = opts.metrics.clone();
+        }
+        Table::recover(params)?
+    };
 
     compaction_state
         .hidden_set_mut()

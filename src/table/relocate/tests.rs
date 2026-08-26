@@ -14,24 +14,20 @@ use crate::metrics::Metrics;
 fn recover_at(file: &Path, checksum: Checksum, table_id: TableId) -> crate::Result<Table> {
     #[cfg(feature = "metrics")]
     let metrics = Arc::new(Metrics::default());
-    Table::recover(
+    let mut params = crate::table::RecoverParams::new(
         file.to_path_buf(),
         checksum,
-        0,
-        0,
         table_id,
-        Arc::new(Cache::with_capacity_bytes(1_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
         Arc::new(StdFs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
         crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        metrics,
-    )
+        Arc::new(Cache::with_capacity_bytes(1_000_000)),
+    );
+    params.descriptor_table = Some(Arc::new(DescriptorTable::new(10)));
+    #[cfg(feature = "metrics")]
+    {
+        params.metrics = metrics;
+    }
+    Table::recover(params)
 }
 
 #[cfg(feature = "columnar")]

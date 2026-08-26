@@ -923,24 +923,32 @@ impl AbstractTree for BlobTree {
         let tables = result
             .into_iter()
             .map(|(table_id, checksum)| -> crate::Result<Table> {
-                Table::recover(
+                let mut params = crate::table::RecoverParams::new(
                     table_folder.join(table_id.to_string()),
                     checksum,
-                    0,
-                    self.index.id,
                     table_id,
-                    self.index.config.cache.clone(),
-                    self.index.config.descriptor_table.clone(),
                     level_fs.clone(),
-                    pin_filter,
-                    pin_index,
-                    self.index.config.encryption.clone(),
-                    #[cfg(zstd_any)]
-                    self.index.config.zstd_dictionary.clone(),
                     self.index.config.comparator.clone(),
-                    #[cfg(feature = "metrics")]
-                    self.index.metrics.clone(),
-                )
+                    self.index.config.cache.clone(),
+                );
+                params.tree_id = self.index.id;
+                params
+                    .descriptor_table
+                    .clone_from(&self.index.config.descriptor_table);
+                params.pin_filter = pin_filter;
+                params.pin_index = pin_index;
+                params.encryption.clone_from(&self.index.config.encryption);
+                #[cfg(zstd_any)]
+                {
+                    params
+                        .zstd_dictionary
+                        .clone_from(&self.index.config.zstd_dictionary);
+                }
+                #[cfg(feature = "metrics")]
+                {
+                    params.metrics = self.index.metrics.clone();
+                }
+                Table::recover(params)
             })
             .collect::<crate::Result<Vec<_>>>()?;
 
