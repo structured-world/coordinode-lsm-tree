@@ -907,3 +907,63 @@ fn overlapping_routes_panic() {
         },
     ]);
 }
+
+/// A ROUTED tree's `Unrecoverable` must not be auto-repaired: route
+/// provenance is not persisted, so a missing routed table is indistinguishable
+/// from a same-level route path change (or a temporarily unmounted tier), and
+/// a rebuild would commit a manifest omitting every SST still sitting on the
+/// old route — the next open then sweeps them as orphans. The operator
+/// verifies the route configuration and invokes `repair` explicitly.
+#[test]
+fn open_or_repair_propagates_a_routed_missing_table() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    {
+        let tree = three_tier_config(dir.path()).open()?;
+        tree.insert("a", "value_a", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    // The hot tier "loses" its table — indistinguishable from the tier being
+    // remounted elsewhere or the route path having changed.
+    let hot_tables_dir = dir.path().join("hot").join("tables");
+    let mut deleted = false;
+    for entry in std::fs::read_dir(&hot_tables_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            std::fs::remove_file(entry.path())?;
+            deleted = true;
+            break;
+        }
+    }
+    assert!(deleted, "expected to delete a hot-tier table file");
+
+    let manifest_names = || -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir.path().join("primary"))
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|n| {
+                n.strip_prefix('v')
+                    .is_some_and(|rest| rest.parse::<u64>().is_ok())
+                    || n == "current"
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    let before = manifest_names();
+
+    let result = three_tier_config(dir.path())
+        .open_or_repair(lsm_tree::RepairPolicy::default().salvage(true));
+    assert!(
+        matches!(result, Err(lsm_tree::Error::Unrecoverable)),
+        "a routed missing table is ambiguous and must propagate: {:?}",
+        result.map(|_| "opened"),
+    );
+    assert_eq!(
+        before,
+        manifest_names(),
+        "an auto-repair would have rewritten the manifest generation",
+    );
+    Ok(())
+}

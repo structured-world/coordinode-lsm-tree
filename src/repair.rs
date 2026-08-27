@@ -2689,10 +2689,14 @@ impl Config {
     /// repair would contend on the same lock), an UNSUPPORTED format version
     /// ([`Error::InvalidVersion`](crate::Error::InvalidVersion) — the store
     /// needs offline conversion or a matching binary, not a V5-only rebuild
-    /// that would reject every table), and every CONFIGURATION mismatch
-    /// (wrong comparator, level route, dictionary, or encryption key) —
-    /// repairing under a wrong configuration would rebuild, and could drop,
-    /// perfectly healthy data.
+    /// that would reject every table), a ROUTED tree's
+    /// [`Error::Unrecoverable`](crate::Error::Unrecoverable) (route
+    /// provenance is not persisted, so a missing routed table is
+    /// indistinguishable from a route path change or an unmounted tier — a
+    /// rebuild would omit every SST still on the old route), and every
+    /// CONFIGURATION mismatch (wrong comparator, level route, dictionary, or
+    /// encryption key) — repairing under a wrong configuration would rebuild,
+    /// and could drop, perfectly healthy data.
     ///
     /// # Errors
     ///
@@ -2722,6 +2726,15 @@ impl Config {
         let retry = self.clone();
         match self.open() {
             Ok(tree) => Ok((tree, None)),
+            // A ROUTED tree's `Unrecoverable` is ambiguous, not positively
+            // structural: route provenance is not persisted, so a table
+            // missing from a routed folder is indistinguishable from a
+            // same-level route path change or a temporarily unmounted tier —
+            // and a rebuild would commit a manifest omitting every SST still
+            // sitting on the old route, which the next open then sweeps as
+            // orphans. Propagate; the operator verifies the route
+            // configuration and invokes `repair` explicitly.
+            Err(e @ crate::Error::Unrecoverable) if retry.level_routes.is_some() => Err(e),
             Err(e) if is_repairable_structural(&e) => {
                 let report =
                     retry.repair_with_resurrection(policy.salvage, policy.allow_resurrection)?;

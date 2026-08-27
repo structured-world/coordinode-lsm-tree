@@ -194,7 +194,9 @@ any repair, derive the obligation from the report instead:
    point-tombstone seqno (and the surviving range tombstones) from the same
    scan, and skip ANY retained record — an operand, but also a put or
    delete — at or below that floor: it is already incorporated or
-   superseded. Two coordination rules make the floor decidable:
+   superseded. A range tombstone covers only records STRICTLY below its
+   seqno (the engine's suppression rule): a record tied with the
+   tombstone's caller-assigned seqno survives a read and must replay. Two coordination rules make the floor decidable:
    - **WAL seqnos start at 1.** Bottommost compaction ZEROES the seqno of
      entries below its GC watermark, so a surviving value at seqno `0` is a
      zeroed survivor embodying the key's whole folded history — treat its
