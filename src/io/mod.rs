@@ -40,18 +40,30 @@ pub enum ErrorKind {
     BrokenPipe,
     /// Operation attempted across distinct devices/filesystems.
     CrossesDevices,
+    /// The remote host of a network filesystem is unreachable (`EHOSTUNREACH`).
+    HostUnreachable,
     /// Operation was interrupted (`EINTR`-equivalent); usually retriable.
     Interrupted,
     /// Data being read does not match the expected format/schema.
     InvalidData,
     /// A function argument had an invalid value.
     InvalidInput,
+    /// The network a filesystem depends on is down (`ENETDOWN`).
+    NetworkDown,
+    /// The network a filesystem depends on is unreachable (`ENETUNREACH`).
+    NetworkUnreachable,
     /// Entity was not found.
     NotFound,
     /// Catch-all for errors that don't fit any other variant.
     Other,
     /// Operation denied due to lack of permissions.
     PermissionDenied,
+    /// A network file handle went stale (`ESTALE` — the NFS server rebooted
+    /// or re-exported); a re-open after the mount recovers clears it.
+    StaleNetworkFileHandle,
+    /// An I/O operation timed out (`ETIMEDOUT` — a slow or wedged network
+    /// filesystem); the data underneath is not implicated.
+    TimedOut,
     /// Reader hit end-of-file before satisfying the request.
     UnexpectedEof,
     /// Operation is not supported on this platform / backend / build.
@@ -67,15 +79,33 @@ pub enum ErrorKind {
 }
 
 impl ErrorKind {
-    /// Whether this kind is an unambiguously TRANSIENT (retryable) I/O failure:
-    /// only [`Interrupted`](Self::Interrupted) (EINTR) and
-    /// [`WouldBlock`](Self::WouldBlock) (EAGAIN). Everything else — including the
-    /// ambiguous [`Other`](Self::Other), which real `EIO` and platform-specific
-    /// structural errors (e.g. a Windows negative-seek on a corrupt file) both
-    /// map to — is treated as persistent / structural. Shared so the repair and
-    /// integrity-verify paths classify I/O failures identically.
+    /// Whether this kind is a TRANSIENT (retryable) I/O failure — one a retry
+    /// (immediately, or after the environment recovers) genuinely clears, and
+    /// which a corrupt on-disk structure can NEVER produce: the interrupted
+    /// syscalls [`Interrupted`](Self::Interrupted) (EINTR) and
+    /// [`WouldBlock`](Self::WouldBlock) (EAGAIN), plus the network-filesystem
+    /// kinds [`TimedOut`](Self::TimedOut),
+    /// [`HostUnreachable`](Self::HostUnreachable),
+    /// [`NetworkDown`](Self::NetworkDown),
+    /// [`NetworkUnreachable`](Self::NetworkUnreachable) and
+    /// [`StaleNetworkFileHandle`](Self::StaleNetworkFileHandle) an NFS / FUSE
+    /// backend surfaces when the transport (not the data) fails. Everything
+    /// else — including the ambiguous [`Other`](Self::Other), which real `EIO`
+    /// and platform-specific structural errors (e.g. a Windows negative-seek on
+    /// a corrupt file) both map to — is treated as persistent / structural.
+    /// Shared so the repair and integrity-verify paths classify I/O failures
+    /// identically.
     pub(crate) fn is_transient(self) -> bool {
-        matches!(self, Self::Interrupted | Self::WouldBlock)
+        matches!(
+            self,
+            Self::Interrupted
+                | Self::WouldBlock
+                | Self::TimedOut
+                | Self::HostUnreachable
+                | Self::NetworkDown
+                | Self::NetworkUnreachable
+                | Self::StaleNetworkFileHandle
+        )
     }
 
     /// Whether this kind must PROPAGATE out of recovery grading instead of
@@ -95,12 +125,17 @@ impl ErrorKind {
             Self::AlreadyExists => "entity already exists",
             Self::BrokenPipe => "broken pipe",
             Self::CrossesDevices => "cross-device link or rename",
+            Self::HostUnreachable => "host unreachable",
             Self::Interrupted => "operation interrupted",
             Self::InvalidData => "invalid data",
             Self::InvalidInput => "invalid input parameter",
+            Self::NetworkDown => "network down",
+            Self::NetworkUnreachable => "network unreachable",
             Self::NotFound => "entity not found",
             Self::Other => "other error",
             Self::PermissionDenied => "permission denied",
+            Self::StaleNetworkFileHandle => "stale network file handle",
+            Self::TimedOut => "operation timed out",
             Self::UnexpectedEof => "unexpected end of file",
             Self::Unsupported => "unsupported",
             Self::WouldBlock => "operation would block",
@@ -250,11 +285,16 @@ impl From<std::io::Error> for Error {
             std::io::ErrorKind::AlreadyExists => (ErrorKind::AlreadyExists, true),
             std::io::ErrorKind::BrokenPipe => (ErrorKind::BrokenPipe, true),
             std::io::ErrorKind::CrossesDevices => (ErrorKind::CrossesDevices, true),
+            std::io::ErrorKind::HostUnreachable => (ErrorKind::HostUnreachable, true),
             std::io::ErrorKind::Interrupted => (ErrorKind::Interrupted, true),
             std::io::ErrorKind::InvalidData => (ErrorKind::InvalidData, true),
             std::io::ErrorKind::InvalidInput => (ErrorKind::InvalidInput, true),
+            std::io::ErrorKind::NetworkDown => (ErrorKind::NetworkDown, true),
+            std::io::ErrorKind::NetworkUnreachable => (ErrorKind::NetworkUnreachable, true),
             std::io::ErrorKind::NotFound => (ErrorKind::NotFound, true),
             std::io::ErrorKind::PermissionDenied => (ErrorKind::PermissionDenied, true),
+            std::io::ErrorKind::StaleNetworkFileHandle => (ErrorKind::StaleNetworkFileHandle, true),
+            std::io::ErrorKind::TimedOut => (ErrorKind::TimedOut, true),
             std::io::ErrorKind::UnexpectedEof => (ErrorKind::UnexpectedEof, true),
             std::io::ErrorKind::Unsupported => (ErrorKind::Unsupported, true),
             std::io::ErrorKind::WouldBlock => (ErrorKind::WouldBlock, true),
@@ -311,12 +351,17 @@ impl From<Error> for std::io::Error {
             ErrorKind::AlreadyExists => std::io::ErrorKind::AlreadyExists,
             ErrorKind::BrokenPipe => std::io::ErrorKind::BrokenPipe,
             ErrorKind::CrossesDevices => std::io::ErrorKind::CrossesDevices,
+            ErrorKind::HostUnreachable => std::io::ErrorKind::HostUnreachable,
             ErrorKind::Interrupted => std::io::ErrorKind::Interrupted,
             ErrorKind::InvalidData => std::io::ErrorKind::InvalidData,
             ErrorKind::InvalidInput => std::io::ErrorKind::InvalidInput,
+            ErrorKind::NetworkDown => std::io::ErrorKind::NetworkDown,
+            ErrorKind::NetworkUnreachable => std::io::ErrorKind::NetworkUnreachable,
             ErrorKind::NotFound => std::io::ErrorKind::NotFound,
             ErrorKind::Other => std::io::ErrorKind::Other,
             ErrorKind::PermissionDenied => std::io::ErrorKind::PermissionDenied,
+            ErrorKind::StaleNetworkFileHandle => std::io::ErrorKind::StaleNetworkFileHandle,
+            ErrorKind::TimedOut => std::io::ErrorKind::TimedOut,
             ErrorKind::UnexpectedEof => std::io::ErrorKind::UnexpectedEof,
             ErrorKind::Unsupported => std::io::ErrorKind::Unsupported,
             ErrorKind::WouldBlock => std::io::ErrorKind::WouldBlock,

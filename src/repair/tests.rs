@@ -10179,6 +10179,41 @@ fn repair_propagates_a_permission_denied_open() -> crate::Result<()> {
     Ok(())
 }
 
+/// A network-filesystem timeout (`ETIMEDOUT` from NFS / FUSE) is a transport
+/// failure, not evidence against the bytes on disk. It must abort the repair
+/// for a retry — grading the file unreadable would commit a manifest that
+/// excludes it and then remove it once the mount recovers.
+#[test]
+fn repair_propagates_a_network_timeout() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    standard_tree_without_manifest(&memfs, &root)?;
+
+    let fault = FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::TimedOut))
+            .on_path(root.join("tables").join("0").to_string_lossy()),
+    );
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair();
+    assert!(
+        matches!(result, Err(crate::Error::Io(ref e)) if e.kind() == ErrorKind::TimedOut),
+        "a transport timeout must abort the repair, never grade the file: {:?}",
+        result.map(|r| (r.recovered, r.unreadable)),
+    );
+    Ok(())
+}
+
 /// The progress handle reports the phase and the byte totals of a live
 /// repair: the totals come from an upfront listing with the same skips as the
 /// scan, so a completed run has taken up exactly what it announced, and a
