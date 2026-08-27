@@ -7529,13 +7529,15 @@ fn repair_fails_when_a_fully_punched_blobs_drop_cannot_complete() -> crate::Resu
 /// A blob file whose punch consumed EVERY frame is a completed tight-space
 /// relocation whose file removal lagged the crash: the frontier walk proves
 /// the whole data section reads as zeros, so no live data remains. Repair
-/// must finish that interrupted drop — publishing an empty-suffix handle
-/// with whole-file metadata instead would leave a file blob GC's stale-byte
-/// arithmetic can never retire (its frames are already gone, so the stale
-/// count never reaches the recorded totals): an immortal empty file.
+/// must finish that interrupted drop AFTER the commit — publishing an
+/// empty-suffix handle with whole-file metadata instead would leave a file
+/// blob GC's stale-byte arithmetic can never retire (its frames are already
+/// gone, so the stale count never reaches the recorded totals): an immortal
+/// empty file. The scan itself removes nothing: a pre-commit abort must
+/// leave the directory exactly as found.
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
-fn blob_recovery_completes_the_drop_of_a_fully_punched_blob_file() -> crate::Result<()> {
+fn blob_recovery_queues_the_drop_of_a_fully_punched_blob_file() -> crate::Result<()> {
     use crate::fs::{Fs, MemFs};
     use std::sync::Arc;
 
@@ -7586,8 +7588,107 @@ fn blob_recovery_completes_the_drop_of_a_fully_punched_blob_file() -> crate::Res
         Some(1)
     );
     assert!(
-        !memfs.exists(&consumed_path)?,
-        "the fully punched file's lagged drop is completed",
+        memfs.exists(&consumed_path)?,
+        "the scan is read-only: the lagged drop belongs after the commit",
+    );
+    assert!(
+        recovery.discard.iter().any(|(p, _)| p == &consumed_path),
+        "the lagged drop is queued for after the commit: {:?}",
+        recovery.discard,
+    );
+    Ok(())
+}
+
+/// A pre-commit ABORT after the scan met a fully punched blob must leave that
+/// blob in place: the scan is read-only, and the OLD manifest of an
+/// explicitly invoked repair over an openable tree may still name the file —
+/// removing it early would leave that manifest referencing a missing blob.
+/// The drop completes only once the rebuilt manifest is durable.
+#[test]
+fn repair_abort_leaves_a_fully_punched_blob_in_place() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        tree.insert(b"k0", alloc::vec![b'x'; 64], 0);
+        tree.flush_active_memtable(0)?;
+        // A SECOND blob file, scanned after 0: the abort lands on it.
+        tree.insert(b"m0", alloc::vec![b'y'; 64], 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Punch the ENTIRE data section of blob 0: a completed relocation whose
+    // removal lagged the crash.
+    let blob_path = root.join(crate::file::BLOBS_FOLDER).join("0");
+    let (data_start, data_end) = {
+        let mut f = fs_dyn.open(&blob_path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut f)?;
+        let data = reader
+            .toc()
+            .section(b"data")
+            .ok_or(crate::Error::InvalidHeader("BlobFile"))?;
+        (data.pos(), data.pos() + data.len())
+    };
+    memfs.punch_hole(&blob_path, data_start, data_end - data_start)?;
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    // The abort: a transient fault on the NEXT blob file's probe — strictly
+    // after the scan met (and, pre-fix, removed) the fully punched blob 0.
+    let fault = FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::WouldBlock)).on_path(
+            root.join(crate::file::BLOBS_FOLDER)
+                .join("1")
+                .to_string_lossy(),
+        ),
+    );
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .repair();
+    assert!(
+        result.is_err(),
+        "the injected transient failure aborts the repair: {:?}",
+        result.map(|r| r.recovered),
+    );
+    assert!(
+        memfs.exists(&blob_path)?,
+        "a pre-commit abort must leave the fully punched blob in place",
     );
     Ok(())
 }
@@ -10057,6 +10158,53 @@ fn unparseable_exclusion_forces_full_history_replay() -> crate::Result<()> {
         report.wal_replay_scope(),
         super::WalReplayScope::FullHistory,
         "no bound can prove a retained record unaffected",
+    );
+    Ok(())
+}
+
+/// A FOREIGN name in `tables/` (`notes.txt`) is set aside as unreadable, but
+/// it never held table data: reporting it as an unknowable LOSS would force
+/// the full-history replay obligation — demanding an unbounded WAL archive —
+/// over a file whose exclusion lost nothing.
+#[test]
+fn foreign_file_exclusion_is_not_an_unknowable_loss() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::{Config, SequenceNumberCounter};
+    use std::io::Write;
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    standard_tree_without_manifest(&memfs, &root)?;
+    {
+        let mut file = memfs.open(
+            &root.join("tables").join("notes.txt"),
+            &FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        file.write_all(b"operator scribbles, not a table")?;
+    }
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .repair()?;
+    assert_eq!(report.recovered, 1, "the healthy table is kept");
+    assert_eq!(
+        report.unreadable, 1,
+        "the foreign name is still set aside: {:?}",
+        report.unreadable_files,
+    );
+    assert!(
+        report.unknowable_losses.is_empty(),
+        "a foreign name held no table data — it is not a loss: {report:?}",
+    );
+    assert_eq!(
+        report.wal_replay_scope(),
+        super::WalReplayScope::TailOnly,
+        "nothing was lost, so the WAL replays its tail as usual",
     );
     Ok(())
 }

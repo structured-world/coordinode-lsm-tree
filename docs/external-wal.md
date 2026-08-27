@@ -163,9 +163,19 @@ any repair, derive the obligation from the report instead:
    - `FullHistory` — same, with no seqno filter: a loss whose sequence base
      died with the manifest, or an excluded table whose coverage never
      parsed (`unknowable_losses`), leaves no bound that scopes the damage.
+     When the trigger is an UNSCOPABLE loss (`unknowable_losses` non-empty),
+     there is no key range either: reconcile retained records across the
+     ENTIRE keyspace in ONE pass — the survivor subtraction of step 3 runs
+     over the whole tree, and iterating `lost_coverage` ranges on top of
+     that pass would subtract the same survivors twice.
 2. **Puts and deletes replay blindly.** Re-applying one at its original seqno
    reproduces the same MVCC version, and a surviving NEWER version still wins
-   by seqno — over-replay inside the lost ranges is harmless for them.
+   by seqno — over-replay inside the lost ranges is harmless for them. This
+   covers EVERY logged write kind: a range deletion is selected by SPAN
+   OVERLAP with a lost range (its half-open `[start, end)` against the
+   inclusive coverage bounds) and replays blindly too, and a batch replays
+   per entry — each entry the lost range covers gets the same treatment its
+   standalone form gets (merge entries go through step 3's presence check).
 3. **Merge operands need a presence check.** An operand that survived the
    repair and is replayed again is folded twice. Collect the surviving
    operands inside each lost range with

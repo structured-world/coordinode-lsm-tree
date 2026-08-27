@@ -2246,46 +2246,29 @@ fn recover_blob_files(
             Ok(BlobFrontier::FullyConsumed) => {
                 // Every frame is punched away: the relocation that consumed
                 // this file completed, only its removal lagged the crash.
-                // Finish that drop instead of publishing an empty-suffix
-                // handle — whole-file metadata over zero live frames is a
-                // file blob GC's stale-byte arithmetic can never retire (its
-                // frames are already gone, so the stale count never reaches
-                // the recorded totals). No live data is discarded: the walk
-                // proved the whole data section reads as zeros.
+                // QUEUE that lagged drop for after the commit instead of
+                // finishing it here: the pre-commit scan is read-only on
+                // purpose — an abort before the commit (a cancellation, a
+                // transient failure on a later file) must leave the directory
+                // exactly as found, and the OLD manifest of an explicitly
+                // invoked repair over an openable tree may still name this
+                // file. Publishing an empty-suffix handle instead is not an
+                // option either: whole-file metadata over zero live frames is
+                // a file blob GC's stale-byte arithmetic can never retire
+                // (its frames are already gone, so the stale count never
+                // reaches the recorded totals). No live data is discarded:
+                // the walk proved the whole data section reads as zeros. The
+                // post-commit removal failing fails the repair, exactly as
+                // the immediate removal used to.
                 log::info!(
                     "blob file {blob_id} at {}: its punch consumed every frame — \
-                     completing the relocation's lagged file drop",
+                     queueing the relocation's lagged file drop for after the commit",
                     blob_path.display(),
                 );
-                match config.fs.remove_file(&blob_path) {
-                    Ok(()) => {
-                        // Entry durability is best-effort: if the removal's
-                        // directory entry resurfaces after a power loss, the
-                        // file is outside the rebuilt manifest and the next
-                        // open's orphan sweep removes it again.
-                        let _ = config
-                            .fs
-                            .sync_directory_with(&blobs_folder, config.sync_mode);
-                    }
-                    Err(e) => {
-                        // Any removal failure fails the repair: the file is
-                        // outside the rebuilt manifest, so the next open
-                        // rediscovers it as an orphan and its sweep hits the
-                        // same removal failure — reporting success for a tree
-                        // that cannot open would be a lie. Quarantine is not
-                        // an out (it preserves damaged DATA for the operator;
-                        // this file holds none, and a directory refusing the
-                        // removal refuses the rename too). Retry once the
-                        // filesystem is fixed.
-                        let e = crate::Error::from(e);
-                        log::error!(
-                            "blob file {blob_id} at {}: cannot complete the lagged \
-                             drop ({e}); failing the repair",
-                            blob_path.display(),
-                        );
-                        return Err(e);
-                    }
-                }
+                discard.push((
+                    blob_path,
+                    "fully punched blob file: a completed relocation's lagged drop".to_string(),
+                ));
                 continue;
             }
             // A TRANSIENT read (flaky I/O) is retryable: recording the blob
@@ -4448,19 +4431,31 @@ fn repair_tree(
     // an entry per KEPT lossy salvage (see `salvaged_coverage`). An excluded
     // TABLE whose metadata never parsed has unknowable coverage — recorded
     // separately so `wal_replay_scope()` can force the full-history
-    // obligation instead of silently answering as if nothing was lost. Blob
-    // files stay out of that set: losing blob content surfaces through the
-    // referencing tables (a lossy handle rewrite, or their exclusion), which
-    // ARE covered above.
+    // obligation instead of silently answering as if nothing was lost. Only a
+    // NUMERIC table candidate qualifies: a FOREIGN name (`notes.txt`) held no
+    // table data by definition, so its exclusion lost nothing — reporting it
+    // unknowable would demand an unbounded WAL archive over scribbles. Blob
+    // files stay out for the same reason in the other direction: losing blob
+    // content surfaces through the referencing tables (a lossy handle
+    // rewrite, or their exclusion), which ARE covered above.
     let blobs_folder = config.path.join(crate::file::BLOBS_FOLDER);
     let mut lost_coverage: Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)> = Vec::new();
     let mut unknowable_losses: Vec<PathBuf> = Vec::new();
+    let is_table_candidate = |path: &std::path::Path| {
+        !path.starts_with(&blobs_folder)
+            && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                matches!(
+                    crate::file::TableDirEntry::classify(n),
+                    crate::file::TableDirEntry::Table(_)
+                )
+            })
+    };
     for (path, _) in &unreadable_files {
         match coverage_by_path.get(path) {
             Some((lo, hi, seqno)) => {
                 lost_coverage.push((path.clone(), lo.clone(), hi.clone(), *seqno));
             }
-            None if !path.starts_with(&blobs_folder) => unknowable_losses.push(path.clone()),
+            None if is_table_candidate(path) => unknowable_losses.push(path.clone()),
             None => {}
         }
     }
