@@ -2158,6 +2158,17 @@ fn recover_blob_files(
             continue;
         }
 
+        // The file counts toward the progress percentage as soon as its
+        // processing starts — including the entries the early arms below
+        // reject (a crashed salvage temp, a non-numeric name), or a finished
+        // repair would sit below 100% (`bytes_processed < bytes_total`).
+        // Mirrors the table scan; best-effort stat, like the total.
+        if let Some(p) = &config.recovery_progress
+            && let Ok(meta) = config.fs.metadata(&blob_path)
+        {
+            p.add_bytes_processed(meta.len);
+        }
+
         // A crashed earlier repair's in-progress blob salvage copy: it is
         // published by an atomic rename, so a surviving one is never
         // referenced and never authoritative. Remove it here rather than
@@ -2246,9 +2257,6 @@ fn recover_blob_files(
         check_cancel(config)?;
         if let Some(p) = &config.recovery_progress {
             p.blob_file_discovered();
-            if let Ok(meta) = config.fs.metadata(&blob_path) {
-                p.add_bytes_processed(meta.len);
-            }
         }
 
         // A tight-space-punched blob records its live-data frontier only in
@@ -4358,7 +4366,15 @@ fn repair_tree(
         .filter(|(_, fidelity, ..)| fidelity.is_complete())
         .map(|(t, ..)| t.id())
         .collect();
-    let mut lineage_partial: Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)> = Vec::new();
+    let mut lineage_partial: Vec<(TableId, PathBuf, UserKey, UserKey, Option<SeqNo>)> = Vec::new();
+    let mut inputs_superseded: crate::HashSet<TableId> = crate::HashSet::default();
+    // Files excluded as REDUNDANT (a derived output whose inputs all
+    // survived, an input a complete output fully covers): their content
+    // lives on in the kept tables, so they are reported in
+    // `unreadable_files` but must NOT contribute `lost_coverage` — nothing
+    // was lost, and a coverage entry would widen the WAL replay for no
+    // reason.
+    let mut redundant_excluded: crate::HashSet<PathBuf> = crate::HashSet::default();
     {
         let candidates = core::mem::take(&mut recovered_tables);
         let kept_ranges: crate::HashMap<TableId, (UserKey, UserKey, SeqNo)> = candidates
@@ -4395,14 +4411,31 @@ fn repair_tree(
                     let reason = "derived output of an uncommitted compaction whose inputs \
                                   all survived; excluded so its merge operands are not \
                                   applied twice";
+                    redundant_excluded.insert(path.clone());
                     unreadable_files.push((path.clone(), reason.to_string()));
                     discard_after_commit.push((fs, path, reason.to_string()));
                 }
                 Some(inputs) => {
-                    // Partial survival: report each overlap with a surviving
-                    // input under the output's own coverage ceiling.
+                    // Partial survival: the output is the only complete copy
+                    // of the LOST inputs' span, so it must be kept — and each
+                    // surviving input the output's key range fully COVERS is
+                    // superseded by it (the compaction read the whole input,
+                    // so every one of its records is in a range-covering
+                    // output) and is excluded, or reads in the overlap apply
+                    // the same merge operands twice; `lost_coverage` cannot
+                    // fix that, since the documented reconciliation would see
+                    // the duplicated operand as surviving and subtract its
+                    // WAL record instead of removing the folded copy. Only a
+                    // COMPLETE output supersedes. An input the output covers
+                    // partially (its remainder belonged to a LOST sibling
+                    // output of the same run) is kept — dropping it would
+                    // lose live records — and the residual overlap is
+                    // reported.
                     let cmp = config.comparator.as_ref();
                     for input in inputs {
+                        if *input == candidate.0.id() {
+                            continue;
+                        }
                         let Some((in_min, in_max, in_hi)) = kept_ranges.get(input) else {
                             continue;
                         };
@@ -4410,6 +4443,13 @@ fn repair_tree(
                         if cmp.compare(out_range.min(), in_max) == core::cmp::Ordering::Greater
                             || cmp.compare(in_min, out_range.max()) == core::cmp::Ordering::Greater
                         {
+                            continue;
+                        }
+                        let covers = candidate.1.is_complete()
+                            && cmp.compare(out_range.min(), in_min) != core::cmp::Ordering::Greater
+                            && cmp.compare(in_max, out_range.max()) != core::cmp::Ordering::Greater;
+                        if covers {
+                            inputs_superseded.insert(*input);
                             continue;
                         }
                         let lo =
@@ -4425,6 +4465,7 @@ fn repair_tree(
                                 in_max
                             };
                         lineage_partial.push((
+                            *input,
                             candidate.2.clone(),
                             lo.clone(),
                             hi.clone(),
@@ -4436,6 +4477,32 @@ fn repair_tree(
                 _ => recovered_tables.push(candidate),
             }
         }
+    }
+    // Second pass: drop the inputs a surviving COMPLETE output fully covers.
+    // Their residual-coverage entries (recorded against a DIFFERENT,
+    // partially-covering output before the covering one was seen) go with
+    // them — the ambiguity those entries reported no longer exists.
+    if !inputs_superseded.is_empty() {
+        let candidates = core::mem::take(&mut recovered_tables);
+        for candidate in candidates {
+            if inputs_superseded.contains(&candidate.0.id()) {
+                let (table, _, path, fs) = candidate;
+                log::info!(
+                    "repair: table {} is fully covered by a surviving compaction \
+                     output; excluding it so its merge operands are not applied twice",
+                    table.id(),
+                );
+                drop(table);
+                let reason = "input fully covered by a surviving compaction output; \
+                              excluded so its merge operands are not applied twice";
+                redundant_excluded.insert(path.clone());
+                unreadable_files.push((path.clone(), reason.to_string()));
+                discard_after_commit.push((fs, path, reason.to_string()));
+            } else {
+                recovered_tables.push(candidate);
+            }
+        }
+        lineage_partial.retain(|(input, ..)| !inputs_superseded.contains(input));
     }
 
     // `salvaged` is a subset of `recovered`, so derive it from the tables that
@@ -4828,6 +4895,11 @@ fn repair_tree(
             })
     };
     for (path, _) in &unreadable_files {
+        // A REDUNDANT exclusion lost nothing — its content lives on in the
+        // kept tables — so it contributes no coverage.
+        if redundant_excluded.contains(path) {
+            continue;
+        }
         match coverage_by_path.get(path) {
             Some((lo, hi, seqno)) => {
                 lost_coverage.push((path.clone(), lo.clone(), hi.clone(), *seqno));
@@ -4838,7 +4910,11 @@ fn repair_tree(
     }
     lost_coverage.extend(salvaged_coverage);
     lost_coverage.extend(ambiguous_order_coverage);
-    lost_coverage.extend(lineage_partial);
+    lost_coverage.extend(
+        lineage_partial
+            .into_iter()
+            .map(|(_, path, lo, hi, bound)| (path, lo, hi, bound)),
+    );
     unknowable_losses.extend(salvaged_unknowable);
 
     // Success only: a failed run leaves the phase where it stopped, which

@@ -8790,15 +8790,14 @@ fn repair_excludes_a_compaction_output_whose_inputs_survived() -> crate::Result<
     Ok(())
 }
 
-/// A FILTERED compaction's output is not derived: the filter's verdicts
-/// (`Remove` / `RemoveWeak` / `ReplaceValue` / `Destroy`) are authoritative
-/// transformations the inputs cannot reproduce — after a committed TTL
-/// compaction, trading the output back for resurrected inputs would revive
-/// the expired values. Such an output records NO lineage, which keeps it out
-/// of the rebuild's dedup entirely.
+/// A compaction filter that only ever answers `Keep` transforms nothing, so
+/// the output stays fully derivable from its inputs and KEEPS its lineage —
+/// hiding every filtered run from the manifest-repair dedup would silently
+/// re-open the duplicate-history double-merge for any deployment that merely
+/// configures a filter.
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
-fn a_filtered_compaction_output_records_no_lineage() -> crate::Result<()> {
+fn a_keep_only_filtered_compaction_output_keeps_its_lineage() -> crate::Result<()> {
     use crate::compaction::filter::{
         CompactionFilter, Context as FilterContext, Factory, ItemAccessor, Verdict,
     };
@@ -8843,8 +8842,71 @@ fn a_filtered_compaction_output_records_no_lineage() -> crate::Result<()> {
     let version = tree.current_version();
     let output = version.iter_tables().next().expect("one compacted table");
     assert_eq!(
+        output.metadata.lineage.as_deref(),
+        Some(&[0, 1][..]),
+        "a Keep-only filter transforms nothing; the output stays derivable",
+    );
+    Ok(())
+}
+
+/// An output a compaction filter actually TRANSFORMED (any non-`Keep`
+/// verdict in its window) is not derivable from its inputs: after a
+/// committed TTL compaction, trading it back for resurrected inputs would
+/// revive the removed values. Such an output sheds its lineage, which keeps
+/// it out of the rebuild's dedup.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_transforming_compaction_output_sheds_its_lineage() -> crate::Result<()> {
+    use crate::compaction::filter::{
+        CompactionFilter, Context as FilterContext, Factory, ItemAccessor, Verdict,
+    };
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    struct RemoveB;
+    impl CompactionFilter for RemoveB {
+        fn filter_item(
+            &mut self,
+            item: ItemAccessor<'_>,
+            _ctx: &FilterContext,
+        ) -> crate::Result<Verdict> {
+            Ok(if item.key() == b"b" {
+                Verdict::Remove
+            } else {
+                Verdict::Keep
+            })
+        }
+    }
+    struct RemoveBFactory;
+    impl Factory for RemoveBFactory {
+        fn name(&self) -> &'static str {
+            "RemoveB"
+        }
+        fn make_filter(&self, _ctx: &FilterContext) -> Box<dyn CompactionFilter> {
+            Box::new(RemoveB)
+        }
+    }
+
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_compaction_filter_factory(Some(Arc::new(RemoveBFactory)))
+    .open()?;
+
+    tree.insert(b"a", b"v", 1);
+    tree.flush_active_memtable(0)?;
+    tree.insert(b"b", b"v", 2);
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(u64::MAX, 3)?;
+
+    let version = tree.current_version();
+    let output = version.iter_tables().next().expect("one compacted table");
+    assert_eq!(
         output.metadata.lineage, None,
-        "a filtered output must not be tradable back for its inputs",
+        "a transformed output must not be tradable back for its inputs",
     );
     Ok(())
 }
@@ -8910,11 +8972,15 @@ fn repair_keeps_an_output_whose_inputs_survived_only_lossily() -> crate::Result<
 }
 
 /// The PARTIAL case: one input of the crashed compaction is gone, so the
-/// output is the only complete copy of its span and must be KEPT alongside
-/// the surviving input — and the overlap is reported, because reads in that
-/// span may double-apply the surviving input's operands.
+/// output (the only complete copy of the lost span) is KEPT — and a
+/// surviving input the output's key range fully COVERS is superseded by it
+/// and excluded: keeping both would apply the same merge operands twice on
+/// every read of the overlap, and `lost_coverage` cannot fix that (the
+/// reconciliation would see the duplicated operand as surviving and subtract
+/// its WAL record instead of removing the folded copy). Nothing is lost, so
+/// no coverage is reported either.
 #[test]
-fn repair_reports_a_compaction_output_with_partially_surviving_inputs() -> crate::Result<()> {
+fn repair_supersedes_an_input_a_partial_output_fully_covers() -> crate::Result<()> {
     use crate::table::Writer;
     use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
     use std::sync::Arc;
@@ -8925,7 +8991,7 @@ fn repair_reports_a_compaction_output_with_partially_surviving_inputs() -> crate
     let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
 
     // Input 0 survives; input 1 is LOST (never written here); output 2
-    // records lineage [0, 1].
+    // records lineage [0, 1] and fully covers input 0's key range.
     {
         let mut w = Writer::new(tables.join("0"), 0, 0, Arc::clone(&fs))?;
         w.write(InternalValue::from_components(
@@ -8956,14 +9022,76 @@ fn repair_reports_a_compaction_output_with_partially_surviving_inputs() -> crate
     )
     .repair()?;
     assert_eq!(
+        report.recovered, 1,
+        "the covered input is superseded by the kept output: {report:?}",
+    );
+    assert!(
+        report.lost_coverage.is_empty(),
+        "a superseded input lost nothing — its content lives in the output: \
+         {report:?}",
+    );
+    Ok(())
+}
+
+/// The RESIDUAL partial case: the surviving input reaches BEYOND the kept
+/// output's range (its remainder belonged to a lost sibling output of the
+/// same run), so it cannot be superseded — dropping it would lose live
+/// records. Both are kept and the overlap is reported.
+#[test]
+fn repair_reports_the_overlap_of_a_partially_covered_input() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    // Input 0 spans [a, z]; the surviving output 2 (lineage [0, 1]) spans
+    // only [a, m] — the [n, z] remainder was in a LOST sibling output.
+    {
+        let mut w = Writer::new(tables.join("0"), 0, 0, Arc::clone(&fs))?;
+        for key in [b"a".as_slice(), b"z".as_slice()] {
+            w.write(InternalValue::from_components(
+                key.to_vec(),
+                b"v".to_vec(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the input is non-empty");
+    }
+    {
+        let mut w = Writer::new(tables.join("2"), 2, 0, Arc::clone(&fs))?
+            .use_recency(Some(1))
+            .use_lineage(Some(vec![0, 1]));
+        for key in [b"a".as_slice(), b"m".as_slice()] {
+            w.write(InternalValue::from_components(
+                key.to_vec(),
+                b"v".to_vec(),
+                2,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the output is non-empty");
+    }
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+    assert_eq!(
         report.recovered, 2,
-        "the output is the only complete copy of the lost input's span and \
-         is kept: {report:?}",
+        "an input reaching beyond the output holds live records and is kept: \
+         {report:?}",
     );
     assert!(
         !report.lost_coverage.is_empty(),
-        "the overlap with the surviving input must be reported — reads there \
-         may double-apply merge operands: {report:?}",
+        "the residual overlap must be reported — reads there may double-apply \
+         merge operands: {report:?}",
     );
     Ok(())
 }
@@ -11404,6 +11532,63 @@ fn repair_publishes_phase_and_byte_progress() -> crate::Result<()> {
         "a completed run took up exactly what it announced",
     );
     assert_eq!(snap.tables_recovered, 1, "the flushed SST was recovered");
+    Ok(())
+}
+
+/// The byte-progress contract holds when the blob folder carries entries the
+/// scan REJECTS early: a foreign (non-numeric) name and a crashed salvage
+/// temp are both in the upfront `bytes_total` listing, so they must count as
+/// processed when their arms dispose of them — or a successful repair ends
+/// `Done` with `bytes_processed < bytes_total` and a percentage UI never
+/// reaches 100%.
+#[test]
+fn repair_progress_reaches_the_total_past_rejected_blob_entries() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, RecoveryPhase, RecoveryProgress, SequenceNumberCounter};
+    use std::io::Write;
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    blob_tree_without_manifest(&memfs, &root)?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    for junk in ["not-a-blob-id", "7.salvage-tmp"] {
+        let mut f = memfs.open(
+            &blobs.join(junk),
+            &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        f.write_all(b"leftover bytes")?;
+    }
+
+    let progress = Arc::new(RecoveryProgress::default());
+    Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .with_kv_separation(Some(
+        crate::KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .with_recovery_progress(Arc::clone(&progress))
+    .repair()?;
+
+    let snap = progress.snapshot();
+    assert_eq!(
+        snap.phase,
+        RecoveryPhase::Done,
+        "a successful run ends Done"
+    );
+    assert!(
+        snap.bytes_total > 0,
+        "the upfront listing published a total"
+    );
+    assert_eq!(
+        snap.bytes_processed, snap.bytes_total,
+        "rejected blob entries count as processed when their arms dispose of \
+         them — {} of {} leaves a percentage UI below 100%",
+        snap.bytes_processed, snap.bytes_total,
+    );
     Ok(())
 }
 

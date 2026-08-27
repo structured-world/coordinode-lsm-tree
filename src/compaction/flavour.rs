@@ -67,12 +67,15 @@ pub(super) fn prepare_table_writer(
     // block compression to the same pool from a pool thread would deadlock
     // (the draining thread parks on a worker slot that can't be scheduled).
     block_parallel: bool,
-    // Whether a COMPACTION FILTER runs over this output. A filtered output is
-    // not derived: the filter's verdicts (Remove / RemoveWeak / ReplaceValue
-    // / Destroy) are authoritative transformations the inputs cannot
-    // reproduce, so manifest repair must never trade the output back for
-    // them — omitting the lineage keeps it out of the rebuild's dedup.
-    filtered: bool,
+    // The compaction-filter transform counter shared with the filter adapter
+    // (`Some` iff a filter is instantiated for this run). Lineage is stamped
+    // unconditionally; the writer STRIPS it from any output whose window saw
+    // a non-`Keep` verdict — that output is not derivable from its inputs
+    // (Remove / RemoveWeak / ReplaceValue / Destroy are authoritative
+    // transformations), so manifest repair must never trade it back for
+    // them. A `Keep`-only filtered run keeps its lineage, so the rebuild's
+    // duplicate-history dedup stays effective.
+    transform_marker: Option<alloc::sync::Arc<portable_atomic::AtomicU64>>,
 ) -> crate::Result<MultiWriter> {
     let (table_base_folder, level_fs) = opts.config.tables_folder_for_level(payload.dest_level);
 
@@ -123,11 +126,15 @@ pub(super) fn prepare_table_writer(
     // The outputs' compaction lineage: the input ids this run merges. Lets a
     // manifest-loss rebuild recognize the output as DERIVED and exclude it
     // when every input survived a crash-before-commit, instead of publishing
-    // both histories and double-applying the merge operands on read. A
-    // FILTERED output records none (see the `filtered` parameter).
-    .use_lineage((!filtered).then(|| payload.table_ids.iter().copied().collect()))
+    // both histories and double-applying the merge operands on read. An
+    // output a filter TRANSFORMS sheds it (see `transform_marker`).
+    .use_lineage(Some(payload.table_ids.iter().copied().collect()))
     // Compaction consumes input tables, so clip RTs to each output table's key range.
     .use_clip_range_tombstones();
+
+    if let Some(marker) = transform_marker {
+        table_writer = table_writer.use_transform_marker(marker);
+    }
 
     // One runtime-config snapshot for the whole writer setup: reading
     // `load_full()` per field could straddle a concurrent

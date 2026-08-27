@@ -139,6 +139,17 @@ pub struct MultiWriter {
     /// for every output of the run. `None` (flush / ingest) omits the key.
     lineage: Option<Vec<TableId>>,
 
+    /// Counter of compaction-filter TRANSFORMATIONS (any non-`Keep` verdict),
+    /// shared with the filter adapter. An output whose window saw one is not
+    /// derivable from its inputs, so its lineage is stripped before its meta
+    /// is written (see [`Writer::strip_lineage`]); untouched outputs of the
+    /// same run keep theirs. `None` — no filter configured.
+    transform_marker: Option<alloc::sync::Arc<portable_atomic::AtomicU64>>,
+
+    /// The marker's value when the CURRENT output started, so each output is
+    /// judged by the verdicts of its own window alone.
+    transforms_at_output_start: u64,
+
     /// Delete strategy applied to every successor [`Writer`], preserved across
     /// rotation. Under copy-on-write the writers persist no delete-bitmap; under
     /// merge-on-read / adaptive a populated bitmap is written.
@@ -232,6 +243,8 @@ impl MultiWriter {
             bulk_ingested: false,
             recency: None,
             lineage: None,
+            transform_marker: None,
+            transforms_at_output_start: 0,
             delete_strategy: crate::config::DeleteStrategy::default(),
             disable_cow_on_sst: false,
             locator_entry: crate::config::LocatorPolicyEntry::None,
@@ -641,6 +654,30 @@ impl MultiWriter {
         self
     }
 
+    /// Wires the compaction-filter transform counter (see the
+    /// `transform_marker` field). Call before writing starts.
+    #[must_use]
+    pub(crate) fn use_transform_marker(
+        mut self,
+        marker: alloc::sync::Arc<portable_atomic::AtomicU64>,
+    ) -> Self {
+        self.transforms_at_output_start = marker.load(core::sync::atomic::Ordering::Relaxed);
+        self.transform_marker = Some(marker);
+        self
+    }
+
+    /// Whether the CURRENT output's window saw a filter transformation;
+    /// re-arms the baseline for the next output.
+    fn output_was_transformed(&mut self) -> bool {
+        let Some(marker) = &self.transform_marker else {
+            return false;
+        };
+        let now = marker.load(core::sync::atomic::Ordering::Relaxed);
+        let transformed = now > self.transforms_at_output_start;
+        self.transforms_at_output_start = now;
+        transformed
+    }
+
     /// Sets the delete strategy for this and every rotated successor writer.
     #[must_use]
     pub fn delete_strategy(mut self, strategy: crate::config::DeleteStrategy) -> Self {
@@ -733,6 +770,12 @@ impl MultiWriter {
         }
 
         let mut old_writer = core::mem::replace(&mut self.writer, new_writer);
+        // The finishing output's meta is about to be written: if a compaction
+        // filter transformed a record within ITS window, the output is not
+        // derivable from its inputs — strip the lineage before it lands.
+        if self.output_was_transformed() {
+            old_writer.strip_lineage();
+        }
         old_writer.spill_block()?;
 
         // Write range tombstones to the finishing writer.
@@ -817,6 +860,10 @@ impl MultiWriter {
     ///
     /// Returns the metadata of created tables
     pub fn finish(mut self) -> crate::Result<Vec<(TableId, Checksum)>> {
+        // Same strip as `rotate` for the LAST output's window.
+        if self.output_was_transformed() {
+            self.writer.strip_lineage();
+        }
         self.writer.spill_block()?;
 
         // Write range tombstones to the last writer. No next table exists,

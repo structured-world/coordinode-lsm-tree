@@ -958,6 +958,14 @@ impl Writer {
         self
     }
 
+    /// Drops the pending lineage (callable mid-write, unlike the builder):
+    /// a compaction FILTER transformed at least one record of THIS output, so
+    /// it is no longer derivable from its inputs and must never be traded
+    /// back for them by the manifest-repair dedup.
+    pub(crate) fn strip_lineage(&mut self) {
+        self.lineage = None;
+    }
+
     /// Wires the resolved per-level retrieval-ribbon locator policy entry.
     ///
     /// `Enabled` makes the writer accumulate a per-key `(block_id, slot)`

@@ -202,6 +202,11 @@ pub(crate) struct StreamFilterAdapter<'a, 'b: 'a> {
     blob_opts: Option<&'a KvSeparationOptions>,
     blob_writer: &'a mut Option<BlobFileWriter>,
     ctx: &'a Context,
+    /// Counts every non-`Keep` verdict, shared with the table writer: an
+    /// output whose window saw a TRANSFORMATION is not derivable from its
+    /// inputs, so the writer strips its compaction lineage (a `Keep`-only
+    /// run keeps it, and the manifest-repair dedup stays effective).
+    transform_marker: Option<alloc::sync::Arc<portable_atomic::AtomicU64>>,
 }
 
 impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
@@ -212,6 +217,7 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
         blobs_folder: &'a Path,
         blob_writer: &'a mut Option<BlobFileWriter>,
         ctx: &'a Context,
+        transform_marker: Option<alloc::sync::Arc<portable_atomic::AtomicU64>>,
     ) -> Self {
         Self {
             filter,
@@ -223,6 +229,7 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
             blob_opts: opts.config.kv_separation_opts.as_ref(),
             blob_writer,
             ctx,
+            transform_marker,
         }
     }
 
@@ -279,13 +286,19 @@ impl<'a, 'b: 'a> StreamFilter for StreamFilterAdapter<'a, 'b> {
             return Ok(StreamFilterVerdict::Keep);
         };
 
-        match filter.filter_item(
+        let verdict = filter.filter_item(
             ItemAccessor {
                 item,
                 shared: &self.shared,
             },
             self.ctx,
-        )? {
+        )?;
+        if !matches!(verdict, Verdict::Keep)
+            && let Some(marker) = &self.transform_marker
+        {
+            marker.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        match verdict {
             Verdict::Destroy => Ok(StreamFilterVerdict::Drop),
             Verdict::Keep => Ok(StreamFilterVerdict::Keep),
             Verdict::Remove => Ok(StreamFilterVerdict::Replace((

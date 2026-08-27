@@ -1473,7 +1473,12 @@ fn run_subcompaction(
     } else {
         None
     };
-    let filtered = compaction_filter.is_some();
+    // Shared transform counter: the adapter ticks it on every non-Keep
+    // verdict, and the table writer strips the lineage of any output whose
+    // window saw one (see `prepare_table_writer`).
+    let transform_marker = compaction_filter
+        .is_some()
+        .then(|| Arc::new(portable_atomic::AtomicU64::new(0)));
 
     // KV separation (no relocation on this path): track fragmentation from
     // dropped/GC'd entries so the merged install updates blob GC stats.
@@ -1489,6 +1494,7 @@ fn run_subcompaction(
         blobs_folder,
         &mut filter_blob_writer,
         &filter_ctx,
+        transform_marker.clone(),
     ));
 
     // Bottommost seqno-zeroing: at the last level, entries below the GC
@@ -1506,7 +1512,7 @@ fn run_subcompaction(
     // block_parallel = false: this sub-compaction already runs on a pool thread,
     // so its block compression must stay serial (nested-pool deadlock otherwise).
     let table_writer =
-        super::flavour::prepare_table_writer(version, opts, payload, false, filtered)?;
+        super::flavour::prepare_table_writer(version, opts, payload, false, transform_marker)?;
     let mut compactor: Box<dyn CompactionFlavour> = match relocation {
         // Tight-space blob defrag: relocate the stale files' live entries into a
         // fresh compact file, resuming each stale scan at its carried-over
@@ -2297,7 +2303,12 @@ fn merge_tables(
         log::trace!("Installing custom compaction filter {:?}", f.name());
         f.make_filter(&filter_ctx)
     });
-    let filtered = compaction_filter.is_some();
+    // Shared transform counter: the adapter ticks it on every non-Keep
+    // verdict, and the table writer strips the lineage of any output whose
+    // window saw one (see `prepare_table_writer`).
+    let transform_marker = compaction_filter
+        .is_some()
+        .then(|| Arc::new(portable_atomic::AtomicU64::new(0)));
 
     // This is used by the compaction filter if it wants to write new blobs
     // TODO: the filter should really pipe new blobs into the compaction stream directly,
@@ -2310,6 +2321,7 @@ fn merge_tables(
         &blobs_folder,
         &mut filter_blob_writer,
         &filter_ctx,
+        transform_marker.clone(),
     ));
 
     // Serial (single-stream) compaction: block compression may use the pool.
@@ -2318,7 +2330,7 @@ fn merge_tables(
         opts,
         payload,
         true,
-        filtered,
+        transform_marker,
     )?;
 
     let start = Instant::now();
