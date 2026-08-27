@@ -8528,6 +8528,128 @@ fn a_crashed_blob_salvage_temp_is_swept_not_fatal() -> crate::Result<()> {
 /// offsets — handles resolving to the wrong records. The salvage therefore
 /// builds into a private temp and publishes atomically: at every fault timing
 /// the tree is either fully repaired or exactly as it was found.
+/// A persist failure BEFORE the `CURRENT` pointer switch must unwind the
+/// published fresh-id blob replacements. The guard was disarmed ahead of
+/// `persist_version`, whose create / encode / finish / directory-sync steps
+/// are all fallible before the switch — so a manifest-write error left the
+/// uncommitted replacement in `blobs/`, and every failed attempt stacked
+/// another fresh-id copy (the retry salvages the damaged original again),
+/// walking recovery toward ENOSPC under exactly the tight-space conditions
+/// repair targets.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_failed_manifest_write_unwinds_published_blob_replacements() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let root = std::path::absolute("/db")?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+
+    let memfs = Arc::new(MemFs::new());
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        for i in 0..8u32 {
+            tree.insert(format!("k{i:04}").as_bytes(), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let blob_path = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one blob file")
+        .path;
+    // Corrupt the LAST frame so the blob is salvaged into a fresh-id
+    // replacement during the repair.
+    let last = crate::vlog::BlobFileScanner::new(&blob_path, &*fs_dyn, 0)?
+        .collect::<crate::Result<Vec<_>>>()?
+        .last()
+        .expect("a last frame")
+        .frame_end;
+    {
+        let mut file = memfs.open(
+            &blob_path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        let byte = crate::file::read_exact(&*file, last - 8, 1)?;
+        file.seek(SeekFrom::Start(last - 8))?;
+        file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
+    }
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    // The rebuilt manifest is `v0` (no `v*` files survive); its write dies
+    // with ENOSPC — strictly BEFORE the `CURRENT` pointer switch.
+    let fault = FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::StorageFull))
+            .on_path(root.join("v0").to_string_lossy()),
+    );
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .repair();
+    assert!(
+        result.is_err(),
+        "the manifest write fault must fail the repair: {:?}",
+        result.map(|r| r.recovered),
+    );
+    assert!(
+        !memfs.exists(&root.join("current"))?,
+        "self-check: the fault fired before the pointer switch",
+    );
+
+    let leftover: Vec<String> = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .filter(|e| !e.is_dir)
+        .map(|e| e.file_name)
+        .collect();
+    assert_eq!(
+        leftover,
+        vec![
+            blob_path
+                .file_name()
+                .expect("blob file name")
+                .to_string_lossy()
+                .to_string()
+        ],
+        "an uncommitted fresh-id replacement must be unwound, or every \
+         failed attempt stacks another copy",
+    );
+    Ok(())
+}
+
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
 fn repair_never_half_publishes_a_salvaged_blob_under_transient_faults() -> crate::Result<()> {
@@ -9405,9 +9527,9 @@ fn blob_tree_without_manifest(
 #[cfg(feature = "lz4")]
 #[test]
 fn repair_leaves_an_unreferenced_blob_out_of_the_manifest() -> crate::Result<()> {
-    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
-    use crate::io::ErrorKind;
+    use crate::fs::{Fs, MemFs};
     use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::io::Write;
     use std::sync::Arc;
 
     let memfs = Arc::new(MemFs::new());
@@ -9428,18 +9550,32 @@ fn repair_leaves_an_unreferenced_blob_out_of_the_manifest() -> crate::Result<()>
         ))
     };
 
-    // A first attempt that fails AFTER publishing its replacement leaves a
-    // fully written, checksum-valid blob under a fresh id that nothing points
-    // at — exactly what the scan cannot tell apart from a real blob file.
-    let fault = FaultFs::new((*memfs).clone());
-    fault.injector().arm(
-        FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::Interrupted))
-            .on_path(crate::file::CURRENT_VERSION_FILE),
-    );
-    assert!(
-        config(Arc::new(fault)).repair().is_err(),
-        "the faulted attempt must fail after producing its replacement",
-    );
+    // A POWER LOSS between a replacement's fresh-id publish and the manifest
+    // commit leaves a fully written, checksum-valid blob under a fresh id
+    // that nothing points at (an ERROR exit unwinds it through the publish
+    // guard, so only a crash produces this state). Fabricate the crash state
+    // directly: a healthy blob at id 1 plus the attempt's UNPUBLISHED
+    // rewritten table still at its `{id}.repair-tmp` name.
+    {
+        let fs_dyn: Arc<dyn Fs> = memfs.clone();
+        let mut w = crate::vlog::blob_file::writer::Writer::new(blobs.join("1"), 1, 0, &*fs_dyn)?;
+        w.write(b"k0000", 1, &[b'x'; 200])?;
+        w.finish()?;
+
+        let table = root.join("tables").join("0");
+        let bytes = {
+            let file = memfs.open(&table, &crate::fs::FsOpenOptions::new().read(true))?;
+            let len = crate::fs::FsFile::metadata(&*file)?.len;
+            #[expect(clippy::expect_used, reason = "test code")]
+            let len = usize::try_from(len).expect("small file");
+            crate::file::read_exact(&*file, 0, len)?.to_vec()
+        };
+        let mut tmp = memfs.open(
+            &super::repair_tmp_path(&table),
+            &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        tmp.write_all(&bytes)?;
+    }
     assert!(
         memfs.exists(&blobs.join("1"))?,
         "the abandoned replacement is what this test is about",

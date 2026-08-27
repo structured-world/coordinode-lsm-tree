@@ -192,9 +192,14 @@ any repair, derive the obligation from the report instead:
    seqno and no operand events, so absence from step 3's multiset does not
    prove an operand was lost. Track, per key, the highest surviving value /
    point-tombstone seqno (and the surviving range tombstones) from the same
-   scan, and skip ANY retained record — an operand, but also a put or
-   delete — at or below that floor: it is already incorporated or
-   superseded. A range tombstone covers only records STRICTLY below its
+   scan, and skip retained records against that floor: an OPERAND at or
+   below it (the fold incorporated operands at and below the chain head's
+   seqno), a put or delete STRICTLY below it. A point record TIED with the
+   floor must replay: equal-seqno point values are resolved by source
+   recency, not by seqno, so the floor cannot decide the tie — replaying
+   every tied WAL record in WAL order does (the memtable overwrites the
+   same internal key, so the last record in WAL order wins, and the
+   memtable is the newest source). A range tombstone covers only records STRICTLY below its
    seqno (the engine's suppression rule): a record tied with the
    tombstone's caller-assigned seqno survives a read and must replay. A
    surviving WEAK (single-delete) tombstone contributes nothing to the

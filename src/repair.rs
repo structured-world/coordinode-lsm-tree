@@ -3080,6 +3080,33 @@ impl<'a> PublishedBlobReplacements<'a> {
     }
 }
 
+/// Whether the `CURRENT` pointer on disk names `version_id` — the
+/// post-failure probe deciding if a failed `persist_version` died before or
+/// after its atomic pointer switch. A missing / unreadable / short pointer
+/// reads as "not switched": the rename either never ran or itself failed,
+/// and both leave the previous pointer (or none) in place. An OLDER tree's
+/// surviving pointer names a lower version id (the rebuild allocates
+/// `max(v*) + 1`), so it never false-positives.
+fn current_names_version(
+    fs: &dyn crate::fs::Fs,
+    folder: &std::path::Path,
+    version_id: u64,
+) -> bool {
+    let Ok(file) = fs.open(
+        &folder.join(crate::file::CURRENT_VERSION_FILE),
+        &crate::fs::FsOpenOptions::new().read(true),
+    ) else {
+        return false;
+    };
+    let Ok(bytes) = crate::file::read_exact(&*file, 0, 8) else {
+        return false;
+    };
+    let Ok(raw) = <[u8; 8]>::try_from(bytes.as_ref()) else {
+        return false;
+    };
+    u64::from_le_bytes(raw) == version_id
+}
+
 impl Drop for PublishedBlobReplacements<'_> {
     fn drop(&mut self) {
         if !self.armed || self.ids.is_empty() {
@@ -4308,45 +4335,67 @@ fn repair_tree(
     // Serialized flushes have DISJOINT seqno ranges, so an ordinary tree
     // reports nothing; only caller-assigned-seqno deployments (which have a
     // WAL to heal from) can intersect.
+    //
+    // An INTERVAL SWEEP, not an all-pairs scan: probes sort by key-range MIN
+    // and walk in that order against an active list pruned of every probe
+    // whose MAX fell below the incoming MIN — each remaining active overlaps
+    // the incoming probe by construction, so the pair work is bounded by the
+    // overlapping pairs actually inspected instead of `n²` (50k recovered
+    // tables would otherwise cost ~1.25 billion pair visits on top of the
+    // full-file verification). A store where every table carries the recency
+    // key skips the sweep entirely.
+    struct RecencyProbe {
+        min: UserKey,
+        max: UserKey,
+        lo_seqno: SeqNo,
+        hi_seqno: SeqNo,
+        modern: bool,
+        path: PathBuf,
+    }
     let mut ambiguous_order_coverage: Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)> = Vec::new();
-    for (i, (a, _, a_path)) in recovered_tables.iter().enumerate() {
-        for (b, _, _) in recovered_tables.iter().skip(i + 1) {
-            if a.metadata.recency.is_some() && b.metadata.recency.is_some() {
-                continue;
+    if recovered_tables
+        .iter()
+        .any(|(t, _, _)| t.metadata.recency.is_none())
+    {
+        let cmp = config.comparator.as_ref();
+        let mut probes: Vec<RecencyProbe> = recovered_tables
+            .iter()
+            .map(|(t, _, path)| RecencyProbe {
+                min: t.metadata.key_range.min().clone(),
+                max: t.metadata.key_range.max().clone(),
+                lo_seqno: t.get_lowest_seqno(),
+                hi_seqno: t.get_highest_seqno(),
+                modern: t.metadata.recency.is_some(),
+                path: path.clone(),
+            })
+            .collect();
+        probes.sort_by(|a, b| cmp.compare(&a.min, &b.min));
+        let mut active: Vec<&RecencyProbe> = Vec::new();
+        for probe in &probes {
+            active.retain(|other| cmp.compare(&other.max, &probe.min) != core::cmp::Ordering::Less);
+            for other in &active {
+                if probe.modern && other.modern {
+                    continue;
+                }
+                if probe.lo_seqno > other.hi_seqno || other.lo_seqno > probe.hi_seqno {
+                    continue;
+                }
+                // `other.min <= probe.min` (sort order) and
+                // `other.max >= probe.min` (retained above), so the key
+                // intersection is `[probe.min, min(maxes)]`.
+                let hi = if cmp.compare(&probe.max, &other.max) == core::cmp::Ordering::Less {
+                    &probe.max
+                } else {
+                    &other.max
+                };
+                ambiguous_order_coverage.push((
+                    probe.path.clone(),
+                    probe.min.clone(),
+                    hi.clone(),
+                    Some(probe.hi_seqno.min(other.hi_seqno)),
+                ));
             }
-            let cmp = config.comparator.as_ref();
-            if !a
-                .metadata
-                .key_range
-                .overlaps_with_key_range_cmp(&b.metadata.key_range, cmp)
-            {
-                continue;
-            }
-            let (a_lo, a_hi) = (a.get_lowest_seqno(), a.get_highest_seqno());
-            let (b_lo, b_hi) = (b.get_lowest_seqno(), b.get_highest_seqno());
-            if a_lo > b_hi || b_lo > a_hi {
-                continue;
-            }
-            let lo = if cmp.compare(a.metadata.key_range.min(), b.metadata.key_range.min())
-                == core::cmp::Ordering::Less
-            {
-                b.metadata.key_range.min()
-            } else {
-                a.metadata.key_range.min()
-            };
-            let hi = if cmp.compare(a.metadata.key_range.max(), b.metadata.key_range.max())
-                == core::cmp::Ordering::Less
-            {
-                a.metadata.key_range.max()
-            } else {
-                b.metadata.key_range.max()
-            };
-            ambiguous_order_coverage.push((
-                a_path.clone(),
-                lo.clone(),
-                hi.clone(),
-                Some(a_hi.min(b_hi)),
-            ));
+            active.push(probe);
         }
     }
     let recovered_tables: Vec<Table> = recovered_tables.into_iter().map(|(t, _, _)| t).collect();
@@ -4432,7 +4481,6 @@ fn repair_tree(
     if let Some(p) = &config.recovery_progress {
         p.set_phase(crate::RecoveryPhase::Committing);
     }
-    published_blob_replacements.disarm();
 
     // Persist with the tree's own runtime config, not defaults: it drives the
     // manifest framing (checksum algorithm, page ECC, footer mirror, manifest
@@ -4440,7 +4488,7 @@ fn repair_tree(
     // metadata to settings it never used. The last live runtime config died with
     // the lost manifest; the config supplied to `repair` is the authoritative
     // replacement.
-    crate::version::persist_version(
+    let persisted = crate::version::persist_version(
         &config.path,
         &version,
         config.comparator.name(),
@@ -4448,7 +4496,22 @@ fn repair_tree(
         Arc::new(config.initial_runtime_config.clone()),
         config.encryption.clone(),
         config.sync_mode,
-    )?;
+    );
+    // The guard stays ARMED until the commit is decided: every fallible
+    // `persist_version` step before its atomic `CURRENT` switch (manifest
+    // create / encode / finish / directory sync, and the switch's own
+    // rename) leaves the replacements unreferenced garbage a retry would
+    // re-derive — keeping them would stack another fresh-id copy per failed
+    // attempt, walking recovery toward ENOSPC under exactly the tight-space
+    // conditions it targets. The ONE fallible step after the switch is the
+    // pointer's directory sync, so on failure the pointer on disk decides
+    // which world this is: a `CURRENT` naming the rebuilt version means the
+    // manifest is published and the replacements are the files it
+    // references.
+    if persisted.is_ok() || current_names_version(&*config.fs, &config.path, version_id) {
+        published_blob_replacements.disarm();
+    }
+    persisted?;
 
     // A rebuilt snapshot is a complete generation on its own. Sweep every stale
     // edit log so nothing is replayed on top of it: the lost manifest's

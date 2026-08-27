@@ -998,14 +998,30 @@ fn reconcile_after_repair(
                 }
             }
         }
-        let record_superseded = |key: &[u8], seqno: u64| {
-            superseded_floor.get(key).is_some_and(|&v| seqno <= v)
-                // STRICT `<`, matching the engine's suppression rule
-                // (`kv_seqno < rt.seqno`): a record TIED with the tombstone's
-                // caller-assigned seqno survives a read, so it must replay.
-                || surviving_range_tombstones
-                    .iter()
-                    .any(|(s, e, rt)| key >= s.as_slice() && key < e.as_slice() && seqno < *rt)
+        let rt_covered = |key: &[u8], seqno: u64| {
+            // STRICT `<`, matching the engine's suppression rule
+            // (`kv_seqno < rt.seqno`): a record TIED with the tombstone's
+            // caller-assigned seqno survives a read, so it must replay.
+            surviving_range_tombstones
+                .iter()
+                .any(|(s, e, rt)| key >= s.as_slice() && key < e.as_slice() && seqno < *rt)
+        };
+        // An OPERAND at the floor is part of the folded chain (the fold
+        // incorporated operands at and below the chain head's seqno), so its
+        // floor check is `<=`.
+        let operand_superseded = |key: &[u8], seqno: u64| {
+            superseded_floor.get(key).is_some_and(|&v| seqno <= v) || rt_covered(key, seqno)
+        };
+        // A POINT record TIED with the floor replays: equal-seqno point
+        // values resolve by SOURCE recency, not by seqno, so the floor
+        // cannot decide the tie — replaying every tied WAL record in WAL
+        // order does (the memtable overwrites the same internal key, so the
+        // last record in WAL order wins, and the memtable is the newest
+        // source). Records STRICTLY below stay skipped, which keeps the
+        // zeroed-survivor protection: that floor is unbounded, and no
+        // genuine record ties with it.
+        let point_superseded = |key: &[u8], seqno: u64| {
+            superseded_floor.get(key).is_some_and(|&v| seqno < v) || rt_covered(key, seqno)
         };
 
         for record in records
@@ -1023,7 +1039,7 @@ fn reconcile_after_repair(
                         Some(count) => *count -= 1,
                         // Folded into (or superseded by) a surviving value or
                         // tombstone: already accounted for.
-                        None if record_superseded(key, record.seqno) => {}
+                        None if operand_superseded(key, record.seqno) => {}
                         None => apply(tree, record)?,
                     }
                 }
@@ -1031,12 +1047,13 @@ fn reconcile_after_repair(
                     if zone.covers_key(key) =>
                 {
                     // Blind replay is idempotent against REAL surviving
-                    // versions, but a record at or below the superseded
+                    // versions, but a record STRICTLY below the superseded
                     // floor is already incorporated (a bottommost-zeroed
                     // survivor sits at seqno 0 while embodying the whole
                     // folded history — replaying over it would resurrect a
-                    // pre-fold state) or superseded outright.
-                    if !record_superseded(key, record.seqno) {
+                    // pre-fold state) or superseded outright; a record TIED
+                    // with the floor replays (see `point_superseded`).
+                    if !point_superseded(key, record.seqno) {
                         apply(tree, record)?;
                     }
                 }
@@ -1058,20 +1075,17 @@ fn reconcile_after_repair(
                     for entry in entries {
                         match entry {
                             BatchEntry::Insert { key, value }
-                                if zone.covers_key(key)
-                                    && !record_superseded(key, record.seqno) =>
+                                if zone.covers_key(key) && !point_superseded(key, record.seqno) =>
                             {
                                 tree.insert(key.as_slice(), value.as_slice(), record.seqno);
                             }
                             BatchEntry::Remove { key }
-                                if zone.covers_key(key)
-                                    && !record_superseded(key, record.seqno) =>
+                                if zone.covers_key(key) && !point_superseded(key, record.seqno) =>
                             {
                                 tree.remove(key.as_slice(), record.seqno);
                             }
                             BatchEntry::RemoveWeak { key }
-                                if zone.covers_key(key)
-                                    && !record_superseded(key, record.seqno) =>
+                                if zone.covers_key(key) && !point_superseded(key, record.seqno) =>
                             {
                                 tree.remove_weak(key.as_slice(), record.seqno);
                             }
@@ -1081,7 +1095,7 @@ fn reconcile_after_repair(
                                     .filter(|count| **count > 0);
                                 match covered {
                                     Some(count) => *count -= 1,
-                                    None if record_superseded(key, record.seqno) => {}
+                                    None if operand_superseded(key, record.seqno) => {}
                                     None => {
                                         tree.merge(key.as_slice(), value.as_slice(), record.seqno);
                                     }
@@ -1512,6 +1526,110 @@ fn reconciled_replay_restores_the_put_a_surviving_weak_delete_pairs_with() -> ls
         "the put the surviving weak delete pairs with must be replayed — a \
          floor at the weak tombstone's seqno would leave the older value to \
          be consumed instead",
+    );
+    assert_eq!(
+        snapshot(&tree),
+        reference,
+        "the reconciled tree mirrors the healthy tree's visible state",
+    );
+    Ok(())
+}
+
+/// A LOST put tied by caller-assigned seqno with a SURVIVING older put must
+/// replay: equal-seqno point values are resolved by source recency, not by
+/// seqno, so flooring the tie away leaves the repaired tree serving whichever
+/// value the fallback table order picked. Replaying every tied WAL record in
+/// WAL order converges the tie authoritatively — the memtable overwrites the
+/// same internal key, so the LAST record in WAL order wins, and the memtable
+/// is the newest source.
+#[test]
+fn reconciled_replay_restores_a_put_tied_with_a_surviving_older_put() -> lsm_tree::Result<()> {
+    // Seqnos start at 1, per the section 4 GC-coordination rule.
+    let records = vec![
+        WalRecord {
+            seqno: 7,
+            op: WalOp::Insert {
+                key: b"tie".to_vec(),
+                value: b"old".to_vec(),
+            },
+        },
+        // --- flush: SST 0 (survives) holds the OLDER tied put
+        WalRecord {
+            seqno: 7,
+            op: WalOp::Insert {
+                key: b"tie".to_vec(),
+                value: b"new".to_vec(),
+            },
+        },
+        // --- flush: SST 1 (damaged below) holds the NEWER tied put
+    ];
+
+    // Reference: the same workload applied to a healthy tree.
+    let reference_dir = tempfile::tempdir().expect("tempdir");
+    let reference = {
+        let tree = open_tree(reference_dir.path());
+        for record in &records {
+            apply(&tree, record)?;
+        }
+        assert_eq!(
+            tree.get(b"tie", 8)?.as_deref(),
+            Some(b"new".as_slice()),
+            "self-check: the newer source wins the tie in the healthy tree",
+        );
+        snapshot(&tree)
+    };
+
+    let crash_dir = tempfile::tempdir().expect("tempdir");
+    let wal_path = crash_dir.path().join("wal.log");
+    let mut wal = ReferenceWal::create(&wal_path).expect("create wal");
+    {
+        let tree = open_tree(crash_dir.path());
+        for record in &records {
+            wal.append(record).expect("wal append");
+            apply(&tree, record)?;
+            tree.flush_active_memtable(0)?;
+        }
+    }
+    // Damage the SECOND SST's leading data block: metadata still parses, so
+    // its coverage is reported; the older tied put's SST survives.
+    let sst = crash_dir.path().join("tables").join("1");
+    let mut bytes = std::fs::read(&sst).expect("read sst");
+    for b in bytes.get_mut(8..24).expect("sst larger than 24 bytes") {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&sst, &bytes).expect("write corruption");
+    for entry in std::fs::read_dir(crash_dir.path()).expect("read dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_version = name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || name == "current" {
+            std::fs::remove_file(entry.path()).expect("remove manifest file");
+        }
+    }
+
+    let (tree, repaired) = Config::new(
+        crash_dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(CounterMerge)))
+    .open_or_repair(lsm_tree::RepairPolicy::default())?;
+    let report = repaired.expect("the damaged store opens only after a repair");
+    assert!(
+        !report.lost_coverage.is_empty(),
+        "the excluded SST's coverage must be reported: {report:?}",
+    );
+
+    reconcile_after_repair(&tree, &wal, &report, 7)?;
+
+    assert_eq!(
+        tree.get(b"tie", 8)?.as_deref(),
+        Some(b"new".as_slice()),
+        "a lost put tied with a surviving put must replay — the tie resolves \
+         by source recency, and the WAL's order is the authority",
     );
     assert_eq!(
         snapshot(&tree),

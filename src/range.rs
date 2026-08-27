@@ -386,6 +386,7 @@ impl TreeIter {
             }
 
             // Sealed memtables
+            let table_source_count = iters.len();
             for memtable in lock.version.sealed_memtables.iter() {
                 range_tombstones.extend(
                     memtable
@@ -431,6 +432,17 @@ impl TreeIter {
                         .map(Ok),
                 ));
             }
+
+            // Tie-break order: the merger resolves identical (key, seqno)
+            // entries to the LOWEST source index, so sources must run NEWEST
+            // FIRST — the point read's order (active memtable, sealed newest
+            // first, then tables). The blocks above push tables first and
+            // memtables oldest-first, so reverse the memtable segment and
+            // rotate it to the front rather than reordering the collection.
+            if let Some(memtable_segment) = iters.get_mut(table_source_count..) {
+                memtable_segment.reverse();
+            }
+            iters.rotate_left(table_source_count);
 
             let merged = build_seeking(iters, lock.comparator.clone());
             // Clone is cheap: point-read RT sets are typically 0-2 entries.
@@ -723,6 +735,7 @@ impl TreeIter {
             }
 
             // Sealed memtables
+            let table_source_count = iters.len();
             for memtable in lock.version.sealed_memtables.iter() {
                 all_range_tombstones.extend(
                     memtable
@@ -792,6 +805,19 @@ impl TreeIter {
                 );
                 iters.push(iter);
             }
+
+            // Tie-break order: the merger resolves identical (key, seqno)
+            // entries to the LOWEST source index, so sources must run NEWEST
+            // FIRST — the point read's order (ephemeral overlay, active
+            // memtable, sealed newest first, then tables). The blocks above
+            // push tables first and memtables oldest-first (their RT
+            // collection deliberately trails the table-skip sort, which wants
+            // the SST-only subset), so reverse the memtable segment and
+            // rotate it to the front rather than reordering the collection.
+            if let Some(memtable_segment) = iters.get_mut(table_source_count..) {
+                memtable_segment.reverse();
+            }
+            iters.rotate_left(table_source_count);
 
             let merged = build_seeking(iters, lock.comparator.clone());
             // Clone needed: MvccStream uses the RT set for merge suppression,
@@ -1248,6 +1274,30 @@ fn build_seek_pipeline<'a>(
     let mut sources: Vec<SeekableLeaf<'a>> =
         Vec::with_capacity(collected.single_tables.len() + collected.multi_runs.len() + 3);
 
+    // Tie-break order: the merger resolves identical (key, seqno) entries to
+    // the LOWEST source index, so sources go NEWEST FIRST — the point read's
+    // order (ephemeral overlay, active memtable, sealed newest first, then
+    // tables). A tied entry otherwise resolves to a source the point read
+    // shadows, and a scan serves a value `get` does not.
+    if let Some((mt, eph_seqno)) = &state.ephemeral {
+        sources.push(SeekableLeaf::Memtable(MemtableLeaf::new(
+            mt,
+            internal.clone(),
+            *eph_seqno,
+        )));
+    }
+    sources.push(SeekableLeaf::Memtable(MemtableLeaf::new(
+        &state.version.active_memtable,
+        internal.clone(),
+        seqno,
+    )));
+    for memtable in state.version.sealed_memtables.iter().rev() {
+        sources.push(SeekableLeaf::Memtable(MemtableLeaf::new(
+            memtable,
+            internal.clone(),
+            seqno,
+        )));
+    }
     for table in &collected.single_tables {
         sources.push(SeekableLeaf::Table(Box::new(TableLeaf::new(
             table.clone(),
@@ -1264,23 +1314,6 @@ fn build_seek_pipeline<'a>(
         ) {
             sources.push(SeekableLeaf::Run(Box::new(leaf)));
         }
-    }
-    for memtable in state.version.sealed_memtables.iter() {
-        sources.push(SeekableLeaf::Memtable(MemtableLeaf::new(
-            memtable,
-            internal.clone(),
-            seqno,
-        )));
-    }
-    sources.push(SeekableLeaf::Memtable(MemtableLeaf::new(
-        &state.version.active_memtable,
-        internal.clone(),
-        seqno,
-    )));
-    if let Some((mt, eph_seqno)) = &state.ephemeral {
-        sources.push(SeekableLeaf::Memtable(MemtableLeaf::new(
-            mt, internal, *eph_seqno,
-        )));
     }
 
     let merged = SeekingMerger::new(sources, state.comparator.clone());
