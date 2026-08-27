@@ -150,6 +150,16 @@ pub struct MultiWriter {
     /// judged by the verdicts of its own window alone.
     transforms_at_output_start: u64,
 
+    /// The marker's value observed AFTER the last record actually written.
+    /// Rotation happens BEFORE the triggering record is inserted, so at that
+    /// moment the live counter already includes verdicts belonging to the NEW
+    /// output (the triggering record's own, and any removals between the two
+    /// writes — the size threshold is a property of the finished old output,
+    /// so every verdict since its last write belongs to the successor). The
+    /// finishing output is therefore judged by this milestone, never the live
+    /// counter.
+    transforms_after_last_write: u64,
+
     /// Delete strategy applied to every successor [`Writer`], preserved across
     /// rotation. Under copy-on-write the writers persist no delete-bitmap; under
     /// merge-on-read / adaptive a populated bitmap is written.
@@ -245,6 +255,7 @@ impl MultiWriter {
             lineage: None,
             transform_marker: None,
             transforms_at_output_start: 0,
+            transforms_after_last_write: 0,
             delete_strategy: crate::config::DeleteStrategy::default(),
             disable_cow_on_sst: false,
             locator_entry: crate::config::LocatorPolicyEntry::None,
@@ -661,21 +672,11 @@ impl MultiWriter {
         mut self,
         marker: alloc::sync::Arc<portable_atomic::AtomicU64>,
     ) -> Self {
-        self.transforms_at_output_start = marker.load(core::sync::atomic::Ordering::Relaxed);
+        let now = marker.load(core::sync::atomic::Ordering::Relaxed);
+        self.transforms_at_output_start = now;
+        self.transforms_after_last_write = now;
         self.transform_marker = Some(marker);
         self
-    }
-
-    /// Whether the CURRENT output's window saw a filter transformation;
-    /// re-arms the baseline for the next output.
-    fn output_was_transformed(&mut self) -> bool {
-        let Some(marker) = &self.transform_marker else {
-            return false;
-        };
-        let now = marker.load(core::sync::atomic::Ordering::Relaxed);
-        let transformed = now > self.transforms_at_output_start;
-        self.transforms_at_output_start = now;
-        transformed
     }
 
     /// Sets the delete strategy for this and every rotated successor writer.
@@ -773,9 +774,14 @@ impl MultiWriter {
         // The finishing output's meta is about to be written: if a compaction
         // filter transformed a record within ITS window, the output is not
         // derivable from its inputs — strip the lineage before it lands.
-        if self.output_was_transformed() {
+        // Judged by the AFTER-LAST-WRITE milestone, not the live counter:
+        // rotation runs before the triggering record is inserted, so verdicts
+        // ticked since the old output's last write (the trigger's own, and
+        // removals in between) belong to the NEW output.
+        if self.transforms_after_last_write > self.transforms_at_output_start {
             old_writer.strip_lineage();
         }
+        self.transforms_at_output_start = self.transforms_after_last_write;
         old_writer.spill_block()?;
 
         // Write range tombstones to the finishing writer.
@@ -825,6 +831,13 @@ impl MultiWriter {
 
         self.writer.write(item)?;
 
+        // The transform-attribution milestone: verdicts ticked up to a
+        // record that actually LANDED belong to the output holding it (see
+        // the `transforms_after_last_write` field).
+        if let Some(marker) = &self.transform_marker {
+            self.transforms_after_last_write = marker.load(core::sync::atomic::Ordering::Relaxed);
+        }
+
         Ok(())
     }
 
@@ -860,8 +873,14 @@ impl MultiWriter {
     ///
     /// Returns the metadata of created tables
     pub fn finish(mut self) -> crate::Result<Vec<(TableId, Checksum)>> {
-        // Same strip as `rotate` for the LAST output's window.
-        if self.output_was_transformed() {
+        // Same strip as `rotate` for the LAST output's window — judged by the
+        // LIVE counter here: with no successor output, trailing verdicts
+        // (removals after the final write) have nowhere else to land, and a
+        // record they removed would otherwise be resurrected by the dedup
+        // trading this output back for its inputs.
+        if let Some(marker) = &self.transform_marker
+            && marker.load(core::sync::atomic::Ordering::Relaxed) > self.transforms_at_output_start
+        {
             self.writer.strip_lineage();
         }
         self.writer.spill_block()?;

@@ -349,3 +349,86 @@ fn locator_section_round_trips_through_writer() -> crate::Result<()> {
 
     Ok(())
 }
+
+/// A filter transformation whose record TRIGGERS the rotation belongs to the
+/// output that would have received it — the NEW one. Rotation runs before
+/// the triggering record is inserted, so at that moment the live counter
+/// already carries its verdict; judging the finishing output by the live
+/// counter would strip the UNTOUCHED old output's lineage and leave the
+/// transformed new output with it — after manifest loss, repair could then
+/// discard the transformed output as derived and resurrect the pre-filter
+/// value from its inputs.
+#[test]
+fn a_transform_on_the_rotation_boundary_belongs_to_the_new_output() -> crate::Result<()> {
+    use crate::fs::StdFs;
+    use crate::{InternalValue, UserKey};
+    use std::sync::Arc;
+
+    let folder = tempfile::tempdir()?;
+    let base_path = folder.path().to_path_buf();
+    std::fs::create_dir_all(&base_path)?;
+
+    let id_gen = SequenceNumberCounter::default();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let marker = Arc::new(portable_atomic::AtomicU64::new(0));
+
+    // Tiny target_size: rotation fires on the key AFTER the 4 KiB fillers.
+    let mut mw = super::MultiWriter::new(base_path.clone(), id_gen, 100, 1, fs)?
+        .use_lineage(Some(vec![7, 8]))
+        .use_transform_marker(Arc::clone(&marker));
+
+    // Output 1: untouched keys.
+    for key in [b"a" as &[u8], b"l"] {
+        mw.write(InternalValue::from_components(
+            UserKey::from(key),
+            vec![0u8; 4_000],
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    // The filter TRANSFORMS the next record (a Remove verdict replaces it
+    // with a tombstone) — the adapter ticks the marker BEFORE the write, and
+    // the write's rotation happens before the record is inserted.
+    marker.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    mw.write(InternalValue::from_components(
+        UserKey::from(b"q" as &[u8]),
+        vec![],
+        2,
+        crate::ValueType::Tombstone,
+    ))?;
+    mw.write(InternalValue::from_components(
+        UserKey::from(b"z" as &[u8]),
+        vec![0u8; 100],
+        3,
+        crate::ValueType::Value,
+    ))?;
+
+    let results = mw.finish()?;
+    assert_eq!(
+        results.len(),
+        2,
+        "the boundary transform forces two outputs"
+    );
+
+    let cache = Arc::new(crate::Cache::with_capacity_bytes(64 * 1_024));
+    let comparator: crate::SharedComparator = Arc::new(crate::DefaultUserComparator);
+    let mut lineages = Vec::new();
+    for (table_id, checksum) in &results {
+        let table = crate::Table::recover(crate::table::RecoverParams::new(
+            base_path.join(table_id.to_string()),
+            *checksum,
+            *table_id,
+            Arc::new(StdFs),
+            comparator.clone(),
+            cache.clone(),
+        ))?;
+        lineages.push(table.metadata.lineage.clone());
+    }
+    assert_eq!(
+        lineages,
+        vec![Some(vec![7, 8]), None],
+        "the untouched first output keeps its lineage; the output holding \
+         the transformed record sheds it",
+    );
+    Ok(())
+}
