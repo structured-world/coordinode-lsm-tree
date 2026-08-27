@@ -4347,9 +4347,17 @@ fn repair_tree(
     // inputs, and each overlap is reported below as ambiguity coverage so a
     // reconciling deployment knows reads in that span may double-apply
     // operands. Presence is judged AFTER the blob-dependency filter above: an
-    // input dropped for an unrecoverable blob does not count as surviving.
-    let present_ids: crate::HashSet<TableId> =
-        recovered_tables.iter().map(|(t, ..)| t.id()).collect();
+    // input dropped for an unrecoverable blob does not count as surviving —
+    // and only a COMPLETE recovery counts at all: a salvaged or
+    // geometry-restricted input already lost records, so its id proves
+    // nothing about the output's contents surviving elsewhere, and trading a
+    // healthy output for damaged inputs would convert recoverable data into
+    // permanent loss.
+    let present_ids: crate::HashSet<TableId> = recovered_tables
+        .iter()
+        .filter(|(_, fidelity, ..)| fidelity.is_complete())
+        .map(|(t, ..)| t.id())
+        .collect();
     let mut lineage_partial: Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)> = Vec::new();
     {
         let candidates = core::mem::take(&mut recovered_tables);

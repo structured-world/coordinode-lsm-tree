@@ -1473,6 +1473,7 @@ fn run_subcompaction(
     } else {
         None
     };
+    let filtered = compaction_filter.is_some();
 
     // KV separation (no relocation on this path): track fragmentation from
     // dropped/GC'd entries so the merged install updates blob GC stats.
@@ -1504,7 +1505,8 @@ fn run_subcompaction(
 
     // block_parallel = false: this sub-compaction already runs on a pool thread,
     // so its block compression must stay serial (nested-pool deadlock otherwise).
-    let table_writer = super::flavour::prepare_table_writer(version, opts, payload, false)?;
+    let table_writer =
+        super::flavour::prepare_table_writer(version, opts, payload, false, filtered)?;
     let mut compactor: Box<dyn CompactionFlavour> = match relocation {
         // Tight-space blob defrag: relocate the stale files' live entries into a
         // fresh compact file, resuming each stale scan at its carried-over
@@ -2295,6 +2297,7 @@ fn merge_tables(
         log::trace!("Installing custom compaction filter {:?}", f.name());
         f.make_filter(&filter_ctx)
     });
+    let filtered = compaction_filter.is_some();
 
     // This is used by the compaction filter if it wants to write new blobs
     // TODO: the filter should really pipe new blobs into the compaction stream directly,
@@ -2310,8 +2313,13 @@ fn merge_tables(
     ));
 
     // Serial (single-stream) compaction: block compression may use the pool.
-    let table_writer =
-        super::flavour::prepare_table_writer(&current_super_version.version, opts, payload, true)?;
+    let table_writer = super::flavour::prepare_table_writer(
+        &current_super_version.version,
+        opts,
+        payload,
+        true,
+        filtered,
+    )?;
 
     let start = Instant::now();
 

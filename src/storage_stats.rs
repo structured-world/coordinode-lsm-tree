@@ -49,7 +49,8 @@ pub enum StorageStatus {
 #[must_use]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct StorageStats {
-    /// Total on-disk bytes of all live SSTs plus blob files: how much is
+    /// Total on-disk bytes of all live SSTs plus blob files (including a
+    /// restricted table's live `.restrict-bound` sidecar): how much is
     /// **occupied**. Pairs with [`Self::capacity_bytes`] / [`Self::available_bytes`]
     /// for an "X of Y used" view in a single call.
     pub used_bytes: u64,
@@ -384,12 +385,37 @@ pub(crate) fn compute_used_bytes(version: &Version) -> crate::Result<u64> {
     // overflow u64; plain arithmetic.
     let mut used_bytes = 0u64;
     for table in version.iter_tables() {
-        used_bytes += table.fs.metadata(&table.path)?.len;
+        used_bytes += table_on_disk_bytes(table)?;
     }
     for blob in version.blob_files.iter() {
         used_bytes += blob.0.fs.metadata(&blob.0.path)?.len;
     }
     Ok(used_bytes)
+}
+
+/// The physical bytes a live table occupies: the SST file plus, for a
+/// tight-space-RESTRICTED table, its `.restrict-bound` sidecar — a live
+/// companion file a checkpoint links and totals too, which keeps the
+/// documented `used_bytes == CheckpointInfo::total_bytes` invariant true for
+/// restricted trees. A restricted view whose sidecar is missing on disk (a
+/// geometry-derived restriction after a repair) counts the SST alone.
+pub(crate) fn table_on_disk_bytes(table: &crate::table::Table) -> crate::Result<u64> {
+    #[cfg_attr(not(feature = "std"), expect(unused_mut, reason = "no sidecar arm"))]
+    let mut bytes = table.fs.metadata(&table.path)?.len;
+    // Restrictions are created only by the std-only tight-space / repair
+    // paths, so the sidecar probe is std-gated with them.
+    #[cfg(feature = "std")]
+    if table.restrict_lower_bound().is_some() {
+        match table
+            .fs
+            .metadata(&crate::restrict_bound::sidecar_path(&table.path))
+        {
+            Ok(m) => bytes += m.len,
+            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(bytes)
 }
 
 /// The transient-output bound a full compaction's space check uses: the largest
@@ -453,8 +479,10 @@ pub(crate) fn compute_storage_stats(
     // would itself signal a corrupt metadata read).
     for table in version.iter_tables() {
         let m = &table.metadata;
-        // Physical file size, NOT m.file_size (which undercounts — see above).
-        let on_disk = table.fs.metadata(&table.path)?.len;
+        // Physical file size, NOT m.file_size (which undercounts — see above);
+        // a restricted table's live sidecar counts too (same basis as the
+        // checkpoint total, see `table_on_disk_bytes`).
+        let on_disk = table_on_disk_bytes(table)?;
         used_bytes += on_disk;
         item_count += m.item_count;
         table_count += 1;

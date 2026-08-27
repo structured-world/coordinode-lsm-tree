@@ -4417,6 +4417,47 @@ fn assert_punched_sst_recovered_restricted(
     Ok(())
 }
 
+/// A restricted table's live `.restrict-bound` sidecar counts on BOTH
+/// accounting surfaces: the checkpoint links and totals it, so
+/// `storage_stats().used_bytes` must include it too, or the documented
+/// `used_bytes == CheckpointInfo::total_bytes` invariant breaks exactly for
+/// restricted trees.
+#[test]
+fn storage_stats_and_checkpoint_agree_on_a_restricted_tree() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = build_punched_prefix_sst(&memfs, &fs, &tables)?;
+    // A valid EXACT sidecar: the repair reopens the table restricted to it.
+    crate::restrict_bound::write(&*fs, &sst, None, 0, b"k00050", crate::fs::SyncMode::Normal)?;
+
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+    };
+    config().repair()?;
+    let tree = config().open()?;
+    let stats = tree.storage_stats()?;
+
+    let cp_dir = root.join("checkpoint");
+    let info = tree.create_checkpoint(&cp_dir)?;
+    assert_eq!(
+        stats.used_bytes, info.total_bytes,
+        "both surfaces count the restricted table's live sidecar",
+    );
+    Ok(())
+}
+
 /// A punched SST with NO `.restrict-bound` sidecar (a legacy punched SST predating
 /// sidecars, or one whose sidecar was lost) has no exact bound. With resurrection
 /// off, repair derives a conservative bound from the punch geometry and recovers
@@ -8749,6 +8790,125 @@ fn repair_excludes_a_compaction_output_whose_inputs_survived() -> crate::Result<
     Ok(())
 }
 
+/// A FILTERED compaction's output is not derived: the filter's verdicts
+/// (`Remove` / `RemoveWeak` / `ReplaceValue` / `Destroy`) are authoritative
+/// transformations the inputs cannot reproduce — after a committed TTL
+/// compaction, trading the output back for resurrected inputs would revive
+/// the expired values. Such an output records NO lineage, which keeps it out
+/// of the rebuild's dedup entirely.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_filtered_compaction_output_records_no_lineage() -> crate::Result<()> {
+    use crate::compaction::filter::{
+        CompactionFilter, Context as FilterContext, Factory, ItemAccessor, Verdict,
+    };
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    struct KeepAll;
+    impl CompactionFilter for KeepAll {
+        fn filter_item(
+            &mut self,
+            _item: ItemAccessor<'_>,
+            _ctx: &FilterContext,
+        ) -> crate::Result<Verdict> {
+            Ok(Verdict::Keep)
+        }
+    }
+    struct KeepAllFactory;
+    impl Factory for KeepAllFactory {
+        fn name(&self) -> &'static str {
+            "KeepAll"
+        }
+        fn make_filter(&self, _ctx: &FilterContext) -> Box<dyn CompactionFilter> {
+            Box::new(KeepAll)
+        }
+    }
+
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_compaction_filter_factory(Some(Arc::new(KeepAllFactory)))
+    .open()?;
+
+    tree.insert(b"a", b"v", 1);
+    tree.flush_active_memtable(0)?;
+    tree.insert(b"b", b"v", 2);
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(u64::MAX, 3)?;
+
+    let version = tree.current_version();
+    let output = version.iter_tables().next().expect("one compacted table");
+    assert_eq!(
+        output.metadata.lineage, None,
+        "a filtered output must not be tradable back for its inputs",
+    );
+    Ok(())
+}
+
+/// The lineage dedup counts only COMPLETE recoveries as surviving inputs: a
+/// salvaged (or geometry-restricted) input already lost records, so its id
+/// proves nothing about the output's contents surviving elsewhere — trading
+/// a healthy output for damaged inputs would convert recoverable data into
+/// permanent loss.
+#[test]
+fn repair_keeps_an_output_whose_inputs_survived_only_lossily() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    // Input 0: present but UNVERIFIABLE (forged unrecognized-ECC descriptor),
+    // so the salvage-mode repair rewrites it — a non-complete recovery.
+    {
+        let mut w = Writer::new(tables.join("0"), 0, 0, Arc::clone(&fs))?;
+        for i in 0..200u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the input is non-empty");
+    }
+    forge_unrecognized_ecc_descriptor(&tables.join("0"))?;
+    // Output 1: healthy, recording input 0 as its lineage.
+    {
+        let mut w = Writer::new(tables.join("1"), 1, 0, Arc::clone(&fs))?
+            .use_recency(Some(0))
+            .use_lineage(Some(vec![0]));
+        w.write(InternalValue::from_components(
+            b"k00000".to_vec(),
+            b"folded".to_vec(),
+            2,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "the output is non-empty");
+    }
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        (report.recovered, report.salvaged),
+        (2, 1),
+        "the healthy output must be KEPT — the lossily recovered input does \
+         not prove its contents survive elsewhere: {report:?}",
+    );
+    Ok(())
+}
+
 /// The PARTIAL case: one input of the crashed compaction is gone, so the
 /// output is the only complete copy of its span and must be KEPT alongside
 /// the surviving input — and the overlap is reported, because reads in that
@@ -8840,7 +9000,20 @@ fn open_or_repair_carries_the_report_when_the_follow_up_open_fails() -> crate::R
     .open_or_repair(crate::repair::RepairPolicy::default());
 
     match result {
-        Err(crate::Error::RepairedButUnopened { report, cause }) => {
+        Err(err @ crate::Error::RepairedButUnopened { .. }) => {
+            // The wrapped failure is reachable through the STANDARD error
+            // chain, so generic logging and transient-retry classifiers see
+            // it without matching this variant by name.
+            assert!(
+                matches!(
+                    core::error::Error::source(&err).and_then(|s| s.downcast_ref::<crate::Error>()),
+                    Some(crate::Error::Io(_)),
+                ),
+                "source() must expose the follow-up open's failure",
+            );
+            let crate::Error::RepairedButUnopened { report, cause } = err else {
+                unreachable!("matched above");
+            };
             assert_eq!(
                 report.recovered, 1,
                 "the committed repair's report rides with the error: {report:?}",

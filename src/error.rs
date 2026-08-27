@@ -459,6 +459,11 @@ impl core::error::Error for Error {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
+            // The variant is explicitly a causal wrapper: generic error-chain
+            // logging and transient-retry classifiers must be able to reach
+            // the follow-up open's own failure through the standard chain.
+            #[cfg(feature = "std")]
+            Self::RepairedButUnopened { cause, .. } => Some(&**cause),
             _ => None,
         }
     }
