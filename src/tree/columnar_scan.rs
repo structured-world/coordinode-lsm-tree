@@ -86,6 +86,13 @@ struct Segment {
     /// legacy tables without the count are conservatively assumed to carry
     /// duplicates. Gates the singleton path's per-key newest-visible dedup.
     may_dup: bool,
+    /// Source recency: the segment's position in the version's newest-first
+    /// table order (lower = newer). Two segments can hold DIFFERENT values
+    /// for one key at one caller-assigned seqno, and the read path serves
+    /// the newer run's value — the merge path breaks the tie with this rank,
+    /// because `group_by_overlap` re-sorts segments by minimum key and the
+    /// concatenation order alone says nothing about recency.
+    recency_rank: usize,
 }
 
 /// One key-disjoint group of segments: either a single segment (streamed
@@ -165,7 +172,10 @@ impl Tree {
         let super_version = self.version_history.read().get_version_for_snapshot(seqno);
 
         let mut segments: Vec<Segment> = Vec::new();
-        for table in super_version.version.iter_tables() {
+        // `iter_tables` yields newest-first (the same order the sequenced
+        // scan sources rely on), so the enumeration index is the recency
+        // rank.
+        for (recency_rank, table) in super_version.version.iter_tables().enumerate() {
             if !table.check_key_range_overlap_cmp(&bounds_ref, comparator.as_ref()) {
                 continue;
             }
@@ -199,6 +209,7 @@ impl Tree {
                 global: table.global_seqno(),
                 visibility,
                 may_dup,
+                recency_rank,
                 table: table.clone(),
             });
         }
@@ -719,10 +730,13 @@ impl ColumnarScan {
         }
 
         // Concatenate every segment's visible rows into one batch, tracking each
-        // surviving row's effective seqno (`local + global`) in lockstep so the
-        // dedup can compare versions across segments with different bases.
+        // surviving row's effective seqno (`local + global`) — and its source
+        // recency rank — in lockstep so the dedup can compare versions across
+        // segments with different bases and break equal-seqno ties the way the
+        // read path does (newer source wins).
         let mut combined: Option<ColumnBatch> = None;
         let mut effective: Vec<SeqNo> = Vec::new();
+        let mut source_rank: Vec<usize> = Vec::new();
         for seg in &group.segments {
             let threshold = self.seqno.saturating_sub(seg.global);
             // No predicate here: in an overlap group the predicate must run after
@@ -754,6 +768,7 @@ impl ColumnarScan {
                             "columnar_scan: effective seqno overflow",
                         ))?;
                         effective.push(eff);
+                        source_rank.push(seg.recency_rank);
                     }
                 }
                 let visible = filter_batch(&batch, &mask);
@@ -786,6 +801,7 @@ impl ColumnarScan {
         }
         let rows = combined.row_count;
         debug_assert_eq!(rows as usize, effective.len(), "seqno tracked per row");
+        debug_assert_eq!(rows as usize, source_rank.len(), "rank tracked per row");
         let mut keys: Vec<&[u8]> = Vec::with_capacity(rows as usize);
         for i in 0..rows {
             keys.push(bytes_column_row(&key_col.data, rows, i)?);
@@ -796,11 +812,19 @@ impl ColumnarScan {
         // only satisfy the no-panic-indexing lint.
         let key_at = |i: u32| keys.get(i as usize).copied().unwrap_or(&[]);
         let eff_at = |i: u32| effective.get(i as usize).copied().unwrap_or(0);
+        let rank_at = |i: u32| source_rank.get(i as usize).copied().unwrap_or(usize::MAX);
         let cmp = self.comparator.as_ref();
         let mut order: Vec<u32> = (0..rows).collect();
+        // (key asc, effective seqno desc, source recency asc): a caller can
+        // reuse one seqno across separately flushed overlapping segments with
+        // DIFFERENT values, and the read path serves the newer run's value —
+        // the rank tie-break makes the dedup below pick the same winner
+        // (combined order alone reflects `group_by_overlap`'s min-key sort,
+        // not recency).
         order.sort_by(|&a, &b| {
             cmp.compare(key_at(a), key_at(b))
                 .then_with(|| eff_at(b).cmp(&eff_at(a)))
+                .then_with(|| rank_at(a).cmp(&rank_at(b)))
         });
 
         // Keep the first index of each distinct key (highest effective seqno);

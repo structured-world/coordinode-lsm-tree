@@ -653,15 +653,16 @@ fn scan_since_replays_a_tied_range_tombstone_first_across_sources() -> lsm_tree:
             ScanSinceEvent::RangeTombstone { .. } => "range",
             ScanSinceEvent::Insert { .. } => "insert",
             ScanSinceEvent::PointTombstone { .. } => "point",
+            ScanSinceEvent::WeakTombstone { .. } => "weak",
             ScanSinceEvent::MergeOperand { .. } => "merge",
         })
         .collect();
     assert_eq!(
         kinds,
-        vec!["range", "insert", "insert", "point"],
+        vec!["range", "insert", "insert", "weak"],
         "a tied range deletion is replayed first no matter which source holds \
          it, or the consumer drops a key the tree still serves; the newer \
-         source's tied point deletion still lands last: {all:?}",
+         source's tied weak-tombstone sentinel still lands last: {all:?}",
     );
     Ok(())
 }
@@ -962,6 +963,36 @@ fn blob_scan_since_in_range_scopes_and_resolves() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A user-authored `remove_weak` is OBSERVABLY different from a regular
+/// delete: a weak tombstone annihilates exactly its matching put during
+/// compaction and can expose an older value from another run, while a
+/// regular tombstone keeps hiding it. The CDC stream must preserve the
+/// distinction, or a replica replaying the events diverges from the source.
+#[test]
+fn scan_since_distinguishes_a_weak_delete() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path())?;
+
+    tree.insert(b"k", b"v", 1);
+    tree.remove_weak(b"k", 2);
+    tree.flush_active_memtable(0)?;
+
+    let got = events(&tree, 0)?;
+    assert!(
+        !got.iter()
+            .any(|e| matches!(e, ScanSinceEvent::PointTombstone { seqno: 2, .. })),
+        "a weak single-delete must not surface as a regular point deletion: {got:?}",
+    );
+    assert!(
+        got.iter().any(|e| matches!(
+            e,
+            ScanSinceEvent::WeakTombstone { key, seqno: 2 } if key.as_ref() == b"k"
+        )),
+        "the weak delete surfaces as its own event kind: {got:?}",
+    );
+    Ok(())
+}
+
 /// An SST's metadata key range covers its POINT keys only, while a range
 /// tombstone it carries can reach past them. The scoped scan's SST pruning
 /// must not skip such a table by its point-key range, or the promised
@@ -1000,10 +1031,10 @@ fn scan_since_scoped_sees_a_tombstone_reaching_past_the_tables_point_keys() -> l
 /// The stream deliberately KEEPS it: it is a real on-disk entry the read path
 /// sees — at a seqno tie it is what makes a read at the range's start key
 /// converge to a deletion (see `scan_since_replays_a_tied_range_tombstone_
-/// first_across_sources`) — and away from a tie it replays as a point delete
+/// first_across_sources`) — and away from a tie it replays as a weak delete
 /// under the range deletion's own seqno: a no-op on top of the range event.
 #[test]
-fn scan_since_surfaces_the_rt_only_sentinel_as_a_tied_point_delete() -> lsm_tree::Result<()> {
+fn scan_since_surfaces_the_rt_only_sentinel_as_a_tied_weak_delete() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let tree = open_tree(folder.path())?;
 
@@ -1018,7 +1049,7 @@ fn scan_since_surfaces_the_rt_only_sentinel_as_a_tied_point_delete() -> lsm_tree
             end_key,
             seqno: 5,
         },
-        ScanSinceEvent::PointTombstone { key, seqno: 5 },
+        ScanSinceEvent::WeakTombstone { key, seqno: 5 },
     ] = got.as_slice()
     else {
         panic!("the range deletion plus its start-key sentinel: {got:?}");

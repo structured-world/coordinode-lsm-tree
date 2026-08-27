@@ -971,7 +971,8 @@ fn reconcile_after_repair(
                         .or_default() += 1;
                 }
                 ScanSinceEvent::Insert { key, seqno, .. }
-                | ScanSinceEvent::PointTombstone { key, seqno } => {
+                | ScanSinceEvent::PointTombstone { key, seqno }
+                | ScanSinceEvent::WeakTombstone { key, seqno } => {
                     let floor = superseded_floor.entry(key.to_vec()).or_default();
                     // Seqno 0 is a bottommost-ZEROED survivor: per the
                     // section 4 GC-coordination rule it already incorporates

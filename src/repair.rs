@@ -4242,6 +4242,20 @@ fn repair_tree(
         })
         .collect();
     let recovered_tables: Vec<Table> = recovered_tables.into_iter().map(|(t, _, _)| t).collect();
+    // A rebuilt manifest whose highest table id is the LAST one cannot be
+    // committed: the next open seeds its id allocator with `highest + 1`,
+    // which overflows — a panic in checked builds, a wrap to an existing low
+    // id in release builds (a later flush then collides with that file).
+    // Mirrors the version-id and blob-id exhaustion guards: fail the repair
+    // instead of publishing a tree that cannot allocate.
+    if recovered_tables.iter().map(Table::id).max() == Some(crate::TableId::MAX) {
+        log::error!(
+            "repair: the table id space is exhausted (id {} is in use); a rebuilt \
+             manifest would make the next open's id allocator overflow",
+            crate::TableId::MAX,
+        );
+        return Err(crate::Error::Unrecoverable);
+    }
     if let Some(p) = &config.recovery_progress {
         p.tables_recovered_add(recovered_tables.len() as u64);
         // Blob files count on the same rule and for the same reason: the

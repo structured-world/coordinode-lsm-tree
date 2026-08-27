@@ -1744,9 +1744,14 @@ impl Tree {
                 operand: entry.value,
                 seqno,
             },
-            ValueType::Tombstone | ValueType::WeakTombstone => {
-                ScanSinceEvent::PointTombstone { key, seqno }
-            }
+            // Weak (single-delete) tombstones keep their own event kind: a
+            // weak tombstone annihilates exactly its matching put during
+            // compaction and can then expose an older value, while a regular
+            // tombstone keeps hiding it — collapsing both into one event
+            // would make a replica replay a weak delete as a full delete and
+            // diverge from the source.
+            ValueType::Tombstone => ScanSinceEvent::PointTombstone { key, seqno },
+            ValueType::WeakTombstone => ScanSinceEvent::WeakTombstone { key, seqno },
             ValueType::Indirection => unreachable!("Indirection handled above"),
         })
     }
@@ -1979,9 +1984,10 @@ impl Tree {
             // deletion — so the event stream must carry it too, or a consumer
             // replaying the stream keeps a value the tree itself does not
             // serve (this stream's one rule is mirroring the tree's reads,
-            // see `merge_source_events`). Away from that tie it replays as a
-            // point delete at the range's start under the range deletion's
-            // own seqno: a no-op.
+            // see `merge_source_events`). It surfaces as the weak-tombstone
+            // event it is on disk; away from that tie a replayed weak delete
+            // at the range's start under the range deletion's own seqno is a
+            // no-op.
             let mut source = Vec::new();
             for entry in table.scan_seqno_range(target_seqno, end_seqno, block_skip)? {
                 if !in_key_range(&entry.key.user_key) {

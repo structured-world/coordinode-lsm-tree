@@ -564,6 +564,66 @@ fn bytes_rows(col: &Column, rows: usize) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Two overlapping segments can hold DIFFERENT values for one key at one
+/// caller-assigned seqno; the tree serves the NEWER run's value. The merge
+/// path must break the tie by source recency — `group_by_overlap` sorts
+/// segments by minimum key, so combined order alone can put the OLDER
+/// segment's row first and the stable sort would keep it.
+#[test]
+fn tree_columnar_scan_breaks_equal_seqno_ties_by_source_recency() {
+    let folder = get_tmp_folder();
+    let tree = open_columnar(folder.path());
+
+    // OLDER segment spans [a, c] (its lower minimum key sorts it first).
+    tree.insert(key(0), b"za".to_vec(), 1);
+    tree.insert(key(2), b"old".to_vec(), 5);
+    tree.flush_active_memtable(0).expect("flush");
+    // NEWER segment spans [b, c] with a DIFFERENT value at the same seqno.
+    tree.insert(key(1), b"zb".to_vec(), 2);
+    tree.insert(key(2), b"new".to_vec(), 5);
+    tree.flush_active_memtable(0).expect("flush");
+
+    // Ground truth: the read path serves the newer run's tied value.
+    assert_eq!(
+        tree.get(key(2), SeqNo::MAX).expect("get").as_deref(),
+        Some(b"new".as_ref()),
+        "the tree itself serves the newer source at a seqno tie",
+    );
+
+    let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for batch in tree
+        .columnar_scan(&[COL_USER_KEY, COL_VALUE], None, SeqNo::MAX, ..)
+        .expect("scan")
+    {
+        let batch = batch.expect("batch");
+        let rows = batch.row_count as usize;
+        let key_col = batch
+            .columns
+            .iter()
+            .find(|c| c.column_id == COL_USER_KEY)
+            .expect("key column");
+        let val_col = batch
+            .columns
+            .iter()
+            .find(|c| c.column_id == COL_VALUE)
+            .expect("value column");
+        got.extend(
+            bytes_rows(key_col, rows)
+                .into_iter()
+                .zip(bytes_rows(val_col, rows)),
+        );
+    }
+    assert_eq!(
+        got,
+        vec![
+            (key(0), b"za".to_vec()),
+            (key(1), b"zb".to_vec()),
+            (key(2), b"new".to_vec()),
+        ],
+        "the columnar merge must agree with the read path at a seqno tie",
+    );
+}
+
 #[test]
 fn tree_columnar_scan_applies_an_unmaterialized_range_tombstone() {
     // Rows inserted, then `remove_range`, then flushed: the columnar segment

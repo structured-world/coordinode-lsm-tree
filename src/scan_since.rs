@@ -70,12 +70,25 @@ pub enum ScanSinceEvent {
         seqno: SeqNo,
     },
 
-    /// A single key was deleted at `seqno`.
-    ///
-    /// Covers both regular and weak (single-delete) tombstones; both reduce to
-    /// "this key is gone as of `seqno`" for replay purposes.
+    /// A single key was deleted at `seqno` with a REGULAR tombstone.
     PointTombstone {
         /// User key that was deleted.
+        key: Slice,
+        /// Sequence number at which the deletion was committed.
+        seqno: SeqNo,
+    },
+
+    /// A single key was WEAK-deleted (single-delete) at `seqno`.
+    ///
+    /// Distinct from [`PointTombstone`](Self::PointTombstone) because the two
+    /// are observably different at the source: a weak tombstone annihilates
+    /// exactly its matching put during compaction and can then expose an
+    /// older value from another run, while a regular tombstone keeps hiding
+    /// it. A consumer replays this with its own weak delete (e.g.
+    /// [`AbstractTree::remove_weak`](crate::AbstractTree::remove_weak)) so
+    /// the replica reproduces the source's operation semantics.
+    WeakTombstone {
+        /// User key that was weak-deleted.
         key: Slice,
         /// Sequence number at which the deletion was committed.
         seqno: SeqNo,
@@ -103,6 +116,7 @@ impl ScanSinceEvent {
             Self::Insert { seqno, .. }
             | Self::MergeOperand { seqno, .. }
             | Self::PointTombstone { seqno, .. }
+            | Self::WeakTombstone { seqno, .. }
             | Self::RangeTombstone { seqno, .. } => *seqno,
         }
     }
@@ -114,7 +128,8 @@ impl ScanSinceEvent {
         match self {
             Self::Insert { key, .. }
             | Self::MergeOperand { key, .. }
-            | Self::PointTombstone { key, .. } => key,
+            | Self::PointTombstone { key, .. }
+            | Self::WeakTombstone { key, .. } => key,
             Self::RangeTombstone { start_key, .. } => start_key,
         }
     }
@@ -143,13 +158,15 @@ impl ScanSinceEvent {
                 ScanSinceEvent::Insert { .. } => 1,
                 ScanSinceEvent::MergeOperand { .. } => 2,
                 ScanSinceEvent::PointTombstone { .. } => 3,
+                ScanSinceEvent::WeakTombstone { .. } => 4,
             }
         }
         fn payload(e: &ScanSinceEvent) -> (&Slice, Option<&Slice>) {
             match e {
                 ScanSinceEvent::Insert { key, value, .. } => (key, Some(value)),
                 ScanSinceEvent::MergeOperand { key, operand, .. } => (key, Some(operand)),
-                ScanSinceEvent::PointTombstone { key, .. } => (key, None),
+                ScanSinceEvent::PointTombstone { key, .. }
+                | ScanSinceEvent::WeakTombstone { key, .. } => (key, None),
                 ScanSinceEvent::RangeTombstone {
                     start_key, end_key, ..
                 } => (start_key, Some(end_key)),

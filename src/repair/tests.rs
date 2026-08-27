@@ -10279,6 +10279,48 @@ fn repair_propagates_a_transient_manifest_probe_failure() -> crate::Result<()> {
     Ok(())
 }
 
+/// A structurally valid recovered SST at the LAST table id must fail the
+/// repair before its manifest commits: the next open seeds its id allocator
+/// with `highest + 1`, which overflows — a panic in checked builds, a wrap
+/// to an existing low id in release builds (a later flush then collides).
+/// Mirrors the checked version-id and blob-id exhaustion paths.
+#[test]
+fn repair_rejects_an_exhausted_table_id_space() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join(u64::MAX.to_string());
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    {
+        let mut w = Writer::new(sst, u64::MAX, 0, Arc::clone(&fs))?;
+        w.write(InternalValue::from_components(
+            b"k".to_vec(),
+            b"v".to_vec(),
+            1,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    let result = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair();
+    assert!(
+        matches!(result, Err(crate::Error::Unrecoverable)),
+        "an exhausted table id space must fail the repair, not commit a \
+         manifest the next open cannot allocate past: {:?}",
+        result.map(|r| r.recovered),
+    );
+    Ok(())
+}
+
 /// A `PermissionDenied` open is an ENVIRONMENTAL failure, not corruption: the
 /// bytes on disk are intact and an operator fixes the ACL / ownership. It
 /// must abort the repair for a retry — grading the healthy file unreadable

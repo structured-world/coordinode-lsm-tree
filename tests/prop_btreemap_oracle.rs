@@ -576,6 +576,17 @@ fn verify_cdc(tree: &Tree, oracle: &Oracle, gc_floor: u64) -> Result<(), TestCas
                 })
             }
             ScanSinceEvent::PointTombstone { .. } => None,
+            // This suite never authors a weak delete, so every weak-tombstone
+            // event is a DeleteRange materialization artifact (the RT-only
+            // sentinel); the key check keeps that self-validating too.
+            ScanSinceEvent::WeakTombstone { key, seqno } if !is_materialized_range(&key, seqno) => {
+                Some(CdcEvent::Point {
+                    seqno,
+                    key: key.to_vec(),
+                    value: None,
+                })
+            }
+            ScanSinceEvent::WeakTombstone { .. } => None,
             ScanSinceEvent::RangeTombstone {
                 start_key,
                 end_key,
