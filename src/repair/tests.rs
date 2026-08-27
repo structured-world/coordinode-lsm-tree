@@ -6633,7 +6633,9 @@ fn blob_recovery_discards_a_file_whose_metadata_id_disagrees() -> crate::Result<
     memfs.rename(&tmp, &one)?;
 
     let config = blob_validation_config(Arc::clone(&memfs));
-    let recovery = super::recover_blob_files(&config)?;
+    let mut published = super::PublishedBlobReplacements::new(&config);
+    let recovery = super::recover_blob_files(&config, &mut published)?;
+    published.disarm();
     assert!(
         recovery.files.is_empty(),
         "no swapped file may be published under its filename's id",
@@ -7059,7 +7061,9 @@ fn blob_recovery_derives_the_frontier_of_a_punched_blob_file() -> crate::Result<
     )
     .with_shared_fs(memfs);
 
-    let recovery = super::recover_blob_files(&config)?;
+    let mut published = super::PublishedBlobReplacements::new(&config);
+    let recovery = super::recover_blob_files(&config, &mut published)?;
+    published.disarm();
     let (files, unreadable) = (recovery.files, recovery.unreadable);
     assert!(
         unreadable.is_empty(),
@@ -7563,7 +7567,9 @@ fn blob_recovery_completes_the_drop_of_a_fully_punched_blob_file() -> crate::Res
     memfs.punch_hole(&consumed_path, data_start, data_end - data_start)?;
 
     let config = blob_validation_config(Arc::clone(&memfs));
-    let recovery = super::recover_blob_files(&config)?;
+    let mut published = super::PublishedBlobReplacements::new(&config);
+    let recovery = super::recover_blob_files(&config, &mut published)?;
+    published.disarm();
     assert!(
         recovery.unreadable.is_empty(),
         "a fully consumed file is a completed relocation, not damage: {:?}",
@@ -8257,7 +8263,9 @@ fn blob_recovery_keeps_a_file_whose_zeroed_tail_follows_live_frames() -> crate::
     memfs.punch_hole(&path, tail_start, data_end - tail_start)?;
 
     let config = blob_validation_config(Arc::clone(&memfs));
-    let recovery = super::recover_blob_files(&config)?;
+    let mut replacements_guard = super::PublishedBlobReplacements::new(&config);
+    let recovery = super::recover_blob_files(&config, &mut replacements_guard)?;
+    replacements_guard.disarm();
     assert!(
         memfs.exists(&path)?,
         "a zeroed tail below live frames is damage, not a completed relocation: \
@@ -9564,7 +9572,9 @@ fn blob_recovery_discards_a_persistently_unreadable_blob_file() -> crate::Result
     )
     .with_shared_fs(memfs.clone());
 
-    let recovery = super::recover_blob_files(&config)?;
+    let mut published = super::PublishedBlobReplacements::new(&config);
+    let recovery = super::recover_blob_files(&config, &mut published)?;
+    published.disarm();
     let (files, unreadable, discard) = (recovery.files, recovery.unreadable, recovery.discard);
     assert!(files.is_empty(), "nothing recoverable");
     assert_eq!(unreadable.len(), 1, "the bad blob is reported");
@@ -9613,7 +9623,9 @@ fn blob_recovery_discards_a_duplicate_blob_id() -> crate::Result<()> {
     )
     .with_shared_fs(memfs.clone());
 
-    let recovery = super::recover_blob_files(&config)?;
+    let mut published = super::PublishedBlobReplacements::new(&config);
+    let recovery = super::recover_blob_files(&config, &mut published)?;
+    published.disarm();
     let (files, unreadable, discard) = (recovery.files, recovery.unreadable, recovery.discard);
     assert_eq!(files.len(), 1, "one blob file per id");
     assert_eq!(
@@ -9693,7 +9705,8 @@ fn blob_recovery_propagates_a_transient_checksum_failure() -> crate::Result<()> 
     )
     .with_fs(fault);
 
-    let result = super::recover_blob_files(&config);
+    let result =
+        super::recover_blob_files(&config, &mut super::PublishedBlobReplacements::new(&config));
     assert!(
         result.is_err(),
         "a transient blob checksum failure must propagate for a retry, not be \
@@ -9855,11 +9868,13 @@ fn standard_tree_without_manifest(
 
 /// A KEPT salvaged copy is a loss too: it dropped corrupt blocks, so within
 /// its bounds a superseded value may now be served — yet nothing in
-/// `unreadable_files` names it. Without its own `lost_coverage` entry,
-/// `wal_replay_scope()` would answer `TailOnly` and the documented WAL
-/// reconciliation would skip the lost changes entirely.
+/// `unreadable_files` names it. Its entry must scope the SOURCE's coverage,
+/// not the replacement's: salvage dropped the block that held the source's
+/// last keys and highest seqno here, so the post-rewrite metadata would
+/// exclude exactly the lost keys from `lost_coverage` (and cap the ceiling
+/// below the truth), and the documented WAL reconciliation would skip them.
 #[test]
-fn lossy_salvage_contributes_lost_coverage() -> crate::Result<()> {
+fn lossy_salvage_contributes_the_source_coverage() -> crate::Result<()> {
     use crate::table::Writer;
     use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
     use std::sync::Arc;
@@ -9870,27 +9885,29 @@ fn lossy_salvage_contributes_lost_coverage() -> crate::Result<()> {
     let sst = tables.join("0");
     let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
 
-    // Several small blocks so salvage keeps the readable remainder.
+    // Several small blocks, ascending seqnos: the LAST block carries both the
+    // highest keys and the highest seqno, so dropping it shrinks the
+    // replacement's range AND ceiling below the source's.
     {
         let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
         for i in 0..64u32 {
             w.write(InternalValue::from_components(
                 format!("k{i:05}").into_bytes(),
                 format!("v{i}").into_bytes(),
-                7,
+                u64::from(i) + 1,
                 ValueType::Value,
             ))?;
         }
         assert!(w.finish()?.is_some(), "the SST is non-empty");
     }
 
-    // Corrupt ONE interior data block: salvage keeps the table minus it.
+    // Corrupt the LAST data block: salvage keeps the table minus it.
     let offsets: alloc::vec::Vec<u64> = recover_table(sst.clone(), &fs)?
         .data_block_handles()
         .filter_map(Result::ok)
         .map(|kh| *kh.as_ref().offset())
         .collect();
-    let Some(corrupt) = offsets.get(1).copied() else {
+    let (Some(corrupt), true) = (offsets.last().copied(), offsets.len() > 2) else {
         panic!("need several blocks, got {offsets:?}");
     };
     let flip = usize::try_from(corrupt).unwrap_or(0) + 16;
@@ -9909,21 +9926,90 @@ fn lossy_salvage_contributes_lost_coverage() -> crate::Result<()> {
     assert_eq!(report.salvaged, 1, "the table survives as a lossy copy");
     assert_eq!(report.recovered, 1, "the lossy copy joins the manifest");
     assert_eq!(report.unreadable, 0, "{:?}", report.unreadable_files);
-    let [(_, lo, hi, bound)] = report.lost_coverage.as_slice() else {
+    let [(path, lo, hi, bound)] = report.lost_coverage.as_slice() else {
         panic!(
             "the kept lossy copy must contribute a lost-coverage entry: {:?}",
             report.lost_coverage,
         );
     };
+    assert_eq!(path, &sst, "the entry names the damaged source");
     assert!(
         lo.as_ref() <= b"k00000".as_slice() && hi.as_ref() >= b"k00063".as_slice(),
-        "the entry scopes at least the copy's key range: [{lo:?}, {hi:?}]",
+        "the entry scopes the SOURCE's key range, not the shrunken copy's: [{lo:?}, {hi:?}]",
     );
-    assert_eq!(*bound, Some(7), "the loss is bounded by the copy's seqnos");
+    assert_eq!(
+        *bound,
+        Some(64),
+        "the ceiling is the SOURCE's highest seqno, not the copy's",
+    );
     assert_eq!(
         report.wal_replay_scope(),
-        super::WalReplayScope::LostUpTo(7),
+        super::WalReplayScope::LostUpTo(64),
         "the WAL must be told how deep the loss reaches",
+    );
+    Ok(())
+}
+
+/// A kept lossy salvage whose SOURCE metadata never parsed (whole-file
+/// recovery failed before the coverage could be captured) cannot be scoped:
+/// the replacement's own metadata only bounds what SURVIVED, not what was
+/// lost. Such a copy must land in `unknowable_losses` and force the
+/// full-history replay obligation.
+#[test]
+fn lossy_salvage_without_source_metadata_is_unknowable() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs};
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+
+    {
+        let build_fs: Arc<dyn Fs> = Arc::new(StdFs);
+        let mut w = Writer::new(sst, 0, 0, Arc::clone(&build_fs))?.use_data_block_size(128);
+        for i in 0..64u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Fault the FIRST streaming read (the preliminary whole-file hash) with a
+    // persistent error: whole-file recovery fails before any metadata is
+    // captured, and block-salvage recovers the blocks it can read.
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    injector.arm(
+        FaultRule::new(FaultOp::Read, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path("tables")
+            .once(),
+    );
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair_with_salvage(true)?;
+    injector.clear();
+    assert_eq!(report.salvaged, 1, "the table survives as a salvaged copy");
+    assert_eq!(
+        report.unknowable_losses.len(),
+        1,
+        "a lossy copy without source metadata cannot be scoped: {report:?}",
+    );
+    assert_eq!(
+        report.wal_replay_scope(),
+        super::WalReplayScope::FullHistory,
+        "no bound derived from survivors can scope what was lost",
     );
     Ok(())
 }
@@ -10327,6 +10413,101 @@ fn repair_cancel_removes_published_blob_replacements() -> crate::Result<()> {
     Ok(())
 }
 
+/// A pre-commit ERROR after a blob replacement was already published must
+/// remove it exactly like a cancellation does: the manifest never adopted
+/// the fresh-id file, and an orphan left behind makes the retry salvage the
+/// original AGAIN beside it — under the tight disk space this recovery
+/// targets, exactly the extra copy that fails with ENOSPC.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_error_removes_published_blob_replacements() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    // TWO blob files: 0 (damaged below) and 1 (healthy, scanned after 0's
+    // replacement is published under the fresh id 2).
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        for i in 0..8u32 {
+            tree.insert(
+                format!("k{i:04}").as_bytes(),
+                alloc::vec![b'a' + u8::try_from(i).expect("small i"); 64],
+                u64::from(i),
+            );
+        }
+        tree.flush_active_memtable(0)?;
+        for i in 0..8u32 {
+            tree.insert(
+                format!("m{i:04}").as_bytes(),
+                alloc::vec![b'a' + u8::try_from(i).expect("small i"); 64],
+                u64::from(i) + 8,
+            );
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    punch_and_corrupt_blob(&memfs, &blobs.join("0"))?;
+
+    // The TRANSIENT fault fires on the first read of the healthy blob 1 —
+    // strictly after blob 0's replacement was published under id 2.
+    let fault = FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::WouldBlock))
+            .on_path(blobs.join("1").to_string_lossy()),
+    );
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .repair();
+    assert!(
+        matches!(result, Err(crate::Error::Io(ref e)) if e.kind().is_transient()),
+        "the transient failure propagates for a retry: {:?}",
+        result.map(|r| r.recovered),
+    );
+    assert!(
+        !memfs.exists(&blobs.join("2"))?,
+        "the published replacement must be removed by the abort — an orphan \
+         here makes the retry build a second copy beside it",
+    );
+    assert!(
+        memfs.exists(&blobs.join("0"))? && memfs.exists(&blobs.join("1"))?,
+        "the originals stay untouched for the retry",
+    );
+    Ok(())
+}
+
 /// A cancel requested through the progress handle aborts the repair with the
 /// dedicated error BEFORE anything is committed — the scan is read-only, so
 /// the directory is left exactly as a retry (with a fresh handle) expects.
@@ -10470,6 +10651,71 @@ fn open_or_repair_propagates_transient_io_without_repairing() -> crate::Result<(
     assert_eq!(
         manifest_names, after,
         "repairing a transient failure would have rewritten the manifest",
+    );
+    Ok(())
+}
+
+/// An UNSUPPORTED format version is not structural corruption: a pre-V5 (or
+/// future) database has no live decoder here and needs offline conversion or
+/// a matching binary. Treating `InvalidVersion` as repairable would run the
+/// V5-only pipeline over it — every table is rejected during the scan and a
+/// fresh V5 manifest is committed around nothing, destroying the store.
+#[test]
+fn open_or_repair_propagates_an_unsupported_format_version() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::{Config, RepairPolicy, SequenceNumberCounter};
+    use std::io::Write;
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    standard_tree_without_manifest(&memfs, &root)?;
+    // Re-establish a valid manifest, then plant the V1 marker file the open's
+    // format gate rejects before it reads anything else.
+    Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs.clone())
+    .repair()?;
+    {
+        let mut file = memfs.open(
+            &root.join("version"),
+            &FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        file.write_all(b"1")?;
+    }
+    let manifest_names: Vec<String> = memfs
+        .read_dir(&root)?
+        .into_iter()
+        .filter(|e| e.file_name.starts_with('v') && e.file_name != "version")
+        .map(|e| e.file_name)
+        .collect();
+
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs.clone())
+    .open_or_repair(RepairPolicy::default().salvage(true));
+    assert!(
+        matches!(result, Err(crate::Error::InvalidVersion(_))),
+        "an unsupported format needs a converter, never a destructive rebuild: {:?}",
+        result.map(|_| "opened"),
+    );
+
+    // No repair ran: the manifest generation is untouched.
+    let after: Vec<String> = memfs
+        .read_dir(&root)?
+        .into_iter()
+        .filter(|e| e.file_name.starts_with('v') && e.file_name != "version")
+        .map(|e| e.file_name)
+        .collect();
+    assert_eq!(
+        manifest_names, after,
+        "repairing an unsupported format would have rewritten the manifest",
     );
     Ok(())
 }

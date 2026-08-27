@@ -99,18 +99,24 @@ pub struct RepairReport {
     /// to be treated as affected.
     ///
     /// A KEPT salvaged copy contributes an entry too: it dropped corrupt
-    /// blocks (or blob records), so within ITS bounds a superseded value may
+    /// blocks (or blob records), so within its bounds a superseded value may
     /// likewise now be served, even though the table itself is in the
-    /// manifest.
+    /// manifest. The entry carries the SOURCE's coverage (captured while its
+    /// metadata was readable), not the replacement's: salvage may have
+    /// dropped the block holding the source's outermost keys or highest
+    /// seqno, and bounds derived from the survivors would exclude exactly
+    /// the lost part.
     ///
     /// Empty when nothing was lost. A table whose metadata was unreadable
     /// contributes no entry here — its coverage is unknowable, and it is
     /// listed in [`unknowable_losses`](Self::unknowable_losses) instead.
     pub lost_coverage: Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)>,
 
-    /// Excluded table files whose loss cannot be scoped at all: their
-    /// metadata never parsed, so neither the affected key range nor a seqno
-    /// bound is derivable. Any entry here forces
+    /// Table files whose loss cannot be scoped at all: their metadata never
+    /// parsed, so neither the affected key range nor a seqno bound is
+    /// derivable. Covers both an EXCLUDED unreadable table and a KEPT lossy
+    /// salvaged copy whose source's metadata was unreadable (the copy's own
+    /// metadata only bounds what survived). Any entry here forces
     /// [`wal_replay_scope`](Self::wal_replay_scope) to
     /// [`WalReplayScope::FullHistory`], since no bound can prove a retained
     /// record is NOT affected. Blob files are not listed: losing blob content
@@ -2064,7 +2070,10 @@ struct BlobRecovery {
 /// or whose metadata is unreadable. The recovered checksum is the whole-file
 /// XXH3-128 digest, identical to the one the blob writer accumulated via
 /// `ChecksummedWriter`, since blob files are written strictly sequentially.
-fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
+fn recover_blob_files(
+    config: &Config,
+    published: &mut PublishedBlobReplacements<'_>,
+) -> crate::Result<BlobRecovery> {
     let blobs_folder = config.path.join(crate::file::BLOBS_FOLDER);
     let mut blob_files: Vec<crate::vlog::BlobFile> = Vec::new();
     let mut unreadable: UnreadableFiles = Vec::new();
@@ -2189,20 +2198,14 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
             continue;
         }
 
-        // Pre-commit file boundary: safe to abort — after removing the blob
-        // replacements this run already PUBLISHED under fresh ids. Unlike the
-        // read-only table scan, a successful blob salvage renames its copy to
-        // a normal numeric name before the commit, and leaving those behind
-        // on a cancel would make the retry re-create each one beside its
-        // orphan — under tight disk space exactly the sequence that fails.
-        if let Err(e) = check_cancel(config) {
-            remove_published_blob_replacements(
-                config,
-                &blobs_folder,
-                rewrites.values().filter_map(remap_replacement_id),
-            )?;
-            return Err(e);
-        }
+        // Pre-commit file boundary: safe to abort. The caller's
+        // `PublishedBlobReplacements` guard unwinds the replacements this run
+        // already published under fresh ids — unlike the read-only table
+        // scan, a successful blob salvage renames its copy to a normal
+        // numeric name before the commit, and leaving those behind would make
+        // the retry re-create each one beside its orphan (under tight disk
+        // space exactly the sequence that fails).
+        check_cancel(config)?;
         if let Some(p) = &config.recovery_progress {
             p.blob_file_discovered();
             if let Ok(meta) = config.fs.metadata(&blob_path) {
@@ -2436,6 +2439,9 @@ fn recover_blob_files(config: &Config) -> crate::Result<BlobRecovery> {
                 let _ = config.fs.remove_file(&temp);
                 return Err(e.into());
             }
+            // Under the caller's guard from this moment: any pre-commit exit
+            // removes the published file.
+            published.publish(new_id);
             config
                 .fs
                 .sync_directory_with(&blobs_folder, config.sync_mode)?;
@@ -2690,10 +2696,13 @@ impl Config {
     /// else is returned as-is: a TRANSIENT I/O failure (a repair would
     /// rebuild the manifest around files a healthy retry could still read), a
     /// held directory lock ([`Error::Locked`](crate::Error::Locked) — the
-    /// repair would contend on the same lock), and every CONFIGURATION
-    /// mismatch (wrong comparator, level route, dictionary, or encryption
-    /// key) — repairing under a wrong configuration would rebuild, and could
-    /// drop, perfectly healthy data.
+    /// repair would contend on the same lock), an UNSUPPORTED format version
+    /// ([`Error::InvalidVersion`](crate::Error::InvalidVersion) — the store
+    /// needs offline conversion or a matching binary, not a V5-only rebuild
+    /// that would reject every table), and every CONFIGURATION mismatch
+    /// (wrong comparator, level route, dictionary, or encryption key) —
+    /// repairing under a wrong configuration would rebuild, and could drop,
+    /// perfectly healthy data.
     ///
     /// # Errors
     ///
@@ -2740,13 +2749,17 @@ impl Config {
 ///
 /// Everything else propagates: transient I/O (a retry could still read the
 /// files a repair would rebuild around), a held directory lock (the repair
-/// would contend on the same lock), and every CONFIGURATION mismatch — a
-/// wrong comparator, level route, zstd dictionary, or an encryption key
-/// surfacing as a decrypt failure. Those are reversible by fixing the call,
-/// while a repair under the wrong configuration rebuilds — and can drop —
-/// perfectly healthy data (e.g. re-ordering SSTs under a mistyped comparator,
-/// or salvage discarding every block it cannot decrypt with the wrong key).
-/// Fail closed: an unlisted (including future) error is NOT repaired.
+/// would contend on the same lock), an UNSUPPORTED format version (a pre-V5
+/// or future database has no live decoder here — it needs offline conversion
+/// or a matching binary, while the V5-only repair would reject every table
+/// and commit a fresh manifest around nothing), and every CONFIGURATION
+/// mismatch — a wrong comparator, level route, zstd dictionary, or an
+/// encryption key surfacing as a decrypt failure. Those are reversible by
+/// fixing the call, while a repair under the wrong configuration rebuilds —
+/// and can drop — perfectly healthy data (e.g. re-ordering SSTs under a
+/// mistyped comparator, or salvage discarding every block it cannot decrypt
+/// with the wrong key). Fail closed: an unlisted (including future) error is
+/// NOT repaired.
 fn is_repairable_structural(e: &crate::Error) -> bool {
     use crate::Error;
     match e {
@@ -2762,7 +2775,6 @@ fn is_repairable_structural(e: &crate::Error) -> bool {
                 | crate::io::ErrorKind::UnexpectedEof
         ),
         Error::Unrecoverable
-        | Error::InvalidVersion(_)
         | Error::Decompress(_)
         | Error::Excised { .. }
         | Error::ChecksumMismatch { .. }
@@ -2970,17 +2982,13 @@ fn sweep_superseded_by_committed_manifest(config: &Config) -> crate::Result<()> 
     Ok(())
 }
 
-/// Core repair routine. Separated from the [`Config::repair`] entry point so the
-/// logic is testable against a borrowed config.
-/// Removes the fresh-id blob replacements a cancelled run already published
-/// (each [`BlobFileRewrite::Remap`] names one), so a pre-commit abort leaves
-/// nothing behind that a retry would have to re-create beside an orphan —
-/// under tight disk space exactly the sequence that fails. `NotFound` is
-/// success (a concurrent sweep, or an in-place rewrite that published no
-/// file); any other removal failure propagates, since an undiscardable
-/// leftover is precisely what the cancel guarantee promises not to leave.
-///
-/// [`BlobFileRewrite::Remap`]: crate::salvage::BlobFileRewrite::Remap
+/// Removes the fresh-id blob replacements an aborting run already published,
+/// so a pre-commit exit leaves nothing behind that a retry would have to
+/// re-create beside an orphan — under tight disk space exactly the sequence
+/// that fails. `NotFound` is success (a concurrent sweep, or an in-place
+/// rewrite that published no file); any other removal failure propagates to
+/// the caller (the guard's `Drop` downgrades it to a log line, since the run
+/// is already aborting with its own error).
 fn remove_published_blob_replacements(
     config: &Config,
     blobs_folder: &std::path::Path,
@@ -3002,16 +3010,63 @@ fn remove_published_blob_replacements(
     Ok(())
 }
 
-/// The fresh id a [`BlobFileRewrite::Remap`] published its replacement under;
-/// `None` for an in-place `DropBelow`, which created no file.
-///
-/// [`BlobFileRewrite::Remap`]: crate::salvage::BlobFileRewrite::Remap
-fn remap_replacement_id(
-    rewrite: &crate::salvage::BlobFileRewrite,
-) -> Option<crate::vlog::BlobFileId> {
-    match rewrite {
-        crate::salvage::BlobFileRewrite::Remap { new_id, .. } => Some(*new_id),
-        crate::salvage::BlobFileRewrite::DropBelow(_) => None,
+/// Every fresh-id blob replacement the running repair has PUBLISHED (renamed
+/// onto its numeric name) before the manifest commit. Dropping the guard
+/// while it is armed removes them: the manifest never adopted the files, and
+/// each one left behind makes the retry salvage its original AGAIN beside
+/// the orphan — under the tight disk space this recovery targets, exactly
+/// the extra full copy that fails with ENOSPC. `Drop`-based so EVERY
+/// pre-commit exit — an error `?`, a cancellation, an early return — unwinds
+/// them uniformly; disarmed immediately before the manifest commit, from
+/// which point the replacements are what the manifest names (a commit
+/// FAILURE deliberately leaves them: the retry's unreferenced-file filter
+/// removes what it does not adopt, and a post-rename commit error must not
+/// delete files a switched manifest may already reference).
+struct PublishedBlobReplacements<'a> {
+    config: &'a Config,
+    blobs_folder: PathBuf,
+    ids: Vec<crate::vlog::BlobFileId>,
+    armed: bool,
+}
+
+impl<'a> PublishedBlobReplacements<'a> {
+    fn new(config: &'a Config) -> Self {
+        Self {
+            config,
+            blobs_folder: config.path.join(crate::file::BLOBS_FOLDER),
+            ids: Vec::new(),
+            armed: true,
+        }
+    }
+
+    /// Records one replacement as published (its rename succeeded).
+    fn publish(&mut self, id: crate::vlog::BlobFileId) {
+        self.ids.push(id);
+    }
+
+    /// The manifest commit is next: the replacements are about to become the
+    /// files it names, so an exit from here on must not remove them.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PublishedBlobReplacements<'_> {
+    fn drop(&mut self) {
+        if !self.armed || self.ids.is_empty() {
+            return;
+        }
+        // Best-effort: the run is already aborting with its own error, and a
+        // survivor is an unreferenced file the next open's orphan sweep (or
+        // the retry's unreferenced-file filter) removes.
+        if let Err(e) =
+            remove_published_blob_replacements(self.config, &self.blobs_folder, self.ids.drain(..))
+        {
+            log::warn!(
+                "repair: could not remove a published blob replacement while \
+                 aborting ({e}); the next open's orphan sweep removes it",
+            );
+        }
     }
 }
 
@@ -3862,9 +3917,12 @@ fn repair_tree(
     // salvaged table dropped for an unrecoverable blob dependency must not
     // count, or `salvaged` could exceed `recovered`). A lossy copy superseded
     // by a complete duplicate is likewise already gone from the candidates.
-    let mut recovered_tables: Vec<(Table, bool)> = recovered_by_id
+    // Each entry keeps its SOURCE path (the scanned `{id}` file, not a
+    // salvage replacement's `{id}.repair-tmp`): it is the key into
+    // `coverage_by_path` when a kept lossy copy's loss is scoped below.
+    let mut recovered_tables: Vec<(Table, bool, PathBuf)> = recovered_by_id
         .into_values()
-        .map(|c| (c.table, c.complete))
+        .map(|c| (c.table, c.complete, c.path))
         .collect();
 
     // Newest first, by DESCENDING recency key. For a flush / ingest table that
@@ -3882,7 +3940,7 @@ fn repair_tree(
     // files reproduces the same tree instead of inheriting the directory
     // scan's order.
     recovered_tables
-        .sort_by_key(|(t, _)| (std::cmp::Reverse(t.l0_recency()), std::cmp::Reverse(t.id())));
+        .sort_by_key(|(t, _, _)| (std::cmp::Reverse(t.l0_recency()), std::cmp::Reverse(t.id())));
 
     // KV-separated (blob) trees additionally carry a blob-file list. Discover the
     // blob files from the `blobs/` folder (no manifest to filter against) and
@@ -3900,9 +3958,10 @@ fn repair_tree(
         crate::vlog::BlobFileId,
         crate::salvage::BlobFileRewrite,
     > = crate::HashMap::default();
-    // Fresh-id blob replacements this run published; removed if the run is
-    // cancelled at the last pre-commit boundary.
-    let mut published_blob_replacement_ids: Vec<crate::vlog::BlobFileId> = Vec::new();
+    // Fresh-id blob replacements this run publishes; removed on ANY exit —
+    // an error, a cancellation — before the manifest commit disarms the
+    // guard (see `PublishedBlobReplacements`).
+    let mut published_blob_replacements = PublishedBlobReplacements::new(config);
     let mut blob_files_salvaged: Vec<(PathBuf, String)> = Vec::new();
     let mut blob_frag = crate::blob_tree::FragmentationMap::default();
     // Damaged blob originals whose replacement is in the rebuilt manifest.
@@ -3915,16 +3974,10 @@ fn repair_tree(
         if let Some(p) = &config.recovery_progress {
             p.set_phase(crate::RecoveryPhase::RecoveringBlobFiles);
         }
-        let recovery = recover_blob_files(config)?;
+        let recovery = recover_blob_files(config, &mut published_blob_replacements)?;
         unreadable_files.extend(recovery.unreadable);
         blob_rewrites = recovery.rewrites;
         blob_frag = recovery.frag;
-        // The fresh-id files this run published, captured before the map is
-        // shared: the last cancellation boundary removes them on an abort.
-        published_blob_replacement_ids = blob_rewrites
-            .values()
-            .filter_map(remap_replacement_id)
-            .collect();
         stale_blob_originals = recovery.stale;
         // Foreign names, duplicates and unreadable blob files: same post-commit
         // removal as the superseded originals (see `BlobRecovery::discard`).
@@ -3967,8 +4020,8 @@ fn repair_tree(
             })
             .collect();
         let blob_rewrites = Arc::new(blob_rewrites);
-        let mut kept: Vec<(Table, bool)> = Vec::with_capacity(recovered_tables.len());
-        for (table, complete) in recovered_tables {
+        let mut kept: Vec<(Table, bool, PathBuf)> = Vec::with_capacity(recovered_tables.len());
+        for (table, complete, source_path) in recovered_tables {
             // One reference read drives everything below: the missing-id check
             // and the rewrite decision.
             let links = match table.list_blob_file_references() {
@@ -4037,7 +4090,7 @@ fn repair_tree(
                 }
             }
             if !needs_rewrite {
-                kept.push((table, complete));
+                kept.push((table, complete, source_path));
                 continue;
             }
             // Rewrite through the salvage pipeline: re-emit every entry with
@@ -4084,7 +4137,7 @@ fn repair_tree(
                         allow_resurrection,
                     )?;
                     let restricted = rewritten.restrict_lower_bound().is_some();
-                    kept.push((rewritten, false));
+                    kept.push((rewritten, false, source_path));
                     swap_after_commit.push((Arc::clone(&fs), output_path, path, restricted));
                 }
                 Ok(SalvageOutcome::Unusable | SalvageOutcome::PunchedBoundLost) => {
@@ -4123,7 +4176,7 @@ fn repair_tree(
         // out of any manifest — which would otherwise be admitted as an
         // ordinary blob and pin a whole copy per failed attempt.
         let mut referenced: crate::HashSet<crate::vlog::BlobFileId> = crate::HashSet::default();
-        for (table, _) in &recovered_tables {
+        for (table, _, _) in &recovered_tables {
             for link in table.list_blob_file_references()?.into_iter().flatten() {
                 referenced.insert(link.blob_file_id);
             }
@@ -4159,35 +4212,33 @@ fn repair_tree(
     // the rebuilt manifest holds.
     let salvaged = recovered_tables
         .iter()
-        .filter(|(_, complete)| !complete)
+        .filter(|(_, complete, _)| !complete)
         .count();
     // A KEPT salvaged copy is lossy too: it dropped corrupt blocks (or blob
     // records), and nothing in `unreadable_files` names it, so without an
     // entry here `wal_replay_scope()` would answer `TailOnly` while older
-    // persisted changes were in fact lost. The copy's own metadata scopes the
-    // loss exactly like an excluded table's would: its key range, and its
-    // highest seqno — with the same unknown-bound rule for a source whose
-    // ingest offset died with the manifest.
+    // persisted changes were in fact lost. The loss is scoped by the
+    // SOURCE's coverage captured during the scan — NOT by the replacement's
+    // own metadata, which only bounds what SURVIVED: salvage may have
+    // dropped the block holding the source's outermost keys or its highest
+    // seqno, and a range/ceiling derived from the survivors would exclude
+    // exactly the lost part. A source whose metadata never parsed
+    // (whole-file recovery failed before the coverage was captured) is
+    // unscopable and joins `unknowable_losses` instead.
+    let mut salvaged_unknowable: Vec<PathBuf> = Vec::new();
     let salvaged_coverage: Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)> = recovered_tables
         .iter()
-        .filter(|(_, complete)| !complete)
-        .map(|(t, _)| {
-            let range = t.metadata.key_range.clone();
-            let bound = (!has_unrecoverable_ingest_offset(
-                t.metadata.bulk_ingested,
-                t.metadata.item_count,
-                t.max_local_seqno(),
-            ))
-            .then(|| t.get_highest_seqno());
-            (
-                (*t.path).clone(),
-                range.min().clone(),
-                range.max().clone(),
-                bound,
-            )
+        .filter(|(_, complete, _)| !complete)
+        .filter_map(|(_, _, source_path)| {
+            if let Some((lo, hi, bound)) = coverage_by_path.get(source_path) {
+                Some((source_path.clone(), lo.clone(), hi.clone(), *bound))
+            } else {
+                salvaged_unknowable.push(source_path.clone());
+                None
+            }
         })
         .collect();
-    let recovered_tables: Vec<Table> = recovered_tables.into_iter().map(|(t, _)| t).collect();
+    let recovered_tables: Vec<Table> = recovered_tables.into_iter().map(|(t, _, _)| t).collect();
     if let Some(p) = &config.recovery_progress {
         p.tables_recovered_add(recovered_tables.len() as u64);
         // Blob files count on the same rule and for the same reason: the
@@ -4234,20 +4285,14 @@ fn repair_tree(
     // starts, so a cancel requested during the final file's verification or
     // salvage would otherwise be silently outrun by the commit. From here on
     // the run is COMMITTING and then cleaning up, and cancellation is no
-    // longer consulted (see `check_cancel`). The abort first removes the blob
-    // replacements this run already published under fresh ids (see the blob
-    // scan's boundary for why they must not be left behind).
-    if let Err(e) = check_cancel(config) {
-        remove_published_blob_replacements(
-            config,
-            &config.path.join(crate::file::BLOBS_FOLDER),
-            published_blob_replacement_ids,
-        )?;
-        return Err(e);
-    }
+    // longer consulted (see `check_cancel`). An abort here — like every
+    // earlier pre-commit exit — unwinds the fresh-id blob replacements
+    // through the `published_blob_replacements` guard.
+    check_cancel(config)?;
     if let Some(p) = &config.recovery_progress {
         p.set_phase(crate::RecoveryPhase::Committing);
     }
+    published_blob_replacements.disarm();
 
     // Persist with the tree's own runtime config, not defaults: it drives the
     // manifest framing (checksum algorithm, page ECC, footer mirror, manifest
@@ -4413,6 +4458,7 @@ fn repair_tree(
         }
     }
     lost_coverage.extend(salvaged_coverage);
+    unknowable_losses.extend(salvaged_unknowable);
 
     // Success only: a failed run leaves the phase where it stopped, which
     // tells a progress display exactly which stage failed.

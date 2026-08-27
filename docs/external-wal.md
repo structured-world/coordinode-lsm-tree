@@ -153,8 +153,9 @@ any repair, derive the obligation from the report instead:
 
 1. **Ask the report.** `RepairReport::wal_replay_scope()` aggregates
    `lost_coverage` (which covers excluded tables AND kept lossy salvaged
-   copies — a copy that dropped corrupt blocks lost data inside its bounds
-   too) and `unknowable_losses`:
+   copies — a copy that dropped corrupt blocks lost data too, scoped by the
+   damaged SOURCE's coverage, not the shrunken copy's) and
+   `unknowable_losses`:
    - `TailOnly` — nothing was lost; run the section 3 replay unchanged.
    - `LostUpTo(b)` — in addition to the tail, replay every RETAINED record
      whose key falls inside a `lost_coverage` range and whose seqno is at or
