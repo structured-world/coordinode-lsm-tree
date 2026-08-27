@@ -2786,10 +2786,12 @@ fn repair_requires_a_hole_inside_the_zeroed_run() -> crate::Result<()> {
 }
 
 /// A fresh id must not be one an orphaned `.restrict-bound` sidecar already
-/// names. The scan skips sidecars, so an id whose table is gone still has one
-/// lying beside it; publishing an UNRESTRICTED rewrite under that id makes a
-/// later manifest-loss repair match the stale sidecar by id and restrict the
-/// replacement at an unrelated bound, silently dropping its prefix.
+/// names: publishing an UNRESTRICTED rewrite under that id makes a later
+/// manifest-loss repair match the stale sidecar by id and restrict the
+/// replacement at an unrelated bound, silently dropping its prefix. The
+/// repair sweeps such orphans post-commit — an unremovable one fails the
+/// run — but the fresh-id guard keeps even the torn commit-then-failed-sweep
+/// state collision-free.
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
 fn repair_does_not_publish_a_rewrite_under_an_id_a_sidecar_names() -> crate::Result<()> {
@@ -2864,8 +2866,10 @@ fn repair_does_not_publish_a_rewrite_under_an_id_a_sidecar_names() -> crate::Res
         }
     }
 
-    // The stale sidecar cannot be cleaned up, so the id must not be handed out
-    // in the first place — clearing it is best-effort, but the collision is not.
+    // The stale sidecar cannot be cleaned up: the id must not be handed out
+    // in the first place, AND the repair must fail rather than succeed over
+    // an orphan the next open's unconditional sweep would refuse to remove
+    // (a success followed by an open failure on the same file).
     let fault = crate::fs::FaultFs::new((*memfs).clone());
     fault.injector().arm(
         crate::fs::FaultRule::new(
@@ -2874,17 +2878,25 @@ fn repair_does_not_publish_a_rewrite_under_an_id_a_sidecar_names() -> crate::Res
         )
         .on_path("restrict-bound"),
     );
-    Config::new(
+    let result = Config::new(
         &root,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
     .with_fs(fault)
     .with_kv_separation(kv())
-    .repair()?;
+    .repair();
+    assert!(
+        result.is_err(),
+        "an unremovable orphaned sidecar fails the repair; left in place the \
+         next open's sweep would hit the same refused unlink: {:?}",
+        result.map(|r| r.recovered),
+    );
 
-    // Whatever id the rewrite took, no surviving sidecar may name it: a later
-    // repair would restrict that table at a bound belonging to another file.
+    // The manifest may already be durable when the post-commit sweep fails,
+    // so even that torn state stays collision-free: whatever id the rewrite
+    // took, no surviving sidecar may name it — a later repair would restrict
+    // that table at a bound belonging to another file.
     let published: Vec<_> = memfs
         .read_dir(&tables)?
         .into_iter()
@@ -8265,6 +8277,139 @@ fn repair_swaps_a_routed_rewrite_through_its_own_backend() -> crate::Result<()> 
         "the swap completed on that tier, leaving no unpublished replacement",
     );
     config().open()?;
+    Ok(())
+}
+
+/// A successful repair leaves no recovery artifact the next open would have
+/// to sweep: disposable crashed-heal temps and ORPHANED live sidecars (their
+/// table did not survive the rebuild) are removed by the repair itself —
+/// `Tree::open` sweeps them unconditionally and propagates a refused
+/// removal, so leaving one would let a successful `Config::repair()` be
+/// followed by an open failure on the very same file. A live sidecar whose
+/// table survives is preserved.
+#[test]
+fn repair_sweeps_orphaned_recovery_artifacts_before_success() -> crate::Result<()> {
+    use crate::fs::Fs;
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(crate::fs::MemFs::new());
+    let root = std::path::absolute("/db")?;
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .open()?
+        {
+            crate::AnyTree::Standard(t) => t,
+            crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+        };
+        tree.insert(b"a", b"v", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    let tables = root.join("tables");
+    // Disposable crashed-heal temps, an ORPHANED live sidecar (no table 9),
+    // and a live sidecar for the SURVIVING table 0.
+    let disposable = [
+        tables.join("0.heal-attest.tmp"),
+        tables.join("7.healtmp-3"),
+        tables.join("0.restrict-bound.tmp"),
+    ];
+    let orphan = tables.join("9.heal-attest");
+    let preserved = tables.join("0.heal-attest");
+    for path in disposable.iter().chain([&orphan, &preserved]) {
+        let mut f = memfs.open(
+            path,
+            &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        f.write_all(&[0xEE; 32])?;
+    }
+
+    Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs.clone())
+    .repair()?;
+
+    for path in &disposable {
+        assert!(
+            !memfs.exists(path)?,
+            "a disposable crashed-heal artifact must not outlive a successful \
+             repair: {}",
+            path.display(),
+        );
+    }
+    assert!(
+        !memfs.exists(&orphan)?,
+        "an orphaned live sidecar (its table is gone) must not outlive a \
+         successful repair",
+    );
+    assert!(
+        memfs.exists(&preserved)?,
+        "a surviving table's live sidecar is preserved",
+    );
+    Ok(())
+}
+
+/// Unknowable-loss classification follows the table-scan's PROVENANCE, not a
+/// path prefix: a level route may nest its tables under the primary tree's
+/// `blobs` directory, and an unreadable numeric SST there is still a lost
+/// table with unknowable coverage. A `starts_with(blobs)` test would
+/// misclassify it as a blob file, `wal_replay_scope()` would answer
+/// `TailOnly`, and an external-WAL recovery would skip the older history the
+/// lost SST may have held.
+#[test]
+fn a_lost_routed_table_under_the_blobs_prefix_is_unknowable() -> crate::Result<()> {
+    use crate::config::LevelRoute;
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    // A pathological but valid route: its base lives under the primary
+    // tree's blobs directory.
+    let cold = root.join(crate::file::BLOBS_FOLDER).join("cold");
+    let routed_tables = cold.join("tables");
+    memfs.create_dir_all(&root.join("tables"))?;
+    memfs.create_dir_all(&routed_tables)?;
+
+    // An unreadable numeric SST on the routed tier: its metadata never
+    // parses, so its coverage is unknowable.
+    let lost = routed_tables.join("7");
+    {
+        let mut f = memfs.open(
+            &lost,
+            &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        f.write_all(&[0xAB; 256])?;
+    }
+
+    let route_fs: Arc<dyn Fs> = memfs.clone();
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .level_routes(vec![LevelRoute {
+        levels: 0..2,
+        path: cold,
+        fs: route_fs,
+    }])
+    .repair()?;
+
+    assert!(
+        report.unknowable_losses.contains(&lost),
+        "an unreadable routed SST has unknowable coverage even under the \
+         blobs prefix: {report:?}",
+    );
     Ok(())
 }
 

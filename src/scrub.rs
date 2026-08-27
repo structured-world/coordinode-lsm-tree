@@ -189,7 +189,8 @@ pub struct PatrolScrubOptions {
     /// [`RecoveryProgress`](crate::RecoveryProgress)). The scrub publishes the
     /// [`Scrubbing`](crate::RecoveryPhase::Scrubbing) phase, byte totals over
     /// the scanned SSTs, per-block scan counters, and applied corrections as
-    /// healed blocks. `None` (the default) publishes nothing.
+    /// recovered-and-healed blocks (healed stays a subset of recovered, per
+    /// the snapshot contract). `None` (the default) publishes nothing.
     pub progress: Option<std::sync::Arc<crate::RecoveryProgress>>,
 }
 
@@ -308,13 +309,17 @@ pub fn patrol_scrub(
         );
     }
     // Publishes one scanned SST's deltas: the file counts as taken up, its
-    // blocks as scanned, and applied corrections as healed blocks.
+    // blocks as scanned, and applied corrections as healed blocks. A
+    // corrected block counts as RECOVERED too — the snapshot documents
+    // healed blocks as a subset of recovered blocks, and a correction that
+    // bumped only the healed counter would let a monitoring consumer compute
+    // a >100% heal ratio.
     let publish = |table: &crate::table::Table, partial: &PatrolScrubReport| {
         if let Some(p) = &options.progress {
             p.add_bytes_processed(table.metadata.file_size);
             p.add_blocks(
                 partial.blocks_scanned as u64,
-                0,
+                partial.corrections_applied as u64,
                 0,
                 partial.corrections_applied as u64,
             );

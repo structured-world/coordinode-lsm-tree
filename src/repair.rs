@@ -3342,6 +3342,11 @@ fn repair_tree(
     // sidecar from a stale source one (see `commit_repair_tmp`).
     let mut swap_after_commit: Vec<(Arc<dyn crate::fs::Fs>, PathBuf, PathBuf, bool)> = Vec::new();
 
+    // Live sidecars ({id}.heal-attest, {id}.restrict-bound) found by the scan.
+    // Judged against the FINAL rebuilt set after the dedup: one whose table
+    // survived is preserved, an orphan is removed post-commit.
+    let mut live_sidecars: Vec<(TableId, PathBuf, Arc<dyn crate::fs::Fs>)> = Vec::new();
+
     for (table_base_folder, folder_fs) in config.all_tables_folders() {
         if !folder_fs.exists(&table_base_folder)? {
             continue;
@@ -3396,18 +3401,36 @@ fn repair_tree(
             // ownership); this match is the repair scan's POLICY for each kind.
             use crate::file::TableDirEntry;
             let table_id = match TableDirEntry::classify(&file_name) {
-                // Sidecar artifacts are not table files, and repair must not
-                // remove the live ones: `Tree::open` PRESERVES a live
-                // `{id}.heal-attest` (the next scrub reconciles a crashed digest
-                // refresh through it), and the `.restrict-bound` bound is read
-                // FOR its SST via `restrict_bound::read` — removing either would
-                // strand its table. The disposable `.tmp` shapes are left to the
-                // open's own sweep.
-                TableDirEntry::HealAttest(_)
-                | TableDirEntry::HealAttestTmp(_)
+                // LIVE sidecar artifacts are not table files, and repair must
+                // not remove one whose table survives: `Tree::open` PRESERVES
+                // a live `{id}.heal-attest` (the next scrub reconciles a
+                // crashed digest refresh through it), and the
+                // `.restrict-bound` bound is read FOR its SST via
+                // `restrict_bound::read`. Whether a sidecar is live is
+                // decided AGAINST THE REBUILT SET after the dedup below —
+                // one whose table did not survive is an orphan the repair
+                // itself removes, because leaving it hands the next open an
+                // unconditional sweep whose refused unlink would turn this
+                // run's success into an unopenable tree.
+                TableDirEntry::HealAttest(id) | TableDirEntry::RestrictBound(id) => {
+                    live_sidecars.push((id, table_path, Arc::clone(&folder_fs)));
+                    continue;
+                }
+                // The disposable `.tmp` shapes are crash leftovers no state
+                // references; the open sweeps them unconditionally, so repair
+                // removes them itself (post-commit) for the same reason.
+                TableDirEntry::HealAttestTmp(_)
                 | TableDirEntry::HealTmp(_)
-                | TableDirEntry::RestrictBound(_)
-                | TableDirEntry::RestrictBoundTmp(_) => continue,
+                | TableDirEntry::RestrictBoundTmp(_) => {
+                    discard_after_commit.push((
+                        Arc::clone(&folder_fs),
+                        table_path,
+                        "disposable crashed-heal artifact; the next open would \
+                         sweep it and fail on a refused removal"
+                            .to_string(),
+                    ));
+                    continue;
+                }
                 // `{id}.repair-tmp` is a replacement a previous repair was
                 // building and never published: no manifest names it (one that
                 // did was swapped in before this scan started), and its source
@@ -4675,6 +4698,27 @@ fn repair_tree(
         }
     }
 
+    // Live sidecars are judged here, against the FINAL rebuilt set: one whose
+    // table survived is preserved (the open and the next scrub read it), an
+    // ORPHAN — its table excluded, superseded, or never recovered — is
+    // removed post-commit. The open sweeps such orphans unconditionally and
+    // fails on a refused removal, so leaving one would let a successful
+    // repair be followed by an open failure on the very same file.
+    {
+        let final_ids: crate::HashSet<TableId> =
+            recovered_tables.iter().map(|(t, ..)| t.id()).collect();
+        for (id, path, fs) in live_sidecars {
+            if final_ids.contains(&id) {
+                continue;
+            }
+            discard_after_commit.push((
+                fs,
+                path,
+                "orphaned sidecar; its table did not survive the rebuild".to_string(),
+            ));
+        }
+    }
+
     // `salvaged` is a subset of `recovered`, so derive it from the tables that
     // survived every filter above. The live progress counter follows the same
     // rule: a candidate displaced by deduplication or dropped by dependency
@@ -5051,12 +5095,21 @@ fn repair_tree(
     // unknowable would demand an unbounded WAL archive over scribbles. Blob
     // files stay out for the same reason in the other direction: losing blob
     // content surfaces through the referencing tables (a lossy handle
-    // rewrite, or their exclusion), which ARE covered above.
-    let blobs_folder = config.path.join(crate::file::BLOBS_FOLDER);
+    // rewrite, or their exclusion), which ARE covered above. Provenance, not
+    // a path prefix, decides which is which: a level route may nest its
+    // tables anywhere (even under the primary tree's blobs directory), so a
+    // candidate is a table iff its parent is one of the scanned table
+    // folders.
+    let table_folders: Vec<PathBuf> = config
+        .all_tables_folders()
+        .into_iter()
+        .map(|(folder, _)| folder)
+        .collect();
     let mut lost_coverage: Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)> = Vec::new();
     let mut unknowable_losses: Vec<PathBuf> = Vec::new();
     let is_table_candidate = |path: &std::path::Path| {
-        !path.starts_with(&blobs_folder)
+        path.parent()
+            .is_some_and(|parent| table_folders.iter().any(|f| f.as_path() == parent))
             && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
                 matches!(
                     crate::file::TableDirEntry::classify(n),

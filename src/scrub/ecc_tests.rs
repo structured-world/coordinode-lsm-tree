@@ -241,6 +241,45 @@ fn patrol_scrub_corrects_without_scheduling_when_auto_heal_off() -> crate::Resul
     Ok(())
 }
 
+/// A scrub-corrected block published to [`crate::RecoveryProgress`] must keep
+/// the snapshot invariant `blocks_healed <= blocks_recovered`
+/// ([`crate::RecoveryProgressSnapshot::blocks_healed`] documents healed as a
+/// subset of recovered): a correction that bumps only the healed counter
+/// makes monitoring consumers compute >100% heal ratios.
+#[test]
+fn patrol_scrub_progress_keeps_healed_within_recovered() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst(dir.path());
+
+    let corrupt_pos = block.offset().0 as usize + Header::MIN_LEN + 3;
+    let mut bytes = std::fs::read(&sst_path)?;
+    let slot = bytes.get_mut(corrupt_pos).expect("corrupt_pos in range");
+    *slot ^= 0x80;
+    std::fs::write(&sst_path, &bytes)?;
+
+    let tree = open_ecc_tree(dir.path());
+    let progress = std::sync::Arc::new(crate::RecoveryProgress::default());
+    let report = patrol_scrub(
+        &tree,
+        &PatrolScrubOptions {
+            progress: Some(std::sync::Arc::clone(&progress)),
+            ..PatrolScrubOptions::default()
+        },
+    );
+    assert!(report.corrections_applied >= 1, "{report:?}");
+
+    let snap = progress.snapshot();
+    assert!(
+        snap.blocks_healed >= 1,
+        "the correction must be published: {snap:?}",
+    );
+    assert!(
+        snap.blocks_healed <= snap.blocks_recovered,
+        "healed blocks are a subset of recovered blocks: {snap:?}",
+    );
+    Ok(())
+}
+
 #[test]
 fn patrol_scrub_reports_uncorrectable_block_not_silently_skipped() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;

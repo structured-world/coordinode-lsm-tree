@@ -250,7 +250,8 @@ pub struct RecoveryProgressSnapshot {
     pub blob_files_recovered: u64,
     /// Data blocks a salvage walk has inspected.
     pub blocks_scanned: u64,
-    /// Data blocks a salvage walk re-emitted into a recovered copy.
+    /// Data blocks a salvage walk re-emitted into a recovered copy, or a
+    /// patrol scrub corrected (its healed payload readable again in place).
     pub blocks_recovered: u64,
     /// Data blocks a salvage walk had to drop (corrupt / undecodable).
     pub blocks_dropped: u64,
