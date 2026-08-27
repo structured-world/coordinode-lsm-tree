@@ -402,6 +402,35 @@ fn highest_existing_version_id_none_when_no_versions_present() -> crate::Result<
     Ok(())
 }
 
+/// The rebuilt version id needs HEADROOM, not just non-overflow: a highest
+/// existing `v{u64::MAX - 1}` makes `checked_add` succeed and the repair
+/// publish at `u64::MAX`, and the first subsequent version edit then
+/// computes `id + 1` — an overflow panic in checked builds, a wrap to
+/// version 0 colliding with old generation state otherwise. Mirrors the
+/// table-id and blob-id exhaustion guards.
+#[test]
+fn repair_rejects_an_exhausted_version_id_space() -> crate::Result<()> {
+    use crate::{Config, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir_all(dir.path().join("tables"))?;
+    std::fs::write(dir.path().join(format!("v{}", u64::MAX - 1)), b"x")?;
+
+    let result = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair();
+    assert!(
+        matches!(result, Err(crate::Error::Unrecoverable)),
+        "a rebuilt id of u64::MAX must fail the repair, not publish a tree \
+         whose next version edit overflows: {:?}",
+        result.map(|r| r.recovered),
+    );
+    Ok(())
+}
+
 /// A plain `repair()` (salvage off) must not BLESS an SST whose data block is
 /// A bulk-ingested SST stores every entry at LOCAL seqno 0 and keeps its real
 /// sequence base in the manifest alone, so a manifest-loss repair cannot know
@@ -8357,6 +8386,82 @@ fn repair_sweeps_orphaned_recovery_artifacts_before_success() -> crate::Result<(
     Ok(())
 }
 
+/// A post-commit cleanup failure must CARRY the completed report: the
+/// manifest is already durable, so the repair happened — and once the
+/// filesystem fault clears, the next open sweeps the leftover itself and
+/// `open_or_repair` answers with no report at all, hiding the committed
+/// repair's lost coverage from an external-WAL consumer that then skips
+/// required replay. Every failure after publication returns
+/// `Error::RepairedButUnopened { report, cause }`, not a bare I/O error.
+#[test]
+fn a_post_commit_cleanup_failure_carries_the_report() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .open()?
+        {
+            crate::AnyTree::Standard(t) => t,
+            crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+        };
+        tree.insert(b"a", b"v", 1);
+        tree.flush_active_memtable(0)?;
+    }
+    // A disposable crashed-heal artifact whose post-commit removal is refused.
+    {
+        let path = root.join("tables").join("0.heal-attest.tmp");
+        let mut f = memfs.open(
+            &path,
+            &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        std::io::Write::write_all(&mut f, &[0xEE; 16])?;
+    }
+    let fault = FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        FaultRule::new(
+            FaultOp::RemoveFile,
+            Fault::Error(ErrorKind::PermissionDenied),
+        )
+        .on_path("heal-attest.tmp"),
+    );
+
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair();
+    match result {
+        Err(crate::Error::RepairedButUnopened { report, cause }) => {
+            assert_eq!(
+                report.recovered, 1,
+                "the committed repair's report rides in the error: {report:?}",
+            );
+            assert!(
+                matches!(*cause, crate::Error::Io(_)),
+                "the refused removal is the cause: {cause:?}",
+            );
+        }
+        other => panic!(
+            "a post-commit cleanup failure must carry the committed report, \
+             got {:?}",
+            other.map(|r| r.recovered),
+        ),
+    }
+    Ok(())
+}
+
 /// Unknowable-loss classification follows the table-scan's PROVENANCE, not a
 /// path prefix: a level route may nest its tables under the primary tree's
 /// `blobs` directory, and an unreadable numeric SST there is still a lost
@@ -13000,6 +13105,65 @@ fn repair_reports_ambiguous_order_of_legacy_overlapping_tables() -> crate::Resul
             crate::repair::WalReplayScope::TailOnly
         ),
         "an unorderable tied history must widen the replay obligation: {report:?}",
+    );
+    Ok(())
+}
+
+/// Under a configured MERGE OPERATOR the same ambiguous legacy overlap is
+/// not reportable-and-publishable: the pair may be a pre-lineage compaction
+/// output beside its surviving input, and publishing both applies the
+/// input's merge operands twice on every read — a multiplicity the
+/// documented WAL reconciliation cannot remove (it sees both physical
+/// copies as survivors, or the operand as folded into the output's value).
+/// Without lineage neither side can be proven redundant, so the repair
+/// fails closed instead of committing a corrupting tree. Value-only
+/// deployments (no operator) keep the report-and-publish path above:
+/// duplicate records are byte-identical there and reads dedupe them.
+#[test]
+fn repair_rejects_ambiguous_legacy_overlap_under_a_merge_operator() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    struct SumMerge;
+    impl crate::MergeOperator for SumMerge {
+        fn merge(
+            &self,
+            _key: &[u8],
+            _base_value: Option<&[u8]>,
+            _operands: &[&[u8]],
+        ) -> crate::Result<crate::UserValue> {
+            Ok(b"sum".to_vec().into())
+        }
+    }
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    for id in [0u64, 1] {
+        let mut w = Writer::new(tables.join(id.to_string()), id, 0, Arc::clone(&fs))?;
+        w.write(InternalValue::from_components(
+            b"k5".to_vec(),
+            b"v".to_vec(),
+            7,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "the table is non-empty");
+    }
+
+    let result = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(SumMerge)))
+    .repair();
+    assert!(
+        matches!(result, Err(crate::Error::Unrecoverable)),
+        "an unorderable legacy overlap under a merge operator must fail the \
+         repair, not publish a double-applying pair: {:?}",
+        result.map(|r| r.recovered),
     );
     Ok(())
 }

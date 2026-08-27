@@ -101,13 +101,15 @@ pub enum Error {
         tag: u8,
     },
 
-    /// A repair COMMITTED its rebuilt manifest, but the follow-up open inside
-    /// [`Config::open_or_repair`](crate::Config::open_or_repair) failed.
+    /// A repair COMMITTED its rebuilt manifest, but a later step failed: the
+    /// repair's own post-commit cleanup, or the follow-up open inside
+    /// [`Config::open_or_repair`](crate::Config::open_or_repair).
     ///
     /// The report travels WITH the error because it exists only in that call:
-    /// the retry finds a healthy manifest, opens without a repair, and
-    /// answers `None` — an external-WAL consumer would otherwise never learn
-    /// its replay obligation
+    /// the retry finds a healthy manifest (its open sweeps any cleanup
+    /// leftover itself), runs no repair, and answers `None` — an
+    /// external-WAL consumer would otherwise never learn its replay
+    /// obligation
     /// ([`RepairReport::wal_replay_scope`](crate::RepairReport::wal_replay_scope))
     /// and could keep stale or resurrected values. Consume the report exactly
     /// as a successful repair's, then retry the open (`cause` is typically
@@ -461,7 +463,7 @@ impl core::error::Error for Error {
             Self::Io(e) => Some(e),
             // The variant is explicitly a causal wrapper: generic error-chain
             // logging and transient-retry classifiers must be able to reach
-            // the follow-up open's own failure through the standard chain.
+            // the post-commit step's own failure through the standard chain.
             #[cfg(feature = "std")]
             Self::RepairedButUnopened { cause, .. } => Some(&**cause),
             _ => None,

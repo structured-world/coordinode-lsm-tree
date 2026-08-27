@@ -4817,6 +4817,29 @@ fn repair_tree(
                 if probe.lo_seqno > other.hi_seqno || other.lo_seqno > probe.hi_seqno {
                     continue;
                 }
+                // Under a configured MERGE OPERATOR the pair is not
+                // publishable at all: it may be a pre-lineage compaction
+                // output beside its surviving input, and publishing both
+                // applies the input's merge operands twice on every read —
+                // a multiplicity the reported replay cannot remove (the
+                // reconciliation sees both physical copies as survivors, or
+                // the operand as folded into the output's value). Without
+                // lineage neither side can be proven redundant, so the
+                // repair fails closed. Value-only deployments proceed to
+                // the report below: their duplicate records are
+                // byte-identical and reads dedupe them, so ties are the
+                // only hazard and the WAL replay settles those.
+                if config.merge_operator.is_some() {
+                    log::error!(
+                        "repair: tables {} and {} overlap with intersecting seqno \
+                         ranges and no trustworthy order or lineage; under a merge \
+                         operator publishing both would double-apply operands, and \
+                         no replay can undo that",
+                        probe.path.display(),
+                        other.path.display(),
+                    );
+                    return Err(crate::Error::Unrecoverable);
+                }
                 // `other.min <= probe.min` (sort order) and
                 // `other.max >= probe.min` (retained above), so the key
                 // intersection is `[probe.min, min(maxes)]`.
@@ -4897,8 +4920,23 @@ fn repair_tree(
     // Next version id after the highest existing one. The max is parsed from
     // on-disk `v{N}` directory names, so a malformed `v{u64::MAX}` entry would
     // overflow; reject it explicitly rather than wrapping the version counter.
+    // The rebuilt id also needs HEADROOM: publishing at `u64::MAX` itself
+    // hands the first subsequent version edit an `id + 1` overflow (a panic
+    // in checked builds, a wrap to version 0 colliding with old generation
+    // state otherwise). Mirrors the table-id and blob-id exhaustion guards.
     let version_id = match highest_existing_version_id(&*config.fs, &config.path)? {
-        Some(max) => max.checked_add(1).ok_or(crate::Error::Unrecoverable)?,
+        Some(max) => {
+            let next = max.checked_add(1).ok_or(crate::Error::Unrecoverable)?;
+            if next == u64::MAX {
+                log::error!(
+                    "repair: the version id space is exhausted (v{max} exists); a \
+                     rebuilt manifest at v{next} would make the next version edit \
+                     overflow",
+                );
+                return Err(crate::Error::Unrecoverable);
+            }
+            next
+        }
         None => 0,
     };
 
@@ -4958,20 +4996,39 @@ fn repair_tree(
     }
     persisted?;
 
+    // The manifest is DURABLE from this point on: the repair happened, and
+    // its report must survive every later failure. A bare error from the
+    // cleanup below would discard the only report — once the filesystem
+    // fault clears, the next open sweeps the leftover itself and
+    // `open_or_repair` answers with no report at all, hiding the committed
+    // repair's lost coverage from an external-WAL consumer. The first
+    // cleanup failure is therefore RECORDED, the remaining cleanup is
+    // skipped, and the completed report rides out inside
+    // [`Error::RepairedButUnopened`].
+    let mut post_commit_error: Option<crate::Error> = None;
+
     // A rebuilt snapshot is a complete generation on its own. Sweep every stale
     // edit log so nothing is replayed on top of it: the lost manifest's
     // generation left its log under an OLDER snapshot id (the rebuilt snapshot
     // uses `max(v*) + 1`), so removing only `edits-{version_id}` would normally
     // miss it. Drop all `edits-*` — none belong to the fresh snapshot.
-    for dirent in config.fs.read_dir(&config.path)? {
-        if dirent.is_dir || !dirent.file_name.starts_with("edits-") {
-            continue;
+    match config.fs.read_dir(&config.path) {
+        Ok(dirents) => {
+            for dirent in dirents {
+                if dirent.is_dir || !dirent.file_name.starts_with("edits-") {
+                    continue;
+                }
+                match config.fs.remove_file(&dirent.path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        post_commit_error = Some(e.into());
+                        break;
+                    }
+                }
+            }
         }
-        match config.fs.remove_file(&dirent.path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
+        Err(e) => post_commit_error = Some(e.into()),
     }
 
     if let Some(p) = &config.recovery_progress {
@@ -4990,17 +5047,20 @@ fn repair_tree(
     // NOT best-effort: the manifest already names this content, so a swap that
     // does not happen is a tree whose next open finds the damaged file under the
     // manifest's checksum and fails.
-    for (fs, tmp_path, table_path, restricted) in swap_after_commit {
-        if let Err(e) =
-            commit_repair_tmp(&*fs, &tmp_path, &table_path, config.sync_mode, restricted)
-        {
-            log::error!(
-                "repair: cannot swap the replacement {} onto {} ({e}); failing the \
-                 repair — the committed manifest names the replacement's content",
-                tmp_path.display(),
-                table_path.display(),
-            );
-            return Err(e);
+    if post_commit_error.is_none() {
+        for (fs, tmp_path, table_path, restricted) in swap_after_commit {
+            if let Err(e) =
+                commit_repair_tmp(&*fs, &tmp_path, &table_path, config.sync_mode, restricted)
+            {
+                log::error!(
+                    "repair: cannot swap the replacement {} onto {} ({e}); failing the \
+                     repair — the committed manifest names the replacement's content",
+                    tmp_path.display(),
+                    table_path.display(),
+                );
+                post_commit_error = Some(e);
+                break;
+            }
         }
     }
 
@@ -5019,17 +5079,20 @@ fn repair_tree(
     // one outcome recovery must never produce, so the failure propagates: the
     // manifest is already durable, and a retry once the filesystem is fixed
     // finishes the sweep on the same inputs.
-    for (path, note) in stale_blob_originals {
-        match discard_unreferenced(&*config.fs, &path, config.sync_mode) {
-            Ok(()) => blob_files_salvaged.push((path, format!("{note}; original removed"))),
-            Err(e) => {
-                log::error!(
-                    "repair: cannot remove the superseded blob original {} ({e}); \
-                     failing the repair — left in blobs/ it is an orphan the next \
-                     open must remove, and that removal would hit the same error",
-                    path.display(),
-                );
-                return Err(e);
+    if post_commit_error.is_none() {
+        for (path, note) in stale_blob_originals {
+            match discard_unreferenced(&*config.fs, &path, config.sync_mode) {
+                Ok(()) => blob_files_salvaged.push((path, format!("{note}; original removed"))),
+                Err(e) => {
+                    log::error!(
+                        "repair: cannot remove the superseded blob original {} ({e}); \
+                         failing the repair — left in blobs/ it is an orphan the next \
+                         open must remove, and that removal would hit the same error",
+                        path.display(),
+                    );
+                    post_commit_error = Some(e);
+                    break;
+                }
             }
         }
     }
@@ -5039,17 +5102,20 @@ fn repair_tree(
     // itself touched nothing, so until this point a crash left the directory
     // exactly as the retry expects to find it; from here the manifest is
     // durable and these files are what the tree no longer references.
-    for (fs, path, note) in discard_after_commit {
-        match discard_unreferenced(&*fs, &path, config.sync_mode) {
-            Ok(()) => log::info!("repair: {} removed ({note})", path.display()),
-            Err(e) => {
-                log::error!(
-                    "repair: cannot remove {} ({e}); failing the repair — left in \
-                     place it is a file the next open must reject or sweep, and it \
-                     would hit the same error",
-                    path.display(),
-                );
-                return Err(e);
+    if post_commit_error.is_none() {
+        for (fs, path, note) in discard_after_commit {
+            match discard_unreferenced(&*fs, &path, config.sync_mode) {
+                Ok(()) => log::info!("repair: {} removed ({note})", path.display()),
+                Err(e) => {
+                    log::error!(
+                        "repair: cannot remove {} ({e}); failing the repair — left in \
+                         place it is a file the next open must reject or sweep, and it \
+                         would hit the same error",
+                        path.display(),
+                    );
+                    post_commit_error = Some(e);
+                    break;
+                }
             }
         }
     }
@@ -5059,18 +5125,21 @@ fn repair_tree(
     // preserve — but leaving one behind hands the next open an orphan to
     // sweep, and a sweep that fails there fails the open. Remove them here and
     // propagate, so a repair that reports success leaves an openable tree.
-    for path in unreferenced_blob_files {
-        match config.fs.remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                log::error!(
-                    "repair: cannot remove the unreferenced blob file {} ({e}); \
-                     failing the repair — left in blobs/ it is an orphan the next \
-                     open must remove, and that removal would hit the same error",
-                    path.display(),
-                );
-                return Err(e.into());
+    if post_commit_error.is_none() {
+        for path in unreferenced_blob_files {
+            match config.fs.remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    log::error!(
+                        "repair: cannot remove the unreferenced blob file {} ({e}); \
+                         failing the repair — left in blobs/ it is an orphan the next \
+                         open must remove, and that removal would hit the same error",
+                        path.display(),
+                    );
+                    post_commit_error = Some(e.into());
+                    break;
+                }
             }
         }
     }
@@ -5140,13 +5209,7 @@ fn repair_tree(
     );
     unknowable_losses.extend(salvaged_unknowable);
 
-    // Success only: a failed run leaves the phase where it stopped, which
-    // tells a progress display exactly which stage failed.
-    if let Some(p) = &config.recovery_progress {
-        p.set_phase(crate::RecoveryPhase::Done);
-    }
-
-    Ok(RepairReport {
+    let report = RepairReport {
         recovered,
         salvaged,
         unreadable: unreadable_files.len(),
@@ -5156,7 +5219,26 @@ fn repair_tree(
         blob_files_salvaged,
         method: "all-to-L0 with sequence-number ordering",
         warnings,
-    })
+    };
+
+    // A recorded post-commit failure carries the completed report out: the
+    // manifest is durable, so the repair happened, and a retry once the
+    // filesystem is fixed finishes the cleanup — but its own open may find
+    // nothing left to repair and answer with no report at all.
+    if let Some(cause) = post_commit_error {
+        return Err(crate::Error::RepairedButUnopened {
+            report: Box::new(report),
+            cause: Box::new(cause),
+        });
+    }
+
+    // Success only: a failed run leaves the phase where it stopped, which
+    // tells a progress display exactly which stage failed.
+    if let Some(p) = &config.recovery_progress {
+        p.set_phase(crate::RecoveryPhase::Done);
+    }
+
+    Ok(report)
 }
 
 #[cfg(test)]
