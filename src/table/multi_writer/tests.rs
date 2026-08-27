@@ -354,8 +354,8 @@ fn locator_section_round_trips_through_writer() -> crate::Result<()> {
 /// output that would have received it — the NEW one. Rotation runs before
 /// the triggering record is inserted, so at that moment the live counter
 /// already carries its verdict; judging the finishing output by the live
-/// counter would strip the UNTOUCHED old output's lineage and leave the
-/// transformed new output with it — after manifest loss, repair could then
+/// counter would mark the UNTOUCHED old output transformed and leave the
+/// transformed new output plain — after manifest loss, repair could then
 /// discard the transformed output as derived and resurrect the pre-filter
 /// value from its inputs.
 #[test]
@@ -422,13 +422,16 @@ fn a_transform_on_the_rotation_boundary_belongs_to_the_new_output() -> crate::Re
             comparator.clone(),
             cache.clone(),
         ))?;
-        lineages.push(table.metadata.lineage.clone());
+        lineages.push((
+            table.metadata.lineage.clone(),
+            table.metadata.lineage_transformed,
+        ));
     }
     assert_eq!(
         lineages,
-        vec![Some(vec![7, 8]), None],
-        "the untouched first output keeps its lineage; the output holding \
-         the transformed record sheds it",
+        vec![(Some(vec![7, 8]), false), (Some(vec![7, 8]), true),],
+        "both outputs keep their lineage; only the output holding the \
+         transformed record carries the transformed marker",
     );
     Ok(())
 }

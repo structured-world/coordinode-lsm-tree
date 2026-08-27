@@ -191,8 +191,10 @@ pub fn link_or_copy_cross_fs(
         // surrounding checkpoint code syncs only DIRECTORIES. Without this a
         // power loss can leave the checkpoint's manifest and directory entries
         // persisted while the cloned inode's extents are not — an immutable
-        // snapshot that verifies as corrupt on the next open.
-        let dst_file = dst_fs.open(dst, &FsOpenOptions::new().read(true))?;
+        // snapshot that verifies as corrupt on the next open. Write access is
+        // required for the flush alone (Windows refuses to flush a read-only
+        // handle with ERROR_ACCESS_DENIED); nothing is written through it.
+        let dst_file = dst_fs.open(dst, &FsOpenOptions::new().read(true).write(true))?;
         FsFile::sync_all_with(&*dst_file, sync_mode)?;
         drop(dst_file);
         return Ok(dst_fs.metadata(dst)?.len);

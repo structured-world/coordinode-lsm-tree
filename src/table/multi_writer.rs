@@ -141,14 +141,22 @@ pub struct MultiWriter {
 
     /// Counter of compaction-filter TRANSFORMATIONS (any non-`Keep` verdict),
     /// shared with the filter adapter. An output whose window saw one is not
-    /// derivable from its inputs, so its lineage is stripped before its meta
-    /// is written (see [`Writer::strip_lineage`]); untouched outputs of the
-    /// same run keep theirs. `None` — no filter configured.
+    /// derivable from its inputs, so it is marked transformed before its meta
+    /// is written (see [`Writer::mark_lineage_transformed`]); untouched
+    /// outputs of the same run stay plain. `None` — no filter configured.
     transform_marker: Option<alloc::sync::Arc<portable_atomic::AtomicU64>>,
 
     /// The marker's value when the CURRENT output started, so each output is
     /// judged by the verdicts of its own window alone.
     transforms_at_output_start: u64,
+
+    /// This writer receives the run's ENTIRE merged stream (a serial
+    /// compaction), so its final output may carry the `lineage_last` marker.
+    /// `false` for parallel sub-compactions and tight-space slices: several
+    /// writers share one lineage there, and a slice's last output closing
+    /// the run would let a surviving slice supersede inputs whose records
+    /// live only in a LOST sibling slice.
+    owns_whole_run: bool,
 
     /// The id of the writer CURRENTLY receiving records, so rotation can
     /// stamp the successor's `lineage_prev` adjacency link.
@@ -260,6 +268,7 @@ impl MultiWriter {
             transform_marker: None,
             transforms_at_output_start: 0,
             transforms_after_last_write: 0,
+            owns_whole_run: false,
             current_writer_id: current_table_id,
             delete_strategy: crate::config::DeleteStrategy::default(),
             disable_cow_on_sst: false,
@@ -670,6 +679,16 @@ impl MultiWriter {
         self
     }
 
+    /// Declares that this writer receives the run's ENTIRE merged stream
+    /// (see the `owns_whole_run` field), allowing its final output to carry
+    /// the `lineage_last` marker. Never set on a parallel sub-compaction or
+    /// tight-space slice.
+    #[must_use]
+    pub(crate) fn use_lineage_whole_run(mut self, whole_run: bool) -> Self {
+        self.owns_whole_run = whole_run;
+        self
+    }
+
     /// Wires the compaction-filter transform counter (see the
     /// `transform_marker` field). Call before writing starts.
     #[must_use]
@@ -782,13 +801,15 @@ impl MultiWriter {
         let mut old_writer = core::mem::replace(&mut self.writer, new_writer);
         // The finishing output's meta is about to be written: if a compaction
         // filter transformed a record within ITS window, the output is not
-        // derivable from its inputs — strip the lineage before it lands.
-        // Judged by the AFTER-LAST-WRITE milestone, not the live counter:
-        // rotation runs before the triggering record is inserted, so verdicts
-        // ticked since the old output's last write (the trigger's own, and
-        // removals in between) belong to the NEW output.
+        // derivable from its inputs — mark the lineage transformed before it
+        // lands, so manifest repair supersedes the inputs it covers instead
+        // of trading it back for them. Judged by the AFTER-LAST-WRITE
+        // milestone, not the live counter: rotation runs before the
+        // triggering record is inserted, so verdicts ticked since the old
+        // output's last write (the trigger's own, and removals in between)
+        // belong to the NEW output.
         if self.transforms_after_last_write > self.transforms_at_output_start {
-            old_writer.strip_lineage();
+            old_writer.mark_lineage_transformed();
         }
         self.transforms_at_output_start = self.transforms_after_last_write;
         old_writer.spill_block()?;
@@ -882,7 +903,7 @@ impl MultiWriter {
     ///
     /// Returns the metadata of created tables
     pub fn finish(mut self) -> crate::Result<Vec<(TableId, Checksum)>> {
-        // Same strip as `rotate` for the LAST output's window — judged by the
+        // Same judgment as `rotate` for the LAST output's window — by the
         // LIVE counter here: with no successor output, trailing verdicts
         // (removals after the final write) have nowhere else to land, and a
         // record they removed would otherwise be resurrected by the dedup
@@ -890,7 +911,18 @@ impl MultiWriter {
         if let Some(marker) = &self.transform_marker
             && marker.load(core::sync::atomic::Ordering::Relaxed) > self.transforms_at_output_start
         {
-            self.writer.strip_lineage();
+            self.writer.mark_lineage_transformed();
+        }
+        // This output closes the run: together with the run's first output
+        // (no `lineage_prev`) and an unbroken adjacency chain, the marker
+        // proves a surviving set is the COMPLETE output set. Only a writer
+        // that owned the WHOLE merged stream may claim it (see
+        // `owns_whole_run`). Rotation always feeds the successor its
+        // triggering record, so the writer finishing here is the run's last
+        // non-empty output (or the run produced nothing at all and no meta
+        // is written).
+        if self.owns_whole_run {
+            self.writer.mark_lineage_last();
         }
         self.writer.spill_block()?;
 

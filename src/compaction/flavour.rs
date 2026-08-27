@@ -69,13 +69,21 @@ pub(super) fn prepare_table_writer(
     block_parallel: bool,
     // The compaction-filter transform counter shared with the filter adapter
     // (`Some` iff a filter is instantiated for this run). Lineage is stamped
-    // unconditionally; the writer STRIPS it from any output whose window saw
-    // a non-`Keep` verdict — that output is not derivable from its inputs
-    // (Remove / RemoveWeak / ReplaceValue / Destroy are authoritative
-    // transformations), so manifest repair must never trade it back for
-    // them. A `Keep`-only filtered run keeps its lineage, so the rebuild's
-    // duplicate-history dedup stays effective.
+    // unconditionally; the writer MARKS it transformed on any output whose
+    // window saw a non-`Keep` verdict — that output is not derivable from
+    // its inputs (Remove / RemoveWeak / ReplaceValue / Destroy are
+    // authoritative transformations), so manifest repair supersedes the
+    // inputs it covers instead of trading it back for them. A `Keep`-only
+    // filtered run stays plain, so the rebuild's duplicate-history dedup is
+    // unaffected.
     transform_marker: Option<alloc::sync::Arc<portable_atomic::AtomicU64>>,
+    // `true` when this writer receives the run's ENTIRE merged stream (a
+    // serial compaction): its final output then carries the `lineage_last`
+    // marker, proving to manifest repair that a surviving first-to-last
+    // chain is the complete output set. `false` for parallel
+    // sub-compactions and tight-space slices, which share one lineage
+    // across several writers.
+    whole_run: bool,
 ) -> crate::Result<MultiWriter> {
     let (table_base_folder, level_fs) = opts.config.tables_folder_for_level(payload.dest_level);
 
@@ -127,8 +135,9 @@ pub(super) fn prepare_table_writer(
     // manifest-loss rebuild recognize the output as DERIVED and exclude it
     // when every input survived a crash-before-commit, instead of publishing
     // both histories and double-applying the merge operands on read. An
-    // output a filter TRANSFORMS sheds it (see `transform_marker`).
+    // output a filter TRANSFORMS is marked so (see `transform_marker`).
     .use_lineage(Some(payload.table_ids.iter().copied().collect()))
+    .use_lineage_whole_run(whole_run)
     // Compaction consumes input tables, so clip RTs to each output table's key range.
     .use_clip_range_tombstones();
 

@@ -82,13 +82,11 @@ pub struct LinkedFile {
 /// `BlockIndexWriter` / `FilterWriter` are generic over a writer `W: Write + Seek`.
 /// `Fs::open()` returns `Box<dyn FsFile>` which implements `Write + Seek`,
 /// so `BufWriter<Box<dyn FsFile>>` satisfies the required trait bounds.
-#[cfg_attr(
-    test,
-    expect(
-        clippy::struct_excessive_bools,
-        reason = "the test-only legacy-meta flag pushes the count past the lint's \
-                  threshold; the production field set stays below it"
-    )
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent on-disk format toggle (bulk-ingest \
+              provenance, lineage transformed / last markers, test-only \
+              legacy-meta flag); enums would obscure the per-flag wiring"
 )]
 pub struct Writer {
     /// Filesystem backend
@@ -325,6 +323,22 @@ pub struct Writer {
     /// not actually cover. Written only alongside `lineage`.
     lineage_prev: Option<TableId>,
 
+    /// A compaction filter TRANSFORMED this output's window (any non-`Keep`
+    /// verdict), so its content is not derivable from its inputs — manifest
+    /// repair must never trade it back for resurrected inputs, which would
+    /// revive the removed values. Persisted as the marker key
+    /// `lineage_transformed`, only alongside `lineage`.
+    lineage_transformed: bool,
+
+    /// This output is the LAST of its compaction run. Together with an
+    /// unbroken adjacency chain from the run's FIRST output (absent
+    /// `lineage_prev`), it proves the surviving set is the run's COMPLETE
+    /// output set, whose span covers every input end to end — keys outside
+    /// the written ranges were consumed by the merge (obsolete versions,
+    /// annihilated weak deletes, filter removals), not lost. Persisted as
+    /// the marker key `lineage_last`, only alongside `lineage`.
+    lineage_last: bool,
+
     /// Pre-trained zstd dictionary for dictionary compression
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
@@ -473,6 +487,8 @@ impl Writer {
             recency: None,
             lineage: None,
             lineage_prev: None,
+            lineage_transformed: false,
+            lineage_last: false,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -805,6 +821,8 @@ impl Writer {
             .use_recency(meta.recency)
             .use_lineage(meta.lineage.clone())
             .use_lineage_prev(meta.lineage_prev)
+            .use_lineage_transformed(meta.lineage_transformed)
+            .use_lineage_last(meta.lineage_last)
             .use_zone_map(has_zone_map)
             // A source with a seqno_bounds section keeps its seqno-scoped
             // block-skip: the writer re-derives the per-block ranges from
@@ -975,14 +993,38 @@ impl Writer {
         self
     }
 
-    /// Drops the pending lineage (callable mid-write, unlike the builder):
-    /// a compaction FILTER transformed at least one record of THIS output, so
-    /// it is no longer derivable from its inputs and must never be traded
-    /// back for them by the manifest-repair dedup. The adjacency link goes
-    /// with it — it only qualifies the lineage.
-    pub(crate) fn strip_lineage(&mut self) {
-        self.lineage = None;
-        self.lineage_prev = None;
+    /// Marks the pending lineage TRANSFORMED (callable mid-write, unlike the
+    /// builder): a compaction FILTER transformed at least one record of THIS
+    /// output, so it is no longer derivable from its inputs and must never be
+    /// traded back for them by the manifest-repair dedup. The lineage itself
+    /// stays — it still proves which inputs this output supersedes.
+    pub(crate) fn mark_lineage_transformed(&mut self) {
+        self.lineage_transformed = true;
+    }
+
+    /// Sets the transformed marker at build time (see
+    /// [`Self::lineage_transformed`]); the rewrite path carries a source
+    /// table's marker onto its replacement.
+    #[must_use]
+    pub(crate) fn use_lineage_transformed(mut self, transformed: bool) -> Self {
+        self.assert_not_started("use_lineage_transformed");
+        self.lineage_transformed = transformed;
+        self
+    }
+
+    /// Marks this output as its run's LAST (callable at finish time; see
+    /// [`Self::lineage_last`]).
+    pub(crate) fn mark_lineage_last(&mut self) {
+        self.lineage_last = true;
+    }
+
+    /// Sets the last-output marker at build time (see [`Self::lineage_last`]);
+    /// the rewrite path carries a source table's marker onto its replacement.
+    #[must_use]
+    pub(crate) fn use_lineage_last(mut self, last: bool) -> Self {
+        self.assert_not_started("use_lineage_last");
+        self.lineage_last = last;
+        self
     }
 
     /// Wires the resolved per-level retrieval-ribbon locator policy entry.
@@ -2440,6 +2482,8 @@ impl Writer {
             recency: self.recency,
             lineage: self.lineage.clone(),
             lineage_prev: self.lineage_prev,
+            lineage_transformed: self.lineage_transformed,
+            lineage_last: self.lineage_last,
             range_tombstone_count,
             // Record the count that corresponds to the delete_bitmap section
             // ACTUALLY written above, via the single `writes_delete_bitmap`
@@ -2652,6 +2696,15 @@ impl Writer {
 /// `index_writer.finish()` / `filter_writer.finish()` have consumed
 /// those two fields by-value, leaving `self` partially-moved and so
 /// unable to dispatch through `&mut self` methods.
+#[cfg_attr(
+    test,
+    expect(
+        clippy::struct_excessive_bools,
+        reason = "the test-only legacy-meta flag pushes the mirror of the \
+                  Writer's independent on-disk format toggles past the \
+                  lint's threshold"
+    )
+)]
 struct MetaSectionParams<'a> {
     section_name: &'static str,
     index_block_count: usize,
@@ -2698,6 +2751,12 @@ struct MetaSectionParams<'a> {
     /// Previous output of the same run: `Some(_)` writes `lineage_prev` (only
     /// alongside `lineage`), proving adjacency for the sibling-union rule.
     lineage_prev: Option<TableId>,
+    /// `true` writes the `lineage_transformed` marker (only alongside
+    /// `lineage`): a filter transformed this output's window.
+    lineage_transformed: bool,
+    /// `true` writes the `lineage_last` marker (only alongside `lineage`):
+    /// this output closed its compaction run.
+    lineage_last: bool,
     range_tombstone_count: u64,
     /// Number of positions in this table's delete bitmap. Recorded so a reader
     /// can AUTHENTICATE the bitmap's presence: the section itself is optional
@@ -2959,6 +3018,15 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
         // output ranges whose previous-output chain is unbroken.
         if let Some(prev) = p.lineage_prev {
             meta_items.push(meta("lineage_prev", &prev.to_le_bytes()));
+        }
+        // Presence markers (empty payload): a transformed window, and the
+        // run's closing output. Both qualify the lineage, so neither is
+        // written without it.
+        if p.lineage_transformed {
+            meta_items.push(meta("lineage_transformed", &[]));
+        }
+        if p.lineage_last {
+            meta_items.push(meta("lineage_last", &[]));
         }
     }
 

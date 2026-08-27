@@ -4355,44 +4355,6 @@ fn repair_tree(
             }
         }
         recovered_tables = kept;
-
-        // Only blob files a surviving table REFERENCES go into the manifest.
-        // An unreferenced one holds no reachable value by definition, and
-        // admitting it would strand it there forever: repair cannot rebuild
-        // fragmentation stats from a directory scan, and blob GC retires a
-        // file only once its recorded stale bytes reach the totals it never
-        // gets. That also settles what a crashed earlier attempt leaves
-        // behind — a fully written salvage replacement that the crash kept
-        // out of any manifest — which would otherwise be admitted as an
-        // ordinary blob and pin a whole copy per failed attempt.
-        let mut referenced: crate::HashSet<crate::vlog::BlobFileId> = crate::HashSet::default();
-        for (table, ..) in &recovered_tables {
-            for link in table.list_blob_file_references()?.into_iter().flatten() {
-                referenced.insert(link.blob_file_id);
-            }
-        }
-        let dropped: Vec<crate::vlog::BlobFileId> = blob_file_list
-            .iter()
-            .map(crate::vlog::BlobFile::id)
-            .filter(|id| !referenced.contains(id))
-            .collect();
-        for id in dropped {
-            log::debug!(
-                "blob file {id} is referenced by no recovered table; leaving it out \
-                 of the rebuilt manifest and removing it"
-            );
-            blob_file_list.remove(id);
-            blob_frag.remove(&id);
-            // Removed POST-COMMIT (see the sweep below): until the manifest is
-            // durable the file is still what a failed attempt's inputs point
-            // at, and a retry re-derives the same decision from a fresh scan.
-            unreferenced_blob_files.push(
-                config
-                    .path
-                    .join(crate::file::BLOBS_FOLDER)
-                    .join(id.to_string()),
-            );
-        }
     }
 
     // A crashed compaction that FINALIZED its outputs before its version edit
@@ -4449,8 +4411,13 @@ fn repair_tree(
         for candidate in candidates {
             let lineage = candidate.0.metadata.lineage.clone();
             match lineage.as_deref() {
+                // A TRANSFORMED output never trades back for its inputs: a
+                // compaction filter removed records from its window, so the
+                // resurrected inputs would revive them. It takes the partial
+                // arm below instead and SUPERSEDES the inputs it covers.
                 Some(inputs)
-                    if !inputs.is_empty()
+                    if !candidate.0.metadata.lineage_transformed
+                        && !inputs.is_empty()
                         && inputs
                             .iter()
                             .all(|id| *id != candidate.0.id() && present_ids.contains(id)) =>
@@ -4540,7 +4507,14 @@ fn repair_tree(
     // gap a lost sibling could hide — an input inside that union is fully
     // redundant even when no single output contains it. A broken chain
     // (a predecessor that did not survive) proves nothing and unions
-    // nothing.
+    // nothing. A chain that spans the run END TO END — from the FIRST
+    // output (no `lineage_prev`) to the one carrying the `lineage_last`
+    // marker — is the run's COMPLETE output set and supersedes every input
+    // outright: keys outside the written ranges were consumed by the merge
+    // (obsolete versions, annihilated weak deletes, filter removals), not
+    // lost. That is what preserves a committed TRANSFORMING compaction —
+    // its outputs no longer contain the filtered records, so only full-run
+    // supersession retires the inputs that still do.
     {
         let mut by_id: crate::HashMap<TableId, usize> = crate::HashMap::default();
         let mut surviving_ranges: crate::HashMap<TableId, (UserKey, UserKey)> =
@@ -4587,18 +4561,29 @@ fn repair_tree(
                 continue;
             }
             // Walk the unbroken chain; ranges follow the run's key order, so
-            // the union is [head.min, tail.max].
+            // the union is [head.min, tail.max]. A chain that runs from the
+            // run's FIRST output (no `lineage_prev`) to its LAST (the
+            // `lineage_last` marker, written only by a writer that owned the
+            // WHOLE run — never by a parallel or tight-space slice, whose
+            // first output also has no persisted predecessor) is the
+            // COMPLETE output set: it supersedes every input outright, no
+            // range check needed. Requiring BOTH ends keeps a surviving
+            // slice from claiming the whole run.
+            let open_lo = head.metadata.lineage_prev.is_none();
             let union_min = head.metadata.key_range.min().clone();
             let mut union_max = head.metadata.key_range.max().clone();
+            let mut open_hi = head.metadata.lineage_last;
             let mut cursor = head_id;
             while let Some(&next) = next_of.get(&cursor) {
                 if let Some(&next_idx) = by_id.get(&next)
                     && let Some((t, ..)) = recovered_tables.get(next_idx)
                 {
                     union_max = t.metadata.key_range.max().clone();
+                    open_hi = t.metadata.lineage_last;
                 }
                 cursor = next;
             }
+            let complete_run = open_lo && open_hi;
             let Some(inputs) = &head.metadata.lineage else {
                 continue;
             };
@@ -4609,8 +4594,9 @@ fn repair_tree(
                 let Some((in_min, in_max)) = surviving_ranges.get(input) else {
                     continue;
                 };
-                if cmp.compare(&union_min, in_min) != core::cmp::Ordering::Greater
-                    && cmp.compare(in_max, &union_max) != core::cmp::Ordering::Greater
+                if complete_run
+                    || (cmp.compare(&union_min, in_min) != core::cmp::Ordering::Greater
+                        && cmp.compare(in_max, &union_max) != core::cmp::Ordering::Greater)
                 {
                     inputs_superseded.insert(*input);
                 }
@@ -4643,6 +4629,50 @@ fn repair_tree(
             }
         }
         lineage_partial.retain(|(input, ..)| !inputs_superseded.contains(input));
+    }
+
+    // Only blob files a surviving table REFERENCES go into the manifest.
+    // An unreferenced one holds no reachable value by definition, and
+    // admitting it would strand it there forever: repair cannot rebuild
+    // fragmentation stats from a directory scan, and blob GC retires a
+    // file only once its recorded stale bytes reach the totals it never
+    // gets. That also settles what a crashed earlier attempt leaves
+    // behind — a fully written salvage replacement that the crash kept
+    // out of any manifest — which would otherwise be admitted as an
+    // ordinary blob and pin a whole copy per failed attempt. Judged against
+    // the FINAL table set — after the lineage dedup above — so a blob
+    // referenced only by an excluded table (a derived output, a superseded
+    // input) is not pinned by a reference the rebuilt manifest no longer
+    // holds.
+    if config.kv_separation_opts.is_some() {
+        let mut referenced: crate::HashSet<crate::vlog::BlobFileId> = crate::HashSet::default();
+        for (table, ..) in &recovered_tables {
+            for link in table.list_blob_file_references()?.into_iter().flatten() {
+                referenced.insert(link.blob_file_id);
+            }
+        }
+        let dropped: Vec<crate::vlog::BlobFileId> = blob_file_list
+            .iter()
+            .map(crate::vlog::BlobFile::id)
+            .filter(|id| !referenced.contains(id))
+            .collect();
+        for id in dropped {
+            log::debug!(
+                "blob file {id} is referenced by no recovered table; leaving it out \
+                 of the rebuilt manifest and removing it"
+            );
+            blob_file_list.remove(id);
+            blob_frag.remove(&id);
+            // Removed POST-COMMIT (see the sweep below): until the manifest is
+            // durable the file is still what a failed attempt's inputs point
+            // at, and a retry re-derives the same decision from a fresh scan.
+            unreferenced_blob_files.push(
+                config
+                    .path
+                    .join(crate::file::BLOBS_FOLDER)
+                    .join(id.to_string()),
+            );
+        }
     }
 
     // `salvaged` is a subset of `recovered`, so derive it from the tables that

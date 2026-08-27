@@ -8595,6 +8595,95 @@ fn repair_counts_only_blob_files_that_reach_the_manifest() -> crate::Result<()> 
     Ok(())
 }
 
+/// Blob reachability is judged against the FINAL table set: a blob file
+/// referenced only by a table the lineage dedup later excludes (here: a
+/// derived output whose inputs all survived) must not reach the rebuilt
+/// manifest. Judged before the dedup it stays pinned forever — repair
+/// rebuilds no fragmentation stats, so blob GC never accrues the stale
+/// bytes that would retire it.
+#[test]
+fn repair_drops_a_blob_referenced_only_by_a_lineage_excluded_output() -> crate::Result<()> {
+    use crate::coding::Encode;
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, InternalValue, KvSeparationOptions, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let tables = root.join("tables");
+    memfs.create_dir_all(&blobs)?;
+    memfs.create_dir_all(&tables)?;
+
+    // Inputs 0 and 1 survive intact and carry no blob references.
+    for (id, key) in [(0u64, b"k".as_slice()), (1u64, b"m".as_slice())] {
+        let mut w =
+            crate::table::Writer::new(tables.join(id.to_string()), id, 0, Arc::clone(&fs_dyn))?;
+        w.write(InternalValue::from_components(
+            key.to_vec(),
+            b"a".to_vec(),
+            1,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "the input is non-empty");
+    }
+
+    // Output 2 records lineage [0, 1] and is the ONLY table referencing
+    // blob file 7.
+    let blob_path = blobs.join("7");
+    let (offset, on_disk_size) = {
+        let mut w = crate::vlog::blob_file::writer::Writer::new(&blob_path, 7, 0, &*fs_dyn)?;
+        let offset = w.offset();
+        let on_disk_size = w.write(b"k", 2, &[b'x'; 300])?;
+        w.finish()?;
+        (offset, on_disk_size)
+    };
+    let indirection = crate::blob_tree::handle::BlobIndirection {
+        vhandle: crate::vlog::ValueHandle {
+            blob_file_id: 7,
+            offset,
+            on_disk_size,
+        },
+        size: 300,
+    };
+    {
+        let mut w = crate::table::Writer::new(tables.join("2"), 2, 0, Arc::clone(&fs_dyn))?
+            .use_recency(Some(0))
+            .use_lineage(Some(vec![0, 1]));
+        w.link_blob_file(7, 1, 300, u64::from(on_disk_size));
+        w.write(InternalValue::from_components(
+            b"k".to_vec(),
+            indirection.encode_into_vec(),
+            2,
+            ValueType::Indirection,
+        ))?;
+        assert!(w.finish()?.is_some(), "the output is non-empty");
+    }
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs.clone())
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .repair()?;
+
+    assert_eq!(
+        report.recovered, 2,
+        "the derived output is excluded, its inputs are the history: {report:?}",
+    );
+    assert!(
+        !memfs.exists(&blob_path)?,
+        "a blob referenced only by the excluded output is unreachable in the \
+         rebuilt manifest and must be swept, not pinned forever",
+    );
+    Ok(())
+}
+
 #[test]
 fn repair_fails_when_an_unreferenced_blob_cannot_be_removed() -> crate::Result<()> {
     use crate::AbstractTree;
@@ -9014,17 +9103,24 @@ fn a_keep_only_filtered_compaction_output_keeps_its_lineage() -> crate::Result<(
         Some(&[0, 1][..]),
         "a Keep-only filter transforms nothing; the output stays derivable",
     );
+    assert!(
+        !output.metadata.lineage_transformed,
+        "a Keep-only window carries no transformed marker",
+    );
     Ok(())
 }
 
 /// An output a compaction filter actually TRANSFORMED (any non-`Keep`
 /// verdict in its window) is not derivable from its inputs: after a
 /// committed TTL compaction, trading it back for resurrected inputs would
-/// revive the removed values. Such an output sheds its lineage, which keeps
-/// it out of the rebuild's dedup.
+/// revive the removed values. Such an output KEEPS its lineage — it still
+/// proves which inputs it supersedes — and carries the transformed marker
+/// so the rebuild's dedup never excludes it as derived. A serial run's
+/// final output also carries the last-output marker, closing the
+/// first-to-last completeness proof.
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
-fn a_transforming_compaction_output_sheds_its_lineage() -> crate::Result<()> {
+fn a_transforming_compaction_output_keeps_its_lineage_marked() -> crate::Result<()> {
     use crate::compaction::filter::{
         CompactionFilter, Context as FilterContext, Factory, ItemAccessor, Verdict,
     };
@@ -9073,8 +9169,150 @@ fn a_transforming_compaction_output_sheds_its_lineage() -> crate::Result<()> {
     let version = tree.current_version();
     let output = version.iter_tables().next().expect("one compacted table");
     assert_eq!(
-        output.metadata.lineage, None,
-        "a transformed output must not be tradable back for its inputs",
+        output.metadata.lineage.as_deref(),
+        Some(&[0, 1][..]),
+        "a transformed output keeps its lineage — it supersedes the inputs it covers",
+    );
+    assert!(
+        output.metadata.lineage_transformed,
+        "the transformed marker keeps the dedup from trading it back for its inputs",
+    );
+    assert!(
+        output.metadata.lineage_last,
+        "a serial run's final output closes the first-to-last completeness proof",
+    );
+    Ok(())
+}
+
+/// A committed TRANSFORMING compaction must survive a manifest loss without
+/// resurrecting the records its filter removed. The inputs linger on disk
+/// (their deletion is deferred past the commit), so a rebuild sees BOTH
+/// histories: the transformed output — whose lineage is marked, never
+/// stripped — supersedes every input as the run's complete first-to-last
+/// output set. Keeping both would revive the removed record from the
+/// retained input and double-apply any unchanged merge operands.
+#[test]
+fn a_committed_transforming_compaction_survives_manifest_loss() -> crate::Result<()> {
+    use crate::compaction::filter::{
+        CompactionFilter, Context as FilterContext, Factory, ItemAccessor, Verdict,
+    };
+    use crate::fs::Fs;
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    // Destroy leaves NO tombstone behind, so the removed record exists only
+    // in the lingering input — the sharpest resurrection window.
+    struct DestroyB;
+    impl CompactionFilter for DestroyB {
+        fn filter_item(
+            &mut self,
+            item: ItemAccessor<'_>,
+            _ctx: &FilterContext,
+        ) -> crate::Result<Verdict> {
+            Ok(if item.key() == b"b" {
+                Verdict::Destroy
+            } else {
+                Verdict::Keep
+            })
+        }
+    }
+    struct DestroyBFactory;
+    impl Factory for DestroyBFactory {
+        fn name(&self) -> &'static str {
+            "DestroyB"
+        }
+        fn make_filter(&self, _ctx: &FilterContext) -> Box<dyn CompactionFilter> {
+            Box::new(DestroyB)
+        }
+    }
+
+    let memfs = Arc::new(crate::fs::MemFs::new());
+    let root = std::path::absolute("/db")?;
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_compaction_filter_factory(Some(Arc::new(DestroyBFactory)))
+        .open()?
+        {
+            crate::AnyTree::Standard(t) => t,
+            crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+        };
+        tree.insert(b"a", b"v", 1);
+        tree.flush_active_memtable(0)?;
+        tree.insert(b"b", b"v", 2);
+        tree.flush_active_memtable(0)?;
+
+        // Snapshot the input SSTs before the compaction consumes them.
+        let mut inputs = Vec::new();
+        for id in 0u64..2 {
+            let path = root.join("tables").join(id.to_string());
+            let mut bytes = Vec::new();
+            memfs
+                .open(&path, &crate::fs::FsOpenOptions::new().read(true))?
+                .read_to_end(&mut bytes)?;
+            inputs.push((path, bytes));
+        }
+
+        tree.major_compact(u64::MAX, 3)?;
+        assert!(
+            tree.get(b"b", crate::MAX_SEQNO)?.is_none(),
+            "the filter removed b at compaction",
+        );
+        drop(tree);
+
+        // The crash window: input deletion never reached the disk (restored
+        // AFTER drop, or the teardown's queued deletions would re-run).
+        for (path, bytes) in inputs {
+            let mut f = memfs.open(
+                &path,
+                &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+            )?;
+            f.write_all(&bytes)?;
+        }
+    }
+
+    // Manifest loss on top.
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs.clone())
+    .repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "the transformed output supersedes both lingering inputs: {report:?}",
+    );
+
+    let reopened = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .open()?;
+    assert!(
+        reopened.get(b"a", crate::MAX_SEQNO)?.is_some(),
+        "the kept record must survive the rebuild",
+    );
+    assert!(
+        reopened.get(b"b", crate::MAX_SEQNO)?.is_none(),
+        "a record the committed filter removed must not resurrect from a \
+         lingering input",
     );
     Ok(())
 }
@@ -9329,6 +9567,70 @@ fn repair_keeps_an_input_when_the_sibling_chain_is_broken() -> crate::Result<()>
     assert!(
         !report.lost_coverage.is_empty(),
         "the residual overlaps must be reported: {report:?}",
+    );
+    Ok(())
+}
+
+/// A TRANSFORMED output without the run-closing marker (a parallel
+/// sub-compaction or tight-space slice, or a run whose later outputs are
+/// lost) supersedes only what its WRITTEN range covers: without the
+/// first-to-last completeness proof, keys beyond it may live in a lost
+/// sibling, so the reaching input is kept and the overlap reported.
+#[test]
+fn a_transformed_output_without_the_run_end_keeps_reaching_inputs() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    // Input 0 spans [a, z]; the TRANSFORMED output 2 covers only [a, m] and
+    // does NOT close the run (no last-output marker — its successor is lost).
+    {
+        let mut w = Writer::new(tables.join("0"), 0, 0, Arc::clone(&fs))?;
+        for key in [b"a".as_slice(), b"z".as_slice()] {
+            w.write(InternalValue::from_components(
+                key.to_vec(),
+                b"v".to_vec(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the input is non-empty");
+    }
+    {
+        let mut w = Writer::new(tables.join("2"), 2, 0, Arc::clone(&fs))?
+            .use_recency(Some(1))
+            .use_lineage(Some(vec![0, 1]))
+            .use_lineage_transformed(true);
+        for key in [b"a".as_slice(), b"m".as_slice()] {
+            w.write(InternalValue::from_components(
+                key.to_vec(),
+                b"w".to_vec(),
+                2,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the output is non-empty");
+    }
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+    assert_eq!(
+        report.recovered, 2,
+        "without the completeness proof the reaching input holds the only \
+         copy of [n, z] and must be kept: {report:?}",
+    );
+    assert!(
+        !report.lost_coverage.is_empty(),
+        "the residual overlap must be reported: {report:?}",
     );
     Ok(())
 }

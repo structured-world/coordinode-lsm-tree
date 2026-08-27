@@ -210,6 +210,137 @@ mod reflink_fs {
     }
 }
 
+/// A [`Fs`] over [`reflink_fs::ReflinkFs`] that models Windows handle
+/// semantics: flushing a handle opened WITHOUT write access fails with
+/// `ERROR_ACCESS_DENIED` (surfaced as `PermissionDenied`). Conforming custom
+/// backends may behave the same way, so the checkpoint must open a
+/// destination it intends to sync with write access.
+mod windows_reflink_fs {
+    use crate::fs::{Fs, FsFile, FsMetadata, FsOpenOptions};
+    use crate::io;
+    use std::path::Path;
+
+    pub(super) struct WindowsReflinkFs;
+
+    impl Fs for WindowsReflinkFs {
+        fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
+            let file = super::reflink_fs::ReflinkFs.open(path, opts)?;
+            if opts.write {
+                Ok(file)
+            } else {
+                Ok(Box::new(FlushRefusingFile(file)))
+            }
+        }
+        fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+            super::reflink_fs::ReflinkFs.create_dir_all(path)
+        }
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<crate::fs::FsDirEntry>> {
+            super::reflink_fs::ReflinkFs.read_dir(path)
+        }
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            super::reflink_fs::ReflinkFs.remove_file(path)
+        }
+        fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+            super::reflink_fs::ReflinkFs.remove_dir_all(path)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            super::reflink_fs::ReflinkFs.rename(from, to)
+        }
+        fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
+            super::reflink_fs::ReflinkFs.metadata(path)
+        }
+        fn sync_directory(&self, path: &Path) -> io::Result<()> {
+            super::reflink_fs::ReflinkFs.sync_directory(path)
+        }
+        fn exists(&self, path: &Path) -> io::Result<bool> {
+            super::reflink_fs::ReflinkFs.exists(path)
+        }
+        fn backend_id(&self) -> Option<u64> {
+            super::reflink_fs::ReflinkFs.backend_id()
+        }
+        fn volume_id(&self, path: &Path) -> Option<u64> {
+            super::reflink_fs::ReflinkFs.volume_id(path)
+        }
+        fn capabilities(&self, path: &Path) -> crate::fs::FsCapabilities {
+            super::reflink_fs::ReflinkFs.capabilities(path)
+        }
+        fn reflink_file(&self, src: &Path, dst: &Path) -> io::Result<()> {
+            super::reflink_fs::ReflinkFs.reflink_file(src, dst)
+        }
+    }
+
+    /// A read-only handle that refuses to flush, the way a Windows handle
+    /// opened without `GENERIC_WRITE` does.
+    struct FlushRefusingFile(Box<dyn FsFile>);
+
+    impl std::io::Read for FlushRefusingFile {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+    impl std::io::Write for FlushRefusingFile {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.flush()
+        }
+    }
+    impl std::io::Seek for FlushRefusingFile {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(pos)
+        }
+    }
+    impl FsFile for FlushRefusingFile {
+        fn sync_all(&self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "flush of a read-only handle",
+            ))
+        }
+        fn sync_data(&self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "flush of a read-only handle",
+            ))
+        }
+        fn metadata(&self) -> io::Result<FsMetadata> {
+            self.0.metadata()
+        }
+        fn set_len(&self, size: u64) -> io::Result<()> {
+            self.0.set_len(size)
+        }
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            self.0.read_at(buf, offset)
+        }
+        fn lock_exclusive(&self) -> io::Result<()> {
+            self.0.lock_exclusive()
+        }
+    }
+}
+
+/// The reflink fast path syncs the freshly cloned destination through a handle
+/// it opens itself — and that handle must carry WRITE access, because Windows
+/// (and conforming custom backends) refuse to flush a read-only handle with
+/// `ERROR_ACCESS_DENIED`. A build that opens the destination read-only fails
+/// every reflink checkpoint on such a backend right after a successful clone.
+#[test]
+fn reflink_checkpoint_sync_handle_carries_write_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("payload.bin");
+    std::fs::write(&src, b"reflink-payload").unwrap();
+    let dst_dir = dir.path().join("dst");
+    std::fs::create_dir_all(&dst_dir).unwrap();
+    let dst = dst_dir.join("payload.bin");
+
+    let fs: Arc<dyn Fs> = Arc::new(windows_reflink_fs::WindowsReflinkFs);
+    let result = link_or_copy_cross_fs(&fs, &src, &fs, &dst, SyncMode::Full, true);
+    assert_eq!(
+        result.expect("the clone's sync handle must be opened with write access"),
+        b"reflink-payload".len() as u64,
+    );
+}
+
 /// The reflink fast path must SYNC the cloned destination file before the
 /// checkpoint treats it as complete. The streamed-copy fallback already does;
 /// the real Linux / macOS `reflink_file` implementations never sync, and the

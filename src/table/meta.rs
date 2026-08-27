@@ -41,6 +41,12 @@ impl From<u128> for Timestamp {
 // compare an ECC-masked copy ([`Self::without_ecc`]) without consuming the
 // original.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "decoded on-disk meta: each bool mirrors an independent \
+              presence-marker key (bulk-ingest provenance, lineage \
+              transformed / last); enums would misrepresent the format"
+)]
 pub struct ParsedMeta {
     pub id: TableId,
     pub created_at: Timestamp,
@@ -198,6 +204,17 @@ pub struct ParsedMeta {
     /// output ranges whose chain is unbroken — a gap could hide a lost
     /// sibling whose span the union does not actually cover.
     pub lineage_prev: Option<TableId>,
+
+    /// A compaction filter TRANSFORMED this output's window (presence of the
+    /// `lineage_transformed` marker): its content is not derivable from its
+    /// inputs, so manifest repair must never trade it back for resurrected
+    /// inputs — it supersedes the inputs it covers instead.
+    pub lineage_transformed: bool,
+
+    /// This output closed its compaction run (presence of the `lineage_last`
+    /// marker). With an unbroken adjacency chain from the run's first output,
+    /// it proves the surviving set is the run's COMPLETE output set.
+    pub lineage_last: bool,
 }
 
 macro_rules! read_u8 {
@@ -598,6 +615,13 @@ impl ParsedMeta {
             None => None,
         };
         let lineage_prev = read_opt_u64(b"lineage_prev")?;
+        // Presence markers: the payload is empty, only existence matters.
+        let lineage_transformed = block
+            .point_read(b"lineage_transformed", SeqNo::MAX, &cmp)?
+            .is_some();
+        let lineage_last = block
+            .point_read(b"lineage_last", SeqNo::MAX, &cmp)?
+            .is_some();
 
         Ok(Self {
             id,
@@ -631,6 +655,8 @@ impl ParsedMeta {
             recency,
             lineage,
             lineage_prev,
+            lineage_transformed,
+            lineage_last,
         })
     }
 }

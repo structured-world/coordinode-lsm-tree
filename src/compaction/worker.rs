@@ -1474,8 +1474,8 @@ fn run_subcompaction(
         None
     };
     // Shared transform counter: the adapter ticks it on every non-Keep
-    // verdict, and the table writer strips the lineage of any output whose
-    // window saw one (see `prepare_table_writer`).
+    // verdict, and the table writer marks transformed the lineage of any
+    // output whose window saw one (see `prepare_table_writer`).
     let transform_marker = compaction_filter
         .is_some()
         .then(|| Arc::new(portable_atomic::AtomicU64::new(0)));
@@ -1511,8 +1511,16 @@ fn run_subcompaction(
 
     // block_parallel = false: this sub-compaction already runs on a pool thread,
     // so its block compression must stay serial (nested-pool deadlock otherwise).
-    let table_writer =
-        super::flavour::prepare_table_writer(version, opts, payload, false, transform_marker)?;
+    // whole_run = false: several sub-compactions (or tight-space slices) share
+    // this payload's lineage, so no single writer may close the run.
+    let table_writer = super::flavour::prepare_table_writer(
+        version,
+        opts,
+        payload,
+        false,
+        transform_marker,
+        false,
+    )?;
     let mut compactor: Box<dyn CompactionFlavour> = match relocation {
         // Tight-space blob defrag: relocate the stale files' live entries into a
         // fresh compact file, resuming each stale scan at its carried-over
@@ -2304,8 +2312,8 @@ fn merge_tables(
         f.make_filter(&filter_ctx)
     });
     // Shared transform counter: the adapter ticks it on every non-Keep
-    // verdict, and the table writer strips the lineage of any output whose
-    // window saw one (see `prepare_table_writer`).
+    // verdict, and the table writer marks transformed the lineage of any
+    // output whose window saw one (see `prepare_table_writer`).
     let transform_marker = compaction_filter
         .is_some()
         .then(|| Arc::new(portable_atomic::AtomicU64::new(0)));
@@ -2324,13 +2332,16 @@ fn merge_tables(
         transform_marker.clone(),
     ));
 
-    // Serial (single-stream) compaction: block compression may use the pool.
+    // Serial (single-stream) compaction: block compression may use the pool,
+    // and the single writer owns the whole run (its final output carries the
+    // `lineage_last` marker).
     let table_writer = super::flavour::prepare_table_writer(
         &current_super_version.version,
         opts,
         payload,
         true,
         transform_marker,
+        true,
     )?;
 
     let start = Instant::now();

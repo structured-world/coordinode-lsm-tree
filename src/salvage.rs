@@ -967,6 +967,8 @@ fn salvage_attempt(
     // reason: the content is the same derived output.
     .use_lineage(table.metadata.lineage.clone())
     .use_lineage_prev(table.metadata.lineage_prev)
+    .use_lineage_transformed(table.metadata.lineage_transformed)
+    .use_lineage_last(table.metadata.lineage_last)
     .use_sync_mode(options.sync_mode)
     // The extractor is configuration (never persisted in the SST), so
     // the rebuilt filter only carries the source's prefix hashes when
