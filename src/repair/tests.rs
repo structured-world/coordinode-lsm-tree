@@ -2554,6 +2554,115 @@ impl crate::fs::Fs for SortedDirFs {
     }
 }
 
+/// An INCONCLUSIVE alias probe must abort the repair, never authorize a
+/// deletion: `false` from `same_file` is what lets `record_best` queue a
+/// "distinct duplicate" for post-commit removal, and if the two spellings
+/// were in fact aliases of one directory entry, that removal unlinks the
+/// exact file the rebuilt manifest retained. (The old `bool` contract could
+/// not even EXPRESS a probe failure — a canonicalization error was silently
+/// reported as "distinct" — so this pins the fallible contract end-to-end.)
+#[test]
+fn repair_aborts_when_the_alias_probe_is_inconclusive() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    /// Forwards everything to [`MemFs`] but refuses the alias probe, the way
+    /// a transient host fault refuses `canonicalize`.
+    struct FailingAliasFs(MemFs);
+    impl Fs for FailingAliasFs {
+        fn open(
+            &self,
+            path: &std::path::Path,
+            options: &crate::fs::FsOpenOptions,
+        ) -> crate::io::Result<Box<dyn crate::fs::FsFile>> {
+            self.0.open(path, options)
+        }
+        fn create_dir_all(&self, path: &std::path::Path) -> crate::io::Result<()> {
+            self.0.create_dir_all(path)
+        }
+        fn read_dir(
+            &self,
+            path: &std::path::Path,
+        ) -> crate::io::Result<Vec<crate::fs::FsDirEntry>> {
+            self.0.read_dir(path)
+        }
+        fn remove_file(&self, path: &std::path::Path) -> crate::io::Result<()> {
+            self.0.remove_file(path)
+        }
+        fn remove_dir_all(&self, path: &std::path::Path) -> crate::io::Result<()> {
+            self.0.remove_dir_all(path)
+        }
+        fn same_file(&self, _a: &std::path::Path, _b: &std::path::Path) -> crate::io::Result<bool> {
+            Err(crate::io::Error::new(
+                crate::io::ErrorKind::Interrupted,
+                "injected alias-probe failure",
+            ))
+        }
+        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> crate::io::Result<()> {
+            self.0.rename(from, to)
+        }
+        fn metadata(&self, path: &std::path::Path) -> crate::io::Result<crate::fs::FsMetadata> {
+            self.0.metadata(path)
+        }
+        fn exists(&self, path: &std::path::Path) -> crate::io::Result<bool> {
+            self.0.exists(path)
+        }
+        fn sync_directory(&self, path: &std::path::Path) -> crate::io::Result<()> {
+            self.0.sync_directory(path)
+        }
+        fn backend_id(&self) -> Option<u64> {
+            self.0.backend_id()
+        }
+    }
+
+    let memfs = MemFs::new();
+    let fs: Arc<dyn Fs> = Arc::new(FailingAliasFs(memfs));
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    // Two spellings of one id: the duplicate decision needs the alias probe.
+    for name in ["1", "01"] {
+        let mut w = crate::table::Writer::new(tables.join(name), 1, 0, Arc::clone(&fs))?;
+        w.write(InternalValue::from_components(
+            b"k".to_vec(),
+            b"v".to_vec(),
+            5,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs)
+    .repair();
+    assert!(
+        result.is_err(),
+        "an inconclusive alias probe must abort the repair instead of \
+         authorizing the duplicate's deletion: {:?}",
+        result.map(|r| r.recovered),
+    );
+    Ok(())
+}
+
+/// A kernel-backed backend's alias probe PROPAGATES a canonicalization
+/// failure instead of reporting "distinct": the caller's `false` authorizes
+/// deleting the "duplicate", which may be the kept file's own alias.
+#[test]
+fn std_fs_same_file_propagates_a_probe_failure() {
+    use crate::fs::Fs;
+    let missing_a = std::path::Path::new("/nonexistent-probe-a");
+    let missing_b = std::path::Path::new("/nonexistent-probe-b");
+    assert!(
+        StdFs.same_file(missing_a, missing_b).is_err(),
+        "a canonicalization failure must surface, never read as distinct",
+    );
+}
+
 /// Two spellings of one id (`1` and `01`) can hold different content, so which
 /// one survives decides what the rebuilt tree contains. Directory iteration
 /// order must not be that decision: the writer's own `{id}` spelling is the
@@ -3213,11 +3322,11 @@ fn same_physical_file_requires_a_shared_namespace() -> crate::Result<()> {
     }
 
     assert!(
-        !super::same_physical_file(&*memfs, &real, &*stdfs, &real),
+        !super::same_physical_file(&*memfs, &real, &*stdfs, &real)?,
         "same path spelling in DIFFERENT namespaces is not an alias",
     );
     assert!(
-        super::same_physical_file(&*stdfs, &real, &*stdfs, &real),
+        super::same_physical_file(&*stdfs, &real, &*stdfs, &real)?,
         "the same host path through one namespace IS an alias",
     );
     Ok(())
@@ -3265,7 +3374,7 @@ fn same_physical_file_ignores_host_symlinks_for_a_virtual_backend() -> crate::Re
     }
 
     assert!(
-        !super::same_physical_file(&*memfs, &real_path, &*memfs, &linked_path),
+        !super::same_physical_file(&*memfs, &real_path, &*memfs, &linked_path)?,
         "a host symlink must not alias two distinct virtual files",
     );
     Ok(())
@@ -8528,6 +8637,138 @@ fn a_crashed_blob_salvage_temp_is_swept_not_fatal() -> crate::Result<()> {
 /// offsets — handles resolving to the wrong records. The salvage therefore
 /// builds into a private temp and publishes atomically: at every fault timing
 /// the tree is either fully repaired or exactly as it was found.
+/// The post-failure `CURRENT` probe must fail SAFE: a probe that cannot read
+/// the pointer (a transient or permission failure on its open / read) proves
+/// nothing about the switch, and treating it as "not switched" lets the
+/// still-armed guard delete replacements a PUBLISHED manifest references —
+/// a repaired tree with missing blob files. The sweep drives a directory-sync
+/// fault through every sync in the commit sequence (including the one AFTER
+/// the pointer rename) while the probe's own open is refused; whatever the
+/// outcome, a pointer that names the rebuilt version must still resolve every
+/// value.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn an_unreadable_current_probe_preserves_published_replacements() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let root = std::path::absolute("/db")?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+
+    let fixture = || -> crate::Result<Arc<MemFs>> {
+        let memfs = Arc::new(MemFs::new());
+        {
+            let tree = match Config::new(
+                &root,
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .with_shared_fs(memfs.clone())
+            .with_kv_separation(Some(
+                KvSeparationOptions::default().separation_threshold(16),
+            ))
+            .open()?
+            {
+                crate::AnyTree::Blob(t) => t,
+                crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+            };
+            for i in 0..8u32 {
+                tree.insert(format!("k{i:04}").as_bytes(), vec![b'v'; 64], u64::from(i));
+            }
+            tree.flush_active_memtable(0)?;
+        }
+        let fs_dyn: Arc<dyn Fs> = memfs.clone();
+        let blob_path = memfs
+            .read_dir(&blobs)?
+            .into_iter()
+            .find(|e| !e.is_dir)
+            .expect("one blob file")
+            .path;
+        let last = crate::vlog::BlobFileScanner::new(&blob_path, &*fs_dyn, 0)?
+            .collect::<crate::Result<Vec<_>>>()?
+            .last()
+            .expect("a last frame")
+            .frame_end;
+        {
+            let mut file = memfs.open(
+                &blob_path,
+                &crate::fs::FsOpenOptions::new().read(true).write(true),
+            )?;
+            let byte = crate::file::read_exact(&*file, last - 8, 1)?;
+            file.seek(SeekFrom::Start(last - 8))?;
+            file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
+        }
+        for e in memfs.read_dir(&root)? {
+            let is_version = e
+                .file_name
+                .strip_prefix('v')
+                .is_some_and(|rest| rest.parse::<u64>().is_ok());
+            if is_version || e.file_name == "current" {
+                memfs.remove_file(&e.path)?;
+            }
+        }
+        Ok(memfs)
+    };
+
+    for skip in 0u64..10 {
+        let memfs = fixture()?;
+        let fault = FaultFs::new((*memfs).clone());
+        // One directory sync in the commit sequence fails...
+        fault
+            .injector()
+            .arm(FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).skip(skip));
+        // ...and the probe cannot read the pointer to find out what happened
+        // (the first `current` open is recovery's own, before the rebuild).
+        fault.injector().arm(
+            FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::PermissionDenied))
+                .on_path(crate::file::CURRENT_VERSION_FILE)
+                .skip(1),
+        );
+
+        let result = Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_fs(fault)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .repair();
+
+        // The invariant, whatever the fault timing hit: a pointer that NAMES
+        // the rebuilt version resolves every surviving value — the guard must
+        // never have deleted a file the published manifest references.
+        if memfs.exists(&root.join("current"))? {
+            let tree = Config::new(
+                &root,
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .with_shared_fs(memfs.clone())
+            .with_kv_separation(Some(
+                KvSeparationOptions::default().separation_threshold(16),
+            ))
+            .open()?;
+            // The corrupt LAST record's key may be gone; every other value
+            // must read back through the (possibly replaced) blob file.
+            for i in 0..7u32 {
+                assert!(
+                    tree.get(format!("k{i:04}").as_bytes(), crate::SeqNo::MAX)?
+                        .is_some(),
+                    "skip={skip}, repair={:?}: a committed manifest must \
+                     resolve its values — a referenced blob file was deleted",
+                    result.as_ref().map(|r| r.recovered),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A persist failure BEFORE the `CURRENT` pointer switch must unwind the
 /// published fresh-id blob replacements. The guard was disarmed ahead of
 /// `persist_version`, whose create / encode / finish / directory-sync steps
@@ -10854,7 +11095,7 @@ impl crate::fs::Fs for HookFs {
     ) -> crate::io::Result<()> {
         self.inner.sync_directory_with(path, mode)
     }
-    fn same_file(&self, a: &std::path::Path, b: &std::path::Path) -> bool {
+    fn same_file(&self, a: &std::path::Path, b: &std::path::Path) -> crate::io::Result<bool> {
         self.inner.same_file(a, b)
     }
     fn hard_link(&self, src: &std::path::Path, dst: &std::path::Path) -> crate::io::Result<()> {

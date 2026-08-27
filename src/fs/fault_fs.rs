@@ -437,7 +437,7 @@ impl<F: Fs> Fs for FaultFs<F> {
         self.inner.remove_dir_all(path)
     }
 
-    fn same_file(&self, a: &Path, b: &Path) -> bool {
+    fn same_file(&self, a: &Path, b: &Path) -> io::Result<bool> {
         self.inner.same_file(a, b)
     }
 

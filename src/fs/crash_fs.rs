@@ -283,7 +283,7 @@ impl Fs for CrashFs {
         Ok(())
     }
 
-    fn same_file(&self, a: &Path, b: &Path) -> bool {
+    fn same_file(&self, a: &Path, b: &Path) -> io::Result<bool> {
         self.inner.same_file(a, b)
     }
 

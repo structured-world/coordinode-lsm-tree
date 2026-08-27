@@ -758,12 +758,17 @@ pub trait Fs: Send + Sync + 'static {
     /// ([`MemFs`]), whose distinct path strings are distinct files by
     /// construction; resolving them through the HOST filesystem would let a
     /// host symlink alias two unrelated virtual files. Kernel-backed backends
-    /// ([`StdFs`]) override this with host canonicalization. A probe that
-    /// cannot decide must answer `false` (treat as distinct): callers use
-    /// `true` to skip duplicate handling, so a false positive lets a real
-    /// duplicate escape.
-    fn same_file(&self, a: &Path, b: &Path) -> bool {
-        a == b
+    /// ([`StdFs`]) override this with host canonicalization.
+    ///
+    /// # Errors
+    ///
+    /// A probe that cannot DECIDE (a canonicalization failure on either side)
+    /// must return the error rather than guessing: callers use `false` to
+    /// authorize duplicate deletion, so a fabricated "distinct" verdict lets
+    /// a transient fault delete the alias of a file the caller keeps —
+    /// unlinking the very directory entry it retained.
+    fn same_file(&self, a: &Path, b: &Path) -> io::Result<bool> {
+        Ok(a == b)
     }
 
     /// Renames a file from `from` to `to`.

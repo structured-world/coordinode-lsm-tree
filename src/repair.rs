@@ -688,19 +688,21 @@ fn same_physical_file(
     a: &std::path::Path,
     fs_b: &dyn crate::fs::Fs,
     b: &std::path::Path,
-) -> bool {
+) -> crate::Result<bool> {
     match (fs_a.backend_id(), fs_b.backend_id()) {
         (Some(id_a), Some(id_b)) if id_a == id_b => {}
         // Different backends, or a backend that gives no namespace guarantee:
         // path spellings are not comparable, so never alias them.
-        _ => return false,
+        _ => return Ok(false),
     }
     // Alias resolution belongs to the BACKEND, not the host: canonicalizing a
     // virtual backend's paths through the host filesystem would let a host
     // symlink alias two unrelated virtual files, and the "duplicate" loser
     // would survive. Kernel-backed backends canonicalize; virtual ones compare
-    // literally.
-    fs_a.same_file(a, b)
+    // literally. An INCONCLUSIVE probe propagates: `false` authorizes
+    // duplicate deletion, and deleting what may be an alias of the kept copy
+    // unlinks the very directory entry the rebuilt manifest retains.
+    Ok(fs_a.same_file(a, b)?)
 }
 
 /// Records a duplicate table file that lost to a better same-id copy: reported
@@ -740,7 +742,7 @@ fn record_best(
     fidelity: Fidelity,
     fs: &Arc<dyn crate::fs::Fs>,
     path: &std::path::Path,
-) {
+) -> crate::Result<()> {
     let candidate = TableCandidate {
         table,
         fidelity,
@@ -751,15 +753,19 @@ fn record_best(
         // If the displaced copy physically ALIASES the kept one (same directory
         // entry via a symlink / junction / case-insensitive path), it is the SAME
         // file — removing it would destroy the kept copy and orphan the manifest
-        // entry. Drop the loser's handle in place instead.
-        let is_alias = map
-            .get(&id)
-            .is_some_and(|kept| same_physical_file(&*loser.fs, &loser.path, &*kept.fs, &kept.path));
+        // entry. Drop the loser's handle in place instead. An INCONCLUSIVE
+        // probe aborts the repair for a retry: guessing "distinct" would
+        // authorize exactly that destruction.
+        let is_alias = match map.get(&id) {
+            Some(kept) => same_physical_file(&*loser.fs, &loser.path, &*kept.fs, &kept.path)?,
+            None => false,
+        };
         if is_alias {
-            return;
+            return Ok(());
         }
         discard_duplicate(loser, unreadable_files, discard_after_commit);
     }
+    Ok(())
 }
 
 /// Block-salvages a corrupt SST during repair: reads the UNTOUCHED original in
@@ -2221,7 +2227,7 @@ fn recover_blob_files(
             // records one checksum per id, and a stale duplicate left in
             // `blobs/` would race the kept file for reads on the next open
             // (directory iteration order picks the physical file).
-            if same_physical_file(&*config.fs, kept, &*config.fs, &blob_path) {
+            if same_physical_file(&*config.fs, kept, &*config.fs, &blob_path)? {
                 continue;
             }
             let reason = format!("duplicate of blob file id {blob_id}");
@@ -3080,31 +3086,50 @@ impl<'a> PublishedBlobReplacements<'a> {
     }
 }
 
-/// Whether the `CURRENT` pointer on disk names `version_id` — the
-/// post-failure probe deciding if a failed `persist_version` died before or
-/// after its atomic pointer switch. A missing / unreadable / short pointer
-/// reads as "not switched": the rename either never ran or itself failed,
-/// and both leave the previous pointer (or none) in place. An OLDER tree's
-/// surviving pointer names a lower version id (the rebuild allocates
-/// `max(v*) + 1`), so it never false-positives.
-fn current_names_version(
+/// What the on-disk `CURRENT` pointer says about a failed `persist_version`:
+/// did its atomic pointer switch happen before the error?
+enum CurrentProbe {
+    /// The pointer names the rebuilt version: the switch happened.
+    Switched,
+    /// The pointer is ABSENT (`NotFound`) or names another version: the
+    /// switch did not happen. Absence is conclusive — a successful rename
+    /// leaves the pointer in place, so `NotFound` means the rename never
+    /// ran; and an OLDER tree's surviving pointer names a lower version id
+    /// (the rebuild allocates `max(v*) + 1`), so it never false-positives.
+    NotSwitched,
+    /// The pointer cannot be read (a transient or permission failure on its
+    /// open or read, or a short pointer): NO conclusion. The caller must
+    /// fail SAFE — treating this as "not switched" would delete files a
+    /// possibly-published manifest references.
+    Inconclusive,
+}
+
+/// The post-failure probe deciding if a failed `persist_version` died before
+/// or after its atomic pointer switch.
+fn probe_current(
     fs: &dyn crate::fs::Fs,
     folder: &std::path::Path,
     version_id: u64,
-) -> bool {
-    let Ok(file) = fs.open(
+) -> CurrentProbe {
+    let file = match fs.open(
         &folder.join(crate::file::CURRENT_VERSION_FILE),
         &crate::fs::FsOpenOptions::new().read(true),
-    ) else {
-        return false;
+    ) {
+        Ok(file) => file,
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return CurrentProbe::NotSwitched,
+        Err(_) => return CurrentProbe::Inconclusive,
     };
     let Ok(bytes) = crate::file::read_exact(&*file, 0, 8) else {
-        return false;
+        return CurrentProbe::Inconclusive;
     };
     let Ok(raw) = <[u8; 8]>::try_from(bytes.as_ref()) else {
-        return false;
+        return CurrentProbe::Inconclusive;
     };
-    u64::from_le_bytes(raw) == version_id
+    if u64::from_le_bytes(raw) == version_id {
+        CurrentProbe::Switched
+    } else {
+        CurrentProbe::NotSwitched
+    }
 }
 
 impl Drop for PublishedBlobReplacements<'_> {
@@ -3362,7 +3387,7 @@ fn repair_tree(
                 // is the SAME file, not a genuine duplicate. Removing it would
                 // destroy the kept copy and leave the manifest referencing a
                 // missing SST, so skip it IN PLACE.
-                if same_physical_file(&*folder_fs, &table_path, &*existing.fs, &existing.path) {
+                if same_physical_file(&*folder_fs, &table_path, &*existing.fs, &existing.path)? {
                     continue;
                 }
                 // A genuine duplicate: removed after the commit so recovery
@@ -3625,7 +3650,7 @@ fn repair_tree(
                                 },
                                 &folder_fs,
                                 &table_path,
-                            );
+                            )?;
                         }
                         RepairKeepDecision::Drop(reason) => {
                             drop(table);
@@ -3701,7 +3726,7 @@ fn repair_tree(
                                         Fidelity::Salvaged,
                                         &folder_fs,
                                         &table_path,
-                                    );
+                                    )?;
                                     swap_after_commit.push((
                                         Arc::clone(&folder_fs),
                                         output_path,
@@ -3774,7 +3799,7 @@ fn repair_tree(
                                 },
                                 &folder_fs,
                                 &table_path,
-                            );
+                            )?;
                         }
                         // `Salvage` is unreachable with the flag off, but a
                         // defensive fallthrough beats a panic in a repair path.
@@ -3906,7 +3931,7 @@ fn repair_tree(
                                 Fidelity::Salvaged,
                                 &folder_fs,
                                 &table_path,
-                            );
+                            )?;
                             swap_after_commit.push((
                                 Arc::clone(&folder_fs),
                                 output_path,
@@ -4507,8 +4532,16 @@ fn repair_tree(
     // pointer's directory sync, so on failure the pointer on disk decides
     // which world this is: a `CURRENT` naming the rebuilt version means the
     // manifest is published and the replacements are the files it
-    // references.
-    if persisted.is_ok() || current_names_version(&*config.fs, &config.path, version_id) {
+    // references. A probe that cannot READ the pointer proves nothing, and
+    // fail-safe is to PRESERVE: the worst a preserved orphan costs is disk
+    // space a later successful repair's reference filtering reclaims, while
+    // a wrong deletion breaks a published manifest permanently.
+    if persisted.is_ok()
+        || !matches!(
+            probe_current(&*config.fs, &config.path, version_id),
+            CurrentProbe::NotSwitched
+        )
+    {
         published_blob_replacements.disarm();
     }
     persisted?;

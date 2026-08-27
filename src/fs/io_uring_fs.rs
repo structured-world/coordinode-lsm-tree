@@ -219,12 +219,12 @@ impl Fs for IoUringFs {
         std::fs::remove_dir_all(path).map_err(crate::io::Error::from)
     }
 
-    fn same_file(&self, a: &Path, b: &Path) -> bool {
-        // Kernel-backed namespace, same contract as the std backend.
-        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-            (Ok(ca), Ok(cb)) => ca == cb,
-            _ => false,
-        }
+    fn same_file(&self, a: &Path, b: &Path) -> crate::io::Result<bool> {
+        // Kernel-backed namespace, same contract as the std backend: a
+        // canonicalization failure propagates instead of guessing "distinct".
+        let ca = std::fs::canonicalize(a).map_err(crate::io::Error::from)?;
+        let cb = std::fs::canonicalize(b).map_err(crate::io::Error::from)?;
+        Ok(ca == cb)
     }
 
     fn rename(&self, from: &Path, to: &Path) -> crate::io::Result<()> {

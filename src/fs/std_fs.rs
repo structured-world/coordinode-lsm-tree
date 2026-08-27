@@ -242,15 +242,15 @@ impl Fs for StdFs {
         std::fs::remove_dir_all(path).map_err(io::Error::from)
     }
 
-    fn same_file(&self, a: &Path, b: &Path) -> bool {
+    fn same_file(&self, a: &Path, b: &Path) -> io::Result<bool> {
         // Kernel-backed namespace: resolve both spellings through the host
         // (symlinks, `..`, case folding). A canonicalization failure on
-        // either side answers "distinct", so a real duplicate is still
-        // handled rather than skipped.
-        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-            (Ok(ca), Ok(cb)) => ca == cb,
-            _ => false,
-        }
+        // either side is PROPAGATED, never guessed as "distinct" — callers
+        // use that verdict to authorize duplicate deletion, and a transient
+        // probe failure must not delete a possible alias of the kept file.
+        let ca = std::fs::canonicalize(a).map_err(io::Error::from)?;
+        let cb = std::fs::canonicalize(b).map_err(io::Error::from)?;
+        Ok(ca == cb)
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
