@@ -911,10 +911,31 @@ fn reconcile_after_repair(
     };
 
     let zones: Vec<LostZone> = if report.unknowable_losses.is_empty() {
-        report
+        // COALESCE overlapping / touching ranges into one zone each, so a
+        // record in the overlap of two lost coverages is processed exactly
+        // once. (The per-pass survivor scan does see the previous pass's
+        // replays — the scan covers the active memtable — but correctness
+        // must not hinge on that subtlety.)
+        let mut ranges: Vec<(&[u8], &[u8])> = report
             .lost_coverage
             .iter()
-            .map(|(_, lo, hi, _)| LostZone::Range(lo.as_ref(), hi.as_ref()))
+            .map(|(_, lo, hi, _)| (lo.as_ref(), hi.as_ref()))
+            .collect();
+        ranges.sort();
+        let mut coalesced: Vec<(&[u8], &[u8])> = Vec::new();
+        for (lo, hi) in ranges {
+            match coalesced.last_mut() {
+                Some((_, chi)) if lo <= *chi => {
+                    if hi > *chi {
+                        *chi = hi;
+                    }
+                }
+                _ => coalesced.push((lo, hi)),
+            }
+        }
+        coalesced
+            .into_iter()
+            .map(|(lo, hi)| LostZone::Range(lo, hi))
             .collect()
     } else {
         vec![LostZone::WholeKeyspace]
@@ -929,18 +950,51 @@ fn reconcile_after_repair(
         };
         let mut survived: std::collections::HashMap<(Vec<u8>, u64, Vec<u8>), usize> =
             std::collections::HashMap::new();
+        // A compaction-FOLDED merge chain leaves a plain surviving value at
+        // the chain head's seqno and no operand events, so absence from the
+        // multiset does not prove an operand was lost. Track the highest
+        // surviving value / point-tombstone seqno per key (and the surviving
+        // range tombstones): an archived operand at or below it is already
+        // incorporated — or superseded — and must not be reapplied.
+        let mut superseded_floor: std::collections::HashMap<Vec<u8>, u64> =
+            std::collections::HashMap::new();
+        let mut surviving_range_tombstones: Vec<(Vec<u8>, Vec<u8>, u64)> = Vec::new();
         for event in standard.scan_since_seqno_in_range::<&[u8], _>(0, zone.scan_bounds())? {
-            if let ScanSinceEvent::MergeOperand {
-                key,
-                operand,
-                seqno,
-            } = event
-            {
-                *survived
-                    .entry((key.to_vec(), seqno, operand.to_vec()))
-                    .or_default() += 1;
+            match event {
+                ScanSinceEvent::MergeOperand {
+                    key,
+                    operand,
+                    seqno,
+                } => {
+                    *survived
+                        .entry((key.to_vec(), seqno, operand.to_vec()))
+                        .or_default() += 1;
+                }
+                ScanSinceEvent::Insert { key, seqno, .. }
+                | ScanSinceEvent::PointTombstone { key, seqno } => {
+                    let floor = superseded_floor.entry(key.to_vec()).or_default();
+                    // Seqno 0 is a bottommost-ZEROED survivor: per the
+                    // section 4 GC-coordination rule it already incorporates
+                    // the key's whole archived history (deployments that
+                    // reconcile start their WAL seqnos at 1, so a genuine
+                    // write cannot sit at 0), and its floor is unbounded.
+                    *floor = (*floor).max(if seqno == 0 { u64::MAX } else { seqno });
+                }
+                ScanSinceEvent::RangeTombstone {
+                    start_key,
+                    end_key,
+                    seqno,
+                } => {
+                    surviving_range_tombstones.push((start_key.to_vec(), end_key.to_vec(), seqno));
+                }
             }
         }
+        let record_superseded = |key: &[u8], seqno: u64| {
+            superseded_floor.get(key).is_some_and(|&v| seqno <= v)
+                || surviving_range_tombstones
+                    .iter()
+                    .any(|(s, e, rt)| key >= s.as_slice() && key < e.as_slice() && seqno <= *rt)
+        };
 
         for record in records
             .iter()
@@ -955,14 +1009,24 @@ fn reconcile_after_repair(
                         // The operand survived the repair: replaying it would
                         // fold it twice.
                         Some(count) => *count -= 1,
+                        // Folded into (or superseded by) a surviving value or
+                        // tombstone: already accounted for.
+                        None if record_superseded(key, record.seqno) => {}
                         None => apply(tree, record)?,
                     }
                 }
                 WalOp::Insert { key, .. } | WalOp::Remove { key } | WalOp::RemoveWeak { key }
                     if zone.covers_key(key) =>
                 {
-                    // Idempotent at their original seqno: blind replay.
-                    apply(tree, record)?;
+                    // Blind replay is idempotent against REAL surviving
+                    // versions, but a record at or below the superseded
+                    // floor is already incorporated (a bottommost-zeroed
+                    // survivor sits at seqno 0 while embodying the whole
+                    // folded history — replaying over it would resurrect a
+                    // pre-fold state) or superseded outright.
+                    if !record_superseded(key, record.seqno) {
+                        apply(tree, record)?;
+                    }
                 }
                 // A range deletion is selected by SPAN OVERLAP with the lost
                 // coverage (its half-open `[start, end)` against the
@@ -981,13 +1045,22 @@ fn reconcile_after_repair(
                 WalOp::Batch { entries } => {
                     for entry in entries {
                         match entry {
-                            BatchEntry::Insert { key, value } if zone.covers_key(key) => {
+                            BatchEntry::Insert { key, value }
+                                if zone.covers_key(key)
+                                    && !record_superseded(key, record.seqno) =>
+                            {
                                 tree.insert(key.as_slice(), value.as_slice(), record.seqno);
                             }
-                            BatchEntry::Remove { key } if zone.covers_key(key) => {
+                            BatchEntry::Remove { key }
+                                if zone.covers_key(key)
+                                    && !record_superseded(key, record.seqno) =>
+                            {
                                 tree.remove(key.as_slice(), record.seqno);
                             }
-                            BatchEntry::RemoveWeak { key } if zone.covers_key(key) => {
+                            BatchEntry::RemoveWeak { key }
+                                if zone.covers_key(key)
+                                    && !record_superseded(key, record.seqno) =>
+                            {
                                 tree.remove_weak(key.as_slice(), record.seqno);
                             }
                             BatchEntry::Merge { key, value } if zone.covers_key(key) => {
@@ -996,6 +1069,7 @@ fn reconcile_after_repair(
                                     .filter(|count| **count > 0);
                                 match covered {
                                     Some(count) => *count -= 1,
+                                    None if record_superseded(key, record.seqno) => {}
                                     None => {
                                         tree.merge(key.as_slice(), value.as_slice(), record.seqno);
                                     }
@@ -1066,6 +1140,288 @@ fn repair_and_reconciled_replay_recover_identical_state() -> lsm_tree::Result<()
         Some(5 + 7 + 11),
         "each merge operand folded exactly once across the lost and the \
          surviving SST",
+    );
+    Ok(())
+}
+
+/// Two lost SSTs with OVERLAPPING coverage must not double-process a record
+/// in the overlap: the reconciliation coalesces overlapping ranges into one
+/// zone, so a lost merge operand folds exactly once and a blind put replays
+/// exactly once regardless of how many lost tables covered its key.
+#[test]
+fn reconciled_replay_coalesces_overlapping_loss_ranges() -> lsm_tree::Result<()> {
+    let i64op = |n: i64| n.to_le_bytes().to_vec();
+    // Seqnos start at 1, per the section 4 GC-coordination rule.
+    let records = vec![
+        WalRecord {
+            seqno: 1,
+            op: WalOp::Insert {
+                key: b"a1".to_vec(),
+                value: b"v1".to_vec(),
+            },
+        },
+        WalRecord {
+            seqno: 2,
+            op: WalOp::Merge {
+                key: b"counter".to_vec(),
+                value: i64op(5),
+            },
+        },
+        // --- flush: SST [a1, counter], damaged below
+        WalRecord {
+            seqno: 3,
+            op: WalOp::Insert {
+                key: b"b1".to_vec(),
+                value: b"v3".to_vec(),
+            },
+        },
+        WalRecord {
+            seqno: 4,
+            op: WalOp::Insert {
+                key: b"z9".to_vec(),
+                value: b"v4".to_vec(),
+            },
+        },
+        // --- flush: SST [b1, z9], damaged below — overlaps [a1, counter]
+        WalRecord {
+            seqno: 5,
+            op: WalOp::Insert {
+                key: b"m5".to_vec(),
+                value: b"mv".to_vec(),
+            },
+        },
+        // --- memtable only: covered by the tail replay
+    ];
+
+    // Reference: the same workload applied to a healthy tree.
+    let reference_dir = tempfile::tempdir().expect("tempdir");
+    let reference = {
+        let tree = open_tree(reference_dir.path());
+        for record in &records {
+            apply(&tree, record)?;
+        }
+        snapshot(&tree)
+    };
+
+    let crash_dir = tempfile::tempdir().expect("tempdir");
+    let wal_path = crash_dir.path().join("wal.log");
+    let mut wal = ReferenceWal::create(&wal_path).expect("create wal");
+    {
+        let tree = open_tree(crash_dir.path());
+        for record in &records {
+            wal.append(record).expect("wal append");
+            apply(&tree, record)?;
+            if record.seqno == 2 || record.seqno == 4 {
+                tree.flush_active_memtable(0)?;
+            }
+        }
+    }
+    // Damage BOTH flushed SSTs' leading data blocks: their metadata still
+    // parses, so both overlapping coverages are reported.
+    for entry in std::fs::read_dir(crash_dir.path().join("tables")).expect("read tables dir") {
+        let entry = entry.expect("dir entry");
+        if entry.file_name().to_string_lossy().parse::<u64>().is_err() {
+            continue;
+        }
+        let path = entry.path();
+        let mut bytes = std::fs::read(&path).expect("read sst");
+        for b in bytes.get_mut(8..24).expect("sst larger than 24 bytes") {
+            *b ^= 0xFF;
+        }
+        std::fs::write(&path, &bytes).expect("write corruption");
+    }
+    for entry in std::fs::read_dir(crash_dir.path()).expect("read dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_version = name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || name == "current" {
+            std::fs::remove_file(entry.path()).expect("remove manifest file");
+        }
+    }
+
+    let (tree, repaired) = Config::new(
+        crash_dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(CounterMerge)))
+    .open_or_repair(lsm_tree::RepairPolicy::default())?;
+    let report = repaired.expect("the damaged store opens only after a repair");
+    assert_eq!(
+        report.lost_coverage.len(),
+        2,
+        "both overlapping coverages are reported: {report:?}",
+    );
+
+    reconcile_after_repair(&tree, &wal, &report, 4)?;
+
+    assert_eq!(
+        snapshot(&tree),
+        reference,
+        "a record in the overlap of two lost ranges must be processed once",
+    );
+    assert_eq!(
+        counter_of(&tree),
+        Some(5),
+        "the lost operand in the overlap folds exactly once",
+    );
+    Ok(())
+}
+
+/// A merge chain FOLDED by compaction leaves no `MergeOperand` events: the
+/// surviving SST holds a plain `Value` carrying the chain head's seqno. When
+/// an unrelated lost table's coarse key range covers that key, the archived
+/// operands are absent from the survivor multiset — the reconciliation must
+/// still not reapply them on top of the already-folded value.
+#[test]
+fn reconciled_replay_skips_operands_folded_into_surviving_values() -> lsm_tree::Result<()> {
+    let i64op = |n: i64| n.to_le_bytes().to_vec();
+    // Seqnos start at 1, per the section 4 GC-coordination rule: seqno 0 is
+    // reserved as the bottommost-zeroed marker.
+    let records = vec![
+        WalRecord {
+            seqno: 1,
+            op: WalOp::Insert {
+                key: b"counter".to_vec(),
+                value: i64op(1),
+            },
+        },
+        WalRecord {
+            seqno: 2,
+            op: WalOp::Merge {
+                key: b"counter".to_vec(),
+                value: i64op(5),
+            },
+        },
+        WalRecord {
+            seqno: 3,
+            op: WalOp::Merge {
+                key: b"counter".to_vec(),
+                value: i64op(7),
+            },
+        },
+        // --- flush + major compaction: the chain folds (and the bottommost
+        //     pass zeroes the survivor's seqno)
+        WalRecord {
+            seqno: 4,
+            op: WalOp::Insert {
+                key: b"a1".to_vec(),
+                value: b"v1".to_vec(),
+            },
+        },
+        WalRecord {
+            seqno: 5,
+            op: WalOp::Insert {
+                key: b"z5".to_vec(),
+                value: b"v5".to_vec(),
+            },
+        },
+        // --- flush: the [a1, z5] SST is the one the crash damages
+        WalRecord {
+            seqno: 6,
+            op: WalOp::Insert {
+                key: b"m9".to_vec(),
+                value: b"mv".to_vec(),
+            },
+        },
+        // --- memtable only: covered by the tail replay
+    ];
+
+    // Reference: the same workload applied to a healthy tree.
+    let reference_dir = tempfile::tempdir().expect("tempdir");
+    let reference = {
+        let tree = open_tree(reference_dir.path());
+        for record in &records {
+            apply(&tree, record)?;
+        }
+        snapshot(&tree)
+    };
+
+    // The crashed store: the counter chain folds via compaction, then the
+    // unrelated [a1, z5] SST is flushed, damaged, and the manifest removed.
+    let crash_dir = tempfile::tempdir().expect("tempdir");
+    let wal_path = crash_dir.path().join("wal.log");
+    let mut wal = ReferenceWal::create(&wal_path).expect("create wal");
+    {
+        let tree = open_tree(crash_dir.path());
+        for record in &records {
+            wal.append(record).expect("wal append");
+            apply(&tree, record)?;
+            if record.seqno == 3 {
+                tree.flush_active_memtable(0)?;
+                // GC watermark far above the chain: the operands fold, and
+                // the bottommost pass zeroes the surviving value's seqno.
+                tree.major_compact(u64::MAX, 1_000)?;
+            }
+            if record.seqno == 5 {
+                tree.flush_active_memtable(0)?;
+            }
+        }
+    }
+    // The freshly flushed [a1, z5] SST has the HIGHEST table id (the
+    // compaction output was allocated earlier). Corrupt its leading data
+    // block: metadata still parses, so its coverage is reported.
+    let tables = crash_dir.path().join("tables");
+    let damaged = std::fs::read_dir(&tables)
+        .expect("read tables dir")
+        .filter_map(|e| {
+            let e = e.expect("dir entry");
+            e.file_name()
+                .to_string_lossy()
+                .parse::<u64>()
+                .ok()
+                .map(|id| (id, e.path()))
+        })
+        .max_by_key(|(id, _)| *id)
+        .map(|(_, path)| path)
+        .expect("a flushed SST");
+    let mut bytes = std::fs::read(&damaged).expect("read sst");
+    for b in bytes.get_mut(8..24).expect("sst larger than 24 bytes") {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&damaged, &bytes).expect("write corruption");
+    for entry in std::fs::read_dir(crash_dir.path()).expect("read dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_version = name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || name == "current" {
+            std::fs::remove_file(entry.path()).expect("remove manifest file");
+        }
+    }
+
+    let (tree, repaired) = Config::new(
+        crash_dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(CounterMerge)))
+    .open_or_repair(lsm_tree::RepairPolicy::default())?;
+    let report = repaired.expect("the damaged store opens only after a repair");
+    assert!(
+        report
+            .lost_coverage
+            .iter()
+            .any(|(_, lo, hi, _)| key_in_coverage(b"counter", lo, hi)),
+        "the coarse lost range must cover the folded key for this scenario: {report:?}",
+    );
+
+    reconcile_after_repair(&tree, &wal, &report, 5)?;
+
+    assert_eq!(
+        snapshot(&tree),
+        reference,
+        "operands folded into a surviving value must not be reapplied",
+    );
+    assert_eq!(
+        counter_of(&tree),
+        Some(1 + 5 + 7),
+        "the folded chain counts each operand exactly once",
     );
     Ok(())
 }

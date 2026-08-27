@@ -961,3 +961,42 @@ fn blob_scan_since_in_range_scopes_and_resolves() -> lsm_tree::Result<()> {
     );
     Ok(())
 }
+
+/// An RT-only flush writes a synthetic weak-tombstone SENTINEL at the range's
+/// start (the writer's `finish`, to give the KV-empty table one index entry).
+/// The stream deliberately KEEPS it: it is a real on-disk entry the read path
+/// sees — at a seqno tie it is what makes a read at the range's start key
+/// converge to a deletion (see `scan_since_replays_a_tied_range_tombstone_
+/// first_across_sources`) — and away from a tie it replays as a point delete
+/// under the range deletion's own seqno: a no-op on top of the range event.
+#[test]
+fn scan_since_surfaces_the_rt_only_sentinel_as_a_tied_point_delete() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path())?;
+
+    // A memtable holding ONLY a range tombstone, flushed: the SST is RT-only.
+    tree.remove_range(b"c", b"f", 5);
+    tree.flush_active_memtable(0)?;
+
+    let got = events(&tree, 0)?;
+    let [
+        ScanSinceEvent::RangeTombstone {
+            start_key,
+            end_key,
+            seqno: 5,
+        },
+        ScanSinceEvent::PointTombstone { key, seqno: 5 },
+    ] = got.as_slice()
+    else {
+        panic!("the range deletion plus its start-key sentinel: {got:?}");
+    };
+    assert_eq!(start_key.as_ref(), b"c");
+    assert_eq!(end_key.as_ref(), b"f");
+    assert_eq!(
+        key.as_ref(),
+        b"c",
+        "the sentinel replays at the range's start, inside the span it \
+         deletes — idempotent for any consumer",
+    );
+    Ok(())
+}

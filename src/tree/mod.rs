@@ -1965,6 +1965,17 @@ impl Tree {
             {
                 continue;
             }
+            // An RT-only table's synthetic weak-tombstone sentinel (the
+            // writer's `finish`) is deliberately NOT filtered out here. It is
+            // a real on-disk entry the READ path sees: at a seqno TIE between
+            // the range deletion and an older source's write at the range's
+            // start key, the sentinel is what makes the read converge to a
+            // deletion — so the event stream must carry it too, or a consumer
+            // replaying the stream keeps a value the tree itself does not
+            // serve (this stream's one rule is mirroring the tree's reads,
+            // see `merge_source_events`). Away from that tie it replays as a
+            // point delete at the range's start under the range deletion's
+            // own seqno: a no-op.
             let mut source = Vec::new();
             for entry in table.scan_seqno_range(target_seqno, end_seqno, block_skip)? {
                 if !in_key_range(&entry.key.user_key) {

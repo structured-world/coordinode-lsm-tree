@@ -1764,3 +1764,75 @@ fn repair_ticks_the_recovery_progress_counters() -> lsm_tree::Result<()> {
     );
     Ok(())
 }
+
+/// An encrypted store opened through `open_or_repair` with a WRONG (or
+/// missing) key must return the decrypt error, never repair: the manifest
+/// reader verifies the Block checksum over the CIPHERTEXT before decrypting,
+/// so an AEAD failure on both footer copies is a configuration signal — and a
+/// repair under the wrong key would exclude every table it cannot decrypt and
+/// commit a rebuilt manifest around nothing.
+#[cfg(feature = "encryption")]
+#[test]
+fn open_or_repair_propagates_a_wrong_key_decrypt_failure() -> lsm_tree::Result<()> {
+    use lsm_tree::Aes256GcmProvider;
+    use std::sync::Arc;
+
+    let dir = lsm_tree::get_tmp_folder();
+
+    // Write with key A.
+    {
+        let tree = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_encryption(Some(Arc::new(Aes256GcmProvider::new(&[0xAA; 32]))))
+        .open()?;
+        tree.insert(b"k", b"v", 1);
+        tree.flush_active_memtable(1)?;
+    }
+    let manifest_names = || -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|n| {
+                n.strip_prefix('v')
+                    .is_some_and(|rest| rest.parse::<u64>().is_ok())
+                    || n == "current"
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    let before = manifest_names();
+
+    // Open with key B: the AEAD verification of both footer copies fails.
+    let result = Config::new(
+        &dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_encryption(Some(Arc::new(Aes256GcmProvider::new(&[0xBB; 32]))))
+    .open_or_repair(lsm_tree::RepairPolicy::default().salvage(true));
+    assert!(
+        matches!(result, Err(lsm_tree::Error::Decrypt(_))),
+        "a wrong key must surface as the reversible configuration error: {:?}",
+        result.map(|_| "opened"),
+    );
+    assert_eq!(
+        before,
+        manifest_names(),
+        "a repair under the wrong key would have rewritten the manifest",
+    );
+
+    // The right key still opens the untouched store.
+    let tree = Config::new(
+        &dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_encryption(Some(Arc::new(Aes256GcmProvider::new(&[0xAA; 32]))))
+    .open()?;
+    assert_eq!(tree.get(b"k", MAX_SEQNO)?.as_deref(), Some(b"v".as_ref()));
+    Ok(())
+}

@@ -187,6 +187,25 @@ any repair, derive the obligation from the report instead:
    application the tree will make — which is exactly the set to subtract.
 4. **Replay order**: tail and lost-range records alike in increasing seqno
    order, each with its original operation, exactly as in section 3.
+5. **Compaction folding needs a superseded-record floor.** A merge chain a
+   compaction FOLDED leaves a plain surviving value at the chain head's
+   seqno and no operand events, so absence from step 3's multiset does not
+   prove an operand was lost. Track, per key, the highest surviving value /
+   point-tombstone seqno (and the surviving range tombstones) from the same
+   scan, and skip ANY retained record — an operand, but also a put or
+   delete — at or below that floor: it is already incorporated or
+   superseded. Two coordination rules make the floor decidable:
+   - **WAL seqnos start at 1.** Bottommost compaction ZEROES the seqno of
+     entries below its GC watermark, so a surviving value at seqno `0` is a
+     zeroed survivor embodying the key's whole folded history — treat its
+     floor as unbounded. A deployment that starts its log at seqno 0 cannot
+     tell that survivor from a genuine first write.
+   - **Do not fold or zero history a lost RANGE DELETION may target.** A
+     zeroed survivor's true age is unknowable, so a replayed range deletion
+     from a lost SST cannot decide whether the survivor pre- or post-dates
+     it. Keep the compaction GC watermark (`seqno_threshold`) at or below
+     the seqno up to which the tree is already authoritative — reconciled,
+     or provably not in need of replay — before letting it fold history.
 
 **Retention is what makes this recoverable.** Records at or below `W` were
 trimmable under section 2, and a trimmed record inside a lost range is gone
