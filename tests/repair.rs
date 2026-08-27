@@ -627,6 +627,72 @@ fn repair_rebuilds_blob_tree_manifest_and_preserves_values() -> lsm_tree::Result
     Ok(())
 }
 
+/// A standard-vs-blob configuration mismatch is a CONFIGURATION error, not
+/// damage: the healthy tree opens fine under the right options. Auto-repair
+/// on it would rebuild a `Standard` manifest around SSTs full of blob
+/// indirections and strand every blob file for the orphan sweep — so the
+/// mismatch must propagate out of `open_or_repair` with the store untouched.
+#[test]
+fn open_or_repair_propagates_a_tree_type_mismatch() -> lsm_tree::Result<()> {
+    let dir = lsm_tree::get_tmp_folder();
+    let big = |i: u64| format!("{i:08}").repeat(512);
+
+    {
+        let tree = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(KvSeparationOptions::default()))
+        .open()?;
+        for i in 0..50 {
+            tree.insert(key(i), big(i).as_bytes(), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    assert!(
+        count_blob_files(dir.path())? >= 1,
+        "the fixture must actually KV-separate",
+    );
+
+    // The MISCONFIGURED open: no KV-separation options requests a standard
+    // tree over an on-disk blob tree.
+    let result = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open_or_repair(lsm_tree::RepairPolicy::default());
+    let outcome = result.as_ref().map(|(_, report)| report);
+    assert!(
+        matches!(outcome, Err(lsm_tree::Error::TreeTypeMismatch { .. })),
+        "a tree-type mismatch is a configuration error and must propagate \
+         instead of triggering a repair: {outcome:?}",
+    );
+
+    // The store is untouched: the CORRECT configuration opens with no repair.
+    let (tree, report) = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(KvSeparationOptions::default()))
+    .open_or_repair(lsm_tree::RepairPolicy::default())?;
+    assert!(
+        report.is_none(),
+        "the mismatch attempt must not have altered the manifest: {report:?}",
+    );
+    for i in 0..50 {
+        assert_eq!(
+            tree.get(key(i), MAX_SEQNO)?.as_deref(),
+            Some(big(i).as_bytes()),
+            "blob-backed value for key {} must be intact",
+            key(i),
+        );
+    }
+    Ok(())
+}
+
 /// Returns the SST file paths under `<dir>/tables/`, sorted by id.
 fn sorted_sst_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(dir.join("tables"))

@@ -196,7 +196,12 @@ any repair, derive the obligation from the report instead:
    delete — at or below that floor: it is already incorporated or
    superseded. A range tombstone covers only records STRICTLY below its
    seqno (the engine's suppression rule): a record tied with the
-   tombstone's caller-assigned seqno survives a read and must replay. Two coordination rules make the floor decidable:
+   tombstone's caller-assigned seqno survives a read and must replay. A
+   surviving WEAK (single-delete) tombstone contributes nothing to the
+   floor: it does not incorporate older history — it annihilates exactly
+   its matching put during compaction and can then expose an older value,
+   so the paired put must replay from a lost SST or the weak delete later
+   consumes a different, older value than the source's pair. Two coordination rules make the floor decidable:
    - **WAL seqnos start at 1.** Bottommost compaction ZEROES the seqno of
      entries below its GC watermark, so a surviving value at seqno `0` is a
      zeroed survivor embodying the key's whole folded history — treat its

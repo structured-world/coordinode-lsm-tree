@@ -8304,6 +8304,16 @@ impl Table {
         self.metadata.seqnos.1
     }
 
+    /// The lowest sequence number of any entry (with the bulk-ingest
+    /// `global_seqno` offset applied), `0` for an empty table. Manifest repair
+    /// pairs it with [`get_highest_seqno`](Self::get_highest_seqno) to test
+    /// whether two L0 tables' seqno ranges can intersect at all — disjoint
+    /// ranges cannot hold a tied entry.
+    #[must_use]
+    pub(crate) fn get_lowest_seqno(&self) -> SeqNo {
+        self.metadata.seqnos.0 + self.global_seqno()
+    }
+
     /// Returns the highest sequence number from KV entries only,
     /// excluding range tombstone seqnos.
     ///

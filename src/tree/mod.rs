@@ -2097,6 +2097,15 @@ impl Tree {
         // source holds; the collapsed event keeps the recency of the NEWEST
         // source holding it (and that source's positions), which is the slot
         // the tree's own precedence gives it.
+        //
+        // WEAK tombstones belong to the idempotent class even though a weak
+        // delete annihilates one put at compaction: its documented contract
+        // pairs it with a key written at most once, byte-identical copies
+        // meeting in one compaction stream drain to a single survivor, and a
+        // consumer cannot materialize multiplicity anyway — replaying the
+        // same `remove_weak` twice at one seqno lands on ONE internal key in
+        // its memtable, so a preserved duplicate would replay to the same
+        // physical state the collapsed stream does.
         runs.sort_by(|a, b| ScanSinceEvent::grouping_order(&a.event, &b.event));
         let mut merged: Vec<(ScanSinceEvent, usize, usize)> = Vec::new();
         let mut iter = runs.into_iter().peekable();
@@ -4314,7 +4323,16 @@ impl Tree {
                     "Tried to open a {requested_tree_type:?}Tree, but the existing tree is of type {:?}Tree. This indicates a misconfiguration or corruption.",
                     version.tree_type(),
                 );
-                return Err(crate::Error::Unrecoverable);
+                // A dedicated error, NOT `Unrecoverable`: the auto-repair path
+                // answers `Unrecoverable` with a manifest rebuild, and a
+                // rebuild under the mismatched type commits the wrong tree
+                // shape (a Standard rebuild of a blob tree strands its blob
+                // files for the orphan sweep). A configuration error must
+                // propagate to the caller instead.
+                return Err(crate::Error::TreeTypeMismatch {
+                    requested: requested_tree_type,
+                    actual: version.tree_type(),
+                });
             }
         }
 

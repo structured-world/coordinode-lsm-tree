@@ -101,6 +101,24 @@ pub enum Error {
         tag: u8,
     },
 
+    /// The on-disk tree's type does not match the type the configuration
+    /// requests: a standard open (no `kv_separation_opts`) of a KV-separated
+    /// (blob) tree, or the reverse.
+    ///
+    /// This is a CONFIGURATION error — fix the options and reopen — not
+    /// damage, so [`Config::open_or_repair`](crate::Config::open_or_repair)
+    /// propagates it instead of repairing: a rebuild under the mismatched
+    /// type would commit a manifest of the wrong tree shape (a `Standard`
+    /// rebuild of a blob tree strands every blob file behind SSTs full of
+    /// indirections, and the orphan sweep then deletes them).
+    TreeTypeMismatch {
+        /// The type the configuration requested.
+        requested: crate::TreeType,
+
+        /// The type the on-disk tree actually has.
+        actual: crate::TreeType,
+    },
+
     /// Blob frame header CRC mismatch (V4 format).
     /// Distinct from `ChecksumMismatch` which covers data payload checksums.
     HeaderCrcMismatch {

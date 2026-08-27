@@ -970,9 +970,17 @@ fn reconcile_after_repair(
                         .entry((key.to_vec(), seqno, operand.to_vec()))
                         .or_default() += 1;
                 }
+                // A weak (single-delete) tombstone does NOT floor: it never
+                // incorporates the key's older history — it annihilates
+                // exactly its matching put during compaction and can then
+                // expose an older value. Flooring at its seqno would skip
+                // replaying that put from a lost SST, leaving the weak delete
+                // to consume a different, older value than the source's pair.
+                // Its blind replay stays idempotent (same internal key), so no
+                // presence tracking is needed either.
+                ScanSinceEvent::WeakTombstone { .. } => {}
                 ScanSinceEvent::Insert { key, seqno, .. }
-                | ScanSinceEvent::PointTombstone { key, seqno }
-                | ScanSinceEvent::WeakTombstone { key, seqno } => {
+                | ScanSinceEvent::PointTombstone { key, seqno } => {
                     let floor = superseded_floor.entry(key.to_vec()).or_default();
                     // Seqno 0 is a bottommost-ZEROED survivor: per the
                     // section 4 GC-coordination rule it already incorporates
@@ -1396,6 +1404,119 @@ fn reconciled_replay_keeps_records_tied_with_surviving_range_tombstones() -> lsm
         snapshot(&tree),
         reference,
         "a lost record tied with a surviving range tombstone must be replayed",
+    );
+    Ok(())
+}
+
+/// A surviving weak (single-delete) tombstone must NOT raise the superseded
+/// floor: unlike a value or a regular tombstone it does not incorporate the
+/// key's older history — it annihilates exactly its matching put during
+/// compaction and can then expose an older value. When that matching put sat
+/// in a lost SST, flooring at the weak tombstone's seqno skips its replay,
+/// and the weak delete later consumes a DIFFERENT (older) value than the
+/// source's pair — diverging both the intermediate snapshots and the
+/// compacted end state.
+#[test]
+fn reconciled_replay_restores_the_put_a_surviving_weak_delete_pairs_with() -> lsm_tree::Result<()> {
+    // Seqnos start at 1, per the section 4 GC-coordination rule.
+    let records = vec![
+        WalRecord {
+            seqno: 1,
+            op: WalOp::Insert {
+                key: b"w1".to_vec(),
+                value: b"old".to_vec(),
+            },
+        },
+        // --- flush: SST 0 (survives) holds the OLDER value
+        WalRecord {
+            seqno: 2,
+            op: WalOp::Insert {
+                key: b"w1".to_vec(),
+                value: b"mid".to_vec(),
+            },
+        },
+        // --- flush: SST 1 (damaged below) holds the put the weak delete pairs with
+        WalRecord {
+            seqno: 3,
+            op: WalOp::RemoveWeak {
+                key: b"w1".to_vec(),
+            },
+        },
+        // --- flush: SST 2 (survives) holds the weak tombstone
+    ];
+
+    // Reference: the same workload applied to a healthy tree.
+    let reference_dir = tempfile::tempdir().expect("tempdir");
+    let reference = {
+        let tree = open_tree(reference_dir.path());
+        for record in &records {
+            apply(&tree, record)?;
+        }
+        assert_eq!(
+            tree.get(b"w1", 3)?.as_deref(),
+            Some(b"mid".as_slice()),
+            "self-check: a snapshot below the weak delete reads the paired put",
+        );
+        snapshot(&tree)
+    };
+
+    let crash_dir = tempfile::tempdir().expect("tempdir");
+    let wal_path = crash_dir.path().join("wal.log");
+    let mut wal = ReferenceWal::create(&wal_path).expect("create wal");
+    {
+        let tree = open_tree(crash_dir.path());
+        for record in &records {
+            wal.append(record).expect("wal append");
+            apply(&tree, record)?;
+            tree.flush_active_memtable(0)?;
+        }
+    }
+    // Damage the SECOND SST's leading data block: metadata still parses, so
+    // its coverage is reported; the weak-tombstone-bearing SST survives.
+    let sst = crash_dir.path().join("tables").join("1");
+    let mut bytes = std::fs::read(&sst).expect("read sst");
+    for b in bytes.get_mut(8..24).expect("sst larger than 24 bytes") {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&sst, &bytes).expect("write corruption");
+    for entry in std::fs::read_dir(crash_dir.path()).expect("read dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_version = name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || name == "current" {
+            std::fs::remove_file(entry.path()).expect("remove manifest file");
+        }
+    }
+
+    let (tree, repaired) = Config::new(
+        crash_dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(CounterMerge)))
+    .open_or_repair(lsm_tree::RepairPolicy::default())?;
+    let report = repaired.expect("the damaged store opens only after a repair");
+    assert!(
+        !report.lost_coverage.is_empty(),
+        "the excluded SST's coverage must be reported: {report:?}",
+    );
+
+    reconcile_after_repair(&tree, &wal, &report, 3)?;
+
+    assert_eq!(
+        tree.get(b"w1", 3)?.as_deref(),
+        Some(b"mid".as_slice()),
+        "the put the surviving weak delete pairs with must be replayed — a \
+         floor at the weak tombstone's seqno would leave the older value to \
+         be consumed instead",
+    );
+    assert_eq!(
+        snapshot(&tree),
+        reference,
+        "the reconciled tree mirrors the healthy tree's visible state",
     );
     Ok(())
 }

@@ -127,8 +127,11 @@ pub struct MultiWriter {
     /// L0 recency key stamped on every successor [`Writer`], preserved across
     /// rotation (see [`Writer::use_recency`]): a compaction sets its inputs'
     /// highest recency so manifest repair can place each output where its
-    /// content belongs, not where its id falls. `None` (flush / ingest) omits
-    /// the key — the table's own id is its recency.
+    /// content belongs, not where its id falls. `None` (flush / ingest)
+    /// stamps each output with ITS OWN id — the same value the repair-side
+    /// fallback derives, but persisted, so a missing key positively
+    /// identifies a LEGACY table whose provenance (flush vs compaction
+    /// output) the repair cannot know.
     recency: Option<TableId>,
 
     /// Delete strategy applied to every successor [`Writer`], preserved across
@@ -171,7 +174,11 @@ impl MultiWriter {
         let current_table_id = table_id_generator.next();
 
         let path = base_path.join(current_table_id.to_string());
-        let writer = Writer::new(path, current_table_id, initial_level, fs.clone())?;
+        // Own-id recency until `use_recency` overrides it (see the `recency`
+        // field): a flush / ingest table's id IS its content recency, and
+        // persisting it keeps the key present on every new table.
+        let writer = Writer::new(path, current_table_id, initial_level, fs.clone())?
+            .use_recency(Some(current_table_id));
 
         Ok(Self {
             fs,
@@ -606,12 +613,16 @@ impl MultiWriter {
         self
     }
 
-    /// Stamps the L0 recency key on this and every rotated successor writer
-    /// (see [`Writer::use_recency`]).
+    /// Stamps a FIXED L0 recency key on this and every rotated successor
+    /// writer (see [`Writer::use_recency`]). `None` keeps the default own-id
+    /// stamping (see the `recency` field): the current writer already carries
+    /// its own id, and each successor stamps its own.
     #[must_use]
     pub(crate) fn use_recency(mut self, recency: Option<TableId>) -> Self {
         self.recency = recency;
-        self.writer = self.writer.use_recency(recency);
+        if recency.is_some() {
+            self.writer = self.writer.use_recency(recency);
+        }
         self
     }
 
@@ -690,7 +701,7 @@ impl MultiWriter {
         new_writer = new_writer.use_zone_map(self.use_zone_map);
         new_writer = new_writer.use_columnar(self.use_columnar);
         new_writer = new_writer.use_bulk_ingested(Some(self.bulk_ingested));
-        new_writer = new_writer.use_recency(self.recency);
+        new_writer = new_writer.use_recency(Some(self.recency.unwrap_or(new_table_id)));
         new_writer = new_writer.delete_strategy(self.delete_strategy);
         new_writer = new_writer.use_disable_cow(self.disable_cow_on_sst);
         new_writer = new_writer.use_locator(self.locator_entry);

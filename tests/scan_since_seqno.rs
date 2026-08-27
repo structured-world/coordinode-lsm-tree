@@ -741,6 +741,39 @@ fn scan_since_keeps_merge_operands_from_two_sources_at_one_seqno() -> lsm_tree::
     Ok(())
 }
 
+/// A weak (single-delete) tombstone collapses across sources like the other
+/// idempotent kinds. Its documented contract pairs it with a key written at
+/// most once, byte-identical copies meeting in one compaction stream drain to
+/// a single survivor, and a replaying consumer cannot materialize
+/// multiplicity anyway: repeating the same `remove_weak` at one seqno lands
+/// on ONE internal key in its memtable — the collapsed stream and a
+/// hypothetical multiplicity-preserving one converge the replica to the same
+/// physical state.
+#[test]
+fn scan_since_collapses_duplicate_weak_deletes_across_sources() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path())?;
+
+    tree.insert(b"k", b"v", 1);
+    tree.flush_active_memtable(0)?;
+    // The SAME weak delete committed into two sources (the post-repair
+    // duplicated-SST shape, or a replayed batch landing twice).
+    for _ in 0..2 {
+        tree.remove_weak(b"k", 5);
+        tree.flush_active_memtable(0)?;
+    }
+
+    let got = events(&tree, 0)?;
+    assert_eq!(
+        got.iter()
+            .filter(|e| matches!(e, ScanSinceEvent::WeakTombstone { key, seqno: 5 } if key.as_ref() == b"k"))
+            .count(),
+        1,
+        "byte-identical weak deletes across sources are one operation: {got:?}",
+    );
+    Ok(())
+}
+
 /// An entry written at the maximum sequence number must be delivered from an
 /// SST exactly as it is from a memtable. The watermark is derived from the
 /// data, so it IS `SeqNo::MAX` here, and an exclusive upper bound would drop

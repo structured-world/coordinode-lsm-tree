@@ -105,7 +105,16 @@ fn tree_reload_blob_again_without_opts() -> lsm_tree::Result<()> {
         .with_kv_separation(None)
         .open();
 
-        assert!(matches!(tree, Err(lsm_tree::Error::Unrecoverable)));
+        // A dedicated configuration error, NOT `Unrecoverable`: the mismatch
+        // must never route into auto-repair (which would rebuild a Standard
+        // manifest over the blob tree and strand its blob files).
+        assert!(matches!(
+            tree,
+            Err(lsm_tree::Error::TreeTypeMismatch {
+                requested: lsm_tree::TreeType::Standard,
+                actual: lsm_tree::TreeType::Blob,
+            })
+        ));
     }
 
     Ok(())

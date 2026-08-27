@@ -569,10 +569,33 @@ fn has_unrecoverable_ingest_offset(
     }
 }
 
-/// A recovered table plus whether its recovery was COMPLETE (a clean whole-file
-/// recovery) or a LOSSY block-salvage that may have dropped corrupt blocks'
-/// keys. Repair keeps the best copy per table id, so a duplicate id in another
-/// table folder can supersede an earlier DAMAGED copy.
+/// How faithfully a recovered candidate carries its source's content. Drives
+/// two DISTINCT report facts: anything but [`Complete`](Self::Complete)
+/// contributes a `lost_coverage` entry (scoped by the source's coverage), while
+/// only [`Salvaged`](Self::Salvaged) counts toward `RepairReport::salvaged` —
+/// a geometry-restricted original is lossy but was never block-salvaged, and
+/// it arises in plain (salvage-off) repairs too.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Fidelity {
+    /// Every live row of the source is present.
+    Complete,
+    /// The ORIGINAL file reopened under a punch-GEOMETRY-derived restriction
+    /// (no exact sidecar, resurrection off): the bound is the straddling
+    /// block's END key, so that block's still-live suffix rows may be excluded.
+    GeometryRestricted,
+    /// A block-salvage rewrite: corrupt blocks (or blob records) were dropped.
+    Salvaged,
+}
+
+impl Fidelity {
+    fn is_complete(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
+/// A recovered table plus its [`Fidelity`]. Repair keeps the best copy per
+/// table id, so a duplicate id in another table folder can supersede an
+/// earlier DAMAGED copy.
 ///
 /// The physical location (`fs` / `path`) travels with the candidate so that when
 /// a duplicate SUPERSEDES it, the loser's file can be removed from `tables/`. The
@@ -581,7 +604,7 @@ fn has_unrecoverable_ingest_offset(
 /// reopen it against the kept copy's mismatched checksum.
 struct TableCandidate {
     table: Table,
-    complete: bool,
+    fidelity: Fidelity,
     fs: Arc<dyn crate::fs::Fs>,
     path: PathBuf,
 }
@@ -605,7 +628,9 @@ fn keep_best_candidate(
         // Keep the existing copy when it is already complete, or when the new one
         // is not an improvement (a lossy duplicate of a lossy copy): the NEW
         // candidate is displaced.
-        Some(existing) if existing.complete || !candidate.complete => Some(candidate),
+        Some(existing) if existing.fidelity.is_complete() || !candidate.fidelity.is_complete() => {
+            Some(candidate)
+        }
         // The new candidate supersedes: `insert` returns the displaced old copy.
         _ => map.insert(id, candidate),
     }
@@ -712,13 +737,13 @@ fn record_best(
     discard_after_commit: &mut Vec<(Arc<dyn crate::fs::Fs>, PathBuf, String)>,
     id: TableId,
     table: Table,
-    complete: bool,
+    fidelity: Fidelity,
     fs: &Arc<dyn crate::fs::Fs>,
     path: &std::path::Path,
 ) {
     let candidate = TableCandidate {
         table,
-        complete,
+        fidelity,
         fs: Arc::clone(fs),
         path: path.to_path_buf(),
     };
@@ -2756,8 +2781,9 @@ impl Config {
 /// or future database has no live decoder here — it needs offline conversion
 /// or a matching binary, while the V5-only repair would reject every table
 /// and commit a fresh manifest around nothing), and every CONFIGURATION
-/// mismatch — a wrong comparator, level route, zstd dictionary, or an
-/// encryption key surfacing as a decrypt failure. Those are reversible by
+/// mismatch — a wrong comparator, level route, zstd dictionary, a
+/// standard-vs-blob tree-type mismatch ([`crate::Error::TreeTypeMismatch`]),
+/// or an encryption key surfacing as a decrypt failure. Those are reversible by
 /// fixing the call, while a repair under the wrong configuration rebuilds —
 /// and can drop — perfectly healthy data (e.g. re-ordering SSTs under a
 /// mistyped comparator, or salvage discarding every block it cannot decrypt
@@ -3299,7 +3325,10 @@ fn repair_tree(
             // Skip a duplicate id ONLY when we already hold a COMPLETE copy — a
             // duplicate cannot improve on it. A previously-seen LOSSY salvage does
             // NOT skip: this copy is still evaluated and may supersede it.
-            if let Some(existing) = recovered_by_id.get(&table_id).filter(|c| c.complete) {
+            if let Some(existing) = recovered_by_id
+                .get(&table_id)
+                .filter(|c| c.fidelity.is_complete())
+            {
                 // If this path physically ALIASES the retained copy (a symlink /
                 // junction / case-insensitive alias resolving to the same directory
                 // entry, e.g. two configured folders pointing at one location), it
@@ -3408,6 +3437,15 @@ fn repair_tree(
             // itself is never mutated, so its whole-file checksum stays valid);
             // written strictly post-commit, a valid sidecar is itself proof of a
             // committed restriction, so its bound is honored directly (see below).
+            // Whether the recovered view's restriction came from PUNCH GEOMETRY
+            // with resurrection off: that bound is the straddling block's END
+            // key, which can discard the block's still-live suffix rows — a
+            // deliberate, non-salvage loss the report must carry (scoped by the
+            // source's coverage), or `wal_replay_scope` stays `TailOnly` while
+            // live rows were removed. An exact sidecar bound and the
+            // resurrection-mode bound (which keeps the whole readable region)
+            // lose nothing.
+            let mut geometry_lossy = false;
             let recovered = 'restrict: {
                 let Ok(table) = recovered else {
                     break 'restrict recovered;
@@ -3481,6 +3519,7 @@ fn repair_tree(
                         };
                         match derived {
                             Ok(DerivedRestriction::Bound(bound)) => {
+                                geometry_lossy = !allow_resurrection;
                                 break 'restrict table.reopen_restricted(bound);
                             }
                             Err(e) => break 'restrict Err(e),
@@ -3552,7 +3591,11 @@ fn repair_tree(
                                 &mut discard_after_commit,
                                 table_id,
                                 table,
-                                true,
+                                if geometry_lossy {
+                                    Fidelity::GeometryRestricted
+                                } else {
+                                    Fidelity::Complete
+                                },
                                 &folder_fs,
                                 &table_path,
                             );
@@ -3628,7 +3671,7 @@ fn repair_tree(
                                         &mut discard_after_commit,
                                         table_id,
                                         table,
-                                        false,
+                                        Fidelity::Salvaged,
                                         &folder_fs,
                                         &table_path,
                                     );
@@ -3697,7 +3740,11 @@ fn repair_tree(
                                 &mut discard_after_commit,
                                 table_id,
                                 table,
-                                true,
+                                if geometry_lossy {
+                                    Fidelity::GeometryRestricted
+                                } else {
+                                    Fidelity::Complete
+                                },
                                 &folder_fs,
                                 &table_path,
                             );
@@ -3829,7 +3876,7 @@ fn repair_tree(
                                 &mut discard_after_commit,
                                 table_id,
                                 table,
-                                false,
+                                Fidelity::Salvaged,
                                 &folder_fs,
                                 &table_path,
                             );
@@ -3923,9 +3970,9 @@ fn repair_tree(
     // Each entry keeps its SOURCE path (the scanned `{id}` file, not a
     // salvage replacement's `{id}.repair-tmp`): it is the key into
     // `coverage_by_path` when a kept lossy copy's loss is scoped below.
-    let mut recovered_tables: Vec<(Table, bool, PathBuf)> = recovered_by_id
+    let mut recovered_tables: Vec<(Table, Fidelity, PathBuf)> = recovered_by_id
         .into_values()
-        .map(|c| (c.table, c.complete, c.path))
+        .map(|c| (c.table, c.fidelity, c.path))
         .collect();
 
     // Newest first, by DESCENDING recency key. For a flush / ingest table that
@@ -4023,8 +4070,8 @@ fn repair_tree(
             })
             .collect();
         let blob_rewrites = Arc::new(blob_rewrites);
-        let mut kept: Vec<(Table, bool, PathBuf)> = Vec::with_capacity(recovered_tables.len());
-        for (table, complete, source_path) in recovered_tables {
+        let mut kept: Vec<(Table, Fidelity, PathBuf)> = Vec::with_capacity(recovered_tables.len());
+        for (table, fidelity, source_path) in recovered_tables {
             // One reference read drives everything below: the missing-id check
             // and the rewrite decision.
             let links = match table.list_blob_file_references() {
@@ -4093,7 +4140,7 @@ fn repair_tree(
                 }
             }
             if !needs_rewrite {
-                kept.push((table, complete, source_path));
+                kept.push((table, fidelity, source_path));
                 continue;
             }
             // Rewrite through the salvage pipeline: re-emit every entry with
@@ -4140,7 +4187,7 @@ fn repair_tree(
                         allow_resurrection,
                     )?;
                     let restricted = rewritten.restrict_lower_bound().is_some();
-                    kept.push((rewritten, false, source_path));
+                    kept.push((rewritten, Fidelity::Salvaged, source_path));
                     swap_after_commit.push((Arc::clone(&fs), output_path, path, restricted));
                 }
                 Ok(SalvageOutcome::Unusable | SalvageOutcome::PunchedBoundLost) => {
@@ -4213,14 +4260,19 @@ fn repair_tree(
     // rule: a candidate displaced by deduplication or dropped by dependency
     // filtering never counts, so the snapshot cannot claim more tables than
     // the rebuilt manifest holds.
+    // Only block-salvage REWRITES: a geometry-restricted original is lossy
+    // (it contributes coverage below) but was never salvaged, and it arises
+    // in plain repairs where `salvaged` is documented to stay zero.
     let salvaged = recovered_tables
         .iter()
-        .filter(|(_, complete, _)| !complete)
+        .filter(|(_, fidelity, _)| *fidelity == Fidelity::Salvaged)
         .count();
-    // A KEPT salvaged copy is lossy too: it dropped corrupt blocks (or blob
-    // records), and nothing in `unreadable_files` names it, so without an
-    // entry here `wal_replay_scope()` would answer `TailOnly` while older
-    // persisted changes were in fact lost. The loss is scoped by the
+    // A KEPT lossy copy — a salvaged rewrite that dropped corrupt blocks (or
+    // blob records), or a geometry-restricted original whose derived bound
+    // may exclude the straddling block's live suffix — names nothing in
+    // `unreadable_files`, so without an entry here `wal_replay_scope()` would
+    // answer `TailOnly` while older persisted changes were in fact lost. The
+    // loss is scoped by the
     // SOURCE's coverage captured during the scan — NOT by the replacement's
     // own metadata, which only bounds what SURVIVED: salvage may have
     // dropped the block holding the source's outermost keys or its highest
@@ -4231,7 +4283,7 @@ fn repair_tree(
     let mut salvaged_unknowable: Vec<PathBuf> = Vec::new();
     let salvaged_coverage: Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)> = recovered_tables
         .iter()
-        .filter(|(_, complete, _)| !complete)
+        .filter(|(_, fidelity, _)| !fidelity.is_complete())
         .filter_map(|(_, _, source_path)| {
             if let Some((lo, hi, bound)) = coverage_by_path.get(source_path) {
                 Some((source_path.clone(), lo.clone(), hi.clone(), *bound))
@@ -4241,6 +4293,62 @@ fn repair_tree(
             }
         })
         .collect();
+    // A pair of L0 tables whose KEY ranges overlap and whose SEQNO ranges
+    // intersect can hold tied entries, and a tied read is settled by run
+    // order. The persisted recency key makes that order trustworthy; when
+    // EITHER table lacks it, the id fallback restores ALLOCATION order,
+    // which a legacy compaction output does not follow (its high id predates
+    // a concurrent newer flush's install) — and a missing key cannot tell
+    // such an output from a flush. The tree still commits the deterministic
+    // id order (an openable tree, always), and the overlap is REPORTED: the
+    // key-range intersection under a seqno ceiling of the intersection's top
+    // (ties need the seqno present in BOTH tables). A reconciling deployment
+    // replays the range and its WAL's authoritative order settles the ties —
+    // the replayed memtable copy is the newest source and wins them.
+    // Serialized flushes have DISJOINT seqno ranges, so an ordinary tree
+    // reports nothing; only caller-assigned-seqno deployments (which have a
+    // WAL to heal from) can intersect.
+    let mut ambiguous_order_coverage: Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)> = Vec::new();
+    for (i, (a, _, a_path)) in recovered_tables.iter().enumerate() {
+        for (b, _, _) in recovered_tables.iter().skip(i + 1) {
+            if a.metadata.recency.is_some() && b.metadata.recency.is_some() {
+                continue;
+            }
+            let cmp = config.comparator.as_ref();
+            if !a
+                .metadata
+                .key_range
+                .overlaps_with_key_range_cmp(&b.metadata.key_range, cmp)
+            {
+                continue;
+            }
+            let (a_lo, a_hi) = (a.get_lowest_seqno(), a.get_highest_seqno());
+            let (b_lo, b_hi) = (b.get_lowest_seqno(), b.get_highest_seqno());
+            if a_lo > b_hi || b_lo > a_hi {
+                continue;
+            }
+            let lo = if cmp.compare(a.metadata.key_range.min(), b.metadata.key_range.min())
+                == core::cmp::Ordering::Less
+            {
+                b.metadata.key_range.min()
+            } else {
+                a.metadata.key_range.min()
+            };
+            let hi = if cmp.compare(a.metadata.key_range.max(), b.metadata.key_range.max())
+                == core::cmp::Ordering::Less
+            {
+                a.metadata.key_range.max()
+            } else {
+                b.metadata.key_range.max()
+            };
+            ambiguous_order_coverage.push((
+                a_path.clone(),
+                lo.clone(),
+                hi.clone(),
+                Some(a_hi.min(b_hi)),
+            ));
+        }
+    }
     let recovered_tables: Vec<Table> = recovered_tables.into_iter().map(|(t, _, _)| t).collect();
     // A rebuilt manifest whose highest table id is the LAST one cannot be
     // committed: the next open seeds its id allocator with `highest + 1`,
@@ -4253,6 +4361,21 @@ fn repair_tree(
             "repair: the table id space is exhausted (id {} is in use); a rebuilt \
              manifest would make the next open's id allocator overflow",
             crate::TableId::MAX,
+        );
+        return Err(crate::Error::Unrecoverable);
+    }
+    // The blob-file id space counts on the same rule. A HEALTHY,
+    // still-referenced blob file at the last id needs no salvage, so the
+    // fresh-id allocator's exhaustion (`next_blob_id == None`) is never
+    // consulted for it — yet the next open seeds its blob allocator with
+    // `max + 1` all the same, with the same overflow.
+    if blob_file_list.iter().map(crate::vlog::BlobFile::id).max()
+        == Some(crate::vlog::BlobFileId::MAX)
+    {
+        log::error!(
+            "repair: the blob file id space is exhausted (id {} is referenced); a \
+             rebuilt manifest would make the next open's blob id allocator overflow",
+            crate::vlog::BlobFileId::MAX,
         );
         return Err(crate::Error::Unrecoverable);
     }
@@ -4487,6 +4610,7 @@ fn repair_tree(
         }
     }
     lost_coverage.extend(salvaged_coverage);
+    lost_coverage.extend(ambiguous_order_coverage);
     unknowable_losses.extend(salvaged_unknowable);
 
     // Success only: a failed run leaves the phase where it stopped, which

@@ -4334,6 +4334,52 @@ fn repair_restricts_a_punched_sst_with_no_sidecar() -> crate::Result<()> {
     assert_punched_sst_recovered_restricted(&memfs, &root)
 }
 
+/// A geometry-derived restriction is deliberately LOSSY: with the exact
+/// sidecar bound gone, the conservative bound is the straddling block's END
+/// key, which can discard that block's still-live suffix rows. Passing the
+/// restricted table on as a COMPLETE recovery would leave `wal_replay_scope`
+/// at `TailOnly` while live rows were removed — the loss must be reported
+/// under the source table's coverage so a reconciling deployment replays it.
+#[test]
+fn repair_reports_loss_from_a_geometry_derived_restriction() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    // Punch the prefix but publish NO sidecar: the bound falls to geometry.
+    let _sst = build_punched_prefix_sst(&memfs, &fs, &tables)?;
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.recovered, 1,
+        "the punched SST is still recovered restricted: {report:?}",
+    );
+    assert!(
+        !report.lost_coverage.is_empty(),
+        "a geometry-derived bound can drop the straddling block's live \
+         suffix; the loss must be reported: {report:?}",
+    );
+    assert!(
+        !matches!(
+            report.wal_replay_scope(),
+            crate::repair::WalReplayScope::TailOnly
+        ),
+        "a lossy restriction must widen the replay obligation: {report:?}",
+    );
+    Ok(())
+}
+
 /// A punched SST whose `.restrict-bound` sidecar reads back MALFORMED (a flipped
 /// byte fails its checksum) has no trustworthy exact bound. With resurrection off,
 /// repair derives a conservative bound from the punch geometry and recovers the
@@ -10321,6 +10367,77 @@ fn repair_rejects_an_exhausted_table_id_space() -> crate::Result<()> {
     Ok(())
 }
 
+/// The blob-file analogue of the table-id guard: a HEALTHY, still-referenced
+/// blob file at the last id needs no salvage, so the fresh-id allocator's
+/// exhaustion is never consulted — yet committing it into the rebuilt
+/// manifest makes the next open seed its blob allocator with `max + 1`,
+/// which panics with overflow in checked builds or wraps to an existing low
+/// id and lets a later blob write collide with an unrelated file.
+#[test]
+fn repair_rejects_an_exhausted_blob_id_space() -> crate::Result<()> {
+    use crate::coding::Encode;
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, InternalValue, KvSeparationOptions, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let tables = root.join("tables");
+    memfs.create_dir_all(&blobs)?;
+    memfs.create_dir_all(&tables)?;
+
+    // A healthy blob file occupying the LAST id (the engine's own allocator
+    // cannot mint it, but a repair-published salvage chain or a foreign copy
+    // can place one), plus an SST whose indirection references it.
+    let blob_path = blobs.join(u64::MAX.to_string());
+    let (offset, on_disk_size) = {
+        let mut w = crate::vlog::blob_file::writer::Writer::new(&blob_path, u64::MAX, 0, &*fs_dyn)?;
+        let offset = w.offset();
+        let on_disk_size = w.write(b"k", 1, &[b'x'; 300])?;
+        w.finish()?;
+        (offset, on_disk_size)
+    };
+    let indirection = crate::blob_tree::handle::BlobIndirection {
+        vhandle: crate::vlog::ValueHandle {
+            blob_file_id: u64::MAX,
+            offset,
+            on_disk_size,
+        },
+        size: 300,
+    };
+    {
+        let mut w = crate::table::Writer::new(tables.join("0"), 0, 0, Arc::clone(&fs_dyn))?;
+        w.link_blob_file(u64::MAX, 1, 300, u64::from(on_disk_size));
+        w.write(InternalValue::from_components(
+            b"k".to_vec(),
+            indirection.encode_into_vec(),
+            1,
+            ValueType::Indirection,
+        ))?;
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .repair();
+    assert!(
+        matches!(result, Err(crate::Error::Unrecoverable)),
+        "an exhausted blob id space must fail the repair, not commit a \
+         manifest the next open cannot allocate past: {:?}",
+        result.map(|r| r.recovered),
+    );
+    Ok(())
+}
+
 /// A `PermissionDenied` open is an ENVIRONMENTAL failure, not corruption: the
 /// bytes on disk are intact and an operator fixes the ACL / ownership. It
 /// must abort the repair for a retry — grading the healthy file unreadable
@@ -11122,6 +11239,137 @@ fn repair_orders_l0_by_recency_key_not_table_id() -> crate::Result<()> {
         Some(b"new".as_ref()),
         "the flush's newer write must shadow the compaction output's superseded \
          one, exactly as the live tree ordered them",
+    );
+    Ok(())
+}
+
+/// Two L0 tables with OVERLAPPING key ranges and INTERSECTING seqno ranges
+/// where at least one lacks the recency meta cannot be ordered reliably: the
+/// id fallback restores ALLOCATION order, but a legacy compaction output
+/// allocated its high id before a concurrent newer flush installed, and a
+/// missing key cannot tell the two apart. Repair still commits the
+/// deterministic id order — an openable tree, always — but must REPORT the
+/// overlap so a reconciling deployment replays the range and its WAL's
+/// authoritative order settles the ties (the replayed memtable copy is the
+/// newest source and wins them).
+#[test]
+fn repair_reports_ambiguous_order_of_legacy_overlapping_tables() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    // The same key at the same caller-chosen seqno with DIFFERENT payloads,
+    // in two tables WITHOUT the recency meta: the tied read's winner depends
+    // entirely on the L0 order the repair guesses.
+    for (id, payload) in [(0u64, b"old".as_slice()), (1u64, b"new".as_slice())] {
+        let mut w = Writer::new(tables.join(id.to_string()), id, 0, Arc::clone(&fs))?;
+        w.write(InternalValue::from_components(
+            b"k5".to_vec(),
+            payload.to_vec(),
+            7,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "the table is non-empty");
+    }
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+    assert_eq!(report.recovered, 2, "both tables are still recovered");
+    assert!(
+        !report.lost_coverage.is_empty(),
+        "the ambiguous overlap must be reported: {report:?}",
+    );
+    assert!(
+        !matches!(
+            report.wal_replay_scope(),
+            crate::repair::WalReplayScope::TailOnly
+        ),
+        "an unorderable tied history must widen the replay obligation: {report:?}",
+    );
+    Ok(())
+}
+
+/// The narrowing contract for the ambiguity report: two recency-less tables
+/// whose seqno ranges are DISJOINT — the normal serialized-flush shape, where
+/// ties are impossible and id order is install order — stay unreported, so an
+/// ordinary manifest-loss repair keeps its `TailOnly` answer.
+#[test]
+fn repair_stays_tail_only_for_disjoint_seqno_legacy_tables() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    // Overlapping KEY ranges but disjoint seqno ranges: two serialized
+    // flushes of the same hot key.
+    for (id, seqno) in [(0u64, 3u64), (1u64, 8u64)] {
+        let mut w = Writer::new(tables.join(id.to_string()), id, 0, Arc::clone(&fs))?;
+        w.write(InternalValue::from_components(
+            b"k5".to_vec(),
+            b"v".to_vec(),
+            seqno,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "the table is non-empty");
+    }
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+    assert_eq!(report.recovered, 2, "both tables are recovered");
+    assert!(
+        matches!(
+            report.wal_replay_scope(),
+            crate::repair::WalReplayScope::TailOnly
+        ),
+        "disjoint seqno ranges leave nothing tied — no report: {report:?}",
+    );
+    Ok(())
+}
+
+/// New flush outputs PERSIST their own id as the recency key — the same
+/// value the repair-side fallback would derive, but present on disk, so a
+/// MISSING key positively identifies a legacy table and the ambiguity report
+/// above stays confined to pre-key history instead of firing on every new
+/// tied flush pair.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn flush_persists_an_own_id_recency_key() -> crate::Result<()> {
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+    let crate::AnyTree::Standard(tree) = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?
+    else {
+        panic!("expected a standard tree");
+    };
+    tree.insert(b"k", b"v", 1);
+    tree.flush_active_memtable(0)?;
+
+    let version = tree.current_version();
+    let table = version.iter_tables().next().expect("one flushed table");
+    assert_eq!(
+        table.metadata.recency,
+        Some(table.id()),
+        "a flush stamps its own id as its recency",
     );
     Ok(())
 }
