@@ -56,6 +56,9 @@ pub enum ErrorKind {
     NotFound,
     /// Catch-all for errors that don't fit any other variant.
     Other,
+    /// The operation ran out of memory (`ENOMEM` — an oversized read buffer
+    /// or an exhausted host); the bytes on disk are not implicated.
+    OutOfMemory,
     /// Operation denied due to lack of permissions.
     PermissionDenied,
     /// The filesystem quota was exceeded (`EDQUOT`).
@@ -123,7 +126,9 @@ impl ErrorKind {
     /// [`StorageFull`](Self::StorageFull),
     /// [`QuotaExceeded`](Self::QuotaExceeded) and
     /// [`ReadOnlyFilesystem`](Self::ReadOnlyFilesystem) (the salvage OUTPUT
-    /// failed, not the source being salvaged). Grading such a file unreadable
+    /// failed, not the source being salvaged), plus
+    /// [`OutOfMemory`](Self::OutOfMemory) (the HOST ran out, not the file's
+    /// bytes). Grading such a file unreadable
     /// commits a manifest that excludes it and then removes it, turning a
     /// recoverable configuration / capacity problem into permanent loss of
     /// intact data; propagating lets the operator fix the environment and
@@ -136,6 +141,7 @@ impl ErrorKind {
                     | Self::StorageFull
                     | Self::QuotaExceeded
                     | Self::ReadOnlyFilesystem
+                    | Self::OutOfMemory
             )
     }
 
@@ -152,6 +158,7 @@ impl ErrorKind {
             Self::NetworkUnreachable => "network unreachable",
             Self::NotFound => "entity not found",
             Self::Other => "other error",
+            Self::OutOfMemory => "out of memory",
             Self::PermissionDenied => "permission denied",
             Self::QuotaExceeded => "filesystem quota exceeded",
             Self::ReadOnlyFilesystem => "read-only filesystem",
@@ -314,6 +321,7 @@ impl From<std::io::Error> for Error {
             std::io::ErrorKind::NetworkDown => (ErrorKind::NetworkDown, true),
             std::io::ErrorKind::NetworkUnreachable => (ErrorKind::NetworkUnreachable, true),
             std::io::ErrorKind::NotFound => (ErrorKind::NotFound, true),
+            std::io::ErrorKind::OutOfMemory => (ErrorKind::OutOfMemory, true),
             std::io::ErrorKind::PermissionDenied => (ErrorKind::PermissionDenied, true),
             std::io::ErrorKind::QuotaExceeded => (ErrorKind::QuotaExceeded, true),
             std::io::ErrorKind::ReadOnlyFilesystem => (ErrorKind::ReadOnlyFilesystem, true),
@@ -384,6 +392,7 @@ impl From<Error> for std::io::Error {
             ErrorKind::NetworkUnreachable => std::io::ErrorKind::NetworkUnreachable,
             ErrorKind::NotFound => std::io::ErrorKind::NotFound,
             ErrorKind::Other => std::io::ErrorKind::Other,
+            ErrorKind::OutOfMemory => std::io::ErrorKind::OutOfMemory,
             ErrorKind::PermissionDenied => std::io::ErrorKind::PermissionDenied,
             ErrorKind::QuotaExceeded => std::io::ErrorKind::QuotaExceeded,
             ErrorKind::ReadOnlyFilesystem => std::io::ErrorKind::ReadOnlyFilesystem,

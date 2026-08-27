@@ -1955,7 +1955,13 @@ impl Tree {
         }
 
         // SSTs. A table whose key range cannot intersect the scope is skipped
-        // without a single block read — the point of the scoped variant.
+        // without a single block read — the point of the scoped variant. The
+        // key range is RANGE-TOMBSTONE-SAFE to prune on: every writer keeps
+        // tombstone coverage inside it (a flush conservatively widens the
+        // range over its tombstone spans — see `write_rts_to_writer` — and a
+        // compaction clips its output's tombstones to the table's
+        // responsibility range), so a tombstone overlapping the scope always
+        // sits in a table this loop visits.
         for table in version.iter_tables() {
             if let Some(bounds) = &ref_bounds
                 && !table

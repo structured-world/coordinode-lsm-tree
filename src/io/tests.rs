@@ -82,7 +82,7 @@ fn from_std_io_error_maps_unknown_to_other() {
     // `std::io::ErrorKind` is `#[non_exhaustive]`; variants
     // we don't map explicitly fall through to `Other` so the
     // bridge stays total.
-    let std_err = std::io::Error::from(std::io::ErrorKind::OutOfMemory);
+    let std_err = std::io::Error::from(std::io::ErrorKind::FileTooLarge);
     let crate_err: Error = std_err.into();
     assert_eq!(crate_err.kind(), ErrorKind::Other);
 }
@@ -128,6 +128,7 @@ fn storage_kinds_survive_the_bridge_as_environmental() {
         std::io::ErrorKind::StorageFull,
         std::io::ErrorKind::QuotaExceeded,
         std::io::ErrorKind::ReadOnlyFilesystem,
+        std::io::ErrorKind::OutOfMemory,
     ] {
         let ours: Error = std::io::Error::from(std_kind).into();
         assert!(
@@ -228,7 +229,7 @@ fn write_all_via_blanket_impl_on_vec() -> std::io::Result<()> {
 /// to the enum without a row here fails the per-arm assertions
 /// (the std round trip would not preserve it).
 #[cfg(feature = "std")]
-const ALL_KINDS: [ErrorKind; 21] = [
+const ALL_KINDS: [ErrorKind; 22] = [
     ErrorKind::AlreadyExists,
     ErrorKind::BrokenPipe,
     ErrorKind::CrossesDevices,
@@ -240,6 +241,7 @@ const ALL_KINDS: [ErrorKind; 21] = [
     ErrorKind::NetworkUnreachable,
     ErrorKind::NotFound,
     ErrorKind::Other,
+    ErrorKind::OutOfMemory,
     ErrorKind::PermissionDenied,
     ErrorKind::QuotaExceeded,
     ErrorKind::ReadOnlyFilesystem,
@@ -300,6 +302,7 @@ fn every_kind_only_std_error_maps_to_matching_kind() {
             ErrorKind::NetworkUnreachable,
         ),
         (std::io::ErrorKind::NotFound, ErrorKind::NotFound),
+        (std::io::ErrorKind::OutOfMemory, ErrorKind::OutOfMemory),
         (
             std::io::ErrorKind::PermissionDenied,
             ErrorKind::PermissionDenied,

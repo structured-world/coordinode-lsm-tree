@@ -962,6 +962,39 @@ fn blob_scan_since_in_range_scopes_and_resolves() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// An SST's metadata key range covers its POINT keys only, while a range
+/// tombstone it carries can reach past them. The scoped scan's SST pruning
+/// must not skip such a table by its point-key range, or the promised
+/// overlapping deletion event is omitted and a range-partitioned CDC
+/// consumer retains a deleted key.
+#[test]
+fn scan_since_scoped_sees_a_tombstone_reaching_past_the_tables_point_keys() -> lsm_tree::Result<()>
+{
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path())?;
+
+    // The OLD table holds the key the scope asks about.
+    tree.insert(b"m", b"old", 1);
+    tree.flush_active_memtable(0)?;
+
+    // The NEW table holds one point key at "a" plus a range deletion
+    // reaching to "z": the tombstone's span covers the scope below.
+    tree.insert(b"a", b"new", 2);
+    tree.remove_range(b"a", b"z", 3);
+    tree.flush_active_memtable(0)?;
+
+    let got: Vec<ScanSinceEvent> = tree
+        .scan_since_seqno_in_range(0, b"m".as_slice()..=b"m".as_slice())?
+        .collect();
+    assert!(
+        got.iter()
+            .any(|e| matches!(e, ScanSinceEvent::RangeTombstone { seqno: 3, .. })),
+        "the deletion overlapping the scope must be delivered even though its \
+         table's point-key range does not: {got:?}",
+    );
+    Ok(())
+}
+
 /// An RT-only flush writes a synthetic weak-tombstone SENTINEL at the range's
 /// start (the writer's `finish`, to give the KV-empty table one index entry).
 /// The stream deliberately KEEPS it: it is a real on-disk entry the read path
