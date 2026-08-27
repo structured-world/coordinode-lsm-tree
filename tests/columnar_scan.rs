@@ -565,6 +565,33 @@ fn bytes_rows(col: &Column, rows: usize) -> Vec<Vec<u8>> {
 }
 
 #[test]
+fn tree_columnar_scan_applies_an_unmaterialized_range_tombstone() {
+    // Rows inserted, then `remove_range`, then flushed: the columnar segment
+    // carries the range tombstone in its RT section (no positional delete
+    // bitmap exists until a later relocation). The scan must suppress the
+    // covered keys exactly as the point and ordinary range reads do.
+    let folder = get_tmp_folder();
+    let tree = open_columnar(folder.path());
+    tree.insert(key(0), b"a".to_vec(), 1);
+    tree.insert(key(1), b"b".to_vec(), 2);
+    tree.insert(key(2), b"c".to_vec(), 3);
+    tree.remove_range(key(1), key(2), 4); // deletes k1 (half-open span)
+    tree.flush_active_memtable(0).expect("flush");
+
+    assert_eq!(
+        scan_keys(&tree, SeqNo::MAX),
+        vec![key(0), key(2)],
+        "a range-tombstone-covered key must not surface from the columnar scan"
+    );
+    // Below the deletion the covered key is still visible.
+    assert_eq!(
+        scan_keys(&tree, 4),
+        vec![key(0), key(1), key(2)],
+        "a snapshot below the range deletion still sees the covered key"
+    );
+}
+
+#[test]
 fn tree_columnar_scan_singleton_segment_dedups_overwritten_key() {
     // A flush-produced columnar segment holds every MVCC version of an
     // overwritten key. A SINGLETON segment (no overlapping neighbor) must still

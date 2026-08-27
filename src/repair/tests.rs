@@ -10327,6 +10327,76 @@ fn repair_propagates_a_permission_denied_open() -> crate::Result<()> {
     Ok(())
 }
 
+/// A salvage replacement write failing with ENOSPC must abort the repair:
+/// the healthy SOURCE is not implicated by a full destination, and grading
+/// it unsalvageable would commit a manifest without it and then remove it —
+/// exactly the loss under the tight-space conditions this recovery targets.
+#[test]
+fn repair_propagates_a_full_destination_during_salvage() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    // Several small blocks with ONE corrupt: verification routes the table
+    // into salvage, whose replacement write is then starved of space.
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+        for i in 0..64u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+    let offsets: alloc::vec::Vec<u64> = recover_table(sst.clone(), &fs)?
+        .data_block_handles()
+        .filter_map(Result::ok)
+        .map(|kh| *kh.as_ref().offset())
+        .collect();
+    let Some(corrupt) = offsets.get(1).copied() else {
+        panic!("need several blocks, got {offsets:?}");
+    };
+    let flip = usize::try_from(corrupt).unwrap_or(0) + 16;
+    let mut bytes = std::fs::read(&sst)?;
+    if let Some(b) = bytes.get_mut(flip) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&sst, &bytes)?;
+
+    let fault = FaultFs::new(StdFs);
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::StorageFull)).on_path("repair-tmp"),
+    );
+    let result = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair_with_salvage(true);
+    assert!(
+        matches!(result, Err(crate::Error::Io(ref e)) if e.kind() == ErrorKind::StorageFull),
+        "a full destination must abort the repair, never grade the source: {:?}",
+        result.map(|r| (r.recovered, r.unreadable)),
+    );
+    assert!(
+        std::fs::metadata(&sst).is_ok(),
+        "the damaged-but-salvageable source stays for the retry",
+    );
+    Ok(())
+}
+
 /// A network-filesystem timeout (`ETIMEDOUT` from NFS / FUSE) is a transport
 /// failure, not evidence against the bytes on disk. It must abort the repair
 /// for a retry — grading the file unreadable would commit a manifest that

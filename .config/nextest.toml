@@ -29,6 +29,13 @@ dir = "target/nextest"
 [profile.default]
 slow-timeout = { period = "10s", terminate-after = 6 }
 fail-fast = true
+# Process-exit grace before a test is flagged "leaky". The default 100ms
+# occasionally trips on ordinary teardown under a fully parallel run (the
+# flagged test is a different, often trivial one each time — probing with a
+# 1ms timeout marks even pure in-memory unit tests). A genuine leak (a
+# surviving child process holding the output pipes) never closes them, so a
+# longer grace loses no detection.
+leak-timeout = "500ms"
 
 # Property tests default to 32 cases via the shared
 # `common::proptest_config()` helper (PROPTEST_CASES /
@@ -77,6 +84,8 @@ fail-fast = false
 slow-timeout = { period = "120s", terminate-after = 3 }
 status-level = "all"
 final-status-level = "flaky"
+# See the default profile: teardown grace, not a detection trade-off.
+leak-timeout = "500ms"
 
 [profile.ci.junit]
 path = "junit.xml"

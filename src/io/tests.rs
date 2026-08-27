@@ -114,6 +114,36 @@ fn network_kinds_survive_the_bridge_as_transient() {
     }
 }
 
+/// Write-side STORAGE kinds (`StorageFull` / ENOSPC, `QuotaExceeded` /
+/// EDQUOT, `ReadOnlyFilesystem` / EROFS) are environmental: the destination,
+/// not the data, failed. Collapsing them into `Other` lets recovery grading
+/// condemn a healthy SOURCE file when writing its salvage replacement fails —
+/// the manifest then excludes the source and removes it. The bridge must
+/// preserve them and classify them environmental (not transient: an
+/// immediate retry does not clear a full disk, the operator does).
+#[cfg(feature = "std")]
+#[test]
+fn storage_kinds_survive_the_bridge_as_environmental() {
+    for std_kind in [
+        std::io::ErrorKind::StorageFull,
+        std::io::ErrorKind::QuotaExceeded,
+        std::io::ErrorKind::ReadOnlyFilesystem,
+    ] {
+        let ours: Error = std::io::Error::from(std_kind).into();
+        assert!(
+            ours.kind().is_environmental(),
+            "{std_kind:?} is an environment failure, got {:?}",
+            ours.kind(),
+        );
+        assert!(
+            !ours.kind().is_transient(),
+            "{std_kind:?} is not cleared by an immediate retry",
+        );
+        let back: std::io::Error = ours.into();
+        assert_eq!(back.kind(), std_kind, "the discriminant must round-trip");
+    }
+}
+
 #[cfg(feature = "std")]
 #[test]
 fn round_trip_through_std_io_error_preserves_writezero() {
@@ -198,7 +228,7 @@ fn write_all_via_blanket_impl_on_vec() -> std::io::Result<()> {
 /// to the enum without a row here fails the per-arm assertions
 /// (the std round trip would not preserve it).
 #[cfg(feature = "std")]
-const ALL_KINDS: [ErrorKind; 18] = [
+const ALL_KINDS: [ErrorKind; 21] = [
     ErrorKind::AlreadyExists,
     ErrorKind::BrokenPipe,
     ErrorKind::CrossesDevices,
@@ -211,7 +241,10 @@ const ALL_KINDS: [ErrorKind; 18] = [
     ErrorKind::NotFound,
     ErrorKind::Other,
     ErrorKind::PermissionDenied,
+    ErrorKind::QuotaExceeded,
+    ErrorKind::ReadOnlyFilesystem,
     ErrorKind::StaleNetworkFileHandle,
+    ErrorKind::StorageFull,
     ErrorKind::TimedOut,
     ErrorKind::UnexpectedEof,
     ErrorKind::Unsupported,
@@ -271,10 +304,16 @@ fn every_kind_only_std_error_maps_to_matching_kind() {
             std::io::ErrorKind::PermissionDenied,
             ErrorKind::PermissionDenied,
         ),
+        (std::io::ErrorKind::QuotaExceeded, ErrorKind::QuotaExceeded),
+        (
+            std::io::ErrorKind::ReadOnlyFilesystem,
+            ErrorKind::ReadOnlyFilesystem,
+        ),
         (
             std::io::ErrorKind::StaleNetworkFileHandle,
             ErrorKind::StaleNetworkFileHandle,
         ),
+        (std::io::ErrorKind::StorageFull, ErrorKind::StorageFull),
         (std::io::ErrorKind::TimedOut, ErrorKind::TimedOut),
         (std::io::ErrorKind::UnexpectedEof, ErrorKind::UnexpectedEof),
         (std::io::ErrorKind::Unsupported, ErrorKind::Unsupported),

@@ -58,9 +58,15 @@ pub enum ErrorKind {
     Other,
     /// Operation denied due to lack of permissions.
     PermissionDenied,
+    /// The filesystem quota was exceeded (`EDQUOT`).
+    QuotaExceeded,
+    /// The filesystem is mounted read-only (`EROFS`).
+    ReadOnlyFilesystem,
     /// A network file handle went stale (`ESTALE` — the NFS server rebooted
     /// or re-exported); a re-open after the mount recovers clears it.
     StaleNetworkFileHandle,
+    /// The storage device is out of space (`ENOSPC`).
+    StorageFull,
     /// An I/O operation timed out (`ETIMEDOUT` — a slow or wedged network
     /// filesystem); the data underneath is not implicated.
     TimedOut,
@@ -110,14 +116,27 @@ impl ErrorKind {
 
     /// Whether this kind must PROPAGATE out of recovery grading instead of
     /// condemning the file it came from: a [transient](Self::is_transient)
-    /// kind (a retry clears it), or [`PermissionDenied`](Self::PermissionDenied)
-    /// — an ENVIRONMENTAL access failure that does not implicate the bytes on
-    /// disk. Grading an EACCES file unreadable commits a manifest that
-    /// excludes it and then removes it, turning a recoverable ACL / ownership
-    /// mistake into permanent loss of intact data; propagating lets the
-    /// operator fix the permissions and retry.
+    /// kind (a retry clears it), or an ENVIRONMENTAL failure that does not
+    /// implicate the bytes on disk —
+    /// [`PermissionDenied`](Self::PermissionDenied) (an ACL / ownership
+    /// mistake), and the write-side destination kinds
+    /// [`StorageFull`](Self::StorageFull),
+    /// [`QuotaExceeded`](Self::QuotaExceeded) and
+    /// [`ReadOnlyFilesystem`](Self::ReadOnlyFilesystem) (the salvage OUTPUT
+    /// failed, not the source being salvaged). Grading such a file unreadable
+    /// commits a manifest that excludes it and then removes it, turning a
+    /// recoverable configuration / capacity problem into permanent loss of
+    /// intact data; propagating lets the operator fix the environment and
+    /// retry.
     pub(crate) fn is_environmental(self) -> bool {
-        self.is_transient() || matches!(self, Self::PermissionDenied)
+        self.is_transient()
+            || matches!(
+                self,
+                Self::PermissionDenied
+                    | Self::StorageFull
+                    | Self::QuotaExceeded
+                    | Self::ReadOnlyFilesystem
+            )
     }
 
     fn as_str(self) -> &'static str {
@@ -134,7 +153,10 @@ impl ErrorKind {
             Self::NotFound => "entity not found",
             Self::Other => "other error",
             Self::PermissionDenied => "permission denied",
+            Self::QuotaExceeded => "filesystem quota exceeded",
+            Self::ReadOnlyFilesystem => "read-only filesystem",
             Self::StaleNetworkFileHandle => "stale network file handle",
+            Self::StorageFull => "storage full",
             Self::TimedOut => "operation timed out",
             Self::UnexpectedEof => "unexpected end of file",
             Self::Unsupported => "unsupported",
@@ -293,7 +315,10 @@ impl From<std::io::Error> for Error {
             std::io::ErrorKind::NetworkUnreachable => (ErrorKind::NetworkUnreachable, true),
             std::io::ErrorKind::NotFound => (ErrorKind::NotFound, true),
             std::io::ErrorKind::PermissionDenied => (ErrorKind::PermissionDenied, true),
+            std::io::ErrorKind::QuotaExceeded => (ErrorKind::QuotaExceeded, true),
+            std::io::ErrorKind::ReadOnlyFilesystem => (ErrorKind::ReadOnlyFilesystem, true),
             std::io::ErrorKind::StaleNetworkFileHandle => (ErrorKind::StaleNetworkFileHandle, true),
+            std::io::ErrorKind::StorageFull => (ErrorKind::StorageFull, true),
             std::io::ErrorKind::TimedOut => (ErrorKind::TimedOut, true),
             std::io::ErrorKind::UnexpectedEof => (ErrorKind::UnexpectedEof, true),
             std::io::ErrorKind::Unsupported => (ErrorKind::Unsupported, true),
@@ -360,7 +385,10 @@ impl From<Error> for std::io::Error {
             ErrorKind::NotFound => std::io::ErrorKind::NotFound,
             ErrorKind::Other => std::io::ErrorKind::Other,
             ErrorKind::PermissionDenied => std::io::ErrorKind::PermissionDenied,
+            ErrorKind::QuotaExceeded => std::io::ErrorKind::QuotaExceeded,
+            ErrorKind::ReadOnlyFilesystem => std::io::ErrorKind::ReadOnlyFilesystem,
             ErrorKind::StaleNetworkFileHandle => std::io::ErrorKind::StaleNetworkFileHandle,
+            ErrorKind::StorageFull => std::io::ErrorKind::StorageFull,
             ErrorKind::TimedOut => std::io::ErrorKind::TimedOut,
             ErrorKind::UnexpectedEof => std::io::ErrorKind::UnexpectedEof,
             ErrorKind::Unsupported => std::io::ErrorKind::Unsupported,

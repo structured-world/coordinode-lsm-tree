@@ -275,10 +275,54 @@ impl ColumnarScan {
     /// only when the snapshot straddles the segment); an overlapping group is
     /// row-merged with newest-effective-seqno-wins dedup.
     fn process_group(&self, group: &Group) -> crate::Result<Vec<ColumnBatch>> {
+        let rts = self.visible_group_range_tombstones(&group.segments)?;
         if let [seg] = group.segments.as_slice() {
-            return self.process_singleton(seg);
+            return self.process_singleton(seg, &rts);
         }
-        self.merge_group(group)
+        self.merge_group(group, &rts)
+    }
+
+    /// The range tombstones of `segments` visible to the scan snapshot, with
+    /// tree-global effective seqnos: an UNMATERIALIZED range deletion (a
+    /// flushed `remove_range` no relocation has folded into a positional
+    /// delete bitmap yet) lives only in the segments' RT sections, and the
+    /// scan must suppress the rows it covers exactly as the point and
+    /// ordinary range reads do. A group is key-disjoint from its neighbours
+    /// and a tombstone's span is inside its own segment's key range, so
+    /// per-group collection sees every tombstone that can cover a group row.
+    fn visible_group_range_tombstones(
+        &self,
+        segments: &[Segment],
+    ) -> crate::Result<Vec<(UserKey, UserKey, SeqNo)>> {
+        let mut rts = Vec::new();
+        for seg in segments {
+            for rt in seg.table.visible_range_tombstones() {
+                let eff = rt
+                    .seqno
+                    .checked_add(seg.global)
+                    .ok_or(Error::InvalidHeader(
+                        "columnar_scan: effective range-tombstone seqno overflows",
+                    ))?;
+                // Same exclusive-MVCC visibility as rows: the deletion exists
+                // for this snapshot only below it.
+                if eff < self.seqno {
+                    rts.push((rt.start.clone(), rt.end.clone(), eff));
+                }
+            }
+        }
+        Ok(rts)
+    }
+
+    /// Whether a row (`key` at tree-global `eff` seqno) is deleted by one of
+    /// the group's visible range tombstones: inside the half-open
+    /// `[start, end)` span and older than the deletion.
+    fn rt_covered(&self, rts: &[(UserKey, UserKey, SeqNo)], key: &[u8], eff: SeqNo) -> bool {
+        let cmp = self.comparator.as_ref();
+        rts.iter().any(|(start, end, rt_eff)| {
+            eff < *rt_eff
+                && cmp.compare(key, start.as_ref()) != core::cmp::Ordering::Less
+                && cmp.compare(key, end.as_ref()) == core::cmp::Ordering::Less
+        })
     }
 
     /// Whether the requested key range is fully unbounded, so no per-row range
@@ -328,14 +372,24 @@ impl ColumnarScan {
     /// column-skip). Otherwise a per-row mask drops rows that are seqno-invisible
     /// (when the snapshot straddles the segment) or outside the requested range
     /// (when the segment only partially overlaps it).
-    fn process_singleton(&self, seg: &Segment) -> crate::Result<Vec<ColumnBatch>> {
+    fn process_singleton(
+        &self,
+        seg: &Segment,
+        rts: &[(UserKey, UserKey, SeqNo)],
+    ) -> crate::Result<Vec<ColumnBatch>> {
         // A segment that RECORDS deletions takes the dedup path even when its
         // keys are provably unique: a key whose single row is a tombstone would
         // otherwise stream through verbatim and surface a key the point read
         // calls absent. Deciding a run is where tombstones are consumed, and
-        // that lives there.
-        if seg.may_dup || seg.table.tombstone_count() > 0 || seg.table.weak_tombstone_count() > 0 {
-            return self.process_singleton_dedup(seg);
+        // that lives there. A visible RANGE tombstone routes there for the
+        // same reason: covered rows must be suppressed, and that needs each
+        // row's seqno, which the verbatim path never decodes.
+        if seg.may_dup
+            || seg.table.tombstone_count() > 0
+            || seg.table.weak_tombstone_count() > 0
+            || !rts.is_empty()
+        {
+            return self.process_singleton_dedup(seg, rts);
         }
         let range_filter = !self.range_is_full();
         if seg.visibility == SeqnoVisibility::All && !range_filter {
@@ -446,19 +500,25 @@ impl ColumnarScan {
     /// (mirroring [`Self::merge_group`]): a key whose newest version fails the
     /// predicate is dropped, never served from an older matching version —
     /// which also rules out predicate-driven zone-map block-skip here.
-    fn process_singleton_dedup(&self, seg: &Segment) -> crate::Result<Vec<ColumnBatch>> {
+    fn process_singleton_dedup(
+        &self,
+        seg: &Segment,
+        rts: &[(UserKey, UserKey, SeqNo)],
+    ) -> crate::Result<Vec<ColumnBatch>> {
         // Decode the columns the dedup needs even when the caller did not
         // project them (dropped again at the end): the key column always, the
-        // seqno column when the snapshot straddles the segment, the predicate
-        // column for the after-dedup filter.
+        // seqno column when the snapshot straddles the segment OR a range
+        // tombstone needs each row's age, the predicate column for the
+        // after-dedup filter.
         let key_projected = self.projection.contains(&COL_USER_KEY);
         let seqno_projected = self.projection.contains(&COL_SEQNO);
         let partial = seg.visibility == SeqnoVisibility::Partial;
+        let seqno_needed = partial || !rts.is_empty();
         let mut augmented = self.projection.clone();
         if !key_projected {
             augmented.push(COL_USER_KEY);
         }
-        if partial && !seqno_projected {
+        if seqno_needed && !seqno_projected {
             augmented.push(COL_SEQNO);
         }
         let predicate_col = self.predicate.as_ref().map(|p| p.column_id);
@@ -515,7 +575,7 @@ impl ColumnarScan {
             } else {
                 None
             };
-            let seqno_col = if partial {
+            let seqno_col = if seqno_needed {
                 Some(
                     batch
                         .columns
@@ -531,10 +591,11 @@ impl ColumnarScan {
 
             let mut mask = Vec::with_capacity(batch.row_count as usize);
             for row in 0..batch.row_count {
-                let visible = match seqno_col {
-                    Some(seqno_col) => fixed_u64_row(&seqno_col.data, row)? < threshold,
-                    None => true,
+                let local = match seqno_col {
+                    Some(seqno_col) => Some(fixed_u64_row(&seqno_col.data, row)?),
+                    None => None,
                 };
+                let visible = !partial || local.is_some_and(|l| l < threshold);
                 if !visible {
                     mask.push(false);
                     continue;
@@ -553,6 +614,23 @@ impl ColumnarScan {
                 // version. Deciding the run here (even when the range filter or
                 // a deletion drops the row) also drops its older versions above.
                 last_key = Some(key.to_vec());
+                // A visible range tombstone deletes the run when it covers the
+                // NEWEST visible version (older versions are older still); an
+                // uncovered newest version shadows the covered older ones, so
+                // deciding on it alone is exact.
+                if !rts.is_empty() {
+                    let eff =
+                        local
+                            .unwrap_or(0)
+                            .checked_add(seg.global)
+                            .ok_or(Error::InvalidHeader(
+                                "columnar_scan: effective seqno overflows",
+                            ))?;
+                    if self.rt_covered(rts, key, eff) {
+                        mask.push(false);
+                        continue;
+                    }
+                }
                 if let Some(vt_col) = vt_col {
                     let byte = *vt_col.data.get(row as usize).ok_or(Error::InvalidHeader(
                         "columnar_scan: value-type column shorter than the row count",
@@ -602,7 +680,11 @@ impl ColumnarScan {
     /// Row-merges an overlapping segment group: over the union of the segments'
     /// visible projected rows, keep the newest version of each key (highest
     /// effective seqno), gathered in key order.
-    fn merge_group(&self, group: &Group) -> crate::Result<Vec<ColumnBatch>> {
+    fn merge_group(
+        &self,
+        group: &Group,
+        rts: &[(UserKey, UserKey, SeqNo)],
+    ) -> crate::Result<Vec<ColumnBatch>> {
         // The merge needs each row's key and effective seqno, so decode the
         // intrinsic key + seqno columns even when the caller did not project them
         // (dropped again at the end).
@@ -762,6 +844,12 @@ impl ColumnarScan {
                 if value_type.is_tombstone() {
                     continue;
                 }
+            }
+            // A visible range tombstone covering the newest visible version
+            // deletes the key (older versions are older still); an uncovered
+            // newest version shadows the covered older ones.
+            if self.rt_covered(rts, key, eff_at(i)) {
+                continue;
             }
             kept.push(i);
         }
