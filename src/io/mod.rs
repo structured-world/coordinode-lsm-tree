@@ -78,6 +78,18 @@ impl ErrorKind {
         matches!(self, Self::Interrupted | Self::WouldBlock)
     }
 
+    /// Whether this kind must PROPAGATE out of recovery grading instead of
+    /// condemning the file it came from: a [transient](Self::is_transient)
+    /// kind (a retry clears it), or [`PermissionDenied`](Self::PermissionDenied)
+    /// — an ENVIRONMENTAL access failure that does not implicate the bytes on
+    /// disk. Grading an EACCES file unreadable commits a manifest that
+    /// excludes it and then removes it, turning a recoverable ACL / ownership
+    /// mistake into permanent loss of intact data; propagating lets the
+    /// operator fix the permissions and retry.
+    pub(crate) fn is_environmental(self) -> bool {
+        self.is_transient() || matches!(self, Self::PermissionDenied)
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::AlreadyExists => "entity already exists",

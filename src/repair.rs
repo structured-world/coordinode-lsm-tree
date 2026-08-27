@@ -472,12 +472,12 @@ pub(crate) fn repair_tmp_is_published(
         Arc::clone(fs),
     )) {
         Ok(table) => table,
-        Err(e) if is_transient_io(&e) => return Err(e),
+        Err(e) if is_environmental_io(&e) => return Err(e),
         Err(_) => return Ok(false),
     };
     let punch_offset = match table.punch_offset_for(bound.as_ref()) {
         Ok(offset) => offset,
-        Err(e) if is_transient_io(&e) => return Err(e),
+        Err(e) if is_environmental_io(&e) => return Err(e),
         Err(_) => return Ok(false),
     };
     let digest = compute_table_checksum_from(&**fs, tmp_path, punch_offset)?;
@@ -514,19 +514,24 @@ fn repair_recover_params(
     params
 }
 
-/// Whether an error is an UNAMBIGUOUSLY TRANSIENT (retryable) I/O failure, as
-/// opposed to one a re-read cannot fix.
+/// Whether an I/O failure must PROPAGATE out of the repair instead of grading
+/// the file it came from — either UNAMBIGUOUSLY TRANSIENT, or an
+/// ENVIRONMENTAL access failure that does not implicate the bytes on disk.
 ///
-/// The allowlist is deliberately narrow: only `Interrupted` (`EINTR`) and
+/// The allowlist is deliberately narrow: `Interrupted` (`EINTR`) and
 /// `WouldBlock` (`EAGAIN`) — the interrupted-syscall errors a retry genuinely
-/// clears, and which a corrupt on-disk structure can NEVER produce.
+/// clears, and which a corrupt on-disk structure can NEVER produce — plus
+/// `PermissionDenied` (`EACCES` / `EPERM`): an ACL / ownership mistake the
+/// operator fixes, while grading the healthy file unreadable commits a
+/// manifest that excludes it and then REMOVES it, turning a recoverable
+/// configuration error into permanent data loss.
 ///
-/// `Other` is NOT treated as transient, even though an injected fault or a raw
-/// `EIO` lands there, because a STRUCTURAL corruption lands there too: a corrupt
+/// `Other` is NOT on the list, even though an injected fault or a raw `EIO`
+/// lands there, because a STRUCTURAL corruption lands there too: a corrupt
 /// trailer that decodes to a bad offset makes the reader seek before the start of
 /// the file, which Windows reports as `ERROR_NEGATIVE_SEEK` — an unmapped OS
 /// error the `From<std::io::Error>` bridge folds into `ErrorKind::Other`. Treating
-/// `Other` as transient would then abort the WHOLE repair (blocking recovery of
+/// `Other` as propagating would then abort the WHOLE repair (blocking recovery of
 /// every healthy sibling table) on a single genuinely-corrupt SST, and the class
 /// is platform-dependent (the same corruption reads back `InvalidInput` on Unix).
 /// A hardware `EIO` is likewise usually a persistent bad-sector failure, so
@@ -536,8 +541,8 @@ fn repair_recover_params(
 ///
 /// This inspects the CRATE's [`crate::io::ErrorKind`], which is what a
 /// `crate::Error::Io` always carries.
-fn is_transient_io(e: &crate::Error) -> bool {
-    matches!(e, crate::Error::Io(io) if io.kind().is_transient())
+fn is_environmental_io(e: &crate::Error) -> bool {
+    matches!(e, crate::Error::Io(io) if io.kind().is_environmental())
 }
 
 /// Whether manifest repair must fail closed on a table because its bulk-ingest
@@ -751,7 +756,7 @@ fn record_best(
 /// Classifies a block-verifier result for the salvage gate. A structural
 /// divergence (a checksum / decode / cross-check mismatch) is genuine
 /// corruption: `Ok(true)`, route the table through salvage. Only a TRANSIENT
-/// [`crate::Error::Io`] (the [`is_transient_io`] allowlist) aborts the repair
+/// [`crate::Error::Io`] (the [`is_environmental_io`] allowlist) aborts the repair
 /// (`Err`) for a retry, rather than dropping a healthy block into a partial
 /// replacement. A PERSISTENT I/O failure is NOT retryable — a bad sector, or a
 /// structural corruption surfacing as `Io(Other)` on some platforms — so it is
@@ -760,7 +765,7 @@ fn record_best(
 fn is_corruption(res: crate::Result<()>) -> crate::Result<bool> {
     match res {
         Ok(()) => Ok(false),
-        Err(e) if is_transient_io(&e) => Err(e),
+        Err(e) if is_environmental_io(&e) => Err(e),
         Err(_) => Ok(true),
     }
 }
@@ -789,13 +794,15 @@ fn block_verify_verdict(
         data_start,
     );
     // A TRANSIENT read failure DURING the walk (a retryable `Interrupted` /
-    // `WouldBlock`) is not block corruption: routing it through salvage would
-    // re-read the same bytes and drop a healthy block. Propagate it so the repair
+    // `WouldBlock`) is not block corruption — routing it through salvage would
+    // re-read the same bytes and drop a healthy block — and neither is an
+    // ENVIRONMENTAL `PermissionDenied` (an ACL / ownership mistake the operator
+    // fixes; the bytes on disk are not implicated). Propagate both so the repair
     // aborts and the operator retries, mirroring the decode-load gate below. Any
     // OTHER kind falls through to the corruption verdict: a truncation
     // (`UnexpectedEof`) is genuine on-disk damage, and a PERSISTENT failure
-    // (`Other` / EIO, `PermissionDenied`) is not fixed by a retry either, so
-    // aborting forever would strand every healthy sibling table on one bad SST.
+    // (`Other` / EIO) is not fixed by a retry, so aborting forever would strand
+    // every healthy sibling table on one bad SST.
     // This matches the `is_corruption` allowlist policy exactly.
     //
     // This gate depends on the walk CLASSIFYING transient faults as one of these
@@ -806,12 +813,12 @@ fn block_verify_verdict(
     for e in &report.errors {
         if let crate::verify::BlockVerifyError::SstFileUnreadable { error, .. }
         | crate::verify::BlockVerifyError::DataReadError { error, .. } = e
-            && error.kind().is_transient()
+            && error.kind().is_environmental()
         {
-            // Preserve the transient ErrorKind: re-wrapping as `Other` would make
-            // the caller's `is_transient_io` check see a non-transient kind and
-            // re-grade this retryable failure as corruption, defeating the
-            // transient-propagation intent of this very gate.
+            // Preserve the ErrorKind: re-wrapping as `Other` would make the
+            // caller's `is_environmental_io` check see a non-propagating kind
+            // and re-grade this retryable / environmental failure as
+            // corruption, defeating the propagation intent of this very gate.
             return Err(crate::Error::Io(crate::io::Error::new(
                 error.kind(),
                 error.to_string(),
@@ -1012,7 +1019,7 @@ pub(crate) fn toc_may_hide_deletions(
         // section, so `true` drops the table rather than resurrecting masked rows.
         Err(e) => {
             let err = crate::Error::Io(e);
-            return if is_transient_io(&err) {
+            return if is_environmental_io(&err) {
                 Err(err)
             } else {
                 Ok(true)
@@ -1029,7 +1036,7 @@ pub(crate) fn toc_may_hide_deletions(
         // genuine catalogue ambiguity that fails closed.
         Err(crate::sfa::Error::Io(e)) => {
             let err = crate::Error::Io(e);
-            if is_transient_io(&err) {
+            if is_environmental_io(&err) {
                 Err(err)
             } else {
                 Ok(true)
@@ -1768,7 +1775,7 @@ fn derive_blob_frontier(
                 anchored = run_end;
                 pos = entry.frame_end;
             }
-            Some(Err(e)) if is_transient_io(&e) => return Err(e),
+            Some(Err(e)) if is_environmental_io(&e) => return Err(e),
             // The zeroed run is not punch geometry (no frame decodes at its
             // end): keep the last anchored frontier.
             _ => return Ok(committed(anchored)),
@@ -1779,7 +1786,7 @@ fn derive_blob_frontier(
             match scanner.next() {
                 None => return Ok(committed(anchored)),
                 Some(Ok(entry)) if !entry.resynced => pos = entry.frame_end,
-                Some(Err(e)) if is_transient_io(&e) => return Err(e),
+                Some(Err(e)) if is_environmental_io(&e) => return Err(e),
                 Some(Ok(_) | Err(_)) => {
                     // The frame starting at `pos` failed (or the scanner
                     // resynced past unproven bytes). Another zeroed hole
@@ -1924,7 +1931,7 @@ fn validate_blob_frames(
                 }
                 prev = Some((entry.key.clone(), entry.seqno));
             }
-            Err(e) if is_transient_io(&e) => return Err(e),
+            Err(e) if is_environmental_io(&e) => return Err(e),
             // A resynced frame has an unprovable boundary (damage upstream);
             // any other error is a structural or persistent frame failure.
             // Both are conclusive: this file's frames do not all verify.
@@ -2286,7 +2293,7 @@ fn recover_blob_files(
             // which the next open's orphan sweep then DELETES — permanent value
             // loss from a one-shot failure. Propagate so a retry re-reads it,
             // mirroring the table-recovery path.
-            Err(e) if is_transient_io(&e) => return Err(e),
+            Err(e) if is_environmental_io(&e) => return Err(e),
             Err(e) => {
                 discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
                 continue;
@@ -2314,7 +2321,7 @@ fn recover_blob_files(
                 &config.fs,
             ) {
                 Ok(handle) => handle,
-                Err(e) if is_transient_io(&e) => return Err(e),
+                Err(e) if is_environmental_io(&e) => return Err(e),
                 Err(e) => {
                     discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
                     continue;
@@ -2411,7 +2418,7 @@ fn recover_blob_files(
                     discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
                     continue;
                 }
-                Err(e) if is_transient_io(&e) => {
+                Err(e) if is_environmental_io(&e) => {
                     // Nothing was published; dropping the temp restores the
                     // pre-repair state exactly, so the retry re-salvages and
                     // re-derives the remap. Best-effort is enough on this
@@ -2496,7 +2503,7 @@ fn recover_blob_files(
         let checksum = match compute_table_checksum_from(&*config.fs, &blob_path, frontier) {
             Ok(c) => crate::Checksum::from_raw(c),
             // Same transient/persistent split as the frontier probe above.
-            Err(e) if is_transient_io(&e) => return Err(e),
+            Err(e) if is_environmental_io(&e) => return Err(e),
             Err(e) => {
                 discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
                 continue;
@@ -2540,7 +2547,7 @@ fn recover_blob_files(
                 blob_files.push(bf);
             }
             // Same transient/persistent split as the checksum read above.
-            Err(e) if is_transient_io(&e) => return Err(e),
+            Err(e) if is_environmental_io(&e) => return Err(e),
             Err(e) => {
                 discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
             }
@@ -2864,7 +2871,7 @@ fn sweep_superseded_by_committed_manifest(config: &Config) -> crate::Result<()> 
         // and outputs both on disk the rebuilt L0 applies duplicate merge
         // operands — where the authoritative manifest would have named which
         // files are live. Propagate for a retry.
-        Err(e) if is_transient_io(&e) => return Err(e),
+        Err(e) if is_environmental_io(&e) => return Err(e),
         // A manifest that does not load cleanly is exactly the case repair
         // exists for: nothing committed to consult, the scan rebuilds from
         // everything.
@@ -3339,7 +3346,7 @@ fn repair_tree(
                 // still-in-place file, which the next open's orphan cleanup then
                 // deletes — permanent loss from a one-shot failure. Propagate it
                 // so a retry re-reads the table, mirroring the recover arms below.
-                Err(e) if is_transient_io(&e) => return Err(e),
+                Err(e) if is_environmental_io(&e) => return Err(e),
                 // A PERSISTENT read failure (a bad data sector, a corrupt trailer)
                 // is genuine damage but does not doom the whole table: fold it into
                 // the recover Result so the structural-failure salvage arm below
@@ -3422,7 +3429,7 @@ fn repair_tree(
                     Ok(crate::restrict_bound::SidecarRead::Present(id, b)) if id == table_id => {
                         Some(b.into())
                     }
-                    Err(e) if is_transient_io(&e) => break 'restrict Err(e),
+                    Err(e) if is_environmental_io(&e) => break 'restrict Err(e),
                     Ok(_) | Err(_) => None,
                 };
 
@@ -3650,7 +3657,7 @@ fn repair_tree(
                                 // nothing has moved: the source is untouched, so the
                                 // retry re-derives the same salvage from it. A
                                 // STRUCTURAL failure is genuine unsalvageability.
-                                Err(salvage_err) if is_transient_io(&salvage_err) => {
+                                Err(salvage_err) if is_environmental_io(&salvage_err) => {
                                     return Err(salvage_err);
                                 }
                                 Err(salvage_err) => {
@@ -3729,7 +3736,7 @@ fn repair_tree(
                     // turning a one-shot read failure into permanent loss.
                     // Propagate the I/O error so a retry re-recovers it,
                     // mirroring the verification / salvage-error paths.
-                    if is_transient_io(&e) {
+                    if is_environmental_io(&e) {
                         return Err(e);
                     }
                     // A tight-space-punched SST that fails whole-file recovery still
@@ -3750,7 +3757,7 @@ fn repair_tree(
                         {
                             Some(b.into())
                         }
-                        Err(read_err) if is_transient_io(&read_err) => return Err(read_err),
+                        Err(read_err) if is_environmental_io(&read_err) => return Err(read_err),
                         Ok(_) | Err(_) => None,
                     };
                     // A PUNCHED source with no trustworthy bound (missing / corrupt
@@ -3868,7 +3875,7 @@ fn repair_tree(
                         // Transient I/O salvage failure: nothing moved, so the
                         // retry re-derives the same salvage from the untouched
                         // source. A structural failure is recorded.
-                        Err(salvage_err) if is_transient_io(&salvage_err) => {
+                        Err(salvage_err) if is_environmental_io(&salvage_err) => {
                             return Err(salvage_err);
                         }
                         Err(salvage_err) => {
@@ -3891,7 +3898,7 @@ fn repair_tree(
                     // permanent loss from a one-shot read failure. Propagate it so
                     // a retry re-recovers the table; only a structural failure is a
                     // genuine unreadable report.
-                    if is_transient_io(&e) {
+                    if is_environmental_io(&e) {
                         return Err(e);
                     }
                     // The rebuilt manifest omits this file, so it is removed once
@@ -4026,7 +4033,7 @@ fn repair_tree(
             // and the rewrite decision.
             let links = match table.list_blob_file_references() {
                 Ok(links) => links,
-                Err(e) if is_transient_io(&e) => return Err(e),
+                Err(e) if is_environmental_io(&e) => return Err(e),
                 Err(e) => {
                     set_aside_table(
                         table,
@@ -4076,7 +4083,7 @@ fn repair_tree(
                 {
                     match handle_below_blob_frontier(&table, &punched_frontiers) {
                         Ok(hit) => needs_rewrite = hit.is_some(),
-                        Err(e) if is_transient_io(&e) => return Err(e),
+                        Err(e) if is_environmental_io(&e) => return Err(e),
                         Err(e) => {
                             set_aside_table(
                                 table,
@@ -4152,7 +4159,7 @@ fn repair_tree(
                 // A retryable failure leaves the source where it was found, so
                 // the retry re-derives the same rewrite from it; nothing to
                 // restore.
-                Err(e) if is_transient_io(&e) => return Err(e),
+                Err(e) if is_environmental_io(&e) => return Err(e),
                 Err(e) => {
                     set_aside_path(
                         &fs,

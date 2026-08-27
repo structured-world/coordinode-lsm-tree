@@ -1430,7 +1430,7 @@ fn repair_with_salvage_propagates_a_transient_verify_io_error() -> crate::Result
     // file (sequential `Read`), and whole-file recovery is lazy on the data
     // section, so neither trips: the first positioned read at this offset is the
     // block-verify DECODE-load, which then surfaces a transient `Io` error.
-    // `Interrupted` is the genuine transient kind (the `is_transient_io`
+    // `Interrupted` is the genuine transient kind (the `is_environmental_io`
     // allowlist): a persistent `Other` would instead grade as corruption and
     // salvage, which is the sibling `is_corruption_routes_a_persistent_io...` case.
     let offset = sole_data_block_offset(&recover_table(sst.clone(), &fs)?);
@@ -4592,12 +4592,13 @@ fn repair_propagates_a_transient_restrict_bound_read() -> crate::Result<()> {
     Ok(())
 }
 
-/// A PERSISTENT `.restrict-bound` sidecar read error (EIO / `PermissionDenied`,
-/// outside the transient allowlist) on a punched SST leaves no trustworthy exact
-/// bound. With resurrection off, repair derives a conservative bound from the
-/// punch geometry and recovers the table restricted, rather than routing it
-/// through the generic salvage path (which would rewrite it unpunched and re-emit
-/// the superseded prefix rows).
+/// A PERSISTENT `.restrict-bound` sidecar read error (`Other` / EIO, outside
+/// the propagation allowlist — an environmental `PermissionDenied` propagates
+/// instead) on a punched SST leaves no trustworthy exact bound. With
+/// resurrection off, repair derives a conservative bound from the punch
+/// geometry and recovers the table restricted, rather than routing it through
+/// the generic salvage path (which would rewrite it unpunched and re-emit the
+/// superseded prefix rows).
 #[test]
 fn repair_restricts_a_punched_sst_on_a_persistent_sidecar_read() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
@@ -4633,11 +4634,11 @@ fn repair_restricts_a_punched_sst_on_a_persistent_sidecar_read() -> crate::Resul
         memfs.punch_hole(&sst, 0, punch)?;
     }
 
-    // Fault the sidecar OPEN with a PERSISTENT kind (not in the retry allowlist).
+    // Fault the sidecar OPEN with a PERSISTENT kind (not in the propagation
+    // allowlist — `Other` is where a raw EIO lands).
     let fault = FaultFs::new(memfs.as_ref().clone());
     fault.injector().arm(
-        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::PermissionDenied))
-            .on_path("restrict-bound"),
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other)).on_path("restrict-bound"),
     );
 
     let report = Config::new(
@@ -10127,6 +10128,54 @@ fn repair_propagates_a_transient_manifest_probe_failure() -> crate::Result<()> {
         manifest_names, after,
         "a rebuild would have written a fresh manifest generation",
     );
+    Ok(())
+}
+
+/// A `PermissionDenied` open is an ENVIRONMENTAL failure, not corruption: the
+/// bytes on disk are intact and an operator fixes the ACL / ownership. It
+/// must abort the repair for a retry — grading the healthy file unreadable
+/// commits a manifest that excludes it and then removes it, turning a
+/// recoverable configuration mistake into permanent data loss.
+#[test]
+fn repair_propagates_a_permission_denied_open() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    standard_tree_without_manifest(&memfs, &root)?;
+
+    // An ACL mistake on the SST: every open of it fails with EACCES.
+    let fault = FaultFs::new((*memfs).clone());
+    let injector = fault.injector();
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path(root.join("tables").join("0").to_string_lossy()),
+    );
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair();
+    assert!(
+        matches!(result, Err(crate::Error::Io(ref e)) if e.kind() == ErrorKind::PermissionDenied),
+        "an access failure must abort the repair, never grade the file: {:?}",
+        result.map(|r| (r.recovered, r.unreadable)),
+    );
+
+    // The operator fixes the ACL; the retry recovers the intact file.
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .repair()?;
+    assert_eq!(report.recovered, 1, "the intact table survives the mistake");
     Ok(())
 }
 
