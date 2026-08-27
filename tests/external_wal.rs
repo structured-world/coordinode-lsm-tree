@@ -1023,6 +1023,16 @@ fn reconcile_after_repair(
         let point_superseded = |key: &[u8], seqno: u64| {
             superseded_floor.get(key).is_some_and(|&v| seqno < v) || rt_covered(key, seqno)
         };
+        // A WEAK delete bypasses the point floor: a newer surviving value
+        // floors the puts below it, but it does not "incorporate" a weak
+        // delete — they coexist physically, and once that value is itself
+        // annihilated, the tree would expose the put the lost weak delete
+        // had consumed at the source. Only the bottommost-ZEROED floor
+        // (`u64::MAX`, embodying the whole folded history — weak deletes
+        // included) suppresses the replay.
+        let weak_superseded = |key: &[u8], seqno: u64| {
+            superseded_floor.get(key).is_some_and(|&v| v == u64::MAX) || rt_covered(key, seqno)
+        };
 
         for record in records
             .iter()
@@ -1043,9 +1053,12 @@ fn reconcile_after_repair(
                         None => apply(tree, record)?,
                     }
                 }
-                WalOp::Insert { key, .. } | WalOp::Remove { key } | WalOp::RemoveWeak { key }
-                    if zone.covers_key(key) =>
-                {
+                WalOp::RemoveWeak { key } if zone.covers_key(key) => {
+                    if !weak_superseded(key, record.seqno) {
+                        apply(tree, record)?;
+                    }
+                }
+                WalOp::Insert { key, .. } | WalOp::Remove { key } if zone.covers_key(key) => {
                     // Blind replay is idempotent against REAL surviving
                     // versions, but a record STRICTLY below the superseded
                     // floor is already incorporated (a bottommost-zeroed
@@ -1085,7 +1098,7 @@ fn reconcile_after_repair(
                                 tree.remove(key.as_slice(), record.seqno);
                             }
                             BatchEntry::RemoveWeak { key }
-                                if zone.covers_key(key) && !point_superseded(key, record.seqno) =>
+                                if zone.covers_key(key) && !weak_superseded(key, record.seqno) =>
                             {
                                 tree.remove_weak(key.as_slice(), record.seqno);
                             }
@@ -1531,6 +1544,117 @@ fn reconciled_replay_restores_the_put_a_surviving_weak_delete_pairs_with() -> ls
         snapshot(&tree),
         reference,
         "the reconciled tree mirrors the healthy tree's visible state",
+    );
+    Ok(())
+}
+
+/// A LOST weak (single-delete) tombstone must replay even when a NEWER
+/// surviving point value floors the key: the floor proves that value
+/// incorporated older history, but a weak delete is not "incorporated" by a
+/// newer value — they coexist physically, and once that newer value is
+/// itself annihilated by a later weak delete, the tree exposes the put the
+/// lost weak tombstone had consumed at the source. Only the
+/// bottommost-ZEROED floor (which embodies the whole folded history,
+/// including any weak deletes) may suppress a weak replay.
+#[test]
+fn reconciled_replay_restores_a_weak_delete_under_a_newer_survivor() -> lsm_tree::Result<()> {
+    // Seqnos start at 1, per the section 4 GC-coordination rule.
+    let records = vec![
+        WalRecord {
+            seqno: 1,
+            op: WalOp::Insert {
+                key: b"w".to_vec(),
+                value: b"old".to_vec(),
+            },
+        },
+        // --- flush: SST 0 (survives) holds the put the LOST weak delete consumed
+        WalRecord {
+            seqno: 2,
+            op: WalOp::RemoveWeak { key: b"w".to_vec() },
+        },
+        // --- flush: SST 1 (damaged below) holds the weak delete
+        WalRecord {
+            seqno: 3,
+            op: WalOp::Insert {
+                key: b"w".to_vec(),
+                value: b"mid".to_vec(),
+            },
+        },
+        // --- flush: SST 2 (survives) — the newer value that floors the key
+        WalRecord {
+            seqno: 4,
+            op: WalOp::RemoveWeak { key: b"w".to_vec() },
+        },
+        // --- flush: SST 3 (survives) — annihilates the newer value later
+    ];
+
+    // Reference: the same workload on a healthy tree.
+    let reference_dir = tempfile::tempdir().expect("tempdir");
+    {
+        let tree = open_tree(reference_dir.path());
+        for record in &records {
+            apply(&tree, record)?;
+            tree.flush_active_memtable(0)?;
+        }
+        assert_eq!(
+            tree.get(b"w", 3)?,
+            None,
+            "self-check: below the newer value the weak delete hides the put",
+        );
+    }
+
+    let crash_dir = tempfile::tempdir().expect("tempdir");
+    let wal_path = crash_dir.path().join("wal.log");
+    let mut wal = ReferenceWal::create(&wal_path).expect("create wal");
+    {
+        let tree = open_tree(crash_dir.path());
+        for record in &records {
+            wal.append(record).expect("wal append");
+            apply(&tree, record)?;
+            tree.flush_active_memtable(0)?;
+        }
+    }
+    // Damage the SECOND SST's leading data block: the weak delete is lost.
+    let sst = crash_dir.path().join("tables").join("1");
+    let mut bytes = std::fs::read(&sst).expect("read sst");
+    for b in bytes.get_mut(8..24).expect("sst larger than 24 bytes") {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&sst, &bytes).expect("write corruption");
+    for entry in std::fs::read_dir(crash_dir.path()).expect("read dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_version = name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || name == "current" {
+            std::fs::remove_file(entry.path()).expect("remove manifest file");
+        }
+    }
+
+    let (tree, repaired) = Config::new(
+        crash_dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(CounterMerge)))
+    .open_or_repair(lsm_tree::RepairPolicy::default())?;
+    let report = repaired.expect("the damaged store opens only after a repair");
+    assert!(
+        !report.lost_coverage.is_empty(),
+        "the excluded SST's coverage must be reported: {report:?}",
+    );
+
+    reconcile_after_repair(&tree, &wal, &report, 4)?;
+
+    assert_eq!(
+        tree.get(b"w", 3)?,
+        None,
+        "the lost weak delete must replay past the newer value's floor — \
+         without it a snapshot below that value exposes the put the source's \
+         weak delete had consumed (and a later compaction makes that \
+         permanent once the newer value is annihilated)",
     );
     Ok(())
 }

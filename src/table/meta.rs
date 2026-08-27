@@ -191,6 +191,13 @@ pub struct ParsedMeta {
     /// merge operands twice on read. `None` — a flush / ingest table, or one
     /// written before the key existed.
     pub lineage: Option<Vec<TableId>>,
+
+    /// The PREVIOUS output of the same compaction run, from the optional
+    /// `lineage_prev` property (`None` for a run's first output, or a table
+    /// without lineage). Proves ADJACENCY: repair may only union sibling
+    /// output ranges whose chain is unbroken — a gap could hide a lost
+    /// sibling whose span the union does not actually cover.
+    pub lineage_prev: Option<TableId>,
 }
 
 macro_rules! read_u8 {
@@ -590,6 +597,7 @@ impl ParsedMeta {
             }
             None => None,
         };
+        let lineage_prev = read_opt_u64(b"lineage_prev")?;
 
         Ok(Self {
             id,
@@ -622,6 +630,7 @@ impl ParsedMeta {
             bulk_ingested,
             recency,
             lineage,
+            lineage_prev,
         })
     }
 }

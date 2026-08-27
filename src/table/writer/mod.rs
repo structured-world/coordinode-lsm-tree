@@ -318,6 +318,13 @@ pub struct Writer {
     /// Persisted as `lineage` (consecutive little-endian ids).
     lineage: Option<Vec<TableId>>,
 
+    /// The PREVIOUS output of the same compaction run (`None` for the run's
+    /// first output). Persisted as `lineage_prev`, it proves ADJACENCY:
+    /// manifest repair may only union sibling output ranges whose chain is
+    /// unbroken — a gap could hide a LOST sibling whose span the union does
+    /// not actually cover. Written only alongside `lineage`.
+    lineage_prev: Option<TableId>,
+
     /// Pre-trained zstd dictionary for dictionary compression
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
@@ -465,6 +472,7 @@ impl Writer {
             bulk_ingested: Some(false),
             recency: None,
             lineage: None,
+            lineage_prev: None,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -796,6 +804,7 @@ impl Writer {
             // derived output for the manifest-repair lineage dedup.
             .use_recency(meta.recency)
             .use_lineage(meta.lineage.clone())
+            .use_lineage_prev(meta.lineage_prev)
             .use_zone_map(has_zone_map)
             // A source with a seqno_bounds section keeps its seqno-scoped
             // block-skip: the writer re-derives the per-block ranges from
@@ -958,12 +967,22 @@ impl Writer {
         self
     }
 
+    /// Sets the previous-output link (see [`Self::lineage_prev`]).
+    #[must_use]
+    pub(crate) fn use_lineage_prev(mut self, prev: Option<TableId>) -> Self {
+        self.assert_not_started("use_lineage_prev");
+        self.lineage_prev = prev;
+        self
+    }
+
     /// Drops the pending lineage (callable mid-write, unlike the builder):
     /// a compaction FILTER transformed at least one record of THIS output, so
     /// it is no longer derivable from its inputs and must never be traded
-    /// back for them by the manifest-repair dedup.
+    /// back for them by the manifest-repair dedup. The adjacency link goes
+    /// with it — it only qualifies the lineage.
     pub(crate) fn strip_lineage(&mut self) {
         self.lineage = None;
+        self.lineage_prev = None;
     }
 
     /// Wires the resolved per-level retrieval-ribbon locator policy entry.
@@ -2420,6 +2439,7 @@ impl Writer {
             bulk_ingested: self.bulk_ingested,
             recency: self.recency,
             lineage: self.lineage.clone(),
+            lineage_prev: self.lineage_prev,
             range_tombstone_count,
             // Record the count that corresponds to the delete_bitmap section
             // ACTUALLY written above, via the single `writes_delete_bitmap`
@@ -2675,6 +2695,9 @@ struct MetaSectionParams<'a> {
     /// Compaction lineage: `Some(_)` writes `lineage` (the sorted input ids a
     /// compaction output merges), `None` omits it.
     lineage: Option<Vec<TableId>>,
+    /// Previous output of the same run: `Some(_)` writes `lineage_prev` (only
+    /// alongside `lineage`), proving adjacency for the sibling-union rule.
+    lineage_prev: Option<TableId>,
     range_tombstone_count: u64,
     /// Number of positions in this table's delete bitmap. Recorded so a reader
     /// can AUTHENTICATE the bitmap's presence: the section itself is optional
@@ -2932,6 +2955,11 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
             bytes.extend_from_slice(&id.to_le_bytes());
         }
         meta_items.push(meta("lineage", &bytes));
+        // Adjacency proof for the sibling-union rule: repair may only union
+        // output ranges whose previous-output chain is unbroken.
+        if let Some(prev) = p.lineage_prev {
+            meta_items.push(meta("lineage_prev", &prev.to_le_bytes()));
+        }
     }
 
     // Test-only legacy simulation: drop the bitmap-content hash so the file

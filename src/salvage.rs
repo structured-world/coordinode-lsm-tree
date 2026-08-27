@@ -966,6 +966,7 @@ fn salvage_attempt(
     // The source's compaction lineage travels with the copy for the same
     // reason: the content is the same derived output.
     .use_lineage(table.metadata.lineage.clone())
+    .use_lineage_prev(table.metadata.lineage_prev)
     .use_sync_mode(options.sync_mode)
     // The extractor is configuration (never persisted in the SST), so
     // the rebuilt filter only carries the source's prefix hashes when

@@ -486,6 +486,108 @@ fn tight_space_crash_and_reopen(
     .open()
 }
 
+/// The post-commit sidecar-write window under MANIFEST LOSS: a committed
+/// slice whose `.restrict-bound` write failed leaves an UNPUNCHED input
+/// beside its slice outputs (the punch never arms without the sidecar).
+/// A manifest-loss repair then faces both histories — and resolves them
+/// through the outputs' recorded lineage: the input is the complete history,
+/// so the derived slice outputs are excluded and no merge operand can be
+/// applied twice. This is what makes the sidecar failure tolerable beyond
+/// the normal-open republish path.
+#[test]
+fn manifest_loss_in_the_unwritten_sidecar_window_resolves_to_one_history() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs};
+    use crate::io::ErrorKind;
+    use core::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    // Every sidecar write is refused, so no slice can arm its punch.
+    let fault = FaultFs::new(mem.clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path(".restrict-bound"),
+    );
+
+    let config = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_fs(fault);
+    let failpoint = config.fail_tight_after_first_slice.clone();
+    let tree = match config.open()? {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    for i in 0..TIGHT_SPACE_KEYS {
+        tree.insert(tight_space_key(i).as_bytes(), vec![0xCDu8; 64], i);
+    }
+    tree.flush_active_memtable(0)?;
+    let used = tree.storage_stats()?.used_bytes;
+    mem.set_capacity(used + used / 4);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = true;
+    })?;
+
+    failpoint.store(true, Ordering::SeqCst);
+    assert!(
+        tree.major_compact(64 * 1024 * 1024, 0).is_err(),
+        "the crash failpoint must abort the tight-space compaction",
+    );
+    assert_eq!(
+        mem.punched_bytes(),
+        0,
+        "with the sidecar write refused, no punch may arm",
+    );
+    drop(tree);
+
+    // Manifest loss inside the window.
+    for e in mem.read_dir(dir.path())? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            mem.remove_file(&e.path)?;
+        }
+    }
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(mem.clone()))
+    .repair()?;
+    assert!(
+        report
+            .unreadable_files
+            .iter()
+            .any(|(_, reason)| reason.contains("derived output")),
+        "the slice outputs must be excluded as derived — publishing both \
+         histories would double-apply merge operands: {report:?}",
+    );
+
+    let reopened = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(mem))
+    .open()?;
+    for i in 0..TIGHT_SPACE_KEYS {
+        assert!(
+            reopened
+                .get(tight_space_key(i).as_bytes(), crate::MAX_SEQNO)?
+                .is_some(),
+            "key {i} lost across the sidecar window + manifest loss",
+        );
+    }
+    Ok(())
+}
+
 /// A legitimately RESTRICTED table (a tight-space compaction crashed after
 /// punching its first slice, so its `[0, punch)` data-block prefix reads as
 /// zeros) must pass every heal-reconcile security gate AND the whole-file

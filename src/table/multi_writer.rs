@@ -150,6 +150,10 @@ pub struct MultiWriter {
     /// judged by the verdicts of its own window alone.
     transforms_at_output_start: u64,
 
+    /// The id of the writer CURRENTLY receiving records, so rotation can
+    /// stamp the successor's `lineage_prev` adjacency link.
+    current_writer_id: TableId,
+
     /// The marker's value observed AFTER the last record actually written.
     /// Rotation happens BEFORE the triggering record is inserted, so at that
     /// moment the live counter already includes verdicts belonging to the NEW
@@ -256,6 +260,7 @@ impl MultiWriter {
             transform_marker: None,
             transforms_at_output_start: 0,
             transforms_after_last_write: 0,
+            current_writer_id: current_table_id,
             delete_strategy: crate::config::DeleteStrategy::default(),
             disable_cow_on_sst: false,
             locator_entry: crate::config::LocatorPolicyEntry::None,
@@ -756,6 +761,10 @@ impl MultiWriter {
         new_writer = new_writer.use_bulk_ingested(Some(self.bulk_ingested));
         new_writer = new_writer.use_recency(Some(self.recency.unwrap_or(new_table_id)));
         new_writer = new_writer.use_lineage(self.lineage.clone());
+        // The adjacency link: this successor follows the writer being closed,
+        // which is what lets manifest repair union UNBROKEN sibling chains.
+        new_writer = new_writer.use_lineage_prev(Some(self.current_writer_id));
+        self.current_writer_id = new_table_id;
         new_writer = new_writer.delete_strategy(self.delete_strategy);
         new_writer = new_writer.use_disable_cow(self.disable_cow_on_sst);
         new_writer = new_writer.use_locator(self.locator_entry);

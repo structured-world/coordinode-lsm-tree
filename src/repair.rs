@@ -691,9 +691,26 @@ fn same_physical_file(
 ) -> crate::Result<bool> {
     match (fs_a.backend_id(), fs_b.backend_id()) {
         (Some(id_a), Some(id_b)) if id_a == id_b => {}
-        // Different backends, or a backend that gives no namespace guarantee:
-        // path spellings are not comparable, so never alias them.
-        _ => return Ok(false),
+        // Two backends that each CLAIM an identity and disagree are provably
+        // distinct namespaces: path spellings are not comparable.
+        (Some(_), Some(_)) => return Ok(false),
+        // A backend WITHOUT an identity claim (a custom `Fs` keeping the
+        // default `None`): the SAME instance is trivially one namespace, so
+        // its own probe below decides. Two DIFFERENT instances cannot be
+        // proven distinct — and `false` here AUTHORIZES deleting what may be
+        // an alias of the kept file — so the verdict is inconclusive and the
+        // repair aborts for the operator to sort out.
+        _ => {
+            if !core::ptr::addr_eq(
+                core::ptr::from_ref::<dyn crate::fs::Fs>(fs_a),
+                core::ptr::from_ref::<dyn crate::fs::Fs>(fs_b),
+            ) {
+                return Err(crate::Error::Io(crate::io::Error::new(
+                    crate::io::ErrorKind::InvalidInput,
+                    "alias identity is inconclusive: the backend reports no namespace id",
+                )));
+            }
+        }
     }
     // Alias resolution belongs to the BACKEND, not the host: canonicalizing a
     // virtual backend's paths through the host filesystem would let a host
@@ -2111,6 +2128,13 @@ struct BlobRecovery {
 fn recover_blob_files(
     config: &Config,
     published: &mut PublishedBlobReplacements<'_>,
+    // Blob ids the recovered tables reference (a conservative SUPERSET: taken
+    // before the blob-dependency filtering, so a table dropped later only
+    // leaves an extra id here). An INVALID blob outside this set is left for
+    // the post-commit sweep instead of being salvaged: the replacement would
+    // be filtered out and deleted anyway, and under tight disk space the
+    // pointless salvage can abort the whole repair with `StorageFull`.
+    referenced: &crate::HashSet<crate::vlog::BlobFileId>,
 ) -> crate::Result<BlobRecovery> {
     let blobs_folder = config.path.join(crate::file::BLOBS_FOLDER);
     let mut blob_files: Vec<crate::vlog::BlobFile> = Vec::new();
@@ -2383,6 +2407,24 @@ fn recover_blob_files(
         // crashed attempt leave SSTs referencing a blob id that no longer
         // exists, and the retry would record those tables unrecoverable.
         let Some(live) = validate_blob_frames(config, &blob_path, blob_id, frontier)? else {
+            // An INVALID blob no recovered table references never reaches the
+            // manifest: salvaging it would allocate a fresh id and burn disk
+            // space on a replacement the reference filter deletes anyway —
+            // and under tight space that pointless salvage can abort the
+            // whole repair with `StorageFull`. Leave it for the post-commit
+            // sweep instead; nothing reachable is lost.
+            if !referenced.contains(&blob_id) {
+                log::debug!(
+                    "blob file {blob_id} is invalid and referenced by no recovered \
+                     table; skipping its salvage and leaving it for the post-commit \
+                     sweep"
+                );
+                discard.push((
+                    blob_path,
+                    "invalid and referenced by no recovered table; salvage skipped".to_string(),
+                ));
+                continue;
+            }
             let Some(new_id) = next_blob_id else {
                 log::error!(
                     "blob file {blob_id} needs salvaging but the blob id space is \
@@ -4107,7 +4149,21 @@ fn repair_tree(
         if let Some(p) = &config.recovery_progress {
             p.set_phase(crate::RecoveryPhase::RecoveringBlobFiles);
         }
-        let recovery = recover_blob_files(config, &mut published_blob_replacements)?;
+        // The candidate reference set, taken from the tables recovered so far
+        // (a conservative superset of the post-filter truth): lets the blob
+        // scan skip salvaging invalid files nothing can reach.
+        let mut referenced_blob_ids: crate::HashSet<crate::vlog::BlobFileId> =
+            crate::HashSet::default();
+        for (table, ..) in &recovered_tables {
+            for link in table.list_blob_file_references()?.into_iter().flatten() {
+                referenced_blob_ids.insert(link.blob_file_id);
+            }
+        }
+        let recovery = recover_blob_files(
+            config,
+            &mut published_blob_replacements,
+            &referenced_blob_ids,
+        )?;
         unreadable_files.extend(recovery.unreadable);
         blob_rewrites = recovery.rewrites;
         blob_frag = recovery.frag;
@@ -4478,6 +4534,90 @@ fn repair_tree(
             }
         }
     }
+    // Sibling-UNION supersession: the outputs of one rotated run record the
+    // same lineage plus an adjacency link (`lineage_prev`), so an UNBROKEN
+    // surviving chain of COMPLETE outputs proves its combined range has no
+    // gap a lost sibling could hide — an input inside that union is fully
+    // redundant even when no single output contains it. A broken chain
+    // (a predecessor that did not survive) proves nothing and unions
+    // nothing.
+    {
+        let mut by_id: crate::HashMap<TableId, usize> = crate::HashMap::default();
+        let mut surviving_ranges: crate::HashMap<TableId, (UserKey, UserKey)> =
+            crate::HashMap::default();
+        for (idx, (t, fidelity, ..)) in recovered_tables.iter().enumerate() {
+            surviving_ranges.insert(
+                t.id(),
+                (
+                    t.metadata.key_range.min().clone(),
+                    t.metadata.key_range.max().clone(),
+                ),
+            );
+            if fidelity.is_complete() && t.metadata.lineage.is_some() {
+                by_id.insert(t.id(), idx);
+            }
+        }
+        let same_lineage = |a: usize, b: usize| {
+            recovered_tables.get(a).map(|(t, ..)| &t.metadata.lineage)
+                == recovered_tables.get(b).map(|(t, ..)| &t.metadata.lineage)
+        };
+        let mut next_of: crate::HashMap<TableId, TableId> = crate::HashMap::default();
+        for &idx in by_id.values() {
+            let Some((t, ..)) = recovered_tables.get(idx) else {
+                continue;
+            };
+            if let Some(prev) = t.metadata.lineage_prev
+                && by_id.get(&prev).is_some_and(|&p| same_lineage(p, idx))
+            {
+                next_of.insert(prev, t.id());
+            }
+        }
+        let cmp = config.comparator.as_ref();
+        for (&head_id, &head_idx) in &by_id {
+            let Some((head, ..)) = recovered_tables.get(head_idx) else {
+                continue;
+            };
+            // A chain HEAD: its predecessor is absent from the surviving set
+            // (or it is the run's first output).
+            if head
+                .metadata
+                .lineage_prev
+                .is_some_and(|prev| by_id.contains_key(&prev))
+            {
+                continue;
+            }
+            // Walk the unbroken chain; ranges follow the run's key order, so
+            // the union is [head.min, tail.max].
+            let union_min = head.metadata.key_range.min().clone();
+            let mut union_max = head.metadata.key_range.max().clone();
+            let mut cursor = head_id;
+            while let Some(&next) = next_of.get(&cursor) {
+                if let Some(&next_idx) = by_id.get(&next)
+                    && let Some((t, ..)) = recovered_tables.get(next_idx)
+                {
+                    union_max = t.metadata.key_range.max().clone();
+                }
+                cursor = next;
+            }
+            let Some(inputs) = &head.metadata.lineage else {
+                continue;
+            };
+            for input in inputs {
+                if by_id.contains_key(input) {
+                    continue;
+                }
+                let Some((in_min, in_max)) = surviving_ranges.get(input) else {
+                    continue;
+                };
+                if cmp.compare(&union_min, in_min) != core::cmp::Ordering::Greater
+                    && cmp.compare(in_max, &union_max) != core::cmp::Ordering::Greater
+                {
+                    inputs_superseded.insert(*input);
+                }
+            }
+        }
+    }
+
     // Second pass: drop the inputs a surviving COMPLETE output fully covers.
     // Their residual-coverage entries (recorded against a DIFFERENT,
     // partially-covering output before the covering one was seen) go with

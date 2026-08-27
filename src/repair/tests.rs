@@ -3295,8 +3295,8 @@ fn a_read_into_a_punched_extent_reports_it_as_excised() -> crate::Result<()> {
 /// through the host filesystem would call them aliases and skip removing
 /// the loser, leaving a same-id leftover that a later reopen can resolve
 /// against the kept copy's manifest checksum. The alias test must therefore
-/// compare backend identity too, and treat "no shared-namespace guarantee"
-/// (`backend_id() == None`) as distinct.
+/// compare backend identity too: two backends that each CLAIM an identity
+/// and disagree are provably distinct namespaces.
 #[test]
 fn same_physical_file_requires_a_shared_namespace() -> crate::Result<()> {
     use crate::fs::{Fs, MemFs, StdFs};
@@ -3328,6 +3328,174 @@ fn same_physical_file_requires_a_shared_namespace() -> crate::Result<()> {
     assert!(
         super::same_physical_file(&*stdfs, &real, &*stdfs, &real)?,
         "the same host path through one namespace IS an alias",
+    );
+    Ok(())
+}
+
+/// An INVALID blob file no recovered table references is left for the
+/// post-commit sweep without a salvage attempt: the replacement would be
+/// filtered out and deleted anyway, and under tight disk space the
+/// pointless salvage can abort the whole repair with `StorageFull` — while
+/// omitting the unreachable original yields a healthy tree.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_skips_salvaging_an_unreferenced_invalid_blob() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        for i in 0..4u32 {
+            tree.insert(format!("k{i:04}").as_bytes(), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    // An ORPHAN blob (id 9, referenced by nothing) with a corrupt last
+    // frame — the shape an interrupted compaction leaves behind.
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let orphan = blobs.join("9");
+    {
+        let mut w = crate::vlog::blob_file::writer::Writer::new(orphan.clone(), 9, 0, &*fs_dyn)?;
+        w.write(b"o1", 1, &[b'x'; 300])?;
+        w.write(b"o2", 2, &[b'y'; 300])?;
+        w.write(b"o3", 3, &[b'z'; 300])?;
+        w.finish()?;
+        let last = crate::vlog::BlobFileScanner::new(&orphan, &*fs_dyn, 0)?
+            .collect::<crate::Result<Vec<_>>>()?
+            .last()
+            .expect("a last frame")
+            .frame_end;
+        let mut f = memfs.open(
+            &orphan,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        let byte = crate::file::read_exact(&*f, last - 8, 1)?;
+        f.seek(SeekFrom::Start(last - 8))?;
+        f.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
+    }
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    // Any WRITE into a salvage temp proves a salvage was attempted — and
+    // stands in for the tight-space abort it can cause.
+    let fault = FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::StorageFull))
+            .on_path(".salvage-tmp"),
+    );
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "the healthy tree is recovered; the unreachable orphan is neither \
+         salvaged nor fatal: {report:?}",
+    );
+    Ok(())
+}
+
+/// A backend WITHOUT an identity claim (`backend_id() == None`, the trait
+/// default a custom `Fs` may keep): the SAME instance is one namespace and
+/// its own alias probe decides, while two DIFFERENT such instances cannot be
+/// proven distinct — and "distinct" authorizes deleting what may be an alias
+/// of the kept file — so the verdict is inconclusive and aborts the repair.
+#[test]
+fn same_physical_file_fails_closed_without_a_backend_identity() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+
+    /// A custom backend keeping the trait's default `backend_id` (`None`)
+    /// but answering alias probes: two spellings alias iff their file names
+    /// match case-insensitively.
+    struct NoIdentityFs(MemFs);
+    impl Fs for NoIdentityFs {
+        fn open(
+            &self,
+            path: &std::path::Path,
+            options: &crate::fs::FsOpenOptions,
+        ) -> crate::io::Result<Box<dyn crate::fs::FsFile>> {
+            self.0.open(path, options)
+        }
+        fn remove_file(&self, path: &std::path::Path) -> crate::io::Result<()> {
+            self.0.remove_file(path)
+        }
+        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> crate::io::Result<()> {
+            self.0.rename(from, to)
+        }
+        fn create_dir_all(&self, path: &std::path::Path) -> crate::io::Result<()> {
+            self.0.create_dir_all(path)
+        }
+        fn remove_dir_all(&self, path: &std::path::Path) -> crate::io::Result<()> {
+            self.0.remove_dir_all(path)
+        }
+        fn sync_directory(&self, path: &std::path::Path) -> crate::io::Result<()> {
+            self.0.sync_directory(path)
+        }
+        fn read_dir(
+            &self,
+            path: &std::path::Path,
+        ) -> crate::io::Result<Vec<crate::fs::FsDirEntry>> {
+            self.0.read_dir(path)
+        }
+        fn metadata(&self, path: &std::path::Path) -> crate::io::Result<crate::fs::FsMetadata> {
+            self.0.metadata(path)
+        }
+        fn exists(&self, path: &std::path::Path) -> crate::io::Result<bool> {
+            self.0.exists(path)
+        }
+        fn same_file(&self, a: &std::path::Path, b: &std::path::Path) -> crate::io::Result<bool> {
+            Ok(a.to_string_lossy()
+                .eq_ignore_ascii_case(&b.to_string_lossy()))
+        }
+    }
+
+    let fs_one = NoIdentityFs(MemFs::new());
+    let a = std::path::Path::new("/db/tables/AA");
+    let b = std::path::Path::new("/db/tables/aa");
+
+    // The SAME instance is one namespace: its own probe decides.
+    assert!(
+        super::same_physical_file(&fs_one, a, &fs_one, b)?,
+        "one identity-less instance must still get to answer its own probe",
+    );
+
+    // Two DIFFERENT identity-less instances: inconclusive, never "distinct".
+    let fs_two = NoIdentityFs(MemFs::new());
+    assert!(
+        super::same_physical_file(&fs_one, a, &fs_two, b).is_err(),
+        "an unprovable identity must abort, not authorize a deletion",
     );
     Ok(())
 }
@@ -6831,7 +6999,7 @@ fn blob_recovery_discards_a_file_whose_metadata_id_disagrees() -> crate::Result<
 
     let config = blob_validation_config(Arc::clone(&memfs));
     let mut published = super::PublishedBlobReplacements::new(&config);
-    let recovery = super::recover_blob_files(&config, &mut published)?;
+    let recovery = super::recover_blob_files(&config, &mut published, &(0..10).collect())?;
     published.disarm();
     assert!(
         recovery.files.is_empty(),
@@ -7259,7 +7427,7 @@ fn blob_recovery_derives_the_frontier_of_a_punched_blob_file() -> crate::Result<
     .with_shared_fs(memfs);
 
     let mut published = super::PublishedBlobReplacements::new(&config);
-    let recovery = super::recover_blob_files(&config, &mut published)?;
+    let recovery = super::recover_blob_files(&config, &mut published, &(0..10).collect())?;
     published.disarm();
     let (files, unreadable) = (recovery.files, recovery.unreadable);
     assert!(
@@ -7767,7 +7935,7 @@ fn blob_recovery_queues_the_drop_of_a_fully_punched_blob_file() -> crate::Result
 
     let config = blob_validation_config(Arc::clone(&memfs));
     let mut published = super::PublishedBlobReplacements::new(&config);
-    let recovery = super::recover_blob_files(&config, &mut published)?;
+    let recovery = super::recover_blob_files(&config, &mut published, &(0..10).collect())?;
     published.disarm();
     assert!(
         recovery.unreadable.is_empty(),
@@ -8562,7 +8730,7 @@ fn blob_recovery_keeps_a_file_whose_zeroed_tail_follows_live_frames() -> crate::
 
     let config = blob_validation_config(Arc::clone(&memfs));
     let mut replacements_guard = super::PublishedBlobReplacements::new(&config);
-    let recovery = super::recover_blob_files(&config, &mut replacements_guard)?;
+    let recovery = super::recover_blob_files(&config, &mut replacements_guard, &(0..10).collect())?;
     replacements_guard.disarm();
     assert!(
         memfs.exists(&path)?,
@@ -9029,6 +9197,138 @@ fn repair_supersedes_an_input_a_partial_output_fully_covers() -> crate::Result<(
         report.lost_coverage.is_empty(),
         "a superseded input lost nothing — its content lives in the output: \
          {report:?}",
+    );
+    Ok(())
+}
+
+/// SIBLING outputs of one run supersede an input their UNION covers: a
+/// rotated compaction records the same lineage in every output plus an
+/// adjacency link to its predecessor, so an unbroken surviving chain proves
+/// the union has no gap a lost sibling could hide — and an input inside it
+/// is fully redundant even when no single output contains it.
+#[test]
+fn repair_supersedes_an_input_covered_by_an_unbroken_sibling_union() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    // Input 0 spans [a, z]; input 1 is LOST. The run rotated into outputs
+    // 2 [a, m] and 3 [n, z], chained 2 -> 3.
+    {
+        let mut w = Writer::new(tables.join("0"), 0, 0, Arc::clone(&fs))?;
+        for key in [b"a".as_slice(), b"z".as_slice()] {
+            w.write(InternalValue::from_components(
+                key.to_vec(),
+                b"v".to_vec(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the input is non-empty");
+    }
+    for (id, keys, prev) in [
+        (2u64, [b"a".as_slice(), b"m".as_slice()], None),
+        (3u64, [b"n".as_slice(), b"z".as_slice()], Some(2)),
+    ] {
+        let mut w = Writer::new(tables.join(id.to_string()), id, 0, Arc::clone(&fs))?
+            .use_recency(Some(1))
+            .use_lineage(Some(vec![0, 1]))
+            .use_lineage_prev(prev);
+        for key in keys {
+            w.write(InternalValue::from_components(
+                key.to_vec(),
+                b"w".to_vec(),
+                2,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the output is non-empty");
+    }
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+    assert_eq!(
+        report.recovered, 2,
+        "the unbroken sibling union covers the input, which is superseded: \
+         {report:?}",
+    );
+    assert!(
+        report.lost_coverage.is_empty(),
+        "a superseded input lost nothing: {report:?}",
+    );
+    Ok(())
+}
+
+/// A BROKEN chain must not union: output 4's predecessor (3) is lost, so the
+/// gap between the surviving outputs may hide the lost sibling's span — the
+/// input cannot be proven redundant and is kept, with the overlaps reported.
+#[test]
+fn repair_keeps_an_input_when_the_sibling_chain_is_broken() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    // Input 0 spans [a, z]; outputs 2 [a, h] and 4 [n, z] survive, but 4's
+    // predecessor (output 3, spanning the middle) is LOST.
+    {
+        let mut w = Writer::new(tables.join("0"), 0, 0, Arc::clone(&fs))?;
+        for key in [b"a".as_slice(), b"z".as_slice()] {
+            w.write(InternalValue::from_components(
+                key.to_vec(),
+                b"v".to_vec(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the input is non-empty");
+    }
+    for (id, keys, prev) in [
+        (2u64, [b"a".as_slice(), b"h".as_slice()], None),
+        (4u64, [b"n".as_slice(), b"z".as_slice()], Some(3)),
+    ] {
+        let mut w = Writer::new(tables.join(id.to_string()), id, 0, Arc::clone(&fs))?
+            .use_recency(Some(1))
+            .use_lineage(Some(vec![0, 1]))
+            .use_lineage_prev(prev);
+        for key in keys {
+            w.write(InternalValue::from_components(
+                key.to_vec(),
+                b"w".to_vec(),
+                2,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the output is non-empty");
+    }
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+    assert_eq!(
+        report.recovered, 3,
+        "a broken chain proves nothing; the input holds the gap's only \
+         complete copy and is kept: {report:?}",
+    );
+    assert!(
+        !report.lost_coverage.is_empty(),
+        "the residual overlaps must be reported: {report:?}",
     );
     Ok(())
 }
@@ -10621,7 +10921,7 @@ fn blob_recovery_discards_a_persistently_unreadable_blob_file() -> crate::Result
     .with_shared_fs(memfs.clone());
 
     let mut published = super::PublishedBlobReplacements::new(&config);
-    let recovery = super::recover_blob_files(&config, &mut published)?;
+    let recovery = super::recover_blob_files(&config, &mut published, &(0..10).collect())?;
     published.disarm();
     let (files, unreadable, discard) = (recovery.files, recovery.unreadable, recovery.discard);
     assert!(files.is_empty(), "nothing recoverable");
@@ -10672,7 +10972,7 @@ fn blob_recovery_discards_a_duplicate_blob_id() -> crate::Result<()> {
     .with_shared_fs(memfs.clone());
 
     let mut published = super::PublishedBlobReplacements::new(&config);
-    let recovery = super::recover_blob_files(&config, &mut published)?;
+    let recovery = super::recover_blob_files(&config, &mut published, &(0..10).collect())?;
     published.disarm();
     let (files, unreadable, discard) = (recovery.files, recovery.unreadable, recovery.discard);
     assert_eq!(files.len(), 1, "one blob file per id");
@@ -10753,8 +11053,11 @@ fn blob_recovery_propagates_a_transient_checksum_failure() -> crate::Result<()> 
     )
     .with_fs(fault);
 
-    let result =
-        super::recover_blob_files(&config, &mut super::PublishedBlobReplacements::new(&config));
+    let result = super::recover_blob_files(
+        &config,
+        &mut super::PublishedBlobReplacements::new(&config),
+        &(0..10).collect(),
+    );
     assert!(
         result.is_err(),
         "a transient blob checksum failure must propagate for a retry, not be \
