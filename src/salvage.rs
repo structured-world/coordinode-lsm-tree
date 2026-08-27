@@ -963,6 +963,9 @@ fn salvage_attempt(
     // a copy published under a FRESH id would otherwise fall back to that new
     // id and claim a recency its content does not have.
     .use_recency(Some(table.l0_recency()))
+    // The source's compaction lineage travels with the copy for the same
+    // reason: the content is the same derived output.
+    .use_lineage(table.metadata.lineage.clone())
     .use_sync_mode(options.sync_mode)
     // The extractor is configuration (never persisted in the SST), so
     // the rebuilt filter only carries the source's prefix hashes when

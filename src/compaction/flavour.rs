@@ -114,6 +114,11 @@ pub(super) fn prepare_table_writer(
     )?
     .set_comparator(opts.config.comparator.clone())
     .use_recency(recency)
+    // The outputs' compaction lineage: the input ids this run merges. Lets a
+    // manifest-loss rebuild recognize the output as DERIVED and exclude it
+    // when every input survived a crash-before-commit, instead of publishing
+    // both histories and double-applying the merge operands on read.
+    .use_lineage(Some(payload.table_ids.iter().copied().collect()))
     // Compaction consumes input tables, so clip RTs to each output table's key range.
     .use_clip_range_tombstones();
 

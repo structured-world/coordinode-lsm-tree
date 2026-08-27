@@ -134,6 +134,11 @@ pub struct MultiWriter {
     /// output) the repair cannot know.
     recency: Option<TableId>,
 
+    /// Compaction lineage stamped on this and every rotated successor (see
+    /// [`Writer::use_lineage`]): the input ids a compaction merges, identical
+    /// for every output of the run. `None` (flush / ingest) omits the key.
+    lineage: Option<Vec<TableId>>,
+
     /// Delete strategy applied to every successor [`Writer`], preserved across
     /// rotation. Under copy-on-write the writers persist no delete-bitmap; under
     /// merge-on-read / adaptive a populated bitmap is written.
@@ -226,6 +231,7 @@ impl MultiWriter {
             use_columnar: false,
             bulk_ingested: false,
             recency: None,
+            lineage: None,
             delete_strategy: crate::config::DeleteStrategy::default(),
             disable_cow_on_sst: false,
             locator_entry: crate::config::LocatorPolicyEntry::None,
@@ -626,6 +632,15 @@ impl MultiWriter {
         self
     }
 
+    /// Stamps the compaction lineage on this and every rotated successor
+    /// writer (see [`Writer::use_lineage`]).
+    #[must_use]
+    pub(crate) fn use_lineage(mut self, lineage: Option<Vec<TableId>>) -> Self {
+        self.lineage.clone_from(&lineage);
+        self.writer = self.writer.use_lineage(lineage);
+        self
+    }
+
     /// Sets the delete strategy for this and every rotated successor writer.
     #[must_use]
     pub fn delete_strategy(mut self, strategy: crate::config::DeleteStrategy) -> Self {
@@ -702,6 +717,7 @@ impl MultiWriter {
         new_writer = new_writer.use_columnar(self.use_columnar);
         new_writer = new_writer.use_bulk_ingested(Some(self.bulk_ingested));
         new_writer = new_writer.use_recency(Some(self.recency.unwrap_or(new_table_id)));
+        new_writer = new_writer.use_lineage(self.lineage.clone());
         new_writer = new_writer.delete_strategy(self.delete_strategy);
         new_writer = new_writer.use_disable_cow(self.disable_cow_on_sst);
         new_writer = new_writer.use_locator(self.locator_entry);

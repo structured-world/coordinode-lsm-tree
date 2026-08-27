@@ -308,6 +308,16 @@ pub struct Writer {
     /// on-disk key. Persisted as `recency`.
     recency: Option<TableId>,
 
+    /// Compaction lineage for manifest repair: the sorted ids of the INPUT
+    /// tables this output was merged from. A crashed compaction that
+    /// finalized its outputs before its version edit committed leaves BOTH
+    /// histories on disk; the lineage lets a manifest-loss rebuild recognize
+    /// the output as DERIVED and exclude it when every input survived,
+    /// instead of publishing both and applying the same merge operands twice
+    /// on read. `None` — a flush / ingest table — omits the on-disk key.
+    /// Persisted as `lineage` (consecutive little-endian ids).
+    lineage: Option<Vec<TableId>>,
+
     /// Pre-trained zstd dictionary for dictionary compression
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
@@ -454,6 +464,7 @@ impl Writer {
             use_columnar: false,
             bulk_ingested: Some(false),
             recency: None,
+            lineage: None,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -778,10 +789,13 @@ impl Writer {
             // manifest-only global_seqno offset. A legacy source of unknown
             // provenance (`None`) re-emits unflagged (we do not guess).
             .use_bulk_ingested(meta.bulk_ingested)
-            // A rewrite keeps the source's L0 recency key: the copy carries the
-            // same content, so it belongs at the same position (a `None` source
-            // falls back to its own id, which the same-id copy shares).
+            // A rewrite keeps the source's L0 recency key AND its compaction
+            // lineage: the copy carries the same content, so it belongs at the
+            // same position (a `None` recency falls back to its own id, which
+            // the same-id copy shares) and stays recognizable as the same
+            // derived output for the manifest-repair lineage dedup.
             .use_recency(meta.recency)
+            .use_lineage(meta.lineage.clone())
             .use_zone_map(has_zone_map)
             // A source with a seqno_bounds section keeps its seqno-scoped
             // block-skip: the writer re-derives the per-block ranges from
@@ -929,6 +943,18 @@ impl Writer {
     pub(crate) fn use_recency(mut self, recency: Option<TableId>) -> Self {
         self.assert_not_started("use_recency");
         self.recency = recency;
+        self
+    }
+
+    /// Sets the compaction lineage (see [`Self::lineage`] field): the ids of
+    /// the inputs this output merges, sorted for a canonical encoding.
+    #[must_use]
+    pub(crate) fn use_lineage(mut self, lineage: Option<Vec<TableId>>) -> Self {
+        self.assert_not_started("use_lineage");
+        self.lineage = lineage.map(|mut ids| {
+            ids.sort_unstable();
+            ids
+        });
         self
     }
 
@@ -2385,6 +2411,7 @@ impl Writer {
             use_columnar: self.use_columnar,
             bulk_ingested: self.bulk_ingested,
             recency: self.recency,
+            lineage: self.lineage.clone(),
             range_tombstone_count,
             // Record the count that corresponds to the delete_bitmap section
             // ACTUALLY written above, via the single `writes_delete_bitmap`
@@ -2637,6 +2664,9 @@ struct MetaSectionParams<'a> {
     /// content position differs from its id), `None` omits it (a flush /
     /// ingest table, whose own id is its recency).
     recency: Option<TableId>,
+    /// Compaction lineage: `Some(_)` writes `lineage` (the sorted input ids a
+    /// compaction output merges), `None` omits it.
+    lineage: Option<Vec<TableId>>,
     range_tombstone_count: u64,
     /// Number of positions in this table's delete bitmap. Recorded so a reader
     /// can AUTHENTICATE the bitmap's presence: the section itself is optional
@@ -2880,6 +2910,20 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
     // all along.
     if let Some(recency) = p.recency {
         meta_items.push(meta("recency", &recency.to_le_bytes()));
+    }
+
+    // Compaction lineage: the sorted input ids this output merges, as
+    // consecutive little-endian u64s. Absence means "not a compaction
+    // output" (or a table from before this key existed). Manifest repair
+    // uses it to exclude a crashed compaction's DERIVED output when every
+    // input survived — publishing both histories would apply the same merge
+    // operands twice on read.
+    if let Some(lineage) = &p.lineage {
+        let mut bytes = Vec::with_capacity(lineage.len() * 8);
+        for id in lineage {
+            bytes.extend_from_slice(&id.to_le_bytes());
+        }
+        meta_items.push(meta("lineage", &bytes));
     }
 
     // Test-only legacy simulation: drop the bitmap-content hash so the file

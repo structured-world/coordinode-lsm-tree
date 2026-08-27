@@ -8637,6 +8637,228 @@ fn a_crashed_blob_salvage_temp_is_swept_not_fatal() -> crate::Result<()> {
 /// offsets — handles resolving to the wrong records. The salvage therefore
 /// builds into a private temp and publishes atomically: at every fault timing
 /// the tree is either fully repaired or exactly as it was found.
+/// A crashed compaction that finalized its outputs before its version edit
+/// committed (or a committed one whose input deletion never finished) leaves
+/// BOTH histories on disk. A manifest-loss rebuild that publishes both makes
+/// every read double-apply the surviving input's merge operands — the output
+/// already carries them. The recorded compaction lineage settles it: an
+/// output whose inputs ALL survived is DERIVED and is excluded (the inputs
+/// are the complete history; a future compaction re-folds them).
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_excludes_a_compaction_output_whose_inputs_survived() -> crate::Result<()> {
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    struct SumMerge;
+    impl crate::MergeOperator for SumMerge {
+        fn merge(
+            &self,
+            _key: &[u8],
+            base_value: Option<&[u8]>,
+            operands: &[&[u8]],
+        ) -> crate::Result<crate::UserValue> {
+            let mut sum: i64 = base_value.map_or(0, |b| {
+                i64::from_le_bytes(b.try_into().expect("8-byte counter"))
+            });
+            for op in operands {
+                sum += i64::from_le_bytes((*op).try_into().expect("8-byte operand"));
+            }
+            Ok(sum.to_le_bytes().to_vec().into())
+        }
+    }
+
+    let dir = tempfile::tempdir()?;
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_merge_operator(Some(Arc::new(SumMerge)))
+    };
+
+    let one = 1i64.to_le_bytes();
+    let inputs: Vec<(std::path::PathBuf, Vec<u8>)>;
+    {
+        let tree = config().open()?;
+        tree.merge(b"counter", one, 1);
+        tree.flush_active_memtable(0)?;
+        tree.merge(b"counter", one, 2);
+        tree.flush_active_memtable(0)?;
+
+        // Preserve the INPUT files, run the compaction, then resurrect them —
+        // the on-disk shape of a crash between output finalization and the
+        // version edit (or of a committed compaction whose input deletion
+        // failed).
+        let tables = dir.path().join("tables");
+        inputs = std::fs::read_dir(&tables)?
+            .map(|e| {
+                let path = e.expect("dir entry").path();
+                let bytes = std::fs::read(&path).expect("read input");
+                (path, bytes)
+            })
+            .collect();
+        assert_eq!(inputs.len(), 2, "two flushed inputs");
+
+        tree.major_compact(u64::MAX, 3)?;
+
+        // The output records its lineage: the two input ids it merged.
+        let version = tree.current_version();
+        let output = version.iter_tables().next().expect("one compacted table");
+        assert_eq!(
+            output.metadata.lineage.as_deref(),
+            Some(&[0, 1][..]),
+            "a compaction output persists the sorted ids of its inputs",
+        );
+    }
+    // Resurrect the inputs AFTER the tree is gone: its teardown re-runs the
+    // compaction's queued input deletions, which would silently undo an
+    // earlier resurrection.
+    for (path, bytes) in &inputs {
+        std::fs::write(path, bytes)?;
+    }
+    for entry in std::fs::read_dir(dir.path())? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_version = name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || name == "current" {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+
+    let report = config().repair()?;
+    assert_eq!(
+        report.recovered, 2,
+        "the derived output is excluded; only the surviving inputs are \
+         published: {report:?}",
+    );
+
+    let tree = config().open()?;
+    let value = tree
+        .get(b"counter", crate::SeqNo::MAX)?
+        .expect("the counter survives");
+    assert_eq!(
+        i64::from_le_bytes(value.as_ref().try_into().expect("8-byte counter")),
+        2,
+        "publishing both histories would double-apply the merge operands",
+    );
+    Ok(())
+}
+
+/// The PARTIAL case: one input of the crashed compaction is gone, so the
+/// output is the only complete copy of its span and must be KEPT alongside
+/// the surviving input — and the overlap is reported, because reads in that
+/// span may double-apply the surviving input's operands.
+#[test]
+fn repair_reports_a_compaction_output_with_partially_surviving_inputs() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    // Input 0 survives; input 1 is LOST (never written here); output 2
+    // records lineage [0, 1].
+    {
+        let mut w = Writer::new(tables.join("0"), 0, 0, Arc::clone(&fs))?;
+        w.write(InternalValue::from_components(
+            b"k".to_vec(),
+            b"a".to_vec(),
+            1,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "the input is non-empty");
+    }
+    {
+        let mut w = Writer::new(tables.join("2"), 2, 0, Arc::clone(&fs))?
+            .use_recency(Some(1))
+            .use_lineage(Some(vec![0, 1]));
+        w.write(InternalValue::from_components(
+            b"k".to_vec(),
+            b"b".to_vec(),
+            2,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "the output is non-empty");
+    }
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+    assert_eq!(
+        report.recovered, 2,
+        "the output is the only complete copy of the lost input's span and \
+         is kept: {report:?}",
+    );
+    assert!(
+        !report.lost_coverage.is_empty(),
+        "the overlap with the surviving input must be reported — reads there \
+         may double-apply merge operands: {report:?}",
+    );
+    Ok(())
+}
+
+/// A committed repair whose FOLLOW-UP open fails must not drop the only
+/// [`crate::RepairReport`]: the retry finds a healthy manifest, opens without
+/// a repair, and answers `None`, so an external-WAL consumer would never
+/// learn the replay obligation. The report ships with the error instead.
+#[test]
+fn open_or_repair_carries_the_report_when_the_follow_up_open_fails() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    standard_tree_without_manifest(&memfs, &root)?;
+
+    // The rebuilt manifest is `v0`: its CREATE (first open) succeeds, the
+    // post-repair open's READ of it fails transiently.
+    let fault = FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Interrupted))
+            .on_path(root.join("v0").to_string_lossy())
+            .skip(1),
+    );
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .open_or_repair(crate::repair::RepairPolicy::default());
+
+    match result {
+        Err(crate::Error::RepairedButUnopened { report, cause }) => {
+            assert_eq!(
+                report.recovered, 1,
+                "the committed repair's report rides with the error: {report:?}",
+            );
+            assert!(
+                matches!(&*cause, crate::Error::Io(e) if e.kind() == ErrorKind::Interrupted),
+                "the open's own failure is preserved as the cause: {cause:?}",
+            );
+        }
+        other => panic!(
+            "a failed post-repair open must carry the completed report, not \
+             drop it: {:?}",
+            other.map(|(_, r)| r),
+        ),
+    }
+    Ok(())
+}
+
 /// The post-failure `CURRENT` probe must fail SAFE: a probe that cannot read
 /// the pointer (a transient or permission failure on its open / read) proves
 /// nothing about the switch, and treating it as "not switched" lets the

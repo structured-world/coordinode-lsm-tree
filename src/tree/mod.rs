@@ -2205,6 +2205,22 @@ impl Tree {
     /// blocked only while that capture runs — the sealed memtables and SSTs the
     /// scan then reads are immutable.
     ///
+    /// # History retention
+    ///
+    /// The stream carries what the tree still PHYSICALLY HOLDS. A compaction
+    /// run with a GC watermark (the `seqno_threshold` passed to
+    /// [`compact`](crate::AbstractTree::compact) /
+    /// [`major_compact`](crate::AbstractTree::major_compact)) drops shadowed
+    /// versions and evicted tombstones below that watermark and may fold
+    /// merge chains and zero bottommost seqnos — history a later scan cannot
+    /// resurrect. The result is therefore complete only for a `target_seqno`
+    /// at or above the highest GC watermark ever applied: a deployment
+    /// replaying this stream (an external-WAL consumer, a CDC replica) must
+    /// keep its compaction watermark at or below the lowest cursor it may
+    /// still rewind to, exactly as `docs/external-wal.md` section 4's
+    /// GC-coordination rules require. The watermark is caller-supplied and
+    /// not persisted, so this method cannot detect a violation for you.
+    ///
     /// # Block-skip
     ///
     /// On SSTs written with the `seqno_bounds` section (`seqno_in_index`), data
@@ -2302,6 +2318,10 @@ impl Tree {
     /// re-apply (in particular, which merge operands SURVIVED and must not be
     /// folded twice) only needs the events inside those ranges. See
     /// `docs/external-wal.md` § Replay after repair.
+    ///
+    /// The history-retention caveat of [`Self::scan_since_seqno`] applies
+    /// unchanged: the stream is complete only for a `target_seqno` at or
+    /// above the highest compaction GC watermark ever applied.
     ///
     /// [`RepairReport::lost_coverage`]: crate::RepairReport::lost_coverage
     ///

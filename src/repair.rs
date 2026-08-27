@@ -2731,8 +2731,12 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Propagates a transient-I/O or lock failure from the open, any repair
-    /// failure, and a failure of the post-repair open.
+    /// Propagates a transient-I/O or lock failure from the open and any
+    /// repair failure. A failure of the POST-repair open surfaces as
+    /// [`Error::RepairedButUnopened`](crate::Error::RepairedButUnopened),
+    /// carrying the completed [`RepairReport`]: the repair is committed, so a
+    /// retry opens without repairing and answers `None` — consume the report
+    /// from the error, or the replay obligation it names is lost.
     ///
     /// # Examples
     ///
@@ -2769,7 +2773,25 @@ impl Config {
             Err(e) if is_repairable_structural(&e) => {
                 let report =
                     retry.repair_with_resurrection(policy.salvage, policy.allow_resurrection)?;
-                let tree = retry.open()?;
+                // The follow-up open's failure must not DROP the report: the
+                // repair is committed, so the caller's retry opens a healthy
+                // tree without a repair and answers `None` — and an
+                // external-WAL consumer would never learn the replay
+                // obligation the report carries. Ship it WITH the error.
+                // The follow-up open's failure must not DROP the report: the
+                // repair is committed, so the caller's retry opens a healthy
+                // tree without a repair and answers `None` — and an
+                // external-WAL consumer would never learn the replay
+                // obligation the report carries. Ship it WITH the error.
+                let tree = match retry.open() {
+                    Ok(tree) => tree,
+                    Err(cause) => {
+                        return Err(crate::Error::RepairedButUnopened {
+                            report: alloc::boxed::Box::new(report),
+                            cause: alloc::boxed::Box::new(cause),
+                        });
+                    }
+                };
                 Ok((tree, Some(report)))
             }
             Err(e) => Err(e),
@@ -4022,10 +4044,11 @@ fn repair_tree(
     // Each entry keeps its SOURCE path (the scanned `{id}` file, not a
     // salvage replacement's `{id}.repair-tmp`): it is the key into
     // `coverage_by_path` when a kept lossy copy's loss is scoped below.
-    let mut recovered_tables: Vec<(Table, Fidelity, PathBuf)> = recovered_by_id
-        .into_values()
-        .map(|c| (c.table, c.fidelity, c.path))
-        .collect();
+    let mut recovered_tables: Vec<(Table, Fidelity, PathBuf, Arc<dyn crate::fs::Fs>)> =
+        recovered_by_id
+            .into_values()
+            .map(|c| (c.table, c.fidelity, c.path, c.fs))
+            .collect();
 
     // Newest first, by DESCENDING recency key. For a flush / ingest table that
     // key is its own id (ids are allocated in increasing order and flushes are
@@ -4042,7 +4065,7 @@ fn repair_tree(
     // files reproduces the same tree instead of inheriting the directory
     // scan's order.
     recovered_tables
-        .sort_by_key(|(t, _, _)| (std::cmp::Reverse(t.l0_recency()), std::cmp::Reverse(t.id())));
+        .sort_by_key(|(t, ..)| (std::cmp::Reverse(t.l0_recency()), std::cmp::Reverse(t.id())));
 
     // KV-separated (blob) trees additionally carry a blob-file list. Discover the
     // blob files from the `blobs/` folder (no manifest to filter against) and
@@ -4122,8 +4145,9 @@ fn repair_tree(
             })
             .collect();
         let blob_rewrites = Arc::new(blob_rewrites);
-        let mut kept: Vec<(Table, Fidelity, PathBuf)> = Vec::with_capacity(recovered_tables.len());
-        for (table, fidelity, source_path) in recovered_tables {
+        let mut kept: Vec<(Table, Fidelity, PathBuf, Arc<dyn crate::fs::Fs>)> =
+            Vec::with_capacity(recovered_tables.len());
+        for (table, fidelity, source_path, source_fs) in recovered_tables {
             // One reference read drives everything below: the missing-id check
             // and the rewrite decision.
             let links = match table.list_blob_file_references() {
@@ -4192,7 +4216,7 @@ fn repair_tree(
                 }
             }
             if !needs_rewrite {
-                kept.push((table, fidelity, source_path));
+                kept.push((table, fidelity, source_path, source_fs));
                 continue;
             }
             // Rewrite through the salvage pipeline: re-emit every entry with
@@ -4239,7 +4263,7 @@ fn repair_tree(
                         allow_resurrection,
                     )?;
                     let restricted = rewritten.restrict_lower_bound().is_some();
-                    kept.push((rewritten, Fidelity::Salvaged, source_path));
+                    kept.push((rewritten, Fidelity::Salvaged, source_path, source_fs));
                     swap_after_commit.push((Arc::clone(&fs), output_path, path, restricted));
                 }
                 Ok(SalvageOutcome::Unusable | SalvageOutcome::PunchedBoundLost) => {
@@ -4278,7 +4302,7 @@ fn repair_tree(
         // out of any manifest — which would otherwise be admitted as an
         // ordinary blob and pin a whole copy per failed attempt.
         let mut referenced: crate::HashSet<crate::vlog::BlobFileId> = crate::HashSet::default();
-        for (table, _, _) in &recovered_tables {
+        for (table, ..) in &recovered_tables {
             for link in table.list_blob_file_references()?.into_iter().flatten() {
                 referenced.insert(link.blob_file_id);
             }
@@ -4307,6 +4331,105 @@ fn repair_tree(
         }
     }
 
+    // A crashed compaction that FINALIZED its outputs before its version edit
+    // committed leaves BOTH histories on disk — and so does a committed
+    // compaction whose input deletion never finished. The recorded lineage
+    // settles it: an output whose inputs ALL survived into this rebuild is
+    // DERIVED — the inputs are the complete history, a future compaction
+    // re-folds them — and publishing both would apply the same merge
+    // operands twice on every read. Exclusion cascades correctly in a single
+    // pass against the PRE-exclusion id set: an intermediate output excluded
+    // for its surviving inputs may itself be named in a later output's
+    // lineage, but every exclusion keeps the excluded table's own inputs, so
+    // the remaining set always bottoms out at lineage-less leaves carrying
+    // the full history. An output with PARTIALLY surviving inputs is KEPT —
+    // it is the only complete copy of its span — alongside the surviving
+    // inputs, and each overlap is reported below as ambiguity coverage so a
+    // reconciling deployment knows reads in that span may double-apply
+    // operands. Presence is judged AFTER the blob-dependency filter above: an
+    // input dropped for an unrecoverable blob does not count as surviving.
+    let present_ids: crate::HashSet<TableId> =
+        recovered_tables.iter().map(|(t, ..)| t.id()).collect();
+    let mut lineage_partial: Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)> = Vec::new();
+    {
+        let candidates = core::mem::take(&mut recovered_tables);
+        let kept_ranges: crate::HashMap<TableId, (UserKey, UserKey, SeqNo)> = candidates
+            .iter()
+            .map(|(t, ..)| {
+                (
+                    t.id(),
+                    (
+                        t.metadata.key_range.min().clone(),
+                        t.metadata.key_range.max().clone(),
+                        t.get_highest_seqno(),
+                    ),
+                )
+            })
+            .collect();
+        for candidate in candidates {
+            let lineage = candidate.0.metadata.lineage.clone();
+            match lineage.as_deref() {
+                Some(inputs)
+                    if !inputs.is_empty()
+                        && inputs
+                            .iter()
+                            .all(|id| *id != candidate.0.id() && present_ids.contains(id)) =>
+                {
+                    let (table, _, path, fs) = candidate;
+                    log::info!(
+                        "repair: table {} is a compaction output whose inputs {:?} all \
+                         survived; excluding the derived copy so its merge operands are \
+                         not applied twice",
+                        table.id(),
+                        inputs,
+                    );
+                    drop(table);
+                    let reason = "derived output of an uncommitted compaction whose inputs \
+                                  all survived; excluded so its merge operands are not \
+                                  applied twice";
+                    unreadable_files.push((path.clone(), reason.to_string()));
+                    discard_after_commit.push((fs, path, reason.to_string()));
+                }
+                Some(inputs) => {
+                    // Partial survival: report each overlap with a surviving
+                    // input under the output's own coverage ceiling.
+                    let cmp = config.comparator.as_ref();
+                    for input in inputs {
+                        let Some((in_min, in_max, in_hi)) = kept_ranges.get(input) else {
+                            continue;
+                        };
+                        let out_range = &candidate.0.metadata.key_range;
+                        if cmp.compare(out_range.min(), in_max) == core::cmp::Ordering::Greater
+                            || cmp.compare(in_min, out_range.max()) == core::cmp::Ordering::Greater
+                        {
+                            continue;
+                        }
+                        let lo =
+                            if cmp.compare(out_range.min(), in_min) == core::cmp::Ordering::Less {
+                                in_min
+                            } else {
+                                out_range.min()
+                            };
+                        let hi =
+                            if cmp.compare(out_range.max(), in_max) == core::cmp::Ordering::Less {
+                                out_range.max()
+                            } else {
+                                in_max
+                            };
+                        lineage_partial.push((
+                            candidate.2.clone(),
+                            lo.clone(),
+                            hi.clone(),
+                            Some(candidate.0.get_highest_seqno().min(*in_hi)),
+                        ));
+                    }
+                    recovered_tables.push(candidate);
+                }
+                _ => recovered_tables.push(candidate),
+            }
+        }
+    }
+
     // `salvaged` is a subset of `recovered`, so derive it from the tables that
     // survived every filter above. The live progress counter follows the same
     // rule: a candidate displaced by deduplication or dropped by dependency
@@ -4317,7 +4440,7 @@ fn repair_tree(
     // in plain repairs where `salvaged` is documented to stay zero.
     let salvaged = recovered_tables
         .iter()
-        .filter(|(_, fidelity, _)| *fidelity == Fidelity::Salvaged)
+        .filter(|(_, fidelity, ..)| *fidelity == Fidelity::Salvaged)
         .count();
     // A KEPT lossy copy — a salvaged rewrite that dropped corrupt blocks (or
     // blob records), or a geometry-restricted original whose derived bound
@@ -4335,8 +4458,8 @@ fn repair_tree(
     let mut salvaged_unknowable: Vec<PathBuf> = Vec::new();
     let salvaged_coverage: Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)> = recovered_tables
         .iter()
-        .filter(|(_, fidelity, _)| !fidelity.is_complete())
-        .filter_map(|(_, _, source_path)| {
+        .filter(|(_, fidelity, ..)| !fidelity.is_complete())
+        .filter_map(|(_, _, source_path, _)| {
             if let Some((lo, hi, bound)) = coverage_by_path.get(source_path) {
                 Some((source_path.clone(), lo.clone(), hi.clone(), *bound))
             } else {
@@ -4380,12 +4503,12 @@ fn repair_tree(
     let mut ambiguous_order_coverage: Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)> = Vec::new();
     if recovered_tables
         .iter()
-        .any(|(t, _, _)| t.metadata.recency.is_none())
+        .any(|(t, ..)| t.metadata.recency.is_none())
     {
         let cmp = config.comparator.as_ref();
         let mut probes: Vec<RecencyProbe> = recovered_tables
             .iter()
-            .map(|(t, _, path)| RecencyProbe {
+            .map(|(t, _, path, _)| RecencyProbe {
                 min: t.metadata.key_range.min().clone(),
                 max: t.metadata.key_range.max().clone(),
                 lo_seqno: t.get_lowest_seqno(),
@@ -4423,7 +4546,7 @@ fn repair_tree(
             active.push(probe);
         }
     }
-    let recovered_tables: Vec<Table> = recovered_tables.into_iter().map(|(t, _, _)| t).collect();
+    let recovered_tables: Vec<Table> = recovered_tables.into_iter().map(|(t, ..)| t).collect();
     // A rebuilt manifest whose highest table id is the LAST one cannot be
     // committed: the next open seeds its id allocator with `highest + 1`,
     // which overflows — a panic in checked builds, a wrap to an existing low
@@ -4707,6 +4830,7 @@ fn repair_tree(
     }
     lost_coverage.extend(salvaged_coverage);
     lost_coverage.extend(ambiguous_order_coverage);
+    lost_coverage.extend(lineage_partial);
     unknowable_losses.extend(salvaged_unknowable);
 
     // Success only: a failed run leaves the phase where it stopped, which

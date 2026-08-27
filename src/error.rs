@@ -101,6 +101,26 @@ pub enum Error {
         tag: u8,
     },
 
+    /// A repair COMMITTED its rebuilt manifest, but the follow-up open inside
+    /// [`Config::open_or_repair`](crate::Config::open_or_repair) failed.
+    ///
+    /// The report travels WITH the error because it exists only in that call:
+    /// the retry finds a healthy manifest, opens without a repair, and
+    /// answers `None` — an external-WAL consumer would otherwise never learn
+    /// its replay obligation
+    /// ([`RepairReport::wal_replay_scope`](crate::RepairReport::wal_replay_scope))
+    /// and could keep stale or resurrected values. Consume the report exactly
+    /// as a successful repair's, then retry the open (`cause` is typically
+    /// transient).
+    #[cfg(feature = "std")]
+    RepairedButUnopened {
+        /// The completed repair's report — not rederivable on a retry.
+        report: alloc::boxed::Box<crate::RepairReport>,
+
+        /// The follow-up open's failure.
+        cause: alloc::boxed::Box<Self>,
+    },
+
     /// The on-disk tree's type does not match the type the configuration
     /// requests: a standard open (no `kv_separation_opts`) of a KV-separated
     /// (blob) tree, or the reverse.

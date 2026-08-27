@@ -8,6 +8,7 @@ use crate::{
     CompressionType, KeyRange, SeqNo, TableId, checksum::ChecksumType, coding::Decode,
     comparator::default_comparator, runtime_config::ChecksumAlgorithm, table::block::BlockType,
 };
+use alloc::vec::Vec;
 use core::ops::Deref;
 
 /// Nanosecond timestamp.
@@ -182,6 +183,14 @@ pub struct ParsedMeta {
     /// or one from before this key existed — means the table's own id is its
     /// recency (see [`Table::l0_recency`](crate::table::Table::l0_recency)).
     pub recency: Option<TableId>,
+
+    /// Compaction lineage from the optional `lineage` property: the sorted
+    /// ids of the INPUT tables a compaction output was merged from. Manifest
+    /// repair uses it to exclude a crashed compaction's DERIVED output when
+    /// every input survived — publishing both histories would apply the same
+    /// merge operands twice on read. `None` — a flush / ingest table, or one
+    /// written before the key existed.
+    pub lineage: Option<Vec<TableId>>,
 }
 
 macro_rules! read_u8 {
@@ -561,6 +570,26 @@ impl ParsedMeta {
         let delete_bitmap_hash = read_opt_u128(b"descriptor#delete_bitmap_hash")?;
         let key_count = read_opt_u64(b"key_count")?;
         let recency = read_opt_u64(b"recency")?;
+        // Compaction lineage: consecutive little-endian input ids. A payload
+        // that is not a whole number of ids is corrupt meta.
+        let lineage = match block.point_read(b"lineage", SeqNo::MAX, &cmp)? {
+            Some(item) => {
+                if item.value.len() % 8 != 0 {
+                    return Err(crate::Error::InvalidHeader("TableMeta"));
+                }
+                Some(
+                    item.value
+                        .chunks_exact(8)
+                        .map(|chunk| {
+                            <[u8; 8]>::try_from(chunk)
+                                .map(u64::from_le_bytes)
+                                .map_err(|_| crate::Error::InvalidHeader("TableMeta"))
+                        })
+                        .collect::<crate::Result<Vec<u64>>>()?,
+                )
+            }
+            None => None,
+        };
 
         Ok(Self {
             id,
@@ -592,6 +621,7 @@ impl ParsedMeta {
             columnar,
             bulk_ingested,
             recency,
+            lineage,
         })
     }
 }
