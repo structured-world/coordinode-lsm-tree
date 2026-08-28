@@ -66,6 +66,24 @@ struct CorpusEntry {
     label: String,
     bytes: Vec<u8>,
     encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
+    /// Byte range of the TAIL meta block, and of its MID mirror. A flip inside
+    /// exactly ONE of them must still recover COMPLETELY — that is what the
+    /// mirror is for — so those iterations hold a stricter invariant than the
+    /// rest (see `meta_mirror_span`).
+    meta_tail: core::ops::Range<usize>,
+    meta_mid: Option<core::ops::Range<usize>>,
+}
+
+impl CorpusEntry {
+    /// Whether `off` lands in exactly one meta mirror, with the other intact.
+    fn hits_one_meta_mirror(&self, off: usize) -> bool {
+        let Some(mid) = self.meta_mid.clone() else {
+            return false;
+        };
+        let in_tail = self.meta_tail.contains(&off);
+        let in_mid = mid.contains(&off);
+        in_tail ^ in_mid
+    }
 }
 
 /// One writer configuration: a label plus the option closure applied to a fresh
@@ -171,13 +189,32 @@ fn build_corpus(dir: &std::path::Path, fs: &Arc<dyn crate::fs::Fs>) -> Vec<Corpu
         }
         assert!(w.finish().unwrap().is_some(), "corpus SST is non-empty");
         let bytes = std::fs::read(&sst).unwrap();
+        let (meta_tail, meta_mid) = meta_mirror_spans(&sst);
         out.push(CorpusEntry {
             label: variant.label.to_string(),
             bytes,
             encryption: variant.encryption,
+            meta_tail,
+            meta_mid,
         });
     }
     out
+}
+
+/// Reads the byte spans of the TAIL meta block and its MID mirror from a
+/// freshly-written (undamaged) corpus SST.
+fn meta_mirror_spans(
+    path: &std::path::Path,
+) -> (core::ops::Range<usize>, Option<core::ops::Range<usize>>) {
+    let mut file = std::fs::File::open(path).unwrap();
+    let reader = crate::sfa::Reader::from_reader(&mut file).unwrap();
+    let span = |name: &[u8]| {
+        reader.toc().section(name).map(|e| {
+            let pos = e.pos() as usize;
+            pos..pos + e.len() as usize
+        })
+    };
+    (span(b"meta").unwrap(), span(b"meta_mid"))
 }
 
 /// Recovers the (possibly bit-flipped) SST at `path`, passing its FRESHLY
@@ -255,6 +292,9 @@ fn recover_and_scan(
 /// assertion while proving nothing about how much it loses.
 static SALVAGE_OK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static SALVAGE_DROPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Iterations whose flip landed in exactly one meta mirror — the cases that
+/// must recover COMPLETELY from the other copy.
+static METAFLIP_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Block-salvages the flipped SST and checks that the loss is MINIMAL.
 ///
@@ -407,8 +447,21 @@ fn fuzz_heal_bitrot() {
         let scratch3 = scratch.clone();
         let ctx3 = ctx.clone();
         let dest3 = salvage_dest.clone();
+        // A flip inside exactly ONE meta mirror must recover COMPLETELY: the
+        // other copy is byte-identical and intact, which is the entire reason
+        // the mirror exists. Accepting an error here would let a regression in
+        // the fallback hide behind "an error is a valid outcome".
+        let one_mirror_damaged = entry.hits_one_meta_mirror(off);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let _ = recover_and_scan(&scratch2, &fs2, enc, &ctx2);
+            let scan = recover_and_scan(&scratch2, &fs2, enc, &ctx2);
+            if one_mirror_damaged {
+                METAFLIP_SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                assert!(
+                    scan.is_ok(),
+                    "{ctx2}: a flip in ONE meta mirror must fall back to the \
+                     intact copy and recover completely, got {scan:?}",
+                );
+            }
             // The read path only has to REFUSE damaged data. Salvage has to
             // lose as little as possible, which is a separate claim and the
             // one this branch checks: a single flipped bit must never cost
@@ -440,9 +493,11 @@ fn fuzz_heal_bitrot() {
 
     let salvage_ok = SALVAGE_OK.load(core::sync::atomic::Ordering::Relaxed);
     let salvage_dropped = SALVAGE_DROPPED.load(core::sync::atomic::Ordering::Relaxed);
+    let metaflips = METAFLIP_SEEN.load(core::sync::atomic::Ordering::Relaxed);
     eprintln!(
         "fuzz_heal_bitrot: {iters} iterations across {} variants in {:?} (seed {SEED:#x}); \
-         salvage succeeded {salvage_ok}× ({salvage_dropped} of them dropped a block)",
+         salvage succeeded {salvage_ok}× ({salvage_dropped} of them dropped a block); \
+         {metaflips} flips hit one meta mirror and recovered from the other",
         corpus.len(),
         start.elapsed(),
     );
@@ -453,6 +508,13 @@ fn fuzz_heal_bitrot() {
         salvage_dropped > 0,
         "no fuzz iteration produced a salvage that dropped a block, so the \
          one-block bound was never exercised",
+    );
+    // Likewise for the mirror: if no flip ever landed in exactly one meta copy,
+    // the "must recover completely" assertion never ran.
+    assert!(
+        metaflips > 0,
+        "no fuzz iteration flipped a byte inside exactly one meta mirror, so the \
+         mirror-fallback requirement was never exercised",
     );
     // A per-iteration recover + full scan is fast, but a loaded / emulated runner
     // can still fit few iterations into the fixed wall-clock budget. Require only
