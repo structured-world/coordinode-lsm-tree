@@ -2772,3 +2772,76 @@ fn tight_space_budgets_blob_relocation_on_the_blob_volume() -> crate::Result<()>
     }
     Ok(())
 }
+
+/// Punching an input reclaims space on the INPUT'S volume. Under level routing
+/// that can be a different volume from the destination, and each slice adds its
+/// whole output to the destination while freeing nothing there: a destination
+/// under pressure grows across slices until it hits ENOSPC, having never
+/// relieved the pool that engaged tight-space mode. Being punch-capable is not
+/// enough — the punch has to land where the outputs do.
+#[test]
+fn tight_space_declines_when_punching_inputs_frees_the_wrong_volume() -> crate::Result<()> {
+    use crate::config::LevelRoute;
+    use crate::fs::{Fs, MemFs};
+
+    let dir = tempfile::tempdir()?;
+    let hot_dir = dir.path().join("hot");
+    // The volume holding the inputs: ample AND punch-capable, so only the
+    // volume comparison can decline this pass.
+    let hot = Arc::new(MemFs::with_capacity(u64::MAX));
+    hot.create_dir_all(&hot_dir)?;
+    // The volume the slice outputs land on, squeezed below the merge.
+    let main = Arc::new(MemFs::with_capacity(u64::MAX));
+
+    let hot_fs: Arc<dyn Fs> = hot.clone();
+    let tree = match Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_shared_fs(main.clone())
+    .level_routes(vec![LevelRoute {
+        levels: 0..1,
+        path: hot_dir.clone(),
+        fs: hot_fs,
+    }])
+    .open()?
+    {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+
+    for i in 0..TIGHT_SPACE_KEYS {
+        tree.insert(tight_space_key(i).as_bytes(), vec![0xCDu8; 64], i);
+    }
+    tree.flush_active_memtable(0)?;
+    main.set_capacity(64 * 1024);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = true;
+    })?;
+
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+
+    assert_eq!(
+        hot.punched_bytes(),
+        0,
+        "punching the routed inputs would free the wrong volume: the constrained \
+         destination gains every slice output and loses nothing",
+    );
+    let sidecars = hot
+        .read_dir(&hot_dir.join("tables"))?
+        .into_iter()
+        .filter(|e| e.file_name.contains("restrict-bound"))
+        .count();
+    assert_eq!(sidecars, 0, "no slice may commit against such an input");
+    for i in 0..TIGHT_SPACE_KEYS {
+        assert!(
+            tree.get(tight_space_key(i).as_bytes(), crate::MAX_SEQNO)?
+                .is_some(),
+            "key {i} lost",
+        );
+    }
+    Ok(())
+}

@@ -297,6 +297,26 @@ enum SpaceGate {
 /// A volume that cannot report free space contributes `u64::MAX`, so a probe
 /// failure never fabricates disk pressure. With no quota and every volume
 /// unbounded, the result is unconditionally `true` (nothing constrains).
+/// Whether two paths sit on PROVABLY separate free-space pools: both backends
+/// report a volume id AND the ids differ.
+///
+/// The unproven cases (a backend that cannot answer, a route to the same mount)
+/// deliberately answer `false` — shared. Every caller uses this to decide
+/// whether space freed on one path relieves the other, and guessing
+/// "independent" there admits a transient peak straight into `ENOSPC` or a
+/// reclaim that lands where nothing needed it.
+fn separate_volumes(
+    a_fs: &dyn crate::fs::Fs,
+    a_path: &crate::path::Path,
+    b_fs: &dyn crate::fs::Fs,
+    b_path: &crate::path::Path,
+) -> bool {
+    match (a_fs.volume_id(a_path), b_fs.volume_id(b_path)) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    }
+}
+
 // `pub` (not `pub(crate)`) inside this crate-private module: clippy flags the
 // redundant restriction since the module itself is already crate-scoped.
 pub fn space_fits_two_layer(
@@ -327,14 +347,7 @@ pub fn space_fits_two_layer(
     let blob_dir = config.path.join(BLOBS_FOLDER);
     let blob_free = config.fs.available_space(&blob_dir).unwrap_or(u64::MAX);
 
-    // Independent only when both destinations report a volume id AND the ids
-    // differ — provably separate free-space pools. A route to the same mount, or
-    // any backend that cannot prove independence, falls through to the combined
-    // budget so a shared-volume transient peak cannot slip past into `ENOSPC`.
-    let independent = match (sst_fs.volume_id(&sst_path), config.fs.volume_id(&blob_dir)) {
-        (Some(sst_vol), Some(blob_vol)) => sst_vol != blob_vol,
-        _ => false,
-    };
+    let independent = separate_volumes(&*sst_fs, &sst_path, &*config.fs, &blob_dir);
 
     if independent {
         volume_fits(sst_bytes, sst_free) && volume_fits(blob_bytes, blob_free)
@@ -896,6 +909,33 @@ fn run_tight_space_compaction(
         return Ok(CompactionResult::nothing());
     }
 
+    // Being able to punch is not the same as punching where it helps. Each
+    // slice adds its WHOLE output to the destination volume but frees only the
+    // share of its inputs that lives THERE, so a destination under pressure
+    // with inputs on another volume grows monotonically across slices: the pass
+    // commits several, hits ENOSPC, and never relieves the pool that engaged
+    // it. When the destination can hold the whole merge it is not the
+    // constrained pool (the gate skipped for the blob volume instead) and the
+    // reclaim landing elsewhere is fine.
+    let inputs_total: u64 = inputs.iter().map(Table::file_size).sum();
+    let dest_free = dest_fs.available_space(&dest_path).unwrap_or(u64::MAX);
+    if dest_free < inputs_total {
+        // Only a PROVEN different volume forfeits the relief; an unproven pair
+        // counts as shared, leaving the single-volume default untouched.
+        let elsewhere = inputs
+            .iter()
+            .find(|t| separate_volumes(&*t.fs, &t.path, &*dest_fs, &dest_path));
+        if let Some(t) = elsewhere {
+            log::info!(
+                "Tight-space compaction unavailable: input table {} is on a different volume \
+                 than the constrained destination, so punching it frees no space where the \
+                 slice outputs land",
+                t.path.display(),
+            );
+            return Ok(CompactionResult::nothing());
+        }
+    }
+
     drop(latest);
     drop(version_history_lock);
     if inputs.is_empty() {
@@ -904,7 +944,6 @@ fn run_tight_space_compaction(
     let tables_in = inputs.len();
 
     let comparator = opts.config.comparator.clone();
-    let available = dest_fs.available_space(&dest_path).unwrap_or(u64::MAX);
     // Slice boundaries are derived from SST block sizes, but on a KV-separated
     // relocating merge the transient is dominated by the RELOCATED blob payload,
     // not the (tiny, handle-only) SSTs. Scale the SST-space budget so a slice
@@ -920,23 +959,13 @@ fn run_tight_space_compaction(
     // input block (`tight_slice_boundaries` returns empty, so no reclaim
     // happens at all) or a slice the blob volume cannot hold.
     let slice_budget = if relocating && stale_total_bytes > 0 {
-        let inputs_total: u64 = inputs.iter().map(Table::file_size).sum();
         let blob_dir = opts.config.path.join(BLOBS_FOLDER);
         let blob_free = opts
             .config
             .fs
             .available_space(&blob_dir)
             .unwrap_or(u64::MAX);
-        // Independent only when both destinations prove a volume id AND the
-        // ids differ, matching `space_fits_two_layer`: anything unproven falls
-        // through to one combined pool.
-        let independent = match (
-            dest_fs.volume_id(&dest_path),
-            opts.config.fs.volume_id(&blob_dir),
-        ) {
-            (Some(sst_vol), Some(blob_vol)) => sst_vol != blob_vol,
-            _ => false,
-        };
+        let independent = separate_volumes(&*dest_fs, &dest_path, &*opts.config.fs, &blob_dir);
         // A slice covering `b` SST bytes writes `b` to the SST volume and
         // `b * stale_total / inputs_total` to the blob volume. Separate pools
         // bound each share on its own volume; a shared pool must hold the SUM,
@@ -946,7 +975,7 @@ fn run_tight_space_compaction(
             (blob_free, stale_total_bytes)
         } else {
             (
-                available.min(blob_free),
+                dest_free.min(blob_free),
                 inputs_total.max(1) + stale_total_bytes,
             )
         };
@@ -955,9 +984,9 @@ fn run_tight_space_compaction(
         let scaled = u128::from(pool) * u128::from(inputs_total.max(1)) / u128::from(share);
         let by_blob = u64::try_from(scaled).unwrap_or(u64::MAX).max(1);
         // The SST side still has to fit its own slice on its own volume.
-        by_blob.min(available.max(1))
+        by_blob.min(dest_free.max(1))
     } else {
-        available.max(1)
+        dest_free.max(1)
     };
     let boundaries = tight_slice_boundaries(&inputs, slice_budget, comparator.as_ref())?;
     if boundaries.is_empty() {
