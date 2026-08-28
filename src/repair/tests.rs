@@ -9906,6 +9906,176 @@ fn a_valid_routed_duplicate_is_excluded_not_unreadable() -> crate::Result<()> {
     Ok(())
 }
 
+/// An AMBIGUOUS repair replacement (its digest differs from the manifest, and
+/// the damaged original beside it cannot prove authority either) is exactly
+/// what a failed post-commit sweep leaves behind. Settling it on the spot ends
+/// the open on that leftover, even when the copy the manifest names is intact
+/// one routed folder over: the temp must wait until every folder is scanned.
+#[test]
+fn an_ambiguous_repair_temp_does_not_shut_out_a_routed_manifest_copy() -> crate::Result<()> {
+    use crate::config::LevelRoute;
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let cold = std::path::absolute("/cold")?;
+    let tables = root.join("tables");
+    let cold_tables = cold.join("tables");
+    memfs.create_dir_all(&tables)?;
+    memfs.create_dir_all(&cold_tables)?;
+
+    // The only copy at rebuild time: the manifest records THIS file's checksum.
+    {
+        let mut w = crate::table::Writer::new(cold_tables.join("0"), 0, 0, Arc::clone(&fs_dyn))?;
+        w.write(InternalValue::from_components(
+            b"a".to_vec(),
+            b"v".to_vec(),
+            1,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "the table is non-empty");
+    }
+
+    let config = || {
+        let route_fs: Arc<dyn Fs> = memfs.clone();
+        let shared: Arc<dyn Fs> = memfs.clone();
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(shared)
+        .level_routes(vec![LevelRoute {
+            levels: 0..2,
+            path: cold.clone(),
+            fs: route_fs,
+        }])
+    };
+    assert_eq!(
+        config().repair()?.recovered,
+        1,
+        "the routed copy is published"
+    );
+
+    // The leftover: in the folder scanned FIRST, a temp whose digest differs
+    // from the manifest beside a damaged original that cannot prove authority.
+    {
+        let mut w =
+            crate::table::Writer::new(tables.join("0.repair-tmp"), 0, 0, Arc::clone(&fs_dyn))?;
+        w.write(InternalValue::from_components(
+            b"a".to_vec(),
+            b"other".to_vec(),
+            1,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "the temp is non-empty");
+        let mut f = memfs.open(
+            &tables.join("0"),
+            &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        std::io::Write::write_all(&mut f, b"not an sst")?;
+    }
+
+    let tree = match config().open()? {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    assert_eq!(
+        tree.get(b"a", crate::MAX_SEQNO)?.as_deref(),
+        Some(&b"v"[..]),
+        "the open settles the ambiguous temp against the routed copy the manifest names",
+    );
+    assert!(
+        !memfs.exists(&tables.join("0.repair-tmp"))?,
+        "a temp proven not to be the manifest's copy is an abandoned build and is \
+         removed by the open that proved it, not left for someone else",
+    );
+    Ok(())
+}
+
+/// A DAMAGED duplicate is the corruption signal, not a healthy exclusion.
+/// Inferring the duplicate's health from the RETAINED copy's fidelity reports
+/// `unreadable == 0` over a failing disk: the operator watching that counter
+/// sees a clean tree while a routed volume rots.
+#[test]
+fn a_damaged_routed_duplicate_is_unreadable_not_a_healthy_exclusion() -> crate::Result<()> {
+    use crate::config::LevelRoute;
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let cold = std::path::absolute("/cold")?;
+    let tables = root.join("tables");
+    let cold_tables = cold.join("tables");
+    memfs.create_dir_all(&tables)?;
+    memfs.create_dir_all(&cold_tables)?;
+
+    {
+        let mut w = crate::table::Writer::new(tables.join("0"), 0, 0, Arc::clone(&fs_dyn))?;
+        w.write(InternalValue::from_components(
+            b"a".to_vec(),
+            b"v".to_vec(),
+            1,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "the table is non-empty");
+    }
+    // The same id under the routed folder, but TRUNCATED: a physically
+    // distinct copy that cannot be opened.
+    {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut memfs.open(
+                &tables.join("0"),
+                &crate::fs::FsOpenOptions::new().read(true),
+            )?,
+            &mut bytes,
+        )?;
+        bytes.truncate(bytes.len() / 2);
+        let mut f = memfs.open(
+            &cold_tables.join("0"),
+            &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        std::io::Write::write_all(&mut f, &bytes)?;
+    }
+
+    let route_fs: Arc<dyn Fs> = memfs.clone();
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .level_routes(vec![LevelRoute {
+        levels: 0..2,
+        path: cold,
+        fs: route_fs,
+    }])
+    .repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "the intact copy is retained: {report:?}"
+    );
+    assert_eq!(
+        report.unreadable, 1,
+        "the damaged duplicate must raise the corruption signal: {report:?}",
+    );
+    assert!(
+        !report
+            .excluded_files
+            .iter()
+            .any(|(p, _)| p.ends_with("0") && p.starts_with("/cold")),
+        "a file that never opened cannot be reported as a healthy exclusion: {report:?}",
+    );
+    Ok(())
+}
+
 /// When a repair's post-commit sweep cannot remove the damaged duplicate it
 /// displaced, the manifest is already durable and names the copy in a LATER
 /// routed folder. The retry the failure documents is an open, and the open

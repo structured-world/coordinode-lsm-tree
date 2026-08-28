@@ -2582,6 +2582,37 @@ fn recover_blob_files(
     let mut kept_paths: crate::HashMap<crate::vlog::BlobFileId, PathBuf> =
         crate::HashMap::default();
 
+    // Whether a file opens on its OWN bytes, for the duplicate verdict below.
+    // A duplicate contributes nothing to the rebuild, but the report's two
+    // channels make different claims about it, and health inferred from the
+    // RETAINED copy would file a rotting duplicate as healthy. A FULLY PUNCHED
+    // file is not damaged — its relocation completed — so it counts as clean.
+    // The live-data frontier of one file: the manifest's COMMITTED value when
+    // it survived — exact, free, and independent of whether the backend can
+    // attribute zeros to a hole — else derived from the punch geometry. Single
+    // source for the recovery walk and the duplicate verdict alike.
+    let resolve_frontier = |blob_id, blob_path: &std::path::Path| -> crate::Result<BlobFrontier> {
+        match committed_frontiers.and_then(|m| m.get(&blob_id).copied()) {
+            Some(committed) => Ok(BlobFrontier::Punched(committed)),
+            None => derive_blob_frontier(&config.fs, blob_path, blob_id),
+        }
+    };
+
+    let opens_cleanly = |blob_id, blob_path: &std::path::Path| -> crate::Result<()> {
+        let frontier = match resolve_frontier(blob_id, blob_path)? {
+            BlobFrontier::Whole => 0,
+            BlobFrontier::Punched(f) => f,
+            BlobFrontier::FullyConsumed => return Ok(()),
+        };
+        let checksum = crate::Checksum::from_raw(compute_table_checksum_from(
+            &*config.fs,
+            blob_path,
+            frontier,
+        )?);
+        crate::vlog::recover_blob_file_from(blob_path, blob_id, checksum, 0, &config.fs, frontier)
+            .map(|_| ())
+    };
+
     for (blob_id, blob_path, _file_name) in candidates {
         if let Some(kept) = kept_paths.get(&blob_id) {
             // A second directory entry for an already-recovered id. An ALIAS
@@ -2593,11 +2624,25 @@ fn recover_blob_files(
             if same_physical_file(&*config.fs, kept, &*config.fs, &blob_path)? {
                 continue;
             }
-            // A healthy exclusion, not an unreadable file: this copy is
-            // valid, its id's content is already held.
-            let reason = format!("duplicate of blob file id {blob_id}");
-            discard.push((blob_path.clone(), reason.clone()));
-            excluded.push((blob_path, reason));
+            // Verify THIS copy before choosing the report channel: an
+            // exclusion claims the file opened and verified, and calling an
+            // unchecked duplicate healthy hides the corruption signal.
+            match opens_cleanly(blob_id, &blob_path) {
+                Ok(()) => {
+                    let reason = format!("duplicate of blob file id {blob_id}");
+                    discard.push((blob_path.clone(), reason.clone()));
+                    excluded.push((blob_path, reason));
+                }
+                // A fault in the ENVIRONMENT is not evidence about these bytes.
+                Err(e) if is_environmental(&e) => return Err(e),
+                Err(e) => {
+                    let reason = format!(
+                        "damaged duplicate of blob file id {blob_id} (kept copy is intact): {e}"
+                    );
+                    discard.push((blob_path.clone(), reason.clone()));
+                    unreadable.push((blob_path, reason));
+                }
+            }
             continue;
         }
 
@@ -2639,51 +2684,47 @@ fn recover_blob_files(
         // punched file WHOLE — publishing handles that dereference the hole).
         // Everything downstream — identity, frame validation, the handle
         // rewrite — runs on it exactly as on a derived one.
-        let committed_frontier = committed_frontiers.and_then(|m| m.get(&blob_id).copied());
-        let frontier = match committed_frontier {
-            Some(committed) => committed,
-            None => match derive_blob_frontier(&config.fs, &blob_path, blob_id) {
-                Ok(BlobFrontier::Whole) => 0,
-                Ok(BlobFrontier::Punched(f)) => f,
-                Ok(BlobFrontier::FullyConsumed) => {
-                    // Every frame is punched away: the relocation that consumed
-                    // this file completed, only its removal lagged the crash.
-                    // QUEUE that lagged drop for after the commit instead of
-                    // finishing it here: the pre-commit scan is read-only on
-                    // purpose — an abort before the commit (a cancellation, a
-                    // transient failure on a later file) must leave the directory
-                    // exactly as found, and the OLD manifest of an explicitly
-                    // invoked repair over an openable tree may still name this
-                    // file. Publishing an empty-suffix handle instead is not an
-                    // option either: whole-file metadata over zero live frames is
-                    // a file blob GC's stale-byte arithmetic can never retire
-                    // (its frames are already gone, so the stale count never
-                    // reaches the recorded totals). No live data is discarded:
-                    // the walk proved the whole data section reads as zeros. The
-                    // post-commit removal failing fails the repair, exactly as
-                    // the immediate removal used to.
-                    log::info!(
-                        "blob file {blob_id} at {}: its punch consumed every frame — \
+        let frontier = match resolve_frontier(blob_id, &blob_path) {
+            Ok(BlobFrontier::Whole) => 0,
+            Ok(BlobFrontier::Punched(f)) => f,
+            Ok(BlobFrontier::FullyConsumed) => {
+                // Every frame is punched away: the relocation that consumed
+                // this file completed, only its removal lagged the crash.
+                // QUEUE that lagged drop for after the commit instead of
+                // finishing it here: the pre-commit scan is read-only on
+                // purpose — an abort before the commit (a cancellation, a
+                // transient failure on a later file) must leave the directory
+                // exactly as found, and the OLD manifest of an explicitly
+                // invoked repair over an openable tree may still name this
+                // file. Publishing an empty-suffix handle instead is not an
+                // option either: whole-file metadata over zero live frames is
+                // a file blob GC's stale-byte arithmetic can never retire
+                // (its frames are already gone, so the stale count never
+                // reaches the recorded totals). No live data is discarded:
+                // the walk proved the whole data section reads as zeros. The
+                // post-commit removal failing fails the repair, exactly as
+                // the immediate removal used to.
+                log::info!(
+                    "blob file {blob_id} at {}: its punch consumed every frame — \
                      queueing the relocation's lagged file drop for after the commit",
-                        blob_path.display(),
-                    );
-                    discard.push((
-                        blob_path,
-                        "fully punched blob file: a completed relocation's lagged drop".to_string(),
-                    ));
-                    continue;
-                }
-                // A TRANSIENT read (flaky I/O) is retryable: recording the blob
-                // unreadable commits a manifest without the still-in-place file,
-                // which the next open's orphan sweep then DELETES — permanent value
-                // loss from a one-shot failure. Propagate so a retry re-reads it,
-                // mirroring the table-recovery path.
-                Err(e) if is_environmental(&e) => return Err(e),
-                Err(e) => {
-                    discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
-                    continue;
-                }
-            },
+                    blob_path.display(),
+                );
+                discard.push((
+                    blob_path,
+                    "fully punched blob file: a completed relocation's lagged drop".to_string(),
+                ));
+                continue;
+            }
+            // A read failure in the ENVIRONMENT is retryable: recording the blob
+            // unreadable commits a manifest without the still-in-place file,
+            // which the next open's orphan sweep then DELETES — permanent value
+            // loss from a fixable failure. Propagate so a retry re-reads it,
+            // mirroring the table-recovery path.
+            Err(e) if is_environmental(&e) => return Err(e),
+            Err(e) => {
+                discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
+                continue;
+            }
         };
 
         // IDENTITY before content: the id under which this file will be
@@ -4027,6 +4068,23 @@ fn scan_table_folders(
                 p.table_discovered();
             }
 
+            // A CLEAN manifest record for this id carries the table's
+            // `global_seqno`: table files are immutable once published and
+            // ids are never reused, so the record's offset describes THIS
+            // logical table even when its bytes have since been damaged.
+            // Reusing it keeps a healthy bulk-ingested SST (and its real
+            // sequence position) where the manifest-loss rule would have to
+            // fail closed.
+            let manifest_global_seqno: Option<SeqNo> = manifest_referenced
+                .as_ref()
+                .and_then(|m| m.tables.get(&table_id))
+                .map(|t| t.global_seqno);
+            // What the committed manifest says about this id's restriction —
+            // authoritative in both directions (see `ManifestRestriction`).
+            let manifest_restriction = manifest_referenced
+                .as_ref()
+                .map_or(ManifestRestriction::Unknown, |m| m.restriction_of(table_id));
+
             // Skip a duplicate id ONLY when we already hold a COMPLETE copy — a
             // duplicate cannot improve on it. A previously-seen LOSSY salvage does
             // NOT skip: this copy is still evaluated and may supersede it.
@@ -4045,12 +4103,52 @@ fn scan_table_folders(
                 }
                 // A genuine duplicate: removed after the commit so recovery
                 // cannot later resolve it instead of the kept copy (the manifest
-                // records only id + checksum, not a path). A HEALTHY exclusion,
-                // not an unreadable file — the copy is valid, its content is
-                // already held.
-                let reason = "duplicate table id; a complete copy is already held";
-                excluded_files.push((table_path.clone(), reason.to_string()));
-                discard_after_commit.push((Arc::clone(&folder_fs), table_path, reason.to_string()));
+                // records only id + checksum, not a path). It cannot improve the
+                // rebuild, but the two report channels make DIFFERENT claims —
+                // `excluded_files` promises a file that opened and verified,
+                // `unreadable_files` is the corruption signal an operator
+                // watches. Inferring health from the RETAINED copy's fidelity
+                // would file a rotting duplicate as healthy and leave
+                // `unreadable == 0` over a failing disk, so verify this copy on
+                // its own bytes before choosing.
+                let verdict = match compute_table_checksum(&*folder_fs, &table_path) {
+                    Ok(c) => Table::recover(repair_recover_params(
+                        config,
+                        table_path.clone(),
+                        crate::Checksum::from_raw(c),
+                        table_id,
+                        folder_fs.clone(),
+                        manifest_global_seqno,
+                    ))
+                    .map(|_| ()),
+                    // Same split as the retained copy's read: a fault in the
+                    // ENVIRONMENT is not evidence about these bytes.
+                    Err(e) if is_environmental(&e) => return Err(e),
+                    Err(e) => Err(e),
+                };
+                match verdict {
+                    Ok(()) => {
+                        let reason = "duplicate table id; a complete copy is already held";
+                        excluded_files.push((table_path.clone(), reason.to_string()));
+                        discard_after_commit.push((
+                            Arc::clone(&folder_fs),
+                            table_path,
+                            reason.to_string(),
+                        ));
+                    }
+                    Err(e) => {
+                        let reason = format!(
+                            "damaged duplicate of table {table_id} (kept copy is intact): {e}"
+                        );
+                        set_aside_path(
+                            &folder_fs,
+                            &table_path,
+                            &reason,
+                            &mut unreadable_files,
+                            &mut discard_after_commit,
+                        );
+                    }
+                }
                 continue;
             }
 
@@ -4061,22 +4159,6 @@ fn scan_table_folders(
             // would then delete. Table::recover would fail on the same bytes, so
             // skip it; block salvage opens with a placeholder digest and drops
             // only the unreadable blocks.
-            // A CLEAN manifest record for this id carries the table's
-            // `global_seqno`: table files are immutable once published and
-            // ids are never reused, so the record's offset describes THIS
-            // logical table even when its bytes have since been damaged.
-            // Reusing it keeps a healthy bulk-ingested SST (and its real
-            // sequence position) where the manifest-loss rule would have to
-            // fail closed.
-            let manifest_global_seqno: Option<SeqNo> = manifest_referenced
-                .as_ref()
-                .and_then(|m| m.tables.get(&table_id))
-                .map(|t| t.global_seqno);
-            // What the committed manifest says about this id's restriction —
-            // authoritative in both directions (see `ManifestRestriction`).
-            let manifest_restriction = manifest_referenced
-                .as_ref()
-                .map_or(ManifestRestriction::Unknown, |m| m.restriction_of(table_id));
             let recovered = match compute_table_checksum(&*folder_fs, &table_path) {
                 Ok(c) => Table::recover(repair_recover_params(
                     config,

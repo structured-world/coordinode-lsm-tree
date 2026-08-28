@@ -4570,6 +4570,19 @@ impl Tree {
         // its error is the open's.
         let mut unrecovered_sightings: crate::HashMap<TableId, crate::Error> =
             crate::HashMap::default();
+        // Repair replacements whose authority could not be settled against the
+        // damaged original beside them. Held until every folder is scanned: a
+        // later routed copy that opens against the manifest settles it (the temp
+        // is then provably NOT what the manifest names, so it is swept there and
+        // then), and only an id no copy delivers surfaces its ambiguity.
+        // A LIST, not a per-id map: routing can put a temp for the same id in
+        // more than one folder, and each one is a file that has to be settled.
+        let mut deferred_temps: Vec<(
+            TableId,
+            crate::path::PathBuf,
+            Arc<dyn crate::fs::Fs>,
+            crate::Error,
+        )> = Vec::new();
 
         // Scan all configured table folders (primary + level routes).
         let all_folders = config.all_tables_folders();
@@ -4702,14 +4715,43 @@ impl Tree {
                         {
                             let published = match table_map.get(&tmp_id) {
                                 Some(&(_, manifest_checksum, _)) => {
-                                    crate::repair::repair_tmp_is_published(
+                                    match crate::repair::repair_tmp_is_published(
                                         config,
                                         folder_fs,
                                         &table_file_path,
                                         tmp_id,
                                         manifest_checksum,
                                         recovery.restrictions.get(&tmp_id),
-                                    )?
+                                    ) {
+                                        Ok(published) => published,
+                                        // A refused mount / missing key says
+                                        // nothing about which copy the manifest
+                                        // names: surface it.
+                                        Err(e) if e.is_environmental() => return Err(e),
+                                        // Neither this temp nor the damaged
+                                        // original beside it can prove it is the
+                                        // manifest's copy. A LATER routed folder
+                                        // may still hold that copy, and deciding
+                                        // here would end the open on a leftover a
+                                        // failed post-commit sweep left behind.
+                                        // Defer: leave the temp untouched, keep
+                                        // the ambiguity, and let the end of the
+                                        // scan decide (see `deferred_temps`).
+                                        Err(e) => {
+                                            log::warn!(
+                                                "repair replacement {} is ambiguous ({e}); \
+                                                 deferring until every routed folder is scanned",
+                                                table_file_path.display(),
+                                            );
+                                            deferred_temps.push((
+                                                tmp_id,
+                                                table_file_path,
+                                                Arc::clone(folder_fs),
+                                                e,
+                                            ));
+                                            continue;
+                                        }
+                                    }
                                 }
                                 None => false,
                             };
@@ -4880,6 +4922,31 @@ impl Tree {
             .find(|(id, _)| table_map.contains_key(id))
         {
             return Err(e);
+        }
+
+        // A deferred replacement whose id RECOVERED from some folder is settled:
+        // that copy matched the manifest, so this temp is provably NOT what the
+        // manifest names — an abandoned build, removed here exactly as the
+        // in-scan branch removes one. One whose id never arrived is still
+        // ambiguous: the temp may be the only copy of what the manifest
+        // describes, so the ambiguity is what the open reports.
+        #[cfg(feature = "std")]
+        for (tmp_id, temp_path, temp_fs, ambiguity) in deferred_temps {
+            if !recovered_table_ids.contains(&tmp_id) {
+                return Err(ambiguity);
+            }
+            log::warn!(
+                "Removing abandoned repair replacement for table {tmp_id} (the copy this open \
+                 recovered is what the manifest names): {}",
+                temp_path.display(),
+            );
+            // The restricted-salvage companion classifies as Foreign and would
+            // fail the next open, so it goes with the temp.
+            let companion = crate::restrict_bound::sidecar_path(&temp_path);
+            if temp_fs.exists(&companion)? {
+                Self::sweep_artifact(temp_fs.as_ref(), &companion)?;
+            }
+            Self::sweep_artifact(temp_fs.as_ref(), &temp_path)?;
         }
 
         if tables.len() < cnt {
