@@ -442,8 +442,9 @@ pub(crate) fn salvage_with_context(
             if attempt_owns_temp(&mid) {
                 discard_partial(fs, &mid_dest);
             }
-            // Return whichever attempt raised the transient error.
-            if matches!(&tail, Err(crate::Error::Io(e)) if e.kind().is_transient()) {
+            // Return whichever attempt raised the retryable error — the same
+            // environmental class the arbitration used to decide to propagate.
+            if matches!(&tail, Err(crate::Error::Io(e)) if e.kind().is_environmental()) {
                 tail
             } else {
                 mid
@@ -497,13 +498,14 @@ enum MirrorArbitration {
 }
 
 /// Chooses which divergent-mirror attempt to publish, or whether to propagate a
-/// transient failure so the caller retries.
+/// retryable failure so the caller retries.
 ///
-/// A TRANSIENT failure on one attempt must NOT lose to an INCOMPLETE success on
-/// the other: a retry of the transiently-failing mirror could recover the blocks
-/// the incomplete winner dropped, so propagate it. A COMPLETE success still wins
-/// (a retry cannot improve on it), and a PERSISTENT failure always loses to any
-/// success (a retry cannot help there). Between two successes the strictly more
+/// An ENVIRONMENTAL failure on one attempt must NOT lose to an INCOMPLETE
+/// success on the other: a retry of that mirror — after the ACL, the quota or
+/// the memory pressure is fixed — could recover the blocks the incomplete
+/// winner dropped, so propagate it. A COMPLETE success still wins (a retry
+/// cannot improve on it), and a failure that implicates the BYTES always loses
+/// to any success (a retry cannot help there). Between two successes the strictly more
 /// complete recovery wins; an exact tie keeps the tail copy (authoritative by
 /// convention — the recovered copy re-derives every authoritative field from the
 /// re-emitted entries, so the losing mirror's non-derivable metadata never
@@ -512,9 +514,15 @@ fn arbitrate_mirrors(
     tail: &crate::Result<SalvageReport>,
     mid: &crate::Result<SalvageReport>,
 ) -> MirrorArbitration {
-    let is_transient = |r: &crate::Result<SalvageReport>| matches!(r, Err(crate::Error::Io(e)) if e.kind().is_transient());
+    // The ENVIRONMENTAL class, the same one the divergence probe and every
+    // repair gate use: an ACL mistake or host pressure on ONE attempt says
+    // nothing about that mirror's bytes, so publishing the other attempt's
+    // INCOMPLETE result would commit a loss a fixed environment would not have
+    // taken. Only a failure that implicates the bytes loses to a partial
+    // success (a retry cannot improve on it).
+    let is_retryable = |r: &crate::Result<SalvageReport>| matches!(r, Err(crate::Error::Io(e)) if e.kind().is_environmental());
     let complete = |r: &crate::Result<SalvageReport>| matches!(r, Ok(rep) if rep.is_complete());
-    if (is_transient(tail) && !complete(mid)) || (is_transient(mid) && !complete(tail)) {
+    if (is_retryable(tail) && !complete(mid)) || (is_retryable(mid) && !complete(tail)) {
         return MirrorArbitration::Propagate;
     }
     // Completeness ranking: more recovered blocks first, then more recovered
@@ -1515,11 +1523,13 @@ fn salvage_blocks(
             // index is checksum-consistent but omits a block, salvage would then
             // publish the indexed subset and report a COMPLETE recovery while
             // losing the omitted keys. Abort so the caller retries. A PERSISTENT
-            // I/O failure (a retry cannot fix a bad sector / truncated trailer) or
-            // a STRUCTURAL trailer error is the genuine "no physical fallback" case
-            // (an unreadable TOC): fall back to the index enumeration alone, so the
-            // already-open table's indexed blocks stay recoverable.
-            Err(crate::sfa::Error::Io(e)) if e.kind().is_transient() => {
+            // I/O failure that implicates the BYTES (a bad sector / truncated
+            // trailer) or a STRUCTURAL trailer error is the genuine "no physical
+            // fallback" case (an unreadable TOC): fall back to the index
+            // enumeration alone, so the already-open table's indexed blocks stay
+            // recoverable. The ENVIRONMENTAL class propagates instead — an ACL
+            // mistake or host pressure says nothing about the trailer.
+            Err(crate::sfa::Error::Io(e)) if e.kind().is_environmental() => {
                 return Err(crate::Error::Io(e));
             }
             Err(_) => None,
@@ -1554,26 +1564,30 @@ fn salvage_blocks(
         };
         // A candidate is REAL only if its header frames AND its payload loads.
         // `Ok(Some)` = a framed, loaded block; `Ok(None)` = structurally not a
-        // block, or a PERSISTENTLY unreadable one (a header that did not frame, a
-        // payload that did not decode, or a bad-sector read a retry can't fix) —
-        // the gap walk treats it as a chain break and drops it. `Err(Io)` is
-        // reserved for a TRANSIENT read failure, propagated so a retryable fault
-        // is never mis-recorded as a permanently dropped gap.
-        let frames_and_loads = |at: u64,
-                                to: u64|
-         -> crate::Result<Option<crate::table::BlockHandle>> {
-            match table.probe_block_handle_in(&*probe_file, at, to) {
-                Ok(h) => match table.salvage_load_block(&h, probe_block_type) {
-                    Ok(_) => Ok(Some(h)),
-                    Err(crate::Error::Io(io)) if io.kind().is_transient() => {
+        // block, or one whose bytes are themselves unreadable (a header that did
+        // not frame, a payload that did not decode, a bad-sector read a retry
+        // can't fix) — the gap walk treats it as a chain break and drops it.
+        // `Err(Io)` is reserved for an ENVIRONMENTAL read failure: the same
+        // class every other gate uses, because a break here drops the candidate
+        // (or the whole unanchored tail) as permanently lost and lets repair
+        // publish the partial replacement over a source whose bytes were never
+        // proven corrupt.
+        let frames_and_loads =
+            |at: u64, to: u64| -> crate::Result<Option<crate::table::BlockHandle>> {
+                match table.probe_block_handle_in(&*probe_file, at, to) {
+                    Ok(h) => match table.salvage_load_block(&h, probe_block_type) {
+                        Ok(_) => Ok(Some(h)),
+                        Err(crate::Error::Io(io)) if io.kind().is_environmental() => {
+                            Err(crate::Error::Io(io))
+                        }
+                        Err(_) => Ok(None),
+                    },
+                    Err(crate::Error::Io(io)) if io.kind().is_environmental() => {
                         Err(crate::Error::Io(io))
                     }
                     Err(_) => Ok(None),
-                },
-                Err(crate::Error::Io(io)) if io.kind().is_transient() => Err(crate::Error::Io(io)),
-                Err(_) => Ok(None),
-            }
-        };
+                }
+            };
         // Returns `true` when the gap `[from, to)` tiled CONTIGUOUSLY to `to`
         // (so `to` is a proven boundary), `false` when the chain broke before
         // reaching it.
@@ -1730,13 +1744,14 @@ fn salvage_blocks(
                     // block instead (the lying handle's separator is just as
                     // untrusted as its span).
                     Ok(probed) => (probed, None),
-                    // Only a TRANSIENT read failure is retryable: propagate it
+                    // An ENVIRONMENTAL read failure is retryable: propagate it
                     // rather than surrender the block (and, when untrusted, the
-                    // whole tail) to a permanent drop over a flaky read. A
-                    // PERSISTENT read failure is not fixed by a retry, so it falls
-                    // through to the unframeable-header arm below and drops just
-                    // this block instead of aborting the whole salvage.
-                    Err(crate::Error::Io(io)) if io.kind().is_transient() => {
+                    // whole tail) to a permanent drop over a fault that says
+                    // nothing about the bytes. A read failure that DOES implicate
+                    // them is not fixed by a retry, so it falls through to the
+                    // unframeable-header arm below and drops just this block
+                    // instead of aborting the whole salvage.
+                    Err(crate::Error::Io(io)) if io.kind().is_environmental() => {
                         return Err(crate::Error::Io(io));
                     }
                     // The indexed block's header does not frame, so its size is

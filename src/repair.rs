@@ -942,22 +942,31 @@ fn keep_salvaged_replacement(
     id: TableId,
     table: Table,
     fs: &Arc<dyn crate::fs::Fs>,
-    table_path: PathBuf,
+    table_path: &std::path::Path,
     output_path: PathBuf,
 ) -> crate::Result<()> {
     let restricted = table.restrict_lower_bound().is_some();
+    // Queue the swap FIRST, then let `record_best` decide: if this candidate
+    // loses (rejected outright, or displaced later by an intact duplicate from
+    // another routed folder), that same call drops the swap again, so only a
+    // replacement the rebuilt manifest actually references is ever renamed.
+    swap_after_commit.push((
+        Arc::clone(fs),
+        output_path,
+        table_path.to_path_buf(),
+        restricted,
+    ));
     record_best(
         map,
         unreadable_files,
         discard_after_commit,
+        swap_after_commit,
         id,
         table,
         Fidelity::Salvaged,
         fs,
-        &table_path,
-    )?;
-    swap_after_commit.push((Arc::clone(fs), output_path, table_path, restricted));
-    Ok(())
+        table_path,
+    )
 }
 
 #[cfg(feature = "std")]
@@ -969,6 +978,13 @@ fn record_best(
     map: &mut crate::HashMap<TableId, TableCandidate>,
     unreadable_files: &mut Vec<(PathBuf, String)>,
     discard_after_commit: &mut Vec<(Arc<dyn crate::fs::Fs>, PathBuf, String)>,
+    // Queued swaps, so a candidate that LOSES here takes its own swap with it:
+    // a replacement the rebuilt manifest does not reference must not be renamed
+    // onto a name the manifest gives to another file, and a rename fault on a
+    // disposable temp would otherwise turn a good repair into
+    // `RepairedButUnopened`. A swap is keyed by the destination it publishes,
+    // which is exactly the losing candidate's own path.
+    swap_after_commit: &mut Vec<(Arc<dyn crate::fs::Fs>, PathBuf, PathBuf, bool)>,
     id: TableId,
     table: Table,
     fidelity: Fidelity,
@@ -992,6 +1008,8 @@ fn record_best(
             Some(kept) => same_physical_file(&*loser.fs, &loser.path, &*kept.fs, &kept.path)?,
             None => false,
         };
+        // The loser's replacement (if it built one) is never published.
+        swap_after_commit.retain(|(_, _, dest, _)| dest != &loser.path);
         if is_alias {
             return Ok(());
         }
@@ -4303,6 +4321,7 @@ fn scan_table_folders(
                                 &mut recovered_by_id,
                                 &mut unreadable_files,
                                 &mut discard_after_commit,
+                                &mut swap_after_commit,
                                 table_id,
                                 table,
                                 if geometry_lossy {
@@ -4387,7 +4406,7 @@ fn scan_table_folders(
                                         table_id,
                                         table,
                                         &folder_fs,
-                                        table_path,
+                                        &table_path,
                                         output_path,
                                     )?;
                                 }
@@ -4447,6 +4466,7 @@ fn scan_table_folders(
                                 &mut recovered_by_id,
                                 &mut unreadable_files,
                                 &mut discard_after_commit,
+                                &mut swap_after_commit,
                                 table_id,
                                 table,
                                 if geometry_lossy {
@@ -4579,7 +4599,7 @@ fn scan_table_folders(
                                 table_id,
                                 table,
                                 &folder_fs,
-                                table_path,
+                                &table_path,
                                 output_path,
                             )?;
                         }

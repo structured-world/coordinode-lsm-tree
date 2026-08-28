@@ -7411,6 +7411,94 @@ fn build_blob(
     Ok(())
 }
 
+/// The PREPASS twin: the physical tiling walk that discovers blocks must
+/// propagate an environmental read too. A break in that chain drops the
+/// candidate — and, past an untrusted index, the whole unanchored tail — as
+/// permanently lost, so repair publishes the partial replacement and removes
+/// a source whose bytes were never proven corrupt. The sweep drives a
+/// corrupt table (which forces the physical walk) with a one-shot
+/// `PermissionDenied` at increasing skip counts.
+#[test]
+fn an_environmental_read_never_breaks_the_physical_tiling_silently() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let mut fault_reached_the_walk = false;
+    for skip in 0..48u64 {
+        let dir = tempdir()?;
+        let source = dir.path().join("source");
+        let dest = dir.path().join("salvaged");
+        let plain: Arc<dyn Fs> = Arc::new(StdFs);
+        {
+            let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&plain))?
+                .use_data_block_size(128)
+                .use_partitioned_index();
+            for i in 0..256u32 {
+                writer.write(iv(i))?;
+            }
+            assert!(writer.finish()?.is_some(), "the source SST is non-empty");
+        }
+        // Break the INDEX section: enumeration stops partway and the salvage
+        // falls back to the physical tiling walk, which is the path under test.
+        {
+            let (index_pos, index_len) = {
+                let mut f = std::fs::File::open(&source)?;
+                let reader = crate::sfa::Reader::from_reader(&mut f)?;
+                let Some((pos, len)) = reader
+                    .toc()
+                    .iter()
+                    .find(|e| e.name() == b"index")
+                    .map(|e| (e.pos(), e.len()))
+                else {
+                    panic!("the SST carries an index section");
+                };
+                (pos, len)
+            };
+            let Ok(flip) = usize::try_from(index_pos + index_len / 2) else {
+                panic!("the index-section offset fits usize");
+            };
+            let mut bytes = std::fs::read(&source)?;
+            if let Some(b) = bytes.get_mut(flip) {
+                *b ^= 0xFF;
+            }
+            std::fs::write(&source, &bytes)?;
+        }
+
+        let fault = FaultFs::new(StdFs);
+        fault.injector().arm(
+            FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
+                .skip(skip)
+                .times(1),
+        );
+        let fs: Arc<dyn Fs> = Arc::new(fault);
+        match salvage_sst(&source, dest, &fs) {
+            Ok(report) => {
+                assert!(
+                    !report
+                        .dropped
+                        .iter()
+                        .any(|d| format!("{:?}", d.reason).contains("PermissionDenied")),
+                    "an environmental failure must never be recorded as a \
+                     dropped block (skip {skip}): {report:?}",
+                );
+            }
+            Err(e) => {
+                assert!(
+                    matches!(&e, crate::Error::Io(io) if io.kind() == ErrorKind::PermissionDenied),
+                    "the only acceptable failure is the propagated \
+                     environmental error (skip {skip}): {e:?}",
+                );
+                fault_reached_the_walk = true;
+            }
+        }
+    }
+    assert!(
+        fault_reached_the_walk,
+        "no skip count reached the salvage read path; the sweep proves nothing",
+    );
+    Ok(())
+}
+
 /// The SST twin: an ENVIRONMENTAL data-block read failure must PROPAGATE,
 /// never be recorded as a dropped block. The metadata and index are readable,
 /// so the walk reaches the block reads; a `PermissionDenied` there is an ACL

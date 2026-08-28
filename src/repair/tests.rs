@@ -11089,6 +11089,78 @@ fn a_clean_manifest_tree_type_refuses_a_contradicting_repair() -> crate::Result<
     Ok(())
 }
 
+/// A DISPLACED salvage takes its queued swap with it. Two routed folders can
+/// each hold a copy of one id: the first is damaged and salvaged, the second
+/// is intact and wins. The rebuilt manifest then references the intact copy,
+/// so the loser's replacement must never be renamed onto that name — a
+/// rename-only fault on a disposable temp would otherwise turn a good repair
+/// into `RepairedButUnopened` and skip the rest of the cleanup.
+#[test]
+fn a_displaced_salvage_drops_its_queued_swap() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{InternalValue, ValueType};
+    use std::sync::Arc;
+
+    let fs: Arc<dyn Fs> = Arc::new(MemFs::new());
+    let dir = std::path::absolute("/displaced")?;
+    fs.create_dir_all(&dir)?;
+    let build = |name: &str| -> crate::Result<crate::table::Table> {
+        let path = dir.join(name);
+        let mut w = crate::table::Writer::new(path.clone(), 0, 0, Arc::clone(&fs))?;
+        w.write(InternalValue::from_components(
+            b"k".to_vec(),
+            b"v".to_vec(),
+            1,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "the table is non-empty");
+        recover_sst(path, &fs)
+    };
+    let salvaged = build("salvaged_source")?;
+    let intact = build("intact")?;
+    let salvaged_source = (*salvaged.path).clone();
+
+    let mut map = crate::HashMap::default();
+    let mut unreadable = Vec::new();
+    let mut discard = Vec::new();
+    let mut swaps = Vec::new();
+
+    // The salvage of the damaged copy queues its swap...
+    super::keep_salvaged_replacement(
+        &mut map,
+        &mut unreadable,
+        &mut discard,
+        &mut swaps,
+        0,
+        salvaged,
+        &fs,
+        &salvaged_source,
+        dir.join("salvaged_source.repair-tmp"),
+    )?;
+    assert_eq!(swaps.len(), 1, "the salvage queued its swap");
+
+    // ...and the INTACT duplicate then displaces it.
+    super::record_best(
+        &mut map,
+        &mut unreadable,
+        &mut discard,
+        &mut swaps,
+        0,
+        intact,
+        super::Fidelity::Complete,
+        &fs,
+        &dir.join("intact"),
+    )?;
+    assert!(
+        swaps.is_empty(),
+        "the displaced salvage's swap must go with it — the manifest now names \
+         the intact copy, so publishing the replacement onto that name is wrong \
+         (still queued: {})",
+        swaps.len(),
+    );
+    Ok(())
+}
+
 /// Between two LOSSY copies of one id, the MORE COMPLETE one is kept. Two
 /// routed folders can each hold a damaged copy of the same table, and their
 /// salvages recover different amounts: keeping whichever was scanned first
