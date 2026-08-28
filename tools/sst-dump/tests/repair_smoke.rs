@@ -63,6 +63,11 @@ fn repair_rebuilds_manifest_and_db_reopens() -> Result<(), Box<dyn std::error::E
         stdout.contains("manifest rebuilt"),
         "unexpected output: {stdout}",
     );
+    assert!(
+        stdout.contains("wal replay:    tail only"),
+        "a lossless repair must still state the replay obligation, so an \
+         external-WAL operator never has to infer it: {stdout}",
+    );
 
     // The DB must reopen and serve every key after the rebuild.
     let tree = Config::new(
@@ -75,6 +80,67 @@ fn repair_rebuilds_manifest_and_db_reopens() -> Result<(), Box<dyn std::error::E
         let got = tree.get(format!("key-{i:06}"), MAX_SEQNO)?;
         assert_eq!(got.as_deref(), Some(format!("value-{i}").as_bytes()));
     }
+
+    Ok(())
+}
+
+/// A repair that drops a table regresses persisted state below an external
+/// WAL's trim watermark, so the tail replay that watermark implies is no
+/// longer sufficient. The CLI is the operator's whole view of the repair:
+/// if it reports success without naming that obligation, the replay stops at
+/// the tail and superseded or deleted values stay visible.
+#[test]
+fn repair_prints_the_wal_replay_obligation_when_coverage_is_lost()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+
+    {
+        let tree = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0u64..50 {
+            tree.insert(format!("key-{i:06}"), format!("value-{i}"), 1 + i);
+        }
+        tree.flush_active_memtable(0)?;
+        for i in 50u64..100 {
+            tree.insert(format!("key-{i:06}"), format!("value-{i}"), 1 + i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    nuke_manifest(dir.path())?;
+
+    // Truncate one table to nothing readable: its metadata never parses, so
+    // repair cannot scope the loss by seqno at all.
+    let victim = std::fs::read_dir(dir.path().join("tables"))?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .min()
+        .ok_or("the tree wrote at least one table")?;
+    std::fs::write(&victim, b"not an sst")?;
+
+    let out = Command::new(SST_DUMP_BIN)
+        .arg(dir.path())
+        .arg("repair")
+        .output()?;
+    assert!(
+        out.status.success(),
+        "repair should exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("wal replay:    REQUIRED"),
+        "the lost coverage must be reported as a replay obligation: {stdout}",
+    );
+    assert!(
+        stdout.contains("unscopable") || stdout.contains("lost "),
+        "the obligation must name the affected file: {stdout}",
+    );
 
     Ok(())
 }

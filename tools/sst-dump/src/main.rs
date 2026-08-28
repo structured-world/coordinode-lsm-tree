@@ -343,9 +343,59 @@ fn run_repair(db_dir: &std::path::Path, salvage: bool) -> ExitCode {
     for warning in &report.warnings {
         println!("warning:       {warning}");
     }
+    print_wal_replay_obligation(&report);
     println!("status:        manifest rebuilt");
 
     ExitCode::SUCCESS
+}
+
+/// Prints what an external write-ahead log must replay after this repair.
+///
+/// A repair that drops or lossily salvages a table regresses persisted state
+/// BELOW the log's trim watermark, so the usual "replay the tail" is not
+/// enough — and an operator reading only `status: manifest rebuilt` would
+/// stop there and leave superseded or deleted values visible. The obligation
+/// is therefore printed on every repair, including the common case where it
+/// is nothing.
+fn print_wal_replay_obligation(report: &lsm_tree::RepairReport) {
+    use lsm_tree::WalReplayScope;
+
+    match report.wal_replay_scope() {
+        WalReplayScope::TailOnly => {
+            println!("wal replay:    tail only (no coverage was lost)");
+        }
+        WalReplayScope::LostUpTo(bound) => {
+            println!(
+                "wal replay:    REQUIRED — replay every retained record with seqno <= {bound} \
+                 whose key falls in a range below, in addition to the usual tail",
+            );
+        }
+        WalReplayScope::FullHistory => {
+            println!(
+                "wal replay:    REQUIRED — a loss could not be scoped by seqno, so the ENTIRE \
+                 retained history of the ranges below must be replayed",
+            );
+        }
+    }
+    for (path, lo, hi, bound) in &report.lost_coverage {
+        let bound = match bound {
+            Some(b) => format!("seqno <= {b}"),
+            None => "seqno bound lost".to_string(),
+        };
+        println!(
+            "  lost {} — {} .. {} ({bound})",
+            path.display(),
+            format_key(lo),
+            format_key(hi),
+        );
+    }
+    for path in &report.unknowable_losses {
+        println!(
+            "  unscopable {} — its metadata never parsed, so neither the affected key range \
+             nor a seqno bound is known",
+            path.display(),
+        );
+    }
 }
 
 fn run_salvage(
