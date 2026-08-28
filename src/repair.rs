@@ -3606,7 +3606,6 @@ fn repair_tree(
         sweep_superseded_by_committed_manifest(config)?;
     #[cfg(not(feature = "std"))]
     let manifest_referenced: Option<CommittedManifest> = None;
-    let mut scanned_table_ids: crate::HashSet<TableId> = crate::HashSet::default();
 
     // Byte totals for the progress percentage, from an upfront listing —
     // before the scan phase starts, so `bytes_processed / bytes_total` is
@@ -3615,6 +3614,69 @@ fn repair_tree(
     if let Some(p) = &config.recovery_progress {
         p.set_phase(crate::RecoveryPhase::ScanningTables);
     }
+
+    // Phase 1: read every table folder and decide, per file, what it is and
+    // whether it can be published. Read-only on disk — nothing is removed or
+    // swapped until the rebuilt manifest is durable, so an abort here leaves
+    // the directory exactly as the retry expects it.
+    let scan = scan_table_folders(
+        config,
+        salvage,
+        allow_resurrection,
+        manifest_referenced.as_ref(),
+    )?;
+
+    // Phase 2: turn what the scan found into a manifest, commit it, and carry
+    // out the removals and swaps that commit authorizes. The directory lock is
+    // held by THIS frame for the whole of it.
+    rebuild_from_scan(config, allow_resurrection, manifest_referenced, scan)
+}
+
+/// Everything [`scan_table_folders`] learned from the table folders, and the
+/// only channel between the scan and the rebuild.
+///
+/// The scan's own bookkeeping ends here: a name it classified, a file it could
+/// not read, a replacement it built. Nothing else it touched survives the
+/// phase boundary, so the rebuild cannot accidentally depend on a scan
+/// intermediate.
+#[cfg(feature = "std")]
+struct TableScan {
+    /// Best recovered copy per table id (a complete recovery beats a lossy
+    /// salvage).
+    recovered_by_id: crate::HashMap<TableId, TableCandidate>,
+    /// Files the rebuild must report as damaged.
+    unreadable_files: Vec<(PathBuf, String)>,
+    /// HEALTHY files the rebuild deliberately leaves out.
+    excluded_files: Vec<(PathBuf, String)>,
+    /// What each scanned table covers, captured while its metadata was
+    /// readable.
+    coverage_by_path: crate::HashMap<PathBuf, (UserKey, UserKey, Option<SeqNo>)>,
+    /// Files to remove once the rebuilt manifest is durable.
+    discard_after_commit: Vec<(Arc<dyn crate::fs::Fs>, PathBuf, String)>,
+    /// Replacements to swap onto their final names once it is.
+    swap_after_commit: Vec<(Arc<dyn crate::fs::Fs>, PathBuf, PathBuf, bool)>,
+    /// Sidecars found beside tables, judged against the FINAL rebuilt set.
+    live_sidecars: Vec<(TableId, PathBuf, Arc<dyn crate::fs::Fs>)>,
+    /// Every table id the scan actually SAW on disk, joined against the
+    /// committed manifest to report ids whose file is gone entirely.
+    scanned_table_ids: crate::HashSet<TableId>,
+}
+
+/// Phase 1 of [`repair_tree`]: classify every entry of every table folder and
+/// recover what can be recovered. See [`TableScan`] for what it hands on.
+///
+/// # Errors
+///
+/// Propagates an environmental failure (the retry re-reads the same bytes) and
+/// any failure that must abort the whole repair rather than grade one file.
+#[cfg(feature = "std")]
+fn scan_table_folders(
+    config: &Config,
+    salvage: bool,
+    allow_resurrection: bool,
+    manifest_referenced: Option<&CommittedManifest>,
+) -> crate::Result<TableScan> {
+    let mut scanned_table_ids: crate::HashSet<TableId> = crate::HashSet::default();
 
     // Best recovered copy per table id: a complete recovery beats a lossy salvage,
     // so a duplicate id across aliased / routed table folders keeps only the best
@@ -4478,6 +4540,47 @@ fn repair_tree(
         }
     }
 
+    Ok(TableScan {
+        recovered_by_id,
+        unreadable_files,
+        excluded_files,
+        coverage_by_path,
+        discard_after_commit,
+        swap_after_commit,
+        live_sidecars,
+        scanned_table_ids,
+    })
+}
+
+/// Phase 2 of [`repair_tree`]: build a manifest from what the scan recovered,
+/// commit it, and carry out exactly the removals and swaps that commit
+/// authorizes.
+///
+/// The caller holds the directory lock for the whole of this.
+///
+/// # Errors
+///
+/// Propagates the commit failure. A failure AFTER the commit surfaces as
+/// [`crate::Error::RepairedButUnopened`] carrying the finished report — the
+/// repair is durable, so the obligation it names must not be lost.
+#[cfg(feature = "std")]
+fn rebuild_from_scan(
+    config: &Config,
+    allow_resurrection: bool,
+    manifest_referenced: Option<CommittedManifest>,
+    scan: TableScan,
+) -> crate::Result<RepairReport> {
+    let TableScan {
+        recovered_by_id,
+        mut unreadable_files,
+        mut excluded_files,
+        coverage_by_path,
+        mut discard_after_commit,
+        mut swap_after_commit,
+        live_sidecars,
+        scanned_table_ids,
+    } = scan;
+
     // Collect the best copy per id, carrying each candidate's completeness so
     // `salvaged` can be derived from the tables that actually make the
     // manifest — after the blob-dependency filtering below, not before (a
@@ -4530,7 +4633,7 @@ fn repair_tree(
     // an error, a cancellation — before the manifest commit disarms the
     // guard (see `PublishedBlobReplacements`).
     let mut published_blob_replacements = PublishedBlobReplacements::new(config);
-    let mut blob_files_salvaged: Vec<(PathBuf, String)> = Vec::new();
+    let blob_files_salvaged: Vec<(PathBuf, String)> = Vec::new();
     let mut blob_frag = crate::blob_tree::FragmentationMap::default();
     // Damaged blob originals whose replacement is in the rebuilt manifest.
     // Set aside only after `persist_version` — see `BlobRecovery::stale`.
@@ -5410,6 +5513,101 @@ fn repair_tree(
         }
     }
     let recovered_tables: Vec<Table> = recovered_tables.into_iter().map(|(t, ..)| t).collect();
+    publish_repaired_manifest(
+        config,
+        RepairPublication {
+            recovered_tables,
+            tree_type,
+            blob_file_list,
+            blob_frag,
+            published_blob_replacements,
+            unreadable_files,
+            excluded_files,
+            lost_coverage_scoped: (
+                salvaged_coverage,
+                ambiguous_order_coverage,
+                lineage_partial,
+                salvaged_unknowable,
+            ),
+            coverage_by_path,
+            manifest_referenced,
+            scanned_table_ids,
+            discard_after_commit,
+            swap_after_commit,
+            stale_blob_originals,
+            unreferenced_blob_files,
+            blob_files_salvaged,
+            salvaged,
+        },
+    )
+}
+
+/// Everything [`publish_repaired_manifest`] needs: the tables that made it
+/// through, and every list whose contents the commit either authorizes to be
+/// carried out (removals, swaps) or must be reported.
+#[cfg(feature = "std")]
+struct RepairPublication<'a> {
+    recovered_tables: Vec<Table>,
+    tree_type: TreeType,
+    blob_file_list: BlobFileList,
+    blob_frag: crate::blob_tree::FragmentationMap,
+    published_blob_replacements: PublishedBlobReplacements<'a>,
+    unreadable_files: Vec<(PathBuf, String)>,
+    excluded_files: Vec<(PathBuf, String)>,
+    #[expect(clippy::type_complexity, reason = "the four coverage channels")]
+    lost_coverage_scoped: (
+        Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)>,
+        Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)>,
+        Vec<(TableId, PathBuf, UserKey, UserKey, Option<SeqNo>, bool)>,
+        Vec<PathBuf>,
+    ),
+    coverage_by_path: crate::HashMap<PathBuf, (UserKey, UserKey, Option<SeqNo>)>,
+    manifest_referenced: Option<CommittedManifest>,
+    scanned_table_ids: crate::HashSet<TableId>,
+    discard_after_commit: Vec<(Arc<dyn crate::fs::Fs>, PathBuf, String)>,
+    swap_after_commit: Vec<(Arc<dyn crate::fs::Fs>, PathBuf, PathBuf, bool)>,
+    stale_blob_originals: Vec<(PathBuf, String)>,
+    unreferenced_blob_files: Vec<PathBuf>,
+    blob_files_salvaged: Vec<(PathBuf, String)>,
+    salvaged: usize,
+}
+
+/// Phase 3 of [`repair_tree`]: commit the rebuilt manifest, then carry out
+/// exactly what that commit authorizes and assemble the report.
+///
+/// The commit is the pivot: before it the directory is untouched and any
+/// failure leaves the retry the same bytes; after it the manifest is durable,
+/// so a failure carries the finished report out through
+/// [`crate::Error::RepairedButUnopened`] rather than discarding it.
+///
+/// # Errors
+///
+/// Propagates the commit failure, or wraps a post-commit one with the report.
+#[cfg(feature = "std")]
+fn publish_repaired_manifest(
+    config: &Config,
+    publication: RepairPublication<'_>,
+) -> crate::Result<RepairReport> {
+    let RepairPublication {
+        recovered_tables,
+        tree_type,
+        blob_file_list,
+        blob_frag,
+        mut published_blob_replacements,
+        unreadable_files,
+        excluded_files,
+        lost_coverage_scoped:
+            (salvaged_coverage, ambiguous_order_coverage, lineage_partial, salvaged_unknowable),
+        coverage_by_path,
+        manifest_referenced,
+        scanned_table_ids,
+        discard_after_commit,
+        swap_after_commit,
+        stale_blob_originals,
+        unreferenced_blob_files,
+        mut blob_files_salvaged,
+        salvaged,
+    } = publication;
     // A rebuilt manifest whose highest table id is the LAST one cannot be
     // committed: the next open seeds its id allocator with `highest + 1`,
     // which overflows — a panic in checked builds, a wrap to an existing low
