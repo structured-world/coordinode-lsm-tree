@@ -7235,6 +7235,21 @@ fn write_three_frame_blob(
     Ok(())
 }
 
+/// Opens the file's meta section and runs the frame validation over it, the
+/// way `recover_blob_files` does — it already holds that handle for the
+/// identity check, so the validation takes it rather than re-reading the same
+/// section per file.
+fn validate_frames(
+    config: &crate::Config,
+    path: &std::path::Path,
+    blob_id: crate::vlog::BlobFileId,
+    live_data_start: u64,
+) -> crate::Result<Option<super::BlobLiveTotals>> {
+    let handle =
+        crate::vlog::recover_blob_file(path, blob_id, crate::Checksum::from_raw(0), 0, &config.fs)?;
+    super::validate_blob_frames(config, path, blob_id, live_data_start, &handle)
+}
+
 fn blob_validation_config(memfs: std::sync::Arc<crate::fs::MemFs>) -> crate::Config {
     crate::Config::new(
         std::path::PathBuf::from("/db"),
@@ -7358,7 +7373,7 @@ fn blob_frame_validation_rejects_reordered_frames() -> crate::Result<()> {
 
     let config = blob_validation_config(memfs);
     assert!(
-        super::validate_blob_frames(&config, &path, 0, 0)?.is_none(),
+        validate_frames(&config, &path, 0, 0)?.is_none(),
         "reordered (individually valid) frames must fail validation",
     );
     Ok(())
@@ -7436,7 +7451,7 @@ fn blob_frame_validation_rejects_a_restamped_compressed_payload() -> crate::Resu
 
     let config = blob_validation_config(memfs);
     assert!(
-        super::validate_blob_frames(&config, &path, 0, 0)?.is_none(),
+        validate_frames(&config, &path, 0, 0)?.is_none(),
         "a checksum-restamped, undecodable compressed payload must fail validation",
     );
     Ok(())
@@ -7500,7 +7515,7 @@ fn blob_frame_validation_rejects_lying_metadata_counters() -> crate::Result<()> 
 
     let config = blob_validation_config(memfs);
     assert!(
-        super::validate_blob_frames(&config, &victim, 0, 0)?.is_none(),
+        validate_frames(&config, &victim, 0, 0)?.is_none(),
         "metadata counters disagreeing with the scanned frames must fail validation",
     );
     Ok(())
@@ -7545,7 +7560,7 @@ fn blob_frame_validation_rejects_understated_metadata_on_a_punched_file() -> cra
 
     let config = blob_validation_config(Arc::clone(&memfs));
     assert!(
-        super::validate_blob_frames(&config, &victim, 0, suffix_start)?.is_some(),
+        validate_frames(&config, &victim, 0, suffix_start)?.is_some(),
         "fixture: the untampered punched file must pass validation",
     );
 
@@ -7577,7 +7592,7 @@ fn blob_frame_validation_rejects_understated_metadata_on_a_punched_file() -> cra
     }
 
     assert!(
-        super::validate_blob_frames(&config, &victim, 0, suffix_start)?.is_none(),
+        validate_frames(&config, &victim, 0, suffix_start)?.is_none(),
         "metadata understating the live suffix must fail validation on a punched file",
     );
     Ok(())
@@ -7647,7 +7662,7 @@ fn blob_frame_validation_rejects_a_range_not_containing_the_punched_suffix() -> 
 
     let config = blob_validation_config(memfs);
     assert!(
-        super::validate_blob_frames(&config, &victim, 0, suffix_start)?.is_none(),
+        validate_frames(&config, &victim, 0, suffix_start)?.is_none(),
         "a key range not containing the scanned suffix must fail validation \
          even when the item and byte totals satisfy the lower bounds",
     );

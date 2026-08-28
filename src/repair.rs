@@ -2194,12 +2194,13 @@ fn validate_blob_frames(
     path: &std::path::Path,
     blob_id: crate::vlog::BlobFileId,
     live_data_start: u64,
+    // The handle the caller already opened for the identity check: its meta
+    // section carries both the compression descriptor and the recorded
+    // totals this cross-check needs, so re-opening it here read the same
+    // section twice per file.
+    handle: &crate::vlog::BlobFile,
 ) -> crate::Result<Option<BlobLiveTotals>> {
     let fs = &config.fs;
-    // Metadata + compression via a placeholder-checksum open (the handle is
-    // never read through; `recover_blob_file` only stores the checksum).
-    let handle =
-        crate::vlog::recover_blob_file(path, blob_id, crate::Checksum::from_raw(0), 0, fs)?;
     let compression = handle.compression();
     let comparator = &config.comparator;
 
@@ -2660,37 +2661,38 @@ fn recover_blob_files(
         // same key, silently serves another generation's value). Salvage is
         // the WRONG remedy here (it would re-emit the foreign records under
         // the filename's id, laundering the swap); set the file aside.
-        {
-            // Placeholder-checksum open (stored, never verified). Same
-            // transient/persistent split as every other per-file step: an
-            // unreadable meta section sets THIS file aside, never the repair.
-            let handle = match crate::vlog::recover_blob_file(
-                &blob_path,
-                blob_id,
-                crate::Checksum::from_raw(0),
-                0,
-                &config.fs,
-            ) {
-                Ok(handle) => handle,
-                Err(e) if is_environmental(&e) => return Err(e),
-                Err(e) => {
-                    discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
-                    continue;
-                }
-            };
-            let stored = handle.meta().id;
-            if stored != blob_id {
-                let e = crate::Error::InvalidHeader(
-                    "blob file's stored metadata id disagrees with its file name",
-                );
-                log::warn!(
-                    "blob file at {}: metadata records id {stored}, file name says \
-                     {blob_id} — a renamed or swapped file; setting it aside",
-                    blob_path.display(),
-                );
+        // Placeholder-checksum open (stored, never verified). Same
+        // transient/persistent split as every other per-file step: an
+        // unreadable meta section sets THIS file aside, never the repair.
+        // Read ONCE and kept: the identity check needs the stored id and the
+        // frame validation below needs the compression descriptor, and both
+        // live in this same meta section.
+        let handle = match crate::vlog::recover_blob_file(
+            &blob_path,
+            blob_id,
+            crate::Checksum::from_raw(0),
+            0,
+            &config.fs,
+        ) {
+            Ok(handle) => handle,
+            Err(e) if is_environmental(&e) => return Err(e),
+            Err(e) => {
                 discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
                 continue;
             }
+        };
+        let stored = handle.meta().id;
+        if stored != blob_id {
+            let e = crate::Error::InvalidHeader(
+                "blob file's stored metadata id disagrees with its file name",
+            );
+            log::warn!(
+                "blob file at {}: metadata records id {stored}, file name says \
+                 {blob_id} — a renamed or swapped file; setting it aside",
+                blob_path.display(),
+            );
+            discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
+            continue;
         }
 
         // Validate the live frame range BEFORE recording a digest: hashing
@@ -2711,7 +2713,8 @@ fn recover_blob_files(
         // removed only AFTER the commit: removing it earlier would make a
         // crashed attempt leave SSTs referencing a blob id that no longer
         // exists, and the retry would record those tables unrecoverable.
-        let Some(live) = validate_blob_frames(config, &blob_path, blob_id, frontier)? else {
+        let Some(live) = validate_blob_frames(config, &blob_path, blob_id, frontier, &handle)?
+        else {
             // An INVALID blob no recovered table references never reaches the
             // manifest: salvaging it would allocate a fresh id and burn disk
             // space on a replacement the reference filter deletes anyway —
