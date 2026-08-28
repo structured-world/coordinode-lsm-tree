@@ -1509,6 +1509,80 @@ fn salvage_propagates_a_transient_open_failure_from_the_mirror_probe() -> crate:
     Ok(())
 }
 
+/// The ENVIRONMENTAL counterpart: a `PermissionDenied` (or any access failure
+/// that does not implicate the bytes) while reading ONE metadata mirror must
+/// propagate too, not fall through to "mirrors agree". Falling through skips
+/// arbitration and salvages from the remaining mirror alone — and if that one
+/// only supports a partial recovery, the repair publishes the lossy result
+/// even though a fixed environment would have recovered more from the other.
+///
+/// `lz4`-gated: the divergent mirror is forged via `compression#data` → Lz4.
+#[cfg(feature = "lz4")]
+#[test]
+fn salvage_propagates_an_environmental_failure_from_the_mirror_probe() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0u64..100 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            format!("val-{i:03}").into_bytes(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+    crate::test_forge::forge_tail_meta_value(&source, b"compression#data", &[1])?;
+
+    // Fault the positioned reads the probe makes on the mirrors themselves —
+    // one mirror unreadable, the other fine — sweeping the skip count so the
+    // fault lands inside the probe wherever its reads fall.
+    let mut reached = false;
+    for skip in 0..24u64 {
+        injector.clear();
+        injector.arm(
+            FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
+                .on_path("source")
+                .skip(skip)
+                .times(1),
+        );
+        let options = SalvageOptions {
+            encryption: None,
+            #[cfg(zstd_any)]
+            zstd_dictionary: None,
+            table_id: 0,
+            expected_stored_id: None,
+            output_id: None,
+            allow_delete_resurrection: false,
+            sync_mode: crate::fs::SyncMode::Normal,
+            prefix_extractor: None,
+            blob_rewrite: None,
+            progress: None,
+        };
+        match super::meta_mirrors_diverge(&source, &fs, &options) {
+            Ok(_) => {}
+            Err(crate::Error::Io(io)) if io.kind() == ErrorKind::PermissionDenied => {
+                reached = true;
+            }
+            Err(e) => panic!("unexpected probe failure at skip {skip}: {e:?}"),
+        }
+    }
+    assert!(
+        reached,
+        "no skip count made the probe read a mirror; the sweep proves nothing",
+    );
+    let _ = dest;
+    Ok(())
+}
+
 /// A PRE-EXISTING destination must survive a divergent-mirror salvage: the
 /// tail attempt correctly fails its `create_new` open, but the MID attempt
 /// writes to a sibling temp path and wins the arbitration — publishing it
@@ -8939,7 +9013,13 @@ fn salvage_blob_file_rejects_a_dictionary_compressed_source() -> crate::Result<(
                 #[cfg(zstd_any)]
                 None
             ),
-            Err(crate::Error::FeatureUnsupported(_)),
+            // The SAME error a wrong dictionary raises, with `got: None`:
+            // both are a mis-supplied recovery context, and repair
+            // propagates that class instead of grading the file damaged.
+            Err(crate::Error::ZstdDictMismatch {
+                expected: 7,
+                got: None
+            }),
         ),
         "a dictionary-compressed blob file must be rejected rather than mis-salvaged",
     );

@@ -10857,6 +10857,96 @@ fn a_clean_manifest_record_preserves_a_bulk_ingested_offset() -> crate::Result<(
     Ok(())
 }
 
+/// A repair run WITHOUT the tree's zstd dictionary must fail, not delete the
+/// blob file it cannot read. A missing (or wrong) dictionary is the caller
+/// supplying the wrong recovery context: every frame fails to decompress
+/// identically, and grading them corrupt "salvages" an intact file into
+/// nothing, drops the tables referencing it, and lets the cleanup remove all
+/// of it. The operator must be able to re-run with the right dictionary.
+#[cfg(zstd_any)]
+#[test]
+fn a_repair_without_the_dictionary_never_discards_the_blob_file() -> crate::Result<()> {
+    use crate::compression::ZstdDictionary;
+    use crate::fs::{Fs, MemFs};
+    use crate::{
+        AbstractTree, CompressionType, Config, KvSeparationOptions, SequenceNumberCounter,
+    };
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db_no_dict")?;
+    let samples: alloc::vec::Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+    let dict = Arc::new(ZstdDictionary::new(&samples));
+    let with_dict = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .zstd_dictionary(Some(Arc::clone(&dict)))
+        .with_kv_separation(Some(
+            KvSeparationOptions::default()
+                .separation_threshold(16)
+                .compression(CompressionType::ZstdDict {
+                    level: 3,
+                    dict_id: dict.id(),
+                })
+                .dict(Arc::clone(&dict)),
+        ))
+    };
+    {
+        let tree = match with_dict().open()? {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        for i in 0..8u32 {
+            tree.insert(format!("k{i:04}").as_bytes(), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+        tree.insert(b"zzz", vec![b'w'; 64], 100);
+        tree.flush_active_memtable(0)?;
+    }
+    // Repair entered over a missing table — but run WITHOUT the dictionary.
+    memfs.remove_file(&root.join("tables").join("1"))?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let blob_count = memfs.read_dir(&blobs)?.len();
+
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs.clone())
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .repair_with_salvage(true);
+    assert!(
+        result.is_err(),
+        "a repair without the dictionary must fail closed, not report success \
+         over a file it could not read: {result:?}",
+    );
+    assert_eq!(
+        memfs.read_dir(&blobs)?.len(),
+        blob_count,
+        "no blob file may be removed by a repair that lacked the dictionary",
+    );
+
+    // With the dictionary the same store repairs and reads.
+    let report = with_dict().repair_with_salvage(true)?;
+    assert!(
+        report.recovered >= 1,
+        "the store repairs with it: {report:?}"
+    );
+    let tree = with_dict().open()?;
+    assert!(
+        tree.get(b"k0000", crate::MAX_SEQNO)?.is_some(),
+        "the values survive the refused repair",
+    );
+    Ok(())
+}
+
 /// An abandoned `{id}.repair-tmp` must be swept BEFORE its source SST is
 /// processed. With no committed manifest to consult, the preliminary sweep
 /// returns without touching it, so the scan itself is what removes it — but

@@ -681,17 +681,31 @@ fn repair_recover_params(
 /// This inspects the CRATE's [`crate::io::ErrorKind`], which is what a
 /// `crate::Error::Io` always carries.
 ///
-/// [`crate::Error::Decrypt`] is in the class too, for the same reason: an
-/// AEAD failure is exactly what a MISSING or WRONG key produces on perfectly
-/// healthy ciphertext, and the two are cryptographically indistinguishable
-/// from genuine rot. Recording it as unreadable commits a manifest omitting
-/// the file — whose cleanup then DELETES the ciphertext — turning a fixable
-/// configuration mistake into permanent loss. Propagating lets a re-run
-/// under the right key recover everything; on genuinely rotted ciphertext
-/// the repair fails instead of guessing, and the bytes stay in place.
+/// The MIS-SUPPLIED RECOVERY CONTEXT errors are in the class too, for the
+/// same reason: they say the caller brought the wrong key or the wrong
+/// dictionary, not that the bytes rotted.
+///
+/// - [`crate::Error::Decrypt`]: an AEAD failure is exactly what a missing or
+///   wrong key produces on perfectly healthy ciphertext, and the two are
+///   cryptographically indistinguishable from genuine rot.
+/// - [`crate::Error::ZstdDictMismatch`]: the persisted descriptor names a
+///   dictionary the caller did not supply (`got: None`) or supplied a
+///   different one. The blob is intact; only the context is wrong.
+///
+/// Recording either as unreadable commits a manifest omitting the file —
+/// whose cleanup then DELETES it — turning a fixable configuration mistake
+/// into permanent loss. Propagating lets a re-run with the right context
+/// recover everything; on genuinely damaged bytes the repair fails instead of
+/// guessing, and they stay in place.
 fn is_environmental(e: &crate::Error) -> bool {
-    matches!(e, crate::Error::Io(io) if io.kind().is_environmental())
-        || matches!(e, crate::Error::Decrypt(_))
+    match e {
+        crate::Error::Io(io) => io.kind().is_environmental(),
+        // Mis-supplied recovery context, not damage.
+        crate::Error::Decrypt(_) => true,
+        #[cfg(zstd_any)]
+        crate::Error::ZstdDictMismatch { .. } => true,
+        _ => false,
+    }
 }
 
 /// Whether manifest repair must fail closed on a table because its bulk-ingest

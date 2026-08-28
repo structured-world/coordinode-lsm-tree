@@ -747,19 +747,23 @@ fn meta_mirrors_diverge(
     );
     match (tail, mid) {
         (Ok(t), Ok(m)) => Ok(t != m),
-        // Only a TRANSIENT read on either mirror must not masquerade as "mirrors
+        // An ENVIRONMENTAL read on either mirror must not masquerade as "mirrors
         // agree" (which would skip the MID recovery attempt and salvage under a
-        // possibly forged tail): propagate it so the caller retries.
+        // possibly forged tail): propagate it so the caller retries. The class
+        // covers the transient kinds AND the access failures that do not
+        // implicate the bytes — an ACL mistake or host pressure on ONE mirror
+        // otherwise falls back to the other, and if that one only supports a
+        // partial salvage the repair publishes the lossy result even though a
+        // fixed environment would have recovered more from the first.
         (Err(crate::Error::Io(io)), _) | (_, Err(crate::Error::Io(io)))
-            if io.kind().is_transient() =>
+            if io.kind().is_environmental() =>
         {
             Err(crate::Error::Io(io))
         }
-        // A structurally unreadable mirror OR a PERSISTENT I/O failure of one
-        // mirror is the ordinary tail-with-MID-fallback case (`recover_inner`
+        // A structurally unreadable mirror OR an I/O failure that DOES implicate
+        // its bytes is the ordinary tail-with-MID-fallback case (`recover_inner`
         // recovers from the readable copy): arbitration is only for two valid
-        // copies that disagree, and a retry cannot make a persistently unreadable
-        // mirror decode.
+        // copies that disagree, and a retry cannot make a rotted mirror decode.
         _ => Ok(false),
     }
 }
@@ -2871,9 +2875,14 @@ pub fn salvage_blob_file(
     #[cfg(zstd_any)]
     if let crate::CompressionType::ZstdDict { dict_id, .. } = compression {
         let Some(dict) = zstd_dictionary else {
-            return Err(crate::Error::FeatureUnsupported(
-                "salvage of a dictionary-compressed blob file without its dictionary",
-            ));
+            // The SAME error a wrong dictionary raises, with `got: None`: both
+            // are the caller supplying the wrong recovery context, and both
+            // must reach the operator unchanged instead of grading the intact
+            // file as damaged.
+            return Err(crate::Error::ZstdDictMismatch {
+                expected: dict_id,
+                got: None,
+            });
         };
         // Validate the supplied dictionary against the persisted descriptor
         // BEFORE the record walk: a mismatched dictionary fails every frame's
@@ -3023,6 +3032,14 @@ pub fn salvage_blob_file(
                         zstd_dictionary.map(alloc::sync::Arc::as_ref),
                     ) {
                         Ok(value) => value,
+                        // The caller brought the wrong dictionary: the frame is
+                        // intact and every later one fails identically, so
+                        // grading them corrupt would "salvage" the whole file
+                        // into nothing. The id check above catches this before
+                        // the walk; this arm keeps the classification honest on
+                        // any path that reaches here anyway.
+                        #[cfg(zstd_any)]
+                        Err(e @ crate::Error::ZstdDictMismatch { .. }) => return Err(e),
                         Err(e) => {
                             dropped.push(DroppedBlob {
                                 reason: BlobDropReason::Corrupt(format!(
