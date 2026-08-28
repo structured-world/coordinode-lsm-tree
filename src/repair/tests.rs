@@ -9434,6 +9434,138 @@ fn a_transforming_compaction_output_keeps_its_lineage_marked() -> crate::Result<
     Ok(())
 }
 
+/// The ZERO-OUTPUT window, pinned as a documented contract: a committed
+/// filter compaction that removed EVERY record emits no SST and therefore
+/// no lineage — nothing durable distinguishes its lingering inputs from
+/// live tables once the manifest is lost, and no marker could safely
+/// authorize dropping them (repair derives everything from the data files;
+/// a marker cannot prove, for its own crash windows, which side of the
+/// commit it was written on without becoming carried state). The rebuild
+/// therefore republishes the inputs as ONE consistent pre-compaction
+/// history — no operand is doubled — and the report's standing warning
+/// ("Recent unlogged version edits ... are lost") covers the transient
+/// re-exposure: the filter is a standing policy and the next compaction
+/// removes the records again.
+#[test]
+fn a_committed_empty_compaction_republishes_inputs_on_manifest_loss() -> crate::Result<()> {
+    use crate::compaction::filter::{
+        CompactionFilter, Context as FilterContext, Factory, ItemAccessor, Verdict,
+    };
+    use crate::fs::Fs;
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    struct DestroyAll;
+    impl CompactionFilter for DestroyAll {
+        fn filter_item(
+            &mut self,
+            _item: ItemAccessor<'_>,
+            _ctx: &FilterContext,
+        ) -> crate::Result<Verdict> {
+            Ok(Verdict::Destroy)
+        }
+    }
+    struct DestroyAllFactory;
+    impl Factory for DestroyAllFactory {
+        fn name(&self) -> &'static str {
+            "DestroyAll"
+        }
+        fn make_filter(&self, _ctx: &FilterContext) -> Box<dyn CompactionFilter> {
+            Box::new(DestroyAll)
+        }
+    }
+
+    let memfs = Arc::new(crate::fs::MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_compaction_filter_factory(Some(Arc::new(DestroyAllFactory)))
+    };
+    {
+        let tree = match config().open()? {
+            crate::AnyTree::Standard(t) => t,
+            crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+        };
+        tree.insert(b"a", b"v", 1);
+        tree.flush_active_memtable(0)?;
+        tree.insert(b"b", b"v", 2);
+        tree.flush_active_memtable(0)?;
+
+        let mut inputs = Vec::new();
+        for id in 0u64..2 {
+            let path = root.join("tables").join(id.to_string());
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(
+                &mut memfs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?,
+                &mut bytes,
+            )?;
+            inputs.push((path, bytes));
+        }
+
+        tree.major_compact(u64::MAX, 3)?;
+        assert_eq!(
+            tree.table_count(),
+            0,
+            "the filter destroyed everything; the committed compaction has \
+             ZERO outputs",
+        );
+        drop(tree);
+
+        for (path, bytes) in inputs {
+            let mut f = memfs.open(
+                &path,
+                &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+            )?;
+            std::io::Write::write_all(&mut f, &bytes)?;
+        }
+    }
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    let report = config().repair()?;
+    assert_eq!(
+        report.recovered, 2,
+        "with no output and no lineage the inputs are the only history: {report:?}",
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("unlogged version edits")),
+        "the standing warning covers the lost empty compaction: {report:?}",
+    );
+
+    let tree = match config().open()? {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    assert!(
+        tree.get(b"a", crate::MAX_SEQNO)?.is_some(),
+        "the pre-compaction history is republished whole (transient \
+         re-exposure, not corruption)",
+    );
+    // The filter is a standing policy: the next compaction removes the
+    // records again.
+    tree.major_compact(u64::MAX, 4)?;
+    assert!(
+        tree.get(b"a", crate::MAX_SEQNO)?.is_none(),
+        "the re-run filter restores the committed outcome",
+    );
+    Ok(())
+}
+
 /// A committed TRANSFORMING compaction must survive a manifest loss without
 /// resurrecting the records its filter removed. The inputs linger on disk
 /// (their deletion is deferred past the commit), so a rebuild sees BOTH
@@ -9881,6 +10013,83 @@ fn a_transformed_output_without_the_run_end_keeps_reaching_inputs() -> crate::Re
     assert!(
         !report.lost_coverage.is_empty(),
         "the residual overlap must be reported: {report:?}",
+    );
+    Ok(())
+}
+
+/// A RESIDUAL overlap fails closed under a merge operator: the kept input's
+/// records inside the overlap are also folded into the kept output, and no
+/// replay can remove that operand multiplicity — the same rule the legacy
+/// ambiguity takes. This is the crash shape a parallel compaction leaves
+/// when input cleanup is partial: an input spanning several sub-compaction
+/// ranges survives while no output (or provable chain) covers it whole.
+/// Value-only deployments keep the report-and-publish path pinned by
+/// [`repair_reports_the_overlap_of_a_partially_covered_input`].
+#[test]
+fn repair_rejects_a_residual_overlap_under_a_merge_operator() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    struct SumMerge;
+    impl crate::MergeOperator for SumMerge {
+        fn merge(
+            &self,
+            _key: &[u8],
+            _base_value: Option<&[u8]>,
+            _operands: &[&[u8]],
+        ) -> crate::Result<crate::UserValue> {
+            Ok(b"sum".to_vec().into())
+        }
+    }
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    // Input 0 spans [a, z]; output 2 (lineage [0, 1], no run-closing proof)
+    // covers only [a, m] — the input's remainder belonged to output 3, which
+    // is LOST.
+    {
+        let mut w = Writer::new(tables.join("0"), 0, 0, Arc::clone(&fs))?;
+        for key in [b"a".as_slice(), b"z".as_slice()] {
+            w.write(InternalValue::from_components(
+                key.to_vec(),
+                b"v".to_vec(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the input is non-empty");
+    }
+    {
+        let mut w = Writer::new(tables.join("2"), 2, 0, Arc::clone(&fs))?
+            .use_recency(Some(1))
+            .use_lineage(Some(vec![0, 1]));
+        for key in [b"a".as_slice(), b"m".as_slice()] {
+            w.write(InternalValue::from_components(
+                key.to_vec(),
+                b"w".to_vec(),
+                2,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the output is non-empty");
+    }
+
+    let result = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(SumMerge)))
+    .repair();
+    assert!(
+        matches!(result, Err(crate::Error::Unrecoverable)),
+        "a residual overlap under a merge operator must fail the repair, not \
+         publish a double-applying pair: {:?}",
+        result.map(|r| r.recovered),
     );
     Ok(())
 }

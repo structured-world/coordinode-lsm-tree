@@ -2638,6 +2638,14 @@ impl Config {
     /// compaction restructures it into proper levels (expect elevated I/O for a
     /// period proportional to the data size).
     ///
+    /// Version edits the lost manifest carried are gone with it (the report's
+    /// standing warning says so): in particular, a committed compaction whose
+    /// filter removed EVERY record left no output to carry lineage, so its
+    /// still-lingering inputs are republished as one consistent
+    /// pre-compaction history — the filter's removals transiently reappear
+    /// until the next compaction re-applies the standing policy. No operand
+    /// is doubled by that window.
+    ///
     /// # Exclusive access
     ///
     /// Repair rewrites `CURRENT`, writes a fresh snapshot, and removes the stale
@@ -4652,6 +4660,31 @@ fn repair_tree(
             }
         }
         lineage_partial.retain(|(input, ..)| !inputs_superseded.contains(input));
+    }
+
+    // A RESIDUAL overlap that survived every supersession pass fails closed
+    // under a merge operator: the kept input's records inside the overlap
+    // are also folded into the kept output, and publishing both applies the
+    // same operands twice on every read — a multiplicity the reported
+    // replay cannot remove, the same rule the legacy ambiguity below takes.
+    // This is the crash shape a parallel compaction leaves when input
+    // cleanup is partial (an input spanning several sub-compaction ranges
+    // survives while no single output or provable chain covers it whole),
+    // and equally a serial run's lost-sibling window. Value-only
+    // deployments proceed to the report: their duplicate records are
+    // byte-identical and reads dedupe them.
+    if config.merge_operator.is_some()
+        && let Some((input, output_path, ..)) = lineage_partial.first()
+    {
+        log::error!(
+            "repair: input table {} overlaps the surviving compaction output {} \
+             that folded part of it, and no surviving output set covers the \
+             input whole; under a merge operator publishing both would \
+             double-apply operands, and no replay can undo that",
+            input,
+            output_path.display(),
+        );
+        return Err(crate::Error::Unrecoverable);
     }
 
     // Only blob files a surviving table REFERENCES go into the manifest.
