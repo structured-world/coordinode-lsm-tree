@@ -241,6 +241,40 @@ fn patrol_scrub_corrects_without_scheduling_when_auto_heal_off() -> crate::Resul
     Ok(())
 }
 
+/// The scrub's byte counters measure PHYSICAL file sizes: the metadata's
+/// `file_size` is recorded at the end of data-block emission, before the
+/// index / filter / meta / footer sections are appended, so totals derived
+/// from it systematically underreport the bytes the scrub actually reads.
+#[test]
+fn patrol_scrub_progress_measures_physical_sizes() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, _block) = write_ecc_sst(dir.path());
+    let physical = std::fs::metadata(&sst_path)?.len();
+
+    let tree = open_ecc_tree(dir.path());
+    let progress = std::sync::Arc::new(crate::RecoveryProgress::default());
+    let report = patrol_scrub(
+        &tree,
+        &PatrolScrubOptions {
+            progress: Some(std::sync::Arc::clone(&progress)),
+            ..PatrolScrubOptions::default()
+        },
+    );
+    assert!(report.is_ok(), "{report:?}");
+
+    let snap = progress.snapshot();
+    assert_eq!(
+        snap.bytes_total, physical,
+        "the total is the SST's physical size, not the pre-section \
+         metadata figure: {snap:?}",
+    );
+    assert_eq!(
+        snap.bytes_processed, snap.bytes_total,
+        "a finished scrub reaches 100%: {snap:?}",
+    );
+    Ok(())
+}
+
 /// A scrub-corrected block published to [`crate::RecoveryProgress`] must keep
 /// the snapshot invariant `blocks_healed <= blocks_recovered`
 /// ([`crate::RecoveryProgressSnapshot::blocks_healed`] documents healed as a

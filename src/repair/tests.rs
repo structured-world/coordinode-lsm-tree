@@ -9578,6 +9578,83 @@ fn a_committed_empty_compaction_republishes_inputs_on_manifest_loss() -> crate::
     Ok(())
 }
 
+/// A physically distinct but VALID duplicate copy of an already-retained
+/// table id (two routed folders holding the same SST) is a healthy
+/// exclusion, not an unreadable file: it opened fine and its content is
+/// already held, so it belongs in `excluded_files` — counting it as
+/// unreadable fired corruption alerts over an intact store.
+#[test]
+fn a_valid_routed_duplicate_is_excluded_not_unreadable() -> crate::Result<()> {
+    use crate::config::LevelRoute;
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let cold = std::path::absolute("/cold")?;
+    let tables = root.join("tables");
+    let cold_tables = cold.join("tables");
+    memfs.create_dir_all(&tables)?;
+    memfs.create_dir_all(&cold_tables)?;
+
+    {
+        let mut w = crate::table::Writer::new(tables.join("0"), 0, 0, Arc::clone(&fs_dyn))?;
+        w.write(InternalValue::from_components(
+            b"a".to_vec(),
+            b"v".to_vec(),
+            1,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "the table is non-empty");
+    }
+    // The same bytes under the routed folder: a physically distinct, equally
+    // valid copy of id 0.
+    {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut memfs.open(
+                &tables.join("0"),
+                &crate::fs::FsOpenOptions::new().read(true),
+            )?,
+            &mut bytes,
+        )?;
+        let mut f = memfs.open(
+            &cold_tables.join("0"),
+            &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        std::io::Write::write_all(&mut f, &bytes)?;
+    }
+
+    let route_fs: Arc<dyn Fs> = memfs.clone();
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .level_routes(vec![LevelRoute {
+        levels: 0..2,
+        path: cold,
+        fs: route_fs,
+    }])
+    .repair()?;
+    assert_eq!(report.recovered, 1, "one copy is retained: {report:?}");
+    assert_eq!(
+        report.unreadable, 0,
+        "a valid duplicate is not an unreadable file: {report:?}",
+    );
+    assert!(
+        report
+            .excluded_files
+            .iter()
+            .any(|(_, reason)| reason.contains("duplicate")),
+        "the duplicate is reported as a healthy exclusion: {report:?}",
+    );
+    Ok(())
+}
+
 /// A BOTTOMMOST compaction that elides a tombstone (and drains the versions
 /// it covered) transforms visibility exactly like a compaction filter: the
 /// output contains neither the tombstone nor the covered value, so a
@@ -12708,12 +12785,20 @@ fn blob_recovery_discards_a_duplicate_blob_id() -> crate::Result<()> {
     let mut published = super::PublishedBlobReplacements::new(&config);
     let recovery = super::recover_blob_files(&config, &mut published, &(0..10).collect())?;
     published.disarm();
-    let (files, unreadable, discard) = (recovery.files, recovery.unreadable, recovery.discard);
+    let (files, unreadable, excluded, discard) = (
+        recovery.files,
+        recovery.unreadable,
+        recovery.excluded,
+        recovery.discard,
+    );
     assert_eq!(files.len(), 1, "one blob file per id");
+    // The displaced copy is VALID — a healthy exclusion, never an
+    // unreadable file (that count fires corruption alerts).
+    assert_eq!(unreadable.len(), 0, "{unreadable:?}");
     assert_eq!(
-        unreadable.len(),
+        excluded.len(),
         1,
-        "the displaced duplicate is reported: {unreadable:?}"
+        "the displaced duplicate is reported as an exclusion: {excluded:?}"
     );
     assert!(
         memfs.exists(&blobs.join("1"))?,

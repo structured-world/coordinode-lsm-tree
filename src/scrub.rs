@@ -298,14 +298,27 @@ pub fn patrol_scrub(
     let version = tree.current_version();
     let tables: Vec<crate::table::Table> = version.iter_tables().cloned().collect();
 
+    // PHYSICAL file size, not `metadata.file_size`: the writer records that
+    // field at the end of data-block emission, before the index / filter /
+    // meta / footer sections are appended, so metadata-derived totals
+    // systematically underreport the bytes the scrub actually reads (the
+    // same reason the repair and checkpoint accounting stat the backend).
+    // Best-effort: a failed stat falls back to the metadata figure, applied
+    // identically to the total and the per-file publish so the two stay
+    // reconciled.
+    let physical_size = |table: &crate::table::Table| {
+        table
+            .fs
+            .metadata(&table.path)
+            .map_or(table.metadata.file_size, |m| m.len)
+    };
     if let Some(p) = &options.progress {
         p.set_phase(crate::RecoveryPhase::Scrubbing);
-        // Byte totals from the tables' own metadata — no extra stat calls.
         // Display-only sum, saturating for the same reason as the repair's.
         p.set_bytes_total(
             tables
                 .iter()
-                .fold(0u64, |acc, t| acc.saturating_add(t.metadata.file_size)),
+                .fold(0u64, |acc, t| acc.saturating_add(physical_size(t))),
         );
     }
     // Publishes one scanned SST's deltas: the file counts as taken up, its
@@ -316,7 +329,7 @@ pub fn patrol_scrub(
     // a >100% heal ratio.
     let publish = |table: &crate::table::Table, partial: &PatrolScrubReport| {
         if let Some(p) = &options.progress {
-            p.add_bytes_processed(table.metadata.file_size);
+            p.add_bytes_processed(physical_size(table));
             p.add_blocks(
                 partial.blocks_scanned as u64,
                 partial.corrections_applied as u64,

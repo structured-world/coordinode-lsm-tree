@@ -124,10 +124,15 @@ fn patrol_scrub_publishes_progress_into_the_shared_handle() {
         tree.insert(format!("key-{i:06}"), format!("v{i:06}"), i);
     }
     tree.flush_active_memtable(500).expect("flush");
+    // PHYSICAL sizes: the metadata's file_size stops at the data blocks and
+    // undercounts the sections the scrub actually reads.
     let expected_bytes: u64 = tree
         .current_version()
         .iter_tables()
-        .map(|t| t.metadata.file_size)
+        .map(|t| {
+            t.fs.metadata(&t.path)
+                .map_or(t.metadata.file_size, |m| m.len)
+        })
         .sum();
 
     let progress = Arc::new(RecoveryProgress::default());

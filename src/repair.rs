@@ -2122,6 +2122,10 @@ struct BlobRecovery {
     /// same reason `stale` is — the scan must leave the directory exactly as a
     /// retry expects to find it.
     discard: Vec<(PathBuf, String)>,
+    /// HEALTHY exclusions (a valid physically distinct duplicate of a kept
+    /// id): reported through the report's `excluded_files`, never the
+    /// unreadable counts.
+    excluded: Vec<(PathBuf, String)>,
 }
 
 /// Discovers the blob files of a KV-separated tree for `repair` by scanning the
@@ -2148,6 +2152,7 @@ fn recover_blob_files(
     let mut blob_files: Vec<crate::vlog::BlobFile> = Vec::new();
     let mut unreadable: UnreadableFiles = Vec::new();
     let mut discard: Vec<(PathBuf, String)> = Vec::new();
+    let mut excluded: Vec<(PathBuf, String)> = Vec::new();
     // How referencing SSTs' handles must be rewritten for the blob files this
     // scan RESHAPED: `Remap` for a file salvaged into a compacted copy,
     // `DropBelow` for an intact file recovered with a punched frontier. Empty
@@ -2170,6 +2175,7 @@ fn recover_blob_files(
             frag,
             stale: stale_originals,
             discard,
+            excluded,
         });
     }
 
@@ -2279,9 +2285,11 @@ fn recover_blob_files(
             if same_physical_file(&*config.fs, kept, &*config.fs, &blob_path)? {
                 continue;
             }
+            // A healthy exclusion, not an unreadable file: this copy is
+            // valid, its id's content is already held.
             let reason = format!("duplicate of blob file id {blob_id}");
             discard.push((blob_path.clone(), reason.clone()));
-            unreadable.push((blob_path, reason));
+            excluded.push((blob_path, reason));
             continue;
         }
 
@@ -2639,6 +2647,7 @@ fn recover_blob_files(
         frag,
         stale: stale_originals,
         discard,
+        excluded,
     })
 }
 
@@ -3356,6 +3365,12 @@ fn repair_tree(
     // (and is never added to two L0 runs). See `keep_best_candidate`.
     let mut recovered_by_id: crate::HashMap<TableId, TableCandidate> = crate::HashMap::default();
     let mut unreadable_files: Vec<(PathBuf, String)> = Vec::new();
+    // HEALTHY files the rebuild deliberately leaves out (valid duplicates,
+    // lineage-redundant outputs and inputs): reported in the report's
+    // `excluded_files`, never in the unreadable counts — they opened and
+    // verified fine, and counting them as unreadable fires corruption
+    // alerts over an intact store.
+    let mut excluded_files: Vec<(PathBuf, String)> = Vec::new();
     // What each scanned table covers, captured while its metadata was readable.
     // Joined against the exclusions at the end to report the coverage the
     // rebuilt manifest lost.
@@ -3549,14 +3564,12 @@ fn repair_tree(
                 }
                 // A genuine duplicate: removed after the commit so recovery
                 // cannot later resolve it instead of the kept copy (the manifest
-                // records only id + checksum, not a path).
-                set_aside_path(
-                    &folder_fs,
-                    &table_path,
-                    "duplicate table id; a complete copy is already held",
-                    &mut unreadable_files,
-                    &mut discard_after_commit,
-                );
+                // records only id + checksum, not a path). A HEALTHY exclusion,
+                // not an unreadable file — the copy is valid, its content is
+                // already held.
+                let reason = "duplicate table id; a complete copy is already held";
+                excluded_files.push((table_path.clone(), reason.to_string()));
+                discard_after_commit.push((Arc::clone(&folder_fs), table_path, reason.to_string()));
                 continue;
             }
 
@@ -4269,6 +4282,7 @@ fn repair_tree(
             &referenced_blob_ids,
         )?;
         unreadable_files.extend(recovery.unreadable);
+        excluded_files.extend(recovery.excluded);
         blob_rewrites = recovery.rewrites;
         blob_frag = recovery.frag;
         stale_blob_originals = recovery.stale;
@@ -4564,12 +4578,9 @@ fn repair_tree(
     let mut inputs_superseded: crate::HashSet<TableId> = crate::HashSet::default();
     // Files excluded as REDUNDANT (a derived output whose inputs all
     // survived, an input a complete output fully covers): their content
-    // lives on in the kept tables, so they are reported in the report's
-    // `excluded_files` — NOT `unreadable_files` (they opened and verified
-    // fine; counting them as unreadable would fire corruption alerts on an
-    // ordinary compaction crash window) and with NO `lost_coverage` (nothing
-    // was lost). The id set feeds the ancestry walk below.
-    let mut excluded_files: Vec<(PathBuf, String)> = Vec::new();
+    // lives on in the kept tables, so they join `excluded_files` with NO
+    // `lost_coverage` (nothing was lost). The id set feeds the ancestry
+    // walk below.
     let mut redundant_excluded_ids: crate::HashSet<TableId> = crate::HashSet::default();
     {
         let candidates = core::mem::take(&mut recovered_tables);
