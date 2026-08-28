@@ -341,6 +341,51 @@ fn reflink_checkpoint_sync_handle_carries_write_access() {
     );
 }
 
+/// A single-component RELATIVE checkpoint target lives in the backend's
+/// current directory: its own directory entry must be made durable by
+/// syncing `"."`, or a power loss can erase a checkpoint
+/// `create_checkpoint` reported complete. Proven by faulting the `"."`
+/// sync — a build that skips it returns `Ok` and never sees the fault.
+/// (Virtual backends without a CWD answer `NotFound` there and are
+/// tolerated; `MemFs` checkpoints to relative targets keep working.)
+#[test]
+fn relative_checkpoint_target_syncs_the_current_directory() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+
+    // Process-per-test (nextest), so re-pointing the CWD is safe.
+    let dir = tempfile::tempdir()?;
+    std::env::set_current_dir(dir.path())?;
+
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let tree = match Config::new(
+        dir.path().join("db"),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .open()?
+    {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    tree.insert(b"a", b"v", 1);
+    tree.flush_active_memtable(0)?;
+
+    injector
+        .arm(FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).on_path("."));
+    let result = tree.create_checkpoint(Path::new("checkpoint_rel"));
+    assert!(
+        result.is_err(),
+        "the relative target's parent (the current directory) must be \
+         synced before the checkpoint counts as complete; got {:?}",
+        result.map(|i| i.total_bytes),
+    );
+    Ok(())
+}
+
 /// The reflink fast path must SYNC the cloned destination file before the
 /// checkpoint treats it as complete. The streamed-copy fallback already does;
 /// the real Linux / macOS `reflink_file` implementations never sync, and the

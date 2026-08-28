@@ -78,6 +78,14 @@ pub struct RepairReport {
     /// Path and human-readable error for each unreadable file.
     pub unreadable_files: Vec<(PathBuf, String)>,
 
+    /// HEALTHY files the rebuild deliberately left out because their content
+    /// lives on in the kept tables: a derived compaction output whose inputs
+    /// all survived, or an input a surviving output (chain) fully covers.
+    /// These opened and verified fine — they are not failures, contribute no
+    /// lost coverage, and are removed once the rebuilt manifest is durable.
+    /// `(path, reason)` per exclusion.
+    pub excluded_files: Vec<(PathBuf, String)>,
+
     /// Key coverage the rebuilt manifest LOST, for every excluded table whose
     /// metadata still parsed: `(path, first key, last key, highest seqno)`.
     ///
@@ -2971,7 +2979,9 @@ impl RepairPolicy {
 /// Propagates a removal failure: leaving a superseded file in place is what
 /// corrupts the rebuild, so the repair must fail rather than proceed past it.
 #[cfg(feature = "std")]
-fn sweep_superseded_by_committed_manifest(config: &Config) -> crate::Result<()> {
+fn sweep_superseded_by_committed_manifest(
+    config: &Config,
+) -> crate::Result<Option<crate::HashSet<TableId>>> {
     let recovery = match crate::version::recovery::recover(
         &config.path,
         &*config.fs,
@@ -2989,7 +2999,7 @@ fn sweep_superseded_by_committed_manifest(config: &Config) -> crate::Result<()> 
         // A manifest that does not load cleanly is exactly the case repair
         // exists for: nothing committed to consult, the scan rebuilds from
         // everything.
-        Err(_) => return Ok(()),
+        Err(_) => return Ok(None),
     };
 
     let referenced_tables: crate::HashSet<TableId> = recovery
@@ -3100,7 +3110,10 @@ fn sweep_superseded_by_committed_manifest(config: &Config) -> crate::Result<()> 
             }
         }
     }
-    Ok(())
+    // The manifest loaded cleanly: hand the caller its referenced table set,
+    // so an id it names that the directory scan never SEES (the file is
+    // gone, not merely unreadable) is still reported as an unscopable loss.
+    Ok(Some(referenced_tables))
 }
 
 /// Removes the fresh-id blob replacements an aborting run already published,
@@ -3317,9 +3330,18 @@ fn repair_tree(
     check_cancel(config)?;
 
     // Finish the previous run's outstanding cleanup first. See
-    // `sweep_superseded_by_committed_manifest`.
+    // `sweep_superseded_by_committed_manifest`. When the manifest itself
+    // loads cleanly (repair was entered over a MISSING file, not a lost
+    // manifest), its referenced table set is kept: an id it names that the
+    // directory scan never sees has no directory entry to report through,
+    // and losing it silently would let `wal_replay_scope()` answer
+    // `TailOnly` over lost persisted data.
     #[cfg(feature = "std")]
-    sweep_superseded_by_committed_manifest(config)?;
+    let manifest_referenced: Option<crate::HashSet<TableId>> =
+        sweep_superseded_by_committed_manifest(config)?;
+    #[cfg(not(feature = "std"))]
+    let manifest_referenced: Option<crate::HashSet<TableId>> = None;
+    let mut scanned_table_ids: crate::HashSet<TableId> = crate::HashSet::default();
 
     // Byte totals for the progress percentage, from an upfront listing —
     // before the scan phase starts, so `bytes_processed / bytes_total` is
@@ -3503,6 +3525,7 @@ fn repair_tree(
                 }
                 TableDirEntry::Table(id) => id,
             };
+            scanned_table_ids.insert(table_id);
 
             if let Some(p) = &config.recovery_progress {
                 p.table_discovered();
@@ -4267,14 +4290,30 @@ fn repair_tree(
         // fine while reads return encoded indirection handles as user values
         // and the blob files stay orphaned. The recovered tables' own
         // `linked_blob_files` sections prove the store's type; fail closed
-        // with the same mismatch error a healthy open raises.
-        for (table, ..) in &recovered_tables {
-            let is_blob_backed = match table.list_blob_file_references() {
+        // with the same mismatch error a healthy open raises. A table whose
+        // section cannot be READ proves nothing either way — publishing it
+        // would be permission granted by ignorance, so it is set aside like
+        // the kv path's dependency filter does (environmental errors
+        // propagate for a retry).
+        let candidates = core::mem::take(&mut recovered_tables);
+        recovered_tables.reserve(candidates.len());
+        for candidate in candidates {
+            let is_blob_backed = match candidate.0.list_blob_file_references() {
                 Ok(refs) => refs.is_some_and(|r| !r.is_empty()),
-                // An unreadable section cannot prove either type; the table
-                // is judged by the dependency filter on the kv path, and on
-                // this path nothing links it to a blob file.
-                Err(_) => false,
+                Err(e) if is_environmental_io(&e) => return Err(e),
+                Err(e) => {
+                    let (table, ..) = candidate;
+                    set_aside_table(
+                        table,
+                        &format!(
+                            "blob-file reference list unreadable ({e}) on a standard \
+                             rebuild; the table cannot prove its tree type"
+                        ),
+                        &mut unreadable_files,
+                        &mut discard_after_commit,
+                    );
+                    continue;
+                }
             };
             if is_blob_backed {
                 log::error!(
@@ -4282,13 +4321,14 @@ fn repair_tree(
                      KV-separated (blob) tree; rebuilding a Standard manifest \
                      over it would return indirection handles as values — \
                      configure kv separation and retry",
-                    table.id(),
+                    candidate.0.id(),
                 );
                 return Err(crate::Error::TreeTypeMismatch {
                     requested: TreeType::Standard,
                     actual: TreeType::Blob,
                 });
             }
+            recovered_tables.push(candidate);
         }
         (
             TreeType::Standard,
@@ -4524,11 +4564,12 @@ fn repair_tree(
     let mut inputs_superseded: crate::HashSet<TableId> = crate::HashSet::default();
     // Files excluded as REDUNDANT (a derived output whose inputs all
     // survived, an input a complete output fully covers): their content
-    // lives on in the kept tables, so they are reported in
-    // `unreadable_files` but must NOT contribute `lost_coverage` — nothing
-    // was lost, and a coverage entry would widen the WAL replay for no
-    // reason. The id set feeds the ancestry walk below.
-    let mut redundant_excluded: crate::HashSet<PathBuf> = crate::HashSet::default();
+    // lives on in the kept tables, so they are reported in the report's
+    // `excluded_files` — NOT `unreadable_files` (they opened and verified
+    // fine; counting them as unreadable would fire corruption alerts on an
+    // ordinary compaction crash window) and with NO `lost_coverage` (nothing
+    // was lost). The id set feeds the ancestry walk below.
+    let mut excluded_files: Vec<(PathBuf, String)> = Vec::new();
     let mut redundant_excluded_ids: crate::HashSet<TableId> = crate::HashSet::default();
     {
         let candidates = core::mem::take(&mut recovered_tables);
@@ -4558,8 +4599,7 @@ fn repair_tree(
                                   all survived; excluded so its merge operands are not \
                                   applied twice";
                     redundant_excluded_ids.insert(table_id);
-                    redundant_excluded.insert(path.clone());
-                    unreadable_files.push((path.clone(), reason.to_string()));
+                    excluded_files.push((path.clone(), reason.to_string()));
                     discard_after_commit.push((fs, path, reason.to_string()));
                 }
                 Some(inputs) => {
@@ -4765,8 +4805,7 @@ fn repair_tree(
                 drop(table);
                 let reason = "input fully covered by a surviving compaction output; \
                               excluded so its merge operands are not applied twice";
-                redundant_excluded.insert(path.clone());
-                unreadable_files.push((path.clone(), reason.to_string()));
+                excluded_files.push((path.clone(), reason.to_string()));
                 discard_after_commit.push((fs, path, reason.to_string()));
             } else {
                 recovered_tables.push(candidate);
@@ -5403,12 +5442,10 @@ fn repair_tree(
                 )
             })
     };
+    // Redundant exclusions live in `excluded_files` and never reach this
+    // loop: their content lives on in the kept tables, so they contribute
+    // no coverage.
     for (path, _) in &unreadable_files {
-        // A REDUNDANT exclusion lost nothing — its content lives on in the
-        // kept tables — so it contributes no coverage.
-        if redundant_excluded.contains(path) {
-            continue;
-        }
         match coverage_by_path.get(path) {
             Some((lo, hi, seqno)) => {
                 lost_coverage.push((path.clone(), lo.clone(), hi.clone(), *seqno));
@@ -5425,12 +5462,31 @@ fn repair_tree(
             .map(|(_, path, lo, hi, bound, _)| (path, lo, hi, bound)),
     );
     unknowable_losses.extend(salvaged_unknowable);
+    // A table the CLEAN manifest referenced that the scan never even SAW: the
+    // file is gone, so there is no directory entry to report through — and
+    // the manifest records no key range for it, so the loss is unscopable.
+    if let Some(referenced) = manifest_referenced {
+        let primary_tables = config.path.join("tables");
+        let mut missing: Vec<TableId> = referenced
+            .into_iter()
+            .filter(|id| !scanned_table_ids.contains(id))
+            .collect();
+        missing.sort_unstable();
+        for id in missing {
+            log::warn!(
+                "repair: table {id} is referenced by the recovered manifest but has \
+                 no file on disk; its loss is unscopable",
+            );
+            unknowable_losses.push(primary_tables.join(id.to_string()));
+        }
+    }
 
     let report = RepairReport {
         recovered,
         salvaged,
         unreadable: unreadable_files.len(),
         unreadable_files,
+        excluded_files,
         lost_coverage,
         unknowable_losses,
         blob_files_salvaged,

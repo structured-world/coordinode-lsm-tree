@@ -228,6 +228,7 @@ fn wal_replay_scope_derives_from_lost_coverage() {
             salvaged: 0,
             unreadable: 0,
             unreadable_files: Vec::new(),
+            excluded_files: Vec::new(),
             lost_coverage: lost,
             unknowable_losses: Vec::new(),
             blob_files_salvaged: Vec::new(),
@@ -9284,6 +9285,17 @@ fn repair_excludes_a_compaction_output_whose_inputs_survived() -> crate::Result<
         "the derived output is excluded; only the surviving inputs are \
          published: {report:?}",
     );
+    // The excluded output opened and verified fine: it is a healthy
+    // redundancy, never an unreadable file — counting it there would fire
+    // corruption alerts on an ordinary compaction crash window.
+    assert_eq!(report.unreadable, 0, "{report:?}");
+    assert!(
+        report
+            .excluded_files
+            .iter()
+            .any(|(_, reason)| reason.contains("derived output")),
+        "the exclusion is reported in its own field: {report:?}",
+    );
 
     let tree = config().open()?;
     let value = tree
@@ -10018,6 +10030,66 @@ fn a_transformed_output_without_the_run_end_fails_on_reaching_inputs() -> crate:
     Ok(())
 }
 
+/// A table the CLEAN manifest references but whose FILE is gone entirely
+/// has no directory entry to report through: the scan never sees it, so
+/// without consulting the manifest the report would answer `TailOnly` over
+/// lost persisted data. The recovered manifest's referenced set is joined
+/// against the scanned ids, and a missing one lands in
+/// `unknowable_losses` — the manifest records no key range, so the loss is
+/// unscopable and the replay obligation widens to full history.
+#[test]
+fn a_manifest_referenced_table_missing_from_disk_is_unknowable() -> crate::Result<()> {
+    use crate::fs::Fs;
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(crate::fs::MemFs::new());
+    let root = std::path::absolute("/db")?;
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .open()?
+        {
+            crate::AnyTree::Standard(t) => t,
+            crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+        };
+        tree.insert(b"a", b"v", 1);
+        tree.flush_active_memtable(0)?;
+        tree.insert(b"b", b"v", 2);
+        tree.flush_active_memtable(0)?;
+    }
+    // The manifest stays intact; one referenced SST vanishes outright.
+    memfs.remove_file(&root.join("tables").join("1"))?;
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "the surviving table is rebuilt: {report:?}"
+    );
+    assert!(
+        report.unknowable_losses.iter().any(|p| p.ends_with("1")),
+        "the manifest-referenced missing table is an unscopable loss: {report:?}",
+    );
+    assert!(
+        matches!(
+            report.wal_replay_scope(),
+            crate::repair::WalReplayScope::FullHistory
+        ),
+        "a vanished table widens the replay obligation: {report:?}",
+    );
+    Ok(())
+}
+
 /// An INCONCLUSIVE post-persist probe must not claim a committed repair:
 /// with the rename refused and the pointer read failing too, nothing
 /// proves the switch, and returning `RepairedButUnopened` would hand a
@@ -10418,6 +10490,112 @@ fn a_corrupt_reference_section_does_not_abort_the_blob_repair() -> crate::Result
             .iter()
             .any(|(path, _)| path.ends_with("1")),
         "the corrupt-section table is reported: {report:?}",
+    );
+    Ok(())
+}
+
+/// The STANDARD-path twin of the corrupt-reference-section pin: without
+/// kv-separation configured, a table whose `linked_blob_files` section is
+/// unreadable must never be published as a plain table (its type is
+/// unprovable — it may hide indirection payloads) nor abort the whole
+/// repair. Today the scan's `verify_blob_links` routes it aside first; the
+/// tree-type check's own set-aside arm guards the path defensively.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_corrupt_reference_section_is_never_published_as_standard() -> crate::Result<()> {
+    use crate::coding::Encode;
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let tables = root.join("tables");
+    memfs.create_dir_all(&blobs)?;
+    memfs.create_dir_all(&tables)?;
+
+    {
+        let mut w = crate::table::Writer::new(tables.join("0"), 0, 0, Arc::clone(&fs_dyn))?;
+        w.write(InternalValue::from_components(
+            b"a".to_vec(),
+            b"v".to_vec(),
+            1,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "table 0 is non-empty");
+    }
+    let blob_path = blobs.join("7");
+    let (offset, on_disk_size) = {
+        let mut w = crate::vlog::blob_file::writer::Writer::new(&blob_path, 7, 0, &*fs_dyn)?;
+        let offset = w.offset();
+        let on_disk = w.write(b"m", 2, &[b'x'; 300])?;
+        w.finish()?;
+        (offset, on_disk)
+    };
+    let checksum = {
+        let mut w = crate::table::Writer::new(tables.join("1"), 1, 0, Arc::clone(&fs_dyn))?;
+        w.link_blob_file(7, 1, 300, u64::from(on_disk_size));
+        let ind = crate::blob_tree::handle::BlobIndirection {
+            vhandle: crate::vlog::ValueHandle {
+                blob_file_id: 7,
+                offset,
+                on_disk_size,
+            },
+            size: 300,
+        };
+        w.write(InternalValue::from_components(
+            b"m".to_vec(),
+            ind.encode_into_vec(),
+            2,
+            ValueType::Indirection,
+        ))?;
+        w.finish()?.expect("table written").1
+    };
+    {
+        let table = crate::table::Table::recover(crate::table::RecoverParams::new(
+            tables.join("1"),
+            checksum,
+            1,
+            Arc::clone(&fs_dyn),
+            crate::comparator::default_comparator(),
+            Arc::new(crate::Cache::with_capacity_bytes(1_000_000)),
+        ))?;
+        let handle = table
+            .regions
+            .linked_blob_files
+            .expect("table 1 has a reference section");
+        drop(table);
+        let mut f = memfs.open(
+            &tables.join("1"),
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        f.seek(SeekFrom::Start(*handle.offset()))?;
+        f.write_all(&u32::MAX.to_le_bytes())?;
+    }
+
+    // NO kv separation: the standard rebuild must set the unprovable table
+    // aside, keep the healthy sibling, and never publish indirection
+    // payloads as values.
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "only the provably-standard sibling is published: {report:?}",
+    );
+    assert!(
+        report
+            .unreadable_files
+            .iter()
+            .any(|(path, _)| path.ends_with("1")),
+        "the unprovable table is set aside and reported: {report:?}",
     );
     Ok(())
 }

@@ -865,17 +865,26 @@ pub fn run_checkpoint<T: AbstractTree>(
     // on the underlying inodes. Required by the same fsync-ordering
     // rule that drove the child-directory syncs above.
     //
-    // Only fsync a NAMED parent. After the CurDir-stripping
-    // normalisation at the top of run_checkpoint, a single-component
-    // target like `"checkpoint"` has an empty parent — there is no
-    // backend-portable directory to fsync (in particular, MemFs has
-    // no CWD, so `sync_directory(".")` returns NotFound). Skip the
-    // fsync in that case; callers needing the parent-dir-entry-
-    // survives-power-loss guarantee pass an absolute target path.
+    // After the CurDir-stripping normalisation at the top of
+    // run_checkpoint, a single-component target like `"checkpoint"` has an
+    // empty parent — its directory entry lives in the backend's CURRENT
+    // directory, so `"."` is synced instead: on a real filesystem that is
+    // the parent whose entry must be durable, and skipping it would let a
+    // power loss erase a checkpoint `create_checkpoint` reported as
+    // complete. A backend without a CWD (MemFs answers `NotFound` for
+    // `"."`) has no such directory entry to persist, and only that answer
+    // is tolerated; any other failure propagates like the named-parent
+    // sync's.
     if let Some(parent) = target_root.parent()
         && !parent.as_os_str().is_empty()
     {
         fsync_directory(parent, &**target_fs, sync_mode)?;
+    } else {
+        match target_fs.sync_directory_with(Path::new("."), sync_mode) {
+            Ok(()) => {}
+            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
     }
 
     cleanup.commit();

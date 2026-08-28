@@ -563,11 +563,15 @@ fn manifest_loss_in_the_unwritten_sidecar_window_resolves_to_one_history() -> cr
     .repair()?;
     assert!(
         report
-            .unreadable_files
+            .excluded_files
             .iter()
             .any(|(_, reason)| reason.contains("derived output")),
         "the slice outputs must be excluded as derived — publishing both \
          histories would double-apply merge operands: {report:?}",
+    );
+    assert_eq!(
+        report.unreadable, 0,
+        "a healthy redundancy exclusion is not an unreadable file: {report:?}",
     );
 
     let reopened = Config::new(
