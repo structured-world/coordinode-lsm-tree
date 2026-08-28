@@ -205,11 +205,13 @@ fn blob_tree_copy() -> lsm_tree::Result<()> {
 }
 
 /// End-to-end: a bulk-ingested table relies on a manifest-only `global_seqno`
-/// offset for its effective MVCC ordering, so manifest repair (which cannot
-/// recover that offset from the SST) must FAIL CLOSED and drop it rather than
-/// register it with offset 0 and silently age its entries. This exercises the
-/// real ingest path (which flags the SST `descriptor#bulk_ingested`) plus
-/// repair, guarding the ingest → flag → drop chain end to end.
+/// offset for its effective MVCC ordering, so a manifest-LOSS repair (which
+/// cannot recover that offset from the SST alone) must FAIL CLOSED and drop
+/// it rather than register it with offset 0 and silently age its entries.
+/// With a CLEAN manifest the repair reuses the recorded offset instead, so
+/// the fixture loses the manifest first. This exercises the real ingest path
+/// (which flags the SST `descriptor#bulk_ingested`) plus repair, guarding
+/// the ingest → flag → drop chain end to end.
 #[test]
 fn repair_drops_a_bulk_ingested_table() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
@@ -244,6 +246,11 @@ fn repair_drops_a_bulk_ingested_table() -> lsm_tree::Result<()> {
         seqno.get() > 0,
         "the ingest allocated a global_seqno offset"
     );
+
+    // Lose the manifest: with a CLEAN manifest the repair would reuse the
+    // recorded offset and keep the table, so only a manifest loss exercises
+    // the fail-closed drop.
+    std::fs::remove_file(folder.path().join("current"))?;
 
     let report = Config::new(&folder, seqno, visible_seqno).repair()?;
     assert_eq!(

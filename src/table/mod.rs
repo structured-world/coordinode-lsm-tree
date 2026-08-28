@@ -398,6 +398,24 @@ pub(crate) enum DerivedRestriction {
     IrregularPunch,
 }
 
+/// Verdict of [`Table::has_punched_data_block`] — whether any zeroed
+/// data-block run carries the physical hole that proves a tight-space
+/// reclaim.
+#[cfg(feature = "std")]
+pub(crate) enum PunchProbe {
+    /// A zeroed run carries a proven hole: the SST was punched.
+    Punched,
+    /// No zeroed data blocks, or every zeroed run is proven ALLOCATED —
+    /// zeros are damage, not a reclaim. Also the verdict on a mount that
+    /// cannot punch at all: a reclaim never ran there.
+    Unpunched,
+    /// Zeroed runs exist on a PUNCH-CAPABLE mount whose hole probe cannot
+    /// answer (`None`): a lost-sidecar reclaim and damage are
+    /// indistinguishable, so the caller must fail closed unless resurrection
+    /// explicitly accepts the ambiguity.
+    Unproven,
+}
+
 impl Table {
     #[must_use]
     pub fn global_seqno(&self) -> SeqNo {
@@ -3725,19 +3743,35 @@ impl Table {
     /// punches per block with arbitrary, unaligned extents, and the filesystem
     /// deallocates only the wholly-contained pages while zero-filling the
     /// edges — so every block-boundary page stays allocated and a whole-extent
-    /// probe would reject genuine punches. A backend that cannot answer leaves
-    /// the punch unproven and the zeros are treated as damage — which
-    /// preserves the whole file for the operator instead of silently
-    /// publishing a truncated view of it.
+    /// probe would reject genuine punches.
+    ///
+    /// A backend that cannot answer the hole probe (`None`) leaves the punch
+    /// UNPROVEN, which is a distinct verdict from "unpunched": on a mount
+    /// that CAN punch, zeroed runs the probe cannot attribute are
+    /// indistinguishable from a lost-sidecar reclaim, and reading them as
+    /// "no punch" would publish the table unrestricted — resurrecting the
+    /// boundary block's rows below the committed restriction. On a mount
+    /// that cannot punch at all, zeros were never a reclaim and stay
+    /// classified as damage.
     ///
     /// # Errors
     ///
     /// Propagates a block-index, positioned-read, or hole-probe failure.
     #[cfg(feature = "std")]
-    pub(crate) fn has_punched_data_block(&self) -> crate::Result<bool> {
+    pub(crate) fn has_punched_data_block(&self) -> crate::Result<PunchProbe> {
         let file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
         // [start, end) of the current run of consecutive zeroed blocks.
         let mut run: Option<(u64, u64)> = None;
+        let mut unattributed = false;
+        let mut probe = |start: u64, end: u64| -> crate::Result<bool> {
+            let answer = self
+                .fs
+                .extent_contains_hole(&self.path, start, end - start)?;
+            if answer.is_none() {
+                unattributed = true;
+            }
+            Ok(answer == Some(true))
+        };
         for handle in self.block_index.iter() {
             let handle = handle?;
             let block = BlockHandle::new(handle.offset(), handle.size());
@@ -3751,23 +3785,20 @@ impl Table {
                 continue;
             }
             if let Some((start, end)) = run.take()
-                && self
-                    .fs
-                    .extent_contains_hole(&self.path, start, end - start)?
-                    == Some(true)
+                && probe(start, end)?
             {
-                return Ok(true);
+                return Ok(PunchProbe::Punched);
             }
         }
         if let Some((start, end)) = run
-            && self
-                .fs
-                .extent_contains_hole(&self.path, start, end - start)?
-                == Some(true)
+            && probe(start, end)?
         {
-            return Ok(true);
+            return Ok(PunchProbe::Punched);
         }
-        Ok(false)
+        if unattributed && self.fs.capabilities(&self.path).punch_hole {
+            return Ok(PunchProbe::Unproven);
+        }
+        Ok(PunchProbe::Unpunched)
     }
 
     /// The conservative restriction bound derived from the PHYSICAL punch alone,

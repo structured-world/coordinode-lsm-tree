@@ -252,9 +252,55 @@ impl Table {
                 crate::ValueType::Value,
             ));
         }
-        if !(len_patched && hash_patched) {
-            entries.sort_by(|a, b| cmp.compare(a.key.user_key.as_ref(), b.key.user_key.as_ref()));
+
+        // A merge-on-read relocation IS a compaction output derived from
+        // exactly the source, so stamp the copy's own complete single-output
+        // run — lineage naming the source, no previous output (the head),
+        // and the run's closing marker — in place of whatever lineage the
+        // source carried. Copying the source's own (or absent) lineage
+        // verbatim would leave a manifest-loss repair unable to associate
+        // the copy with a still-present source (cleanup can lag the
+        // install): both would be retained, and under a merge operator every
+        // operand in the byte-identical data blocks would apply twice. No
+        // transformed marker: the bitmap masks rows the source still holds
+        // as live tombstones, so either dedup direction re-derives the same
+        // materialized content.
+        entries.retain(|e| {
+            !matches!(
+                e.key.user_key.as_ref(),
+                b"lineage" | b"lineage_prev" | b"lineage_transformed" | b"lineage_last"
+            )
+        });
+        entries.push(InternalValue::from_components(
+            b"lineage".to_vec(),
+            &self.metadata.id.to_le_bytes()[..],
+            0,
+            crate::ValueType::Value,
+        ));
+        entries.push(InternalValue::from_components(
+            b"lineage_last".to_vec(),
+            &[][..],
+            0,
+            crate::ValueType::Value,
+        ));
+        // The copy's id is allocated at relocation time, so its CONTENT
+        // position must be stated explicitly: a byte-exact copy of a
+        // compaction output already carries the source's `recency`, but a
+        // flush/ingest source encodes "my id is my recency" by omission —
+        // which would silently become the copy's NEWER id. Pin it to the
+        // source's position.
+        if !entries
+            .iter()
+            .any(|e| e.key.user_key.as_ref() == b"recency")
+        {
+            entries.push(InternalValue::from_components(
+                b"recency".to_vec(),
+                &self.metadata.id.to_le_bytes()[..],
+                0,
+                crate::ValueType::Value,
+            ));
         }
+        entries.sort_by(|a, b| cmp.compare(a.key.user_key.as_ref(), b.key.user_key.as_ref()));
 
         // Same encode parameters the writer uses for the meta block
         // (restart interval 1, no hashing). The reader point-reads by key, so the

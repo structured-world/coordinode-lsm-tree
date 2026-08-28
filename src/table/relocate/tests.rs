@@ -129,6 +129,64 @@ fn relocated_mor_table_passes_metadata_bounds_cross_check() -> crate::Result<()>
     Ok(())
 }
 
+/// A merge-on-read relocation is a compaction output derived from exactly its
+/// source, and its meta must SAY so: lineage naming the source id, no
+/// `lineage_prev` (the run's head), and `lineage_last` (its closing output) —
+/// a complete single-output run. Copying the source's own (or absent)
+/// lineage verbatim leaves a manifest-loss repair unable to associate the
+/// copy with a still-present source (cleanup can lag the install), so BOTH
+/// are retained — and under a merge operator every operand in the
+/// byte-identical data blocks applies twice. The copy also states its
+/// content recency: its id is allocated at relocation time, so without the
+/// key its own (newer) id would masquerade as its content position.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_relocated_table_carries_a_complete_single_output_lineage() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let src_path = dir.path().join("src");
+    let out_path = dir.path().join("out");
+
+    let mut writer = Writer::new(src_path.clone(), 7, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    for i in 0..96u32 {
+        writer.write(InternalValue::from_components(
+            format!("k{i:04}").into_bytes(),
+            b"val",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, src_checksum) = writer.finish()?.expect("source table written");
+    let source = recover_at(&src_path, src_checksum, 7)?;
+
+    let mut bitmap = DeleteBitmap::new();
+    bitmap.insert(4);
+    let out_checksum =
+        source.relocate_columnar_with_deletes(&out_path, &StdFs, 9, &bitmap, SyncMode::Normal)?;
+    let relocated = recover_at(&out_path, out_checksum, 9)?;
+
+    assert_eq!(
+        relocated.metadata.lineage.as_deref(),
+        Some(&[7u64][..]),
+        "the copy's lineage names exactly its source",
+    );
+    assert_eq!(
+        relocated.metadata.lineage_prev, None,
+        "a single-output run has no previous output",
+    );
+    assert!(
+        relocated.metadata.lineage_last,
+        "the single output closes its run",
+    );
+    assert_eq!(
+        relocated.metadata.recency,
+        Some(7),
+        "the copy's content position is its source's, not its own newer id",
+    );
+    Ok(())
+}
+
 /// A tight-space RESTRICTED view reads its live suffix only: `scan()` starts at
 /// the bound and numbers rows from zero, while the relocation copies the whole
 /// physical data section — punched prefix blocks included — and publishes the

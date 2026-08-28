@@ -459,6 +459,15 @@ pub(crate) fn commit_repair_tmp(
 /// replacement, whose punch offset comes from the temp's own index. A temp
 /// that does not even open is the mid-build crash; only transient I/O
 /// propagates for a retry.
+///
+/// A temp whose bytes no longer READ BACK at all (a rotted sector, a build
+/// truncated mid-write — non-environmental either way) must not hold the
+/// tree hostage: when the ORIGINAL `{id}` still matches the manifest's
+/// checksum, the manifest provably names the source, so the unreadable temp
+/// is a disposable abandoned build (`Ok(false)`). The temp's failure
+/// propagates only when the original cannot be proven authoritative either —
+/// the temp could then be a committed-but-unswapped replacement, and
+/// discarding it would destroy the only copy the manifest describes.
 #[cfg(feature = "std")]
 pub(crate) fn repair_tmp_is_published(
     config: &Config,
@@ -468,9 +477,26 @@ pub(crate) fn repair_tmp_is_published(
     manifest_checksum: crate::Checksum,
     restriction: Option<&crate::UserKey>,
 ) -> crate::Result<bool> {
+    // Resolves an unreadable temp against the ORIGINAL `{id}` beside it:
+    // an original matching the manifest's entry proves the temp is an
+    // abandoned build (`Ok(false)` — not published); anything less proven
+    // re-surfaces the temp's own failure.
+    let resolve_with_original = |temp_err: crate::Error| -> crate::Result<bool> {
+        let original = tmp_path.with_file_name(table_id.to_string());
+        match compute_table_checksum(&**fs, &original) {
+            Ok(digest) if crate::Checksum::from_raw(digest) == manifest_checksum => Ok(false),
+            Err(e) if is_environmental(&e) => Err(e),
+            // Neither copy is proven: surface the TEMP's failure (it is the
+            // file this decision is about).
+            Ok(_) | Err(_) => Err(temp_err),
+        }
+    };
     let Some(bound) = restriction else {
-        let digest = compute_table_checksum(&**fs, tmp_path)?;
-        return Ok(crate::Checksum::from_raw(digest) == manifest_checksum);
+        return match compute_table_checksum(&**fs, tmp_path) {
+            Ok(digest) => Ok(crate::Checksum::from_raw(digest) == manifest_checksum),
+            Err(e) if is_environmental(&e) => Err(e),
+            Err(temp_err) => resolve_with_original(temp_err),
+        };
     };
     let table = match crate::table::Table::recover(repair_recover_params(
         config,
@@ -480,16 +506,19 @@ pub(crate) fn repair_tmp_is_published(
         Arc::clone(fs),
     )) {
         Ok(table) => table,
-        Err(e) if is_environmental_io(&e) => return Err(e),
+        Err(e) if is_environmental(&e) => return Err(e),
         Err(_) => return Ok(false),
     };
     let punch_offset = match table.punch_offset_for(bound.as_ref()) {
         Ok(offset) => offset,
-        Err(e) if is_environmental_io(&e) => return Err(e),
+        Err(e) if is_environmental(&e) => return Err(e),
         Err(_) => return Ok(false),
     };
-    let digest = compute_table_checksum_from(&**fs, tmp_path, punch_offset)?;
-    Ok(crate::Checksum::from_raw(digest) == manifest_checksum)
+    match compute_table_checksum_from(&**fs, tmp_path, punch_offset) {
+        Ok(digest) => Ok(crate::Checksum::from_raw(digest) == manifest_checksum),
+        Err(e) if is_environmental(&e) => Err(e),
+        Err(temp_err) => resolve_with_original(temp_err),
+    }
 }
 
 /// Recover params for a repair's TRANSIENT table open: the tree's configured
@@ -549,8 +578,18 @@ fn repair_recover_params(
 ///
 /// This inspects the CRATE's [`crate::io::ErrorKind`], which is what a
 /// `crate::Error::Io` always carries.
-fn is_environmental_io(e: &crate::Error) -> bool {
+///
+/// [`crate::Error::Decrypt`] is in the class too, for the same reason: an
+/// AEAD failure is exactly what a MISSING or WRONG key produces on perfectly
+/// healthy ciphertext, and the two are cryptographically indistinguishable
+/// from genuine rot. Recording it as unreadable commits a manifest omitting
+/// the file — whose cleanup then DELETES the ciphertext — turning a fixable
+/// configuration mistake into permanent loss. Propagating lets a re-run
+/// under the right key recover everything; on genuinely rotted ciphertext
+/// the repair fails instead of guessing, and the bytes stay in place.
+fn is_environmental(e: &crate::Error) -> bool {
     matches!(e, crate::Error::Io(io) if io.kind().is_environmental())
+        || matches!(e, crate::Error::Decrypt(_))
 }
 
 /// Whether manifest repair must fail closed on a table because its bulk-ingest
@@ -812,7 +851,7 @@ fn record_best(
 /// Classifies a block-verifier result for the salvage gate. A structural
 /// divergence (a checksum / decode / cross-check mismatch) is genuine
 /// corruption: `Ok(true)`, route the table through salvage. Only a TRANSIENT
-/// [`crate::Error::Io`] (the [`is_environmental_io`] allowlist) aborts the repair
+/// [`crate::Error::Io`] (the [`is_environmental`] allowlist) aborts the repair
 /// (`Err`) for a retry, rather than dropping a healthy block into a partial
 /// replacement. A PERSISTENT I/O failure is NOT retryable — a bad sector, or a
 /// structural corruption surfacing as `Io(Other)` on some platforms — so it is
@@ -821,7 +860,7 @@ fn record_best(
 fn is_corruption(res: crate::Result<()>) -> crate::Result<bool> {
     match res {
         Ok(()) => Ok(false),
-        Err(e) if is_environmental_io(&e) => Err(e),
+        Err(e) if is_environmental(&e) => Err(e),
         Err(_) => Ok(true),
     }
 }
@@ -872,7 +911,7 @@ fn block_verify_verdict(
             && error.kind().is_environmental()
         {
             // Preserve the ErrorKind: re-wrapping as `Other` would make the
-            // caller's `is_environmental_io` check see a non-propagating kind
+            // caller's `is_environmental` check see a non-propagating kind
             // and re-grade this retryable / environmental failure as
             // corruption, defeating the propagation intent of this very gate.
             return Err(crate::Error::Io(crate::io::Error::new(
@@ -1075,7 +1114,7 @@ pub(crate) fn toc_may_hide_deletions(
         // section, so `true` drops the table rather than resurrecting masked rows.
         Err(e) => {
             let err = crate::Error::Io(e);
-            return if is_environmental_io(&err) {
+            return if is_environmental(&err) {
                 Err(err)
             } else {
                 Ok(true)
@@ -1092,7 +1131,7 @@ pub(crate) fn toc_may_hide_deletions(
         // genuine catalogue ambiguity that fails closed.
         Err(crate::sfa::Error::Io(e)) => {
             let err = crate::Error::Io(e);
-            if is_environmental_io(&err) {
+            if is_environmental(&err) {
                 Err(err)
             } else {
                 Ok(true)
@@ -1259,6 +1298,11 @@ struct TableSalvage<'a> {
     /// frontier); `None` on the plain corrupt-table salvage paths.
     blob_rewrite:
         Option<Arc<crate::HashMap<crate::vlog::BlobFileId, crate::salvage::BlobFileRewrite>>>,
+    /// The CLEAN manifest record's `global_seqno` for this id, when one
+    /// exists. A salvaged copy preserves local seqnos, so the offset applies
+    /// to it unchanged — with it, a bulk-ingested source salvages instead of
+    /// being rejected as unreconstructible.
+    manifest_global_seqno: Option<SeqNo>,
 }
 
 fn try_salvage_table(
@@ -1273,6 +1317,7 @@ fn try_salvage_table(
         table_id,
         reject_punched_without_bound,
         blob_rewrite,
+        manifest_global_seqno,
     } = salvage;
     // Salvage under the tree's configured comparator + crypto/dictionary context
     // so the rewritten SST opens, orders, and decrypts / decompresses consistently
@@ -1343,25 +1388,36 @@ fn try_salvage_table(
     }
 
     // Reopen the freshly-written (clean) salvaged SST so it joins the rebuilt
-    // manifest like any cleanly-recovered table.
+    // manifest like any cleanly-recovered table. A clean manifest record's
+    // ingest offset applies to the copy unchanged (the salvage preserves
+    // local seqnos), so it is reused here just like on the whole-recover path.
     let checksum = crate::Checksum::from_raw(compute_table_checksum(&**fs, table_path)?);
-    let table = Table::recover(repair_recover_params(
-        config,
-        table_path.to_path_buf(),
-        checksum,
-        table_id,
-        Arc::clone(fs),
-    ))?;
+    let table = {
+        let mut params = repair_recover_params(
+            config,
+            table_path.to_path_buf(),
+            checksum,
+            table_id,
+            Arc::clone(fs),
+        );
+        if let Some(g) = manifest_global_seqno {
+            params.global_seqno = g;
+        }
+        Table::recover(params)?
+    };
     // A salvaged copy of a bulk-ingested source still relies on the manifest-only
-    // global_seqno offset the rebuilt manifest cannot recover: its entries stay at
-    // local seqno 0, so installing it with offset 0 would silently mis-order and
-    // over-expose them. Treat it as unsalvageable — remove the freshly-written
-    // copy and let the caller record the table unreadable.
-    if has_unrecoverable_ingest_offset(
-        table.metadata.bulk_ingested,
-        table.metadata.item_count,
-        table.max_local_seqno(),
-    ) {
+    // global_seqno offset a manifest-LOSS rebuild cannot recover: its entries stay
+    // at local seqno 0, so installing it with offset 0 would silently mis-order
+    // and over-expose them. Without a clean manifest record to reuse, treat it as
+    // unsalvageable — remove the freshly-written copy and let the caller record
+    // the table unreadable.
+    if manifest_global_seqno.is_none()
+        && has_unrecoverable_ingest_offset(
+            table.metadata.bulk_ingested,
+            table.metadata.item_count,
+            table.max_local_seqno(),
+        )
+    {
         drop(table);
         // Remove the rejected replacement, and do NOT swallow the error. A
         // discarded `remove_file` failure would leave the freshly-written
@@ -1402,7 +1458,25 @@ fn dropped_data_extent_is_zeroed(
     source: &std::path::Path,
     dropped: &[crate::salvage::DroppedBlock],
 ) -> crate::Result<bool> {
-    Ok(!excised_extents(fs, source, dropped)?.is_empty())
+    let scan = excised_extents(fs, source, dropped)?;
+    // An UNATTRIBUTABLE qualifying run counts too: on a punch-capable mount
+    // a zero run the hole probe cannot answer for is indistinguishable from
+    // a lost-sidecar reclaim, and the caller's fail-closed guard (active
+    // only without resurrection) must fire rather than publish the salvaged
+    // copy unrestricted.
+    Ok(!scan.proven.is_empty() || scan.unattributed)
+}
+
+/// Result of [`excised_extents`]: the zero runs proven to be reclaimed, and
+/// whether any qualifying run could not be attributed either way.
+#[cfg(feature = "std")]
+struct ExcisedScan {
+    /// Structure-anchored zero runs proven to carry a physical hole,
+    /// ascending and disjoint.
+    proven: Vec<(u64, u64)>,
+    /// Whether a qualifying zero run on a PUNCH-CAPABLE mount got `None`
+    /// from the hole probe — reclaim and damage indistinguishable.
+    unattributed: bool,
 }
 
 /// The physically excised byte ranges of `source`'s data section: the
@@ -1426,7 +1500,7 @@ fn excised_extents(
     fs: &dyn crate::fs::Fs,
     source: &std::path::Path,
     dropped: &[crate::salvage::DroppedBlock],
-) -> crate::Result<Vec<(u64, u64)>> {
+) -> crate::Result<ExcisedScan> {
     // Shortest run accepted as a punch. A hole is punched per DATA BLOCK, so a
     // punched block contributes a zero run at least a block long — while inside
     // an intact block a zero run is bounded by its framing (header, key/value
@@ -1436,7 +1510,10 @@ fn excised_extents(
     const MIN_RUN: u64 = crate::table::block::Header::MIN_LEN as u64;
     let mut excised: Vec<(u64, u64)> = Vec::new();
     if dropped.is_empty() {
-        return Ok(excised);
+        return Ok(ExcisedScan {
+            proven: excised,
+            unattributed: false,
+        });
     }
     let mut file = fs.open(source, &crate::fs::FsOpenOptions::new().read(true))?;
     let file_len = crate::fs::FsFile::metadata(&*file)?.len;
@@ -1522,8 +1599,11 @@ fn excised_extents(
     // Zeros are the SHAPE of a reclaim, not the proof: corruption that destroys
     // a data block leaves the same read-as-zeros run, and calling that a punch
     // condemns an otherwise salvageable table as bound-lost. A reclaim
-    // deallocates, so each run must cover an actual HOLE; a backend that cannot
-    // answer leaves it unproven, which keeps the zeros as damage.
+    // deallocates, so each run must cover an actual HOLE. A run proven
+    // ALLOCATED (`Some(false)`) is damage; a run the backend CANNOT attribute
+    // (`None`) on a punch-capable mount is reported separately — reclaim and
+    // damage are then indistinguishable, and the caller's no-resurrection
+    // guard must fail closed rather than read "unproven" as "unpunched".
     //
     // Probed as CONTAINS-a-hole over the run rather than whole-span-is-a-hole
     // or a single midpoint byte: the reclaim punches per block with unaligned
@@ -1534,12 +1614,21 @@ fn excised_extents(
     // Only the presence of the hole matters here — the single caller asks
     // whether the extent was reclaimed at all, not exactly where.
     let mut proven = Vec::with_capacity(merged.len());
+    let mut unattributed = false;
     for (start, end) in merged {
-        if fs.extent_contains_hole(source, start, end - start)? == Some(true) {
-            proven.push((start, end));
+        match fs.extent_contains_hole(source, start, end - start)? {
+            Some(true) => proven.push((start, end)),
+            Some(false) => {}
+            None => unattributed = true,
         }
     }
-    Ok(proven)
+    if unattributed {
+        unattributed = fs.capabilities(source).punch_hole;
+    }
+    Ok(ExcisedScan {
+        proven,
+        unattributed,
+    })
 }
 
 /// Whether the source SST's first data block reads as all zeros, the signature of
@@ -1831,7 +1920,7 @@ fn derive_blob_frontier(
                 anchored = run_end;
                 pos = entry.frame_end;
             }
-            Some(Err(e)) if is_environmental_io(&e) => return Err(e),
+            Some(Err(e)) if is_environmental(&e) => return Err(e),
             // The zeroed run is not punch geometry (no frame decodes at its
             // end): keep the last anchored frontier.
             _ => return Ok(committed(anchored)),
@@ -1842,7 +1931,7 @@ fn derive_blob_frontier(
             match scanner.next() {
                 None => return Ok(committed(anchored)),
                 Some(Ok(entry)) if !entry.resynced => pos = entry.frame_end,
-                Some(Err(e)) if is_environmental_io(&e) => return Err(e),
+                Some(Err(e)) if is_environmental(&e) => return Err(e),
                 Some(Ok(_) | Err(_)) => {
                     // The frame starting at `pos` failed (or the scanner
                     // resynced past unproven bytes). Another zeroed hole
@@ -1987,7 +2076,7 @@ fn validate_blob_frames(
                 }
                 prev = Some((entry.key.clone(), entry.seqno));
             }
-            Err(e) if is_environmental_io(&e) => return Err(e),
+            Err(e) if is_environmental(&e) => return Err(e),
             // A resynced frame has an unprovable boundary (damage upstream);
             // any other error is a structural or persistent frame failure.
             // Both are conclusive: this file's frames do not all verify.
@@ -2361,7 +2450,7 @@ fn recover_blob_files(
             // which the next open's orphan sweep then DELETES — permanent value
             // loss from a one-shot failure. Propagate so a retry re-reads it,
             // mirroring the table-recovery path.
-            Err(e) if is_environmental_io(&e) => return Err(e),
+            Err(e) if is_environmental(&e) => return Err(e),
             Err(e) => {
                 discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
                 continue;
@@ -2389,7 +2478,7 @@ fn recover_blob_files(
                 &config.fs,
             ) {
                 Ok(handle) => handle,
-                Err(e) if is_environmental_io(&e) => return Err(e),
+                Err(e) if is_environmental(&e) => return Err(e),
                 Err(e) => {
                     discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
                     continue;
@@ -2504,7 +2593,7 @@ fn recover_blob_files(
                     discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
                     continue;
                 }
-                Err(e) if is_environmental_io(&e) => {
+                Err(e) if is_environmental(&e) => {
                     // Nothing was published; dropping the temp restores the
                     // pre-repair state exactly, so the retry re-salvages and
                     // re-derives the remap. Best-effort is enough on this
@@ -2589,7 +2678,7 @@ fn recover_blob_files(
         let checksum = match compute_table_checksum_from(&*config.fs, &blob_path, frontier) {
             Ok(c) => crate::Checksum::from_raw(c),
             // Same transient/persistent split as the frontier probe above.
-            Err(e) if is_environmental_io(&e) => return Err(e),
+            Err(e) if is_environmental(&e) => return Err(e),
             Err(e) => {
                 discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
                 continue;
@@ -2633,7 +2722,7 @@ fn recover_blob_files(
                 blob_files.push(bf);
             }
             // Same transient/persistent split as the checksum read above.
-            Err(e) if is_environmental_io(&e) => return Err(e),
+            Err(e) if is_environmental(&e) => return Err(e),
             Err(e) => {
                 discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
             }
@@ -2990,7 +3079,7 @@ impl RepairPolicy {
 #[cfg(feature = "std")]
 fn sweep_superseded_by_committed_manifest(
     config: &Config,
-) -> crate::Result<Option<crate::HashSet<TableId>>> {
+) -> crate::Result<Option<crate::HashMap<TableId, crate::version::recovery::RecoveredTable>>> {
     let recovery = match crate::version::recovery::recover(
         &config.path,
         &*config.fs,
@@ -3004,29 +3093,25 @@ fn sweep_superseded_by_committed_manifest(
         // and outputs both on disk the rebuilt L0 applies duplicate merge
         // operands — where the authoritative manifest would have named which
         // files are live. Propagate for a retry.
-        Err(e) if is_environmental_io(&e) => return Err(e),
+        Err(e) if is_environmental(&e) => return Err(e),
         // A manifest that does not load cleanly is exactly the case repair
         // exists for: nothing committed to consult, the scan rebuilds from
         // everything.
         Err(_) => return Ok(None),
     };
 
-    let referenced_tables: crate::HashSet<TableId> = recovery
-        .table_ids
-        .iter()
-        .flatten()
-        .flatten()
-        .map(|t| t.id)
-        .collect();
-    // For temp-swap resolution: the manifest's per-table checksum is what
-    // distinguishes a committed replacement from an abandoned build.
-    let manifest_checksums: crate::HashMap<TableId, crate::Checksum> = recovery
-        .table_ids
-        .iter()
-        .flatten()
-        .flatten()
-        .map(|t| (t.id, t.checksum))
-        .collect();
+    // The full per-table records, not just the id set: the checksum drives
+    // temp-swap resolution below, and the `global_seqno` ingest offset is
+    // what the caller's scan reuses for a healthy bulk-ingested table (a
+    // clean manifest record makes that offset recoverable).
+    let referenced_tables: crate::HashMap<TableId, crate::version::recovery::RecoveredTable> =
+        recovery
+            .table_ids
+            .iter()
+            .flatten()
+            .flatten()
+            .map(|t| (t.id, *t))
+            .collect();
     for (table_base_folder, folder_fs) in config.all_tables_folders() {
         if !folder_fs.exists(&table_base_folder)? {
             continue;
@@ -3044,8 +3129,8 @@ fn sweep_superseded_by_committed_manifest(
             // from the durable manifest alone.
             if let Some(id) = table_id_from_repair_tmp_name(&dirent.file_name) {
                 let table_path = table_base_folder.join(id.to_string());
-                let published = match manifest_checksums.get(&id) {
-                    Some(&manifest_checksum) => repair_tmp_is_published(
+                let published = match referenced_tables.get(&id).map(|t| t.checksum) {
+                    Some(manifest_checksum) => repair_tmp_is_published(
                         config,
                         &folder_fs,
                         &dirent.path,
@@ -3077,7 +3162,7 @@ fn sweep_superseded_by_committed_manifest(
             let Ok(id) = dirent.file_name.parse::<TableId>() else {
                 continue;
             };
-            if referenced_tables.contains(&id) {
+            if referenced_tables.contains_key(&id) {
                 continue;
             }
             // Unreferenced bare-id files are removed even though one COULD be a
@@ -3119,9 +3204,11 @@ fn sweep_superseded_by_committed_manifest(
             }
         }
     }
-    // The manifest loaded cleanly: hand the caller its referenced table set,
-    // so an id it names that the directory scan never SEES (the file is
-    // gone, not merely unreadable) is still reported as an unscopable loss.
+    // The manifest loaded cleanly: hand the caller its referenced table
+    // records, so an id it names that the directory scan never SEES (the
+    // file is gone, not merely unreadable) is still reported as an
+    // unscopable loss — and so a healthy bulk-ingested table's manifest-only
+    // `global_seqno` offset is reused instead of failing closed.
     Ok(Some(referenced_tables))
 }
 
@@ -3341,15 +3428,20 @@ fn repair_tree(
     // Finish the previous run's outstanding cleanup first. See
     // `sweep_superseded_by_committed_manifest`. When the manifest itself
     // loads cleanly (repair was entered over a MISSING file, not a lost
-    // manifest), its referenced table set is kept: an id it names that the
-    // directory scan never sees has no directory entry to report through,
-    // and losing it silently would let `wal_replay_scope()` answer
-    // `TailOnly` over lost persisted data.
+    // manifest), its referenced table records are kept: an id it names that
+    // the directory scan never sees has no directory entry to report
+    // through, and losing it silently would let `wal_replay_scope()` answer
+    // `TailOnly` over lost persisted data. The records also carry each
+    // table's `global_seqno`, so a healthy bulk-ingested SST keeps its
+    // manifest-only ingest offset instead of being failed closed.
     #[cfg(feature = "std")]
-    let manifest_referenced: Option<crate::HashSet<TableId>> =
-        sweep_superseded_by_committed_manifest(config)?;
+    let manifest_referenced: Option<
+        crate::HashMap<TableId, crate::version::recovery::RecoveredTable>,
+    > = sweep_superseded_by_committed_manifest(config)?;
     #[cfg(not(feature = "std"))]
-    let manifest_referenced: Option<crate::HashSet<TableId>> = None;
+    let manifest_referenced: Option<
+        crate::HashMap<TableId, crate::version::recovery::RecoveredTable>,
+    > = None;
     let mut scanned_table_ids: crate::HashSet<TableId> = crate::HashSet::default();
 
     // Byte totals for the progress percentage, from an upfront listing —
@@ -3580,20 +3672,37 @@ fn repair_tree(
             // would then delete. Table::recover would fail on the same bytes, so
             // skip it; block salvage opens with a placeholder digest and drops
             // only the unreadable blocks.
+            // A CLEAN manifest record for this id carries the table's
+            // `global_seqno`: table files are immutable once published and
+            // ids are never reused, so the record's offset describes THIS
+            // logical table even when its bytes have since been damaged.
+            // Reusing it keeps a healthy bulk-ingested SST (and its real
+            // sequence position) where the manifest-loss rule would have to
+            // fail closed.
+            let manifest_global_seqno: Option<SeqNo> = manifest_referenced
+                .as_ref()
+                .and_then(|m| m.get(&table_id))
+                .map(|t| t.global_seqno);
             let recovered = match compute_table_checksum(&*folder_fs, &table_path) {
-                Ok(c) => Table::recover(repair_recover_params(
-                    config,
-                    table_path.clone(),
-                    crate::Checksum::from_raw(c),
-                    table_id,
-                    folder_fs.clone(),
-                )),
+                Ok(c) => {
+                    let mut params = repair_recover_params(
+                        config,
+                        table_path.clone(),
+                        crate::Checksum::from_raw(c),
+                        table_id,
+                        folder_fs.clone(),
+                    );
+                    if let Some(g) = manifest_global_seqno {
+                        params.global_seqno = g;
+                    }
+                    Table::recover(params)
+                }
                 // A TRANSIENT read (flaky I/O) while hashing is retryable:
                 // recording it unreadable commits a manifest without the
                 // still-in-place file, which the next open's orphan cleanup then
                 // deletes — permanent loss from a one-shot failure. Propagate it
                 // so a retry re-reads the table, mirroring the recover arms below.
-                Err(e) if is_environmental_io(&e) => return Err(e),
+                Err(e) if is_environmental(&e) => return Err(e),
                 // A PERSISTENT read failure (a bad data sector, a corrupt trailer)
                 // is genuine damage but does not doom the whole table: fold it into
                 // the recover Result so the structural-failure salvage arm below
@@ -3610,15 +3719,18 @@ fn repair_tree(
             if let Ok(t) = &recovered {
                 let range = t.metadata.key_range.clone();
                 // The bound is UNKNOWN when the table's sequence base lived in
-                // the lost manifest: this open deliberately passes offset 0, so
+                // the LOST manifest: that open passes offset 0, so
                 // `get_highest_seqno` would report the on-disk LOCAL maximum
                 // (normally 0 for a bulk-ingested SST) and an operator scoping
                 // the affected history by it would stop far below the truth.
-                let seqno = (!has_unrecoverable_ingest_offset(
-                    t.metadata.bulk_ingested,
-                    t.metadata.item_count,
-                    t.max_local_seqno(),
-                ))
+                // With a clean manifest record the offset was reused above,
+                // so the bound is honest again.
+                let seqno = (manifest_global_seqno.is_some()
+                    || !has_unrecoverable_ingest_offset(
+                        t.metadata.bulk_ingested,
+                        t.metadata.item_count,
+                        t.max_local_seqno(),
+                    ))
                 .then(|| t.get_highest_seqno());
                 coverage_by_path.insert(
                     table_path.clone(),
@@ -3634,11 +3746,15 @@ fn repair_tree(
             // entries appear OLDER than they are — visible to snapshots that never
             // saw them and sorted into the wrong L0 order. Drop it instead of
             // silently corrupting MVCC (see `has_unrecoverable_ingest_offset`).
-            if matches!(&recovered, Ok(t) if has_unrecoverable_ingest_offset(
-                t.metadata.bulk_ingested,
-                t.metadata.item_count,
-                t.max_local_seqno(),
-            )) {
+            // ONLY without a clean manifest record: with one, the offset was
+            // recovered above and the table keeps its real sequence position.
+            if manifest_global_seqno.is_none()
+                && matches!(&recovered, Ok(t) if has_unrecoverable_ingest_offset(
+                    t.metadata.bulk_ingested,
+                    t.metadata.item_count,
+                    t.max_local_seqno(),
+                ))
+            {
                 drop(recovered); // release the file handle
                 set_aside_path(
                     &folder_fs,
@@ -3685,7 +3801,7 @@ fn repair_tree(
                     Ok(crate::restrict_bound::SidecarRead::Present(id, b)) if id == table_id => {
                         Some(b.into())
                     }
-                    Err(e) if is_environmental_io(&e) => break 'restrict Err(e),
+                    Err(e) if is_environmental(&e) => break 'restrict Err(e),
                     Ok(_) | Err(_) => None,
                 };
 
@@ -3726,9 +3842,31 @@ fn repair_tree(
                 // fully-punched SST with no live data is set aside too, losing
                 // nothing the flag could have kept.
                 match table.has_punched_data_block() {
-                    Ok(false) => break 'restrict Ok(table),
+                    Ok(crate::table::PunchProbe::Unpunched) => break 'restrict Ok(table),
                     Err(e) => break 'restrict Err(e),
-                    Ok(true) => {
+                    // UNPROVEN zeros on a punch-capable mount: a lost-sidecar
+                    // reclaim and damage are indistinguishable, and publishing
+                    // unrestricted would resurrect the boundary block's rows
+                    // below the committed restriction. Without resurrection
+                    // the table is set aside; with it, the geometry paths
+                    // below (which read zeroed BLOCKS, not holes) restrict
+                    // past the ambiguous region, accepting the re-exposure
+                    // the flag contracts.
+                    Ok(crate::table::PunchProbe::Unproven) if !allow_resurrection => {
+                        drop(table);
+                        set_aside_path(
+                            &folder_fs,
+                            &table_path,
+                            "zeroed data blocks whose allocation state the backend \
+                             cannot attribute (a lost-sidecar punch and damage are \
+                             indistinguishable); a resurrection repair restricts past \
+                             the zeroed region instead",
+                            &mut unreadable_files,
+                            &mut discard_after_commit,
+                        );
+                        continue 'dirent;
+                    }
+                    Ok(crate::table::PunchProbe::Punched | crate::table::PunchProbe::Unproven) => {
                         use crate::table::DerivedRestriction;
                         let derived = if allow_resurrection {
                             match table.derive_resurrection_bound() {
@@ -3872,6 +4010,7 @@ fn repair_tree(
                                     // on this arm.
                                     reject_punched_without_bound: false,
                                     blob_rewrite: None,
+                                    manifest_global_seqno,
                                 },
                             ) {
                                 Ok(SalvageOutcome::Salvaged(salvaged)) => {
@@ -3918,7 +4057,7 @@ fn repair_tree(
                                 // nothing has moved: the source is untouched, so the
                                 // retry re-derives the same salvage from it. A
                                 // STRUCTURAL failure is genuine unsalvageability.
-                                Err(salvage_err) if is_environmental_io(&salvage_err) => {
+                                Err(salvage_err) if is_environmental(&salvage_err) => {
                                     return Err(salvage_err);
                                 }
                                 Err(salvage_err) => {
@@ -4001,7 +4140,7 @@ fn repair_tree(
                     // turning a one-shot read failure into permanent loss.
                     // Propagate the I/O error so a retry re-recovers it,
                     // mirroring the verification / salvage-error paths.
-                    if is_environmental_io(&e) {
+                    if is_environmental(&e) {
                         return Err(e);
                     }
                     // A tight-space-punched SST that fails whole-file recovery still
@@ -4022,7 +4161,7 @@ fn repair_tree(
                         {
                             Some(b.into())
                         }
-                        Err(read_err) if is_environmental_io(&read_err) => return Err(read_err),
+                        Err(read_err) if is_environmental(&read_err) => return Err(read_err),
                         Ok(_) | Err(_) => None,
                     };
                     // A PUNCHED source with no trustworthy bound (missing / corrupt
@@ -4077,6 +4216,7 @@ fn repair_tree(
                             table_id,
                             reject_punched_without_bound: reject_punched,
                             blob_rewrite: None,
+                            manifest_global_seqno,
                         },
                     ) {
                         Ok(SalvageOutcome::Salvaged(salvaged)) => {
@@ -4140,7 +4280,7 @@ fn repair_tree(
                         // Transient I/O salvage failure: nothing moved, so the
                         // retry re-derives the same salvage from the untouched
                         // source. A structural failure is recorded.
-                        Err(salvage_err) if is_environmental_io(&salvage_err) => {
+                        Err(salvage_err) if is_environmental(&salvage_err) => {
                             return Err(salvage_err);
                         }
                         Err(salvage_err) => {
@@ -4163,7 +4303,7 @@ fn repair_tree(
                     // permanent loss from a one-shot read failure. Propagate it so
                     // a retry re-recovers the table; only a structural failure is a
                     // genuine unreadable report.
-                    if is_environmental_io(&e) {
+                    if is_environmental(&e) {
                         return Err(e);
                     }
                     // The rebuilt manifest omits this file, so it is removed once
@@ -4266,7 +4406,7 @@ fn repair_tree(
                         referenced_blob_ids.insert(link.blob_file_id);
                     }
                 }
-                Err(e) if is_environmental_io(&e) => return Err(e),
+                Err(e) if is_environmental(&e) => return Err(e),
                 Err(e) => {
                     log::warn!(
                         "repair: table {} has an unreadable blob-reference section \
@@ -4314,7 +4454,7 @@ fn repair_tree(
         for candidate in candidates {
             let is_blob_backed = match candidate.0.list_blob_file_references() {
                 Ok(refs) => refs.is_some_and(|r| !r.is_empty()),
-                Err(e) if is_environmental_io(&e) => return Err(e),
+                Err(e) if is_environmental(&e) => return Err(e),
                 Err(e) => {
                     let (table, ..) = candidate;
                     set_aside_table(
@@ -4380,7 +4520,7 @@ fn repair_tree(
             // and the rewrite decision.
             let links = match table.list_blob_file_references() {
                 Ok(links) => links,
-                Err(e) if is_environmental_io(&e) => return Err(e),
+                Err(e) if is_environmental(&e) => return Err(e),
                 Err(e) => {
                     set_aside_table(
                         table,
@@ -4430,7 +4570,7 @@ fn repair_tree(
                 {
                     match handle_below_blob_frontier(&table, &punched_frontiers) {
                         Ok(hit) => needs_rewrite = hit.is_some(),
-                        Err(e) if is_environmental_io(&e) => return Err(e),
+                        Err(e) if is_environmental(&e) => return Err(e),
                         Err(e) => {
                             set_aside_table(
                                 table,
@@ -4467,6 +4607,10 @@ fn repair_tree(
             // rewrite re-emits the straddling block's sub-bound rows, which the
             // restriction hides, so an unrestricted copy would resurrect them.
             let restrict_bound = table.restrict_lower_bound().cloned();
+            // The source already carries its recovered ingest offset (from a
+            // clean manifest record, or 0); the rewrite preserves local
+            // seqnos, so the copy reopens under the same offset.
+            let source_global_seqno = table.global_seqno();
             let fs = table.fs.clone();
             drop(table); // release the handle before reading the source again
             match try_salvage_table(
@@ -4479,6 +4623,7 @@ fn repair_tree(
                     table_id: source_id,
                     reject_punched_without_bound: false,
                     blob_rewrite: Some(Arc::clone(&blob_rewrites)),
+                    manifest_global_seqno: (source_global_seqno > 0).then_some(source_global_seqno),
                 },
             ) {
                 Ok(SalvageOutcome::Salvaged(rewritten)) => {
@@ -4506,7 +4651,7 @@ fn repair_tree(
                 // A retryable failure leaves the source where it was found, so
                 // the retry re-derives the same rewrite from it; nothing to
                 // restore.
-                Err(e) if is_environmental_io(&e) => return Err(e),
+                Err(e) if is_environmental(&e) => return Err(e),
                 Err(e) => {
                     set_aside_path(
                         &fs,
@@ -5479,7 +5624,7 @@ fn repair_tree(
     if let Some(referenced) = manifest_referenced {
         let primary_tables = config.path.join("tables");
         let mut missing: Vec<TableId> = referenced
-            .into_iter()
+            .into_keys()
             .filter(|id| !scanned_table_ids.contains(id))
             .collect();
         missing.sort_unstable();

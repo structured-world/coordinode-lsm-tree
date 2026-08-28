@@ -249,7 +249,7 @@ pub fn get_current_version(
     Ok(version_id)
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoveredTable {
     pub id: TableId,
     pub checksum: Checksum,

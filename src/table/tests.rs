@@ -1158,9 +1158,13 @@ fn punched_run_with_allocated_edges_still_proves_the_punch() -> crate::Result<()
             usize::try_from(punch_off).expect("small fixture")
         ])?;
     }
-    // ...but zeros alone are damage, not proof.
+    // ...but zeros alone are damage, not proof (the probe answers, so the
+    // verdict is a definite Unpunched, not an unattributable Unproven).
     assert!(
-        !table.has_punched_data_block()?,
+        matches!(
+            table.has_punched_data_block()?,
+            crate::table::PunchProbe::Unpunched
+        ),
         "zeros without a hole are corruption, never a punch",
     );
 
@@ -1170,7 +1174,10 @@ fn punched_run_with_allocated_edges_still_proves_the_punch() -> crate::Result<()
     let mid = punch_off / 2;
     memfs.punch_hole(&path, mid - 8, 16)?;
     assert!(
-        table.has_punched_data_block()?,
+        matches!(
+            table.has_punched_data_block()?,
+            crate::table::PunchProbe::Punched
+        ),
         "a hole contained in the zeroed run proves the punch even though no \
          block's whole extent is one",
     );

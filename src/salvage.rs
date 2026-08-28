@@ -2862,10 +2862,23 @@ pub fn salvage_blob_file(
         crate::vlog::recover_blob_file(source, blob_file_id, crate::Checksum::from_raw(0), 0, fs)?;
     let compression = source_handle.compression();
     #[cfg(zstd_any)]
-    if matches!(compression, crate::CompressionType::ZstdDict { .. }) && zstd_dictionary.is_none() {
-        return Err(crate::Error::FeatureUnsupported(
-            "salvage of a dictionary-compressed blob file without its dictionary",
-        ));
+    if let crate::CompressionType::ZstdDict { dict_id, .. } = compression {
+        let Some(dict) = zstd_dictionary else {
+            return Err(crate::Error::FeatureUnsupported(
+                "salvage of a dictionary-compressed blob file without its dictionary",
+            ));
+        };
+        // Validate the supplied dictionary against the persisted descriptor
+        // BEFORE the record walk: a mismatched dictionary fails every frame's
+        // decompress, and the walk's catch-all would record each as a Corrupt
+        // drop — a "successful" salvage of zero records that discards a fully
+        // intact file. Fail closed up front instead.
+        if dict.id() != dict_id {
+            return Err(crate::Error::ZstdDictMismatch {
+                expected: dict_id,
+                got: Some(dict.id()),
+            });
+        }
     }
 
     let scanner = if live_data_start > 0 {

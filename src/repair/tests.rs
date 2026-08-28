@@ -1460,7 +1460,7 @@ fn repair_with_salvage_propagates_a_transient_verify_io_error() -> crate::Result
     // file (sequential `Read`), and whole-file recovery is lazy on the data
     // section, so neither trips: the first positioned read at this offset is the
     // block-verify DECODE-load, which then surfaces a transient `Io` error.
-    // `Interrupted` is the genuine transient kind (the `is_environmental_io`
+    // `Interrupted` is the genuine transient kind (the `is_environmental`
     // allowlist): a persistent `Other` would instead grade as corruption and
     // salvage, which is the sibling `is_corruption_routes_a_persistent_io...` case.
     let offset = sole_data_block_offset(&recover_table(sst.clone(), &fs)?);
@@ -1941,6 +1941,119 @@ fn repair_sets_aside_a_partially_punched_sst_without_a_trustworthy_bound() -> cr
         "the reason names the failed punches that made the bound unknowable: {:?}",
         report.unreadable_files,
     );
+    Ok(())
+}
+
+/// Zeroed data blocks the backend CANNOT attribute must fail closed, not
+/// read as "unpunched". On a punch-capable mount whose `extent_contains_hole`
+/// answers the trait-default `None`, a tight-space-punched SST that lost its
+/// sidecar has zeroed runs that are indistinguishable from damage — but
+/// treating them as "no punch" publishes the table UNRESTRICTED, and the
+/// boundary block's rows below the committed restriction reappear. With
+/// resurrection off the table is set aside; the resurrection repair (which
+/// accepts re-exposure by contract) restricts past the zeroed region instead.
+#[test]
+fn repair_sets_aside_zeroed_blocks_the_backend_cannot_attribute() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    /// Forwards to [`MemFs`] (punch-capable, and `capabilities` says so) but
+    /// leaves `extent_contains_hole` at the trait default `None` — a mount
+    /// that can punch but cannot attribute zeros to a hole.
+    struct UnattributedHoleFs(Arc<MemFs>);
+    impl Fs for UnattributedHoleFs {
+        fn open(
+            &self,
+            path: &std::path::Path,
+            options: &crate::fs::FsOpenOptions,
+        ) -> crate::io::Result<Box<dyn crate::fs::FsFile>> {
+            self.0.open(path, options)
+        }
+        fn create_dir_all(&self, path: &std::path::Path) -> crate::io::Result<()> {
+            self.0.create_dir_all(path)
+        }
+        fn read_dir(
+            &self,
+            path: &std::path::Path,
+        ) -> crate::io::Result<Vec<crate::fs::FsDirEntry>> {
+            self.0.read_dir(path)
+        }
+        fn remove_file(&self, path: &std::path::Path) -> crate::io::Result<()> {
+            self.0.remove_file(path)
+        }
+        fn remove_dir_all(&self, path: &std::path::Path) -> crate::io::Result<()> {
+            self.0.remove_dir_all(path)
+        }
+        fn same_file(&self, a: &std::path::Path, b: &std::path::Path) -> crate::io::Result<bool> {
+            self.0.same_file(a, b)
+        }
+        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> crate::io::Result<()> {
+            self.0.rename(from, to)
+        }
+        fn metadata(&self, path: &std::path::Path) -> crate::io::Result<crate::fs::FsMetadata> {
+            self.0.metadata(path)
+        }
+        fn exists(&self, path: &std::path::Path) -> crate::io::Result<bool> {
+            self.0.exists(path)
+        }
+        fn sync_directory(&self, path: &std::path::Path) -> crate::io::Result<()> {
+            self.0.sync_directory(path)
+        }
+        fn backend_id(&self) -> Option<u64> {
+            self.0.backend_id()
+        }
+        fn capabilities(&self, path: &std::path::Path) -> crate::fs::FsCapabilities {
+            self.0.capabilities(path)
+        }
+        fn punch_hole(
+            &self,
+            path: &std::path::Path,
+            offset: u64,
+            len: u64,
+        ) -> crate::io::Result<()> {
+            self.0.punch_hole(path, offset, len)
+        }
+    }
+
+    for allow_resurrection in [false, true] {
+        let memfs = Arc::new(MemFs::new());
+        let fs: Arc<dyn Fs> = Arc::new(UnattributedHoleFs(memfs.clone()));
+        let root = std::path::absolute("/db")?;
+        let tables = root.join("tables");
+        fs.create_dir_all(&tables)?;
+        build_punched_prefix_sst(&memfs, &fs, &tables)?;
+
+        let report = Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs.clone())
+        .repair_with_resurrection(true, allow_resurrection)?;
+        if allow_resurrection {
+            assert_eq!(
+                report.recovered, 1,
+                "the resurrection repair keeps the readable region, restricted \
+                 past the unattributable zeros: {report:?}",
+            );
+        } else {
+            assert_eq!(
+                report.recovered, 0,
+                "zeros the backend cannot attribute must never publish the \
+                 table unrestricted (the punched prefix's sub-bound rows \
+                 would reappear): {report:?}",
+            );
+            assert!(
+                report
+                    .unreadable_files
+                    .first()
+                    .is_some_and(|(_, reason)| reason.contains("cannot attribute")),
+                "the reason names the unattributable zeros: {:?}",
+                report.unreadable_files,
+            );
+        }
+    }
     Ok(())
 }
 
@@ -10241,6 +10354,85 @@ fn a_manifest_referenced_table_missing_from_disk_is_unknowable() -> crate::Resul
     Ok(())
 }
 
+/// A repair under the WRONG encryption key must fail closed, not "succeed"
+/// empty. With `CURRENT` gone the open classifies as structurally repairable
+/// before the key is ever exercised, and inside the scan every SST recovery
+/// fails with an AEAD decrypt error — which is exactly what a missing or
+/// wrong key produces on perfectly healthy ciphertext. Recording those as
+/// unreadable commits a manifest around nothing and the cleanup then DELETES
+/// the ciphertext files: permanent loss that re-running with the right key
+/// would have avoided entirely. The decrypt failure must propagate like an
+/// environmental one, leaving every file in place.
+#[cfg(feature = "encryption")]
+#[test]
+fn a_repair_under_the_wrong_encryption_key_fails_closed() -> crate::Result<()> {
+    use crate::fs::Fs;
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(crate::fs::MemFs::new());
+    let root = std::path::absolute("/db_enc")?;
+    let good: Arc<dyn crate::encryption::EncryptionProvider> =
+        Arc::new(crate::encryption::Aes256GcmProvider::new(&[0x42; 32]));
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_encryption(Some(Arc::clone(&good)))
+        .open()?
+        {
+            crate::AnyTree::Standard(t) => t,
+            crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+        };
+        tree.insert(b"a", b"v", 1);
+        tree.flush_active_memtable(0)?;
+        tree.insert(b"b", b"v", 2);
+        tree.flush_active_memtable(0)?;
+    }
+    // Losing CURRENT makes the open structurally repairable BEFORE the key
+    // mismatch can surface, so the repair scan is where decrypt first fails.
+    memfs.remove_file(&root.join("current"))?;
+
+    let wrong: Arc<dyn crate::encryption::EncryptionProvider> =
+        Arc::new(crate::encryption::Aes256GcmProvider::new(&[0x13; 32]));
+    let Err(err) = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs.clone())
+    .with_encryption(Some(Arc::clone(&wrong)))
+    .repair() else {
+        panic!("a wrong-key repair must fail, not commit an empty manifest");
+    };
+    assert!(
+        matches!(&err, crate::Error::Decrypt(_)),
+        "the failure names the decrypt cause: {err:?}",
+    );
+    // The ciphertext is untouched: re-running with the right key repairs.
+    assert!(
+        memfs.exists(&root.join("tables").join("0"))?
+            && memfs.exists(&root.join("tables").join("1"))?,
+        "no ciphertext file may be deleted by a wrong-key repair",
+    );
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .with_encryption(Some(good))
+    .repair()?;
+    assert_eq!(
+        report.recovered, 2,
+        "the right key recovers every table: {report:?}"
+    );
+    Ok(())
+}
+
 /// An INCONCLUSIVE post-persist probe must not claim a committed repair:
 /// with the rename refused and the pointer read failing too, nothing
 /// proves the switch, and returning `RepairedButUnopened` would hand a
@@ -10469,6 +10661,139 @@ fn a_switched_current_sync_failure_carries_the_report() -> crate::Result<()> {
         }
     }
     panic!("no skip count landed the fault in the post-switch window");
+}
+
+/// When the manifest itself loads CLEANLY and repair was entered over one
+/// missing unrelated file, every surviving table's manifest record — its
+/// `global_seqno` ingest offset included — is recoverable. A bulk-ingested
+/// SST keeps its entries at LOCAL seqno 0 and relies on that manifest-only
+/// offset, so treating it as unrecoverable (the manifest-LOSS rule) would
+/// exclude every healthy bulk-ingested table and delete it after the
+/// commit: one missing file erasing all ingested data. The clean record's
+/// offset must be reused — the table is kept AND its entries stay at their
+/// real sequence position, not offset 0.
+#[test]
+fn a_clean_manifest_record_preserves_a_bulk_ingested_offset() -> crate::Result<()> {
+    use crate::fs::Fs;
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(crate::fs::MemFs::new());
+    let root = std::path::absolute("/db_ingest")?;
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+    };
+    {
+        let tree = match config().open()? {
+            crate::AnyTree::Standard(t) => t,
+            crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+        };
+        tree.insert(b"a", b"v", 1);
+        tree.flush_active_memtable(0)?;
+        // Bulk ingest: entries at local seqno 0 under a manifest-only offset.
+        let mut ingestion = crate::tree::ingest::Ingestion::new(&tree)?;
+        ingestion.write(b"ing".as_slice().into(), b"V".as_slice().into())?;
+        ingestion.finish()?;
+    }
+    // One unrelated referenced file vanishes; the manifest stays clean.
+    memfs.remove_file(&root.join("tables").join("0"))?;
+
+    let report = config().repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "the healthy bulk-ingested table is kept, offset from the clean \
+         manifest record: {report:?}",
+    );
+    assert!(
+        !report
+            .unreadable_files
+            .iter()
+            .any(|(_, why)| why.contains("bulk-ingest")),
+        "no healthy ingested table may be dropped over a recoverable \
+         offset: {report:?}",
+    );
+
+    let tree = config().open()?;
+    assert!(
+        tree.get(b"ing", crate::MAX_SEQNO)?.is_some(),
+        "the ingested row survives the repair",
+    );
+    // The offset is the REAL one, not 0: at snapshot 1 the ingested row
+    // (effective seqno = manifest offset > 1) must not be visible yet. With
+    // a zeroed offset its effective seqno would be 0 and it would leak into
+    // this old snapshot.
+    assert!(
+        tree.get(b"ing", 1)?.is_none(),
+        "the ingested row keeps its real sequence position, not offset 0",
+    );
+    Ok(())
+}
+
+/// A leftover `{id}.repair-tmp` whose bytes NO LONGER READ BACK (a rotted
+/// sector, a truncated build — non-environmental either way) must not hold
+/// the whole tree hostage: when the ORIGINAL `{id}` still matches the clean
+/// manifest's checksum, the manifest provably names the source, the temp is
+/// a disposable abandoned build, and the open sweeps it and proceeds.
+/// Propagation is reserved for environmental failures and for the case
+/// where the original cannot be proven authoritative either (the temp could
+/// then be a committed-but-unswapped replacement).
+#[test]
+fn an_unreadable_repair_temp_yields_to_a_proven_original() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let fault = Arc::new(FaultFs::new(crate::fs::MemFs::new()));
+    let fs: Arc<dyn Fs> = fault.clone();
+    let root = std::path::absolute("/db_tmp_rot")?;
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs.clone())
+    };
+    {
+        let tree = match config().open()? {
+            crate::AnyTree::Standard(t) => t,
+            crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+        };
+        tree.insert(b"a", b"v", 1);
+        tree.flush_active_memtable(0)?;
+    }
+    // The manifest names table 0, so the temp-swap resolution consults its
+    // checksum; the temp itself is made persistently unreadable.
+    let tmp = root.join("tables").join("0.repair-tmp");
+    {
+        let mut f = fs.open(
+            &tmp,
+            &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        std::io::Write::write_all(&mut f, &[0xEE; 64])?;
+    }
+    for op in [FaultOp::Read, FaultOp::ReadAt] {
+        fault
+            .injector()
+            .arm(FaultRule::new(op, Fault::Error(ErrorKind::InvalidData)).on_path("0.repair-tmp"));
+    }
+
+    let tree = config().open()?;
+    assert!(
+        tree.get(b"a", crate::MAX_SEQNO)?.is_some(),
+        "the healthy manifest reopens past the unreadable disposable temp",
+    );
+    assert!(
+        !fs.exists(&tmp)?,
+        "the unreadable temp is swept once the original proves authoritative",
+    );
+    Ok(())
 }
 
 /// An abandoned repair replacement's RESTRICTION SIDECAR goes with it: a

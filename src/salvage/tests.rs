@@ -7149,6 +7149,67 @@ fn salvage_recovers_a_dictionary_sst_with_the_dictionary() -> crate::Result<()> 
     Ok(())
 }
 
+/// A dictionary-compressed BLOB file salvaged under the WRONG dictionary must
+/// fail closed BEFORE the record walk. Without the up-front id check, every
+/// frame's decompress fails with a per-record dictionary mismatch that the
+/// walk's catch-all records as a `Corrupt` drop — the run "succeeds" with
+/// zero records salvaged, and a repair that trusts the report throws away a
+/// fully intact file whose only problem was a mis-supplied dictionary.
+#[cfg(zstd_any)]
+#[test]
+fn a_blob_salvage_under_the_wrong_dictionary_fails_closed() -> crate::Result<()> {
+    use crate::CompressionType;
+    use crate::compression::ZstdDictionary;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("dict_blob");
+    let dest = dir.path().join("dict_blob_salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let samples_a: alloc::vec::Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+    let dict_a = Arc::new(ZstdDictionary::new(&samples_a));
+    let compression = CompressionType::ZstdDict {
+        level: 3,
+        dict_id: dict_a.id(),
+    };
+
+    let mut writer = BlobWriter::new(&source, 0, 0, &*fs)?
+        .use_compression(compression)
+        .use_zstd_dictionary(Some(Arc::clone(&dict_a)));
+    for i in 0..8u32 {
+        let key = format!("key{i:04}");
+        let value: alloc::vec::Vec<u8> = (0..512u32).map(|j| ((i + j) % 251) as u8).collect();
+        writer.write(key.as_bytes(), 0, &value)?;
+    }
+    writer.finish()?;
+
+    // A DIFFERENT training corpus yields a different dictionary id.
+    let samples_b: alloc::vec::Vec<u8> = (0..4000u32).map(|i| (i % 13) as u8).collect();
+    let dict_b = Arc::new(ZstdDictionary::new(&samples_b));
+    assert_ne!(dict_a.id(), dict_b.id(), "the fixture needs distinct ids");
+
+    let Err(err) = salvage_blob_file(
+        &source,
+        dest,
+        &fs,
+        0,
+        &default_comparator(),
+        0,
+        Some(&dict_b),
+    ) else {
+        panic!("a mismatched dictionary must fail the salvage, not empty it");
+    };
+    assert!(
+        matches!(
+            &err,
+            crate::Error::ZstdDictMismatch { expected, got }
+                if *expected == dict_a.id() && *got == Some(dict_b.id())
+        ),
+        "the failure names both ids: {err:?}",
+    );
+    Ok(())
+}
+
 /// An encrypted source sealed under a NON-ZERO table id: the encrypted-block AAD
 /// binds the table id, so salvage must be given that id. With the wrong id the
 /// AAD-bound blocks cannot be decrypted (the gap repair hit when it passed a
