@@ -249,6 +249,90 @@ fn recover_and_scan(
     Ok(())
 }
 
+/// How many fuzz iterations actually reached a SUCCESSFUL salvage, and how
+/// many of those dropped a block. Reported at the end so the minimality check
+/// cannot pass vacuously: a run where salvage always refused would satisfy the
+/// assertion while proving nothing about how much it loses.
+static SALVAGE_OK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SALVAGE_DROPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Block-salvages the flipped SST and checks that the loss is MINIMAL.
+///
+/// The read path's contract is only "never serve altered data"; a table that
+/// refuses everything satisfies it. Salvage carries the opposite obligation —
+/// keep every block the damage did not touch — and that is what this checks:
+///
+/// - every entry the salvaged copy DOES hold is the original one (a salvage
+///   that re-emits altered payloads is silent corruption with extra steps);
+/// - a single flipped bit costs AT MOST ONE block. The flip lands inside one
+///   block, so at most that block can fail its checksum; dropping a second
+///   means the walk lost a boundary it could have re-derived and surrendered
+///   healthy data with the damaged block.
+///
+/// A flip outside the data section (trailer, index, meta) is not covered by
+/// the one-block bound — it can legitimately cost the enumeration itself — so
+/// those iterations only check the no-altered-data half. `Err` is always an
+/// acceptable outcome: refusing is never a loss the caller cannot see.
+#[cfg(feature = "std")]
+fn salvage_and_check_minimality(
+    source: &std::path::Path,
+    dest: &std::path::Path,
+    fs: &Arc<dyn crate::fs::Fs>,
+    encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
+    ctx: &str,
+) -> crate::Result<()> {
+    let options = crate::salvage::SalvageOptions {
+        encryption,
+        #[cfg(zstd_any)]
+        zstd_dictionary: None,
+        table_id: 0,
+        expected_stored_id: None,
+        output_id: None,
+        allow_delete_resurrection: false,
+        sync_mode: crate::fs::SyncMode::Normal,
+        prefix_extractor: None,
+        blob_rewrite: None,
+        progress: None,
+    };
+    let report = crate::salvage::salvage_with_context(
+        source,
+        dest.to_path_buf(),
+        fs,
+        &crate::comparator::default_comparator(),
+        &options,
+    )?;
+    SALVAGE_OK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if !report.dropped.is_empty() {
+        SALVAGE_DROPPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    assert!(
+        report.dropped.len() <= 1,
+        "{ctx}: a single flipped bit cost {} blocks — the walk surrendered \
+         healthy blocks along with the damaged one: {report:?}",
+        report.dropped.len(),
+    );
+    let Some(path) = report.salvaged_path else {
+        return Ok(());
+    };
+    // Every surviving entry must still be its original value.
+    let table = recover(&path, fs, options.encryption.clone())?;
+    for item in table.range_iter(..) {
+        let iv = item?;
+        let k = iv.key.user_key.as_ref();
+        let expected = k
+            .strip_prefix(b"k")
+            .and_then(|d| std::str::from_utf8(d).ok())
+            .and_then(|d| d.parse::<u32>().ok())
+            .map(val);
+        assert_eq!(
+            expected.as_deref(),
+            Some(iv.value.as_ref()),
+            "{ctx}: the SALVAGED copy holds a wrong value for key {k:?}",
+        );
+    }
+    Ok(())
+}
+
 /// Persists the exact bytes that failed (plus a `.txt` describing the case) to a
 /// stable path, and returns it. This is the ground-truth reproducer for a
 /// non-byte-deterministic corpus (encrypted / timestamped SSTs): re-running the
@@ -316,9 +400,22 @@ fn fuzz_heal_bitrot() {
         let fs2 = Arc::clone(&fs);
         let scratch2 = scratch.clone();
         let ctx2 = ctx.clone();
+        let salvage_dest = scratch.with_extension("salvaged");
+        let _ = std::fs::remove_file(&salvage_dest);
+        let enc_for_salvage = entry.encryption.clone();
+        let fs3 = Arc::clone(&fs);
+        let scratch3 = scratch.clone();
+        let ctx3 = ctx.clone();
+        let dest3 = salvage_dest.clone();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let _ = recover_and_scan(&scratch2, &fs2, enc, &ctx2);
+            // The read path only has to REFUSE damaged data. Salvage has to
+            // lose as little as possible, which is a separate claim and the
+            // one this branch checks: a single flipped bit must never cost
+            // more than the one block that carries it.
+            let _ = salvage_and_check_minimality(&scratch3, &dest3, &fs3, enc_for_salvage, &ctx3);
         }));
+        let _ = std::fs::remove_file(&salvage_dest);
         if outcome.is_err() {
             // Encrypted / timestamped corpus SSTs are NOT byte-deterministic (a
             // fresh AEAD nonce + `created_at` per build), so the seed alone cannot
@@ -341,10 +438,21 @@ fn fuzz_heal_bitrot() {
         }
     }
 
+    let salvage_ok = SALVAGE_OK.load(core::sync::atomic::Ordering::Relaxed);
+    let salvage_dropped = SALVAGE_DROPPED.load(core::sync::atomic::Ordering::Relaxed);
     eprintln!(
-        "fuzz_heal_bitrot: {iters} iterations across {} variants in {:?} (seed {SEED:#x})",
+        "fuzz_heal_bitrot: {iters} iterations across {} variants in {:?} (seed {SEED:#x}); \
+         salvage succeeded {salvage_ok}× ({salvage_dropped} of them dropped a block)",
         corpus.len(),
         start.elapsed(),
+    );
+    // The minimality bound is only meaningful if salvage actually ran and
+    // actually lost something: a run where every attempt refused, or where
+    // nothing was ever dropped, would satisfy `dropped <= 1` vacuously.
+    assert!(
+        salvage_dropped > 0,
+        "no fuzz iteration produced a salvage that dropped a block, so the \
+         one-block bound was never exercised",
     );
     // A per-iteration recover + full scan is fast, but a loaded / emulated runner
     // can still fit few iterations into the fixed wall-clock budget. Require only
