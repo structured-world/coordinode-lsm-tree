@@ -1202,14 +1202,23 @@ fn read_ecc_params_out_of_band(
                 // masks the ECC descriptor only when a mirror is unrecognized.
                 decoded.push(meta);
             }
-            // Only a TRANSIENT read fault must not silently drop a mirror from
+            // An ENVIRONMENTAL read fault must not silently drop a mirror from
             // arbitration: with one mirror gone the divergence check goes false
             // and could admit an SST under the surviving (possibly forged) copy
-            // that a retry would expose. Propagate it. A PERSISTENT read failure (a
-            // bad sector a retry cannot fix) or a STRUCTURAL decode failure keeps
-            // the existing fallback (skip this mirror) so the remaining decoded
-            // copy can still supply the ECC state.
-            Err(crate::Error::Io(e)) if e.kind().is_transient() => return Err(e.into()),
+            // that a retry — or the right key — would expose. Propagate it. A
+            // read failure on the DATA (a bad sector) or a STRUCTURAL decode
+            // failure keeps the existing fallback (skip this mirror) so the
+            // remaining decoded copy can still supply the ECC state.
+            Err(e) if e.is_environmental() => {
+                // This probe answers in `io::Result`; a non-I/O environmental
+                // cause (a missing key or dictionary) carries its own message
+                // through `Other` rather than being flattened into a decode
+                // failure the caller would read as damage.
+                return Err(match e {
+                    crate::Error::Io(io) => io.into(),
+                    other => std::io::Error::other(other),
+                });
+            }
             Err(_) => {}
         }
     }

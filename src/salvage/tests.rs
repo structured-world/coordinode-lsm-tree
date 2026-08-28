@@ -8321,6 +8321,61 @@ fn delete_positions_verified_propagates_a_transient_block_read_failure() -> crat
     Ok(())
 }
 
+/// An ENVIRONMENTAL failure is not always transient: `PermissionDenied` (a
+/// refused mount), `StorageFull`, a missing key, a missing dictionary. None of
+/// them say anything about the DATA, and every one of them is fixed by
+/// correcting the context and retrying. Folding one into `Ok(false)` makes the
+/// mask unpositionable, which under the default resurrection policy aborts the
+/// salvage — so `repair_with_salvage` rebuilds the manifest without a table
+/// that was never damaged.
+#[cfg(feature = "columnar")]
+#[test]
+fn delete_positions_verified_propagates_an_environmental_block_read_failure() -> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+
+    let n = 64u32;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..n {
+        writer.write(iv(i))?;
+    }
+    for pos in [5u32, 20, 40] {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar+deletes SST is non-empty",
+    );
+
+    // Open cleanly, THEN refuse the first positional read the walk issues.
+    // `PermissionDenied` is environmental but NOT transient — the class the
+    // narrower gate let fall through to `Ok(false)`.
+    let table = open(source, &fs)?;
+    injector.arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("source")
+            .once(),
+    );
+    let result = table.delete_positions_verified();
+    injector.clear();
+    assert!(
+        matches!(result, Err(crate::Error::Io(ref e)) if e.kind() == ErrorKind::PermissionDenied),
+        "a refused read during delete-position validation must propagate, not be read \
+         as a persistent unpositionable mask: {result:?}",
+    );
+    Ok(())
+}
+
 /// `delete_positions_verified` must DEGRADE a PERSISTENT positional read failure
 /// to `Ok(false)` (an unpositionable mask), not propagate it: with
 /// `allow_delete_resurrection` a bad sector under one block still lets the caller

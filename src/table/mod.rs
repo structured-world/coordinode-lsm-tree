@@ -1038,13 +1038,15 @@ impl Table {
     ///
     /// # Errors
     ///
-    /// Propagates a transient [`crate::Error::Io`] from an index / block read.
-    /// `Ok(false)` is reserved for a STRUCTURAL failure (a reordered index, a
-    /// count mismatch, an undecodable or zero-row block): folding a flaky read
-    /// into `false` would classify a retryable fault as a persistent
-    /// unpositionable mask, and — with the default `allow_delete_resurrection ==
-    /// false` — abort salvage, letting `repair_with_salvage` rebuild the manifest
-    /// WITHOUT a table a retry could have recovered faithfully.
+    /// Propagates an ENVIRONMENTAL failure from an index / block read (see
+    /// [`crate::Error::is_environmental`]): a flaky device, a refused mount, a
+    /// missing key or dictionary. `Ok(false)` is reserved for a STRUCTURAL
+    /// failure (a reordered index, a count mismatch, an undecodable or zero-row
+    /// block): folding a fixable-context fault into `false` would classify it
+    /// as a persistent unpositionable mask, and — with the default
+    /// `allow_delete_resurrection == false` — abort salvage, letting
+    /// `repair_with_salvage` rebuild the manifest WITHOUT a table a retry (or
+    /// the right key) could have recovered faithfully.
     #[cfg(feature = "columnar")]
     pub(crate) fn delete_positions_verified(&self) -> crate::Result<bool> {
         let Some(starts) = self.delete_block_starts.as_deref() else {
@@ -1064,13 +1066,13 @@ impl Table {
         for keyed in self.block_index.iter() {
             let keyed = match keyed {
                 Ok(keyed) => keyed,
-                // Only a TRANSIENT read propagates (a retry could verify the
-                // mask); a PERSISTENT index failure makes every later position
-                // unverifiable, so degrade to an unpositionable mask (`Ok(false)`)
-                // and let the caller's resurrection opt-in decide.
-                Err(crate::Error::Io(e)) if e.kind().is_transient() => {
-                    return Err(crate::Error::Io(e));
-                }
+                // Only an ENVIRONMENTAL read propagates: a retry, the right key,
+                // or the right dictionary could verify the mask, and answering
+                // `Ok(false)` would let the caller fail the salvage closed over
+                // an intact table. A read that fails on the DATA makes every
+                // later position unverifiable, so degrade to an unpositionable
+                // mask (`Ok(false)`) and let the resurrection opt-in decide.
+                Err(e) if e.is_environmental() => return Err(e),
                 Err(_) => return Ok(false),
             };
             let offset = keyed.offset().0;
@@ -1092,14 +1094,13 @@ impl Table {
                 self.zstd_dictionary.as_deref(),
             ) {
                 Ok(block) => block,
-                // Only a TRANSIENT read propagates; a PERSISTENT load failure
-                // leaves the block's actual count unknowable, so every later
-                // position is unverifiable — degrade to an unpositionable mask
+                // Only an ENVIRONMENTAL read propagates (see the index arm
+                // above); a load that fails on the DATA leaves the block's
+                // actual count unknowable, so every later position is
+                // unverifiable — degrade to an unpositionable mask
                 // (`Ok(false)`) rather than trust the (potentially tampered)
                 // zone-map claim for it, and let the resurrection opt-in decide.
-                Err(crate::Error::Io(e)) if e.kind().is_transient() => {
-                    return Err(crate::Error::Io(e));
-                }
+                Err(e) if e.is_environmental() => return Err(e),
                 Err(_) => return Ok(false),
             };
             // FULLY decode the batch rather than trusting the leading LE u32
@@ -3047,14 +3048,15 @@ impl Table {
     pub(crate) fn tli_structure_authenticated(&self) -> crate::Result<bool> {
         match self.verify_tli_mirrors_inner(false) {
             Ok(()) => Ok(true),
-            // Only a TRANSIENT read propagates (so the salvage walk aborts for a
-            // retry rather than surrendering an intact index to a flaky read). A
-            // PERSISTENT mirror failure (a bad-sector `UnexpectedEof` on one
-            // mirror while the other and the data section stay readable) is
-            // untrusted input, not a reason to abort: fold it into `false` so the
-            // walk falls back to physical-chain provenance and still recovers the
-            // readable data blocks.
-            Err(crate::Error::Io(e)) if e.kind().is_transient() => Err(crate::Error::Io(e)),
+            // Only an ENVIRONMENTAL read propagates (so the salvage walk aborts
+            // for a retry, or for the right key, rather than surrendering an
+            // intact index to a fixable fault — `false` costs every indexed
+            // block past the first header break). A failure on the DATA (a
+            // bad-sector `UnexpectedEof` on one mirror while the other and the
+            // data section stay readable) is untrusted input, not a reason to
+            // abort: fold it into `false` so the walk falls back to
+            // physical-chain provenance and still recovers the readable blocks.
+            Err(e) if e.is_environmental() => Err(e),
             Err(_) => Ok(false),
         }
     }
@@ -7101,14 +7103,13 @@ impl Table {
             };
             match load() {
                 Ok(idx) => Some(idx),
-                // Only a TRANSIENT read propagates so repair retries; a PERSISTENT
-                // I/O failure (bad sector, truncation) degrades under salvage like
-                // the seqno-bounds / zone-map / delete-bitmap / locator loaders —
-                // turning a one-shot failure into a permanent drop of the whole
-                // (recoverable) table would be wrong.
-                Err(crate::Error::Io(e)) if e.kind().is_transient() => {
-                    return Err(crate::Error::Io(e));
-                }
+                // Only an ENVIRONMENTAL read propagates so the caller can retry
+                // (or supply the right key): degradation is not free — it sets
+                // `rebuildable_section_degraded`, which fails salvage closed and
+                // costs the whole recoverable table. A failure on the DATA (bad
+                // sector, truncation) degrades under salvage like the
+                // seqno-bounds / zone-map / delete-bitmap / locator loaders.
+                Err(e) if e.is_environmental() => return Err(e),
                 // Salvage never consults the source's filter — the
                 // destination writer rebuilds it from the recovered keys —
                 // so a STRUCTURALLY or PERSISTENTLY unreadable filter index must not
@@ -7383,14 +7384,13 @@ impl Table {
             };
             match load() {
                 Ok(m) => m,
-                // Only a TRANSIENT read propagates so repair retries; a PERSISTENT
-                // failure (bad sector, truncation) degrades this rebuildable,
-                // derived section to an empty map (seqno block-skip disabled)
-                // rather than failing the whole open — turning an optimization's
-                // bit-rot into a hard availability loss would be wrong.
-                Err(crate::Error::Io(e)) if e.kind().is_transient() => {
-                    return Err(crate::Error::Io(e));
-                }
+                // Only an ENVIRONMENTAL read propagates so the caller can retry
+                // (or supply the right key); a failure on the DATA (bad sector,
+                // truncation) degrades this rebuildable, derived section to an
+                // empty map (seqno block-skip disabled) rather than failing the
+                // whole open — turning an optimization's bit-rot into a hard
+                // availability loss would be wrong.
+                Err(e) if e.is_environmental() => return Err(e),
                 Err(e) => {
                     log::warn!(
                         "seqno-bounds section for table {:?} is unreadable ({e}); disabling seqno block-skip",
@@ -7447,12 +7447,11 @@ impl Table {
             };
             match load() {
                 Ok(m) => m,
-                // Only a TRANSIENT read propagates so repair retries; a PERSISTENT
-                // failure degrades this rebuildable, derived section to an empty
-                // map (block-skip disabled) rather than failing the whole open.
-                Err(crate::Error::Io(e)) if e.kind().is_transient() => {
-                    return Err(crate::Error::Io(e));
-                }
+                // Only an ENVIRONMENTAL read propagates so the caller can retry
+                // (or supply the right key); a failure on the DATA degrades this
+                // rebuildable, derived section to an empty map (block-skip
+                // disabled) rather than failing the whole open.
+                Err(e) if e.is_environmental() => return Err(e),
                 Err(e) => {
                     log::warn!(
                         "zone-map section for table {:?} is unreadable ({e}); disabling block-skip",
@@ -7506,16 +7505,16 @@ impl Table {
             };
             match load() {
                 Ok(db) => db,
-                // A TRANSIENT read propagates so repair retries: degrading the
-                // delete mask to "all rows live" on a one-shot fault would
-                // resurrect deleted rows in the rebuilt table. A PERSISTENT read
-                // failure in salvage mode instead falls through to the
-                // degradation branch below, where the caller's
-                // `allow_delete_resurrection` opt-in is honored downstream (a
-                // non-salvage open still fails closed via the final arm).
-                Err(crate::Error::Io(e)) if e.kind().is_transient() => {
-                    return Err(crate::Error::Io(e));
-                }
+                // An ENVIRONMENTAL read propagates so the caller can retry (or
+                // supply the right key): degrading the delete mask to "all rows
+                // live" on a fixable fault would resurrect deleted rows in the
+                // rebuilt table, or — under the default policy — cost the whole
+                // table. A read failure on the DATA in salvage mode instead
+                // falls through to the degradation branch below, where the
+                // caller's `allow_delete_resurrection` opt-in is honored
+                // downstream (a non-salvage open still fails closed via the
+                // final arm).
+                Err(e) if e.is_environmental() => return Err(e),
                 Err(e) if salvage => {
                     log::warn!(
                         "delete-bitmap for table {:?} is unreadable ({e}); salvaging all rows as live",
@@ -7610,18 +7609,17 @@ impl Table {
                 },
             ) {
                 Ok(block) => Some(block),
-                // A TRANSIENT locator read during salvage must PROPAGATE, not
-                // degrade: `rebuildable_section_degraded` makes `salvage_attempt`
-                // read a delete-free table as possibly hiding deletion metadata and
-                // fail the whole SST (`FeatureUnsupported`), dropping an
-                // otherwise-salvageable table instead of retrying the retryable
-                // read. Mirrors the zone-map / seqno-bounds / delete-bitmap loaders.
-                // A non-salvage open keeps the best-effort accelerator behavior
-                // (degrade to the sorted-index path), so a flaky read there never
-                // fails the open.
-                Err(crate::Error::Io(e)) if salvage && e.kind().is_transient() => {
-                    return Err(crate::Error::Io(e));
-                }
+                // An ENVIRONMENTAL locator read during salvage must PROPAGATE,
+                // not degrade: `rebuildable_section_degraded` makes
+                // `salvage_attempt` read a delete-free table as possibly hiding
+                // deletion metadata and fail the whole SST
+                // (`FeatureUnsupported`), dropping an otherwise-salvageable
+                // table instead of surfacing a fault the caller can fix by
+                // retrying or supplying the right key. Mirrors the zone-map /
+                // seqno-bounds / delete-bitmap loaders. A non-salvage open keeps
+                // the best-effort accelerator behavior (degrade to the
+                // sorted-index path), so a fault there never fails the open.
+                Err(e) if salvage && e.is_environmental() => return Err(e),
                 Err(e) => {
                     log::warn!("retrieval-ribbon locator disabled: section load failed: {e:?}");
                     rebuildable_section_degraded = true;
