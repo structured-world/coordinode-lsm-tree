@@ -170,7 +170,8 @@ any repair, derive the obligation from the report instead:
      that pass would subtract the same survivors twice.
    An operator repairing from the command line does not have to reach for the
    API: `sst-dump <db> repair` prints the same obligation as a `wal replay:`
-   line, followed by one line per lost range or unscopable file.
+   line, followed by one line per lost range or unscopable file, the
+   merge-operand exception of step 3, and a pointer back to this section.
 2. **Puts and deletes replay blindly.** Re-applying one at its original seqno
    reproduces the same MVCC version, and a surviving NEWER version still wins
    by seqno — over-replay inside the lost ranges is harmless for them. This

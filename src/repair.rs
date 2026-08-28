@@ -174,7 +174,15 @@ pub enum WalReplayScope {
     LostUpTo(SeqNo),
     /// At least one excluded table's sequence base was itself lost with the
     /// manifest, so no seqno bound scopes the damage: the whole retained
-    /// history of the affected ranges must be replayed.
+    /// history must be reconciled (still presence-checking merge operands).
+    ///
+    /// Read [`RepairReport::unknowable_losses`] to know over WHAT. When it is
+    /// EMPTY the damage is still localized, so the
+    /// [`lost_coverage`](RepairReport::lost_coverage) ranges bound the work.
+    /// When it is NON-EMPTY the loss has no key range either — that table's
+    /// metadata never parsed — and the reconciliation runs over the ENTIRE
+    /// keyspace in ONE pass; iterating the known ranges on top of it would
+    /// subtract the same survivors twice.
     FullHistory,
 }
 

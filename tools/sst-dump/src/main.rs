@@ -363,20 +363,42 @@ fn print_wal_replay_obligation(report: &lsm_tree::RepairReport) {
     match report.wal_replay_scope() {
         WalReplayScope::TailOnly => {
             println!("wal replay:    tail only (no coverage was lost)");
+            return;
         }
         WalReplayScope::LostUpTo(bound) => {
             println!(
-                "wal replay:    REQUIRED — replay every retained record with seqno <= {bound} \
-                 whose key falls in a range below, in addition to the usual tail",
+                "wal replay:    REQUIRED — besides the usual tail, reconcile every retained \
+                 record with seqno <= {bound} whose key falls in a range below",
+            );
+        }
+        // An unscopable loss has NEITHER a seqno bound NOR a key range: its
+        // metadata never parsed, so nothing localizes the damage. Telling the
+        // operator to work through "the ranges below" would have them replay
+        // the known ranges only — or nothing at all when that list is empty.
+        WalReplayScope::FullHistory if !report.unknowable_losses.is_empty() => {
+            println!(
+                "wal replay:    REQUIRED — a loss could not be localized at all: reconcile \
+                 every retained record across the ENTIRE KEYSPACE, in ONE pass (iterating \
+                 the ranges below on top of it would subtract the same survivors twice)",
             );
         }
         WalReplayScope::FullHistory => {
             println!(
-                "wal replay:    REQUIRED — a loss could not be scoped by seqno, so the ENTIRE \
-                 retained history of the ranges below must be replayed",
+                "wal replay:    REQUIRED — a loss could not be scoped by seqno, so reconcile \
+                 the ENTIRE retained history of the ranges below",
             );
         }
     }
+    // "Reconcile", not "replay": a put or a delete may be re-applied blindly,
+    // but a merge OPERAND that survived the repair and is applied again is
+    // FOLDED TWICE and silently changes the value. The surviving operands must
+    // be subtracted first, and folded chains leave a superseded-record floor
+    // that absence from that subtraction does not disprove.
+    println!(
+        "               merge operands are NOT blindly replayable: subtract the survivors \
+         from Tree::scan_since_seqno_in_range and honour the folded-record floor first",
+    );
+    println!("               full procedure: docs/external-wal.md, Replay after repair");
     for (path, lo, hi, bound) in &report.lost_coverage {
         let bound = match bound {
             Some(b) => format!("seqno <= {b}"),

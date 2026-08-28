@@ -141,6 +141,19 @@ fn repair_prints_the_wal_replay_obligation_when_coverage_is_lost()
         stdout.contains("unscopable") || stdout.contains("lost "),
         "the obligation must name the affected file: {stdout}",
     );
+    // The destroyed table's metadata never parsed, so the loss has no key
+    // range at all. Pointing at "the ranges below" would have the operator
+    // reconcile an EMPTY list and call the repair done.
+    assert!(
+        stdout.contains("ENTIRE KEYSPACE"),
+        "an unlocalizable loss must state the whole-keyspace obligation, not refer to \
+         ranges that do not exist: {stdout}",
+    );
+    assert!(
+        stdout.contains("merge operands are NOT blindly replayable"),
+        "re-applying a surviving merge operand folds it twice: the exception must be \
+         stated where the obligation is: {stdout}",
+    );
 
     Ok(())
 }
