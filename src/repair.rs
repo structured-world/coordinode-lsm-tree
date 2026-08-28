@@ -906,6 +906,46 @@ fn discard_duplicate(
 /// the decision for post-commit removal. The one path every recovered table
 /// takes to enter the manifest, so a superseded same-id file is never left
 /// discoverable once the rebuild is durable.
+/// Records a finished SALVAGE replacement and queues the post-commit swap
+/// that publishes it.
+///
+/// Both salvage arms — the one whose VERIFICATION failed and the one whose
+/// whole-file RECOVERY failed — reach exactly this state, and they must not
+/// drift apart: the replacement enters the manifest through `record_best` like
+/// any recovered table, and the swap carries whether it is RESTRICTED so a
+/// retried swap can tell an already-moved replacement sidecar from a stale
+/// source one (see `commit_repair_tmp`).
+#[cfg(feature = "std")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "location + report threaded through"
+)]
+fn keep_salvaged_replacement(
+    map: &mut crate::HashMap<TableId, TableCandidate>,
+    unreadable_files: &mut Vec<(PathBuf, String)>,
+    discard_after_commit: &mut Vec<(Arc<dyn crate::fs::Fs>, PathBuf, String)>,
+    swap_after_commit: &mut Vec<(Arc<dyn crate::fs::Fs>, PathBuf, PathBuf, bool)>,
+    id: TableId,
+    table: Table,
+    fs: &Arc<dyn crate::fs::Fs>,
+    table_path: PathBuf,
+    output_path: PathBuf,
+) -> crate::Result<()> {
+    let restricted = table.restrict_lower_bound().is_some();
+    record_best(
+        map,
+        unreadable_files,
+        discard_after_commit,
+        id,
+        table,
+        Fidelity::Salvaged,
+        fs,
+        &table_path,
+    )?;
+    swap_after_commit.push((Arc::clone(fs), output_path, table_path, restricted));
+    Ok(())
+}
+
 #[cfg(feature = "std")]
 #[expect(
     clippy::too_many_arguments,
@@ -4322,23 +4362,17 @@ fn scan_table_folders(
                                         restrict_bound.clone(),
                                         allow_resurrection,
                                     )?;
-                                    let restricted = table.restrict_lower_bound().is_some();
-                                    record_best(
+                                    keep_salvaged_replacement(
                                         &mut recovered_by_id,
                                         &mut unreadable_files,
                                         &mut discard_after_commit,
+                                        &mut swap_after_commit,
                                         table_id,
                                         table,
-                                        Fidelity::Salvaged,
                                         &folder_fs,
-                                        &table_path,
-                                    )?;
-                                    swap_after_commit.push((
-                                        Arc::clone(&folder_fs),
-                                        output_path,
                                         table_path,
-                                        restricted,
-                                    ));
+                                        output_path,
+                                    )?;
                                 }
                                 Ok(SalvageOutcome::Unusable | SalvageOutcome::PunchedBoundLost) => {
                                     let reason = "verify found corrupt blocks; nothing salvageable";
@@ -4520,23 +4554,17 @@ fn scan_table_folders(
                                 restrict_bound,
                                 allow_resurrection,
                             )?;
-                            let restricted = table.restrict_lower_bound().is_some();
-                            record_best(
+                            keep_salvaged_replacement(
                                 &mut recovered_by_id,
                                 &mut unreadable_files,
                                 &mut discard_after_commit,
+                                &mut swap_after_commit,
                                 table_id,
                                 table,
-                                Fidelity::Salvaged,
                                 &folder_fs,
-                                &table_path,
-                            )?;
-                            swap_after_commit.push((
-                                Arc::clone(&folder_fs),
-                                output_path,
                                 table_path,
-                                restricted,
-                            ));
+                                output_path,
+                            )?;
                         }
                         Ok(SalvageOutcome::Unusable) => {
                             let reason = format!("unrecoverable ({e}); nothing salvageable");
