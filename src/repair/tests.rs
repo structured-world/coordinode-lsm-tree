@@ -10857,6 +10857,66 @@ fn a_clean_manifest_record_preserves_a_bulk_ingested_offset() -> crate::Result<(
     Ok(())
 }
 
+/// An abandoned `{id}.repair-tmp` must be swept BEFORE its source SST is
+/// processed. With no committed manifest to consult, the preliminary sweep
+/// returns without touching it, so the scan itself is what removes it — but
+/// the scan visited the numeric `{id}` first, and salvage of that source then
+/// found its `create_new` destination already occupied. `AlreadyExists` is
+/// not environmental, so the source was recorded unreadable and removed after
+/// the commit, and only then was the temp swept: a retry after a cancellation
+/// (or any pre-commit failure) lost a source whose salvage would have
+/// succeeded.
+#[test]
+fn an_abandoned_temp_is_swept_before_its_source_is_salvaged() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let fs: Arc<dyn Fs> = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db_temp_before_source")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    // A source with a corrupt data block (so the repair must salvage it) and
+    // the leftover temp of a previous, abandoned salvage of that very source.
+    let sst = tables.join("0");
+    write_multiblock_sst(&sst, &fs)?;
+    {
+        let table = recover_sst(sst.clone(), &fs)?;
+        let offset = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|kh| *kh.as_ref().offset())
+            .next()
+            .unwrap_or(0);
+        drop(table);
+        let mut f = fs.open(&sst, &crate::fs::FsOpenOptions::new().write(true))?;
+        std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(offset + 16))?;
+        std::io::Write::write_all(&mut f, &[0xFFu8])?;
+        crate::fs::FsFile::sync_all(&*f)?;
+    }
+    {
+        let mut f = fs.open(
+            &tables.join("0.repair-tmp"),
+            &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        std::io::Write::write_all(&mut f, &[0xEE; 64])?;
+    }
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone())
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.recovered, 1,
+        "the source must salvage: the abandoned temp holding its destination \
+         name is swept first, not after the source is condemned: {report:?}",
+    );
+    Ok(())
+}
+
 /// A CLEAN manifest's tree type is authoritative, and a repair run under a
 /// contradicting configuration must be REFUSED before it mutates anything.
 /// Rebuilding a Standard store's manifest as `Blob` (or the reverse, which no
@@ -10920,6 +10980,196 @@ fn a_clean_manifest_tree_type_refuses_a_contradicting_repair() -> crate::Result<
     assert!(
         tree.get(b"a", crate::MAX_SEQNO)?.is_some(),
         "the surviving table's rows must still read",
+    );
+    Ok(())
+}
+
+/// Between two LOSSY copies of one id, the MORE COMPLETE one is kept. Two
+/// routed folders can each hold a damaged copy of the same table, and their
+/// salvages recover different amounts: keeping whichever was scanned first
+/// throws away rows the other salvage successfully recovered, which is
+/// avoidable loss — the rebuilt manifest needs one copy per id, but nothing
+/// says it must be the first one seen.
+#[test]
+fn the_most_complete_lossy_duplicate_is_kept() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{InternalValue, ValueType};
+    use std::sync::Arc;
+
+    let fs: Arc<dyn Fs> = Arc::new(MemFs::new());
+    let dir = std::path::absolute("/dup")?;
+    fs.create_dir_all(&dir)?;
+    // Two salvages of one id that recovered different amounts.
+    let build = |name: &str, rows: u32| -> crate::Result<crate::table::Table> {
+        let path = dir.join(name);
+        let mut w = crate::table::Writer::new(path.clone(), 0, 0, Arc::clone(&fs))?;
+        for i in 0..rows {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                b"v".to_vec(),
+                u64::from(i) + 1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the table is non-empty");
+        recover_sst(path, &fs)
+    };
+    let thin = build("thin", 2)?;
+    let full = build("full", 40)?;
+    let (thin_path, full_path) = ((*thin.path).clone(), (*full.path).clone());
+
+    let mut map = crate::HashMap::default();
+    let displaced = super::keep_best_candidate(
+        &mut map,
+        0,
+        super::TableCandidate {
+            table: thin,
+            fidelity: super::Fidelity::Salvaged,
+            fs: Arc::clone(&fs),
+            path: thin_path.clone(),
+        },
+    );
+    assert!(
+        displaced.is_none(),
+        "nothing to displace on the first sighting"
+    );
+    let Some(displaced) = super::keep_best_candidate(
+        &mut map,
+        0,
+        super::TableCandidate {
+            table: full,
+            fidelity: super::Fidelity::Salvaged,
+            fs: Arc::clone(&fs),
+            path: full_path.clone(),
+        },
+    ) else {
+        panic!("the second sighting displaces one of the two");
+    };
+    assert_eq!(
+        displaced.path, thin_path,
+        "the THIN salvage must be the one displaced — keeping it would discard \
+         the rows the fuller salvage recovered",
+    );
+    assert_eq!(
+        map.get(&0).map(|c| c.path.clone()),
+        Some(full_path),
+        "the fuller salvage is what the rebuilt manifest keeps",
+    );
+    Ok(())
+}
+
+/// A RESTRICTED original is hashed on the manifest's own basis — its LIVE
+/// SUFFIX, from the punch offset up — not over the whole file. The manifest
+/// records the suffix digest for a restricted table, so hashing the reclaimed
+/// prefix too could never match: the original could never prove itself, and a
+/// disposable unreadable temp beside a perfectly healthy restricted SST would
+/// fail every open and every repair, forever.
+#[test]
+fn a_restricted_original_proves_itself_on_its_live_suffix() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db_restricted_suffix")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    // A punched, restricted original — the shape tight-space leaves behind.
+    let sst = tables.join("0");
+    write_multiblock_sst(&sst, &fs)?;
+    let bound: crate::UserKey = b"k00130".to_vec().into();
+    let suffix_digest = {
+        let table = recover_sst(sst.clone(), &fs)?;
+        let punch_offset = table.punch_offset_for(bound.as_ref())?;
+        drop(table);
+        memfs.punch_hole(&sst, 0, punch_offset)?;
+        // Exactly what the manifest stores for a restricted table.
+        crate::Checksum::from_raw(crate::repair::compute_table_checksum_from(
+            &*fs,
+            &sst,
+            punch_offset,
+        )?)
+    };
+    // The leftover temp of an abandoned restricted salvage: unreadable.
+    let tmp = tables.join("0.repair-tmp");
+    {
+        let mut f = fs.open(
+            &tmp,
+            &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        std::io::Write::write_all(&mut f, &[0xCD; 128])?;
+    }
+
+    let config = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone());
+    let published =
+        crate::repair::repair_tmp_is_published(&config, &fs, &tmp, 0, suffix_digest, Some(&bound))?;
+    assert!(
+        !published,
+        "the healthy restricted original matches the manifest on its live \
+         suffix, which proves the temp a disposable abandoned build",
+    );
+    Ok(())
+}
+
+/// A temp that READS FINE but whose digest does not match is ambiguous too.
+/// It is either an abandoned build, or a COMMITTED replacement that rotted
+/// after its manifest went durable — and the original beside it is the
+/// damaged pre-repair source, which may lack rows the replacement recovered.
+/// Answering "abandoned" on the mismatch alone deletes the only valid copy,
+/// so the original must first prove itself the file the manifest names.
+#[cfg(feature = "std")]
+#[test]
+fn a_readable_temp_with_a_mismatching_digest_is_not_condemned_alone() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let fs: Arc<dyn Fs> = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db_mismatching_temp")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    // Both copies READ fine; neither matches the manifest's entry.
+    write_multiblock_sst(&tables.join("0"), &fs)?;
+    let tmp = tables.join("0.repair-tmp");
+    write_multiblock_sst(&tmp, &fs)?;
+
+    let config = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone());
+    let published = crate::repair::repair_tmp_is_published(
+        &config,
+        &fs,
+        &tmp,
+        0,
+        crate::Checksum::from_raw(0xDEAD_BEEF),
+        None,
+    );
+    assert!(
+        published.is_err(),
+        "a mismatching digest alone must not condemn the temp while the \
+         original proves nothing: {published:?}",
+    );
+
+    // With the ORIGINAL proven authoritative, the same mismatching temp IS
+    // the abandoned build and is condemned.
+    let original_digest = crate::Checksum::from_raw(crate::repair::compute_table_checksum(
+        &*fs,
+        &tables.join("0"),
+    )?);
+    let published =
+        crate::repair::repair_tmp_is_published(&config, &fs, &tmp, 0, original_digest, None)?;
+    assert!(
+        !published,
+        "an original matching the manifest proves the temp abandoned",
     );
     Ok(())
 }

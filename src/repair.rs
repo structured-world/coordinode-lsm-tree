@@ -477,25 +477,68 @@ pub(crate) fn repair_tmp_is_published(
     manifest_checksum: crate::Checksum,
     restriction: Option<&crate::UserKey>,
 ) -> crate::Result<bool> {
-    // Resolves an unreadable temp against the ORIGINAL `{id}` beside it:
-    // an original matching the manifest's entry proves the temp is an
-    // abandoned build (`Ok(false)` — not published); anything less proven
-    // re-surfaces the temp's own failure.
-    let resolve_with_original = |temp_err: crate::Error| -> crate::Result<bool> {
+    // Whether the ORIGINAL `{id}` beside the temp is provably the file the
+    // manifest names — hashed on the SAME basis the manifest recorded it. A
+    // RESTRICTED table's entry holds its LIVE-SUFFIX digest, so hashing the
+    // whole original (its reclaimed prefix included) could never match, and
+    // the temp's ambiguity could never be resolved: every open and every
+    // repair would keep failing on a disposable leftover.
+    let original_is_authoritative = || -> crate::Result<bool> {
         let original = tmp_path.with_file_name(table_id.to_string());
-        match compute_table_checksum(&**fs, &original) {
-            Ok(digest) if crate::Checksum::from_raw(digest) == manifest_checksum => Ok(false),
+        let digest = match restriction {
+            None => compute_table_checksum(&**fs, &original),
+            Some(bound) => {
+                let table = match crate::table::Table::recover(repair_recover_params(
+                    config,
+                    original.clone(),
+                    manifest_checksum,
+                    table_id,
+                    Arc::clone(fs),
+                    None,
+                )) {
+                    Ok(table) => table,
+                    Err(e) if is_environmental(&e) => return Err(e),
+                    // An original that does not open proves nothing.
+                    Err(_) => return Ok(false),
+                };
+                match table.punch_offset_for(bound.as_ref()) {
+                    Ok(offset) => compute_table_checksum_from(&**fs, &original, offset),
+                    Err(e) if is_environmental(&e) => return Err(e),
+                    Err(_) => return Ok(false),
+                }
+            }
+        };
+        match digest {
+            Ok(digest) => Ok(crate::Checksum::from_raw(digest) == manifest_checksum),
             Err(e) if is_environmental(&e) => Err(e),
-            // Neither copy is proven: surface the TEMP's failure (it is the
-            // file this decision is about).
-            Ok(_) | Err(_) => Err(temp_err),
+            Err(_) => Ok(false),
         }
+    };
+    // The temp is condemned as an abandoned build ONLY when the original
+    // proves itself the file the manifest names. Otherwise neither copy is
+    // proven and the ambiguity surfaces — deleting the temp here could
+    // destroy a committed replacement whose swap never ran, and the original
+    // beside it is the damaged pre-repair source.
+    let condemn_only_if_proven = |ambiguity: crate::Error| -> crate::Result<bool> {
+        if original_is_authoritative()? {
+            Ok(false)
+        } else {
+            Err(ambiguity)
+        }
+    };
+    // A temp that READS but does not match is as ambiguous as one that does
+    // not read: it is either an abandoned build or a committed replacement
+    // that rotted after its manifest went durable.
+    let digest_mismatch = |digest: u128| crate::Error::ChecksumMismatch {
+        got: crate::Checksum::from_raw(digest),
+        expected: manifest_checksum,
     };
     let Some(bound) = restriction else {
         return match compute_table_checksum(&**fs, tmp_path) {
-            Ok(digest) => Ok(crate::Checksum::from_raw(digest) == manifest_checksum),
+            Ok(digest) if crate::Checksum::from_raw(digest) == manifest_checksum => Ok(true),
+            Ok(digest) => condemn_only_if_proven(digest_mismatch(digest)),
             Err(e) if is_environmental(&e) => Err(e),
-            Err(temp_err) => resolve_with_original(temp_err),
+            Err(temp_err) => condemn_only_if_proven(temp_err),
         };
     };
     let table = match crate::table::Table::recover(repair_recover_params(
@@ -515,17 +558,18 @@ pub(crate) fn repair_tmp_is_published(
         // failed to swap, and then discarding it destroys the only published
         // copy. Same proof as the checksum paths: condemn the temp only when
         // the original proves itself the file the manifest names.
-        Err(e) => return resolve_with_original(e),
+        Err(e) => return condemn_only_if_proven(e),
     };
     let punch_offset = match table.punch_offset_for(bound.as_ref()) {
         Ok(offset) => offset,
         Err(e) if is_environmental(&e) => return Err(e),
-        Err(e) => return resolve_with_original(e),
+        Err(e) => return condemn_only_if_proven(e),
     };
     match compute_table_checksum_from(&**fs, tmp_path, punch_offset) {
-        Ok(digest) => Ok(crate::Checksum::from_raw(digest) == manifest_checksum),
+        Ok(digest) if crate::Checksum::from_raw(digest) == manifest_checksum => Ok(true),
+        Ok(digest) => condemn_only_if_proven(digest_mismatch(digest)),
         Err(e) if is_environmental(&e) => Err(e),
-        Err(temp_err) => resolve_with_original(temp_err),
+        Err(temp_err) => condemn_only_if_proven(temp_err),
     }
 }
 
@@ -716,9 +760,17 @@ struct TableCandidate {
 
 /// Records `candidate` for `id`, keeping the BETTER of the existing and the new
 /// copy: a COMPLETE recovery replaces a lossy salvage, so an intact duplicate in
-/// a later-scanned folder supersedes an earlier lossy one. Two completes (or two
-/// salvages) are equivalent for the rebuilt manifest — which needs only one
-/// readable copy per id — so the first-seen stays.
+/// a later-scanned folder supersedes an earlier lossy one. Two completes are
+/// equivalent for the rebuilt manifest — which needs only one readable copy per
+/// id — so the first-seen stays.
+///
+/// Two LOSSY copies are NOT equivalent. Damaged copies of one table in two
+/// routed folders salvage independently, and one can recover far more of it
+/// than the other; keeping the first-seen would discard rows the other salvage
+/// did recover, which is avoidable loss. The fuller one wins, measured by the
+/// entries its metadata records — the salvage writes exactly what it recovered,
+/// so that count IS its completeness. Equal counts keep the first-seen, so the
+/// choice stays deterministic across runs over the same directory.
 ///
 /// Returns the DISPLACED loser (the rejected new candidate, or the superseded old
 /// one) so the caller can record its file for removal; `None` when `id` was
@@ -729,16 +781,20 @@ fn keep_best_candidate(
     id: TableId,
     candidate: TableCandidate,
 ) -> Option<TableCandidate> {
-    match map.get(&id) {
-        // Keep the existing copy when it is already complete, or when the new one
-        // is not an improvement (a lossy duplicate of a lossy copy): the NEW
-        // candidate is displaced.
-        Some(existing) if existing.fidelity.is_complete() || !candidate.fidelity.is_complete() => {
-            Some(candidate)
-        }
-        // The new candidate supersedes: `insert` returns the displaced old copy.
-        _ => map.insert(id, candidate),
+    let keeps_existing = match map.get(&id) {
+        // An existing COMPLETE copy is never displaced.
+        Some(existing) if existing.fidelity.is_complete() => true,
+        // A COMPLETE newcomer displaces a lossy incumbent.
+        Some(_) if candidate.fidelity.is_complete() => false,
+        // Both lossy: the one that recovered more of the table wins.
+        Some(existing) => candidate.table.metadata.item_count <= existing.table.metadata.item_count,
+        None => false,
+    };
+    if keeps_existing {
+        return Some(candidate);
     }
+    // The new candidate supersedes: `insert` returns the displaced old copy.
+    map.insert(id, candidate)
 }
 
 /// Removes a blob-salvage temp on a path where the repair goes on to COMMIT a
@@ -3730,13 +3786,29 @@ fn scan_table_folders(
         // scan.
         let mut dirents = folder_fs.read_dir(&table_base_folder)?;
         dirents.sort_by(|a, b| {
+            // Group every name that belongs to one id together, and inside a
+            // group put the abandoned `{id}.repair-tmp` FIRST: this scan
+            // removes it (no manifest names it — one that did was swapped in
+            // before the scan started), and a salvage of `{id}` builds its
+            // replacement under exactly that name. Visiting the source first
+            // would find the destination occupied, fail the salvage with
+            // `AlreadyExists` — not an environmental error — and condemn a
+            // source whose salvage would otherwise have succeeded.
             let key = |e: &crate::fs::FsDirEntry| {
-                let id = e.file_name.parse::<TableId>().ok();
-                (
-                    id.is_none(),
-                    id.unwrap_or(0),
-                    id.is_none_or(|id| e.file_name != id.to_string()),
-                )
+                let numeric = e.file_name.parse::<TableId>().ok();
+                let temp = table_id_from_repair_tmp_name(&e.file_name);
+                let id = numeric.or(temp);
+                // Within an id: the temp, then the writer's own canonical
+                // spelling, then any foreign alternate spelling (`01` for id
+                // 1) — which can therefore never displace the canonical file.
+                let rank = if temp.is_some() {
+                    0
+                } else if numeric.is_some_and(|id| e.file_name == id.to_string()) {
+                    1
+                } else {
+                    2
+                };
+                (id.is_none(), id.unwrap_or(0), rank)
             };
             key(a)
                 .cmp(&key(b))
