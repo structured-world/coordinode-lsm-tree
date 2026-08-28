@@ -2133,67 +2133,12 @@ fn repair_sets_aside_zeroed_blocks_the_backend_cannot_attribute() -> crate::Resu
     use crate::{Config, SequenceNumberCounter};
     use std::sync::Arc;
 
-    /// Forwards to [`MemFs`] (punch-capable, and `capabilities` says so) but
-    /// leaves `extent_contains_hole` at the trait default `None` — a mount
-    /// that can punch but cannot attribute zeros to a hole.
-    struct UnattributedHoleFs(Arc<MemFs>);
-    impl Fs for UnattributedHoleFs {
-        fn open(
-            &self,
-            path: &std::path::Path,
-            options: &crate::fs::FsOpenOptions,
-        ) -> crate::io::Result<Box<dyn crate::fs::FsFile>> {
-            self.0.open(path, options)
-        }
-        fn create_dir_all(&self, path: &std::path::Path) -> crate::io::Result<()> {
-            self.0.create_dir_all(path)
-        }
-        fn read_dir(
-            &self,
-            path: &std::path::Path,
-        ) -> crate::io::Result<Vec<crate::fs::FsDirEntry>> {
-            self.0.read_dir(path)
-        }
-        fn remove_file(&self, path: &std::path::Path) -> crate::io::Result<()> {
-            self.0.remove_file(path)
-        }
-        fn remove_dir_all(&self, path: &std::path::Path) -> crate::io::Result<()> {
-            self.0.remove_dir_all(path)
-        }
-        fn same_file(&self, a: &std::path::Path, b: &std::path::Path) -> crate::io::Result<bool> {
-            self.0.same_file(a, b)
-        }
-        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> crate::io::Result<()> {
-            self.0.rename(from, to)
-        }
-        fn metadata(&self, path: &std::path::Path) -> crate::io::Result<crate::fs::FsMetadata> {
-            self.0.metadata(path)
-        }
-        fn exists(&self, path: &std::path::Path) -> crate::io::Result<bool> {
-            self.0.exists(path)
-        }
-        fn sync_directory(&self, path: &std::path::Path) -> crate::io::Result<()> {
-            self.0.sync_directory(path)
-        }
-        fn backend_id(&self) -> Option<u64> {
-            self.0.backend_id()
-        }
-        fn capabilities(&self, path: &std::path::Path) -> crate::fs::FsCapabilities {
-            self.0.capabilities(path)
-        }
-        fn punch_hole(
-            &self,
-            path: &std::path::Path,
-            offset: u64,
-            len: u64,
-        ) -> crate::io::Result<()> {
-            self.0.punch_hole(path, offset, len)
-        }
-    }
-
     for allow_resurrection in [false, true] {
         let memfs = Arc::new(MemFs::new());
-        let fs: Arc<dyn Fs> = Arc::new(UnattributedHoleFs(memfs.clone()));
+        // A punch-capable mount whose backend cannot attribute zeros to a
+        // hole: `extent_contains_hole` answers the trait default `None`.
+        memfs.set_hole_probe_supported(false);
+        let fs: Arc<dyn Fs> = memfs.clone();
         let root = std::path::absolute("/db")?;
         let tables = root.join("tables");
         fs.create_dir_all(&tables)?;
@@ -2339,6 +2284,63 @@ fn repair_sets_aside_a_partially_punched_sidecarless_sst_that_fails_recovery() -
             .first()
             .is_some_and(|(_, reason)| reason.contains("punched extents found during salvage")),
         "the reason names the punched extents the walk found: {:?}",
+        report.unreadable_files,
+    );
+    Ok(())
+}
+
+/// The recovery-FAILURE arm must fail closed on unattributable zeros too.
+/// Its cheap pre-salvage probe reads the first bytes and asks whether they
+/// carry a hole; on a punch-capable mount whose backend cannot answer, that
+/// probe reports "not punched" and the arm proceeds — so the guard AFTER the
+/// salvage walk, which sees every dropped all-zero extent, is what has to
+/// catch it. Without that second line the replacement publishes
+/// unrestricted, resurrecting the reclaimed prefix's superseded rows.
+#[test]
+fn a_recovery_failure_salvage_fails_closed_on_unattributable_zeros() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    // Punch-capable, but the hole probe cannot attribute: the pre-salvage
+    // fast path is blind here by construction.
+    memfs.set_hole_probe_supported(false);
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db_unattributable_recovery_fail")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    build_punched_prefix_sst(&memfs, &fs, &tables)?;
+
+    // A persistent fault on the first streaming read fails whole-file
+    // recovery and routes the table to the recovery-failure salvage arm.
+    let fault = FaultFs::new(memfs.as_ref().clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::Other))
+            .on_path("tables")
+            .once(),
+    );
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.recovered, 0,
+        "an unattributable punched prefix must not salvage into an \
+         unrestricted output: {report:?}",
+    );
+    assert_eq!(report.unreadable, 1, "{:?}", report.unreadable_files);
+    assert!(
+        report
+            .unreadable_files
+            .first()
+            .is_some_and(|(_, reason)| reason.contains("punched extents found during salvage")),
+        "the post-walk guard is what caught it: {:?}",
         report.unreadable_files,
     );
     Ok(())
@@ -7329,7 +7331,7 @@ fn blob_recovery_discards_a_file_whose_metadata_id_disagrees() -> crate::Result<
 
     let config = blob_validation_config(Arc::clone(&memfs));
     let mut published = super::PublishedBlobReplacements::new(&config);
-    let recovery = super::recover_blob_files(&config, &mut published, &(0..10).collect())?;
+    let recovery = super::recover_blob_files(&config, &mut published, &(0..10).collect(), None)?;
     published.disarm();
     assert!(
         recovery.files.is_empty(),
@@ -7757,7 +7759,7 @@ fn blob_recovery_derives_the_frontier_of_a_punched_blob_file() -> crate::Result<
     .with_shared_fs(memfs);
 
     let mut published = super::PublishedBlobReplacements::new(&config);
-    let recovery = super::recover_blob_files(&config, &mut published, &(0..10).collect())?;
+    let recovery = super::recover_blob_files(&config, &mut published, &(0..10).collect(), None)?;
     published.disarm();
     let (files, unreadable) = (recovery.files, recovery.unreadable);
     assert!(
@@ -8265,7 +8267,7 @@ fn blob_recovery_queues_the_drop_of_a_fully_punched_blob_file() -> crate::Result
 
     let config = blob_validation_config(Arc::clone(&memfs));
     let mut published = super::PublishedBlobReplacements::new(&config);
-    let recovery = super::recover_blob_files(&config, &mut published, &(0..10).collect())?;
+    let recovery = super::recover_blob_files(&config, &mut published, &(0..10).collect(), None)?;
     published.disarm();
     assert!(
         recovery.unreadable.is_empty(),
@@ -9358,7 +9360,8 @@ fn blob_recovery_keeps_a_file_whose_zeroed_tail_follows_live_frames() -> crate::
 
     let config = blob_validation_config(Arc::clone(&memfs));
     let mut replacements_guard = super::PublishedBlobReplacements::new(&config);
-    let recovery = super::recover_blob_files(&config, &mut replacements_guard, &(0..10).collect())?;
+    let recovery =
+        super::recover_blob_files(&config, &mut replacements_guard, &(0..10).collect(), None)?;
     replacements_guard.disarm();
     assert!(
         memfs.exists(&path)?,
@@ -13152,6 +13155,125 @@ fn a_blob_rewrite_preserves_a_zero_ingest_offset() -> crate::Result<()> {
     Ok(())
 }
 
+/// The blob analogue of the committed-restriction authority: a punched blob
+/// file's frontier lives in the manifest's `blob_restrictions`, and when the
+/// manifest loads cleanly that value is exact. Re-deriving it from the punch
+/// geometry instead depends on the backend attributing zeros to a hole — and
+/// a mount that cannot reports the punched file WHOLE, so the SSTs keep
+/// handles into the reclaimed prefix and every read through them fails after
+/// a supposedly successful repair.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_clean_manifest_frontier_survives_a_backend_that_cannot_probe_holes() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::version::{BlobFileList, Level, Run, Version};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db_blob_frontier_authority")?;
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+    {
+        let tree = match config().open()? {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        for i in 0..8u32 {
+            tree.insert(format!("k{i:04}").as_bytes(), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+        // A second table, so losing it makes repair run over a CLEAN manifest.
+        tree.insert(b"zzz", vec![b'w'; 64], 100);
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Install the RESTRICTED blob view a completed tight-space relocation
+    // commits, then punch the prefix it declares dead — and persist that
+    // version, so the manifest carries the frontier in `blob_restrictions`
+    // exactly as a real reclaim leaves it.
+    let (tables, blob_files) = {
+        let tree = match config().open()? {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        let version = tree.index.current_version();
+        let blob = version
+            .blob_files
+            .iter()
+            .next()
+            .cloned()
+            .expect("the flush spilled a blob file");
+        // The frontier a real reclaim leaves: the END of the consumed frame,
+        // so the live suffix still starts at a decodable frame boundary.
+        let entries: Vec<_> = crate::vlog::BlobFileScanner::new(blob.path(), &*fs_dyn, blob.id())?
+            .collect::<crate::Result<Vec<_>>>()?;
+        assert!(entries.len() >= 2, "several frames written");
+        let frontier = entries.first().expect("first frame").frame_end;
+        let data_start = {
+            let mut file = fs_dyn.open(blob.path(), &crate::fs::FsOpenOptions::new().read(true))?;
+            let reader = crate::sfa::Reader::from_reader(&mut file)?;
+            reader
+                .toc()
+                .section(b"data")
+                .expect("blob file has a data section")
+                .pos()
+        };
+        memfs.punch_hole(blob.path(), data_start, frontier - data_start)?;
+        let restricted = blob.reopen_restricted(frontier)?;
+        let tables: Vec<_> = version.iter_tables().cloned().collect();
+        let mut map = crate::HashMap::default();
+        map.insert(restricted.id(), restricted);
+        (tables, BlobFileList::new(map))
+    };
+    let run = Arc::new(Run::new(tables).expect("non-empty run"));
+    let version = Version::from_levels(
+        2,
+        crate::TreeType::Blob,
+        alloc::vec![Level::from_runs(alloc::vec![run])],
+        blob_files,
+        crate::blob_tree::FragmentationMap::default(),
+    );
+    crate::version::persist_version(
+        &root,
+        &version,
+        crate::comparator::default_comparator().name(),
+        &*fs_dyn,
+        Arc::new(crate::runtime_config::RuntimeConfig::default()),
+        None,
+        crate::fs::SyncMode::Normal,
+    )?;
+
+    // The mount can punch but cannot attribute zeros to a hole, so the
+    // geometry walk would report this punched file whole and its frames
+    // would fail validation — losing the file and every table on it.
+    memfs.set_hole_probe_supported(false);
+    // Repair is entered over a MISSING table while the manifest itself loads
+    // cleanly: exactly when its committed frontier is available.
+    memfs.remove_file(&root.join("tables").join("1"))?;
+
+    let report = config().repair()?;
+    assert!(
+        report
+            .unreadable_files
+            .iter()
+            .all(|(p, _)| !p.to_string_lossy().contains("blobs")),
+        "the committed frontier keeps the punched blob file recoverable \
+         without any hole probe: {report:?}",
+    );
+    Ok(())
+}
+
 /// A recovered SST whose blob handles point BELOW a punched blob file's
 /// derived live-data frontier must not be published as-is — a read through
 /// such a handle dereferences the punched (zeroed) prefix and fails. Instead
@@ -13312,7 +13434,7 @@ fn blob_recovery_discards_a_persistently_unreadable_blob_file() -> crate::Result
     .with_shared_fs(memfs.clone());
 
     let mut published = super::PublishedBlobReplacements::new(&config);
-    let recovery = super::recover_blob_files(&config, &mut published, &(0..10).collect())?;
+    let recovery = super::recover_blob_files(&config, &mut published, &(0..10).collect(), None)?;
     published.disarm();
     let (files, unreadable, discard) = (recovery.files, recovery.unreadable, recovery.discard);
     assert!(files.is_empty(), "nothing recoverable");
@@ -13363,7 +13485,7 @@ fn blob_recovery_discards_a_duplicate_blob_id() -> crate::Result<()> {
     .with_shared_fs(memfs.clone());
 
     let mut published = super::PublishedBlobReplacements::new(&config);
-    let recovery = super::recover_blob_files(&config, &mut published, &(0..10).collect())?;
+    let recovery = super::recover_blob_files(&config, &mut published, &(0..10).collect(), None)?;
     published.disarm();
     let (files, unreadable, excluded, discard) = (
         recovery.files,
@@ -13456,6 +13578,7 @@ fn blob_recovery_propagates_a_transient_checksum_failure() -> crate::Result<()> 
         &config,
         &mut super::PublishedBlobReplacements::new(&config),
         &(0..10).collect(),
+        None,
     );
     assert!(
         result.is_err(),

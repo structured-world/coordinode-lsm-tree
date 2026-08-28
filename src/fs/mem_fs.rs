@@ -88,6 +88,14 @@ pub struct MemFs {
     /// the capability-gated fallback (tight-space compaction skips on a backend
     /// that cannot punch). Shared across clones.
     punch_hole_supported: Arc<portable_atomic::AtomicBool>,
+    /// Whether [`Fs::extent_contains_hole`] can ATTRIBUTE zeros to a hole
+    /// (default `true`). A test sets this `false` via
+    /// [`MemFs::set_hole_probe_supported`] to model a punch-capable mount whose
+    /// backend answers the trait default `None` — where a reclaim and ordinary
+    /// damage are indistinguishable and the recovery paths must fail closed.
+    /// Independent of `punch_hole_supported`: a mount can punch and still not
+    /// report extent allocation. Shared across clones.
+    hole_probe_supported: Arc<portable_atomic::AtomicBool>,
 }
 
 #[derive(Debug, Default)]
@@ -170,6 +178,7 @@ impl MemFs {
             punched_total: Arc::new(portable_atomic::AtomicU64::new(0)),
             has_punches: Arc::new(portable_atomic::AtomicBool::new(false)),
             punch_hole_supported: Arc::new(portable_atomic::AtomicBool::new(true)),
+            hole_probe_supported: Arc::new(portable_atomic::AtomicBool::new(true)),
         }
     }
 
@@ -178,6 +187,16 @@ impl MemFs {
     /// because the backend cannot reclaim extents in place.
     pub fn set_punch_hole_supported(&self, supported: bool) {
         self.punch_hole_supported
+            .store(supported, portable_atomic::Ordering::Relaxed);
+    }
+
+    /// Toggles whether [`Fs::extent_contains_hole`] can answer at all. Set
+    /// `false` to model a punch-capable mount whose backend does not report
+    /// extent allocation (the trait default `None`): a reclaim and ordinary
+    /// damage then read identically, and the recovery paths must fail closed
+    /// rather than treat "unproven" as "unpunched".
+    pub fn set_hole_probe_supported(&self, supported: bool) {
+        self.hole_probe_supported
             .store(supported, portable_atomic::Ordering::Relaxed);
     }
 
@@ -1024,6 +1043,12 @@ impl Fs for MemFs {
     }
 
     fn extent_contains_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<Option<bool>> {
+        if !self
+            .hole_probe_supported
+            .load(portable_atomic::Ordering::Relaxed)
+        {
+            return Ok(None);
+        }
         let state = read_state(&self.state)?;
         if !state.files.contains_key(path) {
             return Ok(None);

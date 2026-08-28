@@ -1678,8 +1678,16 @@ fn source_prefix_is_punched(
     // of salvaging the blocks that are still readable. A reclaim deallocates,
     // so the probed window must carry a HOLE — contains-a-hole, the same rule
     // the block-level punch classifier applies (an unaligned punch keeps its
-    // zero-filled edges allocated); a backend that cannot answer leaves it
-    // unproven.
+    // zero-filled edges allocated).
+    //
+    // A backend that cannot answer (`None`) reports NOT-punched here, which is
+    // deliberately the permissive direction: this is only the cheap fast path,
+    // and answering "punched" on an unproven window would set aside every
+    // ordinarily-damaged table on a mount without extent reporting. The
+    // fail-closed decision for unattributable zeros belongs to
+    // `dropped_data_extent_is_zeroed` after the salvage walk, which sees every
+    // dropped all-zero extent rather than just this window and reports them
+    // (see `ExcisedScan::unattributed`).
     Ok(fs.extent_contains_hole(table_path, 0, n as u64)? == Some(true))
 }
 
@@ -2241,6 +2249,14 @@ fn recover_blob_files(
     // be filtered out and deleted anyway, and under tight disk space the
     // pointless salvage can abort the whole repair with `StorageFull`.
     referenced: &crate::HashSet<crate::vlog::BlobFileId>,
+    // The CLEANLY-loading manifest's committed blob frontiers, when one
+    // exists. Each is the AUTHORITATIVE `[data_start, frontier)` boundary of a
+    // tight-space-punched blob file — the same authority its `restrictions`
+    // twin carries for SSTs — so it is preferred over re-deriving the frontier
+    // from the on-disk punch geometry, which a backend that cannot report
+    // extent allocation gets wrong (reporting a punched file whole, whose
+    // handles then dereference the hole).
+    committed_frontiers: Option<&crate::HashMap<crate::vlog::BlobFileId, u64>>,
 ) -> crate::Result<BlobRecovery> {
     let blobs_folder = config.path.join(crate::file::BLOBS_FOLDER);
     let mut blob_files: Vec<crate::vlog::BlobFile> = Vec::new();
@@ -2419,47 +2435,57 @@ fn recover_blob_files(
                 unreadable.push((blob_path, e.to_string()));
             };
 
-        let frontier = match derive_blob_frontier(&config.fs, &blob_path, blob_id) {
-            Ok(BlobFrontier::Whole) => 0,
-            Ok(BlobFrontier::Punched(f)) => f,
-            Ok(BlobFrontier::FullyConsumed) => {
-                // Every frame is punched away: the relocation that consumed
-                // this file completed, only its removal lagged the crash.
-                // QUEUE that lagged drop for after the commit instead of
-                // finishing it here: the pre-commit scan is read-only on
-                // purpose — an abort before the commit (a cancellation, a
-                // transient failure on a later file) must leave the directory
-                // exactly as found, and the OLD manifest of an explicitly
-                // invoked repair over an openable tree may still name this
-                // file. Publishing an empty-suffix handle instead is not an
-                // option either: whole-file metadata over zero live frames is
-                // a file blob GC's stale-byte arithmetic can never retire
-                // (its frames are already gone, so the stale count never
-                // reaches the recorded totals). No live data is discarded:
-                // the walk proved the whole data section reads as zeros. The
-                // post-commit removal failing fails the repair, exactly as
-                // the immediate removal used to.
-                log::info!(
-                    "blob file {blob_id} at {}: its punch consumed every frame — \
+        // The committed frontier, when the manifest loaded cleanly, is exact
+        // and free: no geometry walk, and no dependence on the backend being
+        // able to attribute zeros to a hole (which, unanswered, reports a
+        // punched file WHOLE — publishing handles that dereference the hole).
+        // Everything downstream — identity, frame validation, the handle
+        // rewrite — runs on it exactly as on a derived one.
+        let committed_frontier = committed_frontiers.and_then(|m| m.get(&blob_id).copied());
+        let frontier = match committed_frontier {
+            Some(committed) => committed,
+            None => match derive_blob_frontier(&config.fs, &blob_path, blob_id) {
+                Ok(BlobFrontier::Whole) => 0,
+                Ok(BlobFrontier::Punched(f)) => f,
+                Ok(BlobFrontier::FullyConsumed) => {
+                    // Every frame is punched away: the relocation that consumed
+                    // this file completed, only its removal lagged the crash.
+                    // QUEUE that lagged drop for after the commit instead of
+                    // finishing it here: the pre-commit scan is read-only on
+                    // purpose — an abort before the commit (a cancellation, a
+                    // transient failure on a later file) must leave the directory
+                    // exactly as found, and the OLD manifest of an explicitly
+                    // invoked repair over an openable tree may still name this
+                    // file. Publishing an empty-suffix handle instead is not an
+                    // option either: whole-file metadata over zero live frames is
+                    // a file blob GC's stale-byte arithmetic can never retire
+                    // (its frames are already gone, so the stale count never
+                    // reaches the recorded totals). No live data is discarded:
+                    // the walk proved the whole data section reads as zeros. The
+                    // post-commit removal failing fails the repair, exactly as
+                    // the immediate removal used to.
+                    log::info!(
+                        "blob file {blob_id} at {}: its punch consumed every frame — \
                      queueing the relocation's lagged file drop for after the commit",
-                    blob_path.display(),
-                );
-                discard.push((
-                    blob_path,
-                    "fully punched blob file: a completed relocation's lagged drop".to_string(),
-                ));
-                continue;
-            }
-            // A TRANSIENT read (flaky I/O) is retryable: recording the blob
-            // unreadable commits a manifest without the still-in-place file,
-            // which the next open's orphan sweep then DELETES — permanent value
-            // loss from a one-shot failure. Propagate so a retry re-reads it,
-            // mirroring the table-recovery path.
-            Err(e) if is_environmental(&e) => return Err(e),
-            Err(e) => {
-                discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
-                continue;
-            }
+                        blob_path.display(),
+                    );
+                    discard.push((
+                        blob_path,
+                        "fully punched blob file: a completed relocation's lagged drop".to_string(),
+                    ));
+                    continue;
+                }
+                // A TRANSIENT read (flaky I/O) is retryable: recording the blob
+                // unreadable commits a manifest without the still-in-place file,
+                // which the next open's orphan sweep then DELETES — permanent value
+                // loss from a one-shot failure. Propagate so a retry re-reads it,
+                // mirroring the table-recovery path.
+                Err(e) if is_environmental(&e) => return Err(e),
+                Err(e) => {
+                    discard_unreadable(blob_path, &e, &mut unreadable, &mut discard);
+                    continue;
+                }
+            },
         };
 
         // IDENTITY before content: the id under which this file will be
@@ -3089,6 +3115,11 @@ impl RepairPolicy {
 struct CommittedManifest {
     tables: crate::HashMap<TableId, crate::version::recovery::RecoveredTable>,
     restrictions: crate::HashMap<TableId, crate::UserKey>,
+    /// The blob analogue of `restrictions`: each punched blob file's committed
+    /// `[data_start, frontier)` boundary. Exact where the geometry walk only
+    /// re-derives it — and where a backend that cannot attribute zeros to a
+    /// hole re-derives it WRONG, reporting a punched file whole.
+    blob_frontiers: crate::HashMap<crate::vlog::BlobFileId, u64>,
 }
 
 #[cfg(feature = "std")]
@@ -3266,6 +3297,7 @@ fn sweep_superseded_by_committed_manifest(
     Ok(Some(CommittedManifest {
         tables: referenced_tables,
         restrictions: recovery.restrictions,
+        blob_frontiers: recovery.blob_restrictions,
     }))
 }
 
@@ -4501,6 +4533,7 @@ fn repair_tree(
             config,
             &mut published_blob_replacements,
             &referenced_blob_ids,
+            manifest_referenced.as_ref().map(|m| &m.blob_frontiers),
         )?;
         unreadable_files.extend(recovery.unreadable);
         excluded_files.extend(recovery.excluded);
