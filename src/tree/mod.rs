@@ -4564,6 +4564,12 @@ impl Tree {
         // skipped rather than orphan-deleted.
         let mut recovered_table_ids: crate::HashSet<TableId> = crate::HashSet::default();
         let mut orphaned_tables: Vec<(crate::path::PathBuf, Arc<dyn crate::fs::Fs>)> = vec![];
+        // First recovery failure per manifest id, kept until a later routed
+        // folder yields a copy that opens. Whatever is left once every folder
+        // is scanned is a table the manifest names and no copy delivers, so
+        // its error is the open's.
+        let mut unrecovered_sightings: crate::HashMap<TableId, crate::Error> =
+            crate::HashMap::default();
 
         // Scan all configured table folders (primary + level routes).
         let all_folders = config.all_tables_folders();
@@ -4792,13 +4798,14 @@ impl Tree {
 
                 // Remove from map to prevent duplicate recovery if the same
                 // table file exists in multiple scanned folders.
-                if let Some((level_idx, checksum, global_seqno)) = table_map.remove(&table_id) {
+                if let Some(entry) = table_map.remove(&table_id) {
+                    let (level_idx, checksum, global_seqno) = entry;
                     let pin_filter = config.filter_block_pinning_policy.get(level_idx.into());
                     let pin_index = config.index_block_pinning_policy.get(level_idx.into());
 
                     let table = {
                         let mut params = crate::table::RecoverParams::new(
-                            table_file_path,
+                            table_file_path.clone(),
                             checksum,
                             table_id,
                             folder_fs.clone(),
@@ -4819,11 +4826,34 @@ impl Tree {
                         {
                             params.metrics = metrics.clone();
                         }
-                        Table::recover(params)?
+                        match Table::recover(params) {
+                            Ok(table) => table,
+                            Err(e) => {
+                                // A routed tree can hold this id in more than
+                                // one folder, and repair's post-commit sweep of
+                                // the copy it displaced can fail after the
+                                // manifest is already durable. Ending the search
+                                // on the first sighting would then shut the tree
+                                // on a table that is present and intact one
+                                // folder over. Put the id back, remember the
+                                // failure, and keep scanning; if no folder
+                                // yields the manifest's copy, this error is what
+                                // the open reports.
+                                log::warn!(
+                                    "table {table_id} at {} did not recover ({e}); \
+                                     looking for another routed copy",
+                                    table_file_path.display(),
+                                );
+                                table_map.insert(table_id, entry);
+                                unrecovered_sightings.entry(table_id).or_insert(e);
+                                continue;
+                            }
+                        }
                     };
 
                     tables.push(table);
                     recovered_table_ids.insert(table_id);
+                    unrecovered_sightings.remove(&table_id);
 
                     if tables.len() % progress_mod == 0 {
                         log::debug!("Recovered {}/{cnt} tables", tables.len());
@@ -4840,6 +4870,16 @@ impl Tree {
                     orphaned_tables.push((table_file_path, folder_fs.clone()));
                 }
             }
+        }
+
+        // Every folder is scanned, so an id that never recovered has no copy
+        // left to try. Report the failure that stopped it — a missing-table
+        // diagnostic would hide the reason the file on disk could not be read.
+        if let Some((_, e)) = unrecovered_sightings
+            .into_iter()
+            .find(|(id, _)| table_map.contains_key(id))
+        {
+            return Err(e);
         }
 
         if tables.len() < cnt {

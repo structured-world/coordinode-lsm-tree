@@ -9906,6 +9906,94 @@ fn a_valid_routed_duplicate_is_excluded_not_unreadable() -> crate::Result<()> {
     Ok(())
 }
 
+/// When a repair's post-commit sweep cannot remove the damaged duplicate it
+/// displaced, the manifest is already durable and names the copy in a LATER
+/// routed folder. The retry the failure documents is an open, and the open
+/// scans the primary folder first: sighting the damaged leftover there must
+/// not end the search for that id, or the tree stays shut on a manifest whose
+/// table is present and intact one folder over.
+#[test]
+fn a_damaged_duplicate_in_an_earlier_folder_does_not_shut_out_the_manifest_copy()
+-> crate::Result<()> {
+    use crate::config::LevelRoute;
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let cold = std::path::absolute("/cold")?;
+    let tables = root.join("tables");
+    let cold_tables = cold.join("tables");
+    memfs.create_dir_all(&tables)?;
+    memfs.create_dir_all(&cold_tables)?;
+
+    // The only copy at rebuild time: the manifest records THIS file's checksum.
+    {
+        let mut w = crate::table::Writer::new(cold_tables.join("0"), 0, 0, Arc::clone(&fs_dyn))?;
+        w.write(InternalValue::from_components(
+            b"a".to_vec(),
+            b"v".to_vec(),
+            1,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "the table is non-empty");
+    }
+
+    let config = || {
+        let route_fs: Arc<dyn Fs> = memfs.clone();
+        let shared: Arc<dyn Fs> = memfs.clone();
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(shared)
+        .level_routes(vec![LevelRoute {
+            levels: 0..2,
+            path: cold.clone(),
+            fs: route_fs,
+        }])
+    };
+    let report = config().repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "the routed copy is published: {report:?}"
+    );
+
+    // The leftover a failed post-commit sweep would have left behind: a
+    // damaged copy of the SAME id in the folder scanned FIRST. Truncated, so
+    // it loses its trailer and cannot be opened at all.
+    {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut memfs.open(
+                &cold_tables.join("0"),
+                &crate::fs::FsOpenOptions::new().read(true),
+            )?,
+            &mut bytes,
+        )?;
+        bytes.truncate(bytes.len() / 2);
+        let mut f = memfs.open(
+            &tables.join("0"),
+            &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        std::io::Write::write_all(&mut f, &bytes)?;
+    }
+
+    let tree = match config().open()? {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    assert_eq!(
+        tree.get(b"a", crate::MAX_SEQNO)?.as_deref(),
+        Some(&b"v"[..]),
+        "the open falls through to the routed folder holding the manifest's copy",
+    );
+    Ok(())
+}
+
 /// A BOTTOMMOST compaction that elides a tombstone (and drains the versions
 /// it covered) transforms visibility exactly like a compaction filter: the
 /// output contains neither the tombstone nor the covered value, so a
