@@ -572,8 +572,11 @@ pub(crate) fn compute_level_segment_stats(version: &Version) -> crate::Result<Ve
         for run in run_group.iter() {
             for table in run.iter() {
                 // Physical file size, NOT m.file_size (which undercounts), to
-                // reconcile with the tree-level `used_bytes`.
-                let on_disk = table.fs.metadata(&table.path)?.len;
+                // reconcile with the tree-level `used_bytes` — including a
+                // restricted table's live restriction sidecar (the same basis
+                // as `table_on_disk_bytes`), so summing the levels matches
+                // the documented SST portion of the tree total.
+                let on_disk = table_on_disk_bytes(table)?;
                 let items = table.metadata.item_count;
                 let seg_reads = table.read_count.load(Relaxed);
                 let seg_access = table.last_access_secs.load(Relaxed);

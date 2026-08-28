@@ -133,3 +133,75 @@ fn storage_statistics_blanket_impl_over_real_tree() -> crate::Result<()> {
     assert!(s.cache_stats().capacity_bytes > 0);
     Ok(())
 }
+
+/// The per-level accounting shares the tree-level basis: a restricted
+/// table's live `.restrict-bound` sidecar counts in `LevelStats` /
+/// `SegmentStats` too, or summing the levels stops reconciling with the
+/// documented SST portion of `StorageStats::used_bytes` and tiering
+/// consumers understate the footprint.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn level_stats_count_a_restricted_tables_sidecar() -> crate::Result<()> {
+    use crate::blob_tree::FragmentationMap;
+    use crate::table::{Table, Writer};
+    use crate::version::{BlobFileList, Level, Run, Version};
+    use crate::{InternalValue, TreeType, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(crate::fs::StdFs);
+    let sst = dir.path().join("0");
+
+    // A multi-block SST so a restriction bound lands on a real block boundary.
+    let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+    for i in 0..256u32 {
+        w.write(InternalValue::from_components(
+            format!("k{i:05}").into_bytes(),
+            format!("v{i}").into_bytes(),
+            u64::from(i) + 1,
+            ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = w.finish()?.expect("table written");
+
+    let table = {
+        let mut params = crate::table::RecoverParams::new(
+            sst.clone(),
+            checksum,
+            0,
+            Arc::clone(&fs),
+            crate::comparator::default_comparator(),
+            Arc::new(crate::Cache::with_capacity_bytes(1_000_000)),
+        );
+        params.descriptor_table = Some(Arc::new(crate::descriptor_table::DescriptorTable::new(10)));
+        Table::recover(params)?
+    };
+    let restricted = table.reopen_restricted(b"k00100".to_vec().into())?;
+    crate::restrict_bound::write(&*fs, &sst, None, 0, b"k00100", crate::fs::SyncMode::Normal)?;
+
+    let run = Arc::new(Run::new(vec![restricted]).expect("non-empty run"));
+    let version = Version::from_levels(
+        1,
+        TreeType::Standard,
+        vec![Level::from_runs(vec![run])],
+        BlobFileList::default(),
+        FragmentationMap::default(),
+    );
+
+    let levels = compute_level_segment_stats(&version)?;
+    let sum: u64 = levels.iter().map(|l| l.used_bytes).sum();
+    let expected: u64 = version
+        .iter_tables()
+        .map(table_on_disk_bytes)
+        .sum::<crate::Result<u64>>()?;
+    let sst_alone = fs.metadata(&sst)?.len;
+    assert!(
+        expected > sst_alone,
+        "the fixture's live sidecar contributes bytes ({expected} vs {sst_alone})",
+    );
+    assert_eq!(
+        sum, expected,
+        "per-level and tree-level accounting share one sidecar-aware basis",
+    );
+    Ok(())
+}
