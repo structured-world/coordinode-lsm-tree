@@ -10018,6 +10018,375 @@ fn a_transformed_output_without_the_run_end_fails_on_reaching_inputs() -> crate:
     Ok(())
 }
 
+/// A `persist_version` failure AFTER its atomic `CURRENT` switch (the
+/// pointer's directory sync is the one fallible step past it) must carry
+/// the report: the pointer on disk already names the rebuilt manifest, so
+/// once the transient fault clears the retry opens it without a repair and
+/// answers with no report at all. The sweep arms a one-shot directory-sync
+/// fault at increasing skip counts until it lands in that window (the
+/// re-created `current` proves the switch happened) and asserts the error
+/// is the report-carrying kind.
+#[test]
+fn a_switched_current_sync_failure_carries_the_report() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    for skip in 0..64u64 {
+        let memfs = Arc::new(MemFs::new());
+        let root = std::path::absolute("/db")?;
+        {
+            let tree = match Config::new(
+                &root,
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .with_shared_fs(memfs.clone())
+            .open()?
+            {
+                crate::AnyTree::Standard(t) => t,
+                crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+            };
+            tree.insert(b"a", b"v", 1);
+            tree.flush_active_memtable(0)?;
+        }
+        for e in memfs.read_dir(&root)? {
+            let is_version = e
+                .file_name
+                .strip_prefix('v')
+                .is_some_and(|rest| rest.parse::<u64>().is_ok());
+            if is_version || e.file_name == "current" {
+                memfs.remove_file(&e.path)?;
+            }
+        }
+
+        let fault = FaultFs::new((*memfs).clone());
+        fault.injector().arm(
+            FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+                .skip(skip)
+                .times(1),
+        );
+        let result = Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_fs(fault)
+        .repair();
+
+        let switched = memfs.exists(&root.join("current"))?;
+        match result {
+            Ok(_) => {
+                // The fault fired before any sync (or never) without
+                // reaching the post-switch window at this skip; when the
+                // skip exceeds every sync the repair just succeeds — the
+                // window, if it exists, was at a smaller skip.
+            }
+            Err(e) if !switched => {
+                // Failed before the switch: a bare error is correct here
+                // (nothing was published; the retry re-repairs).
+                assert!(
+                    !matches!(e, crate::Error::RepairedButUnopened { .. }),
+                    "no report may claim a repair the pointer disproves",
+                );
+            }
+            Err(crate::Error::RepairedButUnopened { report, .. }) => {
+                assert_eq!(
+                    report.recovered, 1,
+                    "the switched manifest's report rides in the error: {report:?}",
+                );
+                return Ok(());
+            }
+            Err(other) => panic!(
+                "a failure after the CURRENT switch must carry the report, \
+                 got {other:?}",
+            ),
+        }
+    }
+    panic!("no skip count landed the fault in the post-switch window");
+}
+
+/// An abandoned repair replacement's RESTRICTION SIDECAR goes with it: a
+/// restricted salvage builds `{id}.repair-tmp` plus
+/// `{id}.repair-tmp.restrict-bound`, and a repair that stopped before its
+/// commit leaves both. The open sweeps the temp — and must sweep the
+/// companion too, because that name classifies as Foreign and would fail
+/// the very same open, leaving a healthy manifest unopenable without
+/// another explicit repair.
+#[test]
+fn an_abandoned_repair_temp_sweep_takes_its_restriction_sidecar() -> crate::Result<()> {
+    use crate::fs::Fs;
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(crate::fs::MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+    };
+    {
+        let tree = match config().open()? {
+            crate::AnyTree::Standard(t) => t,
+            crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+        };
+        tree.insert(b"a", b"v", 1);
+        tree.flush_active_memtable(0)?;
+    }
+    // The crash leftovers of a restricted salvage the repair never
+    // committed: the unpublished replacement and its restriction sidecar.
+    let tables = root.join("tables");
+    let tmp = tables.join("9.repair-tmp");
+    let sidecar = tables.join("9.repair-tmp.restrict-bound");
+    for path in [&tmp, &sidecar] {
+        let mut f = memfs.open(
+            path,
+            &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        std::io::Write::write_all(&mut f, &[0xEE; 16])?;
+    }
+
+    let tree = config().open()?;
+    assert!(
+        tree.get(b"a", crate::MAX_SEQNO)?.is_some(),
+        "the healthy manifest reopens",
+    );
+    assert!(!memfs.exists(&tmp)?, "the abandoned replacement is swept",);
+    assert!(
+        !memfs.exists(&sidecar)?,
+        "its restriction sidecar goes with it — left behind it classifies \
+         as Foreign and fails the open",
+    );
+    Ok(())
+}
+
+/// One table's structurally unreadable `linked_blob_files` section must not
+/// abort the whole repair: the reference set is a conservative hint (skip
+/// pointless orphan salvage, reserve referenced ids), and the dependency
+/// filter sets exactly that table aside — nothing that survives can point
+/// at an id the set missed. Today the table scan's own `verify_blob_links`
+/// catches the corruption first and routes the table to salvage, so this
+/// pins the end-to-end outcome (healthy sibling recovered, corrupt table
+/// reported) while the set-build's non-environmental-error tolerance
+/// guards the path defensively.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_corrupt_reference_section_does_not_abort_the_blob_repair() -> crate::Result<()> {
+    use crate::coding::Encode;
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, InternalValue, KvSeparationOptions, SequenceNumberCounter, ValueType};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let tables = root.join("tables");
+    memfs.create_dir_all(&blobs)?;
+    memfs.create_dir_all(&tables)?;
+
+    // Table 0: healthy, no blob references.
+    {
+        let mut w = crate::table::Writer::new(tables.join("0"), 0, 0, Arc::clone(&fs_dyn))?;
+        w.write(InternalValue::from_components(
+            b"a".to_vec(),
+            b"v".to_vec(),
+            1,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "table 0 is non-empty");
+    }
+    // Table 1: references healthy blob 7, then its reference section's
+    // count header is corrupted (the digest died with the manifest, so the
+    // table still recovers structurally).
+    let blob_path = blobs.join("7");
+    let (offset, on_disk_size) = {
+        let mut w = crate::vlog::blob_file::writer::Writer::new(&blob_path, 7, 0, &*fs_dyn)?;
+        let offset = w.offset();
+        let on_disk = w.write(b"m", 2, &[b'x'; 300])?;
+        w.finish()?;
+        (offset, on_disk)
+    };
+    let checksum = {
+        let mut w = crate::table::Writer::new(tables.join("1"), 1, 0, Arc::clone(&fs_dyn))?;
+        w.link_blob_file(7, 1, 300, u64::from(on_disk_size));
+        let ind = crate::blob_tree::handle::BlobIndirection {
+            vhandle: crate::vlog::ValueHandle {
+                blob_file_id: 7,
+                offset,
+                on_disk_size,
+            },
+            size: 300,
+        };
+        w.write(InternalValue::from_components(
+            b"m".to_vec(),
+            ind.encode_into_vec(),
+            2,
+            ValueType::Indirection,
+        ))?;
+        w.finish()?.expect("table written").1
+    };
+    {
+        let table = crate::table::Table::recover(crate::table::RecoverParams::new(
+            tables.join("1"),
+            checksum,
+            1,
+            Arc::clone(&fs_dyn),
+            crate::comparator::default_comparator(),
+            Arc::new(crate::Cache::with_capacity_bytes(1_000_000)),
+        ))?;
+        let handle = table
+            .regions
+            .linked_blob_files
+            .expect("table 1 has a reference section");
+        drop(table);
+        let mut f = memfs.open(
+            &tables.join("1"),
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        f.seek(SeekFrom::Start(*handle.offset()))?;
+        // A forged record count far beyond the section's bytes: the parser
+        // rejects it as invalid data.
+        f.write_all(&u32::MAX.to_le_bytes())?;
+    }
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "the corrupt-section table is set aside; its healthy sibling is \
+         recovered: {report:?}",
+    );
+    assert!(
+        report
+            .unreadable_files
+            .iter()
+            .any(|(path, _)| path.ends_with("1")),
+        "the corrupt-section table is reported: {report:?}",
+    );
+    Ok(())
+}
+
+/// The fresh-id blob allocator reserves every id the recovered tables
+/// still REFERENCE, not only ids present on disk: an SST may point at a
+/// blob file that no longer exists, and allocating that missing id to an
+/// unrelated salvage replacement would let the dependency check find the
+/// id present and keep the SST — whose handles then resolve against the
+/// wrong file's records.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn blob_salvage_never_allocates_a_missing_referenced_id() -> crate::Result<()> {
+    use crate::coding::Encode;
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, InternalValue, KvSeparationOptions, SequenceNumberCounter, ValueType};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let tables = root.join("tables");
+    memfs.create_dir_all(&blobs)?;
+    memfs.create_dir_all(&tables)?;
+
+    // Blob 0: three frames; the LAST frame's trailer is corrupted so the
+    // scan salvages the two live frames into a fresh-id replacement.
+    let blob0 = blobs.join("0");
+    let (offset0, on_disk0) = {
+        let mut w = crate::vlog::blob_file::writer::Writer::new(&blob0, 0, 0, &*fs_dyn)?;
+        let offset = w.offset();
+        let on_disk = w.write(b"a", 1, &[b'x'; 300])?;
+        w.write(b"b", 2, &[b'y'; 300])?;
+        w.write(b"c", 3, &[b'z'; 300])?;
+        w.finish()?;
+        (offset, on_disk)
+    };
+    {
+        let last = crate::vlog::BlobFileScanner::new(&blob0, &*fs_dyn, 0)?
+            .collect::<crate::Result<Vec<_>>>()?
+            .last()
+            .expect("a last frame")
+            .frame_end;
+        let mut f = memfs.open(
+            &blob0,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        let byte = crate::file::read_exact(&*f, last - 8, 1)?;
+        f.seek(SeekFrom::Start(last - 8))?;
+        f.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
+    }
+
+    // The SST references blob 0 AND the MISSING blob 1 — exactly the id the
+    // pre-fix allocator would hand the salvage replacement.
+    {
+        let mut w = crate::table::Writer::new(tables.join("0"), 0, 0, Arc::clone(&fs_dyn))?;
+        w.link_blob_file(0, 1, 300, u64::from(on_disk0));
+        w.link_blob_file(1, 1, 300, 100);
+        let ind0 = crate::blob_tree::handle::BlobIndirection {
+            vhandle: crate::vlog::ValueHandle {
+                blob_file_id: 0,
+                offset: offset0,
+                on_disk_size: on_disk0,
+            },
+            size: 300,
+        };
+        let ind1 = crate::blob_tree::handle::BlobIndirection {
+            vhandle: crate::vlog::ValueHandle {
+                blob_file_id: 1,
+                offset: 0,
+                on_disk_size: 100,
+            },
+            size: 300,
+        };
+        w.write(InternalValue::from_components(
+            b"a".to_vec(),
+            ind0.encode_into_vec(),
+            1,
+            ValueType::Indirection,
+        ))?;
+        w.write(InternalValue::from_components(
+            b"m".to_vec(),
+            ind1.encode_into_vec(),
+            2,
+            ValueType::Indirection,
+        ))?;
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .repair()?;
+    assert_eq!(
+        report.recovered, 0,
+        "blob 1 is referenced but gone; the salvage replacement must not be \
+         allocated onto that id, so the table's dependency stays missing and \
+         the table is excluded: {report:?}",
+    );
+    Ok(())
+}
+
 /// A repair configured WITHOUT kv-separation must not rebuild a Standard
 /// manifest over blob-backed SSTs: with the manifest gone the open's
 /// tree-type check never runs, and the rebuilt tree would open fine while

@@ -2227,8 +2227,13 @@ fn recover_blob_files(
     }
     // Fresh-id allocator for salvaged replacements. Taken over ALL candidates
     // before any is processed, so an id handed out here can never collide with
-    // a file this scan has not reached yet. Repair runs single-threaded on a
-    // tree nobody else has open, so no other allocator competes.
+    // a file this scan has not reached yet — AND over every id the recovered
+    // tables still REFERENCE: an SST may point at a blob file that no longer
+    // exists on disk, and allocating that missing id to an unrelated
+    // replacement would let the later dependency check find the id present
+    // and keep the SST, whose handles then resolve against the wrong file's
+    // records. Repair runs single-threaded on a tree nobody else has open,
+    // so no other allocator competes.
     //
     // `None` once the space is exhausted, and the failure is raised only where
     // an id is actually needed — a healthy tree holding a `u64::MAX` blob is
@@ -2239,6 +2244,7 @@ fn recover_blob_files(
     let mut next_blob_id: Option<crate::vlog::BlobFileId> = candidates
         .iter()
         .map(|(id, _, _)| *id)
+        .chain(referenced.iter().copied())
         .max()
         .map_or(Some(0), |max| max.checked_add(1));
     candidates.sort_by(|a, b| {
@@ -3439,6 +3445,19 @@ fn repair_tree(
                     ));
                     continue;
                 }
+                // An abandoned replacement's restriction sidecar: its temp is
+                // removed by the `RepairTmp` arm (which also takes the
+                // companion, so this entry is usually already gone — the
+                // post-commit removal tolerates that), and a swept temp's
+                // survivor is an orphan.
+                TableDirEntry::RepairTmpCompanion(_) => {
+                    discard_after_commit.push((
+                        Arc::clone(&folder_fs),
+                        table_path,
+                        "restriction sidecar of an abandoned repair replacement".to_string(),
+                    ));
+                    continue;
+                }
                 // `{id}.repair-tmp` is a replacement a previous repair was
                 // building and never published: no manifest names it (one that
                 // did was swapped in before this scan started), and its source
@@ -4182,12 +4201,31 @@ fn repair_tree(
         }
         // The candidate reference set, taken from the tables recovered so far
         // (a conservative superset of the post-filter truth): lets the blob
-        // scan skip salvaging invalid files nothing can reach.
+        // scan skip salvaging invalid files nothing can reach, and reserves
+        // every referenced id in the fresh-id allocator. A table whose
+        // reference section is structurally unreadable contributes nothing
+        // here rather than aborting the whole repair — the dependency filter
+        // below sets exactly that table aside (its dependencies are
+        // unknowable), so nothing that survives can point at an id this set
+        // missed. Environmental errors still propagate: a transient read
+        // failure says nothing about the section.
         let mut referenced_blob_ids: crate::HashSet<crate::vlog::BlobFileId> =
             crate::HashSet::default();
         for (table, ..) in &recovered_tables {
-            for link in table.list_blob_file_references()?.into_iter().flatten() {
-                referenced_blob_ids.insert(link.blob_file_id);
+            match table.list_blob_file_references() {
+                Ok(links) => {
+                    for link in links.into_iter().flatten() {
+                        referenced_blob_ids.insert(link.blob_file_id);
+                    }
+                }
+                Err(e) if is_environmental_io(&e) => return Err(e),
+                Err(e) => {
+                    log::warn!(
+                        "repair: table {} has an unreadable blob-reference section \
+                         ({e}); the dependency filter will set it aside",
+                        table.id(),
+                    );
+                }
             }
         }
         let recovery = recover_blob_files(
@@ -5130,26 +5168,38 @@ fn repair_tree(
     // fail-safe is to PRESERVE: the worst a preserved orphan costs is disk
     // space a later successful repair's reference filtering reclaims, while
     // a wrong deletion breaks a published manifest permanently.
-    if persisted.is_ok()
-        || !matches!(
-            probe_current(&*config.fs, &config.path, version_id),
-            CurrentProbe::NotSwitched
-        )
-    {
-        published_blob_replacements.disarm();
-    }
-    persisted?;
-
-    // The manifest is DURABLE from this point on: the repair happened, and
-    // its report must survive every later failure. A bare error from the
-    // cleanup below would discard the only report — once the filesystem
-    // fault clears, the next open sweeps the leftover itself and
-    // `open_or_repair` answers with no report at all, hiding the committed
-    // repair's lost coverage from an external-WAL consumer. The first
-    // cleanup failure is therefore RECORDED, the remaining cleanup is
-    // skipped, and the completed report rides out inside
-    // [`Error::RepairedButUnopened`].
+    // A failure after the switch (or one the probe cannot rule out) must
+    // still CARRY the report: the pointer on disk may already name the
+    // rebuilt manifest, so the retry opens it without a repair and answers
+    // with no report at all — losing the replay obligation exactly like a
+    // cleanup failure would. Recording the error here routes it through the
+    // same report-carrying exit; only a proven NOT-SWITCHED failure returns
+    // bare (nothing was published, the guard stays armed, and the retry's
+    // own repair produces a fresh report).
     let mut post_commit_error: Option<crate::Error> = None;
+    match persisted {
+        Ok(()) => published_blob_replacements.disarm(),
+        Err(e) => {
+            if matches!(
+                probe_current(&*config.fs, &config.path, version_id),
+                CurrentProbe::NotSwitched
+            ) {
+                return Err(e);
+            }
+            published_blob_replacements.disarm();
+            post_commit_error = Some(e);
+        }
+    }
+
+    // The manifest is DURABLE from this point on (or the probe could not
+    // prove otherwise): the repair happened, and its report must survive
+    // every later failure. A bare error from the cleanup below would
+    // discard the only report — once the filesystem fault clears, the next
+    // open sweeps the leftover itself and `open_or_repair` answers with no
+    // report at all, hiding the committed repair's lost coverage from an
+    // external-WAL consumer. The first post-commit failure is therefore
+    // RECORDED, the remaining cleanup is skipped, and the completed report
+    // rides out inside [`Error::RepairedButUnopened`].
 
     // A rebuilt snapshot is a complete generation on its own. Sweep every stale
     // edit log so nothing is replayed on top of it: the lost manifest's

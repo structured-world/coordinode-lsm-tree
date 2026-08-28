@@ -4724,6 +4724,15 @@ impl Tree {
                                     "Removing abandoned repair replacement: {}",
                                     table_file_path.display()
                                 );
+                                // A RESTRICTED salvage also wrote
+                                // `{temp}.restrict-bound`; that companion must
+                                // go with the temp — its name classifies as
+                                // Foreign and would fail this very open.
+                                let companion =
+                                    crate::restrict_bound::sidecar_path(&table_file_path);
+                                if folder_fs.exists(&companion)? {
+                                    Self::sweep_artifact(folder_fs.as_ref(), &companion)?;
+                                }
                                 Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
                             }
                         }
@@ -4743,6 +4752,31 @@ impl Tree {
                             }
                             log::warn!(
                                 "Removing abandoned repair replacement: {}",
+                                table_file_path.display()
+                            );
+                            // Same companion rule as the std arm above (the
+                            // `restrict_bound` helper is std-gated, so the
+                            // name is spelled out).
+                            let companion = table_base_folder.join(alloc::format!(
+                                "{tmp_id}{}.restrict-bound",
+                                crate::file::REPAIR_TMP_SUFFIX
+                            ));
+                            if folder_fs.exists(&companion)? {
+                                Self::sweep_artifact(folder_fs.as_ref(), &companion)?;
+                            }
+                            Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                        }
+                        continue;
+                    }
+                    // The companion's fate followed its temp when that entry
+                    // resolved (first, by sort order): a finished swap renamed
+                    // it into place, an abandoned build's sweep removed it. A
+                    // survivor here is an orphan (its temp is gone) — remove
+                    // it rather than reject the whole open over it.
+                    crate::file::TableDirEntry::RepairTmpCompanion(_) => {
+                        if folder_fs.exists(&table_file_path)? {
+                            log::warn!(
+                                "Removing orphaned repair-replacement sidecar: {}",
                                 table_file_path.display()
                             );
                             Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;

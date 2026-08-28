@@ -78,6 +78,11 @@ pub enum TableDirEntry {
     /// `{id}.repair-tmp` — a repair's unpublished replacement for `{id}`; see
     /// [`REPAIR_TMP_SUFFIX`].
     RepairTmp(crate::TableId),
+    /// `{id}.repair-tmp.restrict-bound` (or its `.tmp`) — the restriction
+    /// sidecar a restricted salvage wrote beside its replacement. Its fate
+    /// follows the temp's: a committed swap renames it into place, an
+    /// abandoned build's companion is disposable.
+    RepairTmpCompanion(crate::TableId),
     /// None of the shapes the engine owns.
     Foreign,
 }
@@ -107,9 +112,15 @@ impl TableDirEntry {
             return Self::Foreign;
         }
         if let Some(rest) = file_name.strip_suffix(".restrict-bound.tmp") {
+            if let Some(temp_owner) = rest.strip_suffix(REPAIR_TMP_SUFFIX) {
+                return owned_id(temp_owner, Self::RepairTmpCompanion);
+            }
             return owned_id(rest, Self::RestrictBoundTmp);
         }
         if let Some(rest) = file_name.strip_suffix(".restrict-bound") {
+            if let Some(temp_owner) = rest.strip_suffix(REPAIR_TMP_SUFFIX) {
+                return owned_id(temp_owner, Self::RepairTmpCompanion);
+            }
             return owned_id(rest, Self::RestrictBound);
         }
         if let Some(rest) = file_name.strip_suffix(REPAIR_TMP_SUFFIX) {
