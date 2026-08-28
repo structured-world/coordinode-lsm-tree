@@ -4211,6 +4211,35 @@ fn repair_tree(
             recovery.files.into_iter().map(|bf| (bf.id(), bf)).collect();
         (TreeType::Blob, BlobFileList::new(map))
     } else {
+        // A Standard rebuild must not swallow a blob tree: with the manifest
+        // gone the open's tree-type check never ran, so a configuration that
+        // omits kv-separation would otherwise publish a manifest that opens
+        // fine while reads return encoded indirection handles as user values
+        // and the blob files stay orphaned. The recovered tables' own
+        // `linked_blob_files` sections prove the store's type; fail closed
+        // with the same mismatch error a healthy open raises.
+        for (table, ..) in &recovered_tables {
+            let is_blob_backed = match table.list_blob_file_references() {
+                Ok(refs) => refs.is_some_and(|r| !r.is_empty()),
+                // An unreadable section cannot prove either type; the table
+                // is judged by the dependency filter on the kv path, and on
+                // this path nothing links it to a blob file.
+                Err(_) => false,
+            };
+            if is_blob_backed {
+                log::error!(
+                    "repair: table {} references blob files, so this store is a \
+                     KV-separated (blob) tree; rebuilding a Standard manifest \
+                     over it would return indirection handles as values — \
+                     configure kv separation and retry",
+                    table.id(),
+                );
+                return Err(crate::Error::TreeTypeMismatch {
+                    requested: TreeType::Standard,
+                    actual: TreeType::Blob,
+                });
+            }
+        }
         (
             TreeType::Standard,
             BlobFileList::new(crate::HashMap::default()),

@@ -10018,6 +10018,70 @@ fn a_transformed_output_without_the_run_end_fails_on_reaching_inputs() -> crate:
     Ok(())
 }
 
+/// A repair configured WITHOUT kv-separation must not rebuild a Standard
+/// manifest over blob-backed SSTs: with the manifest gone the open's
+/// tree-type check never runs, and the rebuilt tree would open fine while
+/// `get` returns encoded indirection handles as user values and the blob
+/// files stay outside the manifest. The recovered tables' own
+/// `linked_blob_files` sections prove the store's type — fail closed with
+/// the same mismatch error a healthy open raises.
+#[test]
+fn repair_rejects_blob_backed_ssts_without_kv_separation() -> crate::Result<()> {
+    use crate::fs::Fs;
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(crate::fs::MemFs::new());
+    let root = std::path::absolute("/db")?;
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        tree.insert(b"k", vec![b'v'; 64], 1);
+        tree.flush_active_memtable(0)?;
+    }
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .repair();
+    assert!(
+        matches!(
+            result,
+            Err(crate::Error::TreeTypeMismatch {
+                requested: crate::TreeType::Standard,
+                actual: crate::TreeType::Blob,
+            })
+        ),
+        "blob-backed SSTs must not be rebuilt into a Standard manifest: {:?}",
+        result.map(|r| r.recovered),
+    );
+    Ok(())
+}
+
 /// ANCESTRY across compaction generations: input A survives beside the
 /// untransformed intermediate B (excluded as derived — A is its history)
 /// and B's TRANSFORMED descendant C, whose complete run covers B. C's
