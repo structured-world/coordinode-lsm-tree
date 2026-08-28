@@ -1764,9 +1764,8 @@ fn repair_restricts_a_tight_space_punched_table() -> crate::Result<()> {
 #[test]
 fn a_clean_manifest_restriction_survives_a_lost_sidecar() -> crate::Result<()> {
     use crate::fs::{Fs, MemFs};
-    use crate::table::Writer;
     use crate::table::block_index::BlockIndex;
-    use crate::{AbstractTree, Config, InternalValue, SequenceNumberCounter, ValueType};
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
     use std::sync::Arc;
 
     let memfs = Arc::new(MemFs::new());
@@ -1786,18 +1785,7 @@ fn a_clean_manifest_restriction_survives_a_lost_sidecar() -> crate::Result<()> {
 
     // A punched SST with a mid-block bound, published via sidecar; the first
     // repair rebuilds a manifest that commits the restriction.
-    {
-        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
-        for i in 0..256u32 {
-            w.write(InternalValue::from_components(
-                format!("k{i:05}").into_bytes(),
-                format!("v{i}").into_bytes(),
-                u64::from(i) + 1,
-                ValueType::Value,
-            ))?;
-        }
-        assert!(w.finish()?.is_some(), "the SST is non-empty");
-    }
+    write_multiblock_sst(&sst, &fs)?;
     let bound;
     {
         let table = recover_sst(sst.clone(), &fs)?;
@@ -2887,57 +2875,14 @@ fn repair_aborts_when_the_alias_probe_is_inconclusive() -> crate::Result<()> {
     use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
     use std::sync::Arc;
 
-    /// Forwards everything to [`MemFs`] but refuses the alias probe, the way
-    /// a transient host fault refuses `canonicalize`.
-    struct FailingAliasFs(MemFs);
-    impl Fs for FailingAliasFs {
-        fn open(
-            &self,
-            path: &std::path::Path,
-            options: &crate::fs::FsOpenOptions,
-        ) -> crate::io::Result<Box<dyn crate::fs::FsFile>> {
-            self.0.open(path, options)
-        }
-        fn create_dir_all(&self, path: &std::path::Path) -> crate::io::Result<()> {
-            self.0.create_dir_all(path)
-        }
-        fn read_dir(
-            &self,
-            path: &std::path::Path,
-        ) -> crate::io::Result<Vec<crate::fs::FsDirEntry>> {
-            self.0.read_dir(path)
-        }
-        fn remove_file(&self, path: &std::path::Path) -> crate::io::Result<()> {
-            self.0.remove_file(path)
-        }
-        fn remove_dir_all(&self, path: &std::path::Path) -> crate::io::Result<()> {
-            self.0.remove_dir_all(path)
-        }
-        fn same_file(&self, _a: &std::path::Path, _b: &std::path::Path) -> crate::io::Result<bool> {
-            Err(crate::io::Error::new(
-                crate::io::ErrorKind::Interrupted,
-                "injected alias-probe failure",
-            ))
-        }
-        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> crate::io::Result<()> {
-            self.0.rename(from, to)
-        }
-        fn metadata(&self, path: &std::path::Path) -> crate::io::Result<crate::fs::FsMetadata> {
-            self.0.metadata(path)
-        }
-        fn exists(&self, path: &std::path::Path) -> crate::io::Result<bool> {
-            self.0.exists(path)
-        }
-        fn sync_directory(&self, path: &std::path::Path) -> crate::io::Result<()> {
-            self.0.sync_directory(path)
-        }
-        fn backend_id(&self) -> Option<u64> {
-            self.0.backend_id()
-        }
-    }
-
-    let memfs = MemFs::new();
-    let fs: Arc<dyn Fs> = Arc::new(FailingAliasFs(memfs));
+    // A host that refuses the alias probe, the way a transient fault refuses
+    // `canonicalize`.
+    let fault = crate::fs::FaultFs::new(MemFs::new());
+    fault.injector().arm(crate::fs::FaultRule::new(
+        crate::fs::FaultOp::SameFile,
+        crate::fs::Fault::Error(crate::io::ErrorKind::Interrupted),
+    ));
+    let fs: Arc<dyn Fs> = Arc::new(fault);
     let root = std::path::absolute("/db")?;
     let tables = root.join("tables");
     fs.create_dir_all(&tables)?;

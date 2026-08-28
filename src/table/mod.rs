@@ -416,6 +416,30 @@ pub(crate) enum PunchProbe {
     Unproven,
 }
 
+/// Everything one pass over the data blocks can say about a tight-space
+/// reclaim, from [`Table::punch_geometry`].
+///
+/// Read ONCE and classified once: proving a block zeroed reads it in FULL,
+/// and a reclaimed prefix can be hundreds of blocks — deriving the verdict and
+/// the bound on separate passes read the same dead prefix twice and left their
+/// agreement resting on the caller's ordering.
+#[cfg(feature = "std")]
+pub(crate) struct PunchGeometry {
+    /// Whether the zeroed runs are backed by a physical hole.
+    pub(crate) verdict: PunchProbe,
+    /// Index and END key of the first readable block. The conservative bound
+    /// is that key: at or above the true mid-block bound, so no superseded key
+    /// resurrects. `None` when every block reads as zeros.
+    pub(crate) first_readable: Option<(usize, UserKey)>,
+    /// Index of the first readable block AFTER the last zeroed one — the
+    /// greedy (resurrection) anchor, which keeps the whole readable region.
+    pub(crate) after_last_zeroed: Option<usize>,
+    /// A readable block sits BELOW a zeroed one: positive evidence that
+    /// individual `punch_hole` calls failed mid-reclaim, after which no
+    /// geometry bound separates intact-but-consumed blocks from live ones.
+    pub(crate) irregular: bool,
+}
+
 impl Table {
     #[must_use]
     pub fn global_seqno(&self) -> SeqNo {
@@ -3756,13 +3780,14 @@ impl Table {
     ///
     /// # Errors
     ///
-    /// Propagates a block-index, positioned-read, or hole-probe failure.
+    /// Propagates the open, block-index, positioned-read or hole-probe failure.
     #[cfg(feature = "std")]
-    pub(crate) fn has_punched_data_block(&self) -> crate::Result<PunchProbe> {
+    pub(crate) fn punch_geometry(&self) -> crate::Result<PunchGeometry> {
         let file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
         // [start, end) of the current run of consecutive zeroed blocks.
         let mut run: Option<(u64, u64)> = None;
         let mut unattributed = false;
+        let mut punched = false;
         let mut probe = |start: u64, end: u64| -> crate::Result<bool> {
             let answer = self
                 .fs
@@ -3772,10 +3797,22 @@ impl Table {
             }
             Ok(answer == Some(true))
         };
-        for handle in self.block_index.iter() {
+        // The geometry every classifier used to re-derive on its own pass.
+        let mut first_readable: Option<(usize, UserKey)> = None;
+        let mut after_last_zeroed: Option<usize> = None;
+        let mut irregular = false;
+        for (i, handle) in self.block_index.iter().enumerate() {
             let handle = handle?;
             let block = BlockHandle::new(handle.offset(), handle.size());
             if Self::block_is_zeroed_in(&*file, &block)? {
+                // A readable block BELOW a zeroed one is positive evidence of
+                // a punch that failed mid-reclaim.
+                if first_readable.is_some() {
+                    irregular = true;
+                }
+                // The greedy (resurrection) anchor only counts blocks that
+                // follow the LAST zeroed one, so a zeroed block resets it.
+                after_last_zeroed = None;
                 let start = block.offset().0;
                 let end = start + u64::from(block.size());
                 run = Some(match run {
@@ -3784,21 +3821,36 @@ impl Table {
                 });
                 continue;
             }
+            if first_readable.is_none() {
+                first_readable = Some((i, handle.end_key().clone()));
+            }
+            if after_last_zeroed.is_none() {
+                after_last_zeroed = Some(i);
+            }
             if let Some((start, end)) = run.take()
                 && probe(start, end)?
             {
-                return Ok(PunchProbe::Punched);
+                punched = true;
             }
         }
         if let Some((start, end)) = run
             && probe(start, end)?
         {
-            return Ok(PunchProbe::Punched);
+            punched = true;
         }
-        if unattributed && self.fs.capabilities(&self.path).punch_hole {
-            return Ok(PunchProbe::Unproven);
-        }
-        Ok(PunchProbe::Unpunched)
+        let verdict = if punched {
+            PunchProbe::Punched
+        } else if unattributed && self.fs.capabilities(&self.path).punch_hole {
+            PunchProbe::Unproven
+        } else {
+            PunchProbe::Unpunched
+        };
+        Ok(PunchGeometry {
+            verdict,
+            first_readable,
+            after_last_zeroed,
+            irregular,
+        })
     }
 
     /// The conservative restriction bound derived from the PHYSICAL punch alone,
@@ -3841,28 +3893,14 @@ impl Table {
     ///
     /// Propagates a block-index or positioned-read failure.
     #[cfg(feature = "std")]
-    pub(crate) fn derive_restriction_bound(&self) -> crate::Result<DerivedRestriction> {
-        let file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
-        let mut candidate: Option<UserKey> = None;
-        let mut seen_readable = false;
-        for handle in self.block_index.iter() {
-            let handle = handle?;
-            if Self::block_is_zeroed_in(&*file, &BlockHandle::new(handle.offset(), handle.size()))?
-            {
-                if seen_readable {
-                    return Ok(DerivedRestriction::IrregularPunch);
-                }
-            } else {
-                seen_readable = true;
-                if candidate.is_none() {
-                    candidate = Some(handle.end_key().clone());
-                }
-            }
+    pub(crate) fn conservative_restriction(geometry: &PunchGeometry) -> DerivedRestriction {
+        if geometry.irregular {
+            return DerivedRestriction::IrregularPunch;
         }
-        Ok(match candidate {
-            Some(bound) => DerivedRestriction::Bound(bound),
+        match &geometry.first_readable {
+            Some((_, end_key)) => DerivedRestriction::Bound(end_key.clone()),
             None => DerivedRestriction::NoLiveData,
-        })
+        }
     }
 
     /// The GREEDY counterpart of [`derive_restriction_bound`](Self::derive_restriction_bound)
@@ -3882,24 +3920,30 @@ impl Table {
     ///
     /// Propagates a block-index, positioned-read, or block-decode failure.
     #[cfg(feature = "std")]
-    pub(crate) fn derive_resurrection_bound(&self) -> crate::Result<Option<UserKey>> {
-        let file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
-        let mut candidate: Option<UserKey> = None;
-        for handle in self.block_index.iter() {
+    pub(crate) fn greedy_restriction_bound(
+        &self,
+        geometry: &PunchGeometry,
+    ) -> crate::Result<Option<UserKey>> {
+        let Some(start) = geometry.after_last_zeroed else {
+            return Ok(None);
+        };
+        // Every block from here on is readable (a zeroed one would have reset
+        // the anchor), so this only walks forward past WHOLLY EMPTY blocks —
+        // e.g. a columnar block fully masked by its delete bitmap, which
+        // carries no key to anchor on.
+        for (i, handle) in self.block_index.iter().enumerate() {
             let handle = handle?;
-            let bh = BlockHandle::new(handle.offset(), handle.size());
-            if Self::block_is_zeroed_in(&*file, &bh)? {
-                candidate = None;
+            if i < start {
                 continue;
             }
-            if candidate.is_none()
-                && let Some(db) = self.load_data_block(&bh)?
+            let bh = BlockHandle::new(handle.offset(), handle.size());
+            if let Some(db) = self.load_data_block(&bh)?
                 && let Some(first) = db.first_user_key(self.comparator.clone())?
             {
-                candidate = Some(first);
+                return Ok(Some(first));
             }
         }
-        Ok(candidate)
+        Ok(None)
     }
 
     /// Cross-checks the recorded `locator` section against the ACTUAL

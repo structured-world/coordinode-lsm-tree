@@ -104,6 +104,12 @@ pub enum FaultOp {
     /// it exercises the partial-punch geometry recovery (the reclaim stops at
     /// the first failed punch so the resulting hole pattern stays classifiable).
     PunchHole,
+    /// [`Fs::same_file`] — the physical-identity probe that decides whether two
+    /// directory spellings name one file. Failing it models a host that refuses
+    /// `canonicalize` / `stat`, and exercises the fail-closed path (an
+    /// unanswerable alias probe must not be read as "these are distinct
+    /// files"). Matched against the FIRST path.
+    SameFile,
 }
 
 /// What a matched [`FaultRule`] does to the operation.
@@ -438,6 +444,11 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn same_file(&self, a: &Path, b: &Path) -> io::Result<bool> {
+        // Rules match the FIRST path: an alias probe is asked about one file
+        // under two spellings, and `a` is the one a test names.
+        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::SameFile, Some(a)) {
+            return Err(fault_error(kind, FaultOp::SameFile));
+        }
         self.inner.same_file(a, b)
     }
 

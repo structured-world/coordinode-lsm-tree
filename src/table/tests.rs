@@ -1162,7 +1162,7 @@ fn punched_run_with_allocated_edges_still_proves_the_punch() -> crate::Result<()
     // verdict is a definite Unpunched, not an unattributable Unproven).
     assert!(
         matches!(
-            table.has_punched_data_block()?,
+            table.punch_geometry()?.verdict,
             crate::table::PunchProbe::Unpunched
         ),
         "zeros without a hole are corruption, never a punch",
@@ -1175,7 +1175,7 @@ fn punched_run_with_allocated_edges_still_proves_the_punch() -> crate::Result<()
     memfs.punch_hole(&path, mid - 8, 16)?;
     assert!(
         matches!(
-            table.has_punched_data_block()?,
+            table.punch_geometry()?.verdict,
             crate::table::PunchProbe::Punched
         ),
         "a hole contained in the zeroed run proves the punch even though no \
