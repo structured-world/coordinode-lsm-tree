@@ -1298,11 +1298,16 @@ struct TableSalvage<'a> {
     /// frontier); `None` on the plain corrupt-table salvage paths.
     blob_rewrite:
         Option<Arc<crate::HashMap<crate::vlog::BlobFileId, crate::salvage::BlobFileRewrite>>>,
-    /// The CLEAN manifest record's `global_seqno` for this id, when one
-    /// exists. A salvaged copy preserves local seqnos, so the offset applies
-    /// to it unchanged — with it, a bulk-ingested source salvages instead of
-    /// being rejected as unreconstructible.
-    manifest_global_seqno: Option<SeqNo>,
+    /// The source's RECOVERED bulk-ingest sequence offset, when it is known:
+    /// from a clean manifest record, or from a source the scan already
+    /// admitted (the blob-handle rewrite). A salvaged copy preserves local
+    /// seqnos, so the offset applies to it unchanged, and its presence also
+    /// says the offset need not be reconstructed from the SST — so the
+    /// fail-closed bulk-ingest rejection does not apply.
+    ///
+    /// `Some(0)` is a genuine offset, NOT a sentinel: the first ingestion on
+    /// a fresh counter commits offset 0. Only `None` means "unknown".
+    recovered_global_seqno: Option<SeqNo>,
 }
 
 fn try_salvage_table(
@@ -1317,7 +1322,7 @@ fn try_salvage_table(
         table_id,
         reject_punched_without_bound,
         blob_rewrite,
-        manifest_global_seqno,
+        recovered_global_seqno,
     } = salvage;
     // Salvage under the tree's configured comparator + crypto/dictionary context
     // so the rewritten SST opens, orders, and decrypts / decompresses consistently
@@ -1400,7 +1405,7 @@ fn try_salvage_table(
             table_id,
             Arc::clone(fs),
         );
-        if let Some(g) = manifest_global_seqno {
+        if let Some(g) = recovered_global_seqno {
             params.global_seqno = g;
         }
         Table::recover(params)?
@@ -1408,10 +1413,10 @@ fn try_salvage_table(
     // A salvaged copy of a bulk-ingested source still relies on the manifest-only
     // global_seqno offset a manifest-LOSS rebuild cannot recover: its entries stay
     // at local seqno 0, so installing it with offset 0 would silently mis-order
-    // and over-expose them. Without a clean manifest record to reuse, treat it as
+    // and over-expose them. Without a recovered offset to reuse, treat it as
     // unsalvageable — remove the freshly-written copy and let the caller record
     // the table unreadable.
-    if manifest_global_seqno.is_none()
+    if recovered_global_seqno.is_none()
         && has_unrecoverable_ingest_offset(
             table.metadata.bulk_ingested,
             table.metadata.item_count,
@@ -3076,10 +3081,57 @@ impl RepairPolicy {
 ///
 /// Propagates a removal failure: leaving a superseded file in place is what
 /// corrupts the rebuild, so the repair must fail rather than proceed past it.
+/// What a CLEANLY-loading committed manifest hands the repair scan: the full
+/// per-table records (checksum for temp-swap resolution, `global_seqno` so a
+/// bulk-ingested survivor keeps its offset) and the committed RESTRICTIONS —
+/// the authoritative bound for a tight-space-restricted survivor whose
+/// sidecar was lost in the crash window the manifest exists to cover.
+struct CommittedManifest {
+    tables: crate::HashMap<TableId, crate::version::recovery::RecoveredTable>,
+    restrictions: crate::HashMap<TableId, crate::UserKey>,
+}
+
+#[cfg(feature = "std")]
+impl CommittedManifest {
+    /// What this manifest says about `table_id`'s restriction.
+    fn restriction_of(&self, table_id: TableId) -> ManifestRestriction {
+        if !self.tables.contains_key(&table_id) {
+            return ManifestRestriction::Unknown;
+        }
+        self.restrictions
+            .get(&table_id)
+            .map_or(ManifestRestriction::Unrestricted, |bound| {
+                ManifestRestriction::Restricted(bound.clone())
+            })
+    }
+}
+
+/// What a CLEANLY-loading committed manifest says about one scanned table's
+/// restriction. It is the AUTHORITY in BOTH directions: the restriction is
+/// committed BEFORE its `.restrict-bound` sidecar mirror is written, so the
+/// manifest's bound is never the staler of the two; and a table it names
+/// WITHOUT a restriction is genuinely unrestricted (a lifted restriction
+/// drops out of the committed set), so a sidecar surviving there is stale
+/// metadata that would hide a live prefix.
+#[cfg(feature = "std")]
+enum ManifestRestriction {
+    /// The manifest names this table and restricts it to this exact bound.
+    Restricted(crate::UserKey),
+    /// The manifest names this table and does NOT restrict it: ignore any
+    /// surviving sidecar. The punch geometry still runs — a table the
+    /// manifest calls unrestricted has no committed reclaim, so zeroed
+    /// blocks there are damage and must be classified as such, not opened
+    /// over.
+    Unrestricted,
+    /// No clean manifest, or it does not name this table: the sidecar, then
+    /// the punch geometry, decide.
+    Unknown,
+}
+
 #[cfg(feature = "std")]
 fn sweep_superseded_by_committed_manifest(
     config: &Config,
-) -> crate::Result<Option<crate::HashMap<TableId, crate::version::recovery::RecoveredTable>>> {
+) -> crate::Result<Option<CommittedManifest>> {
     let recovery = match crate::version::recovery::recover(
         &config.path,
         &*config.fs,
@@ -3208,8 +3260,13 @@ fn sweep_superseded_by_committed_manifest(
     // records, so an id it names that the directory scan never SEES (the
     // file is gone, not merely unreadable) is still reported as an
     // unscopable loss — and so a healthy bulk-ingested table's manifest-only
-    // `global_seqno` offset is reused instead of failing closed.
-    Ok(Some(referenced_tables))
+    // `global_seqno` offset is reused instead of failing closed. The
+    // committed restrictions ride along: they are the authority for a
+    // restricted survivor whose sidecar the crash took.
+    Ok(Some(CommittedManifest {
+        tables: referenced_tables,
+        restrictions: recovery.restrictions,
+    }))
 }
 
 /// Removes the fresh-id blob replacements an aborting run already published,
@@ -3435,13 +3492,10 @@ fn repair_tree(
     // table's `global_seqno`, so a healthy bulk-ingested SST keeps its
     // manifest-only ingest offset instead of being failed closed.
     #[cfg(feature = "std")]
-    let manifest_referenced: Option<
-        crate::HashMap<TableId, crate::version::recovery::RecoveredTable>,
-    > = sweep_superseded_by_committed_manifest(config)?;
+    let manifest_referenced: Option<CommittedManifest> =
+        sweep_superseded_by_committed_manifest(config)?;
     #[cfg(not(feature = "std"))]
-    let manifest_referenced: Option<
-        crate::HashMap<TableId, crate::version::recovery::RecoveredTable>,
-    > = None;
+    let manifest_referenced: Option<CommittedManifest> = None;
     let mut scanned_table_ids: crate::HashSet<TableId> = crate::HashSet::default();
 
     // Byte totals for the progress percentage, from an upfront listing —
@@ -3681,8 +3735,13 @@ fn repair_tree(
             // fail closed.
             let manifest_global_seqno: Option<SeqNo> = manifest_referenced
                 .as_ref()
-                .and_then(|m| m.get(&table_id))
+                .and_then(|m| m.tables.get(&table_id))
                 .map(|t| t.global_seqno);
+            // What the committed manifest says about this id's restriction —
+            // authoritative in both directions (see `ManifestRestriction`).
+            let manifest_restriction = manifest_referenced
+                .as_ref()
+                .map_or(ManifestRestriction::Unknown, |m| m.restriction_of(table_id));
             let recovered = match compute_table_checksum(&*folder_fs, &table_path) {
                 Ok(c) => {
                     let mut params = repair_recover_params(
@@ -3788,21 +3847,38 @@ fn repair_tree(
                 let Ok(table) = recovered else {
                     break 'restrict recovered;
                 };
-                // Read the input's `.restrict-bound` sidecar. A TRANSIENT read
-                // (Interrupted / WouldBlock) is retryable, so it propagates. A
-                // MISSING / id-MISMATCHED / CORRUPT sidecar or a PERSISTENT read
-                // leaves no trustworthy exact bound and falls to the punch-geometry
-                // path below. See `docs/manifest-recovery.md`.
-                let sidecar_bound: Option<crate::UserKey> = match crate::restrict_bound::read(
-                    &*folder_fs,
-                    &table_path,
-                    config.encryption.as_deref(),
-                ) {
-                    Ok(crate::restrict_bound::SidecarRead::Present(id, b)) if id == table_id => {
-                        Some(b.into())
+                // The CLEAN manifest's committed restriction decides first —
+                // the sidecar is only its on-disk mirror, written after the
+                // commit, so the crash window between them (or a later
+                // sidecar loss) is exactly what the manifest covers. Its
+                // exact bound is restored where the geometry fallback could
+                // only approximate it (losing the straddling block's live
+                // suffix) or set the table aside; and where the manifest
+                // names the table UNRESTRICTED, a surviving sidecar is stale
+                // metadata whose bound would hide a live prefix.
+                let sidecar_bound: Option<crate::UserKey> = match &manifest_restriction {
+                    ManifestRestriction::Restricted(bound) => {
+                        break 'restrict table.reopen_restricted(bound.clone());
                     }
-                    Err(e) if is_environmental(&e) => break 'restrict Err(e),
-                    Ok(_) | Err(_) => None,
+                    ManifestRestriction::Unrestricted => None,
+                    // Read the input's `.restrict-bound` sidecar. A TRANSIENT read
+                    // (Interrupted / WouldBlock) is retryable, so it propagates. A
+                    // MISSING / id-MISMATCHED / CORRUPT sidecar or a PERSISTENT read
+                    // leaves no trustworthy exact bound and falls to the punch-geometry
+                    // path below. See `docs/manifest-recovery.md`.
+                    ManifestRestriction::Unknown => match crate::restrict_bound::read(
+                        &*folder_fs,
+                        &table_path,
+                        config.encryption.as_deref(),
+                    ) {
+                        Ok(crate::restrict_bound::SidecarRead::Present(id, b))
+                            if id == table_id =>
+                        {
+                            Some(b.into())
+                        }
+                        Err(e) if is_environmental(&e) => break 'restrict Err(e),
+                        Ok(_) | Err(_) => None,
+                    },
                 };
 
                 // A valid sidecar always denotes a COMMITTED restriction: tight-space
@@ -4010,7 +4086,7 @@ fn repair_tree(
                                     // on this arm.
                                     reject_punched_without_bound: false,
                                     blob_rewrite: None,
-                                    manifest_global_seqno,
+                                    recovered_global_seqno: manifest_global_seqno,
                                 },
                             ) {
                                 Ok(SalvageOutcome::Salvaged(salvaged)) => {
@@ -4144,25 +4220,30 @@ fn repair_tree(
                         return Err(e);
                     }
                     // A tight-space-punched SST that fails whole-file recovery still
-                    // carries its restriction in the `.restrict-bound` sidecar, but
-                    // recovery produced no `Table` to read the bound from. Read it
-                    // directly from the sibling sidecar and re-impose it on the
-                    // salvaged output below, exactly as the
-                    // verification-failure arm does. A TRANSIENT sidecar read
-                    // propagates; anything else leaves no trustworthy bound, so the
-                    // salvaged output stays unrestricted (a genuinely unpunched SST).
-                    let restrict_bound: Option<crate::UserKey> = match crate::restrict_bound::read(
-                        &*folder_fs,
-                        &table_path,
-                        config.encryption.as_deref(),
-                    ) {
-                        Ok(crate::restrict_bound::SidecarRead::Present(id, b))
-                            if id == table_id =>
-                        {
-                            Some(b.into())
-                        }
-                        Err(read_err) if is_environmental(&read_err) => return Err(read_err),
-                        Ok(_) | Err(_) => None,
+                    // carries its restriction in the CLEAN manifest, or in the
+                    // `.restrict-bound` sidecar mirroring it — but recovery produced
+                    // no `Table` to read the bound from. The manifest decides first
+                    // and in both directions (see `ManifestRestriction`), exactly as
+                    // the verification-failure arm above; only an unknown manifest
+                    // falls to the sidecar. A TRANSIENT sidecar read propagates;
+                    // anything else leaves no trustworthy bound, so the salvaged
+                    // output stays unrestricted (a genuinely unpunched SST).
+                    let restrict_bound: Option<crate::UserKey> = match &manifest_restriction {
+                        ManifestRestriction::Restricted(bound) => Some(bound.clone()),
+                        ManifestRestriction::Unrestricted => None,
+                        ManifestRestriction::Unknown => match crate::restrict_bound::read(
+                            &*folder_fs,
+                            &table_path,
+                            config.encryption.as_deref(),
+                        ) {
+                            Ok(crate::restrict_bound::SidecarRead::Present(id, b))
+                                if id == table_id =>
+                            {
+                                Some(b.into())
+                            }
+                            Err(read_err) if is_environmental(&read_err) => return Err(read_err),
+                            Ok(_) | Err(_) => None,
+                        },
                     };
                     // A PUNCHED source with no trustworthy bound (missing / corrupt
                     // sidecar) cannot be salvaged into an UNRESTRICTED output:
@@ -4216,7 +4297,7 @@ fn repair_tree(
                             table_id,
                             reject_punched_without_bound: reject_punched,
                             blob_rewrite: None,
-                            manifest_global_seqno,
+                            recovered_global_seqno: manifest_global_seqno,
                         },
                     ) {
                         Ok(SalvageOutcome::Salvaged(salvaged)) => {
@@ -4608,8 +4689,14 @@ fn repair_tree(
             // restriction hides, so an unrestricted copy would resurrect them.
             let restrict_bound = table.restrict_lower_bound().cloned();
             // The source already carries its recovered ingest offset (from a
-            // clean manifest record, or 0); the rewrite preserves local
-            // seqnos, so the copy reopens under the same offset.
+            // clean manifest record, or the scan's own admission); the rewrite
+            // preserves local seqnos, so the copy reopens under the same
+            // offset. ZERO is a VALID allocated offset — the first ingestion
+            // on a fresh counter commits offset 0 — not a sentinel for
+            // absence, so it is forwarded unconditionally: a table that
+            // reached this point was already admitted by the scan, and
+            // re-entering the fail-closed offset exclusion here would reject
+            // (and delete) its healthy replacement.
             let source_global_seqno = table.global_seqno();
             let fs = table.fs.clone();
             drop(table); // release the handle before reading the source again
@@ -4623,7 +4710,7 @@ fn repair_tree(
                     table_id: source_id,
                     reject_punched_without_bound: false,
                     blob_rewrite: Some(Arc::clone(&blob_rewrites)),
-                    manifest_global_seqno: (source_global_seqno > 0).then_some(source_global_seqno),
+                    recovered_global_seqno: Some(source_global_seqno),
                 },
             ) {
                 Ok(SalvageOutcome::Salvaged(rewritten)) => {
@@ -5624,6 +5711,7 @@ fn repair_tree(
     if let Some(referenced) = manifest_referenced {
         let primary_tables = config.path.join("tables");
         let mut missing: Vec<TableId> = referenced
+            .tables
             .into_keys()
             .filter(|id| !scanned_table_ids.contains(id))
             .collect();

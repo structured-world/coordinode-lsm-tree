@@ -1754,6 +1754,181 @@ fn repair_restricts_a_tight_space_punched_table() -> crate::Result<()> {
     Ok(())
 }
 
+/// A CLEAN manifest's committed restriction is the authority for a punched
+/// table whose `.restrict-bound` sidecar is lost (the normal crash window the
+/// manifest exists to cover). When repair is entered over one missing
+/// unrelated file, the surviving restricted table must reopen at the
+/// manifest's EXACT bound — falling back to punch geometry would restrict to
+/// the straddling block's END key and silently discard that block's live
+/// suffix (or set the table aside entirely on an irregular pattern).
+#[test]
+fn a_clean_manifest_restriction_survives_a_lost_sidecar() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::table::Writer;
+    use crate::table::block_index::BlockIndex;
+    use crate::{AbstractTree, Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db_manifest_bound")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+    };
+
+    // A punched SST with a mid-block bound, published via sidecar; the first
+    // repair rebuilds a manifest that commits the restriction.
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+        for i in 0..256u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                u64::from(i) + 1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+    let bound;
+    {
+        let table = recover_sst(sst.clone(), &fs)?;
+        // A bound STRICTLY inside its straddling block: if it coincided with
+        // that block's END key, the punch-geometry fallback would derive the
+        // very same bound and the fixture could not tell the two apart.
+        bound = 'pick: {
+            for i in 125..140u32 {
+                let cand = format!("k{i:05}").into_bytes();
+                let straddle_offset = table.punch_offset_for(&cand)?;
+                for handle in table.block_index.iter() {
+                    let handle = handle?;
+                    if handle.offset().0 == straddle_offset
+                        && handle.end_key().as_ref() > cand.as_slice()
+                    {
+                        break 'pick cand;
+                    }
+                }
+            }
+            panic!("a strictly-mid-block bound exists in the fixture");
+        };
+        crate::restrict_bound::write(&*fs, &sst, None, 0, &bound, crate::fs::SyncMode::Normal)?;
+        let punch_offset = table.punch_offset_for(&bound)?;
+        memfs.punch_hole(&sst, 0, punch_offset)?;
+    }
+    let report = config().repair()?;
+    assert_eq!(report.recovered, 1, "fixture repair commits: {report:?}");
+
+    // A second referenced table, so the follow-up repair runs over a CLEAN
+    // manifest with one missing unrelated file.
+    {
+        let tree = config().open()?;
+        tree.insert(b"zzz", b"v", 1000);
+        tree.flush_active_memtable(0)?;
+    }
+
+    // The crash window: the sidecar is gone, an unrelated table vanishes.
+    memfs.remove_file(&crate::restrict_bound::sidecar_path(&sst))?;
+    let second = memfs
+        .read_dir(&tables)?
+        .into_iter()
+        .find(|e| !e.is_dir && e.file_name != "0" && e.file_name.parse::<u64>().is_ok())
+        .map(|e| e.path)
+        .ok_or_else(|| crate::Error::Unrecoverable)?;
+    memfs.remove_file(&second)?;
+
+    let report = config().repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "the restricted survivor is kept at the manifest's bound: {report:?}",
+    );
+
+    // Served IFF key >= the manifest's EXACT bound: geometry fallback would
+    // lose the straddling block's live suffix (keys at/just above the bound).
+    let tree = config().open()?;
+    for i in 0..256u32 {
+        let key = format!("k{i:05}").into_bytes();
+        let served = tree.get(&key, crate::MAX_SEQNO)?.is_some();
+        assert_eq!(
+            served,
+            key.as_slice() >= bound.as_slice(),
+            "key {key:?} served={served}; the manifest bound is exact — a \
+             served key below it is resurrected, an unserved key at/above it \
+             (the straddling block's live suffix) is lost to the geometry \
+             fallback",
+        );
+    }
+    Ok(())
+}
+
+/// The clean manifest is authoritative in the OTHER direction too: a table it
+/// names WITHOUT a restriction is genuinely unrestricted (a lifted
+/// restriction drops out of the committed set), so a `.restrict-bound`
+/// sidecar surviving beside it is stale metadata. Honoring that sidecar would
+/// reopen the healthy table restricted at a bound the tree no longer holds,
+/// silently hiding its whole live prefix.
+#[test]
+fn a_stale_sidecar_cannot_restrict_a_table_the_manifest_calls_unrestricted() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db_stale_sidecar")?;
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+    };
+    {
+        let tree = match config().open()? {
+            crate::AnyTree::Standard(t) => t,
+            crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+        };
+        for i in 0..8u32 {
+            tree.insert(format!("k{i:04}").as_bytes(), b"v", u64::from(i) + 1);
+        }
+        tree.flush_active_memtable(0)?;
+        // A second referenced table, so losing it makes repair run over a
+        // CLEAN manifest.
+        tree.insert(b"zzz", b"v", 100);
+        tree.flush_active_memtable(0)?;
+    }
+
+    // The stale leftover: a sidecar for a restriction the manifest does not
+    // record (lifted, its sidecar never removed).
+    let tables = root.join("tables");
+    let sst = tables.join("0");
+    crate::restrict_bound::write(&*fs, &sst, None, 0, b"k0004", crate::fs::SyncMode::Normal)?;
+    memfs.remove_file(&tables.join("1"))?;
+
+    let report = config().repair()?;
+    assert_eq!(report.recovered, 1, "the healthy table is kept: {report:?}");
+
+    // Every key still reads: the manifest says unrestricted, so the stale
+    // sidecar's bound must not hide the prefix below it.
+    let tree = config().open()?;
+    for i in 0..8u32 {
+        let key = format!("k{i:04}").into_bytes();
+        assert!(
+            tree.get(&key, crate::MAX_SEQNO)?.is_some(),
+            "key {key:?} was hidden by a stale sidecar the manifest contradicts",
+        );
+    }
+    Ok(())
+}
+
 /// With salvage ENABLED, an otherwise-healthy tight-space RESTRICTED SST (a valid
 /// `.restrict-bound` sidecar, fully punch-backed) must be KEPT restricted, not
 /// salvaged away. The salvage-gate block walk must start at the view's live data
@@ -12893,6 +13068,86 @@ fn a_salvaged_blob_takes_a_fresh_id_and_the_original_is_removed() -> crate::Resu
     assert!(
         !memfs.exists(&blobs.join("0"))?,
         "the superseded original is removed once the manifest is committed",
+    );
+    Ok(())
+}
+
+/// A ZERO ingest offset is a valid allocated offset, not a sentinel for
+/// absence: the first bulk ingestion on a fresh counter allocates
+/// `global_seqno == 0` (`next()` returns the pre-increment value). When blob
+/// salvage reshapes the blob file and the ingested SST's handles must be
+/// rewritten, the rewrite must carry that recovered offset — treating 0 as
+/// "no manifest record" re-enters the fail-closed bulk-ingest exclusion, the
+/// replacement is rejected as unusable, and the healthy index SST is set
+/// aside and deleted.
+#[cfg(feature = "std")]
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_blob_rewrite_preserves_a_zero_ingest_offset() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db_zero_ingest")?;
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+    {
+        let tree = match config().open()? {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        // The FIRST ingestion on a fresh counter: its committed offset is 0.
+        let mut ingestion = crate::blob_tree::ingest::BlobIngestion::new(&tree)?;
+        for i in 0..8u32 {
+            ingestion.write(format!("k{i:04}").as_bytes().into(), vec![b'v'; 64].into())?;
+        }
+        ingestion.finish()?;
+    }
+
+    // Corrupt ONE mid-file blob frame; the manifest stays CLEAN. The salvage
+    // compacts the blob file (dropping the bad frame), which reshapes it and
+    // forces the ingested SST's handles through the rewrite path.
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let blob_path = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one blob file")
+        .path;
+    let entries: Vec<_> = crate::vlog::BlobFileScanner::new(&blob_path, &*fs_dyn, 0)?
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert!(entries.len() >= 3, "several frames written");
+    let second = entries.get(1).expect("second frame");
+    {
+        let offset = second.frame_end - 4;
+        let mut file = fs_dyn.open(
+            &blob_path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        let mut byte = [0u8; 1];
+        let n = crate::fs::FsFile::read_at(&*file, &mut byte, offset)?;
+        assert_eq!(n, 1, "one byte read back for the flip");
+        byte[0] ^= 0xFF;
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset))?;
+        std::io::Write::write_all(&mut file, &byte)?;
+    }
+
+    let report = config().repair_with_salvage(true)?;
+    assert_eq!(
+        report.recovered, 1,
+        "the ingested SST survives the blob rewrite with its ZERO offset \
+         carried over, never rejected as offset-less: {report:?}",
     );
     Ok(())
 }
