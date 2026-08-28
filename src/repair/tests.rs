@@ -10018,6 +10018,147 @@ fn a_transformed_output_without_the_run_end_fails_on_reaching_inputs() -> crate:
     Ok(())
 }
 
+/// An INCONCLUSIVE post-persist probe must not claim a committed repair:
+/// with the rename refused and the pointer read failing too, nothing
+/// proves the switch, and returning `RepairedButUnopened` would hand a
+/// consumer a replay obligation against the still-unrepaired tree (its
+/// reconciliation could duplicate merge operands) while the cleanup
+/// sweeps a possibly-live generation's edit logs. The sweep arms a
+/// one-shot pointer-read fault at increasing skip counts; whenever the
+/// repair fails with `CURRENT` absent (never switched), the error must be
+/// bare.
+#[test]
+fn an_inconclusive_current_probe_never_claims_a_committed_repair() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    for skip in 0..8u64 {
+        let memfs = Arc::new(MemFs::new());
+        let root = std::path::absolute("/db")?;
+        {
+            let tree = match Config::new(
+                &root,
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .with_shared_fs(memfs.clone())
+            .open()?
+            {
+                crate::AnyTree::Standard(t) => t,
+                crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+            };
+            tree.insert(b"a", b"v", 1);
+            tree.flush_active_memtable(0)?;
+        }
+        for e in memfs.read_dir(&root)? {
+            let is_version = e
+                .file_name
+                .strip_prefix('v')
+                .is_some_and(|rest| rest.parse::<u64>().is_ok());
+            if is_version || e.file_name == "current" {
+                memfs.remove_file(&e.path)?;
+            }
+        }
+
+        let fault = FaultFs::new((*memfs).clone());
+        fault.injector().arm(
+            FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::Other))
+                .on_path("current")
+                .times(1),
+        );
+        fault.injector().arm(
+            FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::PermissionDenied))
+                .on_path("current")
+                .skip(skip)
+                .times(1),
+        );
+        let result = Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_fs(fault)
+        .repair();
+
+        if !memfs.exists(&root.join("current"))?
+            && let Err(e) = &result
+        {
+            assert!(
+                !matches!(e, crate::Error::RepairedButUnopened { .. }),
+                "CURRENT never switched, so no report may claim a committed \
+                 repair (skip {skip}): {e:?}",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The byte-progress counter credits a removed temp's restriction
+/// companion: the temp's removal takes the companion with it, so the
+/// companion's own (later) directory entry stats `NotFound` and the
+/// prologue skips it — a successful repair would report Done below 100%.
+#[test]
+fn repair_progress_credits_a_removed_temp_companion() -> crate::Result<()> {
+    use crate::fs::Fs;
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(crate::fs::MemFs::new());
+    let root = std::path::absolute("/db")?;
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .open()?
+        {
+            crate::AnyTree::Standard(t) => t,
+            crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+        };
+        tree.insert(b"a", b"v", 1);
+        tree.flush_active_memtable(0)?;
+    }
+    let tables = root.join("tables");
+    for name in ["9.repair-tmp", "9.repair-tmp.restrict-bound"] {
+        let mut f = memfs.open(
+            &tables.join(name),
+            &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        std::io::Write::write_all(&mut f, &[0xEE; 64])?;
+    }
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    let progress = Arc::new(crate::RecoveryProgress::default());
+    Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .with_recovery_progress(Arc::clone(&progress))
+    .repair()?;
+
+    let snap = progress.snapshot();
+    assert!(
+        snap.bytes_processed >= snap.bytes_total,
+        "a successful repair reaches 100%: the removed companion's bytes \
+         are credited at removal time: {snap:?}",
+    );
+    Ok(())
+}
+
 /// A `persist_version` failure AFTER its atomic `CURRENT` switch (the
 /// pointer's directory sync is the one fallible step past it) must carry
 /// the report: the pointer on disk already names the rebuilt manifest, so

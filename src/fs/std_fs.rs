@@ -243,14 +243,27 @@ impl Fs for StdFs {
     }
 
     fn same_file(&self, a: &Path, b: &Path) -> io::Result<bool> {
-        // Kernel-backed namespace: resolve both spellings through the host
-        // (symlinks, `..`, case folding). A canonicalization failure on
-        // either side is PROPAGATED, never guessed as "distinct" — callers
-        // use that verdict to authorize duplicate deletion, and a transient
-        // probe failure must not delete a possible alias of the kept file.
-        let ca = std::fs::canonicalize(a).map_err(io::Error::from)?;
-        let cb = std::fs::canonicalize(b).map_err(io::Error::from)?;
-        Ok(ca == cb)
+        // Filesystem OBJECT identity, not canonical spellings: bind-mount
+        // aliases of one directory keep their two mount-point spellings
+        // through `canonicalize`, and a "distinct" verdict authorizes
+        // deleting what is the same underlying file through another name —
+        // destroying the retained copy too. A probe failure on either side
+        // is PROPAGATED, never guessed as "distinct".
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let ma = std::fs::metadata(a).map_err(io::Error::from)?;
+            let mb = std::fs::metadata(b).map_err(io::Error::from)?;
+            Ok(ma.dev() == mb.dev() && ma.ino() == mb.ino())
+        }
+        // No stable file-identity API off Unix: canonical spellings still
+        // resolve symlinks, `..`, and case folding there.
+        #[cfg(not(unix))]
+        {
+            let ca = std::fs::canonicalize(a).map_err(io::Error::from)?;
+            let cb = std::fs::canonicalize(b).map_err(io::Error::from)?;
+            Ok(ca == cb)
+        }
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {

@@ -3467,6 +3467,18 @@ fn repair_tree(
                 // Removing it cannot lose rows: every row it holds came from a
                 // file this scan is about to read.
                 TableDirEntry::RepairTmp(_) => {
+                    // The removal also takes the temp's restriction
+                    // companion, whose own directory entry is visited LATER
+                    // in this scan — by then its stat returns NotFound and
+                    // the byte-progress prologue skips it, leaving a
+                    // successful repair short of 100%. Credit its bytes now,
+                    // before they disappear.
+                    if let Some(p) = &config.recovery_progress
+                        && let Ok(meta) =
+                            folder_fs.metadata(&crate::restrict_bound::sidecar_path(&table_path))
+                    {
+                        p.add_bytes_processed(meta.len);
+                    }
                     discard_unreferenced(&*folder_fs, &table_path, config.sync_mode)?;
                     log::warn!(
                         "repair: dropped an abandoned replacement {}",
@@ -5168,27 +5180,34 @@ fn repair_tree(
     // fail-safe is to PRESERVE: the worst a preserved orphan costs is disk
     // space a later successful repair's reference filtering reclaims, while
     // a wrong deletion breaks a published manifest permanently.
-    // A failure after the switch (or one the probe cannot rule out) must
-    // still CARRY the report: the pointer on disk may already name the
-    // rebuilt manifest, so the retry opens it without a repair and answers
-    // with no report at all — losing the replay obligation exactly like a
-    // cleanup failure would. Recording the error here routes it through the
-    // same report-carrying exit; only a proven NOT-SWITCHED failure returns
-    // bare (nothing was published, the guard stays armed, and the retry's
-    // own repair produces a fresh report).
+    // A failure after a PROVEN switch must still CARRY the report: the
+    // pointer on disk already names the rebuilt manifest, so the retry
+    // opens it without a repair and answers with no report at all — losing
+    // the replay obligation exactly like a cleanup failure would. Recording
+    // the error routes it through the same report-carrying exit. A proven
+    // NOT-SWITCHED failure returns bare (nothing was published, the guard
+    // stays armed, the retry's own repair produces a fresh report). An
+    // INCONCLUSIVE probe also returns bare: without proof of the switch the
+    // report may describe a repair that never committed, and a consumer
+    // replaying its obligation against the still-live OLD generation could
+    // duplicate merge operands — while the blob replacements are preserved
+    // (the probe's own fail-safe: their worst cost is disk space) and no
+    // post-commit cleanup runs, so nothing of a possibly-live generation
+    // is touched.
     let mut post_commit_error: Option<crate::Error> = None;
     match persisted {
         Ok(()) => published_blob_replacements.disarm(),
-        Err(e) => {
-            if matches!(
-                probe_current(&*config.fs, &config.path, version_id),
-                CurrentProbe::NotSwitched
-            ) {
+        Err(e) => match probe_current(&*config.fs, &config.path, version_id) {
+            CurrentProbe::NotSwitched => return Err(e),
+            CurrentProbe::Switched => {
+                published_blob_replacements.disarm();
+                post_commit_error = Some(e);
+            }
+            CurrentProbe::Inconclusive => {
+                published_blob_replacements.disarm();
                 return Err(e);
             }
-            published_blob_replacements.disarm();
-            post_commit_error = Some(e);
-        }
+        },
     }
 
     // The manifest is DURABLE from this point on (or the probe could not
@@ -5205,24 +5224,28 @@ fn repair_tree(
     // edit log so nothing is replayed on top of it: the lost manifest's
     // generation left its log under an OLDER snapshot id (the rebuilt snapshot
     // uses `max(v*) + 1`), so removing only `edits-{version_id}` would normally
-    // miss it. Drop all `edits-*` — none belong to the fresh snapshot.
-    match config.fs.read_dir(&config.path) {
-        Ok(dirents) => {
-            for dirent in dirents {
-                if dirent.is_dir || !dirent.file_name.starts_with("edits-") {
-                    continue;
-                }
-                match config.fs.remove_file(&dirent.path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        post_commit_error = Some(e.into());
-                        break;
+    // miss it. Drop all `edits-*` — none belong to the fresh snapshot. Runs
+    // only on a PROVEN commit (like every cleanup below): a recorded
+    // post-commit error skips it, and the retry finishes the sweep.
+    if post_commit_error.is_none() {
+        match config.fs.read_dir(&config.path) {
+            Ok(dirents) => {
+                for dirent in dirents {
+                    if dirent.is_dir || !dirent.file_name.starts_with("edits-") {
+                        continue;
+                    }
+                    match config.fs.remove_file(&dirent.path) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            post_commit_error = Some(e.into());
+                            break;
+                        }
                     }
                 }
             }
+            Err(e) => post_commit_error = Some(e.into()),
         }
-        Err(e) => post_commit_error = Some(e.into()),
     }
 
     if let Some(p) = &config.recovery_progress {

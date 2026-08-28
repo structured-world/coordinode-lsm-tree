@@ -758,11 +758,13 @@ pub trait Fs: Send + Sync + 'static {
     /// ([`MemFs`]), whose distinct path strings are distinct files by
     /// construction; resolving them through the HOST filesystem would let a
     /// host symlink alias two unrelated virtual files. Kernel-backed backends
-    /// ([`StdFs`]) override this with host canonicalization.
+    /// ([`StdFs`]) override this with filesystem OBJECT identity (Unix
+    /// device + inode) — canonical spellings alone miss bind-mount aliases,
+    /// which keep their two mount-point spellings over one underlying file.
     ///
     /// # Errors
     ///
-    /// A probe that cannot DECIDE (a canonicalization failure on either side)
+    /// A probe that cannot DECIDE (an identity stat failure on either side)
     /// must return the error rather than guessing: callers use `false` to
     /// authorize duplicate deletion, so a fabricated "distinct" verdict lets
     /// a transient fault delete the alias of a file the caller keeps —

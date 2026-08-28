@@ -220,11 +220,14 @@ impl Fs for IoUringFs {
     }
 
     fn same_file(&self, a: &Path, b: &Path) -> crate::io::Result<bool> {
-        // Kernel-backed namespace, same contract as the std backend: a
-        // canonicalization failure propagates instead of guessing "distinct".
-        let ca = std::fs::canonicalize(a).map_err(crate::io::Error::from)?;
-        let cb = std::fs::canonicalize(b).map_err(crate::io::Error::from)?;
-        Ok(ca == cb)
+        // Filesystem OBJECT identity (device + inode), same contract as the
+        // std backend: bind-mount aliases keep distinct canonical spellings
+        // over one underlying file, and a probe failure propagates instead
+        // of guessing "distinct".
+        use std::os::unix::fs::MetadataExt;
+        let ma = std::fs::metadata(a).map_err(crate::io::Error::from)?;
+        let mb = std::fs::metadata(b).map_err(crate::io::Error::from)?;
+        Ok(ma.dev() == mb.dev() && ma.ino() == mb.ino())
     }
 
     fn rename(&self, from: &Path, to: &Path) -> crate::io::Result<()> {
