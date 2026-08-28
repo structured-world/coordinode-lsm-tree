@@ -3054,23 +3054,27 @@ pub fn salvage_blob_file(
                         reason: BlobDropReason::Corrupt(format!("{e:?}")),
                     });
                 }
-                // Only a TRANSIENT I/O error is retryable and distinguishable: it
-                // may strike AFTER at least one record was emitted, so recording
-                // it as corruption and finishing `dest` would publish a lossy
-                // report whose offset map silently omits the healthy UNREAD tail.
-                // Propagate it so the caller retries and the partial dest is
-                // discarded (below) rather than accepting avoidable data loss.
-                Err(crate::Error::Io(io)) if io.kind().is_transient() => {
+                // An ENVIRONMENTAL I/O error — transient (a retry clears it) or
+                // one that does not implicate the source bytes at all
+                // (`PermissionDenied` is an ACL mistake, `OutOfMemory` is host
+                // pressure; the same classification the repair gates use) — may
+                // strike AFTER at least one record was emitted, so recording it
+                // as corruption and finishing `dest` would publish a lossy
+                // report whose offset map silently omits the healthy UNREAD
+                // tail. Propagate it so the caller retries once the environment
+                // is fixed and the partial dest is discarded (below) rather
+                // than accepting avoidable data loss.
+                Err(crate::Error::Io(io)) if io.kind().is_environmental() => {
                     return Err(crate::Error::Io(io));
                 }
-                // Any other error — a PERSISTENT I/O failure (a bad-sector `Other`,
-                // `PermissionDenied`, or a truncated tail `UnexpectedEof`, none
-                // fixed by a retry), an allocation failure, or a decode fault the
-                // scanner does not re-sync from: an error that leaves the read
-                // position before `data_end` without terminating would make the
-                // iterator keep yielding it. Record the corrupt tail as a drop and
-                // stop the walk, keeping the valid prefix salvageable — this is
-                // the last record it can inspect.
+                // Any other error — a PERSISTENT I/O failure (a bad-sector `Other`
+                // or a truncated tail `UnexpectedEof`, neither fixed by a retry)
+                // or a decode fault the scanner does not re-sync from: an error
+                // that leaves the read position before `data_end` without
+                // terminating would make the iterator keep yielding it. Record
+                // the corrupt tail as a drop and stop the walk, keeping the
+                // valid prefix salvageable — this is the last record it can
+                // inspect.
                 Err(e) => {
                     dropped.push(DroppedBlob {
                         reason: BlobDropReason::Corrupt(format!("{e:?}")),

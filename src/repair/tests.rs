@@ -9578,6 +9578,80 @@ fn a_committed_empty_compaction_republishes_inputs_on_manifest_loss() -> crate::
     Ok(())
 }
 
+/// A BOTTOMMOST compaction that elides a tombstone (and drains the versions
+/// it covered) transforms visibility exactly like a compaction filter: the
+/// output contains neither the tombstone nor the covered value, so a
+/// lingering value-bearing input published beside a partially surviving run
+/// would resurrect the deleted key — and no replay can re-delete it. Such
+/// an output must carry the transformed marker so the rebuild's residual
+/// and ancestry guards apply to it.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_bottommost_tombstone_elision_marks_the_output_transformed() -> crate::Result<()> {
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    tree.insert(b"a", b"v", 1);
+    tree.insert(b"z", b"v", 2);
+    tree.flush_active_memtable(0)?;
+    tree.remove(b"a", 3);
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(u64::MAX, 4)?;
+
+    let version = tree.current_version();
+    let output = version.iter_tables().next().expect("one compacted table");
+    assert_eq!(
+        output.metadata.lineage.as_deref(),
+        Some(&[0, 1][..]),
+        "the output keeps its lineage",
+    );
+    assert!(
+        output.metadata.lineage_transformed,
+        "eliding the tombstone (and draining the covered value) is a \
+         visibility transform: the marker must be set",
+    );
+    Ok(())
+}
+
+/// A WEAK-tombstone annihilation (the weak delete and the value it consumed
+/// both drop during the merge) is the same visibility transform on any
+/// level: a lingering input holding only the consumed value would resurrect
+/// it if published beside a partially surviving run.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_weak_annihilation_marks_the_output_transformed() -> crate::Result<()> {
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    tree.insert(b"k", b"v", 1);
+    tree.insert(b"z", b"v", 2);
+    tree.flush_active_memtable(0)?;
+    tree.remove_weak(b"k", 3);
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(u64::MAX, 4)?;
+
+    let version = tree.current_version();
+    let output = version.iter_tables().next().expect("one compacted table");
+    assert!(
+        output.metadata.lineage_transformed,
+        "the weak annihilation removed the consumed value and its weak \
+         delete: the marker must be set",
+    );
+    Ok(())
+}
+
 /// A committed TRANSFORMING compaction must survive a manifest loss without
 /// resurrecting the records its filter removed. The inputs linger on disk
 /// (their deletion is deferred past the commit), so a rebuild sees BOTH

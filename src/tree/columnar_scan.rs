@@ -404,6 +404,15 @@ impl ColumnarScan {
         }
         let range_filter = !self.range_is_full();
         if seg.visibility == SeqnoVisibility::All && !range_filter {
+            // The predicate is pushed down in the SST's LOCAL coordinates while
+            // the seqno column is globalized only afterwards. That is sound
+            // today because a `COL_SEQNO` predicate is inert at the SST level:
+            // the zone map omits fixed-width columns (no block-skip entry) and
+            // `matching_rows` treats non-`Bytes` columns as all-matching —
+            // both pinned by tests. Any future comparable encoding for fixed
+            // columns MUST translate seqno bounds by `seg.global` before this
+            // pushdown, or a bulk-ingested segment (rows stored at local
+            // seqnos, returned at global ones) would skip matching blocks.
             let mut out = seg
                 .table
                 .columnar_scan(&self.projection, self.predicate.as_ref())?;
@@ -433,6 +442,7 @@ impl ColumnarScan {
         let cmp = self.comparator.as_ref();
 
         let mut out = Vec::new();
+        // Same local-coordinate pushdown note as the verbatim path above.
         for batch in seg
             .table
             .columnar_scan(&augmented, self.predicate.as_ref())?

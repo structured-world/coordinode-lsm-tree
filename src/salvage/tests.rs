@@ -7276,6 +7276,80 @@ fn build_blob(
     Ok(())
 }
 
+/// An ENVIRONMENTAL read failure mid-walk (`PermissionDenied`, `OutOfMemory`
+/// — an ACL mistake or host pressure, not rotted bytes) must PROPAGATE like
+/// a transient one, never be recorded as corruption: accepting it as a drop
+/// finishes a lossy salvage whose committed loss a fixed environment would
+/// have avoided entirely. The sweep arms a one-shot `PermissionDenied` read
+/// fault at increasing skip counts; wherever it lands, the walk either
+/// succeeds untouched or fails with the environmental error — no run may
+/// report a `PermissionDenied` as a corrupt drop.
+#[test]
+fn an_environmental_read_failure_never_becomes_a_lossy_blob_salvage() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let mut fault_reached_the_walk = false;
+    for skip in 0..64u64 {
+        let dir = tempdir()?;
+        let source = dir.path().join("blob_env");
+        let dest = dir.path().join("blob_env_salvaged");
+        let plain: Arc<dyn Fs> = Arc::new(StdFs);
+        build_blob(
+            &source,
+            &plain,
+            &[
+                (b"aaaa", b"AAAAAAAA"),
+                (b"bbbb", b"BBBBBBBB"),
+                (b"cccc", b"CCCCCCCC"),
+            ],
+        )?;
+
+        let fault = FaultFs::new(StdFs);
+        fault.injector().arm(
+            FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::PermissionDenied))
+                .skip(skip)
+                .times(1),
+        );
+        let fs: Arc<dyn Fs> = Arc::new(fault);
+        let result = salvage_blob_file(
+            &source,
+            dest,
+            &fs,
+            0,
+            &default_comparator(),
+            0,
+            #[cfg(zstd_any)]
+            None,
+        );
+        match result {
+            Ok(report) => {
+                assert!(
+                    !report
+                        .dropped
+                        .iter()
+                        .any(|d| matches!(&d.reason, BlobDropReason::Corrupt(msg) if msg.contains("PermissionDenied"))),
+                    "an environmental failure must never be recorded as a \
+                     corrupt drop (skip {skip}): {report:?}",
+                );
+            }
+            Err(e) => {
+                assert!(
+                    matches!(&e, crate::Error::Io(io) if io.kind() == ErrorKind::PermissionDenied),
+                    "the only acceptable failure is the propagated \
+                     environmental error (skip {skip}): {e:?}",
+                );
+                fault_reached_the_walk = true;
+            }
+        }
+    }
+    assert!(
+        fault_reached_the_walk,
+        "no skip count reached the salvage read path; the sweep proves nothing",
+    );
+    Ok(())
+}
+
 /// Scans a blob file into its `(key, value)` records (Ok records only).
 fn scan_blob(path: &std::path::Path, fs: &Arc<dyn Fs>) -> crate::Result<Vec<(Vec<u8>, Vec<u8>)>> {
     Ok(BlobScanner::new(path, &**fs, 0)?

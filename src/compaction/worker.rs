@@ -1473,12 +1473,16 @@ fn run_subcompaction(
     } else {
         None
     };
-    // Shared transform counter: the adapter ticks it on every non-Keep
-    // verdict, and the table writer marks transformed the lineage of any
-    // output whose window saw one (see `prepare_table_writer`).
-    let transform_marker = compaction_filter
-        .is_some()
-        .then(|| Arc::new(portable_atomic::AtomicU64::new(0)));
+    // Shared transform counter, created for EVERY sub-compaction: the filter
+    // adapter ticks it on non-Keep verdicts, the merge stream on its own
+    // visibility-changing drops (bottommost tombstone elision, RT
+    // application, weak annihilation), and the table writer marks
+    // transformed the lineage of any output whose window saw one (see
+    // `prepare_table_writer`).
+    let transform_marker = Some(Arc::new(portable_atomic::AtomicU64::new(0)));
+    if let Some(marker) = &transform_marker {
+        merge_iter = merge_iter.with_transform_marker(Arc::clone(marker));
+    }
 
     // KV separation (no relocation on this path): track fragmentation from
     // dropped/GC'd entries so the merged install updates blob GC stats.
@@ -2311,12 +2315,16 @@ fn merge_tables(
         log::trace!("Installing custom compaction filter {:?}", f.name());
         f.make_filter(&filter_ctx)
     });
-    // Shared transform counter: the adapter ticks it on every non-Keep
-    // verdict, and the table writer marks transformed the lineage of any
-    // output whose window saw one (see `prepare_table_writer`).
-    let transform_marker = compaction_filter
-        .is_some()
-        .then(|| Arc::new(portable_atomic::AtomicU64::new(0)));
+    // Shared transform counter, created for EVERY compaction: the filter
+    // adapter ticks it on non-Keep verdicts, the merge stream ticks it on
+    // its own visibility-changing drops (bottommost tombstone elision,
+    // range-tombstone application, weak-tombstone annihilation), and the
+    // table writer marks transformed the lineage of any output whose window
+    // saw one (see `prepare_table_writer`).
+    let transform_marker = Some(Arc::new(portable_atomic::AtomicU64::new(0)));
+    if let Some(marker) = &transform_marker {
+        merge_iter = merge_iter.with_transform_marker(Arc::clone(marker));
+    }
 
     // This is used by the compaction filter if it wants to write new blobs
     // TODO: the filter should really pipe new blobs into the compaction stream directly,
