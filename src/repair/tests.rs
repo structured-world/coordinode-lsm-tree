@@ -9955,11 +9955,14 @@ fn repair_keeps_an_input_when_the_sibling_chain_is_broken() -> crate::Result<()>
 
 /// A TRANSFORMED output without the run-closing marker (a parallel
 /// sub-compaction or tight-space slice, or a run whose later outputs are
-/// lost) supersedes only what its WRITTEN range covers: without the
-/// first-to-last completeness proof, keys beyond it may live in a lost
-/// sibling, so the reaching input is kept and the overlap reported.
+/// lost) supersedes only what its WRITTEN range covers — and an input
+/// reaching beyond that proof FAILS the repair even on a value-only tree:
+/// the input may still hold a key the filter removed inside the overlap,
+/// reads would resurrect it, and `lost_coverage` cannot repair the
+/// deletion because a compaction-filter verdict is not an external-WAL
+/// event.
 #[test]
-fn a_transformed_output_without_the_run_end_keeps_reaching_inputs() -> crate::Result<()> {
+fn a_transformed_output_without_the_run_end_fails_on_reaching_inputs() -> crate::Result<()> {
     use crate::table::Writer;
     use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
     use std::sync::Arc;
@@ -9999,6 +10002,81 @@ fn a_transformed_output_without_the_run_end_keeps_reaching_inputs() -> crate::Re
         assert!(w.finish()?.is_some(), "the output is non-empty");
     }
 
+    let result = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair();
+    assert!(
+        matches!(result, Err(crate::Error::Unrecoverable)),
+        "a residual overlap against a TRANSFORMED output resurrects \
+         filter-removed keys no replay can re-delete; the repair must fail \
+         closed even without a merge operator: {:?}",
+        result.map(|r| r.recovered),
+    );
+    Ok(())
+}
+
+/// ANCESTRY across compaction generations: input A survives beside the
+/// untransformed intermediate B (excluded as derived — A is its history)
+/// and B's TRANSFORMED descendant C, whose complete run covers B. C's
+/// content is the filtered fold of B — which is the fold of A — so A's
+/// filtered rows must not resurface: superseding B transitively supersedes
+/// A, and only C is published.
+#[test]
+fn repair_supersedes_ancestry_through_an_excluded_intermediate() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    // A (id 0): the original flush, holding k@1.
+    {
+        let mut w = Writer::new(tables.join("0"), 0, 0, Arc::clone(&fs))?;
+        w.write(InternalValue::from_components(
+            b"k".to_vec(),
+            b"v".to_vec(),
+            1,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "A is non-empty");
+    }
+    // B (id 1): the untransformed fold of A (same record).
+    {
+        let mut w = Writer::new(tables.join("1"), 1, 0, Arc::clone(&fs))?
+            .use_recency(Some(0))
+            .use_lineage(Some(vec![0]))
+            .use_lineage_last(true);
+        w.write(InternalValue::from_components(
+            b"k".to_vec(),
+            b"v".to_vec(),
+            1,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "B is non-empty");
+    }
+    // C (id 2): the TRANSFORMED complete-run fold of B — the filter removed
+    // k and kept only m.
+    {
+        let mut w = Writer::new(tables.join("2"), 2, 0, Arc::clone(&fs))?
+            .use_recency(Some(1))
+            .use_lineage(Some(vec![1]))
+            .use_lineage_transformed(true)
+            .use_lineage_last(true);
+        w.write(InternalValue::from_components(
+            b"m".to_vec(),
+            b"w".to_vec(),
+            2,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "C is non-empty");
+    }
+
     let report = Config::new(
         dir.path(),
         SequenceNumberCounter::default(),
@@ -10006,13 +10084,82 @@ fn a_transformed_output_without_the_run_end_keeps_reaching_inputs() -> crate::Re
     )
     .repair()?;
     assert_eq!(
-        report.recovered, 2,
-        "without the completeness proof the reaching input holds the only \
-         copy of [n, z] and must be kept: {report:?}",
+        report.recovered, 1,
+        "C's complete run covers B, and superseding B transitively \
+         supersedes A — publishing A would resurrect the filtered k: {report:?}",
     );
+    Ok(())
+}
+
+/// The UNPROVABLE ancestry configuration fails closed: the transformed C's
+/// run is incomplete (no run-closing marker) and its written range is
+/// disjoint from B's, so nothing proves C incorporated B — yet C's filter
+/// removed rows that live on in B's history carrier (A, after B's
+/// exclusion). No range test can see this, so a retained transformed
+/// output whose input history still has a live unsuperseded carrier
+/// rejects the rebuild.
+#[test]
+fn repair_rejects_a_transformed_output_with_a_live_history_carrier() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+    // A (id 0) holds k@1; B (id 1) is its untransformed fold; C (id 2) is a
+    // TRANSFORMED, INCOMPLETE-run fold of B whose written range [m, m] is
+    // disjoint from B's [k, k] (the filter removed k in C's window).
+    {
+        let mut w = Writer::new(tables.join("0"), 0, 0, Arc::clone(&fs))?;
+        w.write(InternalValue::from_components(
+            b"k".to_vec(),
+            b"v".to_vec(),
+            1,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "A is non-empty");
+    }
+    {
+        let mut w = Writer::new(tables.join("1"), 1, 0, Arc::clone(&fs))?
+            .use_recency(Some(0))
+            .use_lineage(Some(vec![0]))
+            .use_lineage_last(true);
+        w.write(InternalValue::from_components(
+            b"k".to_vec(),
+            b"v".to_vec(),
+            1,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "B is non-empty");
+    }
+    {
+        let mut w = Writer::new(tables.join("2"), 2, 0, Arc::clone(&fs))?
+            .use_recency(Some(1))
+            .use_lineage(Some(vec![1]))
+            .use_lineage_transformed(true);
+        w.write(InternalValue::from_components(
+            b"m".to_vec(),
+            b"w".to_vec(),
+            2,
+            ValueType::Value,
+        ))?;
+        assert!(w.finish()?.is_some(), "C is non-empty");
+    }
+
+    let result = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair();
     assert!(
-        !report.lost_coverage.is_empty(),
-        "the residual overlap must be reported: {report:?}",
+        matches!(result, Err(crate::Error::Unrecoverable)),
+        "a retained transformed output whose input history keeps a live \
+         unsuperseded carrier must fail the repair: {:?}",
+        result.map(|r| r.recovered),
     );
     Ok(())
 }

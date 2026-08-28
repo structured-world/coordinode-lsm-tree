@@ -4415,30 +4415,44 @@ fn repair_tree(
         .filter(|(_, fidelity, ..)| fidelity.is_complete())
         .map(|(t, ..)| t.id())
         .collect();
-    let mut lineage_partial: Vec<(TableId, PathBuf, UserKey, UserKey, Option<SeqNo>)> = Vec::new();
+    // Per-candidate geometry and ancestry, captured over EVERY candidate
+    // before any exclusion: the union pass and the transitive-supersession
+    // closure below must reason about tables the first pass already dropped
+    // (an excluded intermediate output still stands between a retained
+    // descendant and its ultimate inputs).
+    let all_ranges: crate::HashMap<TableId, (UserKey, UserKey, SeqNo)> = recovered_tables
+        .iter()
+        .map(|(t, ..)| {
+            (
+                t.id(),
+                (
+                    t.metadata.key_range.min().clone(),
+                    t.metadata.key_range.max().clone(),
+                    t.get_highest_seqno(),
+                ),
+            )
+        })
+        .collect();
+    let lineage_by_id: crate::HashMap<TableId, Vec<TableId>> = recovered_tables
+        .iter()
+        .filter_map(|(t, ..)| t.metadata.lineage.clone().map(|l| (t.id(), l)))
+        .collect();
+    // The final `bool` records whether the overlapping OUTPUT was
+    // transformed: its filter may have removed keys inside the overlap, so
+    // the kept input's copies are not byte-identical duplicates there.
+    let mut lineage_partial: Vec<(TableId, PathBuf, UserKey, UserKey, Option<SeqNo>, bool)> =
+        Vec::new();
     let mut inputs_superseded: crate::HashSet<TableId> = crate::HashSet::default();
     // Files excluded as REDUNDANT (a derived output whose inputs all
     // survived, an input a complete output fully covers): their content
     // lives on in the kept tables, so they are reported in
     // `unreadable_files` but must NOT contribute `lost_coverage` — nothing
     // was lost, and a coverage entry would widen the WAL replay for no
-    // reason.
+    // reason. The id set feeds the ancestry walk below.
     let mut redundant_excluded: crate::HashSet<PathBuf> = crate::HashSet::default();
+    let mut redundant_excluded_ids: crate::HashSet<TableId> = crate::HashSet::default();
     {
         let candidates = core::mem::take(&mut recovered_tables);
-        let kept_ranges: crate::HashMap<TableId, (UserKey, UserKey, SeqNo)> = candidates
-            .iter()
-            .map(|(t, ..)| {
-                (
-                    t.id(),
-                    (
-                        t.metadata.key_range.min().clone(),
-                        t.metadata.key_range.max().clone(),
-                        t.get_highest_seqno(),
-                    ),
-                )
-            })
-            .collect();
         for candidate in candidates {
             let lineage = candidate.0.metadata.lineage.clone();
             match lineage.as_deref() {
@@ -4454,17 +4468,17 @@ fn repair_tree(
                             .all(|id| *id != candidate.0.id() && present_ids.contains(id)) =>
                 {
                     let (table, _, path, fs) = candidate;
+                    let table_id = table.id();
                     log::info!(
-                        "repair: table {} is a compaction output whose inputs {:?} all \
-                         survived; excluding the derived copy so its merge operands are \
-                         not applied twice",
-                        table.id(),
-                        inputs,
+                        "repair: table {table_id} is a compaction output whose inputs \
+                         {inputs:?} all survived; excluding the derived copy so its \
+                         merge operands are not applied twice",
                     );
                     drop(table);
                     let reason = "derived output of an uncommitted compaction whose inputs \
                                   all survived; excluded so its merge operands are not \
                                   applied twice";
+                    redundant_excluded_ids.insert(table_id);
                     redundant_excluded.insert(path.clone());
                     unreadable_files.push((path.clone(), reason.to_string()));
                     discard_after_commit.push((fs, path, reason.to_string()));
@@ -4490,7 +4504,7 @@ fn repair_tree(
                         if *input == candidate.0.id() {
                             continue;
                         }
-                        let Some((in_min, in_max, in_hi)) = kept_ranges.get(input) else {
+                        let Some((in_min, in_max, in_hi)) = all_ranges.get(input) else {
                             continue;
                         };
                         let out_range = &candidate.0.metadata.key_range;
@@ -4524,6 +4538,7 @@ fn repair_tree(
                             lo.clone(),
                             hi.clone(),
                             Some(candidate.0.get_highest_seqno().min(*in_hi)),
+                            candidate.0.metadata.lineage_transformed,
                         ));
                     }
                     recovered_tables.push(candidate);
@@ -4548,16 +4563,7 @@ fn repair_tree(
     // supersession retires the inputs that still do.
     {
         let mut by_id: crate::HashMap<TableId, usize> = crate::HashMap::default();
-        let mut surviving_ranges: crate::HashMap<TableId, (UserKey, UserKey)> =
-            crate::HashMap::default();
         for (idx, (t, fidelity, ..)) in recovered_tables.iter().enumerate() {
-            surviving_ranges.insert(
-                t.id(),
-                (
-                    t.metadata.key_range.min().clone(),
-                    t.metadata.key_range.max().clone(),
-                ),
-            );
             if fidelity.is_complete() && t.metadata.lineage.is_some() {
                 by_id.insert(t.id(), idx);
             }
@@ -4622,7 +4628,10 @@ fn repair_tree(
                 if by_id.contains_key(input) {
                     continue;
                 }
-                let Some((in_min, in_max)) = surviving_ranges.get(input) else {
+                // `all_ranges`, not the surviving set: superseding an id the
+                // first pass already excluded is what lets the ancestry
+                // closure below reach ITS inputs.
+                let Some((in_min, in_max, _)) = all_ranges.get(input) else {
                     continue;
                 };
                 if complete_run
@@ -4630,6 +4639,31 @@ fn repair_tree(
                         && cmp.compare(in_max, &union_max) != core::cmp::Ordering::Greater)
                 {
                     inputs_superseded.insert(*input);
+                }
+            }
+        }
+    }
+
+    // Transitive-supersession closure over the lineage edges: a superseded
+    // table's content is PROVEN incorporated into a retained output, and it
+    // in turn incorporated its own inputs — so those are redundant too,
+    // even when the retaining output's lineage never names them (it names
+    // the intermediate). Records an intermediate fold dropped (obsolete
+    // versions, annihilated weak-delete pairs) return shadowed or
+    // re-annihilating, and filter removals stay removed with their carrier,
+    // so following the edge loses nothing live. Follows SUPERSEDED ids
+    // only, never exclusions: a derived output excluded in the first pass
+    // was dropped because its inputs are the preferred history — walking
+    // through it would discard the very tables that exclusion kept.
+    {
+        let mut worklist: Vec<TableId> = inputs_superseded.iter().copied().collect();
+        while let Some(id) = worklist.pop() {
+            let Some(inputs) = lineage_by_id.get(&id) else {
+                continue;
+            };
+            for input in inputs {
+                if all_ranges.contains_key(input) && inputs_superseded.insert(*input) {
+                    worklist.push(*input);
                 }
             }
         }
@@ -4663,28 +4697,76 @@ fn repair_tree(
     }
 
     // A RESIDUAL overlap that survived every supersession pass fails closed
-    // under a merge operator: the kept input's records inside the overlap
-    // are also folded into the kept output, and publishing both applies the
-    // same operands twice on every read — a multiplicity the reported
-    // replay cannot remove, the same rule the legacy ambiguity below takes.
-    // This is the crash shape a parallel compaction leaves when input
-    // cleanup is partial (an input spanning several sub-compaction ranges
-    // survives while no single output or provable chain covers it whole),
-    // and equally a serial run's lost-sibling window. Value-only
-    // deployments proceed to the report: their duplicate records are
+    // in two configurations. Against a TRANSFORMED output — always: the
+    // kept input may hold a key the filter removed inside the overlap,
+    // reads would resurrect it, and `lost_coverage` cannot repair the
+    // deletion because a compaction-filter verdict is not an external-WAL
+    // event. Under a merge operator — for any residual: the kept input's
+    // records inside the overlap are also folded into the kept output, and
+    // publishing both applies the same operands twice on every read — a
+    // multiplicity the reported replay cannot remove, the same rule the
+    // legacy ambiguity below takes. This is the crash shape a parallel
+    // compaction leaves when input cleanup is partial (an input spanning
+    // several sub-compaction ranges survives while no single output or
+    // provable chain covers it whole), and equally a serial run's
+    // lost-sibling window. Value-only residuals against UNTRANSFORMED
+    // outputs proceed to the report: their duplicate records are
     // byte-identical and reads dedupe them.
-    if config.merge_operator.is_some()
-        && let Some((input, output_path, ..)) = lineage_partial.first()
+    if let Some((input, output_path, ..)) = lineage_partial
+        .iter()
+        .find(|(.., transformed)| config.merge_operator.is_some() || *transformed)
     {
         log::error!(
             "repair: input table {} overlaps the surviving compaction output {} \
              that folded part of it, and no surviving output set covers the \
-             input whole; under a merge operator publishing both would \
-             double-apply operands, and no replay can undo that",
+             input whole; publishing both would resurrect filter-removed keys \
+             or double-apply merge operands, and no replay can undo either",
             input,
             output_path.display(),
         );
         return Err(crate::Error::Unrecoverable);
+    }
+
+    // Ancestry audit for every RETAINED transformed output: each id its
+    // lineage names must be either superseded (its content provably
+    // incorporated) or itself an excluded derived output whose OWN inputs
+    // pass the same test — the exclusion moved the history onto them. A
+    // live, unsuperseded carrier still holds rows the transform removed,
+    // no range test can see that (the transform may have emptied the
+    // overlap entirely), and no replay can re-delete them: fail closed.
+    for (table, ..) in &recovered_tables {
+        if !table.metadata.lineage_transformed {
+            continue;
+        }
+        let Some(inputs) = &table.metadata.lineage else {
+            continue;
+        };
+        let mut visited: crate::HashSet<TableId> = crate::HashSet::default();
+        let mut worklist: Vec<TableId> = inputs.clone();
+        while let Some(id) = worklist.pop() {
+            if id == table.id() || !visited.insert(id) || inputs_superseded.contains(&id) {
+                continue;
+            }
+            if redundant_excluded_ids.contains(&id) {
+                // The excluded intermediate's history lives on in its own
+                // inputs; audit those instead.
+                if let Some(carried) = lineage_by_id.get(&id) {
+                    worklist.extend(carried.iter().copied());
+                }
+                continue;
+            }
+            if all_ranges.contains_key(&id) {
+                log::error!(
+                    "repair: table {} carries history the transformed compaction \
+                     output {} filtered, and no surviving output set proves that \
+                     history incorporated; publishing both would resurrect the \
+                     filter-removed rows, and no replay can re-delete them",
+                    id,
+                    table.id(),
+                );
+                return Err(crate::Error::Unrecoverable);
+            }
+        }
     }
 
     // Only blob files a surviving table REFERENCES go into the manifest.
@@ -5238,7 +5320,7 @@ fn repair_tree(
     lost_coverage.extend(
         lineage_partial
             .into_iter()
-            .map(|(_, path, lo, hi, bound)| (path, lo, hi, bound)),
+            .map(|(_, path, lo, hi, bound, _)| (path, lo, hi, bound)),
     );
     unknowable_losses.extend(salvaged_unknowable);
 
