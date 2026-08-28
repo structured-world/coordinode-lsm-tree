@@ -498,6 +498,40 @@ impl From<crate::sfa::Error> for Error {
     }
 }
 
+impl Error {
+    /// Whether this failure says something about the ENVIRONMENT or the
+    /// CALLER's configuration rather than about the bytes on disk — the class
+    /// every recovery path must PROPAGATE instead of recording as damage.
+    ///
+    /// Recording one of these as damage commits a manifest that omits the file
+    /// and then removes it, turning a fixable mistake into permanent loss;
+    /// propagating lets the operator fix the environment (or supply the right
+    /// key / dictionary) and re-run with everything still on disk.
+    ///
+    /// - [`Self::Io`] of an environmental kind: the interrupted-syscall
+    ///   retryables, plus access failures that do not implicate the bytes
+    ///   (`PermissionDenied`, `StorageFull`, `QuotaExceeded`,
+    ///   `ReadOnlyFilesystem`, `OutOfMemory`).
+    /// - [`Self::Decrypt`]: an AEAD failure is exactly what a missing or wrong
+    ///   key produces on perfectly healthy ciphertext.
+    /// - [`Self::ZstdDictMismatch`]: the persisted descriptor names a
+    ///   dictionary the caller did not supply, or supplied a different one.
+    ///
+    /// A failure that DOES implicate the bytes (a bad sector, a structural
+    /// decode failure) is not in this class: a retry cannot fix it, and the
+    /// recovery paths grade that file instead of aborting over it.
+    #[must_use]
+    pub(crate) fn is_environmental(&self) -> bool {
+        match self {
+            Self::Io(io) => io.kind().is_environmental(),
+            Self::Decrypt(_) => true,
+            #[cfg(zstd_any)]
+            Self::ZstdDictMismatch { .. } => true,
+            _ => false,
+        }
+    }
+}
+
 // The `Io` variant carries `crate::io::Error` (the no_std-capable I/O error),
 // so this bridge is a direct wrap. Std file-I/O paths surface `std::io::Error`;
 // the std-gated bridge below folds those through `crate::io::Error`.

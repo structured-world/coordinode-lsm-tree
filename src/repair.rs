@@ -698,14 +698,10 @@ fn repair_recover_params(
 /// recover everything; on genuinely damaged bytes the repair fails instead of
 /// guessing, and they stay in place.
 fn is_environmental(e: &crate::Error) -> bool {
-    match e {
-        crate::Error::Io(io) => io.kind().is_environmental(),
-        // Mis-supplied recovery context, not damage.
-        crate::Error::Decrypt(_) => true,
-        #[cfg(zstd_any)]
-        crate::Error::ZstdDictMismatch { .. } => true,
-        _ => false,
-    }
+    // The class itself lives on `Error` so the salvage paths classify
+    // identically — the two drifted apart once already, and the difference is
+    // invisible until a file is deleted over it.
+    e.is_environmental()
 }
 
 /// Whether manifest repair must fail closed on a table because its bulk-ingest
@@ -1008,8 +1004,28 @@ fn record_best(
             Some(kept) => same_physical_file(&*loser.fs, &loser.path, &*kept.fs, &kept.path)?,
             None => false,
         };
-        // The loser's replacement (if it built one) is never published.
-        swap_after_commit.retain(|(_, _, dest, _)| dest != &loser.path);
+        // The loser's replacement (if it built one) is never published — and
+        // dropping the swap drops the ONLY reference to that `{id}.repair-tmp`,
+        // so it is re-queued for removal instead of silently left behind.
+        // Left in place it is exactly the shape the next open cannot resolve:
+        // a temp whose digest does not match the manifest, with no original
+        // beside it in THAT folder to prove it abandoned — so the open fails
+        // before it ever reaches the healthy copy this repair kept.
+        let mut orphaned_temps = Vec::new();
+        swap_after_commit.retain(|(fs, temp, dest, _)| {
+            let publishes_loser = dest == &loser.path;
+            if publishes_loser {
+                orphaned_temps.push((Arc::clone(fs), temp.clone()));
+            }
+            !publishes_loser
+        });
+        for (fs, temp) in orphaned_temps {
+            discard_after_commit.push((
+                fs,
+                temp,
+                "unpublished replacement of a displaced duplicate".to_string(),
+            ));
+        }
         if is_alias {
             return Ok(());
         }
@@ -5465,12 +5481,17 @@ fn rebuild_from_scan(
                 referenced.insert(link.blob_file_id);
             }
         }
-        let dropped: Vec<crate::vlog::BlobFileId> = blob_file_list
+        // Carry each dropped file's RECOVERED path, never a path rebuilt from
+        // its id: the scan accepts a noncanonical spelling (`blobs/01` for id
+        // 1), and removing the reconstructed `blobs/1` would answer `NotFound`
+        // — reporting success while leaving the real file behind for the next
+        // open to sweep, which then fails if that removal is refused.
+        let dropped: Vec<(crate::vlog::BlobFileId, PathBuf)> = blob_file_list
             .iter()
-            .map(crate::vlog::BlobFile::id)
-            .filter(|id| !referenced.contains(id))
+            .filter(|bf| !referenced.contains(&bf.id()))
+            .map(|bf| (bf.id(), bf.path().to_path_buf()))
             .collect();
-        for id in dropped {
+        for (id, path) in dropped {
             log::debug!(
                 "blob file {id} is referenced by no recovered table; leaving it out \
                  of the rebuilt manifest and removing it"
@@ -5480,12 +5501,7 @@ fn rebuild_from_scan(
             // Removed POST-COMMIT (see the sweep below): until the manifest is
             // durable the file is still what a failed attempt's inputs point
             // at, and a retry re-derives the same decision from a fresh scan.
-            unreferenced_blob_files.push(
-                config
-                    .path
-                    .join(crate::file::BLOBS_FOLDER)
-                    .join(id.to_string()),
-            );
+            unreferenced_blob_files.push(path);
         }
     }
 

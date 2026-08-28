@@ -7411,6 +7411,47 @@ fn build_blob(
     Ok(())
 }
 
+/// Mirrors that disagree in a NON-DERIVABLE field must not be arbitrated at
+/// all. The salvage walk re-derives the entry-backed metadata from the records
+/// it re-emits, so a "complete" attempt settles those — but `bulk_ingested`,
+/// `recency` and the compaction lineage are copied from whichever mirror is
+/// selected, and nothing in the file authenticates them. A forged tail that
+/// clears `bulk_ingested` would otherwise win on block completeness alone and
+/// republish an ingested SST at global seqno 0, visible to snapshots that
+/// never saw it.
+#[test]
+fn divergent_non_derivable_metadata_is_never_arbitrated() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // A bulk-ingested SST: every entry at local seqno 0, provenance recorded.
+    let mut writer =
+        Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_bulk_ingested(Some(true));
+    for i in 0..32u32 {
+        writer.write(crate::InternalValue::from_components(
+            format!("k{i:05}").into_bytes(),
+            b"v".to_vec(),
+            0,
+            crate::ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "the source SST is non-empty");
+
+    // Forge ONLY the tail mirror's provenance: the blocks stay intact, so the
+    // tail attempt recovers everything and would win on completeness.
+    crate::test_forge::forge_tail_meta_value(&source, b"descriptor#bulk_ingested", &[0])?;
+
+    let result = salvage_sst(&source, dest, &fs);
+    assert!(
+        result.is_err(),
+        "a disagreement in provenance the walk cannot re-derive must refuse \
+         arbitration, not publish the mirror that happens to decode: {result:?}",
+    );
+    Ok(())
+}
+
 /// The PREPASS twin: the physical tiling walk that discovers blocks must
 /// propagate an environmental read too. A break in that chain drops the
 /// candidate — and, past an untrusted index, the whole unanchored tail — as

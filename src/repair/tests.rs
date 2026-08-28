@@ -11089,6 +11089,77 @@ fn a_clean_manifest_tree_type_refuses_a_contradicting_repair() -> crate::Result<
     Ok(())
 }
 
+/// An unreferenced blob file is removed at the path it was RECOVERED from,
+/// not one rebuilt from its id. The scan accepts a noncanonical spelling
+/// (`blobs/01` for id 1), so removing `blobs/1` answers `NotFound` — the
+/// repair reports success while the real file stays behind for the next open
+/// to sweep, and that open fails if the removal is refused there.
+#[test]
+fn an_unreferenced_blob_is_removed_at_its_recovered_path() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db_blob_spelling")?;
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+    {
+        let tree = match config().open()? {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        tree.insert(b"k", vec![b'v'; 64], 1);
+        tree.flush_active_memtable(0)?;
+    }
+    // Re-spell the blob file NONCANONICALLY and drop every table, so nothing
+    // references it and the repair must remove it.
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let original = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .map(|e| e.path)
+        .ok_or(crate::Error::Unrecoverable)?;
+    // A NONCANONICAL spelling of the file's OWN id (`00` parses to 0, which is
+    // what its metadata records), so the identity check passes and the scan
+    // recovers it under this path.
+    let respelled = blobs.join("00");
+    memfs.rename(&original, &respelled)?;
+    for entry in memfs.read_dir(&root.join("tables"))? {
+        memfs.remove_file(&entry.path)?;
+    }
+    // Lose the manifest too: with a clean one the pre-scan sweep removes the
+    // file by its own directory entry, which never exercises the rebuild's
+    // unreferenced-blob path.
+    for entry in memfs.read_dir(&root)? {
+        let is_version = entry
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || entry.file_name == "current" {
+            memfs.remove_file(&entry.path)?;
+        }
+    }
+
+    let report = config().repair()?;
+    assert!(
+        !memfs.exists(&respelled)?,
+        "the unreferenced blob must be removed at the path it was recovered \
+         from, not at a name rebuilt from its id: {report:?}",
+    );
+    Ok(())
+}
+
 /// A DISPLACED salvage takes its queued swap with it. Two routed folders can
 /// each hold a copy of one id: the first is damaged and salvaged, the second
 /// is intact and wins. The rebuilt manifest then references the intact copy,
@@ -11157,6 +11228,17 @@ fn a_displaced_salvage_drops_its_queued_swap() -> crate::Result<()> {
          the intact copy, so publishing the replacement onto that name is wrong \
          (still queued: {})",
         swaps.len(),
+    );
+    // ...and the replacement it would have published must be QUEUED FOR
+    // REMOVAL, not merely unqueued: dropping the swap drops the only reference
+    // to that temp, and left on disk it is the one shape the next open cannot
+    // resolve — a temp whose digest does not match the manifest, with no
+    // original beside it in that folder to prove it abandoned.
+    let tmp = dir.join("salvaged_source.repair-tmp");
+    assert!(
+        discard.iter().any(|(_, path, _)| path == &tmp),
+        "the unpublished replacement must be queued for removal: {:?}",
+        discard.iter().map(|(_, p, _)| p).collect::<Vec<_>>(),
     );
     Ok(())
 }

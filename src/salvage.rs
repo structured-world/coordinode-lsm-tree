@@ -386,10 +386,25 @@ pub(crate) fn salvage_with_context(
     // the chosen meta, silently truncating the partial-decode read path's
     // synthesized blocks. Re-encoding under the chosen meta keeps the copy
     // self-consistent whichever mirror wins.
-    if !diverged {
+    if diverged == MirrorDivergence::Agree {
         // No arbitration: write directly to `dest`. There is no second attempt,
         // so `dest` is never a live intermediate another process could replace.
         return salvage_attempt(source, dest, fs, comparator, options, false, true);
+    }
+    if diverged == MirrorDivergence::NonDerivable {
+        // The mirrors disagree in a field the walk cannot re-derive and nothing
+        // authenticates — `bulk_ingested`, `recency`, or the compaction
+        // lineage. The writer copies whichever mirror is selected, so a
+        // "complete" attempt proves nothing about them: a forged tail clearing
+        // `bulk_ingested` would republish an ingested SST at global seqno 0,
+        // visible to snapshots that never saw it. Refuse rather than pick.
+        log::error!(
+            "{}: metadata mirrors disagree in fields no entry derives \
+             (bulk-ingest provenance, L0 recency, or compaction lineage); \
+             neither copy can be authenticated, so salvage will not choose",
+            source.display(),
+        );
+        return Err(crate::Error::Unrecoverable);
     }
     // Divergent mirrors: run BOTH attempts to PRIVATE temp paths and publish
     // only the selected winner, so `dest` is never a live intermediate a foreign
@@ -444,7 +459,7 @@ pub(crate) fn salvage_with_context(
             }
             // Return whichever attempt raised the retryable error — the same
             // environmental class the arbitration used to decide to propagate.
-            if matches!(&tail, Err(crate::Error::Io(e)) if e.kind().is_environmental()) {
+            if matches!(&tail, Err(e) if e.is_environmental()) {
                 tail
             } else {
                 mid
@@ -520,7 +535,13 @@ fn arbitrate_mirrors(
     // INCOMPLETE result would commit a loss a fixed environment would not have
     // taken. Only a failure that implicates the bytes loses to a partial
     // success (a retry cannot improve on it).
-    let is_retryable = |r: &crate::Result<SalvageReport>| matches!(r, Err(crate::Error::Io(e)) if e.kind().is_environmental());
+    // The SAME class the repair gates use, straight off `Error` — including
+    // the mis-supplied recovery context (a wrong key, a wrong or missing
+    // dictionary), which is not an `Io` error at all: matching only `Io` here
+    // published the other attempt's INCOMPLETE result and let repair replace
+    // and remove an intact source over a fixable configuration mistake.
+    let is_retryable =
+        |r: &crate::Result<SalvageReport>| matches!(r, Err(e) if e.is_environmental());
     let complete = |r: &crate::Result<SalvageReport>| matches!(r, Ok(rep) if rep.is_complete());
     if (is_retryable(tail) && !complete(mid)) || (is_retryable(mid) && !complete(tail)) {
         return MirrorArbitration::Propagate;
@@ -698,15 +719,32 @@ fn publish_from_temp(
     Ok(rep)
 }
 
+/// How two decoded meta mirrors relate, from [`meta_mirrors_diverge`].
+#[derive(Debug, PartialEq, Eq)]
+enum MirrorDivergence {
+    /// Identical, or only one copy is readable: the ordinary
+    /// tail-with-MID-fallback machinery covers it.
+    Agree,
+    /// They disagree only in fields the salvage walk RE-DERIVES from the
+    /// entries it re-emits, so recovering more blocks settles it: run both
+    /// attempts and publish the more complete one.
+    Derivable,
+    /// They disagree in a field NOTHING derives or authenticates —
+    /// `bulk_ingested`, `recency`, or the compaction lineage. The writer
+    /// copies these from whichever mirror is selected, so choosing is
+    /// choosing which forgery to believe.
+    NonDerivable,
+}
+
 /// Decodes BOTH meta mirrors under the caller's id/encryption context and
-/// reports whether they decode to DIVERGENT contents. Any unreadable copy is
-/// `false` — the ordinary tail-with-MID-fallback machinery already covers
-/// broken mirrors; arbitration is only for two VALID copies that disagree.
+/// reports how they relate. Any unreadable copy is [`MirrorDivergence::Agree`]
+/// — the ordinary tail-with-MID-fallback machinery already covers broken
+/// mirrors; arbitration is only for two VALID copies that disagree.
 fn meta_mirrors_diverge(
     source: &std::path::Path,
     fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
     options: &SalvageOptions,
-) -> crate::Result<bool> {
+) -> crate::Result<MirrorDivergence> {
     // A TRANSIENT open failure must not return Ok(false) (which would skip the
     // dual-attempt arbitration and salvage from the tail view alone): the source
     // is being salvaged, so it EXISTS — a failure to open it is a retryable I/O
@@ -725,13 +763,13 @@ fn meta_mirrors_diverge(
     let trailer = match crate::sfa::Reader::from_reader(&mut file) {
         Ok(t) => t,
         Err(crate::sfa::Error::Io(e)) => return Err(crate::Error::Io(e)),
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(MirrorDivergence::Agree),
     };
     let Ok(regions) = crate::table::regions::ParsedRegions::parse_from_toc(trailer.toc()) else {
-        return Ok(false);
+        return Ok(MirrorDivergence::Agree);
     };
     let Some(mid_handle) = regions.metadata_mid else {
-        return Ok(false);
+        return Ok(MirrorDivergence::Agree);
     };
     // Mirror recover_inner's id policy: an encrypted open always binds the
     // caller's AAD id; an unencrypted one uses the out-of-band durable id
@@ -754,7 +792,33 @@ fn meta_mirrors_diverge(
         options.encryption.as_deref(),
     );
     match (tail, mid) {
-        (Ok(t), Ok(m)) => Ok(t != m),
+        (Ok(t), Ok(m)) => {
+            if t == m {
+                return Ok(MirrorDivergence::Agree);
+            }
+            // Which fields disagree decides whether an arbitration can settle
+            // it at all. The salvage walk re-derives the ENTRY-backed fields
+            // from the records it re-emits, so a disagreement there is
+            // resolvable by recovering more blocks. These fields are NOT
+            // derived from any entry — the writer copies them from whichever
+            // mirror was selected — so a forged tail simply becomes the truth
+            // (clearing `bulk_ingested` republishes an ingested SST at global
+            // seqno 0; rewriting `recency` or the lineage re-orders L0 or
+            // resurrects a compaction's inputs). Nothing in the file
+            // authenticates them against each other, so the salvage refuses
+            // to choose.
+            let non_derivable_disagree = t.bulk_ingested != m.bulk_ingested
+                || t.recency != m.recency
+                || t.lineage != m.lineage
+                || t.lineage_prev != m.lineage_prev
+                || t.lineage_transformed != m.lineage_transformed
+                || t.lineage_last != m.lineage_last;
+            Ok(if non_derivable_disagree {
+                MirrorDivergence::NonDerivable
+            } else {
+                MirrorDivergence::Derivable
+            })
+        }
         // An ENVIRONMENTAL read on either mirror must not masquerade as "mirrors
         // agree" (which would skip the MID recovery attempt and salvage under a
         // possibly forged tail): propagate it so the caller retries. The class
@@ -772,7 +836,7 @@ fn meta_mirrors_diverge(
         // its bytes is the ordinary tail-with-MID-fallback case (`recover_inner`
         // recovers from the readable copy): arbitration is only for two valid
         // copies that disagree, and a retry cannot make a rotted mirror decode.
-        _ => Ok(false),
+        _ => Ok(MirrorDivergence::Agree),
     }
 }
 
