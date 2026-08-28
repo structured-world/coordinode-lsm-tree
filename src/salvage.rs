@@ -2031,12 +2031,13 @@ fn salvage_blocks(
                     }
                     // Wholly-deleted block: nothing to recover, nothing lost.
                     Ok(None) => {}
-                    // Only a TRANSIENT read (a masked block re-read after cache
-                    // eviction) propagates so repair retries; a persistent I/O
-                    // failure or a structural failure drops just this block,
+                    // An ENVIRONMENTAL read (a masked block re-read after cache
+                    // eviction, or an access failure that does not implicate the
+                    // bytes) propagates so repair retries; a failure that DOES
+                    // implicate them, or a structural one, drops just this block,
                     // mirroring the unmasked salvage_load_block arm — a truncated
                     // or unreadable block must not sink every intact sibling.
-                    Err(crate::Error::Io(io)) if io.kind().is_transient() => {
+                    Err(crate::Error::Io(io)) if io.kind().is_environmental() => {
                         return Err(crate::Error::Io(io));
                     }
                     Err(e) => dropped.push(classify_drop(
@@ -2276,12 +2277,13 @@ fn salvage_blocks(
                                     Err(e) => return Err(e),
                                 }
                             }
-                            // Only a transient I/O read is retryable and propagates,
+                            // An ENVIRONMENTAL I/O read is retryable and propagates,
                             // so a partial columnar table is not published with
-                            // healthy rows permanently lost. A persistent or
-                            // structural failure drops just this block (truncation /
-                            // an unreadable block must not sink its intact siblings).
-                            Err(crate::Error::Io(io)) if io.kind().is_transient() => {
+                            // healthy rows permanently lost. A failure that
+                            // implicates the bytes, or a structural one, drops just
+                            // this block (truncation / an unreadable block must not
+                            // sink its intact siblings).
+                            Err(crate::Error::Io(io)) if io.kind().is_environmental() => {
                                 return Err(crate::Error::Io(io));
                             }
                             Err(e) => {
@@ -2294,8 +2296,9 @@ fn salvage_blocks(
                             }
                         }
                     }
-                    // Same transient-only I/O propagation for the delete-masked arm.
-                    Err(crate::Error::Io(io)) if io.kind().is_transient() => {
+                    // Same environmental-only I/O propagation for the
+                    // delete-masked arm.
+                    Err(crate::Error::Io(io)) if io.kind().is_environmental() => {
                         return Err(crate::Error::Io(io));
                     }
                     Err(e) => dropped.push(classify_drop(
@@ -2541,15 +2544,19 @@ fn salvage_blocks(
                     }),
                 }
             }
-            // Only a TRANSIENT I/O error on the block read is retryable: dropping
-            // the block and finishing dest would let repair install a partial
-            // replacement missing keys a retry would recover, so abort and let the
-            // caller discard the partial dest. A PERSISTENT I/O failure (a
-            // bad-sector `Other` / EIO, `PermissionDenied`) or a truncated final
-            // block (`UnexpectedEof`) is not fixed by a retry, so it drops just
-            // this block — a persistently-unreadable tail block must not prevent
-            // every intact earlier block from being recovered.
-            Err(crate::Error::Io(io)) if io.kind().is_transient() => {
+            // An ENVIRONMENTAL I/O error on the block read aborts: dropping the
+            // block and finishing dest would let repair install a partial
+            // replacement missing keys the fixed environment still holds, and
+            // then remove the source — permanent loss from an ACL mistake or
+            // host pressure. That covers the transient kinds AND the access
+            // failures that do not implicate the bytes (`PermissionDenied`,
+            // `OutOfMemory`, …), the same class the blob walk and every repair
+            // gate use. A failure that DOES implicate the bytes (a bad-sector
+            // `Other` / EIO) or a truncated final block (`UnexpectedEof`) is not
+            // fixed by a retry, so it drops just this block — a
+            // persistently-unreadable tail block must not prevent every intact
+            // earlier block from being recovered.
+            Err(crate::Error::Io(io)) if io.kind().is_environmental() => {
                 return Err(crate::Error::Io(io));
             }
             Err(e) => dropped.push(classify_drop(

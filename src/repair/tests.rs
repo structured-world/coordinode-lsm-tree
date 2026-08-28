@@ -10857,6 +10857,131 @@ fn a_clean_manifest_record_preserves_a_bulk_ingested_offset() -> crate::Result<(
     Ok(())
 }
 
+/// A CLEAN manifest's tree type is authoritative, and a repair run under a
+/// contradicting configuration must be REFUSED before it mutates anything.
+/// Rebuilding a Standard store's manifest as `Blob` (or the reverse, which no
+/// surviving SST can disprove when none carries an indirection) leaves the
+/// store openable only under the wrong configuration — the correct one then
+/// fails with `TreeTypeMismatch` against a manifest the repair itself wrote.
+#[test]
+fn a_clean_manifest_tree_type_refuses_a_contradicting_repair() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db_tree_type")?;
+    let standard = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+    };
+    {
+        let tree = match standard().open()? {
+            crate::AnyTree::Standard(t) => t,
+            crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+        };
+        tree.insert(b"a", b"v", 1);
+        tree.flush_active_memtable(0)?;
+        tree.insert(b"b", b"v", 2);
+        tree.flush_active_memtable(0)?;
+    }
+    // Repair is entered over a missing file, so the manifest still loads
+    // cleanly — and it says Standard.
+    memfs.remove_file(&root.join("tables").join("1"))?;
+
+    let result = standard()
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .repair();
+    assert!(
+        matches!(
+            &result,
+            Err(crate::Error::TreeTypeMismatch {
+                requested: crate::TreeType::Blob,
+                actual: crate::TreeType::Standard,
+            })
+        ),
+        "the committed type must refuse the contradicting configuration: {result:?}",
+    );
+
+    // Refused BEFORE mutating: the store is intact, so a repair under the
+    // CORRECT configuration still recovers it and the tree reopens.
+    let report = standard().repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "the refused repair must leave the store repairable: {report:?}",
+    );
+    let tree = standard().open()?;
+    assert!(
+        tree.get(b"a", crate::MAX_SEQNO)?.is_some(),
+        "the surviving table's rows must still read",
+    );
+    Ok(())
+}
+
+/// The RESTRICTED temp path must consult the original too. A restricted
+/// repair that committed its manifest but crashed before the swap leaves the
+/// manifest describing the TEMP; if that temp then fails structurally (its
+/// metadata no longer decodes, so no punch offset can be located), answering
+/// "abandoned build" deletes the very copy the manifest published — while the
+/// surviving original does NOT match the committed checksum. Only an original
+/// that PROVES itself authoritative may condemn the temp; otherwise the
+/// temp's failure propagates, exactly as on the checksum paths.
+#[cfg(feature = "std")]
+#[test]
+fn a_structurally_broken_restricted_temp_is_not_condemned_by_an_unproven_original()
+-> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let fs: Arc<dyn Fs> = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db_restricted_temp")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    // The original beside the temp, and a temp whose bytes decode as nothing.
+    let sst = tables.join("0");
+    write_multiblock_sst(&sst, &fs)?;
+    let tmp = tables.join("0.repair-tmp");
+    {
+        let mut f = fs.open(
+            &tmp,
+            &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        std::io::Write::write_all(&mut f, &[0xAB; 512])?;
+    }
+
+    let config = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone());
+    // The manifest describes the committed REPLACEMENT, so its checksum
+    // matches neither the broken temp nor the surviving original.
+    let bound: crate::UserKey = b"k00130".to_vec().into();
+    let published = crate::repair::repair_tmp_is_published(
+        &config,
+        &fs,
+        &tmp,
+        0,
+        crate::Checksum::from_raw(0xDEAD_BEEF),
+        Some(&bound),
+    );
+    assert!(
+        published.is_err(),
+        "with neither copy proven authoritative, the temp's failure must \
+         propagate instead of condemning the manifest's own replacement: \
+         {published:?}",
+    );
+    Ok(())
+}
+
 /// A leftover `{id}.repair-tmp` whose bytes NO LONGER READ BACK (a rotted
 /// sector, a truncated build — non-environmental either way) must not hold
 /// the whole tree hostage: when the ORIGINAL `{id}` still matches the clean

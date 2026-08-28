@@ -510,12 +510,17 @@ pub(crate) fn repair_tmp_is_published(
     )) {
         Ok(table) => table,
         Err(e) if is_environmental(&e) => return Err(e),
-        Err(_) => return Ok(false),
+        // A temp that does not open is USUALLY the mid-build crash — but the
+        // manifest may equally describe a COMMITTED replacement this run
+        // failed to swap, and then discarding it destroys the only published
+        // copy. Same proof as the checksum paths: condemn the temp only when
+        // the original proves itself the file the manifest names.
+        Err(e) => return resolve_with_original(e),
     };
     let punch_offset = match table.punch_offset_for(bound.as_ref()) {
         Ok(offset) => offset,
         Err(e) if is_environmental(&e) => return Err(e),
-        Err(_) => return Ok(false),
+        Err(e) => return resolve_with_original(e),
     };
     match compute_table_checksum_from(&**fs, tmp_path, punch_offset) {
         Ok(digest) => Ok(crate::Checksum::from_raw(digest) == manifest_checksum),
@@ -3230,6 +3235,31 @@ fn sweep_superseded_by_committed_manifest(
         // everything.
         Err(_) => return Ok(None),
     };
+
+    // BEFORE anything is removed: a clean manifest's tree type is the
+    // authority, and a run configured for the other type would rebuild the
+    // manifest as that type — after which the CORRECT configuration fails
+    // against a manifest this repair itself wrote. The scan cannot catch it
+    // either: no surviving SST proves a Standard store is not a blob one (the
+    // reverse is caught later, by a table that carries indirections). Refuse
+    // while the store is still untouched.
+    let requested = if config.kv_separation_opts.is_some() {
+        TreeType::Blob
+    } else {
+        TreeType::Standard
+    };
+    if recovery.tree_type != requested {
+        log::error!(
+            "repair: the committed manifest describes a {:?} tree but this repair is \
+             configured for {requested:?}; rebuilding would leave the store openable \
+             only under the wrong configuration",
+            recovery.tree_type,
+        );
+        return Err(crate::Error::TreeTypeMismatch {
+            requested,
+            actual: recovery.tree_type,
+        });
+    }
 
     // The full per-table records, not just the id set: the checksum drives
     // temp-swap resolution below, and the `global_seqno` ingest offset is

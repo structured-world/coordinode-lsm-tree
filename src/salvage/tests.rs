@@ -7337,6 +7337,69 @@ fn build_blob(
     Ok(())
 }
 
+/// The SST twin: an ENVIRONMENTAL data-block read failure must PROPAGATE,
+/// never be recorded as a dropped block. The metadata and index are readable,
+/// so the walk reaches the block reads; a `PermissionDenied` there is an ACL
+/// mistake or host pressure, not rotted bytes, and accepting it as a drop
+/// finishes a partial replacement that repair installs before removing the
+/// source — permanent loss a fixed environment would have avoided. The sweep
+/// arms a one-shot fault at increasing skip counts; wherever it lands, the
+/// walk either succeeds untouched or fails with the environmental error.
+#[test]
+fn an_environmental_read_failure_never_becomes_a_lossy_sst_salvage() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let mut fault_reached_the_walk = false;
+    for skip in 0..64u64 {
+        let dir = tempdir()?;
+        let source = dir.path().join("source");
+        let dest = dir.path().join("salvaged");
+        let plain: Arc<dyn Fs> = Arc::new(StdFs);
+        {
+            let mut writer =
+                Writer::new(source.clone(), 0, 0, Arc::clone(&plain))?.use_data_block_size(256);
+            for i in 0..64u32 {
+                writer.write(iv(i))?;
+            }
+            assert!(writer.finish()?.is_some(), "the source SST is non-empty");
+        }
+
+        let fault = FaultFs::new(StdFs);
+        fault.injector().arm(
+            FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
+                .skip(skip)
+                .times(1),
+        );
+        let fs: Arc<dyn Fs> = Arc::new(fault);
+        match salvage_sst(&source, dest, &fs) {
+            Ok(report) => {
+                assert!(
+                    !report
+                        .dropped
+                        .iter()
+                        .any(|d| format!("{:?}", d.reason).contains("PermissionDenied")),
+                    "an environmental failure must never be recorded as a \
+                     dropped block (skip {skip}): {report:?}",
+                );
+            }
+            Err(e) => {
+                assert!(
+                    matches!(&e, crate::Error::Io(io) if io.kind() == ErrorKind::PermissionDenied),
+                    "the only acceptable failure is the propagated \
+                     environmental error (skip {skip}): {e:?}",
+                );
+                fault_reached_the_walk = true;
+            }
+        }
+    }
+    assert!(
+        fault_reached_the_walk,
+        "no skip count reached the salvage read path; the sweep proves nothing",
+    );
+    Ok(())
+}
+
 /// An ENVIRONMENTAL read failure mid-walk (`PermissionDenied`, `OutOfMemory`
 /// — an ACL mistake or host pressure, not rotted bytes) must PROPAGATE like
 /// a transient one, never be recorded as corruption: accepting it as a drop
