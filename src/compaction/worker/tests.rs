@@ -2585,3 +2585,190 @@ fn a_reopened_blob_view_needs_binding_to_carry_the_deletion_pause() -> crate::Re
     );
     Ok(())
 }
+
+/// Tight-space compaction reclaims by punching the CONSUMED PREFIX of each
+/// input, through that input's own backend. Under level routing an input can
+/// sit on a volume that refuses the punch while the output destination accepts
+/// it, and the destination's capability says nothing about the source's.
+/// Admitting the pass on the destination alone commits a restriction and writes
+/// an output per slice while every consumed prefix stays allocated, so the pass
+/// meant to relieve the volume ends up using more of it.
+#[test]
+fn tight_space_declines_when_an_input_backend_cannot_punch() -> crate::Result<()> {
+    use crate::config::LevelRoute;
+    use crate::fs::{Fs, MemFs};
+
+    let dir = tempfile::tempdir()?;
+    let hot_dir = dir.path().join("hot");
+    // The volume holding the inputs: ample, but it cannot punch.
+    let hot = Arc::new(MemFs::with_capacity(u64::MAX));
+    hot.set_punch_hole_supported(false);
+    hot.create_dir_all(&hot_dir)?;
+    // The volume holding the compaction output: punch-capable, and tight
+    // enough that the space gate hands the merge to the tight-space path.
+    let main = Arc::new(MemFs::with_capacity(u64::MAX));
+
+    let hot_fs: Arc<dyn Fs> = hot.clone();
+    let tree = match Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_shared_fs(main.clone())
+    .level_routes(vec![LevelRoute {
+        levels: 0..1,
+        path: hot_dir.clone(),
+        fs: hot_fs,
+    }])
+    .open()?
+    {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+
+    for i in 0..TIGHT_SPACE_KEYS {
+        tree.insert(tight_space_key(i).as_bytes(), vec![0xCDu8; 64], i);
+    }
+    tree.flush_active_memtable(0)?;
+    // The inputs live on the routed volume, so the destination's own pool is
+    // nearly empty: squeeze it below what the merge would write.
+    main.set_capacity(64 * 1024);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = true;
+    })?;
+
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+
+    let sidecars = hot
+        .read_dir(&hot_dir.join("tables"))?
+        .into_iter()
+        .filter(|e| e.file_name.contains("restrict-bound"))
+        .count();
+    assert_eq!(
+        sidecars, 0,
+        "no slice may commit a restriction against an input whose backend \
+         cannot reclaim the prefix that restriction declares consumed",
+    );
+    for i in 0..TIGHT_SPACE_KEYS {
+        assert!(
+            tree.get(tight_space_key(i).as_bytes(), crate::MAX_SEQNO)?
+                .is_some(),
+            "key {i} lost",
+        );
+    }
+    Ok(())
+}
+
+/// On a relocating (KV-separated) tight-space merge the transient is the
+/// RELOCATED BLOB PAYLOAD, which lands on the blob volume. Level routing can
+/// put the SST destination on a different volume entirely, so sizing the slice
+/// budget from the destination's free space scales by the wrong pool: an ample
+/// destination beside a full `blobs/` yields a budget larger than every input
+/// block, `tight_slice_boundaries` finds nothing to cut, and the pass that
+/// exists to reclaim the constrained volume reclaims nothing at all.
+#[test]
+fn tight_space_budgets_blob_relocation_on_the_blob_volume() -> crate::Result<()> {
+    use crate::config::LevelRoute;
+    use crate::fs::{Fs, MemFs};
+
+    const N: u64 = 4_000;
+    let k = |i: u64| format!("key{i:08}");
+    // High-entropy values so the blobs do not compress away and the relocation
+    // transient is real.
+    let val = |i: u64, generation: u8| -> Vec<u8> {
+        let mut s = (i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (u64::from(generation) << 1);
+        (0..200u32)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "xorshift byte extraction; the high bits are intentionally dropped"
+                )]
+                let byte = (s >> 24) as u8;
+                byte
+            })
+            .collect()
+    };
+
+    let dir = tempfile::tempdir()?;
+    let cold_dir = dir.path().join("cold");
+    // The SST volume: ample, and a different volume from the blobs.
+    let cold = Arc::new(MemFs::with_capacity(u64::MAX));
+    cold.create_dir_all(&cold_dir)?;
+    // The blob volume, which is the one that runs out of space.
+    let mem = Arc::new(MemFs::with_capacity(u64::MAX));
+
+    let cold_fs: Arc<dyn Fs> = cold;
+    let config = Config::new(
+        &dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_shared_fs(mem.clone())
+    .level_routes(vec![LevelRoute {
+        levels: 0..7,
+        path: cold_dir,
+        fs: cold_fs,
+    }])
+    .with_kv_separation(Some(
+        KvSeparationOptions::default()
+            .separation_threshold(64)
+            .age_cutoff(1.0)
+            .staleness_threshold(0.1)
+            .file_target_size(48 * 1024),
+    ));
+    let tree = match config.open()? {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+
+    for i in 0..N {
+        tree.insert(k(i).as_bytes(), val(i, 1), i);
+    }
+    tree.flush_active_memtable(0)?;
+    for i in (0..N).step_by(2) {
+        tree.insert(k(i).as_bytes(), val(i, 2), N + i);
+    }
+    tree.flush_active_memtable(0)?;
+
+    // One ample merge so the shadowed generation is COUNTED dead, leaving each
+    // gen-1 file half stale — the precondition for relocating it.
+    let gc_watermark = 4 * N;
+    tree.index.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+    })?;
+    tree.major_compact(64 * 1024 * 1024, gc_watermark)?;
+
+    // Squeeze ONLY the blob volume. The SST destination stays unbounded, so a
+    // budget taken from it is meaningless here.
+    const PROBE: u64 = 1 << 40;
+    mem.set_capacity(PROBE);
+    let blob_stored = PROBE - mem.available_space(dir.path())?;
+    mem.set_capacity(blob_stored + blob_stored / 4);
+    tree.index.update_runtime_config(|c| {
+        c.tight_space_compaction = true;
+    })?;
+
+    tree.major_compact(64 * 1024 * 1024, gc_watermark)?;
+
+    assert!(
+        mem.punched_bytes() > 0,
+        "the relocation must slice against the blob volume's free space and \
+         reclaim stale blob prefixes there",
+    );
+    for i in 0..N {
+        let expected = if i % 2 == 0 { val(i, 2) } else { val(i, 1) };
+        assert_eq!(
+            tree.get(k(i).as_bytes(), crate::MAX_SEQNO)?.as_deref(),
+            Some(expected.as_slice()),
+            "key {i} wrong/lost after the relocating tight-space merge",
+        );
+    }
+    Ok(())
+}

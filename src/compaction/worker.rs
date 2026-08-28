@@ -860,11 +860,41 @@ fn run_tight_space_compaction(
                 for bf in &files {
                     total += bf.physical_size()?;
                 }
+                // Each stale file is punched through its OWN backend, which a
+                // separately backed `blobs/` can refuse.
+                if let Some(bf) = files
+                    .iter()
+                    .find(|bf| !bf.0.fs.capabilities(&bf.0.path).punch_hole)
+                {
+                    log::info!(
+                        "Tight-space compaction unavailable: the backend of blob file {} \
+                         lacks punch_hole, so its relocated prefix would stay allocated",
+                        bf.0.path.display(),
+                    );
+                    return Ok(CompactionResult::nothing());
+                }
                 (files.iter().map(BlobFile::id).collect(), total)
             }
             None => (Vec::new(), 0),
         };
     let relocating = !stale_ids.is_empty();
+
+    // The reclaim runs through each INPUT's own backend, not the destination's:
+    // under level routing an input can sit on a volume that refuses the punch.
+    // Admitting the slice anyway commits its restriction and writes its output
+    // while the consumed prefix stays allocated, so the pass ends using MORE
+    // space on the volume it was meant to relieve.
+    if let Some(t) = inputs
+        .iter()
+        .find(|t| !t.fs.capabilities(&t.path).punch_hole)
+    {
+        log::info!(
+            "Tight-space compaction unavailable: the backend of input table {} lacks \
+             punch_hole, so its consumed prefix would stay allocated",
+            t.path.display(),
+        );
+        return Ok(CompactionResult::nothing());
+    }
 
     drop(latest);
     drop(version_history_lock);
@@ -882,13 +912,50 @@ fn run_tight_space_compaction(
     // blob bytes ≈ the free space: without this, a few small SST blocks would map
     // to the whole blob payload in one slice and overflow the very disk the gate
     // already flagged as too tight.
+    //
+    // That payload lands on the BLOB volume, which level routing can separate
+    // from the SST destination. Budgeting it against the destination's free
+    // space then scales by the wrong pool in both directions: an ample
+    // destination beside a full `blobs/` yields a budget larger than every
+    // input block (`tight_slice_boundaries` returns empty, so no reclaim
+    // happens at all) or a slice the blob volume cannot hold.
     let slice_budget = if relocating && stale_total_bytes > 0 {
         let inputs_total: u64 = inputs.iter().map(Table::file_size).sum();
+        let blob_dir = opts.config.path.join(BLOBS_FOLDER);
+        let blob_free = opts
+            .config
+            .fs
+            .available_space(&blob_dir)
+            .unwrap_or(u64::MAX);
+        // Independent only when both destinations prove a volume id AND the
+        // ids differ, matching `space_fits_two_layer`: anything unproven falls
+        // through to one combined pool.
+        let independent = match (
+            dest_fs.volume_id(&dest_path),
+            opts.config.fs.volume_id(&blob_dir),
+        ) {
+            (Some(sst_vol), Some(blob_vol)) => sst_vol != blob_vol,
+            _ => false,
+        };
+        // A slice covering `b` SST bytes writes `b` to the SST volume and
+        // `b * stale_total / inputs_total` to the blob volume. Separate pools
+        // bound each share on its own volume; a shared pool must hold the SUM,
+        // so the budget solves `b * (inputs_total + stale_total) <= free`
+        // against the tighter probe.
+        let (pool, share) = if independent {
+            (blob_free, stale_total_bytes)
+        } else {
+            (
+                available.min(blob_free),
+                inputs_total.max(1) + stale_total_bytes,
+            )
+        };
         // Both factors are u64, so their u128 product is at most
         // (2^64-1)^2 < u128::MAX — plain multiply cannot overflow.
-        let scaled =
-            u128::from(available) * u128::from(inputs_total.max(1)) / u128::from(stale_total_bytes);
-        u64::try_from(scaled).unwrap_or(u64::MAX).max(1)
+        let scaled = u128::from(pool) * u128::from(inputs_total.max(1)) / u128::from(share);
+        let by_blob = u64::try_from(scaled).unwrap_or(u64::MAX).max(1);
+        // The SST side still has to fit its own slice on its own volume.
+        by_blob.min(available.max(1))
     } else {
         available.max(1)
     };
