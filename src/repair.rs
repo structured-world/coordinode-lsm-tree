@@ -546,6 +546,51 @@ pub(crate) fn repair_tmp_is_published(
 ///
 /// # Errors
 ///
+/// The digest a RESTRICTED view of `table_path` records: its live suffix from
+/// the punch offset `bound` falls at, which is what the manifest holds for a
+/// tight-space-punched table (see [`crate::table::Table::reopen_restricted`]).
+///
+/// `None` when the file cannot be opened or the bound cannot be located in its
+/// index: nothing to compare, never a claim of mismatch.
+///
+/// # Errors
+///
+/// Propagates an ENVIRONMENTAL failure; anything else answers `None`.
+#[cfg(feature = "std")]
+fn restricted_suffix_digest(
+    config: &Config,
+    fs: &Arc<dyn crate::fs::Fs>,
+    table_path: &std::path::Path,
+    table_id: TableId,
+    bound: &crate::UserKey,
+) -> crate::Result<Option<crate::Checksum>> {
+    // Opening reads the trailer, meta and index only; the data blocks the
+    // digest streams are read once, below.
+    let table = match Table::recover(repair_recover_params(
+        config,
+        table_path.to_path_buf(),
+        crate::Checksum::from_raw(0),
+        table_id,
+        Arc::clone(fs),
+        None,
+    )) {
+        Ok(table) => table,
+        Err(e) if is_environmental(&e) => return Err(e),
+        Err(_) => return Ok(None),
+    };
+    let offset = match table.punch_offset_for(bound.as_ref()) {
+        Ok(offset) => offset,
+        Err(e) if is_environmental(&e) => return Err(e),
+        Err(_) => return Ok(None),
+    };
+    drop(table);
+    match compute_table_checksum_from(&**fs, table_path, offset) {
+        Ok(d) => Ok(Some(crate::Checksum::from_raw(d))),
+        Err(e) if is_environmental(&e) => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Propagates an environmental sidecar read failure, so a retry re-reads it.
 #[cfg(feature = "std")]
 fn trustworthy_restriction_bound(
@@ -4209,11 +4254,38 @@ fn scan_table_folders(
                 Err(e) if is_environmental(&e) => return Err(e),
                 Err(e) => Err(e),
             };
-            let matches_manifest = own_digest.as_ref().is_ok_and(|d| {
-                manifest_referenced
-                    .as_ref()
-                    .is_some_and(|m| m.tables.get(&table_id).is_some_and(|t| t.checksum == *d))
-            });
+            let committed_digest = manifest_referenced
+                .as_ref()
+                .and_then(|m| m.tables.get(&table_id))
+                .map(|t| t.checksum);
+            let matches_manifest = match (&own_digest, committed_digest) {
+                (Ok(d), Some(committed)) => {
+                    match trustworthy_restriction_bound(
+                        config,
+                        &*folder_fs,
+                        &table_path,
+                        table_id,
+                        &manifest_restriction,
+                    )? {
+                        // A RESTRICTED entry digests only the LIVE SUFFIX, so
+                        // the whole-file hash can never equal it. Comparing them
+                        // would mark BOTH copies of a restricted id unmatched
+                        // and hand the choice back to scan order, the very
+                        // thing the digest is here to prevent. Reproduce the
+                        // suffix digest the restricted view records instead.
+                        Some(bound) => restricted_suffix_digest(
+                            config,
+                            &folder_fs,
+                            &table_path,
+                            table_id,
+                            &bound,
+                        )?
+                        .is_some_and(|suffix| suffix == committed),
+                        None => *d == committed,
+                    }
+                }
+                _ => false,
+            };
 
             // Skip a duplicate id ONLY when we already hold a COMPLETE copy — a
             // duplicate cannot improve on it. A previously-seen LOSSY salvage does

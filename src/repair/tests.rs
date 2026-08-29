@@ -4896,8 +4896,16 @@ fn storage_stats_and_checkpoint_agree_on_a_restricted_tree() -> crate::Result<()
 
     let cp_dir = root.join("checkpoint");
     let info = tree.create_checkpoint(&cp_dir)?;
+    // Both surfaces measure PHYSICAL bytes, so they agree wherever the
+    // checkpoint shares the source's extents. This backend has no inodes and
+    // copies instead of linking, which materializes the punched prefix as
+    // zeros in the copy, so the checkpoint is larger by exactly that hole and
+    // by nothing else: the sidecar is counted on both sides.
+    let len = memfs.metadata(&sst)?.len;
+    let materialized_hole = len - memfs.allocated_size(&sst)?.unwrap_or(len);
     assert_eq!(
-        stats.used_bytes, info.total_bytes,
+        stats.used_bytes + materialized_hole,
+        info.total_bytes,
         "both surfaces count the restricted table's live sidecar",
     );
     Ok(())
@@ -16776,6 +16784,127 @@ fn the_manifest_checksum_picks_the_table_copy_not_scan_order() -> crate::Result<
         tree.get(b"k", crate::MAX_SEQNO)?.as_deref(),
         Some(&b"live"[..]),
         "the copy the manifest named must win over the one scanned first",
+    );
+    Ok(())
+}
+
+/// A RESTRICTED table's manifest entry digests only its LIVE SUFFIX, so a
+/// whole-file hash never equals it, which marked BOTH complete copies of such
+/// an id unmatched and handed the choice back to scan order, the very thing the
+/// digest exists to prevent. The comparison must reproduce the suffix digest
+/// the restricted view records.
+#[test]
+fn the_manifest_digest_picks_a_restricted_table_copy_too() -> crate::Result<()> {
+    use crate::config::LevelRoute;
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::io::Write;
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let live_root = std::path::absolute("/db_restricted_pick")?;
+    let cold = std::path::absolute("/cold_restricted_pick")?;
+    let tables = live_root.join("tables");
+    let cold_tables = cold.join("tables");
+    memfs.create_dir_all(&tables)?;
+    memfs.create_dir_all(&cold_tables)?;
+
+    let bound: crate::UserKey = b"key000100".to_vec().into();
+    // Two copies of id 0 with DIFFERENT values, each punched at its own bound.
+    // Both are complete and restricted; only the suffix digest separates them.
+    let write_copy = |path: &std::path::Path, marker: u8| -> crate::Result<u64> {
+        let mut w = crate::table::Writer::new(path.to_path_buf(), 0, 0, Arc::clone(&fs_dyn))?
+            .use_data_block_size(128);
+        for i in 0..200u32 {
+            w.write(InternalValue::from_components(
+                format!("key{i:06}").into_bytes(),
+                alloc::vec![marker; 64],
+                u64::from(i) + 1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the table is non-empty");
+        let probe = Config::new(
+            &live_root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        );
+        let table = crate::table::Table::recover(super::repair_recover_params(
+            &probe,
+            path.to_path_buf(),
+            crate::Checksum::from_raw(super::compute_table_checksum(&*fs_dyn, path)?),
+            0,
+            Arc::clone(&fs_dyn),
+            None,
+        ))?;
+        let offset = table.punch_offset_for(&bound)?;
+        drop(table);
+        memfs.punch_hole(path, 0, offset)?;
+        crate::restrict_bound::write(&*fs_dyn, path, None, 0, &bound, crate::fs::SyncMode::Normal)?;
+        Ok(offset)
+    };
+    // The AUTHORITATIVE copy goes to the routed folder (scanned second); the
+    // stale generation takes the primary path that is scanned first.
+    let live_offset = write_copy(&cold_tables.join("0"), b'L')?;
+    write_copy(&tables.join("0"), b'S')?;
+
+    // A manifest naming the LIVE copy: build it by repairing with only that
+    // copy present, then plant the stale twin.
+    let stale_bytes = {
+        let path = tables.join("0");
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut memfs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?,
+            &mut bytes,
+        )?;
+        memfs.remove_file(&path)?;
+        memfs.remove_file(&crate::restrict_bound::sidecar_path(&path))?;
+        bytes
+    };
+    let config = || {
+        let route_fs: Arc<dyn Fs> = memfs.clone();
+        Config::new(
+            &live_root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .level_routes(vec![LevelRoute {
+            levels: 0..2,
+            path: cold.clone(),
+            fs: route_fs,
+        }])
+    };
+    let first = config().repair()?;
+    assert_eq!(first.recovered, 1, "the live copy is published: {first:?}");
+    {
+        let path = tables.join("0");
+        let mut f = memfs.open(
+            &path,
+            &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        f.write_all(&stale_bytes)?;
+        crate::restrict_bound::write(
+            &*fs_dyn,
+            &path,
+            None,
+            0,
+            &bound,
+            crate::fs::SyncMode::Normal,
+        )?;
+    }
+    let _ = live_offset;
+
+    config().repair()?;
+    let tree = match config().open()? {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    assert_eq!(
+        tree.get(b"key000150", crate::MAX_SEQNO)?.as_deref(),
+        Some(&[b'L'; 64][..]),
+        "the restricted copy the manifest digested must win over scan order",
     );
     Ok(())
 }
