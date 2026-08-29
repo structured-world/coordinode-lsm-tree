@@ -2446,6 +2446,21 @@ fn a_retry_never_lowers_an_existing_restriction() -> crate::Result<()> {
         "a retry must not serve a prefix an earlier slice already punched: \
          bound went from {committed_bound:?} to {bound:?}",
     );
+
+    // The sidecar is what a manifest-loss repair trusts, so it must record the
+    // bound the manifest committed. A lower one there republishes the SST as
+    // serving an interval the earlier slice output already owns, whose blocks
+    // are punched out.
+    let crate::restrict_bound::SidecarRead::Present(_, recorded) =
+        crate::restrict_bound::read(&*after.fs, &after.path, after.encryption.as_deref())?
+    else {
+        panic!("the committed restriction must have published its sidecar");
+    };
+    assert_eq!(
+        recorded,
+        bound.to_vec(),
+        "the sidecar must record the bound the manifest committed",
+    );
     Ok(())
 }
 

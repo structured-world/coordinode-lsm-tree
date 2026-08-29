@@ -1362,8 +1362,22 @@ fn run_tight_space_compaction(
                 if removed_ids.contains(&view.id()) {
                     view.mark_as_deleted();
                 } else {
-                    match view.write_restrict_sidecar(boundary, opts.config.sync_mode) {
-                        Ok(()) => match view.punch_offset_for(boundary) {
+                    // The bound this slice COMMITTED for this input, which the
+                    // reopen above may have clamped up to a restriction an
+                    // earlier pass already committed. The sidecar is what a
+                    // manifest-loss repair trusts, so recording the raw boundary
+                    // here would republish the SST as serving an interval the
+                    // earlier slice output owns and whose blocks are punched
+                    // out. The punch offset follows the same bound (punching to
+                    // the lower one would merely redo a subset of an existing
+                    // hole, but the two must not disagree).
+                    let bound = restricted_pairs
+                        .iter()
+                        .find(|(id, _)| *id == view.id())
+                        .and_then(|(_, restricted)| restricted.restrict_lower_bound())
+                        .unwrap_or(boundary);
+                    match view.write_restrict_sidecar(bound, opts.config.sync_mode) {
+                        Ok(()) => match view.punch_offset_for(bound) {
                             Ok(off) => view.mark_punch_on_drop(off),
                             // Post-commit, so a punch-offset lookup failure is non-fatal,
                             // exactly like the sidecar-write failure below: the restriction
