@@ -144,12 +144,17 @@ fn a_failed_relocation_reopen_leaves_no_orphan_output() {
     // The flush wrote table 0; the relocation writes table 1. Positioned reads
     // on that path happen only when it is REOPENED — the writer streams it out
     // — so this fires exactly on the reopen, after finalization.
+    //
+    // The filter is built from the real path rather than written as a literal:
+    // a hardcoded `tables/1` matches nothing where the separator is `\`, and
+    // the rule would then silently never fire.
+    let relocated = folder.join("tables").join("1");
     injector.arm(
         FaultRule::new(
             FaultOp::ReadAt,
             Fault::Error(lsm_tree::io::ErrorKind::PermissionDenied),
         )
-        .on_path("tables/1"),
+        .on_path(relocated.display().to_string()),
     );
     let outcome = tree.major_compact(64 * 1024 * 1024, 5000);
     injector.clear();
