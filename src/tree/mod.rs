@@ -4451,6 +4451,33 @@ impl Tree {
             blob_file.bind_to_tree(&sinks);
         }
 
+        // Re-arm the tight-space reclaims a previous session could not finish.
+        // A reclaim deferred because a checkpoint still hard-linked the file
+        // lived only in that session's queue, and the unrestricted view that
+        // could re-arm it is gone once the process restarts, so the consumed
+        // prefix would stay allocated for the table's lifetime. Nothing is
+        // persisted for this: the intent is DERIVABLE, and the extent is
+        // exactly the prefix the committed bound cuts away. A prefix already
+        // punched re-punches as a no-op, so a completed reclaim costs one
+        // call, and only on a restricted table.
+        #[cfg(feature = "std")]
+        {
+            for table in &recovered_tables {
+                let Some(bound) = table.restrict_lower_bound() else {
+                    continue;
+                };
+                let offset = table.punch_offset_for(bound)?;
+                if offset > 0 {
+                    deletion_pause.retain_reclaim(
+                        Arc::clone(&table.fs),
+                        (*table.path).clone(),
+                        alloc::vec![(0, offset)],
+                    );
+                }
+            }
+            deletion_pause.retry_pending_reclaims();
+        }
+
         Ok(Self(Arc::new(inner)))
     }
 
@@ -5290,3 +5317,7 @@ mod scan_since_freeze_tests;
 
 #[cfg(all(test, feature = "metrics"))]
 mod cache_stats_tests;
+
+#[cfg(all(test, feature = "std"))]
+#[expect(clippy::expect_used, reason = "test code")]
+mod restricted_reclaim_tests;
