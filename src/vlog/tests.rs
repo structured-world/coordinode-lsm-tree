@@ -332,3 +332,77 @@ fn a_refused_digest_read_does_not_decide_the_blob_duplicate() {
         "the healthy copy must still be on disk for the retry",
     );
 }
+
+/// When an id has duplicates and NEITHER reproduces the manifest's checksum,
+/// the filename is not a tiebreak, it is a guess between two wrong answers.
+/// Acting on it opens the tree on the wrong generation and deletes the other
+/// copy as an orphan, though the damaged authoritative file may still be
+/// salvageable frame by frame. Recovery must refuse and leave that to a repair.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn recovery_refuses_when_no_blob_duplicate_matches_the_manifest() {
+    use crate::fs::{Fs, MemFs};
+    use std::io::Write;
+
+    let memfs = MemFs::new();
+    let fs: Arc<dyn Fs> = Arc::new(memfs.clone());
+    let blobs = std::path::absolute("/blobs_no_match").expect("absolute");
+    memfs.create_dir_all(&blobs).expect("mkdir");
+
+    let mut writer = crate::vlog::BlobFileWriter::new(
+        crate::SequenceNumberCounter::default(),
+        &blobs,
+        0,
+        None,
+        Arc::clone(&fs),
+    )
+    .expect("writer");
+    for i in 0..20u32 {
+        writer
+            .write(
+                format!("k{i:04}").as_bytes(),
+                u64::from(i) + 1,
+                &[b'v'; 128],
+            )
+            .expect("write");
+    }
+    assert_eq!(writer.finish().expect("finish").len(), 1, "one blob file");
+
+    let canonical = blobs.join("0");
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut memfs
+            .open(&canonical, &crate::fs::FsOpenOptions::new().read(true))
+            .expect("open"),
+        &mut bytes,
+    )
+    .expect("read");
+    // The manifest's digest is of the UNTOUCHED file; both copies on disk then
+    // differ from it (each flipped at a different offset), so neither can prove
+    // authority.
+    let checksum = Checksum::from_raw(
+        crate::file::checksum_from_with_overrides(&*fs, &canonical, 0, &[]).expect("digest"),
+    );
+    for (path, at) in [(canonical.clone(), 64usize), (blobs.join("00"), 96usize)] {
+        let mut damaged = bytes.clone();
+        let Some(byte) = damaged.get_mut(at) else {
+            panic!("the written blob reaches the flipped offset");
+        };
+        *byte ^= 0xFF;
+        memfs.remove_file(&path).ok();
+        let mut f = memfs
+            .open(
+                &path,
+                &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+            )
+            .expect("create copy");
+        f.write_all(&damaged).expect("write copy");
+    }
+
+    let result = recover_blob_files(&blobs, &[(0, checksum, 0)], 0, None, &fs);
+    assert!(
+        matches!(result, Err(crate::Error::Unrecoverable)),
+        "with no copy matching the manifest, picking one by filename would open \
+         the wrong generation and delete the other",
+    );
+}

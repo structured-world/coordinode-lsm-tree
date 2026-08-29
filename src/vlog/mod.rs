@@ -48,14 +48,14 @@ fn dedupe_blob_sightings(
     blob_files: &mut Vec<BlobFile>,
     orphaned: &mut Vec<PathBuf>,
 ) -> crate::Result<()> {
-    let mut kept: crate::HashMap<BlobFileId, usize> = crate::HashMap::default();
-    let mut duplicates = false;
+    let mut seen: crate::HashMap<BlobFileId, usize> = crate::HashMap::default();
+    let mut duplicate_ids: crate::HashSet<BlobFileId> = crate::HashSet::default();
     for (idx, bf) in blob_files.iter().enumerate() {
-        if kept.insert(bf.id(), idx).is_some() {
-            duplicates = true;
+        if seen.insert(bf.id(), idx).is_some() {
+            duplicate_ids.insert(bf.id());
         }
     }
-    if !duplicates {
+    if duplicate_ids.is_empty() {
         return Ok(());
     }
 
@@ -97,6 +97,24 @@ fn dedupe_blob_sightings(
                 best.insert(bf.id(), (score, idx));
             }
         }
+    }
+    // The manifest digested exactly one file per id. When an id has duplicates
+    // and NONE of them reproduces that digest, the filename is not a tiebreak,
+    // it is a guess between two wrong answers, and acting on it opens the tree
+    // on the wrong generation while deleting the other copy as an orphan. The
+    // damaged authoritative file may still be salvageable frame by frame, which
+    // a repair can do and this cannot. Refuse instead.
+    if let Some(id) = best
+        .iter()
+        .find(|(id, (score, _))| *score > 0 && duplicate_ids.contains(*id))
+        .map(|(id, _)| *id)
+    {
+        log::error!(
+            "blob file {id} has multiple copies and none reproduces the manifest's \
+             checksum; refusing to pick one. Run a repair, which can salvage the \
+             authoritative copy's intact frames",
+        );
+        return Err(crate::Error::Unrecoverable);
     }
     let winners: crate::HashSet<usize> = best.values().map(|&(_, idx)| idx).collect();
     let mut idx = 0;
