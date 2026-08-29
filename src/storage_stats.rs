@@ -396,10 +396,12 @@ pub(crate) fn compute_used_bytes(version: &Version) -> crate::Result<u64> {
 /// The physical bytes a live blob file occupies.
 ///
 /// Blob files are punched in place by the same tight-space reclaim as SSTs, so
-/// they are charged what they still occupy, not their logical length. The
-/// checkpoint counts them physically too, which is what keeps the documented
-/// `used_bytes == CheckpointInfo::total_bytes` invariant true once a reclaim
-/// has run.
+/// they are charged what they still occupy, not their logical length.
+///
+/// This is deliberately a DIFFERENT measure from `CheckpointInfo::total_bytes`,
+/// which counts logical lengths because that is what restoring a snapshot
+/// costs. The two agree for intact files and differ by exactly the punched
+/// holes once a reclaim has run.
 ///
 /// # Errors
 ///
@@ -410,10 +412,13 @@ pub(crate) fn blob_on_disk_bytes(blob: &crate::vlog::BlobFile) -> crate::Result<
 
 /// The physical bytes a live table occupies: the SST file plus, for a
 /// tight-space-RESTRICTED table, its `.restrict-bound` sidecar — a live
-/// companion file a checkpoint links and totals too, which keeps the
-/// documented `used_bytes == CheckpointInfo::total_bytes` invariant true for
-/// restricted trees. A restricted view whose sidecar is missing on disk (a
+/// companion file a checkpoint links and totals too, so both surfaces cover the
+/// same SET of files. A restricted view whose sidecar is missing on disk (a
 /// geometry-derived restriction after a repair) counts the SST alone.
+///
+/// The two surfaces measure that set differently on purpose: this one is
+/// physical (a punched prefix must leave the quota), while
+/// `CheckpointInfo::total_bytes` is logical (that is what a restore costs).
 pub(crate) fn table_on_disk_bytes(table: &crate::table::Table) -> crate::Result<u64> {
     // Physical bytes: charging the logical length would keep a tight-space
     // compaction's freed prefix on the quota forever, so under
@@ -467,12 +472,13 @@ pub(crate) fn full_compaction_demand_bytes(version: &Version) -> u64 {
 /// [`StorageStats::avg_value_bytes`] is forced to `None`. Key bytes are never
 /// separated, so [`StorageStats::avg_key_bytes`] stays exact either way.
 ///
-/// `used_bytes` is the true on-disk file size of every live table and blob
-/// file (one metadata stat per file), not the writer's `Metadata::file_size`
-/// or `crate::version::Version::blob_files`' compressed-payload sum: those
-/// undercount the physical file by the meta block / footer / blob trailer.
-/// Statting matches the figure `Tree::create_checkpoint` reports, so the two
-/// agree on disk reality.
+/// `used_bytes` is the true on-disk footprint of every live table and blob file
+/// (one stat per file), not the writer's `Metadata::file_size` or
+/// `crate::version::Version::blob_files`' compressed-payload sum: those
+/// undercount the physical file by the meta block / footer / blob trailer. It
+/// covers the same files `Tree::create_checkpoint` totals, but measures them
+/// physically rather than logically, so the two differ by the holes a
+/// tight-space reclaim punched and agree everywhere else.
 ///
 /// # Errors
 ///

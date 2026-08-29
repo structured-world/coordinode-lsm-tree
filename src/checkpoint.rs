@@ -197,7 +197,7 @@ pub fn link_or_copy_cross_fs(
         let dst_file = dst_fs.open(dst, &FsOpenOptions::new().read(true).write(true))?;
         FsFile::sync_all_with(&*dst_file, sync_mode)?;
         drop(dst_file);
-        return crate::file::on_disk_bytes(&**dst_fs, dst).map_err(Into::into);
+        return Ok(dst_fs.metadata(dst)?.len);
     }
 
     if shared_namespace {
@@ -214,9 +214,15 @@ pub fn link_or_copy_cross_fs(
             // for `CheckpointInfo::total_bytes` to match on-disk reality
             // (asserted by `checkpoint_info_total_bytes_matches_disk`).
             // One extra stat per linked file is cheap relative to the
-            // link itself. A LINK shares the inode, so a punched table is
-            // counted by what it really occupies, matching `storage_stats`.
-            Ok(()) => return crate::file::on_disk_bytes(&**dst_fs, dst).map_err(Into::into),
+            // link itself.
+            //
+            // LOGICAL length, which is what `CheckpointInfo` documents and what
+            // a restore of this snapshot costs. Counting a sparse file's
+            // allocated blocks instead would make the SAME checkpoint report
+            // different totals depending on whether it was linked or streamed
+            // to another filesystem, since the streamed copy materializes the
+            // holes.
+            Ok(()) => return Ok(dst_fs.metadata(dst)?.len),
             Err(e)
                 if crate::fs::is_cross_device(&e)
                     || e.kind() == crate::io::ErrorKind::Unsupported

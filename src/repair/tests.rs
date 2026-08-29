@@ -4896,15 +4896,16 @@ fn storage_stats_and_checkpoint_agree_on_a_restricted_tree() -> crate::Result<()
 
     let cp_dir = root.join("checkpoint");
     let info = tree.create_checkpoint(&cp_dir)?;
-    // Both surfaces measure PHYSICAL bytes, so they agree wherever the
-    // checkpoint shares the source's extents. This backend has no inodes and
-    // copies instead of linking, which materializes the punched prefix as
-    // zeros in the copy, so the checkpoint is larger by exactly that hole and
-    // by nothing else: the sidecar is counted on both sides.
+    // The two surfaces cover the same FILES but measure them differently on
+    // purpose: usage is physical (a punched prefix must leave the quota), the
+    // checkpoint total is logical (that is what restoring the snapshot costs).
+    // So they differ by exactly the punched hole and by nothing else, which is
+    // what proves the live sidecar is counted on BOTH sides.
     let len = memfs.metadata(&sst)?.len;
-    let materialized_hole = len - memfs.allocated_size(&sst)?.unwrap_or(len);
+    let punched = len - memfs.allocated_size(&sst)?.unwrap_or(len);
+    assert!(punched > 0, "the fixture's prefix is punched");
     assert_eq!(
-        stats.used_bytes + materialized_hole,
+        stats.used_bytes + punched,
         info.total_bytes,
         "both surfaces count the restricted table's live sidecar",
     );
@@ -17007,6 +17008,82 @@ fn a_restricted_table_with_a_routed_duplicate_still_opens() -> crate::Result<()>
         tree.get(b"key000150", crate::MAX_SEQNO)?.as_deref(),
         Some(&[b'L'; 64][..]),
         "the restricted table must still be served with a duplicate present",
+    );
+    Ok(())
+}
+
+/// Removing an unreferenced blob file must make the directory entry's removal
+/// DURABLE. Without the fsync a power loss after the repair reports success can
+/// restore the entry, handing the next open an orphan under exactly the
+/// tight-space conditions repair exists to relieve.
+///
+/// Proved by faulting the directory sync: the removal path is only reached when
+/// the sync is actually attempted, so a repair that ignores the fault is one
+/// that never synced.
+#[test]
+fn repair_syncs_the_blobs_directory_after_removing_an_unreferenced_file() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db_blob_dir_sync")?;
+    let kv = || Some(KvSeparationOptions::default().separation_threshold(16));
+
+    {
+        let tree = match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(kv())
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        tree.insert(b"k0", alloc::vec![b'x'; 64], 0);
+        tree.flush_active_memtable(0)?;
+    }
+
+    let orphan = root.join(crate::file::BLOBS_FOLDER).join("1");
+    let mut w = crate::vlog::blob_file::writer::Writer::new(&orphan, 1, 0, &*fs_dyn)?;
+    w.write(b"z", 9, &[b'z'; 300])?;
+    w.finish()?;
+
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    let fault = FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        FaultRule::new(
+            FaultOp::SyncDirectory,
+            Fault::Error(ErrorKind::PermissionDenied),
+        )
+        .on_path(crate::file::BLOBS_FOLDER),
+    );
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .with_kv_separation(kv())
+    .repair();
+    assert!(
+        result.is_err(),
+        "a repair that cannot make the removal durable must not report success: {result:?}",
     );
     Ok(())
 }
