@@ -3340,26 +3340,12 @@ impl Config {
         let retry = self.clone();
         match self.open() {
             Ok(tree) => Ok((tree, None)),
-            // A ROUTED tree's `Unrecoverable` is ambiguous, not positively
-            // structural: route provenance is not persisted, so a table
-            // missing from a routed folder is indistinguishable from a
-            // same-level route path change or a temporarily unmounted tier —
-            // and a rebuild would commit a manifest omitting every SST still
-            // sitting on the old route, which the next open then sweeps as
-            // orphans. Propagate; the operator verifies the route
-            // configuration and invokes `repair` explicitly.
-            Err(e @ crate::Error::Unrecoverable) if retry.level_routes.is_some() => Err(e),
             Err(e) if is_repairable_structural(&e) => {
                 let report =
                     retry.repair_with_resurrection(policy.salvage, policy.allow_resurrection)?;
                 // The follow-up open's failure must not DROP the report: the
                 // repair is committed, so the caller's retry opens a healthy
-                // tree without a repair and answers `None` — and an
-                // external-WAL consumer would never learn the replay
-                // obligation the report carries. Ship it WITH the error.
-                // The follow-up open's failure must not DROP the report: the
-                // repair is committed, so the caller's retry opens a healthy
-                // tree without a repair and answers `None` — and an
+                // tree without a repair and answers `None`, and an
                 // external-WAL consumer would never learn the replay
                 // obligation the report carries. Ship it WITH the error.
                 let tree = match retry.open() {
@@ -3410,8 +3396,15 @@ fn is_repairable_structural(e: &crate::Error) -> bool {
                 | crate::io::ErrorKind::InvalidData
                 | crate::io::ErrorKind::UnexpectedEof
         ),
-        Error::Unrecoverable
-        | Error::Decompress(_)
+        // `Unrecoverable` is deliberately ABSENT: it is the catch-all for
+        // "cannot classify", the opposite of positive evidence of a structural
+        // defect. Repairing on it rebuilds the manifest from whatever the
+        // current configuration happens to scan, and since route provenance
+        // is not persisted, a routed store reopened with its `level_routes`
+        // omitted presents exactly that way, so the rebuild would drop every
+        // SST on the unscanned tiers. An operator who has verified the
+        // configuration can still invoke `repair` explicitly.
+        Error::Decompress(_)
         | Error::Excised { .. }
         | Error::ChecksumMismatch { .. }
         | Error::HeaderCrcMismatch { .. }

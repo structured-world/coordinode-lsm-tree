@@ -1130,3 +1130,58 @@ fn a_rejected_routed_copy_is_swept_once_a_winner_is_found() -> lsm_tree::Result<
     );
     Ok(())
 }
+
+/// Route provenance is NOT persisted, so a configuration without
+/// `level_routes` cannot prove the store was never routed. Reopening a routed
+/// tree with the routes accidentally omitted therefore looks exactly like a
+/// corrupt store: only the primary folder is scanned and the manifest's
+/// off-route SSTs are missing. Auto-repair must not act on that: it would
+/// commit a manifest omitting every table still sitting on the unscanned
+/// tiers, which the next open then sweeps as orphans.
+#[test]
+fn open_or_repair_refuses_when_omitted_routes_cannot_be_ruled_out() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    {
+        let tree = three_tier_config(dir.path()).open()?;
+        tree.insert("a", "value_a", 1);
+        tree.flush_active_memtable(0)?;
+    }
+    let hot_tables = dir.path().join("hot").join("tables");
+    let routed: Vec<std::path::PathBuf> = std::fs::read_dir(&hot_tables)?
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.is_file())
+        .collect();
+    assert!(!routed.is_empty(), "the flush wrote a routed table");
+
+    // The SAME tree, reopened with the routes left out of the configuration.
+    let no_routes = || {
+        Config::new(
+            dir.path().join("primary"),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+    };
+    let result = no_routes().open_or_repair(lsm_tree::RepairPolicy::default().salvage(true));
+    assert!(
+        result.is_err(),
+        "an ambiguous failure must be reported, not repaired away: {:?}",
+        result.map(|_| "opened"),
+    );
+    for path in &routed {
+        assert!(
+            path.try_exists()?,
+            "the off-route table must survive: {}",
+            path.display(),
+        );
+    }
+
+    // With the routes back, the tree opens without any repair at all.
+    let (_, repaired) =
+        three_tier_config(dir.path()).open_or_repair(lsm_tree::RepairPolicy::default())?;
+    assert!(
+        repaired.is_none(),
+        "the store was healthy all along; only the configuration was wrong",
+    );
+    Ok(())
+}
