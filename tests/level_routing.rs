@@ -1084,3 +1084,49 @@ fn a_damaged_duplicate_does_not_block_the_intact_routed_copy() -> lsm_tree::Resu
     );
     Ok(())
 }
+
+/// A copy rejected by the digest must not survive the open. Left on disk, it
+/// becomes the ONLY sighting of its id once the authoritative route is removed
+/// or temporarily unmounted: arbitration is then skipped and the stale
+/// generation is served instead of the missing route being reported.
+#[test]
+fn a_rejected_routed_copy_is_swept_once_a_winner_is_found() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let other = tempfile::tempdir()?;
+
+    {
+        let tree = three_tier_config(dir.path()).open()?;
+        tree.insert("a", "fresh", 1);
+        tree.flush_active_memtable(0)?;
+    }
+    {
+        let tree = three_tier_config(other.path()).open()?;
+        tree.insert("a", "stale", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    let routed = |base: &std::path::Path| -> std::path::PathBuf {
+        std::fs::read_dir(base.join("hot").join("tables"))
+            .expect("read hot tier")
+            .map(|e| e.expect("entry").path())
+            .find(|p| p.is_file())
+            .expect("the flush wrote a routed table")
+    };
+    let twin = routed(other.path());
+    let id = twin.file_name().expect("table file name").to_owned();
+    let displaced = dir.path().join("primary").join("tables").join(&id);
+    std::fs::copy(&twin, &displaced)?;
+
+    let tree = three_tier_config(dir.path()).open()?;
+    assert_eq!(
+        tree.get("a", lsm_tree::SeqNo::MAX)?.as_deref(),
+        Some(&b"fresh"[..]),
+        "the copy the manifest digested wins",
+    );
+    assert!(
+        !displaced.exists(),
+        "the rejected copy must be swept, or a later open with the winning route \
+         absent would serve it as the only sighting",
+    );
+    Ok(())
+}

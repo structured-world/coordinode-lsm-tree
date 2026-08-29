@@ -4657,6 +4657,21 @@ impl Tree {
         // skipped rather than orphan-deleted.
         let mut recovered_table_ids: crate::HashSet<TableId> = crate::HashSet::default();
         let mut orphaned_tables: Vec<(crate::path::PathBuf, Arc<dyn crate::fs::Fs>)> = vec![];
+        // Copies the digest PROVED stale. Left on disk they are worse than
+        // clutter: once the winning route is removed or temporarily unmounted,
+        // such a file is the only sighting of its id, arbitration is skipped
+        // for want of a duplicate, and the stale generation is served instead
+        // of the missing route being reported. They are swept only after a
+        // winner for that id is established, so a scan that never finds one
+        // keeps every copy it has.
+        let mut rejected_copies: Vec<(TableId, crate::path::PathBuf, Arc<dyn crate::fs::Fs>)> =
+            Vec::new();
+        // Where an ambiguous id was accepted from, so a LATER sighting of it can
+        // be judged against the winner rather than merely skipped.
+        let mut accepted_copies: crate::HashMap<
+            TableId,
+            (crate::path::PathBuf, Arc<dyn crate::fs::Fs>),
+        > = crate::HashMap::default();
         // First recovery failure per manifest id, kept until a later routed
         // folder yields a copy that opens. Whatever is left once every folder
         // is scanned is a table the manifest names and no copy delivers, so
@@ -5067,8 +5082,15 @@ impl Tree {
                                     expected: checksum,
                                 },
                             );
+                            rejected_copies.push((
+                                table_id,
+                                table_file_path,
+                                Arc::clone(folder_fs),
+                            ));
                             continue;
                         }
+                        accepted_copies
+                            .insert(table_id, (table_file_path.clone(), Arc::clone(folder_fs)));
                     }
 
                     tables.push(table);
@@ -5080,8 +5102,29 @@ impl Tree {
                     }
                 } else if recovered_table_ids.contains(&table_id) {
                     // Duplicate sighting of an already-recovered manifest table
-                    // (e.g., via symlink or case-insensitive alias). Skip it —
-                    // do NOT treat as orphan or the live SST will be deleted.
+                    // (e.g., via symlink or case-insensitive alias). Never an
+                    // orphan: that would delete the live SST. But an id the
+                    // digest arbitrated has a KNOWN answer, so a later sighting
+                    // is judged rather than merely skipped, or a stale twin
+                    // scanned after the winner would outlive the open.
+                    let stale = match accepted_copies.get(&table_id) {
+                        Some((winner, winner_fs)) if *winner != table_file_path => {
+                            differs_byte_for_byte(
+                                &**winner_fs,
+                                winner,
+                                folder_fs.as_ref(),
+                                &table_file_path,
+                            )?
+                        }
+                        _ => false,
+                    };
+                    if stale {
+                        rejected_copies.push((
+                            table_id,
+                            table_file_path.clone(),
+                            Arc::clone(folder_fs),
+                        ));
+                    }
                     log::warn!(
                         "Skipping duplicate sighting of manifest table {table_id} in {}",
                         table_file_path.display(),
@@ -5217,6 +5260,28 @@ impl Tree {
         // latest version id has no file of its own under the incremental
         // manifest, so cleaning by it would delete the live snapshot.
         Self::cleanup_orphaned_version(tree_path, snapshot_id, &*config.fs)?;
+
+        // A copy the digest rejected goes only once its id has a winner: with
+        // one it is provably superseded, without one it may be all that is
+        // left. Its `.restrict-bound` companion goes with it, or the next scan
+        // classifies that name as foreign and fails the open.
+        for (table_id, path, copy_fs) in rejected_copies {
+            if !recovered_table_ids.contains(&table_id) {
+                continue;
+            }
+            log::warn!(
+                "Removing superseded copy of table {table_id}: {}",
+                path.display()
+            );
+            #[cfg(feature = "std")]
+            {
+                let companion = crate::restrict_bound::sidecar_path(&path);
+                if copy_fs.exists(&companion)? {
+                    Self::sweep_artifact(copy_fs.as_ref(), &companion)?;
+                }
+            }
+            Self::sweep_artifact(copy_fs.as_ref(), &path)?;
+        }
 
         for (table_path, orphan_fs) in orphaned_tables {
             log::debug!("Deleting orphaned table {}", table_path.display());
@@ -5363,6 +5428,39 @@ fn has_existing_version_state(folder: &Path, fs: &dyn Fs) -> crate::Result<bool>
         }
     }
     Ok(false)
+}
+
+/// Whether two sightings of one table id PROVABLY hold different bytes.
+///
+/// Used to judge a duplicate scanned after its id was already accepted: the
+/// winner matched the manifest, so a copy whose bytes differ from it cannot
+/// also be the committed generation and is safe to sweep. Identical bytes mean
+/// an alias or an exact copy, which is kept.
+///
+/// Only a completed comparison is proof. A read that fails on the BYTES proves
+/// nothing about which generation this is, so it answers `false` and the file
+/// stays; an ENVIRONMENTAL fault propagates, since a retry can re-read it.
+///
+/// # Errors
+///
+/// Propagates an environmental read failure of either file.
+fn differs_byte_for_byte(
+    winner_fs: &dyn crate::fs::Fs,
+    winner: &Path,
+    candidate_fs: &dyn crate::fs::Fs,
+    candidate: &Path,
+) -> crate::Result<bool> {
+    let digest = |fs: &dyn crate::fs::Fs, path: &Path| -> crate::Result<Option<u128>> {
+        match crate::file::checksum_from_with_overrides(fs, path, 0, &[]) {
+            Ok(d) => Ok(Some(d)),
+            Err(e) if e.is_environmental() => Err(e),
+            Err(_) => Ok(None),
+        }
+    };
+    let (Some(a), Some(b)) = (digest(winner_fs, winner)?, digest(candidate_fs, candidate)?) else {
+        return Ok(false);
+    };
+    Ok(a != b)
 }
 
 /// Raises a query's lower bound to a table's tight-space restriction, if any.
