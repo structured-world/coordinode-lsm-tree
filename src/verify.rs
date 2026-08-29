@@ -197,24 +197,25 @@ pub fn verify_integrity(tree: &impl crate::AbstractTree) -> IntegrityReport {
         let start = match table.restrict_lower_bound() {
             Some(bound) => match table.punch_offset_for(bound) {
                 Ok(offset) => offset,
-                // A TRANSIENT index-read failure (EINTR / EAGAIN) while resolving
-                // the punch offset is retryable I/O, not corruption: falling back
-                // to `0` would digest the hole-punched prefix and report a healthy
-                // restricted table as corrupted. Mirror `scan_one_table`, which
-                // routes the same transient failure to an unreadable/IoError
-                // classification and skips the checksum comparison.
-                Err(crate::Error::Io(error)) if error.kind().is_transient() => {
+                // An ENVIRONMENTAL index-read failure (a retryable EINTR /
+                // EAGAIN, but equally a refused mount, an exhausted allocator,
+                // a missing key) says nothing about the bytes: falling back to
+                // `0` would digest the hole-punched prefix and report a healthy
+                // restricted table as corrupted once the condition clears.
+                // Mirror `scan_one_table`, which routes the same failure to an
+                // unreadable/IoError classification and skips the comparison.
+                Err(e) if e.is_environmental() => {
                     report.errors.push(IntegrityError::IoError {
                         path: (*table.path).clone(),
-                        error,
+                        error: environmental_as_io(e),
                     });
                     report.sst_files_checked += 1;
                     continue;
                 }
-                // A PERSISTENT I/O failure (`Other` / EIO) and a STRUCTURAL
-                // failure both fall back to `0` (fail closed): the whole-file
-                // digest then mismatches and the table is reported rather than
-                // silently passing.
+                // A failure on the DATA (a bad sector surfacing as `Other` /
+                // EIO) and a STRUCTURAL failure both fall back to `0` (fail
+                // closed): the whole-file digest then mismatches and the table
+                // is reported rather than silently passing.
                 Err(_) => 0,
             },
             None => 0,
@@ -611,6 +612,22 @@ impl VerifyOptions {
 }
 
 /// Merges a per-SST partial report into an accumulator.
+/// Renders an ENVIRONMENTAL error into the `io::Error` the integrity reports
+/// carry, keeping the original kind when there is one.
+///
+/// The non-I/O environmental causes (a missing key, a missing dictionary) have
+/// no kind of their own; their message is preserved instead of being flattened
+/// into a decode failure, which a reader would take as evidence about the data.
+fn environmental_as_io(e: crate::Error) -> io::Error {
+    match e {
+        crate::Error::Io(io) => io,
+        other => io::Error::new(
+            io::ErrorKind::Other,
+            alloc::string::ToString::to_string(&other),
+        ),
+    }
+}
+
 fn merge_report(dst: &mut BlockVerifyReport, src: BlockVerifyReport) {
     dst.sst_files_scanned += src.sst_files_scanned;
     dst.blocks_scanned += src.blocks_scanned;
@@ -679,22 +696,22 @@ fn scan_one_table(table: &crate::table::Table) -> BlockVerifyReport {
     // to different SSTs), so feed each table's `max_overhead()` separately.
     let max_enc_overhead = table.encryption.as_ref().map_or(0u32, |e| e.max_overhead());
     // A restricted view digests / walks only its live suffix: skip the punched
-    // data-block prefix. A TRANSIENT punch-offset lookup failure (a flaky
-    // partitioned-index read: EINTR / EAGAIN) is recorded as an unreadable-file
-    // I/O error and the walk is skipped — falling back to `0` would walk the
-    // hole-punched prefix and report its zeroed blocks as a false whole-file
-    // checksum mismatch on a healthy restricted table. A PERSISTENT I/O failure
-    // (`Other` / EIO, not retryable) and a STRUCTURAL lookup failure both fall
-    // back to `0` (walk everything, fail closed) so an unresolvable or corrupt
-    // index cannot exempt blocks.
+    // data-block prefix. An ENVIRONMENTAL punch-offset lookup failure (a flaky
+    // partitioned-index read, a refused mount, an exhausted allocator, a
+    // missing key) is recorded as an unreadable-file I/O error and the walk is
+    // skipped — falling back to `0` would walk the hole-punched prefix and
+    // report its zeroed blocks as a false whole-file checksum mismatch on a
+    // healthy restricted table. A failure on the DATA (`Other` / EIO) and a
+    // STRUCTURAL lookup failure both fall back to `0` (walk everything, fail
+    // closed) so an unresolvable or corrupt index cannot exempt blocks.
     let data_start = match table.restrict_lower_bound() {
         Some(bound) => match table.punch_offset_for(bound) {
             Ok(offset) => offset,
-            Err(crate::Error::Io(error)) if error.kind().is_transient() => {
+            Err(e) if e.is_environmental() => {
                 report.errors.push(BlockVerifyError::SstFileUnreadable {
                     table_id,
                     path: path.to_path_buf(),
-                    error,
+                    error: environmental_as_io(e),
                 });
                 return report;
             }
@@ -955,14 +972,29 @@ pub(crate) fn verify_sst_file_with_context(
     // A caller-known punch offset wins; with none, derive the live frontier of
     // a possibly-RESTRICTED SST from its colocated sidecar so a standalone
     // walk does not condemn the intentionally punched prefix as corruption.
-    let data_start = if data_start == 0 {
+    let derived = if data_start == 0 {
         restricted_data_start(fs, path, encryption, known_table_id)
     } else {
-        data_start
+        Ok(data_start)
     };
     let mut report = BlockVerifyReport {
         sst_files_scanned: 1,
         ..BlockVerifyReport::default()
+    };
+    // Reading the sidecar can fail for reasons that say nothing about the SST
+    // (a refused mount, an exhausted allocator, a missing key). Walking from
+    // `0` then condemns the intentionally punched prefix of a healthy
+    // restricted table, so the walk is skipped and the cause reported instead.
+    let data_start = match derived {
+        Ok(offset) => offset,
+        Err(e) => {
+            report.errors.push(BlockVerifyError::SstFileUnreadable {
+                table_id,
+                path: path.to_path_buf(),
+                error: environmental_as_io(e),
+            });
+            return report;
+        }
     };
 
     // SST blocks omit the block_flags byte, so the parity-trailer presence and
@@ -1283,12 +1315,19 @@ fn read_ecc_params_out_of_band(
 /// default). An ENCRYPTED sidecar with no provider reads as corrupt and also
 /// falls back — encrypted restricted SSTs need the provider-carrying path.
 #[cfg(feature = "std")]
+///
+/// # Errors
+///
+/// Propagates an ENVIRONMENTAL sidecar-read failure. Answering `0` for one
+/// would send the walk over a healthy restricted table's punched prefix and
+/// report its zeros as corruption; every other outcome (no sidecar, a
+/// malformed one, an unreadable file) still answers `0`.
 fn restricted_data_start(
     fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
     path: &std::path::Path,
     encryption: Option<&alloc::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
     known_table_id: Option<crate::TableId>,
-) -> u64 {
+) -> crate::Result<u64> {
     // The frontier is derived by WALKING THE FRAMES, never by searching for
     // zero runs at arbitrary byte positions. A punch reclaims whole blocks, so
     // a reclaimed region is exactly a run of block extents that read as zeros —
@@ -1309,7 +1348,10 @@ fn restricted_data_start(
         {
             bound
         }
-        _ => return 0,
+        // Whether this SST is restricted at all is now unknown; answering `0`
+        // would walk a punched prefix as live data.
+        Err(e) if e.is_environmental() => return Err(e),
+        _ => return Ok(0),
     };
     // Where that bound actually falls, read from the table's own index. This is
     // the only authority on the frontier: a committed restriction does NOT make
@@ -1320,18 +1362,21 @@ fn restricted_data_start(
     // standalone path cannot know a custom comparator, so an index lookup that
     // lands too high can never widen the skip beyond what the geometry shows.
     let index_frontier = index_derived_frontier(fs, path, encryption, expected_id, &bound);
+    // An open / metadata failure here needs no classification: the walk opens
+    // the same file and reports the real cause, so it never reaches the
+    // prefix to misjudge it.
     let Ok(mut file) = fs.open(path, &crate::fs::FsOpenOptions::new().read(true)) else {
-        return 0;
+        return Ok(0);
     };
     let Ok(meta) = crate::fs::FsFile::metadata(&*file) else {
-        return 0;
+        return Ok(0);
     };
     let file_len = meta.len;
     // Scan only the DATA section: other sections legitimately contain long
     // zero stretches (padding, sparse index entries) that must not move the
     // data frontier. Without a readable TOC there is no section to scan.
     let Ok(reader) = crate::sfa::Reader::from_reader(&mut file) else {
-        return 0;
+        return Ok(0);
     };
     let Some((data_pos, data_len)) = reader
         .toc()
@@ -1339,7 +1384,7 @@ fn restricted_data_start(
         .find(|e| e.name() == b"data")
         .map(|e| (e.pos(), e.len()))
     else {
-        return 0;
+        return Ok(0);
     };
     let data_end = data_pos.saturating_add(data_len).min(file_len);
     let mut offset = data_pos;
@@ -1352,7 +1397,7 @@ fn restricted_data_start(
         if let Some(header) = block_header_at(&*file, offset) {
             let step = u64::from(header.on_disk_size());
             if step == 0 {
-                return 0; // Malformed length: refuse to guess a frontier.
+                return Ok(0); // Malformed length: refuse to guess a frontier.
             }
             offset = offset.saturating_add(step);
             continue;
@@ -1385,12 +1430,12 @@ fn restricted_data_start(
     }
     // `data_pos` means no validated punched extent was found: nothing to skip.
     if frontier == data_pos {
-        return 0;
+        return Ok(0);
     }
     // Both answers bound the skip: the index says where the restriction ends,
     // the walk says how far the reclaimed geometry actually reaches. Skipping
     // past either would step over live data.
-    index_frontier.map_or(0, |from_index| from_index.min(frontier))
+    Ok(index_frontier.map_or(0, |from_index| from_index.min(frontier)))
 }
 
 /// The offset the restriction `bound` maps to in this SST's block index, or

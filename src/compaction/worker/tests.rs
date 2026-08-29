@@ -2845,3 +2845,67 @@ fn tight_space_declines_when_punching_inputs_frees_the_wrong_volume() -> crate::
     }
     Ok(())
 }
+
+/// A standalone walk learns a table is RESTRICTED from its `.restrict-bound`
+/// sidecar. When reading that sidecar fails for a reason that says nothing
+/// about the SST — a refused mount, an exhausted allocator — answering "not
+/// restricted" sends the walk over the intentionally punched prefix and
+/// reports its zeros as corruption on a HEALTHY table. The condition is the
+/// operator's to fix, so it must be reported as what it is.
+#[test]
+fn a_refused_sidecar_read_is_reported_not_walked_as_corruption() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs};
+    use crate::io::ErrorKind;
+
+    let dir = tempfile::tempdir()?;
+    let capacity = capfs::CapacityFs::new();
+    let fault = FaultFs::new(capacity.clone());
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+    let reopened = tight_space_crash_and_reopen(
+        dir.path(),
+        Arc::clone(&fs),
+        |used| capacity.set_available_space(used / 4),
+        || capacity.punched_bytes(),
+    )?;
+    let version = reopened.current_version();
+    let Some(restricted) = version
+        .iter_tables()
+        .find(|t| t.restrict_lower_bound().is_some())
+    else {
+        panic!("the punched input must reopen as a restricted table");
+    };
+    let path = (*restricted.path).clone();
+
+    // Baseline: with the sidecar readable the walk skips the punched prefix,
+    // so the healthy table verifies clean. That is what the faulted run must
+    // not diverge from by inventing corruption.
+    let clean = crate::verify::verify_sst_file_with_fs(&fs, &path);
+    assert!(
+        clean.errors.is_empty(),
+        "a legitimately punched table verifies clean: {:?}",
+        clean.errors,
+    );
+
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path(".restrict-bound"),
+    );
+    let report = crate::verify::verify_sst_file_with_fs(&fs, &path);
+    injector.clear();
+
+    assert!(
+        !report.errors.is_empty(),
+        "the refused read must be reported at all: {report:?}",
+    );
+    assert!(
+        report
+            .errors
+            .iter()
+            .all(|e| matches!(e, crate::verify::BlockVerifyError::SstFileUnreadable { .. })),
+        "a refused sidecar read must be reported, not turned into corruption \
+         findings over the punched prefix: {:?}",
+        report.errors,
+    );
+    Ok(())
+}
