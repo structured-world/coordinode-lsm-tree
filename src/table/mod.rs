@@ -289,7 +289,8 @@ impl core::fmt::Debug for Table {
 /// [`Table::seqno_visibility`]. Drives whether the tree-level columnar scan can
 /// stream a segment verbatim ([`All`](Self::All)) or must apply a per-row seqno
 /// mask ([`Partial`](Self::Partial)); [`None`](Self::None) segments are dropped.
-#[cfg(feature = "columnar")]
+/// The range estimators use the same classification to skip a table a read at
+/// that snapshot would return nothing from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SeqnoVisibility {
     /// No row is visible at the snapshot (the SST postdates it).
@@ -456,7 +457,6 @@ impl Table {
     /// only a flush-produced multi-seqno SST whose seqno range straddles the
     /// snapshot is [`Partial`](SeqnoVisibility::Partial), which the tree-level
     /// columnar scan resolves with a per-row seqno mask.
-    #[cfg(feature = "columnar")]
     pub(crate) fn seqno_visibility(&self, seqno: SeqNo) -> SeqnoVisibility {
         // Translate the query snapshot into this table's local seqno space; a
         // snapshot below the base predates every row.

@@ -1190,6 +1190,14 @@ impl AbstractTree for Tree {
             let Some(table_seqno) = seqno.checked_sub(table.global_seqno()) else {
                 continue;
             };
+            // The translation alone is not the visibility rule: a table with
+            // `global_seqno == 0` passes it whatever its entries hold, so one
+            // holding nothing but seqno 100 would charge rows and bytes to a
+            // query at seqno 50 that reads none of them. Ask the same
+            // classification the read path uses.
+            if table.seqno_visibility(seqno) == crate::table::SeqnoVisibility::None {
+                continue;
+            }
 
             // data_end = the data section's byte extent = last data block's end.
             let Some(last) = table.block_index.iter().next_back() else {
@@ -1360,6 +1368,11 @@ impl AbstractTree for Tree {
             let Some(table_seqno) = seqno.checked_sub(table.global_seqno()) else {
                 continue;
             };
+            // Wholly above the snapshot: invisible to a read at `seqno`, so it
+            // contributes nothing here either (mirrors approximate_range_stats).
+            if table.seqno_visibility(seqno) == crate::table::SeqnoVisibility::None {
+                continue;
+            }
             // Honor a tight-space restricted view: keys below
             // `restrict_lower_bound()` are the punched-out prefix served by the
             // replacement table, so raise this table's effective lower bound to
