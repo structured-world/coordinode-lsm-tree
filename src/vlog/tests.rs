@@ -406,3 +406,108 @@ fn recovery_refuses_when_no_blob_duplicate_matches_the_manifest() {
          the wrong generation and delete the other",
     );
 }
+
+/// A blob file's tight-space punch can be deferred by a checkpoint's hard link
+/// exactly as a table's. That intent lives only in the running tree's queue, so
+/// after a restart the manifest still recovers the blob with a positive
+/// `live_data_start` while its consumed prefix stays allocated. Recovery
+/// re-derives the table reclaims; it must re-derive the blob ones too.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_reopen_reclaims_a_committed_blob_prefix() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, AnyTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db_blob_reclaim")?;
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(64),
+        ))
+    };
+    {
+        let AnyTree::Blob(tree) = config().open()? else {
+            panic!("expected Blob tree");
+        };
+        for i in 0..64u64 {
+            tree.insert(format!("k{i:05}").as_bytes(), alloc::vec![b'v'; 256], i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let blobs = root.join("blobs");
+    let blob = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("the flush spilled a blob file")
+        .path;
+    let data_start = {
+        let mut file = memfs.open(&blob, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut file)?;
+        reader
+            .toc()
+            .section(b"data")
+            .expect("a blob file has a data section")
+            .pos()
+    };
+    let original = {
+        let mut bytes = Vec::new();
+        memfs
+            .open(&blob, &crate::fs::FsOpenOptions::new().read(true))?
+            .read_to_end(&mut bytes)?;
+        bytes
+    };
+    // The frontier must land on a FRAME boundary, as a real relocation's does:
+    // a punch inside a frame leaves an unparseable record and the file is
+    // rejected outright rather than recovered restricted.
+    let frontier = super::BlobFileScanner::new(&blob, &*memfs, 0)?
+        .next()
+        .expect("the blob file holds at least one frame")?
+        .frame_end;
+
+    // Punch, then rebuild the manifest from the on-disk geometry so the
+    // frontier is COMMITTED, exactly as a completed relocation leaves it.
+    memfs.remove_file(&root.join("current"))?;
+    memfs.punch_hole(&blob, data_start, frontier - data_start)?;
+    config().repair()?;
+
+    // Now restore the prefix bytes: the manifest still says the prefix is
+    // consumed, but the blocks are allocated again, which is the shape a
+    // deferred punch leaves after a restart.
+    {
+        let mut file = memfs.open(&blob, &crate::fs::FsOpenOptions::new().write(true))?;
+        file.seek(SeekFrom::Start(data_start))?;
+        let end = usize::try_from(frontier).expect("test offsets fit usize");
+        let begin = usize::try_from(data_start).expect("test offsets fit usize");
+        file.write_all(original.get(begin..end).expect("prefix in range"))?;
+        file.flush()?;
+    }
+    let allocated_before = memfs
+        .allocated_size(&blob)?
+        .expect("MemFs reports allocation");
+
+    let AnyTree::Blob(tree) = config().open()? else {
+        panic!("expected Blob tree");
+    };
+    let allocated_after = memfs
+        .allocated_size(&blob)?
+        .expect("MemFs reports allocation");
+    assert!(
+        allocated_after < allocated_before,
+        "the reopen must re-derive the blob's punch intent \
+         (allocated {allocated_before} before, {allocated_after} after)",
+    );
+    assert!(
+        tree.get(b"k00063", crate::MAX_SEQNO)?.is_some(),
+        "the live suffix must still be served",
+    );
+    Ok(())
+}

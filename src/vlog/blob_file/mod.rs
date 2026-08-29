@@ -251,9 +251,8 @@ impl Drop for Inner {
                 // re-probes the link count and punches once the checkpoint's
                 // window closes.
                 if off != u64::MAX {
-                    let extent = match data_section_start(&*self.fs, &self.path) {
-                        Ok(data_start) if off > data_start => Some((data_start, off - data_start)),
-                        Ok(_) => None, // nothing consumed below the data start
+                    let extent = match reclaimable_prefix(&*self.fs, &self.path, off) {
+                        Ok(extent) => extent,
                         Err(e) => {
                             log::warn!(
                                 "Skipping tight-space punch of blob file {:?} at {}: could not read data section: {e:?}",
@@ -327,6 +326,27 @@ impl Drop for Inner {
 /// Byte offset where a blob file's `data` section begins, read from its SFA TOC.
 /// Used by the tight-space punch so it reclaims only data frames and never the
 /// SFA header that precedes them.
+/// The extent a reclaim frees when everything below `live_up_to` is consumed:
+/// `[data section start, live_up_to)`, or `None` when nothing lies below it.
+///
+/// The two callers are the punch-on-drop of a superseded view and recovery's
+/// re-derivation of a reclaim a previous session could not finish; sharing the
+/// arithmetic keeps them from disagreeing about where the reclaimable region
+/// begins.
+///
+/// # Errors
+///
+/// Propagates the TOC read of `path`.
+#[cfg(feature = "std")]
+fn reclaimable_prefix(
+    fs: &dyn Fs,
+    path: &Path,
+    live_up_to: u64,
+) -> crate::Result<Option<(u64, u64)>> {
+    let data_start = data_section_start(fs, path)?;
+    Ok((live_up_to > data_start).then(|| (data_start, live_up_to - data_start)))
+}
+
 #[cfg(feature = "std")]
 fn data_section_start(fs: &dyn Fs, path: &Path) -> crate::Result<u64> {
     let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
@@ -460,6 +480,24 @@ impl BlobFile {
     #[must_use]
     pub fn live_data_start(&self) -> u64 {
         self.0.live_data_start
+    }
+
+    /// The extent this view's committed frontier declares consumed, or `None`
+    /// when nothing is.
+    ///
+    /// Recovery uses it to re-derive a reclaim a previous session could not
+    /// finish: the punch intent lived only in that session's queue, and the
+    /// superseded view able to re-arm it is gone after a restart, so a blob
+    /// prefix a checkpoint's link once deferred would otherwise stay allocated
+    /// for the life of the recovered file. Nothing is persisted for this; the
+    /// extent follows from `live_data_start`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the TOC read of the file.
+    #[cfg(feature = "std")]
+    pub(crate) fn committed_reclaimable_prefix(&self) -> crate::Result<Option<(u64, u64)>> {
+        reclaimable_prefix(&*self.0.fs, &self.0.path, self.0.live_data_start)
     }
 
     /// Returns the full blob file checksum.

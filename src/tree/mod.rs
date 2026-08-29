@@ -4500,6 +4500,29 @@ impl Tree {
                     );
                 }
             }
+            // Blob files carry the same deferred intent, in their committed
+            // frontier rather than a restriction bound.
+            for blob in &recovered_blobs {
+                let extent = match blob.committed_reclaimable_prefix() {
+                    Ok(Some(extent)) => extent,
+                    Ok(None) => continue,
+                    Err(e) if e.is_environmental() => return Err(e),
+                    Err(e) => {
+                        log::warn!(
+                            "blob file {:?} carries a committed frontier whose reclaimable \
+                             extent could not be re-derived ({e}); its consumed prefix stays \
+                             allocated until the next relocation",
+                            blob.id(),
+                        );
+                        continue;
+                    }
+                };
+                deletion_pause.retain_reclaim(
+                    Arc::clone(&blob.0.fs),
+                    blob.0.path.clone(),
+                    alloc::vec![extent],
+                );
+            }
             deletion_pause.retry_pending_reclaims();
         }
 
