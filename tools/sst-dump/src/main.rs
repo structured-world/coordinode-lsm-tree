@@ -405,12 +405,34 @@ fn run_repair(db_dir: &std::path::Path, salvage: bool, tree_type: Option<&str>) 
 
     let report = match config.repair_with_salvage(salvage) {
         Ok(report) => report,
+        // The manifest IS committed here and this report is its only copy: a
+        // retry finds the healthy manifest, runs no repair and produces no
+        // report at all, so discarding it would leave an external-WAL operator
+        // with no lost-coverage or full-history reconciliation instructions.
+        // Print it exactly as a successful repair's, then report the failure.
+        Err(lsm_tree::Error::RepairedButUnopened { report, cause }) => {
+            print_report(&report, db_dir);
+            println!("status:        manifest rebuilt, but reopening it failed");
+            eprintln!("repair committed the manifest but the follow-up open failed: {cause}");
+            return ExitCode::FAILURE;
+        }
         Err(err) => {
             eprintln!("repair failed: {err}");
             return ExitCode::FAILURE;
         }
     };
 
+    print_report(&report, db_dir);
+    println!("status:        manifest rebuilt");
+
+    ExitCode::SUCCESS
+}
+
+/// Prints everything a completed repair reports, including its write-ahead-log
+/// replay obligation. Shared by the success path and the committed-but-unopened
+/// failure, which carries the same report and owes the operator the same
+/// instructions.
+fn print_report(report: &lsm_tree::RepairReport, db_dir: &std::path::Path) {
     println!("db dir:        {}", db_dir.display());
     println!("method:        {}", report.method);
     println!("recovered:     {}", report.recovered);
@@ -428,10 +450,7 @@ fn run_repair(db_dir: &std::path::Path, salvage: bool, tree_type: Option<&str>) 
     for warning in &report.warnings {
         println!("warning:       {warning}");
     }
-    print_wal_replay_obligation(&report);
-    println!("status:        manifest rebuilt");
-
-    ExitCode::SUCCESS
+    print_wal_replay_obligation(report);
 }
 
 /// Prints what an external write-ahead log must replay after this repair.
