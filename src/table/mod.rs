@@ -519,7 +519,7 @@ impl FilterProbe<'_> {
 // and is itself dead there (the verify / scrub callers are std-gated).
 #[cfg_attr(
     not(feature = "std"),
-    allow(
+    expect(
         dead_code,
         reason = "gate-only decode; the verify/scrub consumers are std-gated"
     )
@@ -3001,7 +3001,7 @@ impl Table {
     /// matches its altered value bytes.
     #[cfg_attr(
         not(feature = "std"),
-        allow(
+        expect(
             dead_code,
             reason = "per-KV gate half; the verify/scrub consumers are std-gated"
         )
@@ -3672,9 +3672,8 @@ impl Table {
         }
     }
 
-    /// The per-block half of [`Self::verify_seqno_bounds`]: the recorded range
-    /// must equal the one the block's decoded entries span. Split out so the
-    /// combined reconcile pass runs it on the shared decode.
+    /// The recorded per-block seqno range must equal the one the block's
+    /// decoded entries span.
     #[cfg(feature = "std")]
     fn check_block_seqno_bounds(
         recorded_map: &crate::table::seqno_bounds::SeqnoBoundsMap,
@@ -3700,23 +3699,19 @@ impl Table {
         Ok(())
     }
 
-    /// Fully DECODES every data block and checks its entry count against the
-    /// trailer's declared item count. The out-of-band walk verifies only the
-    /// outer frame, and `verify_kv_checksums` is a no-op for a footer-less
-    /// SST, so a checksum- and parity-consistent block with a valid prefix
-    /// followed by a malformed entry is otherwise graded clean: the entry
-    /// decoder turns a mid-stream parse failure into an ordinary end of
-    /// iteration, so a later scan silently omits the malformed tail. Decoding
-    /// to fewer (or more) entries than the trailer declares is corruption.
-    /// Covers both row-major and columnar blocks.
+    /// Checks a block's declared entry count against the DECODED one. The
+    /// out-of-band walk verifies only the outer frame, and `verify_kv_checksums`
+    /// is a no-op for a footer-less SST, so a checksum- and parity-consistent
+    /// block with a valid prefix followed by a malformed entry is otherwise
+    /// graded clean: the entry decoder turns a mid-stream parse failure into an
+    /// ordinary end of iteration, so a later scan silently omits the malformed
+    /// tail. Decoding to fewer (or more) entries than the trailer declares is
+    /// corruption. Covers both row-major and columnar blocks.
     ///
     /// # Errors
     ///
-    /// [`crate::Error::InvalidHeader`] when a block decodes to a different
-    /// entry count than its trailer declares; any I/O / decode error from the
-    /// full scan.
-    #[cfg(feature = "std")]
-    /// Checks a block's declared entry count against the decoded one.
+    /// [`crate::Error::InvalidHeader`] when the block decodes to a different
+    /// entry count than its trailer declares.
     #[cfg(feature = "std")]
     fn check_block_entry_count(block: &DecodedBlock) -> crate::Result<()> {
         #[cfg(feature = "columnar")]
@@ -3778,8 +3773,8 @@ impl Table {
         Ok(Some(crate::table::zone_map::ZoneMap::decode(&block.data)?))
     }
 
-    /// The per-block half of [`Self::verify_zone_map`], so the combined
-    /// reconcile pass runs it on the shared decode. A columnar block records
+    /// The recorded zone-map entry must match the one the block's decoded
+    /// contents produce. A columnar block records
     /// one entry per stored column, re-derived by the SAME function the writer
     /// used, so any divergence (a re-stamped range, an added / dropped column,
     /// a flipped id) is a forgery; a row block records a single synthetic
@@ -4121,28 +4116,14 @@ impl Table {
         Ok(None)
     }
 
-    /// Cross-checks the recorded `locator` section against the ACTUAL
-    /// key → newest-version-block mapping derived from decoding every data
-    /// block. A checksum- and parity-consistent forged locator is accepted by
-    /// the out-of-band walk on its block role alone, but `point_read_inner`
-    /// trusts its answer and reads the addressed block directly: a locator
-    /// redirected from a key's newest-version block to a LATER block holding
-    /// an OLDER version returns that stale value without falling back to the
-    /// sorted index. A correctly-built locator answers every in-table key
-    /// with the block holding its newest version (the FIRST block covering
-    /// it, since blocks are sorted by key then descending seqno), so any key
-    /// whose locator answer points at a different block is corruption. A
-    /// no-op for tables without the section.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::Error::InvalidHeader`] when a key's locator answer disagrees
-    /// with its decoded newest-version block; any I/O / decode error from the
-    /// full scan.
-    #[cfg(feature = "std")]
     /// Reads the `locator` section FROM DISK and pairs it with the ordinal →
     /// handle map (the writer's `block_id` order is the index order), mirroring
     /// the open path. `None` when the table has no locator.
+    ///
+    /// Read from the file rather than taken from the open table because a
+    /// checksum- and parity-consistent forged locator is accepted by the
+    /// out-of-band walk on its block role alone, while `point_read_inner`
+    /// trusts its answer and reads the addressed block directly.
     ///
     /// # Errors
     ///
@@ -4183,9 +4164,15 @@ impl Table {
         )))
     }
 
-    /// The per-block half of [`Self::verify_locator`], so the combined
-    /// reconcile pass runs it on the shared decode. `seen` carries ACROSS
-    /// blocks: the first block holding a user key holds its newest version, so
+    /// Cross-checks the recorded `locator` section against the ACTUAL
+    /// key → newest-version-block mapping the decode yields. A locator
+    /// redirected from a key's newest-version block to a LATER block holding an
+    /// OLDER version returns that stale value without falling back to the
+    /// sorted index, so any key whose locator answer points at a different
+    /// block than the decode does is corruption.
+    ///
+    /// `seen` carries ACROSS blocks: the first block holding a user key holds
+    /// its newest version (blocks are sorted by key then descending seqno), so
     /// that block is the locator's expected answer and a later block's older
     /// versions must not overwrite the expectation.
     #[cfg(feature = "std")]
@@ -4263,26 +4250,17 @@ impl Table {
     }
 
     /// Confirms every decoded key is RETRIEVABLE through its own block's
-    /// in-block indexes, judged on the DISK-FRESH bytes. A data block's
-    /// embedded HASH INDEX is checksum-clean to the out-of-band walk even
-    /// when a bucket was re-stamped to `MARKER_FREE`: the sequential decode
-    /// gates still see every entry, but `point_read` trusts the index and
-    /// returns `None` for the affected keys. Each block is re-read from the
-    /// file and probed through ITS OWN `point_read` — the table-level probe
-    /// this replaces went through the recovery-time in-memory index and the
-    /// block cache, so a pristine cached copy masked the on-disk forge.
-    /// Filter, locator, and TLI misdirection have their own disk-fresh
-    /// gates (`verify_filter`, `verify_locator`, `verify_tli_mirrors`).
-    /// Columnar blocks carry no in-block key index (rows are reconstructed
-    /// on load), so they have nothing to probe.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::Error::InvalidHeader`] when a decoded key is not retrievable
-    /// from its block; any I/O / decode error from the full scan.
-    #[cfg(feature = "std")]
-    /// Confirms every decoded key is RETRIEVABLE through its own block's
     /// in-block indexes, and that the internal-key sort order holds.
+    ///
+    /// Judged on the DISK-FRESH bytes the walk decoded. A data block's embedded
+    /// HASH INDEX is checksum-clean to the out-of-band walk even when a bucket
+    /// was re-stamped to `MARKER_FREE`: the sequential decode gates still see
+    /// every entry, but `point_read` trusts the index and returns `None` for
+    /// the affected keys. Each block is probed through ITS OWN `point_read` —
+    /// the table-level probe this replaces went through the recovery-time
+    /// in-memory index and the block cache, so a pristine cached copy masked
+    /// the on-disk forge. Filter, locator and TLI misdirection have their own
+    /// disk-fresh gates.
     ///
     /// A columnar block has no in-block key index to probe (rows are
     /// reconstructed on load), but the GLOBAL order (user key ASC, then seqno
@@ -4400,24 +4378,14 @@ impl Table {
         self.rebuildable_section_degraded
     }
 
-    /// Probes every decoded data key against the on-disk `filter` section:
-    /// each key the table holds must be reported as POSSIBLY PRESENT. A
+    /// Reads the `filter` section and everything a probe of it needs, so the
+    /// combined reconcile pass builds the state once and then probes it with
+    /// the shared decode. `None` for a table without a filter.
+    ///
+    /// Read from the file rather than taken from the open table because a
     /// checksum- and parity-consistent forged filter is accepted by the
-    /// out-of-band walk on its framing and role alone — the walk never
-    /// probes it — but `check_bloom` trusts it to SKIP point reads, so a key
-    /// made into a false negative silently disappears from every read. A
-    /// false positive is unprovable (it is the filter's normal error mode),
-    /// but a false NEGATIVE on an existing key is corruption by
-    /// construction. A no-op for tables without a filter.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::Error::InvalidHeader`] when the filter reports an existing
-    /// key as definitely absent; any I/O / decode error from the full scan.
-    #[cfg(feature = "std")]
-    /// Reads the filter section and everything the probe needs, returning
-    /// `None` for a table without one, so the combined reconcile pass can
-    /// shared decode.
+    /// out-of-band walk on its framing and role alone — the walk never probes
+    /// it — while `check_bloom` trusts it to SKIP point reads.
     ///
     /// # Errors
     ///
@@ -4440,17 +4408,7 @@ impl Table {
         if regions.filter.is_none() && regions.filter_tli.is_none() {
             return Ok(None);
         }
-        let filter_transform = {
-            let t = match self.encryption.as_deref() {
-                Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
-                None => crate::table::block::BlockTransform::PLAIN,
-            };
-            if let Some(ecc) = self.metadata.ecc_params {
-                t.with_ecc(ecc)
-            } else {
-                t
-            }
-        };
+        let filter_transform = self.section_transform();
         // Partitioned mode: the partition index maps a key to its filter
         // block. Loaded from disk for the same reason as the filter itself.
         let filter_index = if let Some(idx_handle) = regions.filter_tli {
@@ -4531,8 +4489,11 @@ impl Table {
         }))
     }
 
-    /// The per-block half of [`Self::verify_filter`]: every key the block
-    /// decodes must be reported POSSIBLY PRESENT by the on-disk filter.
+    /// Every key the block decodes must be reported POSSIBLY PRESENT by the
+    /// on-disk filter. A false positive is unprovable (it is the filter's
+    /// normal error mode), but a false NEGATIVE on an existing key is
+    /// corruption by construction: it silently disappears the key from every
+    /// read that consults the filter first.
     #[cfg(feature = "std")]
     fn check_filter_block(probe: &mut FilterProbe<'_>, block: &DecodedBlock) -> crate::Result<()> {
         {
@@ -4649,48 +4610,27 @@ impl Table {
         Ok(crate::table::filter::block::FilterBlock::new(block))
     }
 
-    /// Cross-checks the recorded metadata BOUNDS against the table's decoded
-    /// contents. Both meta mirrors re-stamped CONSISTENTLY (fresh checksums
-    /// and parity) pass every byte-level check and the mirror comparison,
-    /// yet run selection trusts `key#min`/`key#max` to route reads AROUND
-    /// this table — a narrowed range silently hides real keys (and the range
-    /// tombstones that mask older tables). Checks, against the ON-DISK meta:
-    /// - the recorded key range COVERS the decoded first/last data keys and
-    ///   every recorded range tombstone's bounds (covers, not equals: the
-    ///   writer legitimately widens the range over tombstone-only spans);
-    /// - the recorded `item_count` equals the decoded entry count (the
-    ///   tombstone sentinel is an on-disk entry counted on both sides);
-    /// - the recorded `data_block_count` equals the indexed block count
-    ///   ([`Table::scan`] hands it to the compaction scanner, which stops
-    ///   after that many blocks — a smaller forge drops the tail);
-    /// - the disk-fresh per-KV footer descriptor matches the recovery-time
-    ///   one (a re-stamped `None` would misread footer bytes as the trailer
-    ///   after reopen);
-    /// - for tables WITHOUT a range-tombstone sentinel, the recorded
-    ///   `seqno#min` is at or below the decoded minimum and `seqno#kv_max`
-    ///   is at or above the decoded maximum (a raised min / lowered max
-    ///   hides visible versions from snapshot reads). RT-bearing tables skip
-    ///   this: the writer records the KV range EXCLUDING the sentinel's
-    ///   synthetic RT-derived seqno, so the decoded range legitimately
-    ///   differs — and those tables are already gated by the fail-closed
-    ///   deletion-metadata attribution rule.
+    /// Reads the meta (and range-tombstone) sections the bounds check judges
+    /// against, and seeds the accumulators the walk fills, so the combined
+    /// reconcile pass builds the state once and feeds it the shared decode.
     ///
-    /// # Errors
+    /// Read from the file rather than taken from the open table because both
+    /// meta mirrors re-stamped CONSISTENTLY (fresh checksums and parity) pass
+    /// every byte-level check and the mirror comparison, while run selection
+    /// trusts `key#min`/`key#max` to route reads AROUND this table — a narrowed
+    /// range silently hides real keys (and the range tombstones that mask older
+    /// tables).
     ///
-    /// [`crate::Error::InvalidHeader`] when the recorded bounds disagree
-    /// with the decoded contents; any I/O / decode error from the full scan.
     /// `bitmap_digest_authenticated`: whether the caller has ALREADY
     /// authenticated this file's bytes — bitmap section included — against a
     /// matching manifest digest (the directly attributable heal path: the
     /// pre-heal digest probed equal, so the file differs solely by that
     /// pass's corrections). Only then may a LEGACY table whose bitmap
     /// carries no `descriptor#delete_bitmap_hash` pass; repair has no such
-    /// digest and must keep failing closed on it. The flag drives the
-    /// delete-bitmap gate below, which exists only on columnar builds
-    /// (a positional delete bitmap is a columnar-layout section).
-    /// Reads the meta (and range-tombstone) sections the bounds check judges
-    /// against, and seeds the accumulators the walk fills, so the combined
-    /// reconcile pass builds the state once and feeds it the shared decode.
+    /// digest and must keep failing closed on it. Carried on the probe for the
+    /// delete-bitmap gate in [`Self::finish_meta_bounds`], which exists only on
+    /// columnar builds (a positional delete bitmap is a columnar-layout
+    /// section).
     ///
     /// # Errors
     ///
@@ -4846,10 +4786,8 @@ impl Table {
         })
     }
 
-    /// The per-block half of [`Self::verify_metadata_bounds`]: accumulate the
-    /// decoded entry count, key range and seqno range the recorded bounds are
-    /// judged against. Split out so the combined reconcile pass runs it on the
-    /// shared decode.
+    /// Accumulates the decoded entry count, key range and seqno range that
+    /// [`Self::finish_meta_bounds`] judges the recorded bounds against.
     #[cfg(feature = "std")]
     fn observe_meta_bounds(probe: &mut MetaBoundsProbe, block: &DecodedBlock) -> crate::Result<()> {
         {
@@ -4900,8 +4838,27 @@ impl Table {
         }
     }
 
-    /// The finalize half of [`Self::verify_metadata_bounds`]: judge the
-    /// recorded bounds against everything the walk accumulated.
+    /// Judges the recorded metadata BOUNDS against everything the walk
+    /// accumulated. Checks, against the ON-DISK meta:
+    /// - the recorded key range COVERS the decoded first/last data keys and
+    ///   every recorded range tombstone's bounds (covers, not equals: the
+    ///   writer legitimately widens the range over tombstone-only spans);
+    /// - the recorded `item_count` equals the decoded entry count (the
+    ///   tombstone sentinel is an on-disk entry counted on both sides);
+    /// - the recorded `data_block_count` equals the indexed block count
+    ///   ([`Table::scan`] hands it to the compaction scanner, which stops
+    ///   after that many blocks — a smaller forge drops the tail);
+    /// - the disk-fresh per-KV footer descriptor matches the recovery-time
+    ///   one (a re-stamped `None` would misread footer bytes as the trailer
+    ///   after reopen);
+    /// - for tables WITHOUT a range-tombstone sentinel, the recorded
+    ///   `seqno#min` is at or below the decoded minimum and `seqno#kv_max`
+    ///   is at or above the decoded maximum (a raised min / lowered max
+    ///   hides visible versions from snapshot reads). RT-bearing tables skip
+    ///   this: the writer records the KV range EXCLUDING the sentinel's
+    ///   synthetic RT-derived seqno, so the decoded range legitimately
+    ///   differs — and those tables are already gated by the fail-closed
+    ///   deletion-metadata attribution rule.
     ///
     /// # Errors
     ///
@@ -5300,7 +5257,7 @@ impl Table {
     /// the decode, plus whatever `check` returns.
     #[cfg_attr(
         not(feature = "std"),
-        allow(
+        expect(
             dead_code,
             reason = "gate-only walk; the verify/scrub consumers are std-gated"
         )
