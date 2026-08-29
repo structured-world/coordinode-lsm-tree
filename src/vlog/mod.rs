@@ -25,6 +25,77 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicBool;
 
+/// Keeps ONE recovered copy per blob id, moving the rest to `orphaned`.
+///
+/// The manifest names exactly one file per id and records the checksum of its
+/// live suffix, so a copy that reproduces that digest IS the one it named. When
+/// none does — both copies rotted, or the digest cannot be read — the canonical
+/// spelling (`{id}`) is kept over any alternate one, and first-seen order
+/// breaks a remaining tie. That is a deterministic answer rather than a correct
+/// one, but it beats letting directory order decide, and the surviving copy's
+/// damage still surfaces on the read that meets it.
+fn dedupe_blob_sightings(
+    fs: &Arc<dyn Fs>,
+    blob_files: &mut Vec<BlobFile>,
+    orphaned: &mut Vec<PathBuf>,
+) {
+    let mut kept: crate::HashMap<BlobFileId, usize> = crate::HashMap::default();
+    let mut duplicates = false;
+    for (idx, bf) in blob_files.iter().enumerate() {
+        if kept.insert(bf.id(), idx).is_some() {
+            duplicates = true;
+        }
+    }
+    if !duplicates {
+        return;
+    }
+
+    // Score each sighting: a matching digest wins outright, then the canonical
+    // spelling, then first-seen. `checksum_from_with_overrides` re-reads the
+    // file, so this runs ONLY on the rare id that was seen twice.
+    let rank = |bf: &BlobFile| -> u8 {
+        let digest_matches =
+            crate::file::checksum_from_with_overrides(&**fs, &bf.0.path, bf.0.live_data_start, &[])
+                .is_ok_and(|d| Checksum::from_raw(d) == bf.0.checksum);
+        if digest_matches {
+            return 0;
+        }
+        // Rebuilt rather than string-compared: `file_name` is `&OsStr` with
+        // `std` and `&str` without it, and the join answers both.
+        let canonical = bf.0.path.parent().is_some_and(|dir| {
+            dir.join(alloc::string::ToString::to_string(&bf.id())) == *bf.0.path
+        });
+        if canonical { 1 } else { 2 }
+    };
+
+    let mut best: crate::HashMap<BlobFileId, (u8, usize)> = crate::HashMap::default();
+    for (idx, bf) in blob_files.iter().enumerate() {
+        let score = rank(bf);
+        match best.get(&bf.id()) {
+            Some(&(prev, _)) if prev <= score => {}
+            _ => {
+                best.insert(bf.id(), (score, idx));
+            }
+        }
+    }
+    let winners: crate::HashSet<usize> = best.values().map(|&(_, idx)| idx).collect();
+    let mut idx = 0;
+    blob_files.retain(|bf| {
+        let keep = winners.contains(&idx);
+        if !keep {
+            log::warn!(
+                "blob file {} duplicates id {}; the manifest names another copy, so this one \
+                 is an orphan",
+                bf.0.path.display(),
+                bf.id(),
+            );
+            orphaned.push(bf.0.path.clone());
+        }
+        idx += 1;
+        keep
+    });
+}
+
 pub fn recover_blob_files(
     folder: &Path,
     ids: &[(BlobFileId, Checksum, u64)],
@@ -168,6 +239,17 @@ pub fn recover_blob_files(
             orphaned_blob_files.push(blob_file_path.clone());
         }
     }
+
+    // Two directory entries can parse to the SAME id — `blobs/0` beside a
+    // noncanonical `blobs/00`, which is what a repair leaves when its
+    // post-commit removal of the displaced copy fails. Both matched the
+    // manifest id above, and the version this feeds builds a map keyed by id,
+    // so without resolving them here whichever came last would silently win:
+    // a copy with readable metadata but a rotted value frame could replace the
+    // authoritative blob and make reads fail. The manifest's checksum covers
+    // the live suffix of the copy it named, so it decides; the losers are
+    // orphans, which the caller sweeps.
+    dedupe_blob_sightings(fs, &mut blob_files, &mut orphaned_blob_files);
 
     if blob_files.len() < ids.len() {
         return Err(crate::Error::Unrecoverable);

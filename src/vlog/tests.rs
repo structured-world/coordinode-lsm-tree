@@ -161,3 +161,84 @@ fn blob_punch_on_drop_retains_the_reclaim_when_the_link_probe_cannot_answer() ->
     );
     Ok(())
 }
+
+/// Two directory entries of the SAME id — `0` beside a noncanonical `00`, what
+/// a repair leaves when its post-commit removal of the displaced copy fails —
+/// both match the manifest id and both used to be recovered. The version this
+/// feeds keys by id, so directory order decided which one won: a copy whose
+/// metadata parses but whose value frames rotted could replace the
+/// authoritative blob and make reads fail. The manifest's checksum names one of
+/// them, and that is the one that must survive.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+#[expect(clippy::indexing_slicing, reason = "test code")]
+fn recovery_keeps_the_blob_copy_the_manifest_checksum_names() {
+    use crate::fs::{Fs, MemFs};
+
+    let memfs = MemFs::new();
+    let fs: Arc<dyn Fs> = Arc::new(memfs.clone());
+    let blobs = std::path::absolute("/blobs").expect("absolute");
+    memfs.create_dir_all(&blobs).expect("mkdir");
+
+    // The authoritative file, written through the real blob writer so its
+    // metadata section and frames are genuine.
+    let mut writer = crate::vlog::BlobFileWriter::new(
+        crate::SequenceNumberCounter::default(),
+        &blobs,
+        0,
+        None,
+        Arc::clone(&fs),
+    )
+    .expect("writer");
+    for i in 0..20u32 {
+        writer
+            .write(
+                format!("k{i:04}").as_bytes(),
+                u64::from(i) + 1,
+                &[b'v'; 128],
+            )
+            .expect("write");
+    }
+    let written = writer.finish().expect("finish");
+    assert_eq!(written.len(), 1, "one blob file");
+
+    let authoritative = blobs.join("0");
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut memfs
+            .open(&authoritative, &crate::fs::FsOpenOptions::new().read(true))
+            .expect("open"),
+        &mut bytes,
+    )
+    .expect("read");
+    let checksum = Checksum::from_raw(
+        crate::file::checksum_from_with_overrides(&*fs, &authoritative, 0, &[]).expect("digest"),
+    );
+
+    // The stale twin: same id (`00` parses to 0), one flipped byte in a frame.
+    let mut rotted = bytes.clone();
+    let Some(byte) = rotted.get_mut(64) else {
+        panic!("the written blob reaches the flipped offset");
+    };
+    *byte ^= 0xFF;
+    let mut f = memfs
+        .open(
+            &blobs.join("00"),
+            &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+        )
+        .expect("create twin");
+    std::io::Write::write_all(&mut f, &rotted).expect("write twin");
+    drop(f);
+
+    let (recovered, orphans) =
+        recover_blob_files(&blobs, &[(0, checksum, 0)], 0, None, &fs).expect("recover");
+    assert_eq!(recovered.len(), 1, "one copy per id survives");
+    assert_eq!(
+        &*recovered[0].0.path, &*authoritative,
+        "the copy whose digest matches the manifest is the one kept",
+    );
+    assert!(
+        orphans.iter().any(|p| p.ends_with("00")),
+        "the losing copy is reported as an orphan for the caller to sweep: {orphans:?}",
+    );
+}

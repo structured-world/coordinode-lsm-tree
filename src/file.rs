@@ -132,6 +132,90 @@ impl TableDirEntry {
     }
 }
 
+/// Streams `path` from byte `start` to end through XXH3-128, splicing
+/// `overrides` over the bytes on disk as it goes.
+///
+/// `start == 0` with no overrides reproduces the whole-file digest a normal
+/// write accumulates; a non-zero `start` digests only the LIVE SUFFIX of a
+/// hole-punched file, which is what the manifest records for a restricted SST
+/// or a punched blob. Each override replaces the bytes at its offset, so a
+/// caller can predict the digest a pending in-place repair would produce
+/// without writing it first.
+///
+/// Lives here rather than beside the repair that grew it: the blob open path
+/// needs the same digest to tell two directory entries of one id apart, and
+/// that path compiles without `std`.
+///
+/// # Errors
+///
+/// Propagates the open / read failures of `path`.
+pub(crate) fn checksum_from_with_overrides(
+    fs: &dyn Fs,
+    path: &Path,
+    start: u64,
+    overrides: &[(u64, alloc::vec::Vec<u8>)],
+) -> crate::Result<u128> {
+    // `FsFile` inherits whichever `Read`/`Seek` the build has: std's under the
+    // `std` feature, the crate's own under `no_std`.
+    #[cfg(not(feature = "std"))]
+    use crate::io::{Read, Seek, SeekFrom};
+    #[cfg(feature = "std")]
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+    // Seek + sequential read: keeps the `start == 0` read pattern identical to
+    // the plain whole-file digest, so a restricted file is not read through a
+    // different access pattern than an unrestricted one.
+    if start != 0 {
+        file.seek(SeekFrom::Start(start))?;
+    }
+    let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
+    let mut buf = alloc::vec![0u8; 256 * 1024];
+    let mut chunk_start = start;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break; // EOF
+        }
+        let chunk_end = chunk_start + n as u64;
+        let Some(chunk) = buf.get_mut(..n) else { break };
+        // Splice every override overlapping this chunk. Overrides are few (one
+        // per corrupt block), so scanning them per chunk is negligible.
+        for (off, bytes) in overrides {
+            let ov_end = *off + bytes.len() as u64;
+            let lo = (*off).max(chunk_start);
+            let hi = ov_end.min(chunk_end);
+            // Skip a non-overlapping override BEFORE computing relative offsets:
+            // the bound subtractions below are unsigned, and an override ending
+            // before this chunk (or starting after it) would otherwise underflow
+            // (a debug panic). Once `lo < hi` holds, `chunk_start <= lo < hi <=
+            // chunk_end` and `off <= lo < hi <= ov_end`, so all four differences
+            // are non-negative.
+            if lo >= hi {
+                continue;
+            }
+            // The overlap lies inside a `<= 256 KiB` chunk, so every difference
+            // fits `usize`; `try_from` handles the 32-bit target without a cast.
+            let (Ok(dst_lo), Ok(dst_hi), Ok(src_lo), Ok(src_hi)) = (
+                usize::try_from(lo - chunk_start),
+                usize::try_from(hi - chunk_start),
+                usize::try_from(lo - *off),
+                usize::try_from(hi - *off),
+            ) else {
+                continue;
+            };
+            if let (Some(dst), Some(src)) =
+                (chunk.get_mut(dst_lo..dst_hi), bytes.get(src_lo..src_hi))
+            {
+                dst.copy_from_slice(src);
+            }
+        }
+        hasher.update(&*chunk);
+        chunk_start = chunk_end;
+    }
+    Ok(hasher.digest128())
+}
+
 /// Reads bytes from a file at the given offset without changing the cursor.
 ///
 /// Uses [`FsFile::read_at`] (equivalent to `pread(2)`) so multiple threads
