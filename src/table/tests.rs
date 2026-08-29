@@ -753,11 +753,16 @@ fn metadata_bounds_accept_a_legacy_bitmap_when_digest_authenticated() -> crate::
         Table::recover(params)?
     };
     assert!(
-        table.verify_metadata_bounds(false).is_err(),
+        matches!(
+            table.verify_reconcile_gates(None, false),
+            Err((crate::table::ReconcileGate::MetadataBounds, _))
+        ),
         "repair (no matching digest) keeps failing closed on the \
          unauthenticatable legacy bitmap",
     );
-    table.verify_metadata_bounds(true)?;
+    if let Err((gate, e)) = table.verify_reconcile_gates(None, true) {
+        panic!("an authenticated digest accepts the legacy bitmap, {gate:?} refused it: {e}");
+    }
     Ok(())
 }
 
@@ -1521,77 +1526,65 @@ fn twelve_letter_items() -> Vec<crate::InternalValue> {
         .collect()
 }
 
-/// The reconcile gates must share ONE decode per live block. Each of them used
-/// to walk the table itself, so a single reconcile re-read and re-decoded every
-/// block once per gate and repair time grew with the gate count; the combined
-/// pass reads each block exactly once, no matter how many gates consume it.
-#[test]
-fn reconcile_gates_read_each_block_once() -> crate::Result<()> {
+/// Reads a whole reconcile costs on a table of `blocks` four-entry data blocks,
+/// counted at the filesystem. The table carries a zone map so the section-level
+/// gates take part too.
+fn reconcile_read_count(name: &str, blocks: usize) -> crate::Result<usize> {
     use crate::fs::{FaultFs, Fs, MemFs};
 
-    // `rotate_every == Some(4)` gives three data blocks over the twelve keys.
-    const BLOCKS: usize = 3;
-
-    let mem = MemFs::new();
-    let faulty = std::sync::Arc::new(FaultFs::new(mem));
+    let faulty = std::sync::Arc::new(FaultFs::new(MemFs::new()));
     let injector = faulty.injector();
-    let root = std::path::absolute("/reconcile_pass")?;
+    let root = std::path::absolute(alloc::format!("/{name}"))?;
     faulty.create_dir_all(&root)?;
     let path = root.join("table");
 
-    {
-        let mut writer = Writer::new(path.clone(), 0, 0, faulty.clone())?.use_zone_map(true);
-        for (idx, item) in twelve_letter_items().iter().enumerate() {
-            if idx % 4 == 0 {
-                writer.spill_block()?;
-            }
-            writer.write(item.clone())?;
+    let mut writer = Writer::new(path.clone(), 0, 0, faulty.clone())?.use_zone_map(true);
+    for idx in 0..blocks * 4 {
+        if idx % 4 == 0 {
+            writer.spill_block()?;
         }
-        let Some((_, checksum)) = writer.finish()? else {
-            panic!("the fixture writes twelve entries");
-        };
-        let mut params = test_recover_params(path, checksum);
-        params.fs = faulty;
-        let table = Table::recover(params)?;
-        assert_eq!(
-            table.block_index.iter().count(),
-            BLOCKS,
-            "the fixture must have three data blocks",
-        );
-
-        // Baseline: the whole family, each gate walking the table itself, the
-        // way the repair and scrub chains used to call them.
-        injector.clear();
-        table.verify_kv_checksums()?;
-        table.verify_seqno_bounds()?;
-        table.verify_block_entry_counts()?;
-        table.verify_zone_map()?;
-        table.verify_locator()?;
-        table.verify_filter(None)?;
-        table.verify_point_read_reachability()?;
-        table.verify_metadata_bounds(false)?;
-        let individual = injector.read_count();
-
-        // The same family on ONE decode of each block.
-        injector.clear();
-        let combined_result = table.verify_reconcile_gates(None, false);
-        assert!(
-            combined_result.is_ok(),
-            "the combined pass must accept a healthy table: {:?}",
-            combined_result.map_err(|(gate, e)| (gate, e.to_string())),
-        );
-        let combined = injector.read_count();
-
-        // Measured on this fixture: 18 reads for the eight separate walks
-        // against 6 for the combined pass (three data blocks plus the section
-        // reads, which happen once either way). The margin grows with the
-        // block count, since only the per-block half is multiplied.
-        assert!(
-            combined > 0 && individual >= combined * 2,
-            "the whole family on one pass must cost far less than eight \
-             separate walks: combined {combined} reads against {individual}",
-        );
+        writer.write(crate::InternalValue::from_components(
+            alloc::format!("key{idx:04}").into_bytes(),
+            b"v".as_slice(),
+            0,
+            crate::ValueType::Value,
+        ))?;
     }
+    let Some((_, checksum)) = writer.finish()? else {
+        panic!("the fixture writes entries");
+    };
+    let mut params = test_recover_params(path, checksum);
+    params.fs = faulty;
+    let table = Table::recover(params)?;
+    assert_eq!(
+        table.block_index.iter().count(),
+        blocks,
+        "the fixture must produce one data block per four entries",
+    );
+
+    injector.clear();
+    if let Err((gate, e)) = table.verify_reconcile_gates(None, false) {
+        panic!("a healthy table must pass every gate, {gate:?} refused it: {e}");
+    }
+    Ok(injector.read_count())
+}
+
+/// The reconcile gates must share ONE read of each live block. Each of them
+/// used to walk the table itself, so a reconcile re-read and re-decoded every
+/// block once per gate and repair time grew with the gate count.
+///
+/// Asserted as a SLOPE: doubling the blocks must cost exactly one extra read
+/// per added block. A per-gate walk would charge one per gate per block, so
+/// the old shape cannot satisfy this no matter what the constant term is.
+#[test]
+fn reconcile_gates_read_each_block_once() -> crate::Result<()> {
+    let small = reconcile_read_count("reconcile_small", 3)?;
+    let large = reconcile_read_count("reconcile_large", 6)?;
+    assert_eq!(
+        large - small,
+        3,
+        "three more blocks must cost three more reads, got {small} then {large}",
+    );
     Ok(())
 }
 
@@ -5260,7 +5253,9 @@ fn columnar_zone_map_records_per_column_stats_and_round_trips() -> crate::Result
 
     // The writer's per-column map and the verifier's re-derivation agree, so the
     // forgery cross-check accepts the honest table.
-    table.verify_zone_map()?;
+    if let Err((gate, e)) = table.verify_reconcile_gates(None, false) {
+        panic!("the honest columnar table must pass every gate, {gate:?} refused it: {e}");
+    }
     Ok(())
 }
 
@@ -5904,7 +5899,9 @@ fn verify_locator_rejects_a_redirected_key_mapping() -> crate::Result<()> {
 
     let table = recover_test_table(&file, checksum)?;
     // Intact locator verifies clean.
-    table.verify_locator()?;
+    if let Err((gate, e)) = table.verify_reconcile_gates(None, false) {
+        panic!("an intact locator must pass every gate, {gate:?} refused it: {e}");
+    }
 
     // Rebuild the SAME ribbon (same key set, same widths → byte-identical
     // length) but redirect the FIRST key to a DIFFERENT block ordinal.
@@ -5936,10 +5933,17 @@ fn verify_locator_rejects_a_redirected_key_mapping() -> crate::Result<()> {
     crate::test_forge::forge_replace_section_payload(&file, b"locator", &forged, None)?;
 
     let table = recover_test_table(&file, checksum)?;
-    let result = table.verify_locator();
+    let result = table.verify_reconcile_gates(None, false);
     assert!(
-        matches!(result, Err(crate::Error::InvalidHeader(_))),
-        "a redirected locator must be rejected, got {result:?}",
+        matches!(
+            result,
+            Err((
+                crate::table::ReconcileGate::Locator,
+                crate::Error::InvalidHeader(_)
+            ))
+        ),
+        "a redirected locator must be rejected by the locator gate, got {:?}",
+        result.map_err(|(gate, e)| (gate, e.to_string())),
     );
     Ok(())
 }

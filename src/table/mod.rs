@@ -3459,57 +3459,6 @@ impl Table {
         pos.checked_add(len) == Some(at)
     }
 
-    /// Cross-checks the recorded `seqno_bounds` section against the ACTUAL
-    /// per-block seqno ranges derived from decoding every data block's
-    /// entries. The section's block is checksum-clean to the out-of-band
-    /// walk even when its PAYLOAD was re-stamped to another structurally
-    /// valid map, and `scan_since_seqno` trusts it to SKIP blocks — a forged
-    /// range silently omits a block's live entries from every CDC /
-    /// incremental scan. Every recorded block must exist, every data block
-    /// must be recorded, and each recorded range must equal the decoded one.
-    /// A no-op for tables without the section.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::Error::InvalidHeader`] when the recorded map disagrees with
-    /// the decoded entries; any I/O / decode error from the full scan.
-    #[cfg(feature = "std")]
-    // Single-gate entry point. Production runs the whole family through
-    // `verify_reconcile_gates` (one decode per block), so this exists for the
-    // per-gate tests that pin THIS check's own behaviour and message.
-    #[cfg(test)]
-    pub(crate) fn verify_seqno_bounds(&self) -> crate::Result<()> {
-        let Some(seqno_bounds) = self.read_seqno_bounds_section()? else {
-            return Ok(());
-        };
-        // No early return on an empty map: a PRESENT-but-empty section on a
-        // table with data blocks is a forgery (every writer emits one entry per
-        // block). The per-block loop below rejects it — the first block's
-        // `bounds_for` returns `None` — while a genuinely empty table (no data
-        // blocks) still passes, since the loop runs zero times and `checked`
-        // equals the empty map's length.
-        // Skip a restricted view's punched (dead) prefix blocks; count only the
-        // LIVE seqno_bounds entries below so the cross-check covers the suffix.
-        let punch = self.punch_offset()?;
-        let mut checked = 0usize;
-        self.for_each_live_block(|block| {
-            Self::check_block_seqno_bounds(&seqno_bounds, block)?;
-            checked = checked
-                .checked_add(1)
-                .ok_or(crate::Error::InvalidHeader("seqno_bounds"))?;
-            Ok(())
-        })?;
-        // Every recorded entry matched some walked block (offsets are unique
-        // on both sides), so equal counts mean the map records EXACTLY the
-        // table's blocks — a forged extra entry cannot hide among them.
-        if checked != seqno_bounds.live_len(punch) {
-            return Err(crate::Error::InvalidHeader(
-                "seqno_bounds carries entries for blocks the index does not hold",
-            ));
-        }
-        Ok(())
-    }
-
     /// Runs the whole semantic cross-check family on ONE disk-fresh decode per
     /// live data block.
     ///
@@ -3767,14 +3716,7 @@ impl Table {
     /// entry count than its trailer declares; any I/O / decode error from the
     /// full scan.
     #[cfg(feature = "std")]
-    // Single-gate entry point; see `verify_seqno_bounds`.
-    #[cfg(test)]
-    pub(crate) fn verify_block_entry_counts(&self) -> crate::Result<()> {
-        self.for_each_live_block(Self::check_block_entry_count)
-    }
-
-    /// The per-block half of [`Self::verify_block_entry_counts`], so the
-    /// combined reconcile pass runs it on the shared decode.
+    /// Checks a block's declared entry count against the decoded one.
     #[cfg(feature = "std")]
     fn check_block_entry_count(block: &DecodedBlock) -> crate::Result<()> {
         #[cfg(feature = "columnar")]
@@ -3794,67 +3736,6 @@ impl Table {
         if block.entries.len() != row.len() {
             return Err(crate::Error::InvalidHeader(
                 "data block decodes to fewer entries than its trailer declares",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Cross-checks the recorded `zone_map` section against the ACTUAL
-    /// per-block statistics derived from decoding every data block. The
-    /// section's block is checksum-clean to the out-of-band walk even when
-    /// its PAYLOAD was re-stamped to another structurally valid map, and
-    /// `columnar_scan` trusts its min/max to SKIP blocks — a forged range
-    /// silently omits matching rows. A row block records one synthetic column
-    /// (whole-block key range + row count); a columnar block records one entry
-    /// per stored column, re-derived from the decoded batch. Every block must
-    /// be recorded and its recorded stats must equal the decoded ones. A no-op
-    /// for tables without the section.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::Error::InvalidHeader`] when the recorded map disagrees with
-    /// the decoded blocks; any I/O / decode error from the full scan.
-    #[cfg(feature = "std")]
-    // Single-gate entry point; see `verify_seqno_bounds`.
-    #[cfg(test)]
-    pub(crate) fn verify_zone_map(&self) -> crate::Result<()> {
-        // Re-read the section FROM DISK: the in-memory map is best-effort at
-        // recover time, so an on-disk re-stamp after the open is invisible to
-        // it. An unreadable section is an error here (the caller is deciding
-        // whether to trust the file's bytes), unlike the best-effort load.
-        let Some(zone_map) = self.read_zone_map_section()? else {
-            return Ok(());
-        };
-        // The writer emits one zone-map entry per data block whenever the
-        // section exists, so a PRESENT-but-empty map on a table with data blocks
-        // is a forgery — e.g. a delete_bitmap relabeled and re-roled to an empty
-        // zone_map, which drops the deletion metadata while every semantic gate
-        // (tiling, block role, parsed deletion state) still passes. Reject it,
-        // as the other rebuildable-section checks do.
-        if zone_map.is_empty() {
-            if self.block_index.iter().next().is_some() {
-                return Err(crate::Error::InvalidHeader(
-                    "zone_map section is present but empty on a table with data blocks",
-                ));
-            }
-            return Ok(());
-        }
-        // A restricted view's punched prefix blocks are DEAD (never read), and
-        // the zone_map still carries their entries (the file is punched, not
-        // rewritten). Skip those blocks and count only the LIVE zone_map entries
-        // below, so the cross-check authenticates exactly the suffix.
-        let punch = self.punch_offset()?;
-        let mut checked = 0usize;
-        self.for_each_live_block(|block| {
-            Self::check_block_zone_entry(&zone_map, block)?;
-            checked = checked
-                .checked_add(1)
-                .ok_or(crate::Error::InvalidHeader("zone_map"))?;
-            Ok(())
-        })?;
-        if checked != zone_map.live_len(punch) {
-            return Err(crate::Error::InvalidHeader(
-                "zone_map carries entries for blocks the index does not hold",
             ));
         }
         Ok(())
@@ -4259,24 +4140,6 @@ impl Table {
     /// with its decoded newest-version block; any I/O / decode error from the
     /// full scan.
     #[cfg(feature = "std")]
-    // Single-gate entry point; see `verify_seqno_bounds`.
-    #[cfg(test)]
-    pub(crate) fn verify_locator(&self) -> crate::Result<()> {
-        let Some(locator) = self.read_locator_section()? else {
-            return Ok(());
-        };
-
-        // Walk blocks in index (block_id) order; the FIRST time a user key
-        // appears is its newest version, so that block is the locator's
-        // expected answer. `seen` dedups across blocks (a key's older
-        // versions in later blocks must not overwrite the expectation).
-        let mut seen: crate::HashSet<Vec<u8>> = crate::HashSet::default();
-        // A restricted view's punched prefix blocks are dead; the walk skips
-        // them. Their keys are superseded, so a suffix key's newest version is
-        // in the suffix, and reads never consult the locator's prefix answers.
-        self.for_each_live_block(|block| self.check_block_locator(&locator, &mut seen, block))
-    }
-
     /// Reads the `locator` section FROM DISK and pairs it with the ordinal →
     /// handle map (the writer's `block_id` order is the index order), mirroring
     /// the open path. `None` when the table has no locator.
@@ -4418,36 +4281,22 @@ impl Table {
     /// [`crate::Error::InvalidHeader`] when a decoded key is not retrievable
     /// from its block; any I/O / decode error from the full scan.
     #[cfg(feature = "std")]
-    // Single-gate entry point; see `verify_seqno_bounds`.
-    #[cfg(test)]
-    pub(crate) fn verify_point_read_reachability(&self) -> crate::Result<()> {
-        // Columnar blocks carry no in-block key index to probe, but the GLOBAL
-        // internal-key sort order (user key ASC, then seqno DESC per key) is still
-        // an invariant the read path relies on: `column_batch_match_entries`
-        // binary-searches the key column assuming it is sorted, so a
-        // checksum-restamped block with reordered keys — which every other
-        // columnar check (count / zone-bound comparisons) tolerates — would make
-        // point reads miss a key or return a stale version. Enforce the order over
-        // the live suffix (the punched prefix is dead); there is no point_read to
-        // run, so this is the only order gate for a columnar table.
-        // The internal-key sort order (user key ASC, then seqno DESC per key) is
-        // a GLOBAL invariant across the whole table, not just within a block.
-        // Carry the last decoded internal key ACROSS block boundaries so a
-        // checksum-restamped later block cannot raise the seqno of a key that
-        // also ends the preceding block: both blocks would decode and probe
-        // cleanly on their own, yet after reopen the index seeks the first block
-        // and a later compaction could persist the stale (lower-seqno) version.
-        // A restricted view's punched prefix blocks are dead; the walk skips
-        // them. The global sort order still holds across the LIVE suffix, so
-        // `prev_internal` simply starts at the first live block.
-        let mut prev_internal: Option<(UserKey, SeqNo)> = None;
-        self.for_each_live_block(|block| self.check_block_reachability(&mut prev_internal, block))
-    }
-
-    /// The per-block half of [`Self::verify_point_read_reachability`], so the
-    /// combined reconcile pass runs it on the shared decode. `prev_internal`
-    /// carries the last decoded internal key ACROSS blocks, which is what makes
-    /// the sort-order check global rather than per-block.
+    /// Confirms every decoded key is RETRIEVABLE through its own block's
+    /// in-block indexes, and that the internal-key sort order holds.
+    ///
+    /// A columnar block has no in-block key index to probe (rows are
+    /// reconstructed on load), but the GLOBAL order (user key ASC, then seqno
+    /// DESC per key) is still an invariant the read path relies on:
+    /// `column_batch_match_entries` binary-searches the key column assuming it
+    /// is sorted, so a checksum-restamped block with reordered keys — which
+    /// every other columnar check tolerates — would make point reads miss a key
+    /// or return a stale version.
+    ///
+    /// `prev_internal` carries the last decoded internal key ACROSS blocks,
+    /// which is what makes the order check global rather than per-block: a
+    /// restamped later block must not raise the seqno of a key that also ends
+    /// the preceding block, since both would decode and probe cleanly on their
+    /// own while a later compaction persisted the stale version.
     #[cfg(feature = "std")]
     fn check_block_reachability(
         &self,
@@ -4566,21 +4415,8 @@ impl Table {
     /// [`crate::Error::InvalidHeader`] when the filter reports an existing
     /// key as definitely absent; any I/O / decode error from the full scan.
     #[cfg(feature = "std")]
-    // Single-gate entry point; see `verify_seqno_bounds`.
-    #[cfg(test)]
-    pub(crate) fn verify_filter(
-        &self,
-        prefix_extractor: Option<&alloc::sync::Arc<dyn crate::prefix::PrefixExtractor>>,
-    ) -> crate::Result<()> {
-        let Some(mut probe) = self.filter_probe(prefix_extractor)? else {
-            return Ok(());
-        };
-        self.for_each_live_block(|block| probe.check_block(block))
-    }
-
     /// Reads the filter section and everything the probe needs, returning
-    /// `None` for a table without one. Split from [`Self::verify_filter`] so
-    /// the combined reconcile pass can build the probe once and feed it the
+    /// `None` for a table without one, so the combined reconcile pass can
     /// shared decode.
     ///
     /// # Errors
@@ -4852,21 +4688,9 @@ impl Table {
     /// digest and must keep failing closed on it. The flag drives the
     /// delete-bitmap gate below, which exists only on columnar builds
     /// (a positional delete bitmap is a columnar-layout section).
-    // Single-gate entry point; see `verify_seqno_bounds`.
-    #[cfg(test)]
-    pub(crate) fn verify_metadata_bounds(
-        &self,
-        bitmap_digest_authenticated: bool,
-    ) -> crate::Result<()> {
-        let mut probe = self.meta_bounds_probe(bitmap_digest_authenticated)?;
-        self.for_each_live_block(|block| Self::observe_meta_bounds(&mut probe, block))?;
-        self.finish_meta_bounds(probe)
-    }
-
     /// Reads the meta (and range-tombstone) sections the bounds check judges
-    /// against, and seeds the accumulators the walk fills. Split from
-    /// [`Self::verify_metadata_bounds`] so the combined reconcile pass can
-    /// build the state once and feed it the shared decode.
+    /// against, and seeds the accumulators the walk fills, so the combined
+    /// reconcile pass builds the state once and feeds it the shared decode.
     ///
     /// # Errors
     ///

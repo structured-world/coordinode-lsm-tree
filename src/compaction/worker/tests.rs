@@ -637,17 +637,12 @@ fn restricted_view_passes_every_reconcile_gate() -> crate::Result<()> {
         panic!("the punched input must reopen as a restricted table");
     };
 
-    restricted.verify_kv_checksums()?;
     restricted.verify_blob_links()?;
     restricted.verify_tli_mirrors()?;
-    restricted.verify_seqno_bounds()?;
-    restricted.verify_block_entry_counts()?;
-    restricted.verify_zone_map()?;
-    restricted.verify_locator()?;
-    restricted.verify_filter(None)?;
     restricted.verify_block_layout()?;
-    restricted.verify_point_read_reachability()?;
-    restricted.verify_metadata_bounds(false)?;
+    if let Err((gate, e)) = restricted.verify_reconcile_gates(None, false) {
+        panic!("the healthy restricted suffix must pass every gate, {gate:?} refused it: {e}");
+    }
     Ok(())
 }
 

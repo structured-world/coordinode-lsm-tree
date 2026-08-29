@@ -124,8 +124,10 @@ fn relocated_mor_table_passes_metadata_bounds_cross_check() -> crate::Result<()>
     let relocated = recover_at(&out_path, out_checksum, 1)?;
 
     // The re-encoded meta describes the appended bitmap, so the forgery
-    // cross-check accepts the healthy relocated table.
-    relocated.verify_metadata_bounds(false)?;
+    // cross-checks accept the healthy relocated table.
+    if let Err((gate, e)) = relocated.verify_reconcile_gates(None, false) {
+        panic!("a healthy relocated table must pass every gate, {gate:?} refused it: {e}");
+    }
     Ok(())
 }
 
