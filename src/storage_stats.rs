@@ -388,9 +388,24 @@ pub(crate) fn compute_used_bytes(version: &Version) -> crate::Result<u64> {
         used_bytes += table_on_disk_bytes(table)?;
     }
     for blob in version.blob_files.iter() {
-        used_bytes += blob.0.fs.metadata(&blob.0.path)?.len;
+        used_bytes += blob_on_disk_bytes(blob)?;
     }
     Ok(used_bytes)
+}
+
+/// The physical bytes a live blob file occupies.
+///
+/// Blob files are punched in place by the same tight-space reclaim as SSTs, so
+/// they are charged what they still occupy, not their logical length. The
+/// checkpoint counts them physically too, which is what keeps the documented
+/// `used_bytes == CheckpointInfo::total_bytes` invariant true once a reclaim
+/// has run.
+///
+/// # Errors
+///
+/// Propagates the stat failures of the blob file.
+pub(crate) fn blob_on_disk_bytes(blob: &crate::vlog::BlobFile) -> crate::Result<u64> {
+    Ok(crate::file::on_disk_bytes(&*blob.0.fs, &blob.0.path)?)
 }
 
 /// The physical bytes a live table occupies: the SST file plus, for a
@@ -503,7 +518,7 @@ pub(crate) fn compute_storage_stats(
     // Physical blob-file size (metadata + trailer included), NOT
     // BlobFileList::on_disk_size() which sums only the compressed payload.
     for blob in version.blob_files.iter() {
-        used_bytes += blob.0.fs.metadata(&blob.0.path)?.len;
+        used_bytes += blob_on_disk_bytes(blob)?;
     }
 
     let avg_entry_on_disk_bytes = if item_count == 0 {

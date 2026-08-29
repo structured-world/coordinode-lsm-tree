@@ -844,3 +844,39 @@ fn a_finely_sliced_tight_space_compaction_completes() -> lsm_tree::Result<()> {
     }
     Ok(())
 }
+
+/// Blob files are punched in place by the same tight-space reclaim as SSTs, so
+/// they must be charged the bytes they still occupy. Charging their logical
+/// length keeps the freed space on the quota forever and makes
+/// `used_bytes` disagree with the checkpoint totals, which count physical
+/// bytes.
+#[test]
+fn a_punched_blob_file_is_charged_its_allocated_bytes() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::Fs;
+
+    let folder = get_tmp_folder();
+    let (tree, mem) = open_capped_blob(folder.path(), u64::MAX);
+    for i in 0..200u64 {
+        tree.insert(format!("key{i:08}").as_bytes(), vec![0xCDu8; 256], i);
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    let before = tree.storage_stats()?.used_bytes;
+
+    // Reclaim a prefix of the blob file, exactly as the tight-space pass does.
+    let blob = mem
+        .read_dir(&folder.path().join("blobs"))?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("the flush wrote a blob file")
+        .path;
+    let punch_at = mem.metadata(&blob)?.len / 2;
+    mem.punch_hole(&blob, 0, punch_at)?;
+
+    let after = tree.storage_stats()?.used_bytes;
+    assert_eq!(
+        after,
+        before - punch_at,
+        "the reclaimed blob prefix must leave the quota (was {before}, now {after})",
+    );
+    Ok(())
+}
