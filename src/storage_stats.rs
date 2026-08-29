@@ -503,10 +503,26 @@ pub(crate) fn compute_storage_stats(
         // checkpoint total, see `table_on_disk_bytes`).
         let on_disk = table_on_disk_bytes(table)?;
         used_bytes += on_disk;
-        item_count += m.item_count;
+        // A restricted view's metadata still describes the whole original SST;
+        // its consumed prefix belongs to the output that superseded it, and
+        // both live in this version while a slice is in flight. Count what this
+        // view serves, and scale the per-entry aggregates by the same share so
+        // the averages stay consistent with the count.
+        let live_items = table.live_item_count()?;
+        let share = |total: u64| -> u64 {
+            if live_items == m.item_count || m.item_count == 0 {
+                return total;
+            }
+            u64::try_from(u128::from(total) * u128::from(live_items) / u128::from(m.item_count))
+                .unwrap_or(total)
+        };
+        item_count += live_items;
         table_count += 1;
-        reclaimable_entries += m.weak_tombstone_reclaimable;
-        match (m.sum_user_key_bytes, m.sum_value_bytes) {
+        reclaimable_entries += share(m.weak_tombstone_reclaimable);
+        match (
+            m.sum_user_key_bytes.map(share),
+            m.sum_value_bytes.map(share),
+        ) {
             (Some(k), Some(v)) => {
                 sum_key += k;
                 sum_value += v;
@@ -596,7 +612,10 @@ pub(crate) fn compute_level_segment_stats(version: &Version) -> crate::Result<Ve
                 // as `table_on_disk_bytes`), so summing the levels matches
                 // the documented SST portion of the tree total.
                 let on_disk = table_on_disk_bytes(table)?;
-                let items = table.metadata.item_count;
+                // What this VIEW serves, on the same basis as the tree total: a
+                // restricted table's metadata still counts the prefix the
+                // superseding output owns.
+                let items = table.live_item_count()?;
                 let seg_reads = table.read_count.load(Relaxed);
                 let seg_access = table.last_access_secs.load(Relaxed);
                 used_bytes += on_disk;

@@ -265,3 +265,69 @@ fn a_punched_table_is_charged_its_allocated_bytes() -> crate::Result<()> {
     );
     Ok(())
 }
+
+/// A restricted table's `metadata.item_count` still describes the WHOLE
+/// original SST, prefix included. While a tight-space slice is in flight the
+/// version holds both that restricted input and the output that now owns the
+/// prefix, so summing the raw metadata counts those entries twice: the reported
+/// item count inflates, the average entry size shrinks, and
+/// `estimated_remaining_entries` overstates capacity.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_restricted_table_contributes_only_its_live_entries() -> crate::Result<()> {
+    use crate::blob_tree::FragmentationMap;
+    use crate::table::{Table, Writer};
+    use crate::version::{BlobFileList, Level, Run, Version};
+    use crate::{InternalValue, TreeType, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(crate::fs::StdFs);
+    let sst = dir.path().join("0");
+
+    let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+    for i in 0..256u32 {
+        w.write(InternalValue::from_components(
+            format!("k{i:05}").into_bytes(),
+            format!("v{i}").into_bytes(),
+            u64::from(i) + 1,
+            ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = w.finish()?.expect("table written");
+
+    let table = Table::recover(crate::table::RecoverParams::new(
+        sst,
+        checksum,
+        0,
+        Arc::clone(&fs),
+        crate::comparator::default_comparator(),
+        Arc::new(crate::Cache::with_capacity_bytes(1_000_000)),
+    ))?;
+    let whole = table.metadata.item_count;
+    assert_eq!(whole, 256, "the fixture holds every entry");
+
+    // Restrict away roughly the first half, as a completed slice would.
+    let restricted = table.reopen_restricted(b"k00128".to_vec().into())?;
+    let run = Arc::new(Run::new(vec![restricted]).expect("non-empty run"));
+    let version = Version::from_levels(
+        1,
+        TreeType::Standard,
+        vec![Level::from_runs(vec![run])],
+        BlobFileList::default(),
+        FragmentationMap::default(),
+    );
+
+    let stats = compute_storage_stats(&version, false, true)?;
+    assert!(
+        stats.item_count < whole,
+        "the consumed prefix must not be counted: reported {} of {whole}",
+        stats.item_count,
+    );
+    assert!(
+        stats.item_count > whole / 4,
+        "the live suffix must still be counted: reported {} of {whole}",
+        stats.item_count,
+    );
+    Ok(())
+}
