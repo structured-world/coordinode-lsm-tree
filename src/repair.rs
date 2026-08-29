@@ -1607,14 +1607,31 @@ fn try_salvage_table(
     // ingest offset applies to the copy unchanged (the salvage preserves
     // local seqnos), so it is reused here just like on the whole-recover path.
     let checksum = crate::Checksum::from_raw(compute_table_checksum(&**fs, table_path)?);
-    let table = Table::recover(repair_recover_params(
+    let table = match Table::recover(repair_recover_params(
         config,
         table_path.to_path_buf(),
         checksum,
         table_id,
         Arc::clone(fs),
         recovered_global_seqno,
-    ))?;
+    )) {
+        Ok(table) => table,
+        Err(e) => {
+            // Same rule as the rejection below: the copy is this pass's own
+            // byproduct and no manifest will ever name it, so leaving it makes
+            // an orphan the next open must delete — and a retry writes another
+            // one beside it. Remove it; the reopen failure is what the caller
+            // sees.
+            if let Err(rm) = discard_unreferenced(&**fs, table_path, config.sync_mode) {
+                log::error!(
+                    "salvaged copy {} could not be removed after its reopen failed ({rm}); \
+                     it stays until the next orphan sweep",
+                    table_path.display(),
+                );
+            }
+            return Err(e);
+        }
+    };
     // A salvaged copy of a bulk-ingested source still relies on the manifest-only
     // global_seqno offset a manifest-LOSS rebuild cannot recover: its entries stay
     // at local seqno 0, so installing it with offset 0 would silently mis-order
@@ -2612,13 +2629,24 @@ fn recover_blob_files(
             BlobFrontier::Punched(f) => f,
             BlobFrontier::FullyConsumed => return Ok(()),
         };
+        // The digest is recomputed from THESE bytes, so it can only prove the
+        // file is self-consistent — never that it is undamaged. Recovery then
+        // parses the metadata section alone, so a rotted value frame sails
+        // through both. Walk the frames, exactly as a retained file's does.
         let checksum = crate::Checksum::from_raw(compute_table_checksum_from(
             &*config.fs,
             blob_path,
             frontier,
         )?);
-        crate::vlog::recover_blob_file_from(blob_path, blob_id, checksum, 0, &config.fs, frontier)
-            .map(|_| ())
+        let handle = crate::vlog::recover_blob_file_from(
+            blob_path, blob_id, checksum, 0, &config.fs, frontier,
+        )?;
+        match validate_blob_frames(config, blob_path, blob_id, frontier, &handle)? {
+            Some(_) => Ok(()),
+            None => Err(crate::Error::InvalidHeader(
+                "blob frame validation failed on this copy",
+            )),
+        }
     };
 
     for (blob_id, blob_path, _file_name) in candidates {
@@ -4128,11 +4156,38 @@ fn scan_table_folders(
                         folder_fs.clone(),
                         manifest_global_seqno,
                     ))
-                    .map(|_| ()),
+                    // The digest was recomputed from THESE bytes, so recovery
+                    // can only prove the file is self-consistent — and it stops
+                    // at the trailer, meta and index, leaving every lazily-read
+                    // data block unexamined. Walk the blocks, exactly as the
+                    // retained copy's keep-decision does.
+                    .and_then(|table| {
+                        match block_verify_verdict(config, &folder_fs, &table_path, &table)? {
+                            BlockVerifyVerdict::Clean | BlockVerifyVerdict::DegradedButReadable => {
+                                Ok(())
+                            }
+                            BlockVerifyVerdict::Corrupt => Err(crate::Error::InvalidHeader(
+                                "block verification failed on this copy",
+                            )),
+                            // Nothing about the data was verified (the walk
+                            // could not size the parity trailers), so this copy
+                            // cannot be called healthy either.
+                            BlockVerifyVerdict::DegradedUnscanned => Err(
+                                crate::Error::InvalidHeader("this copy could not be verified"),
+                            ),
+                        }
+                    }),
                     // Same split as the retained copy's read: a fault in the
                     // ENVIRONMENT is not evidence about these bytes.
                     Err(e) if is_environmental(&e) => return Err(e),
                     Err(e) => Err(e),
+                };
+                // `block_verify_verdict` propagates an environmental failure
+                // rather than grading it; that is the operator's to fix, not a
+                // verdict on this copy.
+                let verdict = match verdict {
+                    Err(e) if is_environmental(&e) => return Err(e),
+                    other => other,
                 };
                 match verdict {
                     Ok(()) => {

@@ -9996,6 +9996,88 @@ fn an_ambiguous_repair_temp_does_not_shut_out_a_routed_manifest_copy() -> crate:
     Ok(())
 }
 
+/// A duplicate whose STRUCTURE is intact but whose DATA rotted is the harder
+/// case: its trailer, meta and index all parse, and the digest is recomputed
+/// from its own bytes, so a structural check can only ever agree with itself.
+/// Without walking the blocks the copy is filed as healthy and the corruption
+/// signal is lost on exactly the damage a reader would hit.
+#[test]
+fn a_routed_duplicate_with_a_rotted_data_block_is_unreadable() -> crate::Result<()> {
+    use crate::config::LevelRoute;
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let cold = std::path::absolute("/cold")?;
+    let tables = root.join("tables");
+    let cold_tables = cold.join("tables");
+    memfs.create_dir_all(&tables)?;
+    memfs.create_dir_all(&cold_tables)?;
+
+    {
+        let mut w = crate::table::Writer::new(tables.join("0"), 0, 0, Arc::clone(&fs_dyn))?
+            .use_data_block_size(128);
+        for i in 0..200u32 {
+            w.write(InternalValue::from_components(
+                format!("key{i:06}").into_bytes(),
+                vec![0xABu8; 64],
+                u64::from(i) + 1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the table is non-empty");
+    }
+    // The routed copy: byte-identical except for one flipped byte INSIDE the
+    // first data block. The trailer, meta and index are untouched, so it opens.
+    {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut memfs.open(
+                &tables.join("0"),
+                &crate::fs::FsOpenOptions::new().read(true),
+            )?,
+            &mut bytes,
+        )?;
+        // Well past the block header, well before the index/meta region.
+        let Some(byte) = bytes.get_mut(64) else {
+            panic!("the written file reaches the flipped offset");
+        };
+        *byte ^= 0xFF;
+        let mut f = memfs.open(
+            &cold_tables.join("0"),
+            &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        std::io::Write::write_all(&mut f, &bytes)?;
+    }
+
+    let route_fs: Arc<dyn Fs> = memfs.clone();
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .level_routes(vec![LevelRoute {
+        levels: 0..2,
+        path: cold,
+        fs: route_fs,
+    }])
+    .repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "the intact copy is retained: {report:?}"
+    );
+    assert_eq!(
+        report.unreadable, 1,
+        "a duplicate that opens but whose data rotted is still the corruption \
+         signal: {report:?}",
+    );
+    Ok(())
+}
+
 /// A DAMAGED duplicate is the corruption signal, not a healthy exclusion.
 /// Inferring the duplicate's health from the RETAINED copy's fidelity reports
 /// `unreadable == 0` over a failing disk: the operator watching that counter
@@ -11414,6 +11496,76 @@ fn an_unreferenced_blob_is_removed_at_its_recovered_path() -> crate::Result<()> 
         !memfs.exists(&respelled)?,
         "the unreferenced blob must be removed at the path it was recovered \
          from, not at a name rebuilt from its id: {report:?}",
+    );
+    Ok(())
+}
+
+/// A duplicate BLOB whose metadata section parses but whose value frames
+/// rotted is the same trap as the SST case: recovery reads only the metadata,
+/// and the digest handed to it is recomputed from the very bytes in question,
+/// so nothing there can disagree. Only the frame walk sees the damage, and
+/// without it the copy is filed as a healthy exclusion.
+#[test]
+fn a_duplicate_blob_with_a_rotted_frame_is_unreadable() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db_blob_dup_rot")?;
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+    {
+        let tree = match config().open()? {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        for i in 0..40u32 {
+            tree.insert(format!("k{i:04}"), vec![b'v'; 128], u64::from(i) + 1);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // A second entry for the SAME id under a noncanonical spelling of that id,
+    // so the scan recovers it as a genuine duplicate — with one byte of a
+    // value frame flipped. Its metadata section is untouched.
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let original = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .map(|e| e.path)
+        .ok_or(crate::Error::Unrecoverable)?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut memfs.open(&original, &crate::fs::FsOpenOptions::new().read(true))?,
+        &mut bytes,
+    )?;
+    let Some(byte) = bytes.get_mut(64) else {
+        panic!("the written blob reaches the flipped offset");
+    };
+    *byte ^= 0xFF;
+    let mut f = memfs.open(
+        &blobs.join("00"),
+        &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+    )?;
+    std::io::Write::write_all(&mut f, &bytes)?;
+    drop(f);
+
+    let report = config().repair()?;
+    assert_eq!(
+        report.unreadable, 1,
+        "a duplicate blob whose frames rotted is the corruption signal, not a \
+         healthy exclusion: {report:?}",
     );
     Ok(())
 }
