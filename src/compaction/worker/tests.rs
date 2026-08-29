@@ -2909,3 +2909,103 @@ fn a_refused_sidecar_read_is_reported_not_walked_as_corruption() -> crate::Resul
     );
     Ok(())
 }
+
+/// A routed merge whose inputs straddle two volumes is not automatically
+/// hopeless: the slices reclaim the DESTINATION-local inputs as they go, so the
+/// pass only has to absorb the remote share. Declining whenever a single remote
+/// input exists leaves a space-constrained tree read-only with reclaimable
+/// bytes sitting right there.
+#[test]
+fn tight_space_engages_when_the_local_share_covers_the_output() -> crate::Result<()> {
+    use crate::config::LevelRoute;
+    use crate::fs::{Fs, MemFs};
+
+    let dir = tempfile::tempdir()?;
+    let hot_dir = dir.path().join("hot");
+    let hot = Arc::new(MemFs::with_capacity(u64::MAX));
+    hot.create_dir_all(&hot_dir)?;
+    let main = Arc::new(MemFs::with_capacity(u64::MAX));
+
+    // Moved, not cloned: only the destination volume is inspected afterwards.
+    let hot_fs: Arc<dyn Fs> = hot;
+    let tree = match Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_shared_fs(main.clone())
+    .level_routes(vec![LevelRoute {
+        levels: 0..1,
+        path: hot_dir.clone(),
+        fs: hot_fs,
+    }])
+    .open()?
+    {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+
+    // First generation, compacted down so it lands on the DESTINATION volume.
+    for i in 0..TIGHT_SPACE_KEYS {
+        tree.insert(tight_space_key(i).as_bytes(), vec![0xCDu8; 64], i);
+    }
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+    let local_bytes: u64 = tree
+        .current_version()
+        .iter_tables()
+        .filter(|t| t.path.starts_with(dir.path().join("tables")))
+        .map(crate::table::Table::file_size)
+        .sum();
+    assert!(
+        local_bytes > 0,
+        "the first generation is on the destination"
+    );
+
+    // A small second generation on the ROUTED volume.
+    for i in 0..64u64 {
+        tree.insert(
+            tight_space_key(i).as_bytes(),
+            vec![0xEFu8; 64],
+            TIGHT_SPACE_KEYS + i,
+        );
+    }
+    tree.flush_active_memtable(0)?;
+    let remote_bytes: u64 = tree
+        .current_version()
+        .iter_tables()
+        .filter(|t| t.path.starts_with(&hot_dir))
+        .map(crate::table::Table::file_size)
+        .sum();
+    assert!(
+        remote_bytes > 0 && remote_bytes < local_bytes,
+        "the routed share must be the smaller one ({remote_bytes} vs {local_bytes})",
+    );
+
+    // Free space covers the REMOTE share but not the whole merge: reclaiming
+    // the local inputs slice by slice is exactly what makes this fit.
+    let used = tree.storage_stats()?.used_bytes;
+    main.set_capacity(used + remote_bytes * 2);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = true;
+    })?;
+
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+
+    assert!(
+        main.punched_bytes() > 0,
+        "the destination-local inputs must be reclaimed rather than the pass \
+         declining over the routed remainder",
+    );
+    for i in 0..64u64 {
+        assert_eq!(
+            tree.get(tight_space_key(i).as_bytes(), crate::MAX_SEQNO)?
+                .as_deref(),
+            Some(&[0xEFu8; 64][..]),
+            "the newest generation survives the rewrite",
+        );
+    }
+    Ok(())
+}

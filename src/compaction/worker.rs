@@ -922,15 +922,23 @@ fn run_tight_space_compaction(
     if dest_free < inputs_total {
         // Only a PROVEN different volume forfeits the relief; an unproven pair
         // counts as shared, leaving the single-volume default untouched.
-        let elsewhere = inputs
+        //
+        // Some inputs elsewhere is not the same as no relief. The output is
+        // bounded by the inputs, and each slice frees the DESTINATION-local
+        // share as it goes, so the volume only has to absorb the remote share:
+        // 90 MB local plus 10 MB remote completes with 20 MB free. Requiring
+        // every input to be colocated would leave a constrained tree read-only
+        // with the reclaimable bytes sitting on the very volume that is full.
+        let remote_total: u64 = inputs
             .iter()
-            .find(|t| separate_volumes(&*t.fs, &t.path, &*dest_fs, &dest_path));
-        if let Some(t) = elsewhere {
+            .filter(|t| separate_volumes(&*t.fs, &t.path, &*dest_fs, &dest_path))
+            .map(Table::file_size)
+            .sum();
+        if dest_free < remote_total {
             log::info!(
-                "Tight-space compaction unavailable: input table {} is on a different volume \
-                 than the constrained destination, so punching it frees no space where the \
-                 slice outputs land",
-                t.path.display(),
+                "Tight-space compaction unavailable: {remote_total} bytes of input live on a \
+                 different volume than the constrained destination and only {dest_free} bytes \
+                 are free there, so the slices would grow it without relief",
             );
             return Ok(CompactionResult::nothing());
         }
