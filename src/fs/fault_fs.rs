@@ -96,6 +96,12 @@ pub enum FaultOp {
     /// Failing it with [`io::ErrorKind::Unsupported`] models a backend that
     /// leaves the trait default in place (no hard-link support).
     HardLink,
+    /// [`Fs::available_space`] — the free-space probe every space decision
+    /// consults. Failing it models a backend that cannot report free space
+    /// (an object store, a quota-only deployment), which the engine reads as
+    /// "physically unbounded" — so a test arms it to prove the LOGICAL quota
+    /// still bounds what the engine admits.
+    AvailableSpace,
     /// [`Fs::allocated_size`] — the physical-allocation probe manifest repair
     /// uses to detect a hole-punched SST. Failing it exercises the fail-closed
     /// path (a probe error must not be read as "unpunched").
@@ -539,6 +545,9 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn available_space(&self, path: &Path) -> io::Result<u64> {
+        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::AvailableSpace, Some(path)) {
+            return Err(fault_error(kind, FaultOp::AvailableSpace));
+        }
         self.inner.available_space(path)
     }
 

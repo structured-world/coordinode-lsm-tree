@@ -2310,6 +2310,59 @@ fn space_gate_for_merge_narrows_a_full_run_that_exceeds_free() -> crate::Result<
     Ok(())
 }
 
+/// A backend that cannot report free space reads as physically unbounded, so
+/// on a quota-only deployment the LOGICAL limit is the only thing that rejects
+/// a merge. Deriving the slice budget from the physical probe alone then leaves
+/// it unbounded, `tight_slice_boundaries` emits no interior boundary, and the
+/// pass that was engaged to reclaim space returns having reclaimed nothing —
+/// leaving the tree read-only with no way out.
+#[test]
+fn tight_space_slices_when_only_the_quota_constrains() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    let dir = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    let faulty = FaultFs::new(mem.clone());
+    faulty.injector().arm(FaultRule::new(
+        FaultOp::AvailableSpace,
+        Fault::Error(crate::io::ErrorKind::Unsupported),
+    ));
+
+    let tree = match Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_shared_fs(Arc::new(faulty))
+    .open()?
+    {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    for i in 0..TIGHT_SPACE_KEYS {
+        tree.insert(tight_space_key(i).as_bytes(), vec![0xCDu8; 64], i);
+    }
+    tree.flush_active_memtable(0)?;
+
+    // A quota that leaves less headroom than the merge's output needs: the
+    // only constraint in play, since the free-space probe answers "unknown".
+    let used = crate::storage_stats::compute_used_bytes(&tree.current_version())?;
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = true;
+        c.storage_limit_bytes = Some(used + used / 4);
+    })?;
+
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+    assert!(
+        mem.punched_bytes() > 0,
+        "the slices must reclaim a prefix; a quota-only tree has no other way \
+         back from read-only",
+    );
+    Ok(())
+}
+
 /// A restricted view's metadata still counts the punched-out prefix. The
 /// planner's numerator raises that table's lower bound to the restriction, so
 /// a denominator taken from the whole file reports a FULL-keyspace query as

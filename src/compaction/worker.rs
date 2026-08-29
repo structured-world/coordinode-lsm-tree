@@ -946,6 +946,19 @@ fn run_tight_space_compaction(
         }
     }
 
+    // The tree-wide logical quota is the OTHER constraint the space gate
+    // enforces, and it is the one that engaged this pass whenever the backend
+    // cannot report free space: an unanswerable `available_space` reads as
+    // physically unbounded, so nothing else is left to reject a merge. The
+    // clamp-to-zero matches the gate's min-semantics (a quota set below the
+    // live footprint leaves no headroom).
+    let quota_headroom = match opts.runtime_config.load().storage_limit_bytes {
+        Some(limit) => {
+            limit.saturating_sub(crate::storage_stats::compute_used_bytes(&latest.version)?)
+        }
+        None => u64::MAX,
+    };
+
     drop(latest);
     drop(version_history_lock);
     if inputs.is_empty() {
@@ -968,7 +981,7 @@ fn run_tight_space_compaction(
     // destination beside a full `blobs/` yields a budget larger than every
     // input block (`tight_slice_boundaries` returns empty, so no reclaim
     // happens at all) or a slice the blob volume cannot hold.
-    let slice_budget = if relocating && stale_total_bytes > 0 {
+    let physical_budget = if relocating && stale_total_bytes > 0 {
         let blob_dir = opts.config.path.join(BLOBS_FOLDER);
         let blob_free = opts
             .config
@@ -998,6 +1011,12 @@ fn run_tight_space_compaction(
     } else {
         dest_free.max(1)
     };
+    // Whatever the physical pools allow, a slice's output has to fit the quota
+    // too: it is a tree-wide logical limit, not a property of one volume, so it
+    // caps the budget on both paths. Without this a quota-only deployment
+    // slices nothing (an unbounded budget yields no interior boundary) and
+    // never leaves read-only, which is the state that engaged the pass.
+    let slice_budget = physical_budget.min(quota_headroom.max(1));
     let boundaries = tight_slice_boundaries(&inputs, slice_budget, comparator.as_ref())?;
     if boundaries.is_empty() {
         // Indivisible (single block across all inputs) — no incremental reclaim.
