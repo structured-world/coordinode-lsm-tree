@@ -1494,7 +1494,12 @@ impl AbstractTree for Tree {
             },
         );
         let mut add_memtable = |mt: &crate::Memtable| {
-            total_rows = total_rows.saturating_add(mt.len() as u64);
+            // The denominator counts what a read at this snapshot can SEE, the
+            // same rule the SST loop applies: an entry at or above `seqno` is
+            // filtered out of the numerator below, so counting it here would
+            // report a full-keyspace query as selecting half of what it sees.
+            let visible = mt.iter().filter(|kv| kv.key.seqno < seqno).count() as u64;
+            total_rows = total_rows.saturating_add(visible);
             let in_range = mt
                 .range_internal(mt_range.clone())
                 .filter(|kv| kv.key.seqno < seqno)

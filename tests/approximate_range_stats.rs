@@ -458,3 +458,40 @@ fn a_future_table_is_absent_from_the_selectivity_denominator() -> lsm_tree::Resu
     );
     Ok(())
 }
+
+/// The memtable half of the same rule: entries at or above the snapshot are
+/// filtered out of the numerator, so counting them in the denominator reports a
+/// full-keyspace query as selecting only part of what it sees.
+#[test]
+fn future_memtable_rows_are_absent_from_the_selectivity_denominator() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let tree = match any {
+        AnyTree::Standard(t) => t,
+        AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+
+    // Half the memtable is visible at seqno 50, half is newer. Nothing is
+    // flushed, so the whole estimate comes from the memtable.
+    for i in 0..100u32 {
+        tree.insert(key(i), vec![0xAB; 32], 10);
+    }
+    for i in 100..200u32 {
+        tree.insert(key(i), vec![0xCD; 32], 100);
+    }
+
+    let full = tree.approximate_range_cardinality(key(0)..key(200), 50)?;
+    assert!(
+        (full.selectivity - 1.0).abs() < f64::EPSILON,
+        "a full-keyspace query selects every snapshot-visible memtable row \
+         (got selectivity {}, rows {})",
+        full.selectivity,
+        full.rows,
+    );
+    Ok(())
+}
