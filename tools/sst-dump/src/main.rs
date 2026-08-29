@@ -172,8 +172,10 @@ enum Command {
     /// Uses the default comparator and no encryption: a tree created
     /// with a custom comparator or with encryption must be repaired via
     /// the library `Config::repair` API with the matching config.
-    /// A KV-separated (blob) tree is detected by its `blobs/` folder and
-    /// repaired with KV separation enabled so its blob files are recovered.
+    /// A KV-separated (blob) tree is rebuilt with KV separation enabled so its
+    /// blob files are recovered. Pass `--tree-type` to state which kind the
+    /// store is; without it the type is inferred from `blobs/` holding files,
+    /// which an empty or operator-created directory does not establish.
     Repair {
         /// Block-salvage SSTs that fail whole-file recovery instead of leaving
         /// them out: the corrupt original is quarantined and a fresh SST with
@@ -181,6 +183,20 @@ enum Command {
         /// missing the key ranges of its corrupt blocks (a last-resort option).
         #[arg(long)]
         salvage: bool,
+
+        /// Tree type to rebuild as: `standard` or `blob` (KV-separated).
+        ///
+        /// Repairing under the wrong type is not recoverable by another
+        /// repair: a `blob` manifest over standard SSTs makes every later
+        /// standard open fail, and the manifest it wrote is then clean, so a
+        /// standard repair refuses it. When the manifest still loads, it
+        /// supplies the type and this option is unnecessary. When it does
+        /// not, the type is inferred from `blobs/` holding at least one file
+        /// — an EMPTY `blobs/` proves nothing, and a directory an operator
+        /// created beside a standard tree is not evidence either, so pass
+        /// this explicitly whenever you know which one it is.
+        #[arg(long, value_parser = ["standard", "blob"])]
+        tree_type: Option<String>,
     },
 
     /// Print sizing stats for the SST's BuRR filter: on-disk filter
@@ -286,7 +302,9 @@ fn main() -> ExitCode {
             keys_only,
         } => run_dump(&cli.path, from.as_deref(), to.as_deref(), max, keys_only),
         Command::FilterStats => run_filter_stats(&cli.path),
-        Command::Repair { salvage } => run_repair(&cli.path, salvage),
+        Command::Repair { salvage, tree_type } => {
+            run_repair(&cli.path, salvage, tree_type.as_deref())
+        }
         Command::DumpBlock {
             offset,
             tree_id,
@@ -300,7 +318,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_repair(db_dir: &std::path::Path, salvage: bool) -> ExitCode {
+fn run_repair(db_dir: &std::path::Path, salvage: bool, tree_type: Option<&str>) -> ExitCode {
     use lsm_tree::{Config, KvSeparationOptions, SequenceNumberCounter};
 
     let mut config = Config::new(
@@ -309,12 +327,32 @@ fn run_repair(db_dir: &std::path::Path, salvage: bool) -> ExitCode {
         SequenceNumberCounter::default(),
     );
 
-    // A `blobs/` folder marks a KV-separated (blob) tree. Enable KV separation so
-    // repair rediscovers the blob files and records the matching tree type;
-    // without it, repair would rebuild a standard-tree manifest and drop the
-    // blobs. The separation options only affect future writes, so defaults are
-    // fine for recovery.
-    if db_dir.join("blobs").is_dir() {
+    // Repairing under the wrong tree type traps the store: a blob manifest
+    // over standard SSTs fails every later standard open, and the manifest it
+    // committed is clean, so a standard repair declines to touch it. The
+    // caller's word beats any guess. Without one, `blobs/` is evidence only
+    // when it actually HOLDS blob files — an empty directory (or one an
+    // operator created beside a standard tree) says nothing about what was
+    // persisted. The separation options only affect future writes, so
+    // defaults are fine for recovery.
+    let blob_tree = match tree_type {
+        Some("blob") => true,
+        Some("standard") => false,
+        // `value_parser` restricts the flag to those two, so anything else
+        // here is the absent case.
+        _ => {
+            let holds_blob_files = std::fs::read_dir(db_dir.join("blobs"))
+                .map(|mut entries| entries.any(|e| e.is_ok_and(|e| e.path().is_file())))
+                .unwrap_or(false);
+            if holds_blob_files {
+                println!(
+                    "tree type:     blob (inferred: blobs/ holds files; pass --tree-type to override)"
+                );
+            }
+            holds_blob_files
+        }
+    };
+    if blob_tree {
         config = config.with_kv_separation(Some(KvSeparationOptions::default()));
     }
 

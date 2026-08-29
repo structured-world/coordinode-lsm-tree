@@ -157,3 +157,56 @@ fn repair_prints_the_wal_replay_obligation_when_coverage_is_lost()
 
     Ok(())
 }
+
+/// A stray `blobs/` directory beside a STANDARD tree is not evidence of KV
+/// separation. Inferring one from its mere presence commits a blob manifest
+/// over standard SSTs, and that traps the store: the application's standard
+/// open then fails, and a standard repair declines to touch the now-clean blob
+/// manifest. An empty directory must leave the rebuild standard.
+#[test]
+fn an_empty_blobs_dir_does_not_make_a_standard_tree_a_blob_tree()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+
+    {
+        let tree = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0u64..50 {
+            tree.insert(format!("key-{i:06}"), format!("value-{i}"), 1 + i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    // What an operator, a partial copy, or a backup tool can leave behind.
+    std::fs::create_dir_all(dir.path().join("blobs"))?;
+    nuke_manifest(dir.path())?;
+
+    let out = Command::new(SST_DUMP_BIN)
+        .arg(dir.path())
+        .arg("repair")
+        .output()?;
+    assert!(
+        out.status.success(),
+        "repair should exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // The proof is the reopen: a blob manifest would fail a standard open with
+    // a tree-type mismatch, and no later repair could undo it.
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    for i in 0u64..50 {
+        assert_eq!(
+            tree.get(format!("key-{i:06}"), MAX_SEQNO)?.as_deref(),
+            Some(format!("value-{i}").as_bytes()),
+        );
+    }
+    Ok(())
+}
