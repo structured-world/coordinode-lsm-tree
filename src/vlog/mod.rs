@@ -177,40 +177,27 @@ pub fn recover_blob_files(
     for (idx, dirent) in entries.into_iter().enumerate() {
         let file_name = &dirent.file_name;
 
-        // https://en.wikipedia.org/wiki/.DS_Store
-        if file_name == ".DS_Store" {
-            continue;
-        }
-
-        // https://en.wikipedia.org/wiki/AppleSingle_and_AppleDouble_formats
-        if file_name.starts_with("._") {
-            continue;
-        }
-
-        // Skip directories before parsing — non-numeric directory names would
-        // fail the parse and abort recovery.
         if dirent.is_dir {
             continue;
         }
 
-        // `{id}.salvage-tmp`: a manifest repair's in-progress blob salvage
-        // copy. It is published by an atomic rename, so one that survives is
-        // always from a crashed repair and never referenced by any manifest —
-        // sweep it like any other orphan instead of failing the name parse
-        // (which would leave the tree unopenable until an operator intervened).
-        // Both halves must parse so a foreign name that merely ends in the
-        // suffix is NOT treated as ours.
-        if let Some(id_part) = file_name.strip_suffix(".salvage-tmp")
-            && id_part.parse::<BlobFileId>().is_ok()
-        {
-            orphaned_blob_files.push(dirent.path.clone());
-            continue;
-        }
-
-        let blob_file_id = file_name.parse::<BlobFileId>().map_err(|e| {
-            log::error!("invalid blob file name {file_name:?}: {e:?}");
-            crate::Error::Unrecoverable
-        })?;
+        // The naming grammar decides, not a list of names to tolerate: a shape
+        // the engine does not name is not engine state, so it is passed over
+        // untouched rather than read, swept, or made a reason to refuse the
+        // store.
+        let blob_file_id = match crate::file::BlobDirEntry::classify(file_name) {
+            crate::file::BlobDirEntry::Blob(id) => id,
+            // Published by an atomic rename, so a survivor is from a crashed
+            // repair and is referenced by no manifest.
+            crate::file::BlobDirEntry::SalvageTmp(_) => {
+                orphaned_blob_files.push(dirent.path.clone());
+                continue;
+            }
+            crate::file::BlobDirEntry::Foreign => {
+                log::debug!("Ignoring {file_name:?} in the blobs folder: not an engine file");
+                continue;
+            }
+        };
 
         let blob_file_path = &dirent.path;
 

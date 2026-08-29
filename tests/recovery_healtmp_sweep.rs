@@ -40,12 +40,12 @@ fn recovery_sweeps_exact_healtmp_artifact_and_reopens() -> lsm_tree::Result<()> 
 }
 
 /// Only the exact `{numeric-id}.healtmp-{numeric-seq}` shape is owned cleanup
-/// state. A foreign file whose name merely CONTAINS `.healtmp` (an operator
-/// backup like `0.healtmp.backup` or a stray `notes.healtmp`) must NOT be
-/// deleted — recovery fails on the unparseable name, exactly as it does for
-/// any other unrecognized file under `tables/`, and the file survives.
+/// state. A file whose name merely CONTAINS `.healtmp` (an operator backup like
+/// `0.healtmp.backup` or a stray `notes.healtmp`) is not engine state at all:
+/// recovery passes over it and it survives, exactly as any other unowned name
+/// under `tables/` does.
 #[test]
-fn recovery_with_non_artifact_healtmp_name_fails_without_deleting() -> lsm_tree::Result<()> {
+fn recovery_ignores_a_non_artifact_healtmp_name_without_deleting_it() -> lsm_tree::Result<()> {
     for foreign_name in [
         "0.healtmp.backup",
         "notes.healtmp",
@@ -63,10 +63,11 @@ fn recovery_with_non_artifact_healtmp_name_fails_without_deleting() -> lsm_tree:
         let foreign = folder.path().join("tables").join(foreign_name);
         std::fs::File::create(&foreign)?;
 
-        let result = open(&folder);
-        assert!(
-            matches!(result, Err(lsm_tree::Error::Unrecoverable)),
-            "recovery must refuse the unrecognized file {foreign_name:?} instead of deleting it"
+        let tree = open(&folder)?;
+        assert_eq!(
+            tree.get("a", lsm_tree::MAX_SEQNO)?.as_deref(),
+            Some(&b"a"[..]),
+            "an unowned name must not affect recovery: {foreign_name:?}",
         );
         assert!(
             foreign.try_exists()?,

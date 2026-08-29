@@ -5400,12 +5400,11 @@ fn repair_honors_a_valid_sidecar_despite_a_persistent_dead_prefix_read() -> crat
 }
 
 /// A file whose name only LOOKS like a heal-temp — `{id}.healtmp-{non-numeric}`
-/// (e.g. `5.healtmp-backup`) — must NOT be skipped as an owned artifact: recovery
-/// owns only `{id}.healtmp-{numeric}`, so leaving it in place makes the next
-/// `Tree::open` reject its non-numeric name instead of sweeping it, leaving the
-/// repaired database unopenable. Repair must remove it like any foreign file.
+/// (e.g. `5.healtmp-backup`) is NOT an owned artifact: the grammar owns only
+/// `{id}.healtmp-{numeric}`. Being unowned, it is an operator's file, so the
+/// repair leaves it exactly where it is and the tree opens over it.
 #[test]
-fn repair_removes_a_foreign_healtmp_suffix() -> crate::Result<()> {
+fn repair_leaves_a_foreign_healtmp_suffix_in_place() -> crate::Result<()> {
     use crate::table::Writer;
     use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
     use std::sync::Arc;
@@ -5444,9 +5443,9 @@ fn repair_removes_a_foreign_healtmp_suffix() -> crate::Result<()> {
         "the real table is recovered: {report:?}"
     );
     assert!(
-        !foreign.exists(),
-        "the foreign .healtmp- file is removed from tables/, not left to break \
-         the next open",
+        foreign.exists(),
+        "a name the engine does not own is the operator's file, not the \
+         repair's to remove",
     );
     Ok(())
 }
@@ -14960,12 +14959,12 @@ fn unparseable_exclusion_forces_full_history_replay() -> crate::Result<()> {
     Ok(())
 }
 
-/// A FOREIGN name in `tables/` (`notes.txt`) is set aside as unreadable, but
-/// it never held table data: reporting it as an unknowable LOSS would force
-/// the full-history replay obligation — demanding an unbounded WAL archive —
-/// over a file whose exclusion lost nothing.
+/// A FOREIGN name in `tables/` (`notes.txt`) is not engine state: the repair
+/// neither reads it nor reports it, and above all does not count it as an
+/// unknowable LOSS, which would force the full-history replay obligation and
+/// demand an unbounded WAL archive over a file that never held table data.
 #[test]
-fn foreign_file_exclusion_is_not_an_unknowable_loss() -> crate::Result<()> {
+fn a_foreign_name_is_neither_read_nor_reported_by_repair() -> crate::Result<()> {
     use crate::fs::{Fs, FsOpenOptions, MemFs};
     use crate::{Config, SequenceNumberCounter};
     use std::io::Write;
@@ -14987,13 +14986,17 @@ fn foreign_file_exclusion_is_not_an_unknowable_loss() -> crate::Result<()> {
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .with_shared_fs(memfs)
+    .with_shared_fs(memfs.clone())
     .repair()?;
     assert_eq!(report.recovered, 1, "the healthy table is kept");
     assert_eq!(
-        report.unreadable, 1,
-        "the foreign name is still set aside: {:?}",
+        report.unreadable, 0,
+        "a name the engine does not own is not an unreadable ENGINE file: {:?}",
         report.unreadable_files,
+    );
+    assert!(
+        memfs.exists(&root.join("tables").join("notes.txt"))?,
+        "the operator's file survives the repair untouched",
     );
     assert!(
         report.unknowable_losses.is_empty(),

@@ -2551,7 +2551,7 @@ fn recover_blob_files(
             is_dir,
         } = dirent;
 
-        if is_dir || file_name == ".DS_Store" || file_name.starts_with("._") {
+        if is_dir {
             continue;
         }
 
@@ -2566,16 +2566,13 @@ fn recover_blob_files(
             p.add_bytes_processed(meta.len);
         }
 
-        // A crashed earlier repair's in-progress blob salvage copy: it is
-        // published by an atomic rename, so a surviving one is never
-        // referenced and never authoritative. Remove it here rather than
-        // classifying it as a foreign name (and re-salvage from the original
-        // below if that file still fails validation). Both halves must parse
-        // so a foreign name merely ending in the suffix is not treated as ours.
-        if file_name
-            .strip_suffix(".salvage-tmp")
-            .is_some_and(|id| id.parse::<crate::vlog::BlobFileId>().is_ok())
-        {
+        let blob_id = match crate::file::BlobDirEntry::classify(&file_name) {
+            crate::file::BlobDirEntry::Blob(id) => id,
+            // A crashed earlier repair's in-progress salvage copy: published by
+            // an atomic rename, so a survivor is never referenced and never
+            // authoritative. Removed here (and re-salvaged from the original
+            // below if that file still fails validation).
+            //
             // A removal failure fails the repair: the temp is outside the
             // rebuilt manifest, so the next open classifies it as an orphan
             // and its sweep hits the same removal failure — reporting success
@@ -2583,18 +2580,19 @@ fn recover_blob_files(
             // an out (it preserves damaged DATA; a temp is discardable
             // garbage, and a directory refusing removal refuses the rename
             // too). Retry after the filesystem is fixed.
-            remove_temp(config, &blob_path)?;
-            continue;
-        }
-
-        let Ok(blob_id) = file_name.parse::<crate::vlog::BlobFileId>() else {
-            // A non-numeric name aborts the reopen's blob recovery (it parses
-            // every name in blobs/), so it MUST go. It is removed after the
-            // commit, and a removal that fails then fails the repair — a bad
-            // name left in place is a tree that does not reopen.
-            discard.push((blob_path.clone(), "file name is not a blob id".to_string()));
-            unreadable.push((blob_path, "file name is not a blob id".to_string()));
-            continue;
+            crate::file::BlobDirEntry::SalvageTmp(_) => {
+                remove_temp(config, &blob_path)?;
+                continue;
+            }
+            // Not a shape the engine names: not part of the inventory being
+            // rebuilt, and not the repair's to remove.
+            crate::file::BlobDirEntry::Foreign => {
+                log::debug!(
+                    "repair: ignoring {} in the blobs folder: not an engine file",
+                    blob_path.display(),
+                );
+                continue;
+            }
         };
         candidates.push((blob_id, blob_path, file_name));
     }
@@ -3882,10 +3880,7 @@ fn publish_recovery_bytes_total(config: &Config) {
         for dirent in dirents {
             // Same skips as the scan loops, so `bytes_processed` can reach
             // `bytes_total` exactly.
-            if dirent.is_dir
-                || dirent.file_name == ".DS_Store"
-                || dirent.file_name.starts_with("._")
-            {
+            if dirent.is_dir {
                 continue;
             }
             if let Ok(meta) = fs.metadata(&dirent.path) {
@@ -4106,8 +4101,7 @@ fn scan_table_folders(
                 is_dir,
             } = dirent;
 
-            // https://en.wikipedia.org/wiki/.DS_Store
-            if is_dir || file_name == ".DS_Store" || file_name.starts_with("._") {
+            if is_dir {
                 continue;
             }
 
@@ -4197,18 +4191,15 @@ fn scan_table_folders(
                     );
                     continue;
                 }
-                // A foreign name cannot be a table id, and `Tree::open` rejects
-                // such a file outright (recovery parses every name in
-                // `tables/`). Leaving it there would let repair report success
-                // over a tree that still cannot reopen, so it is removed after
-                // the commit; a removal that fails then fails the repair.
+                // Not a shape the engine names, so not part of the inventory a
+                // repair rebuilds: left exactly where it is. Removing it to
+                // make the tree openable would be destroying an operator's file
+                // to fix a problem the scanner invented, and the open no longer
+                // has that problem.
                 TableDirEntry::Foreign => {
-                    set_aside_path(
-                        &folder_fs,
-                        &table_path,
-                        "file name is not a table id",
-                        &mut unreadable_files,
-                        &mut discard_after_commit,
+                    log::debug!(
+                        "repair: ignoring {} in the tables folder: not an engine file",
+                        table_path.display(),
                     );
                     continue;
                 }

@@ -44,6 +44,48 @@ pub fn table_id_from_repair_tmp_name(file_name: &str) -> Option<crate::TableId> 
         .and_then(|id| id.parse::<crate::TableId>().ok())
 }
 
+/// Suffix of a manifest repair's in-progress blob salvage copy.
+pub const BLOB_SALVAGE_TMP_SUFFIX: &str = ".salvage-tmp";
+
+/// What a directory entry in a `blobs/` folder IS: the blob half of the naming
+/// grammar, exactly as [`TableDirEntry`] is the table half.
+///
+/// The engine walks its directories by the shapes IT names. Anything else is
+/// [`Foreign`](Self::Foreign): not engine state, so never read, never deleted,
+/// and never a reason to refuse the store. A scanner that instead enumerated
+/// the foreign names it tolerates would be chasing an unbounded, per-platform
+/// set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobDirEntry {
+    /// `{id}`: a blob (value-log) file.
+    Blob(crate::vlog::BlobFileId),
+    /// `{id}.salvage-tmp`: a repair's in-progress salvage copy. It is
+    /// published by an atomic rename, so a survivor is from a crashed repair
+    /// and is never referenced by any manifest. Disposable.
+    SalvageTmp(crate::vlog::BlobFileId),
+    /// None of the shapes the engine owns.
+    Foreign,
+}
+
+impl BlobDirEntry {
+    /// Classifies a file name in a `blobs/` folder.
+    ///
+    /// Ownership is exact-shape: the id must parse as a number, so a foreign
+    /// name that merely ends in an owned suffix (an operator's
+    /// `notes.salvage-tmp`) is [`Foreign`](Self::Foreign).
+    #[must_use]
+    pub fn classify(file_name: &str) -> Self {
+        let owned_id = |rest: &str, make: fn(crate::vlog::BlobFileId) -> Self| {
+            rest.parse::<crate::vlog::BlobFileId>()
+                .map_or(Self::Foreign, make)
+        };
+        if let Some(rest) = file_name.strip_suffix(BLOB_SALVAGE_TMP_SUFFIX) {
+            return owned_id(rest, Self::SalvageTmp);
+        }
+        owned_id(file_name, Self::Blob)
+    }
+}
+
 /// What a directory entry in a `tables/` folder IS — the one grammar every
 /// scanner classifies names against.
 ///

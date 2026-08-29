@@ -4757,16 +4757,6 @@ impl Tree {
                     is_dir,
                 } = dirent;
 
-                // https://en.wikipedia.org/wiki/.DS_Store
-                if file_name == ".DS_Store" {
-                    continue;
-                }
-
-                // https://en.wikipedia.org/wiki/AppleSingle_and_AppleDouble_formats
-                if file_name.starts_with("._") {
-                    continue;
-                }
-
                 let table_file_name = &file_name;
                 if is_dir {
                     log::warn!(
@@ -4971,9 +4961,17 @@ impl Tree {
                         }
                         continue;
                     }
+                    // Not a shape the engine names, so not engine state: passed
+                    // over untouched. Refusing the store here would let any
+                    // stray file (an operator's note, a backup, a desktop
+                    // environment's directory metadata) make it unopenable,
+                    // which is why scanners used to carry a list of foreign
+                    // names to tolerate. The grammar answers it instead.
                     crate::file::TableDirEntry::Foreign => {
-                        log::error!("invalid table file name {table_file_name:?}");
-                        return Err(crate::Error::Unrecoverable);
+                        log::debug!(
+                            "Ignoring {table_file_name:?} in the tables folder: not an engine file"
+                        );
+                        continue;
                     }
                     crate::file::TableDirEntry::Table(id) => id,
                 };

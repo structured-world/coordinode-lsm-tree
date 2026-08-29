@@ -224,8 +224,10 @@ fn repair_with_no_ssts_produces_empty_readable_tree() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// The engine rebuilds ITS inventory: a name matching no shape it owns is the
+/// operator's file, neither reported as engine damage nor tidied away.
 #[test]
-fn repair_reports_non_table_id_filename_as_unreadable() -> lsm_tree::Result<()> {
+fn repair_leaves_a_non_table_id_filename_alone() -> lsm_tree::Result<()> {
     let dir = lsm_tree::get_tmp_folder();
 
     {
@@ -244,9 +246,8 @@ fn repair_reports_non_table_id_filename_as_unreadable() -> lsm_tree::Result<()> 
     let good_count = count_sst_files(dir.path())?;
     nuke_manifest(dir.path())?;
 
-    // A non-numeric file name cannot be a table id. Repair must move it out of
-    // `tables/` (Tree::open rejects non-numeric names outright), otherwise repair
-    // would report success while the DB still cannot reopen.
+    // A non-numeric file name matches no shape the engine owns, so it is not
+    // engine state: the repair rebuilds the inventory around it.
     let bad = dir.path().join("tables").join("not-a-table-id");
     std::fs::write(&bad, b"whatever")?;
 
@@ -258,22 +259,15 @@ fn repair_reports_non_table_id_filename_as_unreadable() -> lsm_tree::Result<()> 
     .repair()?;
 
     assert_eq!(report.recovered, good_count);
-    assert_eq!(report.unreadable, 1);
-    assert!(
-        report.unreadable_files[0].0.ends_with("not-a-table-id"),
-        "the non-numeric file must be the reported unreadable entry",
+    assert_eq!(
+        report.unreadable, 0,
+        "an unowned name is not an unreadable ENGINE file: {:?}",
+        report.unreadable_files,
     );
     assert!(
-        report.unreadable_files[0].1.contains("table id"),
-        "the reason should explain the name is not a table id, got: {}",
-        report.unreadable_files[0].1,
-    );
-
-    // The junk must no longer sit in `tables/` — repair removes it so the tree
-    // reopens cleanly WITHOUT any manual cleanup.
-    assert!(
-        !dir.path().join("tables").join("not-a-table-id").exists(),
-        "non-table-id file must be removed from tables/ by repair",
+        bad.exists(),
+        "the operator's file stays where they put it: the repair rebuilds the \
+         engine's inventory, it does not tidy the directory",
     );
     let tree = Config::new(
         dir.path(),
@@ -430,8 +424,10 @@ fn repair_reports_unopenable_file_as_unreadable() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// The blob half of the naming rule: an unowned name in `blobs/` is not the
+/// repair's to remove, so a refused removal cannot fail it.
 #[test]
-fn repair_fails_when_a_bad_filename_cannot_be_removed() -> lsm_tree::Result<()> {
+fn repair_does_not_attempt_to_remove_a_foreign_blob_filename() -> lsm_tree::Result<()> {
     use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
     use lsm_tree::io::ErrorKind;
 
@@ -455,12 +451,9 @@ fn repair_fails_when_a_bad_filename_cannot_be_removed() -> lsm_tree::Result<()> 
 
     nuke_manifest(dir.path())?;
 
-    // A non-numeric name in blobs/ would make the reopened tree's blob recovery
-    // (which parses every name) abort, so repair must remove it.
-    std::fs::write(dir.path().join("blobs").join("not-a-blob-id"), b"junk")?;
-    // Refuse the removal, exactly as the next open's sweep of that same name
-    // would be refused. Repair must fail rather than report success over a tree
-    // whose reopen the leftover name aborts.
+    let foreign = dir.path().join("blobs").join("not-a-blob-id");
+    std::fs::write(&foreign, b"junk")?;
+    // Any removal of that path fails. The repair must not care.
     let fault = FaultFs::new(StdFs);
     fault.injector().arm(
         FaultRule::new(
@@ -480,17 +473,21 @@ fn repair_fails_when_a_bad_filename_cannot_be_removed() -> lsm_tree::Result<()> 
     .repair();
 
     assert!(
-        result.is_err(),
-        "repair must fail when it cannot remove a bad filename, got {result:?}",
+        result.is_ok(),
+        "a file the engine does not own is never removed, so a refused removal \
+         cannot fail the repair, got {result:?}",
     );
+    assert!(foreign.try_exists()?, "the operator's file survives");
 
     Ok(())
 }
 
+/// A name the engine does not own is not the repair's to remove, so a refused
+/// removal cannot fail the repair: proved by arming the fault and requiring
+/// success, which only holds if no removal is attempted at all.
 #[test]
-fn repair_fails_when_a_bad_table_filename_cannot_be_removed() -> lsm_tree::Result<()> {
-    // Sibling of the blob-side test above, covering `tables/` so the
-    // false-success regression cannot slip back for standard trees.
+fn repair_does_not_attempt_to_remove_a_foreign_table_filename() -> lsm_tree::Result<()> {
+    // Sibling of the blob-side test above, covering `tables/`.
     use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
     use lsm_tree::io::ErrorKind;
 
@@ -512,10 +509,9 @@ fn repair_fails_when_a_bad_table_filename_cannot_be_removed() -> lsm_tree::Resul
 
     nuke_manifest(dir.path())?;
 
-    // A non-numeric name in tables/ would make the reopened tree's recovery
-    // (which parses every name) abort, so repair must remove it.
-    std::fs::write(dir.path().join("tables").join("not-a-table-id"), b"junk")?;
-    // Refuse that removal, exactly as the next open's sweep would be refused.
+    let foreign = dir.path().join("tables").join("not-a-table-id");
+    std::fs::write(&foreign, b"junk")?;
+    // Any removal of that path fails. The repair must not care.
     let fault = FaultFs::new(StdFs);
     fault.injector().arm(
         FaultRule::new(
@@ -534,9 +530,11 @@ fn repair_fails_when_a_bad_table_filename_cannot_be_removed() -> lsm_tree::Resul
     .repair();
 
     assert!(
-        result.is_err(),
-        "repair must fail when it cannot remove a bad table filename, got {result:?}",
+        result.is_ok(),
+        "a file the engine does not own is never removed, so a refused removal \
+         cannot fail the repair, got {result:?}",
     );
+    assert!(foreign.try_exists()?, "the operator's file survives");
 
     Ok(())
 }
