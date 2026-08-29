@@ -16379,3 +16379,215 @@ fn a_restricted_routed_duplicate_is_not_read_as_corrupt() -> crate::Result<()> {
     );
     Ok(())
 }
+
+/// Candidates are sorted canonical-first, so a DAMAGED `blobs/0` is visited
+/// before an intact `blobs/00` of the same id. Salvaging the leader records a
+/// LOSSY replacement as the incumbent, and the whole copy that follows is then
+/// discarded as a redundant duplicate — the repair commits a partial rewrite of
+/// data that was available in full. An intact copy must win over a salvage.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn an_intact_blob_duplicate_wins_over_a_salvage_of_the_canonical_copy() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db_blob_intact_dup")?;
+    let value = |i: u32| alloc::vec![b'a' + u8::try_from(i).expect("small i"); 64];
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+
+    {
+        let tree = match config().open()? {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        for i in 0..8u32 {
+            tree.insert(format!("k{i:04}").as_bytes(), value(i), u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let canonical = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one blob file")
+        .path;
+    // The INTACT copy under the alternate spelling of its own id.
+    let intact = blobs.join("00");
+    {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut memfs.open(&canonical, &crate::fs::FsOpenOptions::new().read(true))?,
+            &mut bytes,
+        )?;
+        let mut f = memfs.open(
+            &intact,
+            &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        f.write_all(&bytes)?;
+    }
+    // Damage the LAST frame of the canonical copy: salvageable, but lossy.
+    let entries: Vec<_> = crate::vlog::BlobFileScanner::new(&canonical, &*fs_dyn, 0)?
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert_eq!(entries.len(), 8, "eight separated values");
+    let flip_at = entries.last().expect("last frame").frame_end - 8;
+    {
+        let mut file = memfs.open(
+            &canonical,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        let byte = crate::file::read_exact(&*file, flip_at, 1)?;
+        file.seek(SeekFrom::Start(flip_at))?;
+        file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
+    }
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    let report = config().repair()?;
+    assert_eq!(
+        report.blob_files_salvaged.len(),
+        0,
+        "an intact copy of the id exists, so nothing needs salvaging: {report:?}",
+    );
+
+    // The proof that no record was dropped: every key still reads its value.
+    let tree = match config().open()? {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+    };
+    for i in 0..8u32 {
+        assert_eq!(
+            tree.get(format!("k{i:04}").as_bytes(), crate::MAX_SEQNO)?
+                .as_deref(),
+            Some(value(i).as_slice()),
+            "key {i} must survive: the intact duplicate held every frame",
+        );
+    }
+    Ok(())
+}
+
+/// The replacements are durable the moment the manifest commits, so the report
+/// must name every one of them — it is the operator's only account of which
+/// blobs were replaced, and it travels inside `RepairedButUnopened`. Building
+/// the entries as removals succeeded left the list truncated exactly when the
+/// cleanup went wrong, which is when the account matters most.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_salvaged_blob_is_reported_even_when_its_original_cannot_be_removed() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = MemFs::new();
+    let fault = FaultFs::new(memfs.clone());
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+    let root = std::path::absolute("/db_salvage_report")?;
+    let value = |i: u32| alloc::vec![b'a' + u8::try_from(i).expect("small i"); 64];
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&fs))
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+
+    {
+        let tree = match config().open()? {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        for i in 0..8u32 {
+            tree.insert(format!("k{i:04}").as_bytes(), value(i), u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let blob_path = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one blob file")
+        .path;
+    let entries: Vec<_> = crate::vlog::BlobFileScanner::new(&blob_path, &memfs, 0)?
+        .collect::<crate::Result<Vec<_>>>()?;
+    let flip_at = entries.last().expect("last frame").frame_end - 8;
+    {
+        let mut file = memfs.open(
+            &blob_path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        let byte = crate::file::read_exact(&*file, flip_at, 1)?;
+        file.seek(SeekFrom::Start(flip_at))?;
+        file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
+    }
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    // The salvage runs and commits; removing the superseded original then
+    // fails, which fails the repair AFTER the replacement is durable.
+    injector.arm(
+        FaultRule::new(
+            FaultOp::RemoveFile,
+            Fault::Error(ErrorKind::PermissionDenied),
+        )
+        .on_path(blob_path.display().to_string()),
+    );
+    let outcome = config().repair();
+    injector.clear();
+
+    let Err(crate::Error::RepairedButUnopened { report, .. }) = outcome else {
+        panic!("a post-commit cleanup failure must carry the finished report, got {outcome:?}");
+    };
+    assert_eq!(
+        report.blob_files_salvaged.len(),
+        1,
+        "the durable replacement must be reported whatever the cleanup did: {report:?}",
+    );
+    assert!(
+        report
+            .blob_files_salvaged
+            .first()
+            .is_some_and(
+                |(_, note)| note.contains("records salvaged") && note.contains("NOT removed")
+            ),
+        "the note says what was recovered AND that the original is still there: {report:?}",
+    );
+    Ok(())
+}

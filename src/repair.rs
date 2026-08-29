@@ -2598,6 +2598,48 @@ fn recover_blob_files(
         }
     };
 
+    // Sightings of one id are contiguous (the sort keys on id first) and the
+    // CANONICAL spelling leads each group. That order is wrong when the leader
+    // is damaged: the loop below would salvage it into a fresh id, record that
+    // lossy replacement as the incumbent, and then discard a later INTACT copy
+    // as a redundant duplicate — committing a partial rewrite of data that was
+    // available in full. Promote a cleanly-opening sighting to the front of its
+    // group so salvage runs only when no copy of the id is whole.
+    let candidates = {
+        let mut ordered: Vec<(crate::vlog::BlobFileId, PathBuf, String)> =
+            Vec::with_capacity(candidates.len());
+        let mut rest = candidates.into_iter().peekable();
+        while let Some(first) = rest.next() {
+            let blob_id = first.0;
+            let mut group = vec![first];
+            while rest.peek().is_some_and(|c| c.0 == blob_id) {
+                if let Some(c) = rest.next() {
+                    group.push(c);
+                }
+            }
+            if group.len() > 1 {
+                let mut whole = None;
+                for (k, candidate) in group.iter().enumerate() {
+                    match opens_cleanly(blob_id, &candidate.1) {
+                        Ok(()) => {
+                            whole = Some(k);
+                            break;
+                        }
+                        // Not evidence about these bytes, and the choice it
+                        // would steer decides which copy survives.
+                        Err(e) if is_environmental(&e) => return Err(e),
+                        Err(_) => {}
+                    }
+                }
+                if let Some(k) = whole {
+                    group.swap(0, k);
+                }
+            }
+            ordered.extend(group);
+        }
+        ordered
+    };
+
     for (blob_id, blob_path, _file_name) in candidates {
         if let Some(kept) = kept_paths.get(&blob_id) {
             // A second directory entry for an already-recovered id. An ALIAS
@@ -6131,10 +6173,27 @@ fn publish_repaired_manifest(
     // one outcome recovery must never produce, so the failure propagates: the
     // manifest is already durable, and a retry once the filesystem is fixed
     // finishes the sweep on the same inputs.
+    // The replacements are DURABLE the moment the manifest commits, so the
+    // report must name every one of them regardless of what the cleanup does.
+    // Recording them only as removals succeeded left the report empty whenever
+    // an earlier post-commit step had already failed, and truncated whenever a
+    // removal failed midway — and that report is what rides out inside
+    // `RepairedButUnopened`, the operator's only account of which blobs were
+    // replaced. Build the entries first; the removal only annotates them.
+    let salvage_report_base = blob_files_salvaged.len();
+    blob_files_salvaged.extend(
+        stale_blob_originals
+            .iter()
+            .map(|(path, note)| (path.clone(), format!("{note}; original NOT removed"))),
+    );
     if post_commit_error.is_none() {
-        for (path, note) in stale_blob_originals {
-            match discard_unreferenced(&*config.fs, &path, config.sync_mode) {
-                Ok(()) => blob_files_salvaged.push((path, format!("{note}; original removed"))),
+        for (i, (path, note)) in stale_blob_originals.iter().enumerate() {
+            match discard_unreferenced(&*config.fs, path, config.sync_mode) {
+                Ok(()) => {
+                    if let Some(entry) = blob_files_salvaged.get_mut(salvage_report_base + i) {
+                        *entry = (path.clone(), format!("{note}; original removed"));
+                    }
+                }
                 Err(e) => {
                     log::error!(
                         "repair: cannot remove the superseded blob original {} ({e}); \
