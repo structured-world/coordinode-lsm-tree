@@ -205,3 +205,63 @@ fn level_stats_count_a_restricted_tables_sidecar() -> crate::Result<()> {
     );
     Ok(())
 }
+
+/// A tight-space compaction reclaims the consumed prefix of its input IN PLACE:
+/// the blocks are gone from the device while `len` still reports the original
+/// size. Charging the logical length keeps those freed bytes on the quota
+/// forever: under `storage_limit_bytes` the headroom never recovers and the
+/// tree stays read-only even though the compaction succeeded.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_punched_table_is_charged_its_allocated_bytes() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::table::{Table, Writer};
+    use crate::{InternalValue, ValueType};
+    use std::sync::Arc;
+
+    let memfs = MemFs::new();
+    let fs: Arc<dyn Fs> = Arc::new(memfs.clone());
+    let dir = std::path::absolute("/punched_accounting")?;
+    memfs.create_dir_all(&dir)?;
+    let sst = dir.join("0");
+
+    let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(128);
+    for i in 0..256u32 {
+        w.write(InternalValue::from_components(
+            format!("k{i:05}").into_bytes(),
+            format!("v{i}").into_bytes(),
+            u64::from(i) + 1,
+            ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = w.finish()?.expect("table written");
+
+    let table = Table::recover(crate::table::RecoverParams::new(
+        sst.clone(),
+        checksum,
+        0,
+        Arc::clone(&fs),
+        crate::comparator::default_comparator(),
+        Arc::new(crate::Cache::with_capacity_bytes(1_000_000)),
+    ))?;
+    let bound: crate::UserKey = b"k00100".to_vec().into();
+    let punch_at = table.punch_offset_for(&bound)?;
+    assert!(punch_at > 0, "the bound must fall past the first block");
+    let logical = fs.metadata(&sst)?.len;
+
+    let restricted = table.reopen_restricted(bound)?;
+    // Reclaim the consumed prefix, exactly as the tight-space pass does.
+    memfs.punch_hole(&sst, 0, punch_at)?;
+
+    let charged = table_on_disk_bytes(&restricted)?;
+    assert!(
+        charged < logical,
+        "the reclaimed prefix must leave the quota: charged {charged}, logical {logical}",
+    );
+    assert_eq!(
+        charged,
+        logical - punch_at,
+        "what is charged is what is still allocated",
+    );
+    Ok(())
+}

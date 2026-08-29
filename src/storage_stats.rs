@@ -400,8 +400,12 @@ pub(crate) fn compute_used_bytes(version: &Version) -> crate::Result<u64> {
 /// restricted trees. A restricted view whose sidecar is missing on disk (a
 /// geometry-derived restriction after a repair) counts the SST alone.
 pub(crate) fn table_on_disk_bytes(table: &crate::table::Table) -> crate::Result<u64> {
+    // Physical bytes: charging the logical length would keep a tight-space
+    // compaction's freed prefix on the quota forever, so under
+    // `storage_limit_bytes` the headroom would never recover and the tree would
+    // stay read-only despite the compaction having succeeded.
     #[cfg_attr(not(feature = "std"), expect(unused_mut, reason = "no sidecar arm"))]
-    let mut bytes = table.fs.metadata(&table.path)?.len;
+    let mut bytes = crate::file::on_disk_bytes(&*table.fs, &table.path)?;
     // Restrictions are created only by the std-only tight-space / repair
     // paths, so the sidecar probe is std-gated with them.
     #[cfg(feature = "std")]

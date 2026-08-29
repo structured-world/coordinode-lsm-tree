@@ -132,6 +132,34 @@ impl TableDirEntry {
     }
 }
 
+/// The bytes `path` occupies for accounting: its length MINUS the holes
+/// punched out of it.
+///
+/// A tight-space compaction punches the consumed prefix out of its input, which
+/// leaves `len` reporting the original size while those blocks are gone from
+/// the device; charging the length would keep the freed bytes on the quota
+/// forever. The allocation is the lower of the two only when a hole exists:
+/// a normal file's allocation is ROUNDED UP to a block, and adopting that would
+/// inflate every file in the tree by up to a block for no gain. So take the
+/// smaller, which is the length for an intact file and the live extents for a
+/// punched one. A backend that cannot report allocation answers `None` (it also
+/// never punches), where the length is exact.
+///
+/// Every accounting surface measures through this one rule: `storage_stats` and
+/// the checkpoint totals are asserted equal, so a second spelling of "how big is
+/// this file" is a divergence waiting to happen.
+///
+/// # Errors
+///
+/// Propagates the stat failures of `path`.
+pub(crate) fn on_disk_bytes(fs: &dyn Fs, path: &Path) -> crate::io::Result<u64> {
+    let len = fs.metadata(path)?.len;
+    Ok(match fs.allocated_size(path)? {
+        Some(allocated) => allocated.min(len),
+        None => len,
+    })
+}
+
 /// Streams `path` from byte `start` to end through XXH3-128, splicing
 /// `overrides` over the bytes on disk as it goes.
 ///
