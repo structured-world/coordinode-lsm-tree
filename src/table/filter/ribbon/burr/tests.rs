@@ -1220,3 +1220,28 @@ fn retrieval_wire_bytes_use_filter_type_three() {
         "retrieval filter_type tag must be 3",
     );
 }
+
+/// A key the ribbon solve cannot place is an ordinary outcome of an unlucky
+/// band placement, and BuRR's answer to one is the next layer. Failing the
+/// build instead turned a small, perfectly valid key set into a dead write:
+/// the LSM writer surfaced it as an unrecoverable compaction.
+#[test]
+fn burr_builds_every_small_key_set_by_bumping_unplaceable_keys() {
+    for n in 1..=256_usize {
+        let params = BurrParams::with_fp_rate(n, 0.01).expect("valid params");
+        let builder = BurrBuilder::new(params).expect("builder");
+        // Distinct, well-spread hashes, deterministic across runs.
+        let hashes: Vec<u64> = (0..n as u64)
+            .map(|i| crate::hash::hash64(&(i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).to_le_bytes()))
+            .collect();
+        let filter = builder
+            .build_from_hashes(&hashes)
+            .unwrap_or_else(|e| panic!("n={n} must build, got {e:?}"));
+        for (at, hash) in hashes.iter().enumerate() {
+            assert!(
+                filter.contains_hash(*hash),
+                "n={n}: key {at} must be a member (a bumped key may not be lost)",
+            );
+        }
+    }
+}

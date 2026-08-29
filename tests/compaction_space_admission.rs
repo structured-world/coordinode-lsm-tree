@@ -791,3 +791,53 @@ fn tight_space_blob_defrag_relocates_a_fragmented_file_in_slices() -> lsm_tree::
     }
     Ok(())
 }
+
+/// A tight-space compaction whose input is still hard-linked cannot reclaim as
+/// it goes, so it slices the rewrite very finely. The tiny outputs that
+/// produces used to hit a BuRR construction that could not place a key and
+/// failed the whole build, turning a valid compaction into a dead write.
+#[test]
+fn a_finely_sliced_tight_space_compaction_completes() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::Fs;
+
+    let folder = get_tmp_folder();
+    let (tree, mem) = open_capped(folder.path(), u64::MAX);
+    for i in 0..2_000u64 {
+        tree.insert(format!("key{i:08}").as_bytes(), vec![0xCDu8; 64], i);
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    let used = tree.storage_stats().expect("stats").used_bytes;
+
+    // A second name for the input, as a checkpoint that hard-linked it during
+    // its window would leave: the reclaim must then be deferred rather than
+    // zeroing a snapshot, so free space never grows as the rewrite proceeds.
+    let tables_dir = folder.path().join("tables");
+    let link_dir = folder.path().join("..").join("checkpoint-links");
+    mem.create_dir_all(&link_dir)?;
+    for entry in mem.read_dir(&tables_dir)? {
+        if !entry.is_dir {
+            mem.hard_link(
+                &entry.path,
+                &link_dir.join(entry.path.file_name().expect("table file name")),
+            )?;
+        }
+    }
+
+    mem.set_capacity(used + used / 4);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+        c.tight_space_compaction = true;
+    })?;
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+
+    for i in (0..2_000u64).step_by(97) {
+        assert_eq!(
+            tree.get(format!("key{i:08}").as_bytes(), lsm_tree::SeqNo::MAX)?
+                .as_deref(),
+            Some(&[0xCDu8; 64][..]),
+            "every key must survive the finely sliced rewrite",
+        );
+    }
+    Ok(())
+}
