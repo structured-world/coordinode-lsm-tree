@@ -1528,15 +1528,16 @@ fn twelve_letter_items() -> Vec<crate::InternalValue> {
 
 /// Reads a whole reconcile costs on a table of `blocks` four-entry data blocks,
 /// counted at the filesystem. The table carries a zone map so the section-level
-/// gates take part too.
-fn reconcile_read_count(name: &str, blocks: usize) -> crate::Result<usize> {
-    use crate::fs::{FaultFs, Fs, MemFs};
+/// gates take part too. On a REAL on-disk file: the claim is about what a
+/// reconcile costs in I/O, so the medium it is measured on should be the one it
+/// runs against.
+fn reconcile_read_count(blocks: usize) -> crate::Result<usize> {
+    use crate::fs::{FaultFs, StdFs};
 
-    let faulty = std::sync::Arc::new(FaultFs::new(MemFs::new()));
+    let dir = tempfile::tempdir()?;
+    let faulty = std::sync::Arc::new(FaultFs::new(StdFs));
     let injector = faulty.injector();
-    let root = std::path::absolute(alloc::format!("/{name}"))?;
-    faulty.create_dir_all(&root)?;
-    let path = root.join("table");
+    let path = dir.path().join("table");
 
     let mut writer = Writer::new(path.clone(), 0, 0, faulty.clone())?.use_zone_map(true);
     for idx in 0..blocks * 4 {
@@ -1578,8 +1579,8 @@ fn reconcile_read_count(name: &str, blocks: usize) -> crate::Result<usize> {
 /// the old shape cannot satisfy this no matter what the constant term is.
 #[test]
 fn reconcile_gates_read_each_block_once() -> crate::Result<()> {
-    let small = reconcile_read_count("reconcile_small", 3)?;
-    let large = reconcile_read_count("reconcile_large", 6)?;
+    let small = reconcile_read_count(3)?;
+    let large = reconcile_read_count(6)?;
     assert_eq!(
         large - small,
         3,
