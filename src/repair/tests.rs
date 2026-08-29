@@ -17090,3 +17090,57 @@ fn repair_syncs_the_blobs_directory_after_removing_an_unreferenced_file() -> cra
     );
     Ok(())
 }
+
+/// A remote or custom backend's transport blip surfaces as a connection error.
+/// It says nothing about the bytes on disk, so it must abort the repair for a
+/// retry: grading the healthy file unreadable commits a manifest that excludes
+/// it and then removes it, turning a temporary outage into permanent loss of
+/// intact data.
+#[test]
+fn repair_propagates_a_connection_failure() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    for kind in [
+        ErrorKind::ConnectionReset,
+        ErrorKind::ConnectionAborted,
+        ErrorKind::ConnectionRefused,
+        ErrorKind::NotConnected,
+    ] {
+        let memfs = Arc::new(MemFs::new());
+        let root = std::path::absolute("/db")?;
+        standard_tree_without_manifest(&memfs, &root)?;
+
+        let fault = FaultFs::new((*memfs).clone());
+        fault.injector().arm(
+            FaultRule::new(FaultOp::Open, Fault::Error(kind))
+                .on_path(root.join("tables").join("0").to_string_lossy()),
+        );
+        let result = Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_fs(fault)
+        .repair();
+        assert!(
+            matches!(result, Err(crate::Error::Io(ref e)) if e.kind() == kind),
+            "a {kind:?} transport failure must abort the repair, never grade the \
+             file: {:?}",
+            result.map(|r| (r.recovered, r.unreadable)),
+        );
+
+        // The backend recovers; the retry recovers the intact file.
+        let report = Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs)
+        .repair()?;
+        assert_eq!(report.recovered, 1, "the intact table survives the outage");
+    }
+    Ok(())
+}

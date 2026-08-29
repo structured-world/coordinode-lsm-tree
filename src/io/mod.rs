@@ -36,8 +36,16 @@ pub type Result<T> = core::result::Result<T, Error>;
 pub enum ErrorKind {
     /// Entity (file, directory, key, etc.) already exists.
     AlreadyExists,
-    /// Broken pipe — the other end of a stream is closed.
+    /// Broken pipe: the other end of a stream is closed.
     BrokenPipe,
+    /// A network backend's connection was reset by the peer (`ECONNRESET`).
+    ConnectionAborted,
+    /// A network backend refused the connection (`ECONNREFUSED`).
+    ConnectionRefused,
+    /// A network backend's connection was reset mid-transfer (`ECONNRESET`).
+    ConnectionReset,
+    /// A network backend's socket is not connected (`ENOTCONN`).
+    NotConnected,
     /// Operation attempted across distinct devices/filesystems.
     CrossesDevices,
     /// The remote host of a network filesystem is unreachable (`EHOSTUNREACH`).
@@ -98,10 +106,15 @@ impl ErrorKind {
     /// [`NetworkDown`](Self::NetworkDown),
     /// [`NetworkUnreachable`](Self::NetworkUnreachable) and
     /// [`StaleNetworkFileHandle`](Self::StaleNetworkFileHandle) an NFS / FUSE
-    /// backend surfaces when the transport (not the data) fails. Everything
-    /// else — including the ambiguous [`Other`](Self::Other), which real `EIO`
-    /// and platform-specific structural errors (e.g. a Windows negative-seek on
-    /// a corrupt file) both map to — is treated as persistent / structural.
+    /// backend surfaces when the transport (not the data) fails, and the
+    /// connection kinds [`ConnectionAborted`](Self::ConnectionAborted),
+    /// [`ConnectionRefused`](Self::ConnectionRefused),
+    /// [`ConnectionReset`](Self::ConnectionReset) and
+    /// [`NotConnected`](Self::NotConnected) a remote or custom backend surfaces
+    /// when its transport drops mid-request. Everything else, including the
+    /// ambiguous [`Other`](Self::Other) that real `EIO` and platform-specific
+    /// structural errors (e.g. a Windows negative-seek on a corrupt file) both
+    /// map to, is treated as persistent / structural.
     /// Shared so the repair and integrity-verify paths classify I/O failures
     /// identically.
     pub(crate) fn is_transient(self) -> bool {
@@ -114,6 +127,12 @@ impl ErrorKind {
                 | Self::NetworkDown
                 | Self::NetworkUnreachable
                 | Self::StaleNetworkFileHandle
+                // A remote or custom backend's transport dropping mid-request
+                // says nothing about the bytes it was carrying.
+                | Self::ConnectionAborted
+                | Self::ConnectionRefused
+                | Self::ConnectionReset
+                | Self::NotConnected
         )
     }
 
@@ -149,6 +168,10 @@ impl ErrorKind {
         match self {
             Self::AlreadyExists => "entity already exists",
             Self::BrokenPipe => "broken pipe",
+            Self::ConnectionAborted => "connection aborted",
+            Self::ConnectionRefused => "connection refused",
+            Self::ConnectionReset => "connection reset",
+            Self::NotConnected => "not connected",
             Self::CrossesDevices => "cross-device link or rename",
             Self::HostUnreachable => "host unreachable",
             Self::Interrupted => "operation interrupted",
@@ -313,6 +336,10 @@ impl From<std::io::Error> for Error {
         let (kind, kind_is_mapped) = match std_kind {
             std::io::ErrorKind::AlreadyExists => (ErrorKind::AlreadyExists, true),
             std::io::ErrorKind::BrokenPipe => (ErrorKind::BrokenPipe, true),
+            std::io::ErrorKind::ConnectionAborted => (ErrorKind::ConnectionAborted, true),
+            std::io::ErrorKind::ConnectionRefused => (ErrorKind::ConnectionRefused, true),
+            std::io::ErrorKind::ConnectionReset => (ErrorKind::ConnectionReset, true),
+            std::io::ErrorKind::NotConnected => (ErrorKind::NotConnected, true),
             std::io::ErrorKind::CrossesDevices => (ErrorKind::CrossesDevices, true),
             std::io::ErrorKind::HostUnreachable => (ErrorKind::HostUnreachable, true),
             std::io::ErrorKind::Interrupted => (ErrorKind::Interrupted, true),
@@ -383,6 +410,10 @@ impl From<Error> for std::io::Error {
         let kind = match err.kind {
             ErrorKind::AlreadyExists => std::io::ErrorKind::AlreadyExists,
             ErrorKind::BrokenPipe => std::io::ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionAborted => std::io::ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionRefused => std::io::ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset => std::io::ErrorKind::ConnectionReset,
+            ErrorKind::NotConnected => std::io::ErrorKind::NotConnected,
             ErrorKind::CrossesDevices => std::io::ErrorKind::CrossesDevices,
             ErrorKind::HostUnreachable => std::io::ErrorKind::HostUnreachable,
             ErrorKind::Interrupted => std::io::ErrorKind::Interrupted,
