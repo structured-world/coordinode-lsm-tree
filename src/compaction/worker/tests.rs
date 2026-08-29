@@ -1279,61 +1279,70 @@ fn tight_space_slice_retains_a_tombstone_for_an_unrestricted_repair_survivor() -
     Ok(())
 }
 
-/// A KV-separated tight-space compaction that RELOCATES a fragmented blob
-/// file in slices and crashes after the first slice must reopen consistently:
-/// the relocated entries (now in fresh compact files referenced by the
-/// installed slice output) AND the not-yet-relocated entries (still in the
-/// punched stale file's intact suffix) must all read their latest value.
-#[test]
-fn tight_space_blob_relocation_crash_after_first_slice_recovers_all_keys() -> crate::Result<()> {
+/// Shared key count, key / value shapes and GC watermark for the blob
+/// relocation tests, so the fixture and every assertion cover one dataset.
+const BLOB_RELOC_KEYS: u64 = 4_000;
+const BLOB_RELOC_WATERMARK: u64 = 4 * BLOB_RELOC_KEYS;
+
+fn blob_reloc_key(i: u64) -> String {
+    format!("key{i:08}")
+}
+
+/// High-entropy (xorshift) values so the blobs do NOT compress away: the
+/// relocation transient must be real for the space gate to skip the full merge
+/// and engage the slicing path. Deterministic per (key, generation) so an
+/// assertion can regenerate the expected bytes.
+fn blob_reloc_value(i: u64, generation: u8) -> Vec<u8> {
+    let mut s = (i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (u64::from(generation) << 1);
+    (0..200u32)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "xorshift byte extraction; the high bits are intentionally dropped"
+            )]
+            let byte = (s >> 24) as u8;
+            byte
+        })
+        .collect()
+}
+
+/// The KV-separation options both the original and the reopened tree use: a
+/// reopen with different staleness knobs would not be the same deployment, and
+/// a retry of the relocation has to see the same candidate set.
+fn blob_reloc_kv_options() -> KvSeparationOptions {
+    KvSeparationOptions::default()
+        .separation_threshold(64)
+        // Keep every stale file (default age_cutoff 0.25 would drain a small
+        // candidate set to empty) and treat a lightly-dead file as stale so the
+        // half-shadowed first generation is relocated.
+        .age_cutoff(1.0)
+        .staleness_threshold(0.1)
+        // Small blob files → several per generation, so relocation has multiple
+        // stale files and the merge slices across them.
+        .file_target_size(48 * 1024)
+}
+
+/// Drives a KV-separated tight-space compaction that RELOCATES a fragmented
+/// blob file in slices, crashes it right after the first slice is durably
+/// installed and punched, and returns the reopened tree on the same simulated
+/// disk. Callers assert over the resulting state.
+fn blob_relocation_crash_and_reopen(
+    dir: &std::path::Path,
+    mem: &crate::fs::MemFs,
+) -> crate::Result<crate::blob_tree::BlobTree> {
     use core::sync::atomic::Ordering;
 
-    const N: u64 = 4_000;
-    let k = |i: u64| format!("key{i:08}");
-    // High-entropy (xorshift) values so the blobs do NOT compress away: the
-    // relocation transient must be real for the space gate to skip the full
-    // merge and engage the slicing path. Deterministic per (key, generation)
-    // so the post-reopen assertion can regenerate the expected bytes. Odd keys
-    // keep their first-generation value (a relocated live blob); even keys are
-    // overwritten (their first-gen blob is dead → in-file fragmentation).
-    let val = |i: u64, generation: u8| -> Vec<u8> {
-        let mut s = (i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (u64::from(generation) << 1);
-        (0..200u32)
-            .map(|_| {
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "xorshift byte extraction; the high bits are intentionally dropped"
-                )]
-                let byte = (s >> 24) as u8;
-                byte
-            })
-            .collect()
-    };
-
-    let dir = tempfile::tempdir()?;
-    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
     let config = Config::new(
-        &dir,
+        dir,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
     .data_block_size_policy(BlockSizePolicy::all(512))
     .with_shared_fs(Arc::new(mem.clone()))
-    .with_kv_separation(Some(
-        KvSeparationOptions::default()
-            .separation_threshold(64)
-            // Keep every stale file (default age_cutoff 0.25 would drain a
-            // small candidate set to empty) and treat a lightly-dead file as
-            // stale so the half-shadowed first generation is relocated.
-            .age_cutoff(1.0)
-            .staleness_threshold(0.1)
-            // Small blob files → several per generation, so relocation has
-            // multiple stale files and the merge slices across them.
-            .file_target_size(48 * 1024),
-    ));
+    .with_kv_separation(Some(blob_reloc_kv_options()));
     let failpoint = config.fail_tight_after_first_slice.clone();
     let tree = match config.open()? {
         crate::AnyTree::Blob(t) => t,
@@ -1341,14 +1350,18 @@ fn tight_space_blob_relocation_crash_after_first_slice_recovers_all_keys() -> cr
     };
 
     // Generation 1: every key → a blob.
-    for i in 0..N {
-        tree.insert(k(i).as_bytes(), val(i, 1), i);
+    for i in 0..BLOB_RELOC_KEYS {
+        tree.insert(blob_reloc_key(i).as_bytes(), blob_reloc_value(i, 1), i);
     }
     tree.flush_active_memtable(0)?;
     // Generation 2: overwrite EVEN keys only, interleaved so every gen-1 blob
     // file ends up ~half dead (stale, not fully dead → eligible to relocate).
-    for i in (0..N).step_by(2) {
-        tree.insert(k(i).as_bytes(), val(i, 2), N + i);
+    for i in (0..BLOB_RELOC_KEYS).step_by(2) {
+        tree.insert(
+            blob_reloc_key(i).as_bytes(),
+            blob_reloc_value(i, 2),
+            BLOB_RELOC_KEYS + i,
+        );
     }
     tree.flush_active_memtable(0)?;
 
@@ -1359,12 +1372,11 @@ fn tight_space_blob_relocation_crash_after_first_slice_recovers_all_keys() -> cr
     // It also collapses the index SSTs to the bottom level. The watermark sits
     // above every live seqno so the merge actually folds the shadowed entries
     // (seqno 0 keeps all MVCC versions and records no fragmentation).
-    let gc_watermark = 4 * N;
     tree.index.update_runtime_config(|c| {
         c.storage_admission_check = true;
         c.storage_limit_bytes = None;
     })?;
-    tree.major_compact(64 * 1024 * 1024, gc_watermark)?;
+    tree.major_compact(64 * 1024 * 1024, BLOB_RELOC_WATERMARK)?;
 
     let used = tree.storage_stats()?.used_bytes;
 
@@ -1379,7 +1391,8 @@ fn tight_space_blob_relocation_crash_after_first_slice_recovers_all_keys() -> cr
     // punched.
     failpoint.store(true, Ordering::SeqCst);
     assert!(
-        tree.major_compact(64 * 1024 * 1024, gc_watermark).is_err(),
+        tree.major_compact(64 * 1024 * 1024, BLOB_RELOC_WATERMARK)
+            .is_err(),
         "the crash failpoint must abort the relocating tight-space compaction",
     );
     assert!(
@@ -1391,29 +1404,85 @@ fn tight_space_blob_relocation_crash_after_first_slice_recovers_all_keys() -> cr
         "the first relocated slice must have punched a stale blob prefix",
     );
 
-    // Reopen on the same simulated disk and verify every key reads its latest
-    // value: odd keys = relocated gen-1 blob, even keys = gen-2 blob.
     drop(tree);
-    let reopened = match Config::new(
-        &dir,
+    match Config::new(
+        dir,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .with_kv_separation(Some(
-        KvSeparationOptions::default().separation_threshold(64),
-    ))
-    .with_shared_fs(Arc::new(mem))
+    .with_kv_separation(Some(blob_reloc_kv_options()))
+    .with_shared_fs(Arc::new(mem.clone()))
     .open()?
     {
-        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Blob(t) => Ok(t),
         crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
-    };
-    for i in 0..N {
-        let expected = if i % 2 == 0 { val(i, 2) } else { val(i, 1) };
+    }
+}
+
+/// A KV-separated tight-space compaction that RELOCATES a fragmented blob
+/// file in slices and crashes after the first slice must reopen consistently:
+/// the relocated entries (now in fresh compact files referenced by the
+/// installed slice output) AND the not-yet-relocated entries (still in the
+/// punched stale file's intact suffix) must all read their latest value.
+#[test]
+fn tight_space_blob_relocation_crash_after_first_slice_recovers_all_keys() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    let reopened = blob_relocation_crash_and_reopen(dir.path(), &mem)?;
+
+    // Every key reads its latest value: odd keys = relocated gen-1 blob, even
+    // keys = gen-2 blob.
+    for i in 0..BLOB_RELOC_KEYS {
+        let expected = blob_reloc_value(i, u8::from(i % 2 == 0) + 1);
         assert_eq!(
-            reopened.get(k(i).as_bytes(), crate::MAX_SEQNO)?.as_deref(),
+            reopened
+                .get(blob_reloc_key(i).as_bytes(), crate::MAX_SEQNO)?
+                .as_deref(),
             Some(expected.as_slice()),
             "key {i} wrong/lost after a crash mid blob-relocation + reopen",
+        );
+    }
+    Ok(())
+}
+
+/// A relocation that committed a slice and then aborted leaves the stale blob
+/// file RESTRICTED: its consumed prefix is punched and its view carries the
+/// committed frontier. A retry must resume the scan THERE. Starting at the data
+/// section instead reads the punched zeros, byte-wise resynchronization taints
+/// every surviving frame, and the relocation is rejected on every retry —
+/// stranding a space-constrained blob tree with no way to reclaim.
+#[test]
+fn a_relocation_retry_resumes_at_the_committed_blob_frontier() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    let tree = blob_relocation_crash_and_reopen(dir.path(), &mem)?;
+
+    {
+        let version = tree.index.current_version();
+        assert!(
+            version.blob_files.iter().any(|bf| bf.live_data_start() > 0),
+            "the crashed relocation must leave a blob file with a committed frontier",
+        );
+    }
+
+    let punched_before = mem.punched_bytes();
+    tree.index.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = true;
+    })?;
+    tree.major_compact(64 * 1024 * 1024, BLOB_RELOC_WATERMARK)?;
+    assert!(
+        mem.punched_bytes() > punched_before,
+        "the retry must relocate further and punch what it consumed",
+    );
+
+    for i in 0..BLOB_RELOC_KEYS {
+        let expected = blob_reloc_value(i, u8::from(i % 2 == 0) + 1);
+        assert_eq!(
+            tree.get(blob_reloc_key(i).as_bytes(), crate::MAX_SEQNO)?
+                .as_deref(),
+            Some(expected.as_slice()),
+            "key {i} wrong/lost after the relocation retry",
         );
     }
     Ok(())

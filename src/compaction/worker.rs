@@ -1666,9 +1666,27 @@ fn run_subcompaction(
                 reloc
                     .stale_files
                     .iter()
-                    .map(|bf| match reloc.resume_offsets.get(&bf.id()) {
-                        Some(&off) => BlobFileScanner::resume(&bf.0.path, &*bf.0.fs, bf.id(), off),
-                        None => BlobFileScanner::new(&bf.0.path, &*bf.0.fs, bf.id()),
+                    .map(|bf| {
+                        // Never scan below the frontier the FILE itself
+                        // declares: a relocation that committed a slice and
+                        // then aborted leaves the stale file restricted with
+                        // its consumed prefix punched, and this run's map
+                        // starts empty. Reading from the data section would
+                        // hit those zeros, resynchronize byte-wise, and taint
+                        // every surviving frame, so the retry could never
+                        // relocate anything. Deciding it here (rather than
+                        // seeding the map) keeps the two from drifting apart.
+                        let off = reloc
+                            .resume_offsets
+                            .get(&bf.id())
+                            .copied()
+                            .unwrap_or(0)
+                            .max(bf.live_data_start());
+                        if off == 0 {
+                            BlobFileScanner::new(&bf.0.path, &*bf.0.fs, bf.id())
+                        } else {
+                            BlobFileScanner::resume(&bf.0.path, &*bf.0.fs, bf.id(), off)
+                        }
                     })
                     .collect::<crate::Result<Vec<_>>>()?,
             );
