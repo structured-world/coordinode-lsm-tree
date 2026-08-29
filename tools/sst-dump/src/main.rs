@@ -318,6 +318,42 @@ fn main() -> ExitCode {
     }
 }
 
+/// Whether `blobs/` holds something that can actually BE a blob file.
+///
+/// Only a name the recovery path would parse as a blob id counts: an operator's
+/// notes, a backup marker or a `.DS_Store` are regular files too, and treating
+/// them as evidence rebuilds a standard store as a blob one, which no later
+/// repair can undo.
+///
+/// # Errors
+///
+/// A missing `blobs/` answers `false` (conclusive: there is no blob directory).
+/// Every other failure PROPAGATES: an unreadable directory means the scan could
+/// not answer, and guessing publishes a tree type the store is then stuck with.
+fn infer_blob_tree(db_dir: &std::path::Path) -> std::io::Result<bool> {
+    let entries = match std::fs::read_dir(db_dir.join("blobs")) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.path().is_file() {
+            continue;
+        }
+        // The blob recovery path parses the file NAME as the id, so a name that
+        // does not parse is not a blob file, whatever else it may be.
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.parse::<u64>().is_ok())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn run_repair(db_dir: &std::path::Path, salvage: bool, tree_type: Option<&str>) -> ExitCode {
     use lsm_tree::{Config, KvSeparationOptions, SequenceNumberCounter};
 
@@ -340,17 +376,28 @@ fn run_repair(db_dir: &std::path::Path, salvage: bool, tree_type: Option<&str>) 
         Some("standard") => false,
         // `value_parser` restricts the flag to those two, so anything else
         // here is the absent case.
-        _ => {
-            let holds_blob_files = std::fs::read_dir(db_dir.join("blobs"))
-                .map(|mut entries| entries.any(|e| e.is_ok_and(|e| e.path().is_file())))
-                .unwrap_or(false);
-            if holds_blob_files {
-                println!(
-                    "tree type:     blob (inferred: blobs/ holds files; pass --tree-type to override)"
-                );
+        _ => match infer_blob_tree(db_dir) {
+            Ok(inferred) => {
+                if inferred {
+                    println!(
+                        "tree type:     blob (inferred: blobs/ holds a blob file; pass \
+                         --tree-type to override)"
+                    );
+                }
+                inferred
             }
-            holds_blob_files
-        }
+            // The scan could not answer. Publishing a tree type on a guess is
+            // not recoverable by another repair, so stop and let the operator
+            // retry once the fault clears, or state the type outright.
+            Err(e) => {
+                eprintln!(
+                    "cannot determine the tree type: reading {}/blobs failed ({e}). \
+                     Fix the access error and retry, or pass --tree-type.",
+                    db_dir.display(),
+                );
+                return ExitCode::FAILURE;
+            }
+        },
     };
     if blob_tree {
         config = config.with_kv_separation(Some(KvSeparationOptions::default()));
