@@ -1531,7 +1531,7 @@ fn twelve_letter_items() -> Vec<crate::InternalValue> {
 /// gates take part too. On a REAL on-disk file: the claim is about what a
 /// reconcile costs in I/O, so the medium it is measured on should be the one it
 /// runs against.
-fn reconcile_read_count(blocks: usize) -> crate::Result<usize> {
+fn reconcile_read_count(blocks: usize) -> crate::Result<(usize, usize)> {
     use crate::fs::{FaultFs, StdFs};
 
     let dir = tempfile::tempdir()?;
@@ -1567,7 +1567,7 @@ fn reconcile_read_count(blocks: usize) -> crate::Result<usize> {
     if let Err((gate, e)) = table.verify_reconcile_gates(None, false) {
         panic!("a healthy table must pass every gate, {gate:?} refused it: {e}");
     }
-    Ok(injector.read_count())
+    Ok((injector.read_count(), injector.open_count()))
 }
 
 /// The reconcile gates must share ONE read of each live block. Each of them
@@ -1579,12 +1579,20 @@ fn reconcile_read_count(blocks: usize) -> crate::Result<usize> {
 /// the old shape cannot satisfy this no matter what the constant term is.
 #[test]
 fn reconcile_gates_read_each_block_once() -> crate::Result<()> {
-    let small = reconcile_read_count(3)?;
-    let large = reconcile_read_count(6)?;
+    let (small, small_opens) = reconcile_read_count(3)?;
+    let (large, large_opens) = reconcile_read_count(6)?;
     assert_eq!(
         large - small,
         3,
         "three more blocks must cost three more reads, got {small} then {large}",
+    );
+    // The sections are read through ONE lent handle, so the whole pass opens
+    // the file once however many sections it consults and however many blocks
+    // it walks. A reader that opens for itself makes this the section count.
+    assert_eq!(
+        (small_opens, large_opens),
+        (1, 1),
+        "a reconcile must open the table once",
     );
     Ok(())
 }

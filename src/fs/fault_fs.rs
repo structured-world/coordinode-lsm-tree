@@ -272,6 +272,10 @@ pub struct FaultInjector {
     /// about how MUCH a path reads (a verification walking each block once
     /// rather than once per gate) has nothing to assert on.
     reads: core::sync::atomic::AtomicUsize,
+    /// Files opened, counted whether or not a rule matched. A pass that reads
+    /// several sections of one file can open it once and lend the handle, or
+    /// open it per section; only the count tells the two apart.
+    opens: core::sync::atomic::AtomicUsize,
 }
 
 impl FaultInjector {
@@ -303,13 +307,27 @@ impl FaultInjector {
         self.reads.load(core::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Removes all armed rules AND the recorded observations (sync modes and
-    /// the read count), resetting the injector so a later phase cannot see
-    /// state recorded before the `clear()`.
+    /// Records one file open. Called on every `open`, matched or not.
+    pub(crate) fn count_open(&self) {
+        self.opens
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Files opened since the injector was created (or since the last
+    /// [`Self::clear`]).
+    #[must_use]
+    pub fn open_count(&self) -> usize {
+        self.opens.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Removes all armed rules AND the recorded observations (sync modes, the
+    /// read count and the open count), resetting the injector so a later phase
+    /// cannot see state recorded before the `clear()`.
     pub fn clear(&self) {
         self.rules.lock().clear();
         self.sync_log.lock().clear();
         self.reads.store(0, core::sync::atomic::Ordering::Relaxed);
+        self.opens.store(0, core::sync::atomic::Ordering::Relaxed);
     }
 
     /// Records one file-level mode-carrying sync observation (see
@@ -429,6 +447,7 @@ impl<F: Fs> FaultFs<F> {
 
 impl<F: Fs> Fs for FaultFs<F> {
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
+        self.injector.count_open();
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::Open, Some(path)) {
             return Err(fault_error(kind, FaultOp::Open));
         }

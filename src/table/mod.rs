@@ -477,8 +477,9 @@ pub(crate) struct MetaBoundsProbe {
 pub(crate) struct FilterProbe<'a> {
     /// The table being judged, for its comparator and id.
     table: &'a Table,
-    /// The file the sections are read from, held open across the walk.
-    file: alloc::boxed::Box<dyn crate::fs::FsFile>,
+    /// The file the sections are read from, lent by the pass that opened it
+    /// and borrowed across the walk for the partition reads.
+    file: &'a dyn crate::fs::FsFile,
     /// Codec / encryption / ECC context every filter block decodes under.
     transform: crate::table::block::BlockTransform<'a>,
     /// The partition index, when the filter is partitioned.
@@ -860,7 +861,7 @@ impl Table {
     // which is itself dead there (the verify/scrub caller is std-gated).
     #[cfg_attr(
         not(feature = "std"),
-        allow(
+        expect(
             dead_code,
             reason = "gate-only loader; the verify/scrub consumers are std-gated"
         )
@@ -3488,10 +3489,16 @@ impl Table {
         // Sections first: every gate that has one reads it before the walk, so
         // a forged section fails without decoding a single block.
         let kv_algo = self.metadata.kv_checksum_algo;
+        // One open and one TOC parse for the whole pass: every section below is
+        // read from the SAME on-disk image, so the gates cannot disagree about
+        // which bytes they are judging.
+        let (file, regions) = self.open_sections().map_err(tag(G::SeqnoBounds))?;
         let seqno_bounds = self
-            .read_seqno_bounds_section()
+            .read_seqno_bounds_section(&*file, &regions)
             .map_err(tag(G::SeqnoBounds))?;
-        let zone_map = self.read_zone_map_section().map_err(tag(G::ZoneMap))?;
+        let zone_map = self
+            .read_zone_map_section(&*file, &regions)
+            .map_err(tag(G::ZoneMap))?;
         let zone_map = match zone_map {
             // A PRESENT-but-empty map on a table with data blocks is a forgery;
             // the standalone gate rejects it before its walk, so do it here.
@@ -3508,12 +3515,14 @@ impl Table {
             }
             other => other,
         };
-        let locator = self.read_locator_section().map_err(tag(G::Locator))?;
+        let locator = self
+            .read_locator_section(&*file, &regions)
+            .map_err(tag(G::Locator))?;
         let mut filter = self
-            .filter_probe(prefix_extractor)
+            .filter_probe(&*file, &regions, prefix_extractor)
             .map_err(tag(G::Filter))?;
         let mut meta = self
-            .meta_bounds_probe(bitmap_digest_authenticated)
+            .meta_bounds_probe(&*file, &regions, bitmap_digest_authenticated)
             .map_err(tag(G::MetadataBounds))?;
 
         // Per-block state the gates carry across the walk.
@@ -3612,6 +3621,28 @@ impl Table {
             .map_err(tag(G::MetadataBounds))
     }
 
+    /// Opens the file and parses its TOC: the pair every reconcile section read
+    /// works from. Done ONCE per pass and lent to each reader, so a reconcile
+    /// costs one open and one TOC parse instead of one per section, and every
+    /// gate judges the SAME on-disk image rather than up to five successive
+    /// ones.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the file open, the SFA trailer read and the TOC parse.
+    #[cfg(feature = "std")]
+    fn open_sections(
+        &self,
+    ) -> crate::Result<(
+        alloc::boxed::Box<dyn crate::fs::FsFile>,
+        regions::ParsedRegions,
+    )> {
+        let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
+        let trailer = crate::sfa::Reader::from_reader(&mut file)?;
+        let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
+        Ok((file, regions))
+    }
+
     /// Reads the `seqno_bounds` section FROM DISK, or `None` when the table
     /// has none.
     ///
@@ -3623,20 +3654,19 @@ impl Table {
     ///
     /// # Errors
     ///
-    /// Propagates the file open, the TOC parse and the section decode, and
-    /// rejects a block that does not carry the seqno-bounds role.
+    /// Propagates the section decode, and rejects a block that does not carry
+    /// the seqno-bounds role.
     #[cfg(feature = "std")]
     fn read_seqno_bounds_section(
         &self,
+        file: &dyn crate::fs::FsFile,
+        regions: &regions::ParsedRegions,
     ) -> crate::Result<Option<crate::table::seqno_bounds::SeqnoBoundsMap>> {
-        let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
-        let trailer = crate::sfa::Reader::from_reader(&mut file)?;
-        let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
         let Some(sb_handle) = regions.seqno_bounds else {
             return Ok(None);
         };
         let block = Block::from_file(
-            &*file,
+            file,
             sb_handle,
             crate::table::block::BlockIdentity {
                 table_id: self.metadata.id,
@@ -3743,18 +3773,19 @@ impl Table {
     ///
     /// # Errors
     ///
-    /// Propagates the file open, the TOC parse and the section decode, and
-    /// rejects a block that does not carry the zone-map role.
+    /// Propagates the section decode, and rejects a block that does not carry
+    /// the zone-map role.
     #[cfg(feature = "std")]
-    fn read_zone_map_section(&self) -> crate::Result<Option<crate::table::zone_map::ZoneMap>> {
-        let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
-        let trailer = crate::sfa::Reader::from_reader(&mut file)?;
-        let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
+    fn read_zone_map_section(
+        &self,
+        file: &dyn crate::fs::FsFile,
+        regions: &regions::ParsedRegions,
+    ) -> crate::Result<Option<crate::table::zone_map::ZoneMap>> {
         let Some(zm_handle) = regions.zone_map else {
             return Ok(None);
         };
         let block = Block::from_file(
-            &*file,
+            file,
             zm_handle,
             crate::table::block::BlockIdentity {
                 table_id: self.metadata.id,
@@ -4127,18 +4158,19 @@ impl Table {
     ///
     /// # Errors
     ///
-    /// Propagates the file open, the TOC parse and the index walk, and rejects
-    /// a block that does not carry the locator role.
+    /// Propagates the section decode and the index walk, and rejects a block
+    /// that does not carry the locator role.
     #[cfg(feature = "std")]
-    fn read_locator_section(&self) -> crate::Result<Option<crate::table::locator::LoadedLocator>> {
-        let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
-        let trailer = crate::sfa::Reader::from_reader(&mut file)?;
-        let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
+    fn read_locator_section(
+        &self,
+        file: &dyn crate::fs::FsFile,
+        regions: &regions::ParsedRegions,
+    ) -> crate::Result<Option<crate::table::locator::LoadedLocator>> {
         let Some(loc_handle) = regions.locator else {
             return Ok(None);
         };
         let block = Block::from_file(
-            &*file,
+            file,
             loc_handle,
             crate::table::block::BlockIdentity {
                 table_id: self.metadata.id,
@@ -4392,19 +4424,18 @@ impl Table {
     /// Propagates the section reads, and rejects a present-but-empty filter on
     /// a table that has data blocks.
     #[cfg(feature = "std")]
-    fn filter_probe(
-        &self,
+    fn filter_probe<'a>(
+        &'a self,
+        file: &'a dyn crate::fs::FsFile,
+        regions: &regions::ParsedRegions,
         prefix_extractor: Option<&alloc::sync::Arc<dyn crate::prefix::PrefixExtractor>>,
-    ) -> crate::Result<Option<FilterProbe<'_>>> {
+    ) -> crate::Result<Option<FilterProbe<'a>>> {
         // Re-read the filter FROM DISK: the open path PINS the filter (or
         // its partition index) in memory at recover time, so an on-disk
         // re-stamp after the open (the very forge this check exists for)
         // would be invisible to `check_bloom`. An unreadable filter is an
         // error here (the caller is deciding whether to trust the bytes),
         // unlike the read path's permissive empty-payload sentinel.
-        let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
-        let trailer = crate::sfa::Reader::from_reader(&mut file)?;
-        let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
         if regions.filter.is_none() && regions.filter_tli.is_none() {
             return Ok(None);
         }
@@ -4413,7 +4444,7 @@ impl Table {
         // block. Loaded from disk for the same reason as the filter itself.
         let filter_index = if let Some(idx_handle) = regions.filter_tli {
             let block = Block::from_file(
-                &*file,
+                file,
                 idx_handle,
                 crate::table::block::BlockIdentity {
                     table_id: self.metadata.id,
@@ -4450,7 +4481,7 @@ impl Table {
         let full_filter = if filter_index.is_none() {
             regions
                 .filter
-                .map(|h| Self::load_filter_block(&*file, &filter_transform, self.metadata.id, h))
+                .map(|h| Self::load_filter_block(file, &filter_transform, self.metadata.id, h))
                 .transpose()?
         } else {
             None
@@ -4525,7 +4556,7 @@ impl Table {
                         alloc::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
                         alloc::collections::btree_map::Entry::Vacant(e) => {
                             e.insert(Self::load_filter_block(
-                                &*probe.file,
+                                probe.file,
                                 &probe.transform,
                                 table.metadata.id,
                                 part_handle,
@@ -4639,19 +4670,15 @@ impl Table {
     #[cfg(feature = "std")]
     fn meta_bounds_probe(
         &self,
+        file: &dyn crate::fs::FsFile,
+        regions: &regions::ParsedRegions,
         bitmap_digest_authenticated: bool,
     ) -> crate::Result<MetaBoundsProbe> {
-        // Re-read the meta FROM DISK: the in-memory copy was parsed at
-        // recover time, so an on-disk re-stamp after the open (the very
-        // forge this check exists for) would be invisible to it.
-        let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
-        let trailer = crate::sfa::Reader::from_reader(&mut file)?;
-        let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
         // Tail-first with MID fallback, mirroring recovery: the next open
         // trusts the same copy, and a table living off its intact MID mirror
         // (unreadable forged tail) must be judged by THAT copy's bounds.
         let meta = match crate::table::meta::ParsedMeta::load_with_handle(
-            &*file,
+            file,
             &regions.metadata,
             Some(self.metadata.id),
             self.encryption.as_deref(),
@@ -4662,7 +4689,7 @@ impl Table {
                     return Err(tail_err);
                 };
                 crate::table::meta::ParsedMeta::load_with_handle(
-                    &*file,
+                    file,
                     &mid_handle,
                     Some(self.metadata.id),
                     self.encryption.as_deref(),
@@ -4694,7 +4721,7 @@ impl Table {
         // check further down.
         let tombstones = if let Some(rt_handle) = regions.range_tombstones {
             let block = Block::from_file(
-                &*file,
+                file,
                 rt_handle,
                 crate::table::block::BlockIdentity {
                     table_id: self.metadata.id,
@@ -4702,17 +4729,7 @@ impl Table {
                     dict_id: 0,
                     window_log: 0,
                 },
-                &{
-                    let t = match self.encryption.as_deref() {
-                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
-                        None => crate::table::block::BlockTransform::PLAIN,
-                    };
-                    if let Some(ecc) = self.metadata.ecc_params {
-                        t.with_ecc(ecc)
-                    } else {
-                        t
-                    }
-                },
+                &self.section_transform(),
             )?;
             if block.header.block_type != BlockType::RangeTombstone {
                 return Err(crate::Error::InvalidTag((
@@ -5112,17 +5129,7 @@ impl Table {
                     dict_id: 0,
                     window_log: 0,
                 },
-                &{
-                    let t = match self.encryption.as_deref() {
-                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
-                        None => crate::table::block::BlockTransform::PLAIN,
-                    };
-                    if let Some(ecc) = self.metadata.ecc_params {
-                        t.with_ecc(ecc)
-                    } else {
-                        t
-                    }
-                },
+                &self.section_transform(),
             )?;
             if block.header.block_type != BlockType::BlockLayout {
                 return Err(crate::Error::InvalidTag((
