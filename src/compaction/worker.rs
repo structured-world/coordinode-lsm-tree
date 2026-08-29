@@ -80,6 +80,22 @@ pub struct Options {
 
     pub compaction_state: Arc<Mutex<CompactionState>>,
 
+    /// The tree-wide deletion pause, installed on every compaction-produced table
+    /// before it becomes visible. A flush registers it via `register_tables`, but
+    /// compaction installs its outputs directly (`install_merge` / tight-space),
+    /// so it must be threaded here — without it a Page-ECC output's in-place heal
+    /// skips the checkpoint mutation window and can race a checkpoint hard-link.
+    pub deletion_pause: Arc<crate::deletion_pause::DeletionPause>,
+
+    /// The tree-wide ECC heal-hint sink, installed on every
+    /// compaction-produced table alongside the deletion pause and for the
+    /// same reason: a flush registers it via `register_tables`, but
+    /// compaction installs its outputs directly. Without it a
+    /// confirmed-persistent ECC correction while reading such an output
+    /// corrects the block in memory yet can never queue the SST for a
+    /// healing rewrite, so the bitrot stays on disk indefinitely.
+    pub heal_hints: Arc<crate::heal_hints::HealHints>,
+
     /// Shared handle to the live runtime config. Compaction loads
     /// a fresh snapshot via [`crate::runtime_config::handle::RuntimeConfigHandle::load_full`]
     /// each time it writes the manifest, so toggles applied via
@@ -117,6 +133,8 @@ impl Options {
             mvcc_gc_watermark: 0,
 
             compaction_state: tree.compaction_state.clone(),
+            deletion_pause: tree.deletion_pause.clone(),
+            heal_hints: tree.heal_hints.clone(),
             runtime_config: tree.runtime_config.clone(),
             encryption: tree.config.encryption.clone(),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::new(
@@ -279,6 +297,26 @@ enum SpaceGate {
 /// A volume that cannot report free space contributes `u64::MAX`, so a probe
 /// failure never fabricates disk pressure. With no quota and every volume
 /// unbounded, the result is unconditionally `true` (nothing constrains).
+/// Whether two paths sit on PROVABLY separate free-space pools: both backends
+/// report a volume id AND the ids differ.
+///
+/// The unproven cases (a backend that cannot answer, a route to the same mount)
+/// deliberately answer `false` — shared. Every caller uses this to decide
+/// whether space freed on one path relieves the other, and guessing
+/// "independent" there admits a transient peak straight into `ENOSPC` or a
+/// reclaim that lands where nothing needed it.
+fn separate_volumes(
+    a_fs: &dyn crate::fs::Fs,
+    a_path: &crate::path::Path,
+    b_fs: &dyn crate::fs::Fs,
+    b_path: &crate::path::Path,
+) -> bool {
+    match (a_fs.volume_id(a_path), b_fs.volume_id(b_path)) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    }
+}
+
 // `pub` (not `pub(crate)`) inside this crate-private module: clippy flags the
 // redundant restriction since the module itself is already crate-scoped.
 pub fn space_fits_two_layer(
@@ -309,14 +347,7 @@ pub fn space_fits_two_layer(
     let blob_dir = config.path.join(BLOBS_FOLDER);
     let blob_free = config.fs.available_space(&blob_dir).unwrap_or(u64::MAX);
 
-    // Independent only when both destinations report a volume id AND the ids
-    // differ — provably separate free-space pools. A route to the same mount, or
-    // any backend that cannot prove independence, falls through to the combined
-    // budget so a shared-volume transient peak cannot slip past into `ENOSPC`.
-    let independent = match (sst_fs.volume_id(&sst_path), config.fs.volume_id(&blob_dir)) {
-        (Some(sst_vol), Some(blob_vol)) => sst_vol != blob_vol,
-        _ => false,
-    };
+    let independent = separate_volumes(&*sst_fs, &sst_path, &*config.fs, &blob_dir);
 
     if independent {
         volume_fits(sst_bytes, sst_free) && volume_fits(blob_bytes, blob_free)
@@ -335,7 +366,9 @@ pub fn space_fits_two_layer(
 /// space is checked per destination volume (SST output volume + primary blob
 /// volume, combined onto one budget when they share a filesystem).
 ///
-/// The SST bound is `Σ input file_size`; the blob bound is the physical on-disk
+/// The SST bound is `Σ input live_file_size` (a tight-space-restricted input
+/// contributes only its live suffix — the punched prefix is superseded and never
+/// rewritten); the blob bound is the physical on-disk
 /// size of the stale blob files selected for relocation. This is a best-effort
 /// estimate: a merge operator / compaction filter that *grows* values can still
 /// write more than the inputs, so a mid-merge `ENOSPC` remains possible — that
@@ -380,8 +413,7 @@ fn space_gate_for_merge(
             .table_ids
             .iter()
             .filter_map(|&id| version.get_table(id))
-            .map(Table::file_size)
-            .sum();
+            .try_fold(0u64, |acc, t| t.live_file_size().map(|size| acc + size))?;
         let blob_sigma: u64 = match &opts.config.kv_separation_opts {
             Some(blob_opts) => pick_blob_files_to_rewrite(&p.table_ids, version, blob_opts)?
                 .iter()
@@ -404,7 +436,7 @@ fn space_gate_for_merge(
     // Constrained: try the run-adjacent narrowing candidates in ascending SST
     // size and run the first that fits the full two-layer budget. Skip only when
     // none fit (a truly-too-big single merge is the opt-in tight-space domain).
-    for narrowed in narrow_merge_candidates(version, payload) {
+    for narrowed in narrow_merge_candidates(version, payload)? {
         if fits(&narrowed)? {
             return Ok(SpaceGate::Narrowed(narrowed));
         }
@@ -413,8 +445,9 @@ fn space_gate_for_merge(
 }
 
 /// The run-adjacent table-pair narrowing candidates for a too-large merge,
-/// sorted by combined SST `file_size` ascending, each preserving the merge's
-/// destination.
+/// sorted by combined SST `live_file_size` ascending (the same measure the gate
+/// charges, so a restricted input's superseded prefix does not distort the
+/// order), each preserving the merge's destination.
 ///
 /// Narrowing is only safe within a single run (key-sorted, non-overlapping
 /// tables): a run-adjacent pair is always a valid, reclaiming merge, and the
@@ -433,7 +466,7 @@ fn space_gate_for_merge(
 fn narrow_merge_candidates(
     version: &Version,
     payload: &CompactionPayload,
-) -> Vec<CompactionPayload> {
+) -> crate::Result<Vec<CompactionPayload>> {
     // The single run that holds every payload table (if any).
     let Some(run) = version
         .iter_levels()
@@ -445,7 +478,7 @@ fn narrow_merge_candidates(
                 .all(|id| run.iter().any(|t| t.id() == *id))
         })
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let run_tables: Vec<&Table> = run.iter().collect();
@@ -457,7 +490,7 @@ fn narrow_merge_candidates(
         }
         // Two on-disk file sizes; the sum is bounded by filesystem capacity and
         // cannot overflow u64.
-        let combined = a.file_size() + b.file_size();
+        let combined = a.live_file_size()? + b.live_file_size()?;
         candidates.push((
             combined,
             CompactionPayload {
@@ -469,7 +502,7 @@ fn narrow_merge_candidates(
         ));
     }
     candidates.sort_by_key(|(combined, _)| *combined);
-    candidates.into_iter().map(|(_, p)| p).collect()
+    Ok(candidates.into_iter().map(|(_, p)| p).collect())
 }
 
 fn pick_run_indexes(run: &Run<Table>, to_compact: &[TableId]) -> Option<(usize, usize)> {
@@ -809,6 +842,11 @@ fn run_tight_space_compaction(
         return Ok(CompactionResult::nothing());
     }
 
+    // A reclaim a checkpoint's window forced the deletion pause to retain is
+    // space this very compaction is short of, so collect it before deciding
+    // anything: the checkpoint that blocked it has usually released by now.
+    opts.deletion_pause.retry_pending_reclaims();
+
     let latest = version_history_lock.latest_version();
     let Some(inputs) = payload
         .table_ids
@@ -837,11 +875,89 @@ fn run_tight_space_compaction(
                 for bf in &files {
                     total += bf.physical_size()?;
                 }
+                // Each stale file is punched through its OWN backend, which a
+                // separately backed `blobs/` can refuse.
+                if let Some(bf) = files
+                    .iter()
+                    .find(|bf| !bf.0.fs.capabilities(&bf.0.path).punch_hole)
+                {
+                    log::info!(
+                        "Tight-space compaction unavailable: the backend of blob file {} \
+                         lacks punch_hole, so its relocated prefix would stay allocated",
+                        bf.0.path.display(),
+                    );
+                    return Ok(CompactionResult::nothing());
+                }
                 (files.iter().map(BlobFile::id).collect(), total)
             }
             None => (Vec::new(), 0),
         };
     let relocating = !stale_ids.is_empty();
+
+    // The reclaim runs through each INPUT's own backend, not the destination's:
+    // under level routing an input can sit on a volume that refuses the punch.
+    // Admitting the slice anyway commits its restriction and writes its output
+    // while the consumed prefix stays allocated, so the pass ends using MORE
+    // space on the volume it was meant to relieve.
+    if let Some(t) = inputs
+        .iter()
+        .find(|t| !t.fs.capabilities(&t.path).punch_hole)
+    {
+        log::info!(
+            "Tight-space compaction unavailable: the backend of input table {} lacks \
+             punch_hole, so its consumed prefix would stay allocated",
+            t.path.display(),
+        );
+        return Ok(CompactionResult::nothing());
+    }
+
+    // Being able to punch is not the same as punching where it helps. Each
+    // slice adds its WHOLE output to the destination volume but frees only the
+    // share of its inputs that lives THERE, so a destination under pressure
+    // with inputs on another volume grows monotonically across slices: the pass
+    // commits several, hits ENOSPC, and never relieves the pool that engaged
+    // it. When the destination can hold the whole merge it is not the
+    // constrained pool (the gate skipped for the blob volume instead) and the
+    // reclaim landing elsewhere is fine.
+    let inputs_total: u64 = inputs.iter().map(Table::file_size).sum();
+    let dest_free = dest_fs.available_space(&dest_path).unwrap_or(u64::MAX);
+    if dest_free < inputs_total {
+        // Only a PROVEN different volume forfeits the relief; an unproven pair
+        // counts as shared, leaving the single-volume default untouched.
+        //
+        // Some inputs elsewhere is not the same as no relief. The output is
+        // bounded by the inputs, and each slice frees the DESTINATION-local
+        // share as it goes, so the volume only has to absorb the remote share:
+        // 90 MB local plus 10 MB remote completes with 20 MB free. Requiring
+        // every input to be colocated would leave a constrained tree read-only
+        // with the reclaimable bytes sitting on the very volume that is full.
+        let remote_total: u64 = inputs
+            .iter()
+            .filter(|t| separate_volumes(&*t.fs, &t.path, &*dest_fs, &dest_path))
+            .map(Table::file_size)
+            .sum();
+        if dest_free < remote_total {
+            log::info!(
+                "Tight-space compaction unavailable: {remote_total} bytes of input live on a \
+                 different volume than the constrained destination and only {dest_free} bytes \
+                 are free there, so the slices would grow it without relief",
+            );
+            return Ok(CompactionResult::nothing());
+        }
+    }
+
+    // The tree-wide logical quota is the OTHER constraint the space gate
+    // enforces, and it is the one that engaged this pass whenever the backend
+    // cannot report free space: an unanswerable `available_space` reads as
+    // physically unbounded, so nothing else is left to reject a merge. The
+    // clamp-to-zero matches the gate's min-semantics (a quota set below the
+    // live footprint leaves no headroom).
+    let quota_headroom = match opts.runtime_config.load().storage_limit_bytes {
+        Some(limit) => {
+            limit.saturating_sub(crate::storage_stats::compute_used_bytes(&latest.version)?)
+        }
+        None => u64::MAX,
+    };
 
     drop(latest);
     drop(version_history_lock);
@@ -851,7 +967,6 @@ fn run_tight_space_compaction(
     let tables_in = inputs.len();
 
     let comparator = opts.config.comparator.clone();
-    let available = dest_fs.available_space(&dest_path).unwrap_or(u64::MAX);
     // Slice boundaries are derived from SST block sizes, but on a KV-separated
     // relocating merge the transient is dominated by the RELOCATED blob payload,
     // not the (tiny, handle-only) SSTs. Scale the SST-space budget so a slice
@@ -859,16 +974,49 @@ fn run_tight_space_compaction(
     // blob bytes ≈ the free space: without this, a few small SST blocks would map
     // to the whole blob payload in one slice and overflow the very disk the gate
     // already flagged as too tight.
-    let slice_budget = if relocating && stale_total_bytes > 0 {
-        let inputs_total: u64 = inputs.iter().map(Table::file_size).sum();
+    //
+    // That payload lands on the BLOB volume, which level routing can separate
+    // from the SST destination. Budgeting it against the destination's free
+    // space then scales by the wrong pool in both directions: an ample
+    // destination beside a full `blobs/` yields a budget larger than every
+    // input block (`tight_slice_boundaries` returns empty, so no reclaim
+    // happens at all) or a slice the blob volume cannot hold.
+    let physical_budget = if relocating && stale_total_bytes > 0 {
+        let blob_dir = opts.config.path.join(BLOBS_FOLDER);
+        let blob_free = opts
+            .config
+            .fs
+            .available_space(&blob_dir)
+            .unwrap_or(u64::MAX);
+        let independent = separate_volumes(&*dest_fs, &dest_path, &*opts.config.fs, &blob_dir);
+        // A slice covering `b` SST bytes writes `b` to the SST volume and
+        // `b * stale_total / inputs_total` to the blob volume. Separate pools
+        // bound each share on its own volume; a shared pool must hold the SUM,
+        // so the budget solves `b * (inputs_total + stale_total) <= free`
+        // against the tighter probe.
+        let (pool, share) = if independent {
+            (blob_free, stale_total_bytes)
+        } else {
+            (
+                dest_free.min(blob_free),
+                inputs_total.max(1) + stale_total_bytes,
+            )
+        };
         // Both factors are u64, so their u128 product is at most
         // (2^64-1)^2 < u128::MAX — plain multiply cannot overflow.
-        let scaled =
-            u128::from(available) * u128::from(inputs_total.max(1)) / u128::from(stale_total_bytes);
-        u64::try_from(scaled).unwrap_or(u64::MAX).max(1)
+        let scaled = u128::from(pool) * u128::from(inputs_total.max(1)) / u128::from(share);
+        let by_blob = u64::try_from(scaled).unwrap_or(u64::MAX).max(1);
+        // The SST side still has to fit its own slice on its own volume.
+        by_blob.min(dest_free.max(1))
     } else {
-        available.max(1)
+        dest_free.max(1)
     };
+    // Whatever the physical pools allow, a slice's output has to fit the quota
+    // too: it is a tree-wide logical limit, not a property of one volume, so it
+    // caps the budget on both paths. Without this a quota-only deployment
+    // slices nothing (an unbounded budget yields no interior boundary) and
+    // never leaves read-only, which is the state that engaged the pass.
+    let slice_budget = physical_budget.min(quota_headroom.max(1));
     let boundaries = tight_slice_boundaries(&inputs, slice_budget, comparator.as_ref())?;
     if boundaries.is_empty() {
         // Indivisible (single block across all inputs) — no incremental reclaim.
@@ -881,7 +1029,21 @@ fn run_tight_space_compaction(
         .hide(payload.table_ids.iter().copied());
 
     let dst_lvl: usize = payload.canonical_level.into();
-    let is_last_level = payload.dest_level == opts.config.level_count - 1;
+    // Tight-space slice merges apply NO removal semantics: no bottommost GC
+    // (tombstone drop, seqno zeroing, range-tombstone application) even when the
+    // destination IS the last level, and no user compaction filter (passed as
+    // `false` to each slice's sub-compaction below). A slice restricts a surviving
+    // input and hides its consumed prefix; if a fully-consumed sibling carried the
+    // tombstone for a key that also lives in that prefix, last-level GC would drop
+    // the tombstone from the output — and a filter verdict would drop a record
+    // that survives nowhere else. A crash window that leaves the survivor
+    // unrestricted (sidecar not yet written, prefix not yet punched) would then
+    // let manifest repair re-expose the removed rows. Retaining every record makes
+    // the slice output a SUPERSET that shadows any surviving prefix in every crash
+    // window; a later normal last-level compaction reclaims
+    // the deferred GC. Space is still reclaimed here via the hole punch, which is
+    // what tight-space is for.
+    let bottommost_gc = false;
     let blobs_folder = opts.config.path.join(BLOBS_FOLDER);
     // Canonicalize range tombstones across all inputs (a boundary-spanning RT is
     // otherwise copied into every slice output).
@@ -935,16 +1097,41 @@ fn run_tight_space_compaction(
                 &rts,
                 (lower.clone(), Bound::Excluded(boundary.clone())),
                 dst_lvl,
-                is_last_level,
+                bottommost_gc,
+                // Slices apply no removal semantics; see the parameter docs.
+                false,
                 &blobs_folder,
                 reloc,
             )?;
             drop(version);
 
             let outputs: Vec<Table> = produced.created_tables().to_vec();
+            // Install the tree-wide sinks on each slice output before the
+            // version edit makes it visible (mirrors `install_merge`): the
+            // deletion pause, so a later in-place heal cannot race a
+            // checkpoint hard-link, and the heal-hint sink, so a
+            // confirmed-persistent ECC correction on a read can queue this
+            // SST for a healing rewrite instead of leaving the bitrot on
+            // disk. NOT the background deleter — a rolled-back slice must
+            // return its space immediately, and this loop rolls back exactly
+            // when space is scarce.
+            for table in &outputs {
+                table.bind_to_tree(&crate::table::TableSinks {
+                    deletion_pause: &opts.deletion_pause,
+                    heal_hints: &opts.heal_hints,
+                    #[cfg(feature = "std")]
+                    background_deleter: None,
+                });
+            }
             // KV-separation: blob files this slice relocated live entries into,
             // plus the GC diff of entries it dropped.
             let mut new_blobs: Vec<BlobFile> = produced.created_blob_files().to_vec();
+            // Capture the rollback set NOW, before the reopened stale views are
+            // pushed onto `new_blobs` below: `mark_as_deleted` on a reopened view
+            // unlinks its SHARED path (the still-live stale blob the current version
+            // references), so a rollback must delete only the genuinely-new blob
+            // files this slice created, never the reopened views.
+            let blobs_for_cleanup = new_blobs.clone();
             let frag = produced.blob_frag_map().clone();
             let gc_diff = if frag.is_empty() { None } else { Some(frag) };
 
@@ -959,27 +1146,109 @@ fn run_tight_space_compaction(
             }
             drop(produced);
 
+            // Serialize each surviving input's suffix-digest capture (inside
+            // `reopen_restricted` below) and this slice's manifest install
+            // against a concurrent in-place heal on the same table identity. A
+            // patrol that heals a suffix block BETWEEN the digest read and the
+            // version edit would bind the restricted manifest to a pre-heal
+            // suffix digest; the patrol then sees the restriction change and
+            // skips its whole-file refresh, and its attestation binds whole-file
+            // (not suffix) digests, so once the prefix is punched the mismatch is
+            // permanently unattributable. Hold each restricted input's heal lock
+            // across the reopen AND the `upgrade_version` below (released when
+            // these guards drop at the end of this slice iteration). Only inputs
+            // that extend past the boundary (`max >= boundary`) are re-opened, so
+            // only those are locked. The patrol holds at most one table's heal
+            // lock at a time, so acquiring several here cannot deadlock it.
+            //
+            // Lock-order note: this path takes `compaction_state` (held from
+            // `do_compaction`) BEFORE these heal locks, while the patrol reconcile
+            // takes a heal lock and then `compaction_state` inside
+            // `refresh_table_checksum`. To keep that inversion from deadlocking,
+            // the patrol side `try_lock`s `compaction_state` and skips its refresh
+            // on contention rather than blocking — so it never waits on
+            // `compaction_state` while holding a heal lock this loop wants.
+            #[cfg(feature = "page_ecc")]
+            let heal_locks: Vec<Arc<parking_lot::Mutex<()>>> = current_views
+                .iter()
+                .filter(|v| {
+                    comparator.compare(v.metadata.key_range.max(), boundary)
+                        != core::cmp::Ordering::Less
+                })
+                .map(Table::heal_lock_arc)
+                .collect();
+            #[cfg(feature = "page_ecc")]
+            let _heal_guards: Vec<parking_lot::MutexGuard<'_, ()>> =
+                heal_locks.iter().map(|l| l.lock()).collect();
+
+            // Classify each input at this boundary: restrict (extends past it) or
+            // remove (fully consumed by this slice). Re-open restricted views as
+            // distinct Inners so a prior view drops and punches independently.
+            //
+            // `run_subcompaction` above already finalized this slice's output SSTs
+            // and blob files, but the install below is what references them. A
+            // failure between here and the install (a sidecar write or a restricted
+            // reopen) returns before any version points at those outputs, so, like
+            // the install error path below, roll them back now instead of pinning
+            // the space until the next open's orphan sweep. Tight-space runs exactly
+            // when free space is scarce, so an ENOSPC here would otherwise both abort
+            // the reclaim and hold the bytes this slice just consumed.
+            // Pre-install rollback. The slice's finalized outputs/blobs are still
+            // unreferenced (no version points at them), so on any failure before the
+            // install commits they must be retracted or the scarce space stays pinned
+            // until the next orphan sweep. No `.restrict-bound` sidecar is touched
+            // here: the sidecar write is STRICTLY POST-COMMIT (the mark step below the
+            // install), so an aborted slice never publishes one and there is nothing
+            // to retract. That ordering is the crash-safety invariant — a sidecar on
+            // disk always denotes a committed restriction (see the mark step and
+            // `docs/manifest-recovery.md`).
+            let rollback = |e: crate::Error| -> crate::Error {
+                for t in &outputs {
+                    t.mark_as_deleted();
+                }
+                for b in &blobs_for_cleanup {
+                    b.mark_as_deleted();
+                }
+                e
+            };
+
             // Re-open each stale blob file as a distinct Inner: the re-opened view
             // replaces the original in the new version (same id), and the original
             // — held only by prior snapshots after this — punches its consumed
             // `[data_start, frontier)` prefix when it drains. Mirrors the SST
             // `reopen_restricted` swap. Files with no consumption yet are skipped
-            // (nothing to punch, original stays installed).
+            // (nothing to punch, original stays installed). Sits BELOW the
+            // rollback closure on purpose: this reopen hashes the stale file's
+            // live suffix, and a failure here — like the restricted SST reopen
+            // below — must retract the slice's finalized-but-unreferenced
+            // outputs, not leak them until an orphan sweep.
             let mut prior_to_punch: Vec<(BlobFile, u64)> = Vec::new();
             if relocating {
+                // Test-only failpoint: a restricted-blob reopen failure at this
+                // exact point (outputs finalized, install not yet run).
+                #[cfg(test)]
+                if opts
+                    .config
+                    .fail_tight_blob_reopen
+                    .swap(false, core::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(rollback(cancelled_compaction()));
+                }
                 for sf in &current_stale {
                     if let Some(off) = resume_offsets.get(&sf.id()).copied() {
-                        new_blobs.push(sf.reopen()?);
+                        // The re-opened view serves only `[off, end)`: the prior
+                        // view punches everything below once its readers drain.
+                        // Capture the digest over that live suffix NOW, while the
+                        // file is still whole, and record `off` as the view's
+                        // frontier — a whole-file digest would never match the
+                        // punched file, and integrity checks hash from the
+                        // frontier for exactly this reason.
+                        new_blobs.push(sf.reopen_restricted(off).map_err(rollback)?);
                         prior_to_punch.push((sf.clone(), off));
                     }
                 }
             }
 
-            let blobs_for_cleanup = new_blobs.clone();
-
-            // Classify each input at this boundary: restrict (extends past it) or
-            // remove (fully consumed by this slice). Re-open restricted views as
-            // distinct Inners so a prior view drops and punches independently.
             let mut restricted_pairs: Vec<(TableId, Table)> = Vec::new();
             let mut removed_ids: Vec<TableId> = Vec::new();
             let mut next_views: Vec<Table> = Vec::new();
@@ -989,10 +1258,54 @@ fn run_tight_space_compaction(
                 {
                     removed_ids.push(view.id());
                 } else {
-                    let restricted = view.reopen_restricted(boundary.clone())?;
+                    // Open the restricted view over the same physical SST. This is an
+                    // IN-MEMORY reopen (it reads the live suffix digest but writes
+                    // nothing to disk), so a failure here commits nothing and just
+                    // rolls back the finalized outputs. The `.restrict-bound` sidecar
+                    // that records this view's exact bound is written only AFTER the
+                    // install commits (the mark step below), never here.
+                    //
+                    // Later ordinary compactions read this view through
+                    // `Table::scan()`, which starts at the restriction bound
+                    // (blocks below it are punched and unreadable, and the
+                    // prefix rows' authoritative copies live in the slice
+                    // output) — so the restricted SST stays compactable and is
+                    // eventually retired through the normal path.
+                    // A restriction only ever RISES. The boundaries were built
+                    // from the whole block index, punched prefix included, so an
+                    // input a previous run already restricted can be handed a
+                    // boundary BELOW its committed bound; reopening there would
+                    // republish the SST as serving its own punched prefix, whose
+                    // reads land in the zeros and whose rows the earlier slice
+                    // output already owns.
+                    let bound = match view.restrict_lower_bound() {
+                        Some(committed)
+                            if comparator.compare(committed, boundary)
+                                == core::cmp::Ordering::Greater =>
+                        {
+                            committed.clone()
+                        }
+                        _ => boundary.clone(),
+                    };
+                    let restricted = view.reopen_restricted(bound).map_err(rollback)?;
                     restricted_pairs.push((view.id(), restricted.clone()));
                     next_views.push(restricted);
                 }
+            }
+
+            // Bind the blob files this slice publishes, exactly as its SST
+            // outputs were bound above — both the freshly written ones and the
+            // re-opened restricted views, since the version edit below makes
+            // all of them reachable at once. An unbound blob's `Drop` can
+            // unlink it while a checkpoint is capturing, and its prefix punch
+            // can zero bytes the checkpoint has already hard-linked.
+            for blob_file in &new_blobs {
+                blob_file.bind_to_tree(&crate::table::TableSinks {
+                    deletion_pause: &opts.deletion_pause,
+                    heal_hints: &opts.heal_hints,
+                    #[cfg(feature = "std")]
+                    background_deleter: None,
+                });
             }
 
             // Install one atomic, durable version edit for the slice.
@@ -1019,22 +1332,89 @@ fn run_tight_space_compaction(
                 opts.encryption.clone(),
             );
             if let Err(e) = install {
-                for t in &outputs {
-                    t.mark_as_deleted();
-                }
-                for b in &blobs_for_cleanup {
-                    b.mark_as_deleted();
-                }
-                return Err(e);
+                // The install did not commit, so no sidecar was written (the mark
+                // step below is strictly post-commit) and the punches never arm:
+                // retract only the finalized-but-unreferenced outputs so the scarce
+                // space is freed now instead of at the next orphan sweep.
+                return Err(rollback(e));
             }
 
-            // Arm each surviving prior SST view to punch its consumed prefix on
-            // drop; a fully-consumed input is deleted outright (data is in outputs).
+            // Mark, then punch. The install committed, so now record each restricted
+            // input's exact bound to its `.restrict-bound` sidecar — STRICTLY AFTER
+            // the commit, so a sidecar on disk always denotes a committed restriction
+            // (manifest repair honors it without a commit protocol). Then arm the
+            // prefix punch. A fully-consumed input is deleted outright (its data is in
+            // the outputs).
+            //
+            // A sidecar write that fails HERE is not fatal: the restriction is already
+            // durable in the manifest, which is what the bound is recovered FROM —
+            // the next open republishes any sidecar that never landed. Log it and
+            // leave that input UNPUNCHED meanwhile, so a manifest-loss repair that
+            // runs before that open sees no-sidecar + unpunched and keeps the whole
+            // input rather than deriving a conservative bound and dropping up to one
+            // live block. Keeping it whole is itself only tolerable transiently: the
+            // repair would publish both the input and the slice output as L0 runs,
+            // and while point reads are shadowed by the output, merge operands are
+            // deliberately never deduplicated across sources, so an operand in the
+            // consumed prefix WOULD be applied twice. Hence the republish on open —
+            // never punch without the sidecar, and never leave it missing for good.
             for view in &current_views {
                 if removed_ids.contains(&view.id()) {
                     view.mark_as_deleted();
                 } else {
-                    view.mark_punch_on_drop(view.punch_offset_for(boundary)?);
+                    // The bound this slice COMMITTED for this input, which the
+                    // reopen above may have clamped up to a restriction an
+                    // earlier pass already committed. The sidecar is what a
+                    // manifest-loss repair trusts, so recording the raw boundary
+                    // here would republish the SST as serving an interval the
+                    // earlier slice output owns and whose blocks are punched
+                    // out. The punch offset follows the same bound (punching to
+                    // the lower one would merely redo a subset of an existing
+                    // hole, but the two must not disagree).
+                    let bound = restricted_pairs
+                        .iter()
+                        .find(|(id, _)| *id == view.id())
+                        .and_then(|(_, restricted)| restricted.restrict_lower_bound())
+                        .unwrap_or(boundary);
+                    match view.write_restrict_sidecar(bound, opts.config.sync_mode) {
+                        Ok(()) => match view.punch_offset_for(bound) {
+                            Ok(off) => view.mark_punch_on_drop(off),
+                            // Post-commit, so a punch-offset lookup failure is non-fatal,
+                            // exactly like the sidecar-write failure below: the restriction
+                            // is already durable (manifest + sidecar), so leave the input
+                            // unpunched and let a later compaction reclaim it. Propagating
+                            // `?` here would abort an already-committed slice.
+                            Err(e) => log::error!(
+                                "tight-space could not resolve the punch offset for table \
+                                 {} after committing its restriction: {e}; leaving the input \
+                                 unpunched, a later compaction reclaims it",
+                                view.id(),
+                            ),
+                        },
+                        // On a LATER slice of the same input, this failure leaves
+                        // the PREVIOUS slice's sidecar in place — valid but
+                        // stale (a lower bound). Deliberately left there: a
+                        // manifest-loss repair before the next open then
+                        // restricts to that lower bound and republishes only the
+                        // newly consumed interval beside the slice output — the
+                        // same already-tolerated duplication class as a FIRST
+                        // slice's failure (whole unpunched input republished),
+                        // and strictly less of it. REMOVING the stale sidecar
+                        // gains nothing and can lose data: the punch geometry
+                        // re-derives the SAME lower bound (the holes end where
+                        // that slice punched), while a backend that cannot
+                        // prove holes then classifies the zeroed prefix as
+                        // damage and salvage drops live rows the slice output
+                        // does not carry. With the manifest alive, the next
+                        // open replaces a DISAGREEING sidecar from the
+                        // manifest's bound, which closes this window.
+                        Err(e) => log::error!(
+                            "tight-space could not write the restrict-bound sidecar for \
+                             table {} after committing its restriction: {e}; leaving the \
+                             input unpunched, a later compaction rewrites it",
+                            view.id(),
+                        ),
+                    }
                 }
             }
             // Arm each re-opened stale blob file's prior view to punch its
@@ -1097,7 +1477,9 @@ fn run_tight_space_compaction(
             &rts,
             (lower.clone(), Bound::Unbounded),
             dst_lvl,
-            is_last_level,
+            bottommost_gc,
+            // Slices apply no removal semantics; see the parameter docs.
+            false,
             &blobs_folder,
             tail_reloc,
         )?;
@@ -1166,6 +1548,15 @@ fn run_subcompaction(
     bounds: (core::ops::Bound<UserKey>, core::ops::Bound<UserKey>),
     dst_lvl: usize,
     is_last_level: bool,
+    // Whether the user compaction filter runs in this merge. `false` on
+    // tight-space slices, which apply NO removal semantics (bottommost GC is
+    // deferred the same way): a slice's output must be a SUPERSET that shadows
+    // any surviving input prefix in every crash window — a post-commit sidecar
+    // write failure deliberately leaves the input unpunched, and a
+    // manifest-loss repair then republishes that prefix whole, so a record the
+    // filter removed here would survive nowhere else and resurrect. The
+    // filtering is deferred, not lost: the next normal compaction applies it.
+    apply_compaction_filter: bool,
     blobs_folder: &std::path::Path,
     // When `Some` (tight-space blob defrag only), this sub-compaction relocates
     // the live entries of `stale_files` into a fresh compact blob file, resuming
@@ -1229,11 +1620,24 @@ fn run_subcompaction(
     }
 
     let filter_ctx = Context { is_last_level };
-    let mut compaction_filter = opts
-        .config
-        .compaction_filter_factory
-        .as_ref()
-        .map(|f| f.make_filter(&filter_ctx));
+    let mut compaction_filter = if apply_compaction_filter {
+        opts.config
+            .compaction_filter_factory
+            .as_ref()
+            .map(|f| f.make_filter(&filter_ctx))
+    } else {
+        None
+    };
+    // Shared transform counter, created for EVERY sub-compaction: the filter
+    // adapter ticks it on non-Keep verdicts, the merge stream on its own
+    // visibility-changing drops (bottommost tombstone elision, RT
+    // application, weak annihilation), and the table writer marks
+    // transformed the lineage of any output whose window saw one (see
+    // `prepare_table_writer`).
+    let transform_marker = Some(Arc::new(portable_atomic::AtomicU64::new(0)));
+    if let Some(marker) = &transform_marker {
+        merge_iter = merge_iter.with_transform_marker(Arc::clone(marker));
+    }
 
     // KV separation (no relocation on this path): track fragmentation from
     // dropped/GC'd entries so the merged install updates blob GC stats.
@@ -1249,6 +1653,7 @@ fn run_subcompaction(
         blobs_folder,
         &mut filter_blob_writer,
         &filter_ctx,
+        transform_marker.clone(),
     ));
 
     // Bottommost seqno-zeroing: at the last level, entries below the GC
@@ -1265,7 +1670,16 @@ fn run_subcompaction(
 
     // block_parallel = false: this sub-compaction already runs on a pool thread,
     // so its block compression must stay serial (nested-pool deadlock otherwise).
-    let table_writer = super::flavour::prepare_table_writer(version, opts, payload, false)?;
+    // whole_run = false: several sub-compactions (or tight-space slices) share
+    // this payload's lineage, so no single writer may close the run.
+    let table_writer = super::flavour::prepare_table_writer(
+        version,
+        opts,
+        payload,
+        false,
+        transform_marker,
+        false,
+    )?;
     let mut compactor: Box<dyn CompactionFlavour> = match relocation {
         // Tight-space blob defrag: relocate the stale files' live entries into a
         // fresh compact file, resuming each stale scan at its carried-over
@@ -1282,9 +1696,27 @@ fn run_subcompaction(
                 reloc
                     .stale_files
                     .iter()
-                    .map(|bf| match reloc.resume_offsets.get(&bf.id()) {
-                        Some(&off) => BlobFileScanner::resume(&bf.0.path, &*bf.0.fs, bf.id(), off),
-                        None => BlobFileScanner::new(&bf.0.path, &*bf.0.fs, bf.id()),
+                    .map(|bf| {
+                        // Never scan below the frontier the FILE itself
+                        // declares: a relocation that committed a slice and
+                        // then aborted leaves the stale file restricted with
+                        // its consumed prefix punched, and this run's map
+                        // starts empty. Reading from the data section would
+                        // hit those zeros, resynchronize byte-wise, and taint
+                        // every surviving frame, so the retry could never
+                        // relocate anything. Deciding it here (rather than
+                        // seeding the map) keeps the two from drifting apart.
+                        let off = reloc
+                            .resume_offsets
+                            .get(&bf.id())
+                            .copied()
+                            .unwrap_or(0)
+                            .max(bf.live_data_start());
+                        if off == 0 {
+                            BlobFileScanner::new(&bf.0.path, &*bf.0.fs, bf.id())
+                        } else {
+                            BlobFileScanner::resume(&bf.0.path, &*bf.0.fs, bf.id(), off)
+                        }
                     })
                     .collect::<crate::Result<Vec<_>>>()?,
             );
@@ -1576,6 +2008,10 @@ fn plan_merge_on_read(
         // that no longer line up with the verbatim-copied physical blocks. Relocating
         // it would alias the wrong rows; fall back to copy-on-write instead.
         || !source.delete_bitmap().is_empty()
+        // A tight-space restricted view renumbers for the same reason — `scan()`
+        // starts at its bound — and the relocation would additionally copy the
+        // punched prefix and publish it unrestricted.
+        || source.restrict_lower_bound().is_some()
     {
         return Ok(None);
     }
@@ -1647,24 +2083,55 @@ fn run_merge_on_read_relocation(
         opts.config.sync_mode,
     )?;
 
-    let relocated = Table::recover(
-        new_path,
-        checksum,
-        0,
-        opts.tree_id,
-        new_id,
-        opts.config.cache.clone(),
-        opts.config.descriptor_table.clone(),
-        level_fs,
-        opts.config.filter_block_pinning_policy.get(dst_lvl),
-        opts.config.index_block_pinning_policy.get(dst_lvl),
-        opts.config.encryption.clone(),
+    let relocated = {
+        let mut params = crate::table::RecoverParams::new(
+            new_path.clone(),
+            checksum,
+            new_id,
+            Arc::clone(&level_fs),
+            opts.config.comparator.clone(),
+            opts.config.cache.clone(),
+        );
+        params.tree_id = opts.tree_id;
+        params
+            .descriptor_table
+            .clone_from(&opts.config.descriptor_table);
+        params.pin_filter = opts.config.filter_block_pinning_policy.get(dst_lvl);
+        params.pin_index = opts.config.index_block_pinning_policy.get(dst_lvl);
+        params.encryption.clone_from(&opts.config.encryption);
         #[cfg(zstd_any)]
-        opts.config.zstd_dictionary.clone(),
-        opts.config.comparator.clone(),
+        {
+            params
+                .zstd_dictionary
+                .clone_from(&opts.config.zstd_dictionary);
+        }
         #[cfg(feature = "metrics")]
-        opts.metrics.clone(),
-    )?;
+        {
+            params.metrics = opts.metrics.clone();
+        }
+        match Table::recover(params) {
+            Ok(table) => table,
+            Err(e) => {
+                // The output is finalized but no manifest names it and no
+                // handle exists to mark it deleted, so nothing else will drop
+                // it before a restart's orphan sweep. Background compaction
+                // retries the same merge, and each attempt would leave another
+                // full-sized copy on the volume this pass was meant to relieve.
+                // The relocation writer already unlinks on a pre-finalization
+                // failure; this closes the window after it.
+                if let Err(rm) = level_fs.remove_file(&new_path)
+                    && rm.kind() != crate::io::ErrorKind::NotFound
+                {
+                    log::error!(
+                        "relocation output {} could not be removed after its reopen failed \
+                         ({rm}); it stays until the next orphan sweep",
+                        new_path.display(),
+                    );
+                }
+                return Err(e);
+            }
+        }
+    };
 
     compaction_state
         .hidden_set_mut()
@@ -1865,6 +2332,7 @@ fn merge_tables(
                                 range,
                                 dst_lvl,
                                 is_last_level,
+                                true,
                                 &blobs,
                                 // The parallel path never relocates blobs; tight
                                 // blob defrag is the serial slice loop's domain.
@@ -1911,6 +2379,7 @@ fn merge_tables(
                                 range,
                                 dst_lvl,
                                 is_last_level,
+                                true,
                                 &blobs_folder,
                                 None,
                             )
@@ -2040,6 +2509,16 @@ fn merge_tables(
         log::trace!("Installing custom compaction filter {:?}", f.name());
         f.make_filter(&filter_ctx)
     });
+    // Shared transform counter, created for EVERY compaction: the filter
+    // adapter ticks it on non-Keep verdicts, the merge stream ticks it on
+    // its own visibility-changing drops (bottommost tombstone elision,
+    // range-tombstone application, weak-tombstone annihilation), and the
+    // table writer marks transformed the lineage of any output whose window
+    // saw one (see `prepare_table_writer`).
+    let transform_marker = Some(Arc::new(portable_atomic::AtomicU64::new(0)));
+    if let Some(marker) = &transform_marker {
+        merge_iter = merge_iter.with_transform_marker(Arc::clone(marker));
+    }
 
     // This is used by the compaction filter if it wants to write new blobs
     // TODO: the filter should really pipe new blobs into the compaction stream directly,
@@ -2052,11 +2531,20 @@ fn merge_tables(
         &blobs_folder,
         &mut filter_blob_writer,
         &filter_ctx,
+        transform_marker.clone(),
     ));
 
-    // Serial (single-stream) compaction: block compression may use the pool.
-    let table_writer =
-        super::flavour::prepare_table_writer(&current_super_version.version, opts, payload, true)?;
+    // Serial (single-stream) compaction: block compression may use the pool,
+    // and the single writer owns the whole run (its final output carries the
+    // `lineage_last` marker).
+    let table_writer = super::flavour::prepare_table_writer(
+        &current_super_version.version,
+        opts,
+        payload,
+        true,
+        transform_marker,
+        true,
+    )?;
 
     let start = Instant::now();
 

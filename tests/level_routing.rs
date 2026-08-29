@@ -907,3 +907,286 @@ fn overlapping_routes_panic() {
         },
     ]);
 }
+
+/// A ROUTED tree's `Unrecoverable` must not be auto-repaired: route
+/// provenance is not persisted, so a missing routed table is indistinguishable
+/// from a same-level route path change (or a temporarily unmounted tier), and
+/// a rebuild would commit a manifest omitting every SST still sitting on the
+/// old route — the next open then sweeps them as orphans. The operator
+/// verifies the route configuration and invokes `repair` explicitly.
+#[test]
+fn open_or_repair_propagates_a_routed_missing_table() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    {
+        let tree = three_tier_config(dir.path()).open()?;
+        tree.insert("a", "value_a", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    // The hot tier "loses" its table — indistinguishable from the tier being
+    // remounted elsewhere or the route path having changed.
+    let hot_tables_dir = dir.path().join("hot").join("tables");
+    let mut deleted = false;
+    for entry in std::fs::read_dir(&hot_tables_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            std::fs::remove_file(entry.path())?;
+            deleted = true;
+            break;
+        }
+    }
+    assert!(deleted, "expected to delete a hot-tier table file");
+
+    let manifest_names = || -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir.path().join("primary"))
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|n| {
+                n.strip_prefix('v')
+                    .is_some_and(|rest| rest.parse::<u64>().is_ok())
+                    || n == "current"
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    let before = manifest_names();
+
+    let result = three_tier_config(dir.path())
+        .open_or_repair(lsm_tree::RepairPolicy::default().salvage(true));
+    assert!(
+        matches!(result, Err(lsm_tree::Error::Unrecoverable)),
+        "a routed missing table is ambiguous and must propagate: {:?}",
+        result.map(|_| "opened"),
+    );
+    assert_eq!(
+        before,
+        manifest_names(),
+        "an auto-repair would have rewritten the manifest generation",
+    );
+    Ok(())
+}
+
+/// A failed post-commit sweep can leave an INTACT copy of a routed table's id
+/// in a folder scanned earlier. Opening proves structure, not generation, so
+/// without a digest check the stale twin wins on scan order and normal reads
+/// return superseded values.
+#[test]
+fn a_stale_twin_in_an_earlier_folder_loses_to_the_manifest_digest() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let other = tempfile::tempdir()?;
+
+    {
+        let tree = three_tier_config(dir.path()).open()?;
+        tree.insert("a", "fresh", 1);
+        tree.flush_active_memtable(0)?;
+    }
+    // A same-id table holding a DIFFERENT generation: an independent tree
+    // starts its table counter at the same place.
+    {
+        let tree = three_tier_config(other.path()).open()?;
+        tree.insert("a", "stale", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    let routed = |base: &std::path::Path| -> std::path::PathBuf {
+        std::fs::read_dir(base.join("hot").join("tables"))
+            .expect("read hot tier")
+            .map(|e| e.expect("entry").path())
+            .find(|p| p.is_file())
+            .expect("the flush wrote a routed table")
+    };
+    let twin = routed(other.path());
+    let id = twin.file_name().expect("table file name").to_owned();
+    // The primary folder is scanned BEFORE the routes, so this copy is the
+    // first sighting of the id.
+    std::fs::copy(&twin, dir.path().join("primary").join("tables").join(&id))?;
+
+    let tree = three_tier_config(dir.path()).open()?;
+    assert_eq!(
+        tree.get("a", lsm_tree::SeqNo::MAX)?.as_deref(),
+        Some(&b"fresh"[..]),
+        "the copy the manifest digested must win over scan order",
+    );
+    Ok(())
+}
+
+/// A displaced copy can have readable metadata and an unreadable data extent:
+/// it opens, then its digest read fails. Ending the scan there lets a damaged
+/// copy permanently block the intact one a folder over, which is the very
+/// cleanup-failure outage the routed-copy retry exists to survive.
+#[test_log::test]
+fn a_damaged_duplicate_does_not_block_the_intact_routed_copy() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+
+    // The engine canonicalises every configured path (`Config::new` and
+    // `level_routes` alike), so a bare "/…" root names a different key than the
+    // one it creates wherever an absolute path carries a prefix. Canonicalise
+    // here too, so the fixture and the engine address the same directories.
+    let base = std::path::absolute("/db_damaged_duplicate").expect("absolute base");
+    let base = base.as_path();
+    let mem = MemFs::new();
+    let faulty = Arc::new(FaultFs::new(mem.clone()));
+    let injector = faulty.injector();
+
+    let config = |fs: Arc<dyn Fs>| {
+        Config::new(
+            base,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::None))
+        .index_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::None))
+        .with_shared_fs(Arc::clone(&fs))
+        .level_routes(vec![LevelRoute {
+            levels: 0..2,
+            path: base.join("hot"),
+            fs,
+        }])
+    };
+
+    {
+        let tree = config(Arc::new(mem.clone())).open()?;
+        tree.insert("a", "authoritative", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    // The flush routed the table to the hot tier; plant a byte-identical twin
+    // in the primary folder, which is scanned FIRST.
+    let hot_tables = base.join("hot").join("tables");
+    let twin = mem
+        .read_dir(&hot_tables)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("the flush wrote a routed table")
+        .path;
+    let displaced = base
+        .join("tables")
+        .join(twin.file_name().expect("table file name"));
+    mem.hard_link(&twin, &displaced)?;
+
+    // Metadata still parses, but the copy cannot be read through for its
+    // digest: the shape a localized unreadable extent leaves behind.
+    // The SECOND open of this copy is the digest's: recovery opens it first and
+    // parses cleanly, then the digest reopens it to stream the file. Faulting
+    // the first open instead would exercise the recover-failure path, which is
+    // already covered, and the test would pass without proving anything.
+    injector.arm(
+        FaultRule::new(
+            FaultOp::Open,
+            Fault::Error(lsm_tree::io::ErrorKind::InvalidData),
+        )
+        .on_path(displaced.display().to_string())
+        .skip(1),
+    );
+
+    let tree = config(faulty).open()?;
+    assert_eq!(
+        tree.get("a", lsm_tree::SeqNo::MAX)?.as_deref(),
+        Some(&b"authoritative"[..]),
+        "the intact routed copy must still be found and served",
+    );
+    Ok(())
+}
+
+/// A copy rejected by the digest must not survive the open. Left on disk, it
+/// becomes the ONLY sighting of its id once the authoritative route is removed
+/// or temporarily unmounted: arbitration is then skipped and the stale
+/// generation is served instead of the missing route being reported.
+#[test]
+fn a_rejected_routed_copy_is_swept_once_a_winner_is_found() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let other = tempfile::tempdir()?;
+
+    {
+        let tree = three_tier_config(dir.path()).open()?;
+        tree.insert("a", "fresh", 1);
+        tree.flush_active_memtable(0)?;
+    }
+    {
+        let tree = three_tier_config(other.path()).open()?;
+        tree.insert("a", "stale", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    let routed = |base: &std::path::Path| -> std::path::PathBuf {
+        std::fs::read_dir(base.join("hot").join("tables"))
+            .expect("read hot tier")
+            .map(|e| e.expect("entry").path())
+            .find(|p| p.is_file())
+            .expect("the flush wrote a routed table")
+    };
+    let twin = routed(other.path());
+    let id = twin.file_name().expect("table file name").to_owned();
+    let displaced = dir.path().join("primary").join("tables").join(&id);
+    std::fs::copy(&twin, &displaced)?;
+
+    let tree = three_tier_config(dir.path()).open()?;
+    assert_eq!(
+        tree.get("a", lsm_tree::SeqNo::MAX)?.as_deref(),
+        Some(&b"fresh"[..]),
+        "the copy the manifest digested wins",
+    );
+    assert!(
+        !displaced.exists(),
+        "the rejected copy must be swept, or a later open with the winning route \
+         absent would serve it as the only sighting",
+    );
+    Ok(())
+}
+
+/// Route provenance is NOT persisted, so a configuration without
+/// `level_routes` cannot prove the store was never routed. Reopening a routed
+/// tree with the routes accidentally omitted therefore looks exactly like a
+/// corrupt store: only the primary folder is scanned and the manifest's
+/// off-route SSTs are missing. Auto-repair must not act on that: it would
+/// commit a manifest omitting every table still sitting on the unscanned
+/// tiers, which the next open then sweeps as orphans.
+#[test]
+fn open_or_repair_refuses_when_omitted_routes_cannot_be_ruled_out() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    {
+        let tree = three_tier_config(dir.path()).open()?;
+        tree.insert("a", "value_a", 1);
+        tree.flush_active_memtable(0)?;
+    }
+    let hot_tables = dir.path().join("hot").join("tables");
+    let routed: Vec<std::path::PathBuf> = std::fs::read_dir(&hot_tables)?
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.is_file())
+        .collect();
+    assert!(!routed.is_empty(), "the flush wrote a routed table");
+
+    // The SAME tree, reopened with the routes left out of the configuration.
+    let no_routes = || {
+        Config::new(
+            dir.path().join("primary"),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+    };
+    let result = no_routes().open_or_repair(lsm_tree::RepairPolicy::default().salvage(true));
+    assert!(
+        result.is_err(),
+        "an ambiguous failure must be reported, not repaired away: {:?}",
+        result.map(|_| "opened"),
+    );
+    for path in &routed {
+        assert!(
+            path.try_exists()?,
+            "the off-route table must survive: {}",
+            path.display(),
+        );
+    }
+
+    // With the routes back, the tree opens without any repair at all.
+    let (_, repaired) =
+        three_tier_config(dir.path()).open_or_repair(lsm_tree::RepairPolicy::default())?;
+    assert!(
+        repaired.is_none(),
+        "the store was healthy all along; only the configuration was wrong",
+    );
+    Ok(())
+}

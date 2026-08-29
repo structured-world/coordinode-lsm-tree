@@ -65,6 +65,45 @@ pub fn get_next_tree_id() -> TreeId {
     TREE_ID_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
 }
 
+/// A test seam: a callback fired at a coordination point inside the tree.
+#[cfg(test)]
+pub type TestHook = Box<dyn Fn() + Send>;
+
+/// Per-tree test seams, fired at lock-coordination points so a test can prove
+/// a lock-scope invariant deterministically instead of racing it. They are
+/// per-tree fields rather than process statics on purpose: a plain
+/// `cargo test` run executes many tests in one process, where a leftover
+/// global hook fires inside unrelated tests.
+#[cfg(test)]
+#[derive(Default)]
+pub struct TestHooks {
+    /// Fired while the CDC scan holds the version-history write guard, so a
+    /// test can prove a writer is excluded for that window.
+    pub(crate) scan_freeze: std::sync::Mutex<Option<TestHook>>,
+    /// Fired by `remove_range` between obtaining the active memtable and
+    /// inserting the tombstone, so a test can prove the version-history read
+    /// guard spans the whole insert.
+    pub(crate) range_write: std::sync::Mutex<Option<TestHook>>,
+}
+
+#[cfg(test)]
+impl TestHooks {
+    /// Runs the hook in `slot`, if any.
+    pub(crate) fn fire(slot: &std::sync::Mutex<Option<TestHook>>) {
+        #[expect(clippy::unwrap_used, reason = "test-only seam")]
+        let guard = slot.lock().unwrap();
+        if let Some(hook) = guard.as_ref() {
+            hook();
+        }
+    }
+
+    /// Installs `hook` into `slot`, replacing any previous one.
+    pub(crate) fn install(slot: &std::sync::Mutex<Option<TestHook>>, hook: TestHook) {
+        #[expect(clippy::unwrap_used, reason = "test-only seam")]
+        slot.lock().unwrap().replace(hook);
+    }
+}
+
 pub struct TreeInner {
     /// Unique tree ID
     pub id: TreeId,
@@ -196,6 +235,10 @@ pub struct TreeInner {
     #[doc(hidden)]
     #[cfg(feature = "metrics")]
     pub metrics: Arc<Metrics>,
+
+    /// Per-tree test seams (see [`TestHooks`]).
+    #[cfg(test)]
+    pub(crate) test_hooks: TestHooks,
 }
 
 impl TreeInner {
@@ -270,6 +313,9 @@ impl TreeInner {
 
             #[cfg(feature = "metrics")]
             metrics: Metrics::default().into(),
+
+            #[cfg(test)]
+            test_hooks: TestHooks::default(),
         })
     }
 

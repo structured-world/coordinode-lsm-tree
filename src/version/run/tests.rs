@@ -397,7 +397,7 @@ fn range_overlap_indexes_cmp_reverse() {
 
     assert_eq!(
         Some((0, 3)),
-        run.range_overlap_indexes_cmp::<&[u8], _>(&.., &cmp)
+        run.range_overlap_indexes_cmp::<&[u8], _, _>(&.., &cmp)
     );
 
     // Inclusive range covering one table (z..=p in reverse = first table)
@@ -423,7 +423,7 @@ fn range_overlap_indexes_cmp_reverse() {
         (Bound::Excluded(b"p"), Bound::Included(b"a"));
     assert_eq!(
         Some((1, 3)),
-        run.range_overlap_indexes_cmp::<&[u8], _>(&bounds_excl_start, &cmp)
+        run.range_overlap_indexes_cmp::<&[u8], _, _>(&bounds_excl_start, &cmp)
     );
 
     // Exclusive end bound: include first table only
@@ -431,7 +431,7 @@ fn range_overlap_indexes_cmp_reverse() {
         (Bound::Included(b"z"), Bound::Excluded(b"o"));
     assert_eq!(
         Some((0, 0)),
-        run.range_overlap_indexes_cmp::<&[u8], _>(&bounds_excl_end, &cmp)
+        run.range_overlap_indexes_cmp::<&[u8], _, _>(&bounds_excl_end, &cmp)
     );
 
     // Semi-open range (start..): Included start, Unbounded end

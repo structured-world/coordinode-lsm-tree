@@ -2,7 +2,6 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
-use crate::path::Path;
 use crate::{
     Cache, GlobalTableId, TreeId, UserValue,
     version::BlobFileList,
@@ -34,10 +33,19 @@ impl<'a> Accessor<'a> {
         self
     }
 
+    /// Reads one separated value.
+    ///
+    /// The blob file is reopened from the path it was RECOVERED under, so no
+    /// caller supplies a base directory: a file can legitimately sit under a
+    /// noncanonical spelling of its own id (`blobs/00` for id 0), and a path
+    /// rebuilt from the id would miss it on every cache miss.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the blob file's open / read failures.
     pub fn get(
         &self,
         tree_id: TreeId,
-        base_path: &Path,
         key: &[u8],
         vhandle: &ValueHandle,
         cache: &Cache,
@@ -54,7 +62,7 @@ impl<'a> Accessor<'a> {
 
         let (file, _) = blob_file
             .file_accessor()
-            .get_or_open_blob_file(&bf_id, &base_path.join(vhandle.blob_file_id.to_string()))?;
+            .get_or_open_blob_file(&bf_id, &blob_file.0.path)?;
 
         let reader = {
             let r = Reader::new(blob_file, file.as_ref());

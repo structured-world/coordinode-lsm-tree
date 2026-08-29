@@ -89,6 +89,17 @@ pub struct CompactionStream<'a, I: Iterator<Item = Item>, F: StreamFilter = NoFi
     rt_active: Option<ActiveTombstoneSet>,
     rt_idx: usize,
     rt_sorted: bool,
+
+    /// Ticked on every VISIBILITY-CHANGING drop this merge performs itself —
+    /// a bottommost tombstone elision (and the versions it drains), a
+    /// range-tombstone application, a weak-tombstone annihilation. Such a
+    /// drop makes the output non-derivable from its inputs exactly like a
+    /// compaction-filter verdict (a lingering input published beside a
+    /// partially surviving run would resurrect the deleted data), so the
+    /// table writer marks the affected output's lineage transformed through
+    /// the same counter the filter adapter ticks. Obsolete-version drops do
+    /// NOT tick: the newer version shadowing them lives in the output.
+    transform_marker: Option<Arc<portable_atomic::AtomicU64>>,
 }
 
 impl<I: Iterator<Item = Item>> CompactionStream<'_, I, NoFilter> {
@@ -111,6 +122,7 @@ impl<I: Iterator<Item = Item>> CompactionStream<'_, I, NoFilter> {
             rt_active: None,
             rt_idx: 0,
             rt_sorted: false,
+            transform_marker: None,
         }
     }
 }
@@ -132,11 +144,20 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
             rt_active: self.rt_active,
             rt_idx: self.rt_idx,
             rt_sorted: self.rt_sorted,
+            transform_marker: self.transform_marker,
         }
     }
 
     pub fn evict_tombstones(mut self, b: bool) -> Self {
         self.evict_tombstones = b;
+        self
+    }
+
+    /// Wires the shared transform counter (see the `transform_marker` field);
+    /// the same counter the filter adapter ticks on non-`Keep` verdicts.
+    #[must_use]
+    pub fn with_transform_marker(mut self, marker: Arc<portable_atomic::AtomicU64>) -> Self {
+        self.transform_marker = Some(marker);
         self
     }
 
@@ -247,7 +268,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
         loop {
             let should_take = self.inner.peek().is_some_and(|peeked| {
                 if let Ok(peeked) = peeked {
-                    peeked.key.user_key == user_key
+                    crate::comparator::same_user_key(&peeked.key.user_key, &user_key)
                 } else {
                     true
                 }
@@ -296,6 +317,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                         if let Some(watcher) = &mut self.dropped_callback {
                             watcher.on_dropped(&next);
                         }
+                        self.note_transform();
                     } else {
                         base_value = Some(next.value);
                     }
@@ -307,11 +329,14 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                     unreachable!("Indirection should be caught by peek check");
                 }
                 ValueType::Tombstone | ValueType::WeakTombstone => {
-                    // Tombstone kills base — merge with no base
+                    // Tombstone kills base — merge with no base. The tombstone
+                    // itself is consumed by the fold, so the output no longer
+                    // carries it: a visibility transform.
                     found_boundary = true;
                     if let Some(watcher) = &mut self.dropped_callback {
                         watcher.on_dropped(&next);
                     }
+                    self.note_transform();
                     self.drain_key(&user_key)?;
                     break;
                 }
@@ -324,8 +349,11 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
         // would resurrect deleted state across compaction.
         collected.retain(|e| {
             let covered = self.covered_by_applied_tombstone(e.key.user_key.as_ref(), e.key.seqno);
-            if covered && let Some(watcher) = &mut self.dropped_callback {
-                watcher.on_dropped(e);
+            if covered {
+                if let Some(watcher) = &mut self.dropped_callback {
+                    watcher.on_dropped(e);
+                }
+                self.note_transform();
             }
             !covered
         });
@@ -359,12 +387,20 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
         ))
     }
 
+    /// Records one visibility-changing drop (see the `transform_marker`
+    /// field): the output no longer derives from its inputs.
+    fn note_transform(&self) {
+        if let Some(marker) = &self.transform_marker {
+            marker.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// Drains the remaining versions of the given key.
     fn drain_key(&mut self, key: &UserKey) -> crate::Result<()> {
         loop {
             let Some(next) = self.inner.next_if(|kv| {
                 if let Ok(kv) = kv {
-                    let expired = kv.key.user_key == key;
+                    let expired = crate::comparator::same_user_key(&kv.key.user_key, key);
 
                     if expired && let Some(watcher) = &mut self.dropped_callback {
                         watcher.on_dropped(kv);
@@ -439,6 +475,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
 
                 if peeked.key.user_key > head.key.user_key {
                     if head.is_tombstone() && self.evict_tombstones {
+                        self.note_transform();
                         continue;
                     }
 
@@ -471,6 +508,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
                                 if let Some(watcher) = &mut self.dropped_callback {
                                     watcher.on_dropped(&merged);
                                 }
+                                self.note_transform();
                                 continue;
                             }
                             // Skip zeroing for partial merges (MergeOperand) to avoid duplicate keys
@@ -488,22 +526,27 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
                         // Head MergeOperand above GC — preserve tail for future merge
                     } else {
                         if head.key.value_type == ValueType::Tombstone && self.evict_tombstones {
+                            self.note_transform();
                             fail_iter!(self.drain_key(&head.key.user_key));
                             continue;
                         }
 
-                        // Drop weak tombstone if next item is Value
+                        // Drop weak tombstone if next item is Value: the weak
+                        // delete and the value it consumed both leave the
+                        // output — an annihilation, a visibility transform.
                         let drop_weak_tombstone = peeked.key.value_type == ValueType::Value
                             && head.key.value_type == ValueType::WeakTombstone;
                         // Tail expired — drain (head is never MergeOperand here)
                         fail_iter!(self.drain_key(&head.key.user_key));
 
                         if drop_weak_tombstone {
+                            self.note_transform();
                             continue;
                         }
                     }
                 }
             } else if head.is_tombstone() && self.evict_tombstones {
+                self.note_transform();
                 continue;
             } else if head.key.value_type.is_merge_operand()
                 && head.key.seqno < self.gc_seqno_threshold
@@ -523,6 +566,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
                 if let Some(watcher) = &mut self.dropped_callback {
                     watcher.on_dropped(&head);
                 }
+                self.note_transform();
                 continue;
             }
 

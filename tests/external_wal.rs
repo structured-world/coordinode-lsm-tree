@@ -649,3 +649,1438 @@ fn external_wal_recipe_recovers_through_the_crash_fs_harness() -> lsm_tree::Resu
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// § Replay after repair (docs/external-wal.md section 4)
+// ---------------------------------------------------------------------------
+
+/// The section 4 workload: puts on both sides of the to-be-lost range, merge
+/// operands before AND after the first flush (so some survive the repair and
+/// some are lost with the excluded SST), and a memtable-only tail record.
+fn repair_workload() -> Vec<WalRecord> {
+    let i64op = |n: i64| n.to_le_bytes().to_vec();
+    vec![
+        WalRecord {
+            seqno: 0,
+            op: WalOp::Insert {
+                key: b"a1".to_vec(),
+                value: b"v1".to_vec(),
+            },
+        },
+        WalRecord {
+            seqno: 1,
+            op: WalOp::Merge {
+                key: b"counter".to_vec(),
+                value: i64op(5),
+            },
+        },
+        WalRecord {
+            seqno: 2,
+            op: WalOp::Insert {
+                key: b"a2".to_vec(),
+                value: b"v2".to_vec(),
+            },
+        },
+        WalRecord {
+            seqno: 3,
+            op: WalOp::Merge {
+                key: b"counter".to_vec(),
+                value: i64op(7),
+            },
+        },
+        // --- first flush: everything above lands in the SST the crash damages
+        WalRecord {
+            seqno: 4,
+            op: WalOp::Insert {
+                key: b"z9".to_vec(),
+                value: b"v9".to_vec(),
+            },
+        },
+        WalRecord {
+            seqno: 5,
+            op: WalOp::Merge {
+                key: b"counter".to_vec(),
+                value: i64op(11),
+            },
+        },
+        // --- second flush: the SST above SURVIVES the repair
+        WalRecord {
+            seqno: 6,
+            op: WalOp::Insert {
+                key: b"m1".to_vec(),
+                value: b"mv".to_vec(),
+            },
+        },
+        // --- memtable only: lost with the crash, covered by the tail replay
+    ]
+}
+
+/// Builds the crashed-and-damaged store: applies `records` with a flush after
+/// each seqno in `flush_after`, drops the tree, corrupts the FIRST flushed
+/// SST's leading data block, and removes the manifest. Returns the WAL (fully
+/// retained: the archive-retention deployment from the spec).
+fn crashed_store_with(
+    folder: &Path,
+    records: &[WalRecord],
+    flush_after: &[u64],
+) -> lsm_tree::Result<ReferenceWal> {
+    let wal_path = folder.join("wal.log");
+    let mut wal = ReferenceWal::create(&wal_path).expect("create wal");
+    {
+        let tree = open_tree(folder);
+        for record in records {
+            wal.append(record).expect("wal append");
+            apply(&tree, record)?;
+            if flush_after.contains(&record.seqno) {
+                tree.flush_active_memtable(0)?;
+            }
+        }
+    }
+
+    // The first flushed SST holds seqnos 0..=3 (keys a1, a2, counter). Corrupt
+    // its leading data block: whole-file recovery still parses the metadata
+    // (so the repair can report the lost coverage), but block verification
+    // fails and a plain repair excludes the table.
+    let sst1 = folder.join("tables").join("0");
+    let mut bytes = std::fs::read(&sst1).expect("read sst");
+    for b in bytes.get_mut(8..24).expect("sst larger than 24 bytes") {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&sst1, &bytes).expect("write corruption");
+
+    // The crash also took the manifest.
+    for entry in std::fs::read_dir(folder).expect("read dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_version = name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || name == "current" {
+            std::fs::remove_file(entry.path()).expect("remove manifest file");
+        }
+    }
+    Ok(wal)
+}
+
+/// The section 4 workload with flushes after seqnos 3 and 5 (see
+/// [`repair_workload`]).
+fn crashed_repairable_store(folder: &Path) -> lsm_tree::Result<ReferenceWal> {
+    crashed_store_with(folder, &repair_workload(), &[3, 5])
+}
+
+/// A workload whose to-be-lost SST carries a RANGE DELETION and a BATCH: the
+/// section 4 replay must select the range record by span overlap and replay
+/// the batch per entry (merge entries presence-checked), or the tombstoned
+/// key resurrects and the batch's writes vanish.
+fn range_and_batch_workload() -> Vec<WalRecord> {
+    let i64op = |n: i64| n.to_le_bytes().to_vec();
+    vec![
+        WalRecord {
+            seqno: 0,
+            op: WalOp::Insert {
+                key: b"a1".to_vec(),
+                value: b"v1".to_vec(),
+            },
+        },
+        WalRecord {
+            seqno: 1,
+            op: WalOp::Insert {
+                key: b"d5".to_vec(),
+                value: b"doomed".to_vec(),
+            },
+        },
+        WalRecord {
+            seqno: 2,
+            op: WalOp::Merge {
+                key: b"counter".to_vec(),
+                value: i64op(5),
+            },
+        },
+        WalRecord {
+            seqno: 3,
+            op: WalOp::RemoveRange {
+                start: b"d".to_vec(),
+                end: b"e".to_vec(),
+            },
+        },
+        WalRecord {
+            seqno: 4,
+            op: WalOp::Batch {
+                entries: vec![
+                    BatchEntry::Insert {
+                        key: b"b1".to_vec(),
+                        value: b"bv".to_vec(),
+                    },
+                    BatchEntry::Merge {
+                        key: b"counter".to_vec(),
+                        value: i64op(7),
+                    },
+                ],
+            },
+        },
+        // --- first flush: everything above lands in the SST the crash damages
+        WalRecord {
+            seqno: 5,
+            op: WalOp::Insert {
+                key: b"z9".to_vec(),
+                value: b"v9".to_vec(),
+            },
+        },
+        // --- second flush: the SST above SURVIVES the repair
+        WalRecord {
+            seqno: 6,
+            op: WalOp::Insert {
+                key: b"m1".to_vec(),
+                value: b"mv".to_vec(),
+            },
+        },
+        // --- memtable only: lost with the crash, covered by the tail replay
+    ]
+}
+
+/// Whether `key` falls inside the inclusive `[lo, hi]` coverage bounds (the
+/// default bytewise comparator, matching the tree under test).
+fn key_in_coverage(key: &[u8], lo: &[u8], hi: &[u8]) -> bool {
+    key >= lo && key <= hi
+}
+
+/// One zone the reconciliation must cover: a reported lost key range, or —
+/// when any loss is UNSCOPABLE (`unknowable_losses`) — the whole keyspace.
+enum LostZone<'a> {
+    /// The inclusive `[lo, hi]` bounds of one `lost_coverage` entry.
+    Range(&'a [u8], &'a [u8]),
+    /// No bounds exist: reconcile every retained record.
+    WholeKeyspace,
+}
+
+impl LostZone<'_> {
+    /// Whether a point operation's key falls inside the zone.
+    fn covers_key(&self, key: &[u8]) -> bool {
+        match self {
+            Self::Range(lo, hi) => key_in_coverage(key, lo, hi),
+            Self::WholeKeyspace => true,
+        }
+    }
+
+    /// Whether a range deletion's half-open `[start, end)` span overlaps the
+    /// zone.
+    fn overlaps_span(&self, start: &[u8], end: &[u8]) -> bool {
+        match self {
+            Self::Range(lo, hi) => start <= *hi && *lo < end,
+            Self::WholeKeyspace => true,
+        }
+    }
+
+    /// The zone as scan bounds for the surviving-operand presence check.
+    fn scan_bounds(&self) -> (std::ops::Bound<&[u8]>, std::ops::Bound<&[u8]>) {
+        use std::ops::Bound;
+        match self {
+            Self::Range(lo, hi) => (Bound::Included(*lo), Bound::Included(*hi)),
+            Self::WholeKeyspace => (Bound::Unbounded, Bound::Unbounded),
+        }
+    }
+}
+
+/// The section 4 reconciliation, exactly as specified: tail replay above `w`,
+/// then per lost zone replay retained records at or below the bound — puts
+/// and deletes blindly, merge operands only when the surviving-operand
+/// multiset (from `scan_since_seqno_in_range`) does not already cover them.
+/// An UNSCOPABLE loss (`unknowable_losses`) has no bounds, so the whole
+/// keyspace is reconciled in ONE pass — running the per-range passes on top
+/// of it would subtract the same survivors twice and double-fold merges.
+fn reconcile_after_repair(
+    tree: &AnyTree,
+    wal: &ReferenceWal,
+    report: &lsm_tree::RepairReport,
+    w: u64,
+) -> lsm_tree::Result<()> {
+    use lsm_tree::{ScanSinceEvent, WalReplayScope};
+
+    let records = wal.records().expect("wal records");
+
+    // Tail replay (section 3), unchanged.
+    for record in records.iter().filter(|r| r.seqno > w) {
+        apply(tree, record)?;
+    }
+
+    let ceiling = match report.wal_replay_scope() {
+        WalReplayScope::TailOnly => return Ok(()),
+        WalReplayScope::LostUpTo(b) => b,
+        WalReplayScope::FullHistory => u64::MAX,
+    };
+
+    let zones: Vec<LostZone> = if report.unknowable_losses.is_empty() {
+        // COALESCE overlapping / touching ranges into one zone each, so a
+        // record in the overlap of two lost coverages is processed exactly
+        // once. (The per-pass survivor scan does see the previous pass's
+        // replays — the scan covers the active memtable — but correctness
+        // must not hinge on that subtlety.)
+        let mut ranges: Vec<(&[u8], &[u8])> = report
+            .lost_coverage
+            .iter()
+            .map(|(_, lo, hi, _)| (lo.as_ref(), hi.as_ref()))
+            .collect();
+        ranges.sort();
+        let mut coalesced: Vec<(&[u8], &[u8])> = Vec::new();
+        for (lo, hi) in ranges {
+            match coalesced.last_mut() {
+                Some((_, chi)) if lo <= *chi => {
+                    if hi > *chi {
+                        *chi = hi;
+                    }
+                }
+                _ => coalesced.push((lo, hi)),
+            }
+        }
+        coalesced
+            .into_iter()
+            .map(|(lo, hi)| LostZone::Range(lo, hi))
+            .collect()
+    } else {
+        vec![LostZone::WholeKeyspace]
+    };
+
+    for zone in zones {
+        // Surviving merge applications inside the zone, as a multiset of
+        // (key, seqno, operand): the scan delivers one event per application
+        // the tree will make, which is exactly the set to subtract.
+        let AnyTree::Standard(standard) = tree else {
+            panic!("this guard drives a standard tree");
+        };
+        let mut survived: std::collections::HashMap<(Vec<u8>, u64, Vec<u8>), usize> =
+            std::collections::HashMap::new();
+        // A compaction-FOLDED merge chain leaves a plain surviving value at
+        // the chain head's seqno and no operand events, so absence from the
+        // multiset does not prove an operand was lost. Track the highest
+        // surviving value / point-tombstone seqno per key (and the surviving
+        // range tombstones): an archived operand at or below it is already
+        // incorporated — or superseded — and must not be reapplied.
+        let mut superseded_floor: std::collections::HashMap<Vec<u8>, u64> =
+            std::collections::HashMap::new();
+        let mut surviving_range_tombstones: Vec<(Vec<u8>, Vec<u8>, u64)> = Vec::new();
+        for event in standard.scan_since_seqno_in_range::<&[u8], _>(0, zone.scan_bounds())? {
+            match event {
+                ScanSinceEvent::MergeOperand {
+                    key,
+                    operand,
+                    seqno,
+                } => {
+                    *survived
+                        .entry((key.to_vec(), seqno, operand.to_vec()))
+                        .or_default() += 1;
+                }
+                // A weak (single-delete) tombstone does NOT floor: it never
+                // incorporates the key's older history — it annihilates
+                // exactly its matching put during compaction and can then
+                // expose an older value. Flooring at its seqno would skip
+                // replaying that put from a lost SST, leaving the weak delete
+                // to consume a different, older value than the source's pair.
+                // Its blind replay stays idempotent (same internal key), so no
+                // presence tracking is needed either.
+                ScanSinceEvent::WeakTombstone { .. } => {}
+                ScanSinceEvent::Insert { key, seqno, .. }
+                | ScanSinceEvent::PointTombstone { key, seqno } => {
+                    let floor = superseded_floor.entry(key.to_vec()).or_default();
+                    // Seqno 0 is a bottommost-ZEROED survivor: per the
+                    // section 4 GC-coordination rule it already incorporates
+                    // the key's whole archived history (deployments that
+                    // reconcile start their WAL seqnos at 1, so a genuine
+                    // write cannot sit at 0), and its floor is unbounded.
+                    *floor = (*floor).max(if seqno == 0 { u64::MAX } else { seqno });
+                }
+                ScanSinceEvent::RangeTombstone {
+                    start_key,
+                    end_key,
+                    seqno,
+                } => {
+                    surviving_range_tombstones.push((start_key.to_vec(), end_key.to_vec(), seqno));
+                }
+            }
+        }
+        let rt_covered = |key: &[u8], seqno: u64| {
+            // STRICT `<`, matching the engine's suppression rule
+            // (`kv_seqno < rt.seqno`): a record TIED with the tombstone's
+            // caller-assigned seqno survives a read, so it must replay.
+            surviving_range_tombstones
+                .iter()
+                .any(|(s, e, rt)| key >= s.as_slice() && key < e.as_slice() && seqno < *rt)
+        };
+        // An OPERAND at the floor is part of the folded chain (the fold
+        // incorporated operands at and below the chain head's seqno), so its
+        // floor check is `<=`.
+        let operand_superseded = |key: &[u8], seqno: u64| {
+            superseded_floor.get(key).is_some_and(|&v| seqno <= v) || rt_covered(key, seqno)
+        };
+        // A POINT record TIED with the floor replays: equal-seqno point
+        // values resolve by SOURCE recency, not by seqno, so the floor
+        // cannot decide the tie — replaying every tied WAL record in WAL
+        // order does (the memtable overwrites the same internal key, so the
+        // last record in WAL order wins, and the memtable is the newest
+        // source). Records STRICTLY below stay skipped, which keeps the
+        // zeroed-survivor protection: that floor is unbounded, and no
+        // genuine record ties with it.
+        let point_superseded = |key: &[u8], seqno: u64| {
+            superseded_floor.get(key).is_some_and(|&v| seqno < v) || rt_covered(key, seqno)
+        };
+        // A WEAK delete bypasses the point floor: a newer surviving value
+        // floors the puts below it, but it does not "incorporate" a weak
+        // delete — they coexist physically, and once that value is itself
+        // annihilated, the tree would expose the put the lost weak delete
+        // had consumed at the source. Only the bottommost-ZEROED floor
+        // (`u64::MAX`, embodying the whole folded history — weak deletes
+        // included) suppresses the replay.
+        let weak_superseded = |key: &[u8], seqno: u64| {
+            superseded_floor.get(key).is_some_and(|&v| v == u64::MAX) || rt_covered(key, seqno)
+        };
+
+        for record in records
+            .iter()
+            .filter(|r| r.seqno <= ceiling && r.seqno <= w)
+        {
+            match &record.op {
+                WalOp::Merge { key, value } if zone.covers_key(key) => {
+                    let covered = survived
+                        .get_mut(&(key.clone(), record.seqno, value.clone()))
+                        .filter(|count| **count > 0);
+                    match covered {
+                        // The operand survived the repair: replaying it would
+                        // fold it twice.
+                        Some(count) => *count -= 1,
+                        // Folded into (or superseded by) a surviving value or
+                        // tombstone: already accounted for.
+                        None if operand_superseded(key, record.seqno) => {}
+                        None => apply(tree, record)?,
+                    }
+                }
+                WalOp::RemoveWeak { key } if zone.covers_key(key) => {
+                    if !weak_superseded(key, record.seqno) {
+                        apply(tree, record)?;
+                    }
+                }
+                WalOp::Insert { key, .. } | WalOp::Remove { key } if zone.covers_key(key) => {
+                    // Blind replay is idempotent against REAL surviving
+                    // versions, but a record STRICTLY below the superseded
+                    // floor is already incorporated (a bottommost-zeroed
+                    // survivor sits at seqno 0 while embodying the whole
+                    // folded history — replaying over it would resurrect a
+                    // pre-fold state) or superseded outright; a record TIED
+                    // with the floor replays (see `point_superseded`).
+                    if !point_superseded(key, record.seqno) {
+                        apply(tree, record)?;
+                    }
+                }
+                // A range deletion is selected by SPAN OVERLAP with the lost
+                // coverage (its half-open `[start, end)` against the
+                // inclusive `[lo, hi]`), and replays blindly like a point
+                // delete: idempotent at its original seqno.
+                WalOp::RemoveRange { start, end }
+                    if zone.overlaps_span(start.as_slice(), end.as_slice()) =>
+                {
+                    apply(tree, record)?;
+                }
+                // A batch is a group of standalone operations sharing one
+                // seqno: each entry the lost zone covers gets the same
+                // treatment its standalone form gets — merge entries
+                // subtract the survivors, the rest replay blindly. Entries
+                // outside the zone were never lost and are skipped.
+                WalOp::Batch { entries } => {
+                    for entry in entries {
+                        match entry {
+                            BatchEntry::Insert { key, value }
+                                if zone.covers_key(key) && !point_superseded(key, record.seqno) =>
+                            {
+                                tree.insert(key.as_slice(), value.as_slice(), record.seqno);
+                            }
+                            BatchEntry::Remove { key }
+                                if zone.covers_key(key) && !point_superseded(key, record.seqno) =>
+                            {
+                                tree.remove(key.as_slice(), record.seqno);
+                            }
+                            BatchEntry::RemoveWeak { key }
+                                if zone.covers_key(key) && !weak_superseded(key, record.seqno) =>
+                            {
+                                tree.remove_weak(key.as_slice(), record.seqno);
+                            }
+                            BatchEntry::Merge { key, value } if zone.covers_key(key) => {
+                                let covered = survived
+                                    .get_mut(&(key.clone(), record.seqno, value.clone()))
+                                    .filter(|count| **count > 0);
+                                match covered {
+                                    Some(count) => *count -= 1,
+                                    None if operand_superseded(key, record.seqno) => {}
+                                    None => {
+                                        tree.merge(key.as_slice(), value.as_slice(), record.seqno);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Executable proof of section 4: a crash that also damages a flushed SST is
+/// recovered by repair + the documented reconciliation, byte-for-byte to the
+/// non-crashed run — including merge operands split across a lost and a
+/// surviving SST, which is the case the presence check exists for.
+#[test]
+fn repair_and_reconciled_replay_recover_identical_state() -> lsm_tree::Result<()> {
+    // Reference: the same workload applied to a healthy tree.
+    let reference_dir = tempfile::tempdir().expect("tempdir");
+    let reference = {
+        let tree = open_tree(reference_dir.path());
+        for record in repair_workload() {
+            apply(&tree, &record)?;
+        }
+        snapshot(&tree)
+    };
+
+    let crash_dir = tempfile::tempdir().expect("tempdir");
+    let wal = crashed_repairable_store(crash_dir.path())?;
+
+    // One-call recovery entry point; no salvage, so the damaged SST is
+    // excluded and its coverage reported.
+    let (tree, repaired) = Config::new(
+        crash_dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(CounterMerge)))
+    .open_or_repair(lsm_tree::RepairPolicy::default())?;
+    let report = repaired.expect("the damaged store opens only after a repair");
+    assert!(
+        !report.lost_coverage.is_empty(),
+        "the excluded SST's coverage must be reported: {report:?}",
+    );
+    assert_eq!(
+        report.wal_replay_scope(),
+        lsm_tree::WalReplayScope::LostUpTo(3),
+        "the lost SST topped out at seqno 3",
+    );
+
+    // W: everything through the last flush (seqno 5) was applied and
+    // persisted before the crash; the WAL retained the full history (the
+    // archive-retention deployment).
+    reconcile_after_repair(&tree, &wal, &report, 5)?;
+
+    assert_eq!(
+        snapshot(&tree),
+        reference,
+        "repair + reconciled replay must reproduce the non-crashed state",
+    );
+    assert_eq!(
+        counter_of(&tree),
+        Some(5 + 7 + 11),
+        "each merge operand folded exactly once across the lost and the \
+         surviving SST",
+    );
+    Ok(())
+}
+
+/// Two lost SSTs with OVERLAPPING coverage must not double-process a record
+/// in the overlap: the reconciliation coalesces overlapping ranges into one
+/// zone, so a lost merge operand folds exactly once and a blind put replays
+/// exactly once regardless of how many lost tables covered its key.
+#[test]
+fn reconciled_replay_coalesces_overlapping_loss_ranges() -> lsm_tree::Result<()> {
+    let i64op = |n: i64| n.to_le_bytes().to_vec();
+    // Seqnos start at 1, per the section 4 GC-coordination rule.
+    let records = vec![
+        WalRecord {
+            seqno: 1,
+            op: WalOp::Insert {
+                key: b"a1".to_vec(),
+                value: b"v1".to_vec(),
+            },
+        },
+        WalRecord {
+            seqno: 2,
+            op: WalOp::Merge {
+                key: b"counter".to_vec(),
+                value: i64op(5),
+            },
+        },
+        // --- flush: SST [a1, counter], damaged below
+        WalRecord {
+            seqno: 3,
+            op: WalOp::Insert {
+                key: b"b1".to_vec(),
+                value: b"v3".to_vec(),
+            },
+        },
+        WalRecord {
+            seqno: 4,
+            op: WalOp::Insert {
+                key: b"z9".to_vec(),
+                value: b"v4".to_vec(),
+            },
+        },
+        // --- flush: SST [b1, z9], damaged below — overlaps [a1, counter]
+        WalRecord {
+            seqno: 5,
+            op: WalOp::Insert {
+                key: b"m5".to_vec(),
+                value: b"mv".to_vec(),
+            },
+        },
+        // --- memtable only: covered by the tail replay
+    ];
+
+    // Reference: the same workload applied to a healthy tree.
+    let reference_dir = tempfile::tempdir().expect("tempdir");
+    let reference = {
+        let tree = open_tree(reference_dir.path());
+        for record in &records {
+            apply(&tree, record)?;
+        }
+        snapshot(&tree)
+    };
+
+    let crash_dir = tempfile::tempdir().expect("tempdir");
+    let wal_path = crash_dir.path().join("wal.log");
+    let mut wal = ReferenceWal::create(&wal_path).expect("create wal");
+    {
+        let tree = open_tree(crash_dir.path());
+        for record in &records {
+            wal.append(record).expect("wal append");
+            apply(&tree, record)?;
+            if record.seqno == 2 || record.seqno == 4 {
+                tree.flush_active_memtable(0)?;
+            }
+        }
+    }
+    // Damage BOTH flushed SSTs' leading data blocks: their metadata still
+    // parses, so both overlapping coverages are reported.
+    for entry in std::fs::read_dir(crash_dir.path().join("tables")).expect("read tables dir") {
+        let entry = entry.expect("dir entry");
+        if entry.file_name().to_string_lossy().parse::<u64>().is_err() {
+            continue;
+        }
+        let path = entry.path();
+        let mut bytes = std::fs::read(&path).expect("read sst");
+        for b in bytes.get_mut(8..24).expect("sst larger than 24 bytes") {
+            *b ^= 0xFF;
+        }
+        std::fs::write(&path, &bytes).expect("write corruption");
+    }
+    for entry in std::fs::read_dir(crash_dir.path()).expect("read dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_version = name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || name == "current" {
+            std::fs::remove_file(entry.path()).expect("remove manifest file");
+        }
+    }
+
+    let (tree, repaired) = Config::new(
+        crash_dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(CounterMerge)))
+    .open_or_repair(lsm_tree::RepairPolicy::default())?;
+    let report = repaired.expect("the damaged store opens only after a repair");
+    assert_eq!(
+        report.lost_coverage.len(),
+        2,
+        "both overlapping coverages are reported: {report:?}",
+    );
+
+    reconcile_after_repair(&tree, &wal, &report, 4)?;
+
+    assert_eq!(
+        snapshot(&tree),
+        reference,
+        "a record in the overlap of two lost ranges must be processed once",
+    );
+    assert_eq!(
+        counter_of(&tree),
+        Some(5),
+        "the lost operand in the overlap folds exactly once",
+    );
+    Ok(())
+}
+
+/// The engine suppresses a record under a range tombstone only STRICTLY
+/// below it (`kv_seqno < rt.seqno`): a record TIED with the tombstone's
+/// caller-assigned seqno survives a read. The reconciliation's coverage test
+/// must use the same strict comparison, or a lost record tied with a
+/// surviving range tombstone is skipped and the repaired tree diverges from
+/// the pre-loss one.
+#[test]
+fn reconciled_replay_keeps_records_tied_with_surviving_range_tombstones() -> lsm_tree::Result<()> {
+    // Seqnos start at 1, per the section 4 GC-coordination rule.
+    let records = vec![
+        WalRecord {
+            seqno: 1,
+            op: WalOp::Insert {
+                key: b"a1".to_vec(),
+                value: b"v1".to_vec(),
+            },
+        },
+        WalRecord {
+            seqno: 2,
+            op: WalOp::Insert {
+                key: b"x7".to_vec(),
+                value: b"vx".to_vec(),
+            },
+        },
+        // --- flush: SST [a1, x7], damaged below
+        WalRecord {
+            seqno: 2,
+            op: WalOp::RemoveRange {
+                start: b"x".to_vec(),
+                end: b"y".to_vec(),
+            },
+        },
+        WalRecord {
+            seqno: 3,
+            op: WalOp::Insert {
+                key: b"z9".to_vec(),
+                value: b"v3".to_vec(),
+            },
+        },
+        // --- flush: the surviving SST carries the TIED range tombstone
+        WalRecord {
+            seqno: 4,
+            op: WalOp::Insert {
+                key: b"m1".to_vec(),
+                value: b"mv".to_vec(),
+            },
+        },
+        // --- memtable only: covered by the tail replay
+    ];
+
+    // Reference: the same workload applied to a healthy tree.
+    let reference_dir = tempfile::tempdir().expect("tempdir");
+    let reference = {
+        let tree = open_tree(reference_dir.path());
+        for record in &records {
+            apply(&tree, record)?;
+        }
+        snapshot(&tree)
+    };
+    assert!(
+        reference.iter().any(|(k, _)| k == b"x7"),
+        "the tied record survives a read of the healthy tree: {reference:?}",
+    );
+
+    let crash_dir = tempfile::tempdir().expect("tempdir");
+    let wal_path = crash_dir.path().join("wal.log");
+    let mut wal = ReferenceWal::create(&wal_path).expect("create wal");
+    {
+        let tree = open_tree(crash_dir.path());
+        let mut flushed_first = false;
+        for record in &records {
+            wal.append(record).expect("wal append");
+            apply(&tree, record)?;
+            if record.seqno == 2 && !flushed_first {
+                // After the point inserts, BEFORE the tied range deletion.
+                flushed_first = true;
+                tree.flush_active_memtable(0)?;
+            } else if record.seqno == 3 {
+                tree.flush_active_memtable(0)?;
+            }
+        }
+    }
+    // Damage the FIRST SST's leading data block: metadata still parses, so
+    // its coverage is reported; the tombstone-bearing SST survives.
+    let sst = crash_dir.path().join("tables").join("0");
+    let mut bytes = std::fs::read(&sst).expect("read sst");
+    for b in bytes.get_mut(8..24).expect("sst larger than 24 bytes") {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&sst, &bytes).expect("write corruption");
+    for entry in std::fs::read_dir(crash_dir.path()).expect("read dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_version = name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || name == "current" {
+            std::fs::remove_file(entry.path()).expect("remove manifest file");
+        }
+    }
+
+    let (tree, repaired) = Config::new(
+        crash_dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(CounterMerge)))
+    .open_or_repair(lsm_tree::RepairPolicy::default())?;
+    let report = repaired.expect("the damaged store opens only after a repair");
+    assert!(
+        !report.lost_coverage.is_empty(),
+        "the excluded SST's coverage must be reported: {report:?}",
+    );
+
+    reconcile_after_repair(&tree, &wal, &report, 3)?;
+
+    assert_eq!(
+        snapshot(&tree),
+        reference,
+        "a lost record tied with a surviving range tombstone must be replayed",
+    );
+    Ok(())
+}
+
+/// A surviving weak (single-delete) tombstone must NOT raise the superseded
+/// floor: unlike a value or a regular tombstone it does not incorporate the
+/// key's older history — it annihilates exactly its matching put during
+/// compaction and can then expose an older value. When that matching put sat
+/// in a lost SST, flooring at the weak tombstone's seqno skips its replay,
+/// and the weak delete later consumes a DIFFERENT (older) value than the
+/// source's pair — diverging both the intermediate snapshots and the
+/// compacted end state.
+#[test]
+fn reconciled_replay_restores_the_put_a_surviving_weak_delete_pairs_with() -> lsm_tree::Result<()> {
+    // Seqnos start at 1, per the section 4 GC-coordination rule.
+    let records = vec![
+        WalRecord {
+            seqno: 1,
+            op: WalOp::Insert {
+                key: b"w1".to_vec(),
+                value: b"old".to_vec(),
+            },
+        },
+        // --- flush: SST 0 (survives) holds the OLDER value
+        WalRecord {
+            seqno: 2,
+            op: WalOp::Insert {
+                key: b"w1".to_vec(),
+                value: b"mid".to_vec(),
+            },
+        },
+        // --- flush: SST 1 (damaged below) holds the put the weak delete pairs with
+        WalRecord {
+            seqno: 3,
+            op: WalOp::RemoveWeak {
+                key: b"w1".to_vec(),
+            },
+        },
+        // --- flush: SST 2 (survives) holds the weak tombstone
+    ];
+
+    // Reference: the same workload applied to a healthy tree.
+    let reference_dir = tempfile::tempdir().expect("tempdir");
+    let reference = {
+        let tree = open_tree(reference_dir.path());
+        for record in &records {
+            apply(&tree, record)?;
+        }
+        assert_eq!(
+            tree.get(b"w1", 3)?.as_deref(),
+            Some(b"mid".as_slice()),
+            "self-check: a snapshot below the weak delete reads the paired put",
+        );
+        snapshot(&tree)
+    };
+
+    let crash_dir = tempfile::tempdir().expect("tempdir");
+    let wal_path = crash_dir.path().join("wal.log");
+    let mut wal = ReferenceWal::create(&wal_path).expect("create wal");
+    {
+        let tree = open_tree(crash_dir.path());
+        for record in &records {
+            wal.append(record).expect("wal append");
+            apply(&tree, record)?;
+            tree.flush_active_memtable(0)?;
+        }
+    }
+    // Damage the SECOND SST's leading data block: metadata still parses, so
+    // its coverage is reported; the weak-tombstone-bearing SST survives.
+    let sst = crash_dir.path().join("tables").join("1");
+    let mut bytes = std::fs::read(&sst).expect("read sst");
+    for b in bytes.get_mut(8..24).expect("sst larger than 24 bytes") {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&sst, &bytes).expect("write corruption");
+    for entry in std::fs::read_dir(crash_dir.path()).expect("read dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_version = name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || name == "current" {
+            std::fs::remove_file(entry.path()).expect("remove manifest file");
+        }
+    }
+
+    let (tree, repaired) = Config::new(
+        crash_dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(CounterMerge)))
+    .open_or_repair(lsm_tree::RepairPolicy::default())?;
+    let report = repaired.expect("the damaged store opens only after a repair");
+    assert!(
+        !report.lost_coverage.is_empty(),
+        "the excluded SST's coverage must be reported: {report:?}",
+    );
+
+    reconcile_after_repair(&tree, &wal, &report, 3)?;
+
+    assert_eq!(
+        tree.get(b"w1", 3)?.as_deref(),
+        Some(b"mid".as_slice()),
+        "the put the surviving weak delete pairs with must be replayed — a \
+         floor at the weak tombstone's seqno would leave the older value to \
+         be consumed instead",
+    );
+    assert_eq!(
+        snapshot(&tree),
+        reference,
+        "the reconciled tree mirrors the healthy tree's visible state",
+    );
+    Ok(())
+}
+
+/// A LOST weak (single-delete) tombstone must replay even when a NEWER
+/// surviving point value floors the key: the floor proves that value
+/// incorporated older history, but a weak delete is not "incorporated" by a
+/// newer value — they coexist physically, and once that newer value is
+/// itself annihilated by a later weak delete, the tree exposes the put the
+/// lost weak tombstone had consumed at the source. Only the
+/// bottommost-ZEROED floor (which embodies the whole folded history,
+/// including any weak deletes) may suppress a weak replay.
+#[test]
+fn reconciled_replay_restores_a_weak_delete_under_a_newer_survivor() -> lsm_tree::Result<()> {
+    // Seqnos start at 1, per the section 4 GC-coordination rule.
+    let records = vec![
+        WalRecord {
+            seqno: 1,
+            op: WalOp::Insert {
+                key: b"w".to_vec(),
+                value: b"old".to_vec(),
+            },
+        },
+        // --- flush: SST 0 (survives) holds the put the LOST weak delete consumed
+        WalRecord {
+            seqno: 2,
+            op: WalOp::RemoveWeak { key: b"w".to_vec() },
+        },
+        // --- flush: SST 1 (damaged below) holds the weak delete
+        WalRecord {
+            seqno: 3,
+            op: WalOp::Insert {
+                key: b"w".to_vec(),
+                value: b"mid".to_vec(),
+            },
+        },
+        // --- flush: SST 2 (survives) — the newer value that floors the key
+        WalRecord {
+            seqno: 4,
+            op: WalOp::RemoveWeak { key: b"w".to_vec() },
+        },
+        // --- flush: SST 3 (survives) — annihilates the newer value later
+    ];
+
+    // Reference: the same workload on a healthy tree.
+    let reference_dir = tempfile::tempdir().expect("tempdir");
+    {
+        let tree = open_tree(reference_dir.path());
+        for record in &records {
+            apply(&tree, record)?;
+            tree.flush_active_memtable(0)?;
+        }
+        assert_eq!(
+            tree.get(b"w", 3)?,
+            None,
+            "self-check: below the newer value the weak delete hides the put",
+        );
+    }
+
+    let crash_dir = tempfile::tempdir().expect("tempdir");
+    let wal_path = crash_dir.path().join("wal.log");
+    let mut wal = ReferenceWal::create(&wal_path).expect("create wal");
+    {
+        let tree = open_tree(crash_dir.path());
+        for record in &records {
+            wal.append(record).expect("wal append");
+            apply(&tree, record)?;
+            tree.flush_active_memtable(0)?;
+        }
+    }
+    // Damage the SECOND SST's leading data block: the weak delete is lost.
+    let sst = crash_dir.path().join("tables").join("1");
+    let mut bytes = std::fs::read(&sst).expect("read sst");
+    for b in bytes.get_mut(8..24).expect("sst larger than 24 bytes") {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&sst, &bytes).expect("write corruption");
+    for entry in std::fs::read_dir(crash_dir.path()).expect("read dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_version = name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || name == "current" {
+            std::fs::remove_file(entry.path()).expect("remove manifest file");
+        }
+    }
+
+    let (tree, repaired) = Config::new(
+        crash_dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(CounterMerge)))
+    .open_or_repair(lsm_tree::RepairPolicy::default())?;
+    let report = repaired.expect("the damaged store opens only after a repair");
+    assert!(
+        !report.lost_coverage.is_empty(),
+        "the excluded SST's coverage must be reported: {report:?}",
+    );
+
+    reconcile_after_repair(&tree, &wal, &report, 4)?;
+
+    assert_eq!(
+        tree.get(b"w", 3)?,
+        None,
+        "the lost weak delete must replay past the newer value's floor — \
+         without it a snapshot below that value exposes the put the source's \
+         weak delete had consumed (and a later compaction makes that \
+         permanent once the newer value is annihilated)",
+    );
+    Ok(())
+}
+
+/// A LOST put tied by caller-assigned seqno with a SURVIVING older put must
+/// replay: equal-seqno point values are resolved by source recency, not by
+/// seqno, so flooring the tie away leaves the repaired tree serving whichever
+/// value the fallback table order picked. Replaying every tied WAL record in
+/// WAL order converges the tie authoritatively — the memtable overwrites the
+/// same internal key, so the LAST record in WAL order wins, and the memtable
+/// is the newest source.
+#[test]
+fn reconciled_replay_restores_a_put_tied_with_a_surviving_older_put() -> lsm_tree::Result<()> {
+    // Seqnos start at 1, per the section 4 GC-coordination rule.
+    let records = vec![
+        WalRecord {
+            seqno: 7,
+            op: WalOp::Insert {
+                key: b"tie".to_vec(),
+                value: b"old".to_vec(),
+            },
+        },
+        // --- flush: SST 0 (survives) holds the OLDER tied put
+        WalRecord {
+            seqno: 7,
+            op: WalOp::Insert {
+                key: b"tie".to_vec(),
+                value: b"new".to_vec(),
+            },
+        },
+        // --- flush: SST 1 (damaged below) holds the NEWER tied put
+    ];
+
+    // Reference: the same workload applied to a healthy tree.
+    let reference_dir = tempfile::tempdir().expect("tempdir");
+    let reference = {
+        let tree = open_tree(reference_dir.path());
+        for record in &records {
+            apply(&tree, record)?;
+        }
+        assert_eq!(
+            tree.get(b"tie", 8)?.as_deref(),
+            Some(b"new".as_slice()),
+            "self-check: the newer source wins the tie in the healthy tree",
+        );
+        snapshot(&tree)
+    };
+
+    let crash_dir = tempfile::tempdir().expect("tempdir");
+    let wal_path = crash_dir.path().join("wal.log");
+    let mut wal = ReferenceWal::create(&wal_path).expect("create wal");
+    {
+        let tree = open_tree(crash_dir.path());
+        for record in &records {
+            wal.append(record).expect("wal append");
+            apply(&tree, record)?;
+            tree.flush_active_memtable(0)?;
+        }
+    }
+    // Damage the SECOND SST's leading data block: metadata still parses, so
+    // its coverage is reported; the older tied put's SST survives.
+    let sst = crash_dir.path().join("tables").join("1");
+    let mut bytes = std::fs::read(&sst).expect("read sst");
+    for b in bytes.get_mut(8..24).expect("sst larger than 24 bytes") {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&sst, &bytes).expect("write corruption");
+    for entry in std::fs::read_dir(crash_dir.path()).expect("read dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_version = name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || name == "current" {
+            std::fs::remove_file(entry.path()).expect("remove manifest file");
+        }
+    }
+
+    let (tree, repaired) = Config::new(
+        crash_dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(CounterMerge)))
+    .open_or_repair(lsm_tree::RepairPolicy::default())?;
+    let report = repaired.expect("the damaged store opens only after a repair");
+    assert!(
+        !report.lost_coverage.is_empty(),
+        "the excluded SST's coverage must be reported: {report:?}",
+    );
+
+    reconcile_after_repair(&tree, &wal, &report, 7)?;
+
+    assert_eq!(
+        tree.get(b"tie", 8)?.as_deref(),
+        Some(b"new".as_slice()),
+        "a lost put tied with a surviving put must replay — the tie resolves \
+         by source recency, and the WAL's order is the authority",
+    );
+    assert_eq!(
+        snapshot(&tree),
+        reference,
+        "the reconciled tree mirrors the healthy tree's visible state",
+    );
+    Ok(())
+}
+
+/// A merge chain FOLDED by compaction leaves no `MergeOperand` events: the
+/// surviving SST holds a plain `Value` carrying the chain head's seqno. When
+/// an unrelated lost table's coarse key range covers that key, the archived
+/// operands are absent from the survivor multiset — the reconciliation must
+/// still not reapply them on top of the already-folded value.
+#[test]
+fn reconciled_replay_skips_operands_folded_into_surviving_values() -> lsm_tree::Result<()> {
+    let i64op = |n: i64| n.to_le_bytes().to_vec();
+    // Seqnos start at 1, per the section 4 GC-coordination rule: seqno 0 is
+    // reserved as the bottommost-zeroed marker.
+    let records = vec![
+        WalRecord {
+            seqno: 1,
+            op: WalOp::Insert {
+                key: b"counter".to_vec(),
+                value: i64op(1),
+            },
+        },
+        WalRecord {
+            seqno: 2,
+            op: WalOp::Merge {
+                key: b"counter".to_vec(),
+                value: i64op(5),
+            },
+        },
+        WalRecord {
+            seqno: 3,
+            op: WalOp::Merge {
+                key: b"counter".to_vec(),
+                value: i64op(7),
+            },
+        },
+        // --- flush + major compaction: the chain folds (and the bottommost
+        //     pass zeroes the survivor's seqno)
+        WalRecord {
+            seqno: 4,
+            op: WalOp::Insert {
+                key: b"a1".to_vec(),
+                value: b"v1".to_vec(),
+            },
+        },
+        WalRecord {
+            seqno: 5,
+            op: WalOp::Insert {
+                key: b"z5".to_vec(),
+                value: b"v5".to_vec(),
+            },
+        },
+        // --- flush: the [a1, z5] SST is the one the crash damages
+        WalRecord {
+            seqno: 6,
+            op: WalOp::Insert {
+                key: b"m9".to_vec(),
+                value: b"mv".to_vec(),
+            },
+        },
+        // --- memtable only: covered by the tail replay
+    ];
+
+    // Reference: the same workload applied to a healthy tree.
+    let reference_dir = tempfile::tempdir().expect("tempdir");
+    let reference = {
+        let tree = open_tree(reference_dir.path());
+        for record in &records {
+            apply(&tree, record)?;
+        }
+        snapshot(&tree)
+    };
+
+    // The crashed store: the counter chain folds via compaction, then the
+    // unrelated [a1, z5] SST is flushed, damaged, and the manifest removed.
+    let crash_dir = tempfile::tempdir().expect("tempdir");
+    let wal_path = crash_dir.path().join("wal.log");
+    let mut wal = ReferenceWal::create(&wal_path).expect("create wal");
+    {
+        let tree = open_tree(crash_dir.path());
+        for record in &records {
+            wal.append(record).expect("wal append");
+            apply(&tree, record)?;
+            if record.seqno == 3 {
+                tree.flush_active_memtable(0)?;
+                // GC watermark far above the chain: the operands fold, and
+                // the bottommost pass zeroes the surviving value's seqno.
+                tree.major_compact(u64::MAX, 1_000)?;
+            }
+            if record.seqno == 5 {
+                tree.flush_active_memtable(0)?;
+            }
+        }
+    }
+    // The freshly flushed [a1, z5] SST has the HIGHEST table id (the
+    // compaction output was allocated earlier). Corrupt its leading data
+    // block: metadata still parses, so its coverage is reported.
+    let tables = crash_dir.path().join("tables");
+    let damaged = std::fs::read_dir(&tables)
+        .expect("read tables dir")
+        .filter_map(|e| {
+            let e = e.expect("dir entry");
+            e.file_name()
+                .to_string_lossy()
+                .parse::<u64>()
+                .ok()
+                .map(|id| (id, e.path()))
+        })
+        .max_by_key(|(id, _)| *id)
+        .map(|(_, path)| path)
+        .expect("a flushed SST");
+    let mut bytes = std::fs::read(&damaged).expect("read sst");
+    for b in bytes.get_mut(8..24).expect("sst larger than 24 bytes") {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&damaged, &bytes).expect("write corruption");
+    for entry in std::fs::read_dir(crash_dir.path()).expect("read dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_version = name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || name == "current" {
+            std::fs::remove_file(entry.path()).expect("remove manifest file");
+        }
+    }
+
+    let (tree, repaired) = Config::new(
+        crash_dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(CounterMerge)))
+    .open_or_repair(lsm_tree::RepairPolicy::default())?;
+    let report = repaired.expect("the damaged store opens only after a repair");
+    assert!(
+        report
+            .lost_coverage
+            .iter()
+            .any(|(_, lo, hi, _)| key_in_coverage(b"counter", lo, hi)),
+        "the coarse lost range must cover the folded key for this scenario: {report:?}",
+    );
+
+    reconcile_after_repair(&tree, &wal, &report, 5)?;
+
+    assert_eq!(
+        snapshot(&tree),
+        reference,
+        "operands folded into a surviving value must not be reapplied",
+    );
+    assert_eq!(
+        counter_of(&tree),
+        Some(1 + 5 + 7),
+        "the folded chain counts each operand exactly once",
+    );
+    Ok(())
+}
+
+/// An UNSCOPABLE loss (`unknowable_losses`: the excluded SST's metadata never
+/// parsed) reports no key range at all, so `FullHistory` cannot be served by
+/// iterating `lost_coverage` — the reconciliation must scan and reconcile
+/// retained records across the ENTIRE keyspace, merge presence checks
+/// included, or the lost table's pre-watermark records are never replayed.
+#[test]
+fn reconciled_replay_covers_the_whole_keyspace_for_unknowable_losses() -> lsm_tree::Result<()> {
+    // Reference: the same workload applied to a healthy tree.
+    let reference_dir = tempfile::tempdir().expect("tempdir");
+    let reference = {
+        let tree = open_tree(reference_dir.path());
+        for record in repair_workload() {
+            apply(&tree, &record)?;
+        }
+        snapshot(&tree)
+    };
+
+    let crash_dir = tempfile::tempdir().expect("tempdir");
+    let wal = crashed_store_with(crash_dir.path(), &repair_workload(), &[3, 5])?;
+    // Deepen the damage: the whole first SST is garbage, so not even its
+    // metadata parses — the loss is unscopable.
+    std::fs::write(
+        crash_dir.path().join("tables").join("0"),
+        b"not a table at all",
+    )
+    .expect("overwrite sst");
+
+    let (tree, repaired) = Config::new(
+        crash_dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(CounterMerge)))
+    .open_or_repair(lsm_tree::RepairPolicy::default())?;
+    let report = repaired.expect("the damaged store opens only after a repair");
+    assert!(
+        report.lost_coverage.is_empty(),
+        "an unparseable SST has no coverage to report: {report:?}",
+    );
+    assert_eq!(
+        report.unknowable_losses.len(),
+        1,
+        "the unparseable SST is an unscopable loss: {report:?}",
+    );
+    assert_eq!(
+        report.wal_replay_scope(),
+        lsm_tree::WalReplayScope::FullHistory,
+        "no bound can scope the damage",
+    );
+
+    reconcile_after_repair(&tree, &wal, &report, 5)?;
+
+    assert_eq!(
+        snapshot(&tree),
+        reference,
+        "the whole-keyspace reconciliation must recover the unscopable loss",
+    );
+    assert_eq!(
+        counter_of(&tree),
+        Some(5 + 7 + 11),
+        "lost operands replayed, the surviving one subtracted — exactly once each",
+    );
+    Ok(())
+}
+
+/// Section 4 covers EVERY logged write kind: a range deletion in the lost SST
+/// replays by span overlap with the lost coverage, and a batch replays per
+/// entry with the same treatment its standalone form gets (merge entries
+/// subtract the survivors). Skipping either resurrects the tombstoned key
+/// and loses the batch's writes.
+#[test]
+fn reconciled_replay_covers_range_deletions_and_batches() -> lsm_tree::Result<()> {
+    // Reference: the same workload applied to a healthy tree.
+    let reference_dir = tempfile::tempdir().expect("tempdir");
+    let reference = {
+        let tree = open_tree(reference_dir.path());
+        for record in range_and_batch_workload() {
+            apply(&tree, &record)?;
+        }
+        snapshot(&tree)
+    };
+
+    let crash_dir = tempfile::tempdir().expect("tempdir");
+    let wal = crashed_store_with(crash_dir.path(), &range_and_batch_workload(), &[4, 5])?;
+
+    let (tree, repaired) = Config::new(
+        crash_dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(CounterMerge)))
+    .open_or_repair(lsm_tree::RepairPolicy::default())?;
+    let report = repaired.expect("the damaged store opens only after a repair");
+    assert!(
+        !report.lost_coverage.is_empty(),
+        "the excluded SST's coverage must be reported: {report:?}",
+    );
+
+    reconcile_after_repair(&tree, &wal, &report, 5)?;
+
+    assert_eq!(
+        snapshot(&tree),
+        reference,
+        "the reconciliation must replay the range deletion (no resurrected \
+         d5) and the batch's entries (b1 present, counter complete)",
+    );
+    assert_eq!(
+        counter_of(&tree),
+        Some(5 + 7),
+        "both lost merge operands — standalone and batched — folded once",
+    );
+    Ok(())
+}
+
+/// Contract guard: skipping the presence check — replaying every retained
+/// lost-range merge operand up to `W` instead of subtracting the survivors —
+/// double-folds the operand that SURVIVED the repair in the second SST. The
+/// wrong recovery is detectably wrong, which is why section 4 demands the
+/// `scan_since_seqno_in_range` multiset subtraction rather than any
+/// seqno-window heuristic.
+#[test]
+fn blindly_replaying_lost_range_merges_double_counts() -> lsm_tree::Result<()> {
+    let crash_dir = tempfile::tempdir().expect("tempdir");
+    let wal = crashed_repairable_store(crash_dir.path())?;
+
+    let (tree, repaired) = Config::new(
+        crash_dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(CounterMerge)))
+    .open_or_repair(lsm_tree::RepairPolicy::default())?;
+    let report = repaired.expect("the damaged store opens only after a repair");
+    let w = 5;
+
+    // The WRONG reconciliation: the correct tail, then every retained record
+    // whose key falls in a lost range replayed up to `W` — no survivor
+    // subtraction. The +5 and +7 operands were genuinely lost (replaying them
+    // is right), but the surviving +11 at seqno 5 is inside `key range × ≤ W`
+    // and folds a second time.
+    let records = wal.records().expect("wal records");
+    for record in records.iter().filter(|r| r.seqno > w) {
+        apply(&tree, record)?;
+    }
+    for (_, lo, hi, _) in &report.lost_coverage {
+        for record in records.iter().filter(|r| r.seqno <= w) {
+            let key = match &record.op {
+                WalOp::Insert { key, .. }
+                | WalOp::Remove { key }
+                | WalOp::RemoveWeak { key }
+                | WalOp::Merge { key, .. } => key,
+                WalOp::RemoveRange { .. } | WalOp::Batch { .. } => continue,
+            };
+            if key_in_coverage(key, lo, hi) {
+                apply(&tree, record)?;
+            }
+        }
+    }
+
+    assert_eq!(
+        counter_of(&tree),
+        Some(5 + 7 + 11 + 11),
+        "without the survivor subtraction the surviving operand folds twice",
+    );
+    Ok(())
+}

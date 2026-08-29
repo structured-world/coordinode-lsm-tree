@@ -1,7 +1,6 @@
 use super::*;
 use crate::SequenceNumberCounter;
 use crate::fs::StdFs;
-use crate::vlog::blob_file::writer::BLOB_HEADER_LEN_V3;
 use std::fs::File;
 use std::sync::Arc;
 use test_log::test;
@@ -315,8 +314,8 @@ fn blob_reader_corrupted_on_disk_key_detected_by_cross_check_and_checksum() -> c
 
     // Tamper on-disk key bytes.
     // V4 header layout: MAGIC(4) + Checksum(16) + SeqNo(8) + KeyLen(2) + RealValLen(4) + OnDiskValLen(4) + HeaderCrc(4) = 42
-    // Key starts at offset 42 from blob start (BLOB_HEADER_LEN_V4).
-    let key_offset = usize::try_from(handle.offset).unwrap() + BLOB_HEADER_LEN_V4;
+    // Key starts at offset 42 from blob start (BLOB_HEADER_LEN).
+    let key_offset = usize::try_from(handle.offset).unwrap() + BLOB_HEADER_LEN;
     let mut raw = std::fs::read(&blob_file.0.path)?;
     raw[key_offset] ^= 0xFF; // flip bits in first key byte
     let corrupted_key = raw[key_offset..key_offset + 3].to_vec();
@@ -430,9 +429,8 @@ fn blob_reader_corrupted_value_payload_triggers_checksum_mismatch() -> crate::Re
     let blob_file = writer.finish()?;
     let blob_file = blob_file.first().unwrap();
 
-    // Value payload starts after header + key: offset + BLOB_HEADER_LEN_V4 + key_len
-    let payload_offset =
-        usize::try_from(handle.offset).unwrap() + BLOB_HEADER_LEN_V4 + b"key".len();
+    // Value payload starts after header + key: offset + BLOB_HEADER_LEN + key_len
+    let payload_offset = usize::try_from(handle.offset).unwrap() + BLOB_HEADER_LEN + b"key".len();
     let mut raw = std::fs::read(&blob_file.0.path)?;
     raw[payload_offset] ^= 0xFF; // flip bits in first value byte
     std::fs::write(&blob_file.0.path, &raw)?;
@@ -467,7 +465,7 @@ fn blob_reader_corrupted_on_disk_key_lz4_returns_invalid_header() -> crate::Resu
     let blob_file = writer.finish()?;
     let blob_file = blob_file.first().unwrap();
 
-    let key_offset = usize::try_from(handle.offset).unwrap() + BLOB_HEADER_LEN_V4;
+    let key_offset = usize::try_from(handle.offset).unwrap() + BLOB_HEADER_LEN;
     let mut raw = std::fs::read(&blob_file.0.path)?;
     raw[key_offset] ^= 0xFF;
     std::fs::write(&blob_file.0.path, &raw)?;
@@ -502,7 +500,7 @@ fn blob_reader_corrupted_on_disk_key_zstd_returns_invalid_header() -> crate::Res
     let blob_file = writer.finish()?;
     let blob_file = blob_file.first().unwrap();
 
-    let key_offset = usize::try_from(handle.offset).unwrap() + BLOB_HEADER_LEN_V4;
+    let key_offset = usize::try_from(handle.offset).unwrap() + BLOB_HEADER_LEN;
     let mut raw = std::fs::read(&blob_file.0.path)?;
     raw[key_offset] ^= 0xFF;
     std::fs::write(&blob_file.0.path, &raw)?;
@@ -589,18 +587,18 @@ fn blob_reader_v4_corrupted_header_crc_field_detected() -> crate::Result<()> {
     Ok(())
 }
 
-/// Verify V4 header layout: `BLOB_HEADER_LEN_V4` = 42 bytes
+/// Verify the frame header layout: `BLOB_HEADER_LEN` = 42 bytes
 /// (`magic:4` + `checksum:16` + `seqno:8` + `key_len:2` + `real_val_len:4` + `on_disk_val_len:4` + `header_crc:4`).
 #[test]
-fn blob_header_len_v4_is_42() {
-    assert_eq!(BLOB_HEADER_LEN_V4, 42);
-    assert_eq!(BLOB_HEADER_LEN_V3, 38);
+fn blob_header_len_is_42() {
+    assert_eq!(BLOB_HEADER_LEN, 42);
 }
 
-/// Write a V3 blob file manually and verify the reader handles it
-/// via the V3 backward compat path (no `header_crc` validation).
+/// A frame under the retired pre-V5 `b"BLOB"` magic (no header CRC) must be
+/// REJECTED: the engine reads exactly one on-disk format — there is no
+/// backward-compat decode path.
 #[test]
-fn blob_reader_v3_backward_compat_roundtrip() -> crate::Result<()> {
+fn blob_reader_rejects_retired_blob_magic_frame() -> crate::Result<()> {
     use crate::file_accessor::FileAccessor;
     use crate::io::WriteBytesExt;
     use crate::vlog::{ValueHandle, blob_file::Inner as BlobFileInner};
@@ -672,6 +670,7 @@ fn blob_reader_v3_backward_compat_roundtrip() -> crate::Result<()> {
     let blob_file = crate::BlobFile(Arc::new(BlobFileInner {
         id: 0,
         tree_id: 0,
+        live_data_start: 0,
         path: blob_file_path,
         meta: crate::vlog::blob_file::meta::Metadata {
             id: 0,
@@ -712,8 +711,11 @@ fn blob_reader_v3_backward_compat_roundtrip() -> crate::Result<()> {
         on_disk_size: value.len() as u32,
     };
 
-    let result = reader.get(key, &handle)?;
-    assert_eq!(result, value);
+    let result = reader.get(key, &handle);
+    assert!(
+        matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
+        "a retired-format frame must be rejected, got: {result:?}",
+    );
 
     Ok(())
 }

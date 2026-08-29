@@ -83,6 +83,20 @@ impl FsFile for File {
         })
     }
 
+    #[cfg(unix)]
+    fn hard_link_count(&self) -> io::Result<u64> {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(Self::metadata(self)?.nlink())
+    }
+
+    // `std` exposes the NTFS link count only behind the unstable
+    // `windows_by_handle` feature, so query the Win32 API directly (same
+    // dependency-free pattern as `available_space_sys` below).
+    #[cfg(windows)]
+    fn hard_link_count(&self) -> io::Result<u64> {
+        hard_link_count_sys::hard_link_count(self).map_err(io::Error::from)
+    }
+
     fn set_len(&self, size: u64) -> io::Result<()> {
         Self::set_len(self, size).map_err(io::Error::from)
     }
@@ -228,7 +242,36 @@ impl Fs for StdFs {
         std::fs::remove_dir_all(path).map_err(io::Error::from)
     }
 
+    fn same_file(&self, a: &Path, b: &Path) -> io::Result<bool> {
+        // Filesystem OBJECT identity, not canonical spellings: bind-mount
+        // aliases of one directory keep their two mount-point spellings
+        // through `canonicalize`, and a "distinct" verdict authorizes
+        // deleting what is the same underlying file through another name —
+        // destroying the retained copy too. A probe failure on either side
+        // is PROPAGATED, never guessed as "distinct".
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let ma = std::fs::metadata(a).map_err(io::Error::from)?;
+            let mb = std::fs::metadata(b).map_err(io::Error::from)?;
+            Ok(ma.dev() == mb.dev() && ma.ino() == mb.ino())
+        }
+        // No stable file-identity API off Unix: canonical spellings still
+        // resolve symlinks, `..`, and case folding there.
+        #[cfg(not(unix))]
+        {
+            let ca = std::fs::canonicalize(a).map_err(io::Error::from)?;
+            let cb = std::fs::canonicalize(b).map_err(io::Error::from)?;
+            Ok(ca == cb)
+        }
+    }
+
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        // `std::fs::rename` satisfies the trait's replace contract on every
+        // platform: on Windows it maps to `MoveFileExW` with
+        // `MOVEFILE_REPLACE_EXISTING` (POSIX-semantics rename on newer
+        // toolchains), so an existing destination FILE — open handles
+        // included — is atomically replaced, same as on Unix.
         std::fs::rename(from, to).map_err(io::Error::from)
     }
 
@@ -249,6 +292,11 @@ impl Fs for StdFs {
     #[cfg(windows)]
     fn available_space(&self, path: &Path) -> io::Result<u64> {
         available_space_sys::disk_free_available(path).map_err(io::Error::from)
+    }
+
+    #[cfg(unix)]
+    fn allocated_size(&self, path: &Path) -> io::Result<Option<u64>> {
+        Ok(super::unix_allocated_size(path)?)
     }
 
     fn sync_directory(&self, path: &Path) -> io::Result<()> {
@@ -426,6 +474,22 @@ impl Fs for StdFs {
     #[cfg(target_os = "linux")]
     fn punch_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<()> {
         linux_caps::punch_hole(path, offset, len).map_err(io::Error::from)
+    }
+
+    /// Linux: extent-local hole probe via `lseek(SEEK_DATA)`. Only this target
+    /// can punch, so only here can a hole exist to attribute; elsewhere the
+    /// trait default ("cannot tell") is also the truthful answer.
+    #[cfg(target_os = "linux")]
+    fn extent_is_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<Option<bool>> {
+        Ok(linux_caps::extent_is_hole(path, offset, len)?)
+    }
+
+    /// Linux: contained-hole probe via `lseek(SEEK_HOLE)` (see the trait docs —
+    /// an unaligned punch leaves its zero-filled edges allocated, so the
+    /// whole-range probe above answers `false` on a genuinely punched range).
+    #[cfg(target_os = "linux")]
+    fn extent_contains_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<Option<bool>> {
+        Ok(linux_caps::extent_contains_hole(path, offset, len)?)
     }
 }
 
@@ -756,17 +820,17 @@ mod sys {
         #[expect(unsafe_code, reason = "LockFileEx FFI call with valid handle")]
         let ret = unsafe {
             LockFileEx(
-                handle as *mut std::ffi::c_void,
+                handle,
                 LOCKFILE_EXCLUSIVE_LOCK,
                 0,
                 u32::MAX,
                 u32::MAX,
-                &mut overlapped,
+                &raw mut overlapped,
             )
         };
 
         if ret == 0 {
-            return Err(std::io::Error::last_os_error().into());
+            return Err(std::io::Error::last_os_error());
         }
         Ok(())
     }
@@ -816,12 +880,12 @@ mod sys {
         #[expect(unsafe_code, reason = "LockFileEx FFI call with valid handle")]
         let ret = unsafe {
             LockFileEx(
-                handle as *mut std::ffi::c_void,
+                handle,
                 LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
                 0,
                 u32::MAX,
                 u32::MAX,
-                &mut overlapped,
+                &raw mut overlapped,
             )
         };
 
@@ -1096,6 +1160,112 @@ mod linux_caps {
         Ok(())
     }
 
+    /// Whether `[offset, offset + len)` is entirely unallocated, via
+    /// `lseek(SEEK_DATA)`: it returns the next byte at or after `offset` that is
+    /// backed by data, so the extent is a hole exactly when that byte lies at or
+    /// past its end. `ENXIO` means no data follows at all — a hole to EOF.
+    ///
+    /// Unlike a file-wide allocation total this attributes the hole to THIS
+    /// range, which is what tells a reclaimed data block from one destroyed by
+    /// corruption (both read as zeros).
+    #[cfg(target_pointer_width = "64")]
+    pub(super) fn extent_is_hole(path: &Path, offset: u64, len: u64) -> io::Result<Option<bool>> {
+        if len == 0 {
+            return Ok(Some(false));
+        }
+        let off = i64::try_from(offset)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset exceeds i64"))?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "extent end overflows"))?;
+        let f = File::open(path)?;
+        // SAFETY: `f` owns a valid readable fd for the duration of the call; the
+        // offset and whence are plain integers.
+        #[expect(unsafe_code, reason = "lseek(SEEK_DATA) FFI for an extent hole probe")]
+        let next_data = unsafe { libc::lseek(f.as_raw_fd(), off, libc::SEEK_DATA) };
+        if next_data < 0 {
+            let err = io::Error::last_os_error();
+            // No data at or after `offset`: the rest of the file is a hole.
+            if err.raw_os_error() == Some(libc::ENXIO) {
+                return Ok(Some(true));
+            }
+            // A filesystem without SEEK_DATA cannot answer; do not guess.
+            if matches!(err.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP)) {
+                return Ok(None);
+            }
+            return Err(err);
+        }
+        Ok(Some(u64::try_from(next_data).unwrap_or(u64::MAX) >= end))
+    }
+
+    /// As [`extent_is_hole`], but answers whether the range CONTAINS a hole:
+    /// `lseek(SEEK_HOLE)` finds the next hole at or after `offset`, and a
+    /// result before the range end proves a contained hole. The implicit
+    /// every-file-ends-in-a-hole EOF state is excluded by clamping the range
+    /// end to the file length — a fully allocated file seeks to EOF, which is
+    /// never below the clamped end.
+    #[cfg(target_pointer_width = "64")]
+    pub(super) fn extent_contains_hole(
+        path: &Path,
+        offset: u64,
+        len: u64,
+    ) -> io::Result<Option<bool>> {
+        if len == 0 {
+            return Ok(Some(false));
+        }
+        let off = i64::try_from(offset)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset exceeds i64"))?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "extent end overflows"))?;
+        let f = File::open(path)?;
+        let file_len = f.metadata()?.len();
+        // SAFETY: `f` owns a valid readable fd for the duration of the call; the
+        // offset and whence are plain integers.
+        #[expect(
+            unsafe_code,
+            reason = "lseek(SEEK_HOLE) FFI for a contained-hole probe"
+        )]
+        let next_hole = unsafe { libc::lseek(f.as_raw_fd(), off, libc::SEEK_HOLE) };
+        if next_hole < 0 {
+            let err = io::Error::last_os_error();
+            // Offset at or past EOF: nothing of the range is backed by the
+            // file, so no hole INSIDE it can be attributed.
+            if err.raw_os_error() == Some(libc::ENXIO) {
+                return Ok(Some(false));
+            }
+            // A filesystem without SEEK_HOLE cannot answer; do not guess.
+            if matches!(err.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP)) {
+                return Ok(None);
+            }
+            return Err(err);
+        }
+        Ok(Some(
+            u64::try_from(next_hole).unwrap_or(u64::MAX) < end.min(file_len),
+        ))
+    }
+
+    /// 32-bit Linux: `punch_hole` is unsupported there, so no hole can exist to
+    /// attribute; "cannot tell" is the truthful answer.
+    #[cfg(not(target_pointer_width = "64"))]
+    pub(super) fn extent_is_hole(
+        _path: &Path,
+        _offset: u64,
+        _len: u64,
+    ) -> io::Result<Option<bool>> {
+        Ok(None)
+    }
+
+    /// 32-bit Linux: as [`extent_is_hole`] — no punch support, "cannot tell".
+    #[cfg(not(target_pointer_width = "64"))]
+    pub(super) fn extent_contains_hole(
+        _path: &Path,
+        _offset: u64,
+        _len: u64,
+    ) -> io::Result<Option<bool>> {
+        Ok(None)
+    }
+
     /// 32-bit Linux: `punch_hole` capability is reported false, so this is
     /// unreachable in practice; surface `Unsupported` to keep the contract.
     #[cfg(not(target_pointer_width = "64"))]
@@ -1255,6 +1425,61 @@ mod linux_caps {
 }
 
 // ---------------------------------------------------------------------------
+// Hard-link count probe (Windows)
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+mod hard_link_count_sys {
+    use std::io;
+    use std::os::windows::io::AsRawHandle as _;
+
+    /// `BY_HANDLE_FILE_INFORMATION` (Win32): 13 little-endian `DWORD`s. The
+    /// `FILETIME` pairs are flattened to `[u32; 2]` to keep the declaration
+    /// dependency-free; the layout is identical.
+    #[repr(C)]
+    #[allow(non_snake_case, reason = "Win32 API struct")]
+    #[derive(Default)]
+    struct ByHandleFileInformation {
+        dwFileAttributes: u32,
+        ftCreationTime: [u32; 2],
+        ftLastAccessTime: [u32; 2],
+        ftLastWriteTime: [u32; 2],
+        dwVolumeSerialNumber: u32,
+        nFileSizeHigh: u32,
+        nFileSizeLow: u32,
+        nNumberOfLinks: u32,
+        nFileIndexHigh: u32,
+        nFileIndexLow: u32,
+    }
+
+    // SAFETY (ABI): the signature matches the Win32
+    // `GetFileInformationByHandle` contract — a file handle plus an out
+    // pointer, returning a non-zero `BOOL` on success.
+    #[allow(non_snake_case, reason = "Win32 API signature")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(
+            hFile: *mut core::ffi::c_void,
+            lpFileInformation: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    pub(super) fn hard_link_count(file: &std::fs::File) -> io::Result<u64> {
+        let mut info = ByHandleFileInformation::default();
+        // SAFETY: the handle comes from a live `File` borrow; `info` is a
+        // valid out pointer; fields are read only on success.
+        #[expect(
+            unsafe_code,
+            reason = "GetFileInformationByHandle for the NTFS link count"
+        )]
+        let rc = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &raw mut info) };
+        if rc == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(u64::from(info.nNumberOfLinks))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Filesystem free-space probe
 // ---------------------------------------------------------------------------
 
@@ -1302,7 +1527,7 @@ mod available_space_sys {
         let rc = unsafe {
             GetDiskFreeSpaceExW(
                 wide.as_ptr(),
-                &mut avail,
+                &raw mut avail,
                 core::ptr::null_mut(),
                 core::ptr::null_mut(),
             )

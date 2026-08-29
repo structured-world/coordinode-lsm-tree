@@ -82,9 +82,67 @@ fn from_std_io_error_maps_unknown_to_other() {
     // `std::io::ErrorKind` is `#[non_exhaustive]`; variants
     // we don't map explicitly fall through to `Other` so the
     // bridge stays total.
-    let std_err = std::io::Error::from(std::io::ErrorKind::OutOfMemory);
+    let std_err = std::io::Error::from(std::io::ErrorKind::FileTooLarge);
     let crate_err: Error = std_err.into();
     assert_eq!(crate_err.kind(), ErrorKind::Other);
+}
+
+/// NFS / FUSE / remote backends surface retryable NETWORK kinds
+/// (`TimedOut`, `HostUnreachable`, `NetworkDown`, `NetworkUnreachable`,
+/// `StaleNetworkFileHandle`). Collapsing them into `Other` erases the
+/// transient signal, and recovery grading then condemns a healthy file as
+/// corrupt — the manifest excludes it and removes it. The bridge must
+/// preserve them, classify them transient, and round-trip the discriminant.
+#[cfg(feature = "std")]
+#[test]
+fn network_kinds_survive_the_bridge_as_transient() {
+    for std_kind in [
+        std::io::ErrorKind::TimedOut,
+        std::io::ErrorKind::HostUnreachable,
+        std::io::ErrorKind::NetworkDown,
+        std::io::ErrorKind::NetworkUnreachable,
+        std::io::ErrorKind::StaleNetworkFileHandle,
+    ] {
+        let ours: Error = std::io::Error::from(std_kind).into();
+        assert!(
+            ours.kind().is_transient(),
+            "{std_kind:?} is a retryable environment failure, got {:?}",
+            ours.kind(),
+        );
+        let back: std::io::Error = ours.into();
+        assert_eq!(back.kind(), std_kind, "the discriminant must round-trip");
+    }
+}
+
+/// Write-side STORAGE kinds (`StorageFull` / ENOSPC, `QuotaExceeded` /
+/// EDQUOT, `ReadOnlyFilesystem` / EROFS) are environmental: the destination,
+/// not the data, failed. Collapsing them into `Other` lets recovery grading
+/// condemn a healthy SOURCE file when writing its salvage replacement fails —
+/// the manifest then excludes the source and removes it. The bridge must
+/// preserve them and classify them environmental (not transient: an
+/// immediate retry does not clear a full disk, the operator does).
+#[cfg(feature = "std")]
+#[test]
+fn storage_kinds_survive_the_bridge_as_environmental() {
+    for std_kind in [
+        std::io::ErrorKind::StorageFull,
+        std::io::ErrorKind::QuotaExceeded,
+        std::io::ErrorKind::ReadOnlyFilesystem,
+        std::io::ErrorKind::OutOfMemory,
+    ] {
+        let ours: Error = std::io::Error::from(std_kind).into();
+        assert!(
+            ours.kind().is_environmental(),
+            "{std_kind:?} is an environment failure, got {:?}",
+            ours.kind(),
+        );
+        assert!(
+            !ours.kind().is_transient(),
+            "{std_kind:?} is not cleared by an immediate retry",
+        );
+        let back: std::io::Error = ours.into();
+        assert_eq!(back.kind(), std_kind, "the discriminant must round-trip");
+    }
 }
 
 #[cfg(feature = "std")]
@@ -171,16 +229,25 @@ fn write_all_via_blanket_impl_on_vec() -> std::io::Result<()> {
 /// to the enum without a row here fails the per-arm assertions
 /// (the std round trip would not preserve it).
 #[cfg(feature = "std")]
-const ALL_KINDS: [ErrorKind; 13] = [
+const ALL_KINDS: [ErrorKind; 22] = [
     ErrorKind::AlreadyExists,
     ErrorKind::BrokenPipe,
     ErrorKind::CrossesDevices,
+    ErrorKind::HostUnreachable,
     ErrorKind::Interrupted,
     ErrorKind::InvalidData,
     ErrorKind::InvalidInput,
+    ErrorKind::NetworkDown,
+    ErrorKind::NetworkUnreachable,
     ErrorKind::NotFound,
     ErrorKind::Other,
+    ErrorKind::OutOfMemory,
     ErrorKind::PermissionDenied,
+    ErrorKind::QuotaExceeded,
+    ErrorKind::ReadOnlyFilesystem,
+    ErrorKind::StaleNetworkFileHandle,
+    ErrorKind::StorageFull,
+    ErrorKind::TimedOut,
     ErrorKind::UnexpectedEof,
     ErrorKind::Unsupported,
     ErrorKind::WouldBlock,
@@ -222,14 +289,35 @@ fn every_kind_only_std_error_maps_to_matching_kind() {
             std::io::ErrorKind::CrossesDevices,
             ErrorKind::CrossesDevices,
         ),
+        (
+            std::io::ErrorKind::HostUnreachable,
+            ErrorKind::HostUnreachable,
+        ),
         (std::io::ErrorKind::Interrupted, ErrorKind::Interrupted),
         (std::io::ErrorKind::InvalidData, ErrorKind::InvalidData),
         (std::io::ErrorKind::InvalidInput, ErrorKind::InvalidInput),
+        (std::io::ErrorKind::NetworkDown, ErrorKind::NetworkDown),
+        (
+            std::io::ErrorKind::NetworkUnreachable,
+            ErrorKind::NetworkUnreachable,
+        ),
         (std::io::ErrorKind::NotFound, ErrorKind::NotFound),
+        (std::io::ErrorKind::OutOfMemory, ErrorKind::OutOfMemory),
         (
             std::io::ErrorKind::PermissionDenied,
             ErrorKind::PermissionDenied,
         ),
+        (std::io::ErrorKind::QuotaExceeded, ErrorKind::QuotaExceeded),
+        (
+            std::io::ErrorKind::ReadOnlyFilesystem,
+            ErrorKind::ReadOnlyFilesystem,
+        ),
+        (
+            std::io::ErrorKind::StaleNetworkFileHandle,
+            ErrorKind::StaleNetworkFileHandle,
+        ),
+        (std::io::ErrorKind::StorageFull, ErrorKind::StorageFull),
+        (std::io::ErrorKind::TimedOut, ErrorKind::TimedOut),
         (std::io::ErrorKind::UnexpectedEof, ErrorKind::UnexpectedEof),
         (std::io::ErrorKind::Unsupported, ErrorKind::Unsupported),
         (std::io::ErrorKind::WouldBlock, ErrorKind::WouldBlock),

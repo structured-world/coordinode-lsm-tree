@@ -50,6 +50,9 @@ fn sample() -> VersionEdit {
             (7, UserKey::from(&b"mmm"[..])),
             (10, UserKey::from(&b"zzzz"[..])),
         ],
+        // Two blob frontiers, so the round-trip also covers the fixed-width
+        // blob-restriction codec (id + offset).
+        blob_restrictions: vec![(3, 4_096), (4, 1_048_576)],
     }
 }
 
@@ -113,6 +116,33 @@ fn empty_gc_stats_roundtrips_as_none() {
     let mut payload = Vec::new();
     framing::read_framed_record(&mut &buf[..], u64::MAX, None, &mut payload).expect("read");
     assert_eq!(VersionEdit::decode_payload(&payload).expect("decode"), edit);
+}
+
+#[test]
+fn payload_without_the_blob_frontier_section_decodes_as_empty() {
+    // Edits written before blob frontiers existed end right after `restrictions`.
+    // Reading such a payload must yield an empty blob-frontier list, not an
+    // InvalidHeader — otherwise every pre-existing manifest becomes unopenable.
+    let mut edit = sample();
+    edit.blob_restrictions = vec![];
+    let mut payload = Vec::new();
+    edit.encode_payload(&mut payload).expect("encode");
+    let decoded = VersionEdit::decode_payload(&payload).expect("decode");
+    assert!(decoded.blob_restrictions.is_empty());
+
+    // ...and an edit that carries frontiers still round-trips them.
+    let mut with_frontiers = sample();
+    with_frontiers.blob_restrictions = vec![(7, 4096), (9, 1 << 20)];
+    let mut payload = Vec::new();
+    with_frontiers
+        .encode_payload(&mut payload)
+        .expect("encode with frontiers");
+    assert_eq!(
+        VersionEdit::decode_payload(&payload)
+            .expect("decode with frontiers")
+            .blob_restrictions,
+        vec![(7, 4096), (9, 1 << 20)],
+    );
 }
 
 #[test]

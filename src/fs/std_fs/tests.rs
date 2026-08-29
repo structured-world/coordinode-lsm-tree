@@ -809,3 +809,46 @@ fn try_disable_cow_linux_succeeds_or_noops() -> io::Result<()> {
     fs.try_disable_cow(&path)?;
     Ok(())
 }
+
+/// A stat failure in `allocated_size` propagates as `Err`, never masked as
+/// `Ok(None)`. Manifest repair reads `Ok(None)` as "allocation-unaware backend"
+/// (hence "unpunched"); swallowing the error on a genuinely punched file would
+/// drop its restriction and expose the zeroed prefix.
+#[cfg(unix)]
+#[test]
+fn allocated_size_missing_path_is_err_not_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("does-not-exist.sst");
+    let got = StdFs.allocated_size(&missing);
+    assert!(
+        got.is_err(),
+        "stat failure must propagate as Err, got {got:?}"
+    );
+}
+
+/// `same_file` answers by filesystem OBJECT identity, not canonical path
+/// spelling: a hard link's two names canonicalize to different spellings
+/// while naming one inode — like the two mount-point spellings of a
+/// bind-mount alias, where a "distinct" verdict authorizes a deletion
+/// that destroys the retained copy too.
+#[cfg(unix)]
+#[test]
+fn same_file_answers_by_identity_not_spelling() -> io::Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    let c = dir.path().join("c");
+    std::fs::write(&a, b"payload")?;
+    std::fs::hard_link(&a, &b)?;
+    std::fs::write(&c, b"payload")?;
+
+    assert!(
+        StdFs.same_file(&a, &b)?,
+        "two names of one inode are the same file",
+    );
+    assert!(
+        !StdFs.same_file(&a, &c)?,
+        "distinct inodes are distinct files",
+    );
+    Ok(())
+}

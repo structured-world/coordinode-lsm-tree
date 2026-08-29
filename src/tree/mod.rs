@@ -413,6 +413,84 @@ impl AbstractTree for Tree {
         self.version_history.read().latest_version().version
     }
 
+    #[cfg(feature = "std")]
+    fn refresh_table_checksum(
+        &self,
+        table_id: TableId,
+        checksum: crate::checksum::Checksum,
+        expected_restriction: Option<&crate::UserKey>,
+    ) -> crate::Result<crate::abstract_tree::ChecksumRefreshOutcome> {
+        use crate::abstract_tree::ChecksumRefreshOutcome;
+        // Same lock order as flush / compaction version installs: compaction
+        // state first, then the version history write lock. But the caller (the
+        // patrol reconcile) holds this table's HEAL LOCK across this call, and a
+        // concurrent tight-space compaction acquires that heal lock WHILE holding
+        // `compaction_state`. Blocking on `compaction_state` here would invert the
+        // order (heal_lock -> compaction_state on this path vs
+        // compaction_state -> heal_lock on the compaction path) and deadlock
+        // permanently. `try_lock` instead: a failed acquire means a compaction is
+        // mid-install, so skip this refresh — but report the skip as CONTENDED,
+        // not as a benign no-op: the healed bytes are durable while the manifest
+        // digest stays stale, so a "clean" report would mislead a later
+        // integrity check / checkpoint. The caller keeps the attestation and
+        // surfaces a finding; the next patrol retries once the compaction
+        // releases the state.
+        let Some(mut _compaction_state) = self.compaction_state.try_lock() else {
+            return Ok(ChecksumRefreshOutcome::Contended);
+        };
+        let mut version_lock = self.version_history.write();
+
+        // Under the install lock, resolve the CURRENT view of this table and
+        // reject the refresh if either it is gone (compacted away — nothing to
+        // refresh) or its restriction no longer matches the one `checksum` was
+        // computed for. A tight-space compaction can swap the captured view for a
+        // restricted same-id view (punching its prefix) between the caller's read
+        // and this lock; installing the caller's digest against a different
+        // restriction would record one the punched file can never match. Skipping
+        // leaves the current view's own (compaction-installed) digest in place for
+        // the next patrol to reconcile.
+        let restriction_matches = version_lock
+            .latest_version()
+            .version
+            .iter_tables()
+            .find(|t| t.id() == table_id)
+            .is_some_and(|t| t.restrict_lower_bound() == expected_restriction);
+        if !restriction_matches {
+            // No-op: the manifest digest is unchanged, so the caller must keep the
+            // attestation for the next patrol.
+            return Ok(ChecksumRefreshOutcome::Stale);
+        }
+
+        version_lock
+            .upgrade_version(
+                &self.config.path,
+                |current| {
+                    let mut copy = current.clone();
+                    if let Some(next) = copy
+                        .version
+                        .with_refreshed_table_checksum(table_id, checksum)
+                    {
+                        copy.version = next;
+                    }
+                    Ok(copy)
+                },
+                &self.config.seqno,
+                &self.config.visible_seqno,
+                &*self.config.fs,
+                self.0.runtime_config.load_full(),
+                self.0.config.encryption.clone(),
+            )
+            .map(|()| ChecksumRefreshOutcome::Refreshed)
+    }
+
+    fn sync_mode(&self) -> crate::fs::SyncMode {
+        self.config.sync_mode
+    }
+
+    fn prefix_extractor(&self) -> Option<alloc::sync::Arc<dyn crate::prefix::PrefixExtractor>> {
+        self.config.prefix_extractor.clone()
+    }
+
     fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
         // One version snapshot reused for the footprint and the full-compaction
         // estimate below: a second `current_version()` could race a concurrent
@@ -445,7 +523,7 @@ impl AbstractTree for Tree {
             // blob relocation. Using the per-volume gate (not `available >=
             // full_compaction_bytes` against the min-volume free) keeps the status
             // from reporting tight when a routed merge would actually be admitted.
-            let sst_need = crate::storage_stats::full_compaction_demand_bytes(&version);
+            let sst_need = crate::storage_stats::full_compaction_demand_bytes(&version)?;
             // `saturating_sub`: `level_count >= 1` always, so this is the last
             // level index; the clamp only guards a degenerate zero-level config.
             let sst_dest_level = self.0.config.level_count.saturating_sub(1);
@@ -837,24 +915,32 @@ impl AbstractTree for Tree {
         let tables = result
             .into_iter()
             .map(|(table_id, checksum)| -> crate::Result<Table> {
-                Table::recover(
+                let mut params = crate::table::RecoverParams::new(
                     folder.join(table_id.to_string()),
                     checksum,
-                    0,
-                    self.id,
                     table_id,
-                    self.config.cache.clone(),
-                    self.config.descriptor_table.clone(),
                     level_fs.clone(),
-                    pin_filter,
-                    pin_index,
-                    self.config.encryption.clone(),
-                    #[cfg(zstd_any)]
-                    self.config.zstd_dictionary.clone(),
                     self.config.comparator.clone(),
-                    #[cfg(feature = "metrics")]
-                    self.metrics.clone(),
-                )
+                    self.config.cache.clone(),
+                );
+                params.tree_id = self.id;
+                params
+                    .descriptor_table
+                    .clone_from(&self.config.descriptor_table);
+                params.pin_filter = pin_filter;
+                params.pin_index = pin_index;
+                params.encryption.clone_from(&self.config.encryption);
+                #[cfg(zstd_any)]
+                {
+                    params
+                        .zstd_dictionary
+                        .clone_from(&self.config.zstd_dictionary);
+                }
+                #[cfg(feature = "metrics")]
+                {
+                    params.metrics = self.metrics.clone();
+                }
+                Table::recover(params)
             })
             .collect::<crate::Result<Vec<_>>>()?;
 
@@ -882,18 +968,17 @@ impl AbstractTree for Tree {
         // Wire the tree-wide deletion pause into every fresh table / blob
         // file so an in-flight checkpoint defers their cleanup if they
         // later get marked `is_deleted` by compaction.
-        for table in tables {
-            table.install_deletion_pause(Arc::clone(&self.deletion_pause));
+        let sinks = crate::table::TableSinks {
+            deletion_pause: &self.deletion_pause,
+            heal_hints: &self.heal_hints,
             #[cfg(feature = "std")]
-            table.install_background_deleter(Arc::clone(&self.background_deleter));
-            table.install_heal_hints(Arc::clone(&self.heal_hints));
+            background_deleter: Some(&self.background_deleter),
+        };
+        for table in tables {
+            table.bind_to_tree(&sinks);
         }
-        if let Some(bfs) = blob_files {
-            for bf in bfs {
-                bf.install_deletion_pause(Arc::clone(&self.deletion_pause));
-                #[cfg(feature = "std")]
-                bf.install_background_deleter(Arc::clone(&self.background_deleter));
-            }
+        for bf in blob_files.unwrap_or(&[]) {
+            bf.bind_to_tree(&sinks);
         }
 
         let mut _compaction_state = self.compaction_state.lock();
@@ -1105,6 +1190,14 @@ impl AbstractTree for Tree {
             let Some(table_seqno) = seqno.checked_sub(table.global_seqno()) else {
                 continue;
             };
+            // The translation alone is not the visibility rule: a table with
+            // `global_seqno == 0` passes it whatever its entries hold, so one
+            // holding nothing but seqno 100 would charge rows and bytes to a
+            // query at seqno 50 that reads none of them. Ask the same
+            // classification the read path uses.
+            if table.seqno_visibility(seqno) == crate::table::SeqnoVisibility::None {
+                continue;
+            }
 
             // data_end = the data section's byte extent = last data block's end.
             let Some(last) = table.block_index.iter().next_back() else {
@@ -1262,7 +1355,29 @@ impl AbstractTree for Tree {
         let mut total_rows: u64 = 0;
 
         for table in super_version.version.iter_tables() {
-            total_rows = total_rows.saturating_add(table.metadata.item_count);
+            // Snapshot visibility is settled BEFORE the denominator grows. A
+            // table no read at `seqno` can see is not part of the dataset the
+            // selectivity describes, and counting it there while excluding it
+            // from `rows` reports a full-keyspace query as selecting half the
+            // tree. Out-of-RANGE tables do belong in the denominator, which is
+            // why that check stays below it.
+            //
+            // A snapshot below the table's base means the table postdates it
+            // (`checked_sub` yields `None`).
+            let Some(table_seqno) = seqno.checked_sub(table.global_seqno()) else {
+                continue;
+            };
+            // Wholly above the snapshot: invisible to a read at `seqno`, so it
+            // contributes nothing here either (mirrors approximate_range_stats).
+            if table.seqno_visibility(seqno) == crate::table::SeqnoVisibility::None {
+                continue;
+            }
+            // What this VIEW serves, not what the file holds: a tight-space
+            // restricted table's metadata still counts the punched-out prefix
+            // its replacement now owns, while the numerator below starts at the
+            // restriction — so charging the prefix here would report a
+            // full-keyspace query as selecting a fraction of the tree.
+            total_rows = total_rows.saturating_add(table.live_item_count()?);
             if !table
                 .metadata
                 .key_range
@@ -1270,11 +1385,6 @@ impl AbstractTree for Tree {
             {
                 continue;
             }
-            // A snapshot below the table's base means the table postdates it and
-            // contributes nothing here, so skip it (`checked_sub` yields `None`).
-            let Some(table_seqno) = seqno.checked_sub(table.global_seqno()) else {
-                continue;
-            };
             // Honor a tight-space restricted view: keys below
             // `restrict_lower_bound()` are the punched-out prefix served by the
             // replacement table, so raise this table's effective lower bound to
@@ -1285,7 +1395,16 @@ impl AbstractTree for Tree {
                 comparator,
             );
             let zone_map = &table.zone_map;
-            if !zone_map.is_empty() {
+            // A COLUMNAR block's per-column bounds are recorded in BYTE order,
+            // which is the only ordering a value column has. Comparing them
+            // with a non-lexicographic user comparator reads the recorded
+            // minimum as a comparator maximum, so the walk stops before blocks
+            // that overlap the query: the shortcut is skipped for such trees
+            // and the byte-fraction estimate below answers instead. A row
+            // block's bounds are the block's first and last key, already in
+            // comparator order, so the default path is unaffected.
+            let zone_bounds_ordered = comparator.is_lexicographic() || !table.metadata.columnar;
+            if !zone_map.is_empty() && zone_bounds_ordered {
                 // Zone map present: sum the per-block row counts of blocks whose
                 // key range overlaps the query. A block is past the range once its
                 // minimum key is above the upper bound; the boundary block at the
@@ -1389,7 +1508,12 @@ impl AbstractTree for Tree {
             },
         );
         let mut add_memtable = |mt: &crate::Memtable| {
-            total_rows = total_rows.saturating_add(mt.len() as u64);
+            // The denominator counts what a read at this snapshot can SEE, the
+            // same rule the SST loop applies: an entry at or above `seqno` is
+            // filtered out of the numerator below, so counting it here would
+            // report a full-keyspace query as selecting half of what it sees.
+            let visible = mt.iter().filter(|kv| kv.key.seqno < seqno).count() as u64;
+            total_rows = total_rows.saturating_add(visible);
             let in_range = mt
                 .range_internal(mt_range.clone())
                 .filter(|kv| kv.key.seqno < seqno)
@@ -1610,9 +1734,21 @@ impl AbstractTree for Tree {
     }
 
     fn remove_range<K: Into<UserKey>>(&self, start: K, end: K, seqno: SeqNo) -> u64 {
-        let memtable = Arc::clone(&self.version_history.read().latest_version().active_memtable);
+        // The read guard is held through the insert, like `append_entry`: the
+        // CDC scan's capture (write side of this lock) must exclude every
+        // in-flight memtable write, or a backdated range deletion could land
+        // after the capture yet below the returned watermark and be lost; the
+        // guard also keeps a concurrent `rotate_memtable()` from sealing the
+        // memtable mid-insert.
+        let history = self.version_history.read();
 
-        memtable.insert_range_tombstone(start.into(), end.into(), seqno)
+        #[cfg(test)]
+        inner::TestHooks::fire(&self.test_hooks.range_write);
+
+        history
+            .latest_version()
+            .active_memtable
+            .insert_range_tombstone(start.into(), end.into(), seqno)
     }
 }
 
@@ -1647,9 +1783,14 @@ impl Tree {
                 operand: entry.value,
                 seqno,
             },
-            ValueType::Tombstone | ValueType::WeakTombstone => {
-                ScanSinceEvent::PointTombstone { key, seqno }
-            }
+            // Weak (single-delete) tombstones keep their own event kind: a
+            // weak tombstone annihilates exactly its matching put during
+            // compaction and can then expose an older value, while a regular
+            // tombstone keeps hiding it — collapsing both into one event
+            // would make a replica replay a weak delete as a full delete and
+            // diverge from the source.
+            ValueType::Tombstone => ScanSinceEvent::PointTombstone { key, seqno },
+            ValueType::WeakTombstone => ScanSinceEvent::WeakTombstone { key, seqno },
             ValueType::Indirection => unreachable!("Indirection handled above"),
         })
     }
@@ -1678,86 +1819,410 @@ impl Tree {
     where
         F: Fn(&Version, InternalValue) -> crate::Result<ScanSinceEvent>,
     {
-        let super_version = self.version_history.read().latest_version();
-        let version = &super_version.version;
+        self.scan_since_seqno_scoped(target_seqno, block_skip, resolve_indirection, None)
+    }
 
-        // Stable upper watermark, captured once before walking any source: the
-        // highest seqno present across every source at scan start (in global
-        // coordinates — `Table::get_highest_seqno` already adds the offset).
-        // The active memtable is shared and mutable, so without this cap a
-        // write committed mid-scan could leak in and break the "consistent
-        // snapshot of changes in [target, watermark]" contract. The seqno
-        // counter is not a reliable bound here because callers may assign
-        // seqnos explicitly without advancing it, so derive it from the data.
-        let end_seqno = {
-            let active = super_version.active_memtable.get_highest_seqno();
-            let sealed = super_version
-                .sealed_memtables
-                .iter()
-                .map(|mt| mt.get_highest_seqno())
-                .max()
-                .flatten();
-            let tables = version.iter_tables().map(Table::get_highest_seqno).max();
-            active.max(sealed).max(tables)
+    /// As [`Self::scan_since_seqno_with`], optionally scoped to a key range
+    /// (in the tree comparator's order): point events are delivered only for
+    /// keys INSIDE the bounds, range tombstones when their span OVERLAPS them
+    /// (a tombstone reaching into the range affects replay within it), and
+    /// SSTs whose key range cannot intersect the bounds are skipped without
+    /// being read — which is what makes a post-repair reconciliation over
+    /// [`RepairReport::lost_coverage`](crate::RepairReport) affordable.
+    pub(crate) fn scan_since_seqno_scoped<F>(
+        &self,
+        target_seqno: SeqNo,
+        block_skip: bool,
+        resolve_indirection: F,
+        key_range: Option<&(Bound<UserKey>, Bound<UserKey>)>,
+    ) -> crate::Result<alloc::vec::IntoIter<ScanSinceEvent>>
+    where
+        F: Fn(&Version, InternalValue) -> crate::Result<ScanSinceEvent>,
+    {
+        use core::cmp::Ordering;
+
+        let cmp = self.config.comparator.clone();
+        let in_key_range = |key: &[u8]| -> bool {
+            let Some((lo, hi)) = key_range else {
+                return true;
+            };
+            (match lo {
+                Bound::Included(b) => cmp.compare(key, b.as_ref()) != Ordering::Less,
+                Bound::Excluded(b) => cmp.compare(key, b.as_ref()) == Ordering::Greater,
+                Bound::Unbounded => true,
+            }) && (match hi {
+                Bound::Included(b) => cmp.compare(key, b.as_ref()) != Ordering::Greater,
+                Bound::Excluded(b) => cmp.compare(key, b.as_ref()) == Ordering::Less,
+                Bound::Unbounded => true,
+            })
         };
+        // A range tombstone covers `[start, end)`; it is delivered when that
+        // span overlaps the scope, since a deletion reaching into the range
+        // affects replay within it.
+        let rt_in_range = |rt: &RangeTombstone| -> bool {
+            let Some((lo, hi)) = key_range else {
+                return true;
+            };
+            (match lo {
+                // `rt.end` is EXCLUSIVE: the tombstone reaches keys strictly
+                // below it, so it clears the lower bound only when its end is
+                // ABOVE the bound key (for an excluded bound this over-includes
+                // the touching case, which is harmless: replaying an extra
+                // idempotent deletion event cannot corrupt a consumer).
+                Bound::Included(b) | Bound::Excluded(b) => {
+                    cmp.compare(rt.end.as_ref(), b.as_ref()) == Ordering::Greater
+                }
+                Bound::Unbounded => true,
+            }) && (match hi {
+                Bound::Included(b) => {
+                    cmp.compare(rt.start.as_ref(), b.as_ref()) != Ordering::Greater
+                }
+                Bound::Excluded(b) => cmp.compare(rt.start.as_ref(), b.as_ref()) == Ordering::Less,
+                Bound::Unbounded => true,
+            })
+        };
+        // The active memtable is the one source a writer can still change, and
+        // the seqno cap alone does not exclude that: a caller may commit with an
+        // explicit seqno at or BELOW the cap (`apply_batch` takes the seqno from
+        // the caller), and a live lock-free walk would then see that write or
+        // miss it depending on where the node lands relative to the cursor —
+        // even splitting one batch. A consumer that advanced past the returned
+        // watermark would lose the change for good.
+        //
+        // So freeze it: writers hold the version-history READ guard for their
+        // whole insert (that is what keeps `rotate_memtable` from sealing
+        // mid-batch), so taking the WRITE guard excludes them. The cap and the
+        // active memtable's raw entries are captured under it; everything else —
+        // sealed memtables, tables — is immutable and needs no coordination.
+        //
+        // Mapping runs AFTER the guard drops: it resolves blob indirections,
+        // which reads a blob file, and no I/O may happen with writers blocked.
+        let (super_version, end_seqno, active_entries, active_range_tombstones) = {
+            let guard = self.version_history.write();
+            let super_version = guard.latest_version();
+            #[cfg(test)]
+            inner::TestHooks::fire(&self.test_hooks.scan_freeze);
+            let end_seqno = {
+                let active = super_version.active_memtable.get_highest_seqno();
+                let sealed = super_version
+                    .sealed_memtables
+                    .iter()
+                    .map(|mt| mt.get_highest_seqno())
+                    .max()
+                    .flatten();
+                let tables = super_version
+                    .version
+                    .iter_tables()
+                    .map(Table::get_highest_seqno)
+                    .max();
+                active.max(sealed).max(tables)
+            };
+            let entries: Vec<InternalValue> = end_seqno.map_or_else(Vec::new, |cap| {
+                super_version
+                    .active_memtable
+                    .iter()
+                    .filter(|e| e.key.seqno >= target_seqno && e.key.seqno <= cap)
+                    .collect()
+            });
+            let rts = super_version.active_memtable.range_tombstones_sorted();
+            // Explicit: the guard must outlive the capture above, and writers
+            // resume the moment it goes.
+            drop(guard);
+            (super_version, end_seqno, entries, rts)
+        };
+        let version = &super_version.version;
         // No entries anywhere ⇒ nothing qualifies, regardless of target.
         let Some(end_seqno) = end_seqno else {
             return Ok(Vec::new().into_iter());
         };
 
-        let mut events: Vec<ScanSinceEvent> = Vec::new();
+        // Events are gathered PER SOURCE, not into one flat list: copies of a
+        // change across two sources are the same change and collapse, but a
+        // single source may legitimately hold a byte-identical event more than
+        // once (a write batch may carry the same merge operand for a key
+        // twice; both are stored under the batch's shared seqno and both are
+        // applied on read). See `merge_source_events`.
+        let mut sources: Vec<Vec<ScanSinceEvent>> = Vec::new();
 
-        // Point entries: active + sealed memtables, then SSTs (block-skip).
-        for entry in super_version.active_memtable.iter() {
-            if entry.key.seqno >= target_seqno && entry.key.seqno <= end_seqno {
-                events.push(Self::map_event(entry, version, &resolve_indirection)?);
+        let in_window = |seqno: SeqNo| seqno >= target_seqno && seqno <= end_seqno;
+        let range_tombstone_event = |rt: &RangeTombstone| {
+            in_window(rt.seqno).then(|| ScanSinceEvent::RangeTombstone {
+                start_key: rt.start.clone(),
+                end_key: rt.end.clone(),
+                seqno: rt.seqno,
+            })
+        };
+
+        // The scope bounds as borrowed slices, for SST key-range pruning.
+        fn as_ref_bound(b: &Bound<UserKey>) -> Bound<&[u8]> {
+            match b {
+                Bound::Included(k) => Bound::Included(k.as_ref()),
+                Bound::Excluded(k) => Bound::Excluded(k.as_ref()),
+                Bound::Unbounded => Bound::Unbounded,
             }
         }
-        for memtable in super_version.sealed_memtables.iter() {
+        let ref_bounds = key_range.map(|(lo, hi)| (as_ref_bound(lo), as_ref_bound(hi)));
+
+        // Active memtable — mapped from the frozen capture above, not walked
+        // again: a second walk would reintroduce exactly the race the freeze
+        // closed.
+        let mut source = Vec::new();
+        for entry in active_entries {
+            if !in_key_range(&entry.key.user_key) {
+                continue;
+            }
+            source.push(Self::map_event(entry, version, &resolve_indirection)?);
+        }
+        for rt in active_range_tombstones {
+            if rt_in_range(&rt) {
+                source.extend(range_tombstone_event(&rt));
+            }
+        }
+        sources.push(source);
+
+        // Sealed memtables, NEWEST first: the list is kept in seal order, and
+        // every source below must be older than the one before it, because the
+        // merge derives replay precedence from that position.
+        for memtable in super_version.sealed_memtables.iter().rev() {
+            let mut source = Vec::new();
             for entry in memtable.iter() {
-                if entry.key.seqno >= target_seqno && entry.key.seqno <= end_seqno {
-                    events.push(Self::map_event(entry, version, &resolve_indirection)?);
+                if in_window(entry.key.seqno) && in_key_range(&entry.key.user_key) {
+                    source.push(Self::map_event(entry, version, &resolve_indirection)?);
                 }
             }
-        }
-        for table in version.iter_tables() {
-            // `scan_seqno_range` upper bound is exclusive; `end_seqno` is the
-            // inclusive max, so add one (saturating for the MAX edge).
-            for entry in
-                table.scan_seqno_range(target_seqno, end_seqno.saturating_add(1), block_skip)?
-            {
-                events.push(Self::map_event(entry, version, &resolve_indirection)?);
-            }
-        }
-
-        // Range tombstones from the same sources, carrying their own seqno.
-        let mut push_range_tombstone = |rt: &RangeTombstone| {
-            if rt.seqno >= target_seqno && rt.seqno <= end_seqno {
-                events.push(ScanSinceEvent::RangeTombstone {
-                    start_key: rt.start.clone(),
-                    end_key: rt.end.clone(),
-                    seqno: rt.seqno,
-                });
-            }
-        };
-        for rt in super_version.active_memtable.range_tombstones_sorted() {
-            push_range_tombstone(&rt);
-        }
-        for memtable in super_version.sealed_memtables.iter() {
             for rt in memtable.range_tombstones_sorted() {
-                push_range_tombstone(&rt);
+                if rt_in_range(&rt) {
+                    source.extend(range_tombstone_event(&rt));
+                }
             }
+            sources.push(source);
         }
+
+        // SSTs. A table whose key range cannot intersect the scope is skipped
+        // without a single block read — the point of the scoped variant. The
+        // key range is RANGE-TOMBSTONE-SAFE to prune on: every writer keeps
+        // tombstone coverage inside it (a flush conservatively widens the
+        // range over its tombstone spans — see `write_rts_to_writer` — and a
+        // compaction clips its output's tombstones to the table's
+        // responsibility range), so a tombstone overlapping the scope always
+        // sits in a table this loop visits.
         for table in version.iter_tables() {
-            for rt in table.range_tombstones() {
-                push_range_tombstone(rt);
+            if let Some(bounds) = &ref_bounds
+                && !table
+                    .metadata
+                    .key_range
+                    .overlaps_with_bounds_cmp(bounds, cmp.as_ref())
+            {
+                continue;
+            }
+            // An RT-only table's synthetic weak-tombstone sentinel (the
+            // writer's `finish`) is deliberately NOT filtered out here. It is
+            // a real on-disk entry the READ path sees: at a seqno TIE between
+            // the range deletion and an older source's write at the range's
+            // start key, the sentinel is what makes the read converge to a
+            // deletion — so the event stream must carry it too, or a consumer
+            // replaying the stream keeps a value the tree itself does not
+            // serve (this stream's one rule is mirroring the tree's reads,
+            // see `merge_source_events`). It surfaces as the weak-tombstone
+            // event it is on disk; away from that tie a replayed weak delete
+            // at the range's start under the range deletion's own seqno is a
+            // no-op.
+            let mut source = Vec::new();
+            for entry in table.scan_seqno_range(target_seqno, end_seqno, block_skip)? {
+                if !in_key_range(&entry.key.user_key) {
+                    continue;
+                }
+                source.push(Self::map_event(entry, version, &resolve_indirection)?);
+            }
+            // Clamped to the view's tight-space restriction: the punched
+            // prefix's deletions are re-emitted by the slice output that
+            // superseded it, so the raw list would duplicate those events.
+            for rt in table.visible_range_tombstones() {
+                if rt_in_range(&rt) {
+                    source.extend(range_tombstone_event(&rt));
+                }
+            }
+            sources.push(source);
+        }
+
+        Ok(Self::merge_source_events(sources).into_iter())
+    }
+
+    /// Merge per-source event lists into one replay-ordered stream, `sources`
+    /// ordered NEWEST first.
+    ///
+    /// Replay order is increasing seqno, then — for events sharing one seqno —
+    /// increasing source AGE reversed, so the newest source's event is applied
+    /// LAST. That matters because two sources can hold different values for one
+    /// key at one seqno ([`AbstractTree::apply_batch`] takes a caller-chosen
+    /// seqno and does not require it to be unique), the tree serves the newer
+    /// one, and a consumer keeps whatever it applies last. Sorting such ties by
+    /// payload instead would decide precedence by byte order.
+    ///
+    /// What happens to byte-identical copies follows ONE rule: the stream must
+    /// mirror what a read of the same tree does, because a consumer replaying
+    /// it has to reach the state the tree itself serves.
+    ///
+    /// - **Merge operands are all kept.** The read path collects every
+    ///   physically stored operand for a key and applies them in order — it
+    ///   never deduplicates by seqno — so two operands are two applications
+    ///   whether they sit in one source or in two. Seqnos do not disambiguate
+    ///   here: [`AbstractTree::apply_batch`] takes a caller-chosen seqno and
+    ///   does not require it to be unique, and one batch may carry the same
+    ///   operand for a key twice.
+    /// - **Idempotent events collapse across sources.** A write, a deletion or
+    ///   a range deletion replayed twice reaches the same state, and the read
+    ///   path shadows the copies by seqno rather than compounding them. One
+    ///   committed change can physically live in two published tables — a
+    ///   manifest-loss repair publishes every surviving SST as its own L0 run,
+    ///   including both the inputs and the outputs of a compaction that crashed
+    ///   before deleting its inputs — and delivering it twice would be noise.
+    ///   Repeats WITHIN one source are still kept: they are separate entries
+    ///   the source genuinely holds.
+    fn merge_source_events(sources: Vec<Vec<ScanSinceEvent>>) -> Vec<ScanSinceEvent> {
+        // Per source, collapse equal neighbours into runs, each tagged with
+        // its source's recency (0 = newest) and the position of EVERY copy it
+        // carries.
+        //
+        // The POSITIONS are what keep an order-sensitive merge operator
+        // correct: a source applies the operands of one batch in the order
+        // they were added, all at one seqno, and grouping them by payload
+        // would replay them in a different order — an append or a list push
+        // then converges somewhere the tree never was. Grouping still SORTS
+        // (equal events have to meet), so each run remembers where each of its
+        // members sat: one shared position would fold a repeated operand's
+        // copies onto its twin's slot and replay `B, A, B` as `A, B, B`.
+        struct Run {
+            event: ScanSinceEvent,
+            recency: usize,
+            /// Original scan position of every copy, ascending.
+            positions: Vec<usize>,
+        }
+        let mut runs: Vec<Run> = Vec::new();
+        for (recency, source) in sources.into_iter().enumerate() {
+            let mut indexed: Vec<(usize, ScanSinceEvent)> =
+                source.into_iter().enumerate().collect();
+            indexed.sort_by(|(_, a), (_, b)| ScanSinceEvent::grouping_order(a, b));
+            let mut iter = indexed.into_iter();
+            let Some((position, mut current)) = iter.next() else {
+                continue;
+            };
+            let mut positions = alloc::vec![position];
+            for (index, event) in iter {
+                if event == current {
+                    positions.push(index);
+                } else {
+                    positions.sort_unstable();
+                    runs.push(Run {
+                        event: core::mem::replace(&mut current, event),
+                        recency,
+                        positions: core::mem::replace(&mut positions, alloc::vec![index]),
+                    });
+                }
+            }
+            positions.sort_unstable();
+            runs.push(Run {
+                event: current,
+                recency,
+                positions,
+            });
+        }
+
+        // Merge the per-source runs. Operands are never collapsed — every copy
+        // is an application the read path makes, so each keeps ITS source's
+        // recency and ITS scan position, and the replay order below (oldest
+        // source first, then position) applies them exactly as the tree does.
+        // Idempotent events collapse across sources to the count a single
+        // source holds; the collapsed event keeps the recency of the NEWEST
+        // source holding it (and that source's positions), which is the slot
+        // the tree's own precedence gives it.
+        //
+        // WEAK tombstones belong to the idempotent class even though a weak
+        // delete annihilates one put at compaction: its documented contract
+        // pairs it with a key written at most once, byte-identical copies
+        // meeting in one compaction stream drain to a single survivor, and a
+        // consumer cannot materialize multiplicity anyway — replaying the
+        // same `remove_weak` twice at one seqno lands on ONE internal key in
+        // its memtable, so a preserved duplicate would replay to the same
+        // physical state the collapsed stream does.
+        runs.sort_by(|a, b| ScanSinceEvent::grouping_order(&a.event, &b.event));
+        let mut merged: Vec<(ScanSinceEvent, usize, usize)> = Vec::new();
+        let mut iter = runs.into_iter().peekable();
+        while let Some(run) = iter.next() {
+            if matches!(run.event, ScanSinceEvent::MergeOperand { .. }) {
+                // Equal operand runs from OTHER sources follow as their own
+                // iterations and emit their own copies — no draining here.
+                for &position in &run.positions {
+                    merged.push((run.event.clone(), run.recency, position));
+                }
+                continue;
+            }
+            let Run {
+                event,
+                mut recency,
+                mut positions,
+            } = run;
+            let mut count = positions.len();
+            while let Some(other) = iter.next_if(|next| next.event == event) {
+                debug_assert_eq!(other.event, event, "next_if matched the same event");
+                count = count.max(other.positions.len());
+                if other.recency < recency {
+                    recency = other.recency;
+                    positions = other.positions;
+                }
+            }
+            // The winning source may hold fewer copies than the count another
+            // source did; the extras repeat its last position (they are
+            // byte-identical, so their relative order carries no information).
+            while positions.len() < count {
+                let last = positions.last().copied().unwrap_or_default();
+                positions.push(last);
+            }
+            for &position in positions.iter().take(count) {
+                merged.push((event.clone(), recency, position));
             }
         }
 
-        // Replay order is increasing seqno across every source.
-        events.sort_by_key(ScanSinceEvent::seqno);
-
-        Ok(events.into_iter())
+        // Finally, replay order: seqno, then range deletions, then oldest source
+        // first, then the position that source gave the event — which is how an
+        // order-sensitive merge operator converges to what the tree serves.
+        //
+        // The range-deletion step comes BEFORE source recency, not after: a tied
+        // deletion does not suppress the writes it spans (suppression is
+        // strictly `entry.seqno < tombstone.seqno`), so the tree keeps them, and
+        // a replay that applied the deletion last would drop them. Ordering by
+        // recency first would do exactly that whenever the deletion sits in the
+        // newer source.
+        merged.sort_by(|(a, a_recency, a_pos), (b, b_recency, b_pos)| {
+            fn deletion_first(e: &ScanSinceEvent) -> u8 {
+                u8::from(!matches!(e, ScanSinceEvent::RangeTombstone { .. }))
+            }
+            a.seqno()
+                .cmp(&b.seqno())
+                .then_with(|| deletion_first(a).cmp(&deletion_first(b)))
+                .then_with(|| b_recency.cmp(a_recency))
+                .then_with(|| {
+                    // Within one source and one seqno, a scan yields a key's
+                    // versions NEWEST first, and the read path reverses that run
+                    // to apply them chronologically. Mirror it: same key ⇒ the
+                    // later scan position replays FIRST. Distinct keys at one
+                    // seqno touch different state, so their relative order is
+                    // free — keep it deterministic by scan position.
+                    //
+                    // Identity is the engine's one relation (byte equality, see
+                    // `same_user_key`), which is what the read path this mirrors
+                    // uses to group a key's versions. Asking the comparator here
+                    // would answer the same question — its contract makes
+                    // `Equal` imply byte equality — while letting the two paths
+                    // disagree the moment a comparator broke that.
+                    if crate::comparator::same_user_key(a.key(), b.key()) {
+                        b_pos.cmp(a_pos)
+                    } else {
+                        a_pos.cmp(b_pos)
+                    }
+                })
+        });
+        merged.into_iter().map(|(event, ..)| event).collect()
     }
 
     /// Iterate change events with `seqno >= target_seqno`.
@@ -1768,6 +2233,32 @@ impl Tree {
     /// connector, Debezium-style pipeline) replays the events in order to
     /// reconstruct the source's history. Superseded versions are not collapsed
     /// (a key written three times after the target yields three events).
+    ///
+    /// # Concurrency
+    ///
+    /// The result is a snapshot of the tree as of the call: the active memtable
+    /// is captured with writers excluded, so a batch committed concurrently is
+    /// either wholly in the result or wholly absent, never split across it. This
+    /// holds even for a caller-chosen sequence number at or below the reported
+    /// watermark, which the seqno bound alone would not exclude. Writers are
+    /// blocked only while that capture runs — the sealed memtables and SSTs the
+    /// scan then reads are immutable.
+    ///
+    /// # History retention
+    ///
+    /// The stream carries what the tree still PHYSICALLY HOLDS. A compaction
+    /// run with a GC watermark (the `seqno_threshold` passed to
+    /// [`compact`](crate::AbstractTree::compact) /
+    /// [`major_compact`](crate::AbstractTree::major_compact)) drops shadowed
+    /// versions and evicted tombstones below that watermark and may fold
+    /// merge chains and zero bottommost seqnos — history a later scan cannot
+    /// resurrect. The result is therefore complete only for a `target_seqno`
+    /// at or above the highest GC watermark ever applied: a deployment
+    /// replaying this stream (an external-WAL consumer, a CDC replica) must
+    /// keep its compaction watermark at or below the lowest cursor it may
+    /// still rewind to, exactly as `docs/external-wal.md` section 4's
+    /// GC-coordination rules require. The watermark is caller-supplied and
+    /// not persisted, so this method cannot detect a violation for you.
     ///
     /// # Block-skip
     ///
@@ -1851,6 +2342,51 @@ impl Tree {
                 "scan_since_seqno on KV-separated values requires the blob-tree scan path",
             ))
         })
+    }
+
+    /// Range-scoped variant of [`Self::scan_since_seqno`]: delivers only
+    /// events whose key falls within `range` (in the tree comparator's
+    /// order); range-deletion events are delivered when their span OVERLAPS
+    /// it, since a tombstone reaching into the range affects replay within
+    /// it. SSTs whose key range cannot intersect the bounds are skipped
+    /// without a single block read.
+    ///
+    /// This is the presence-check primitive for reconciling an external
+    /// write-ahead log after a repair: [`RepairReport::lost_coverage`] names
+    /// the affected key ranges, and deciding which retained WAL records to
+    /// re-apply (in particular, which merge operands SURVIVED and must not be
+    /// folded twice) only needs the events inside those ranges. See
+    /// `docs/external-wal.md` § Replay after repair.
+    ///
+    /// The history-retention caveat of [`Self::scan_since_seqno`] applies
+    /// unchanged: the stream is complete only for a `target_seqno` at or
+    /// above the highest compaction GC watermark ever applied.
+    ///
+    /// [`RepairReport::lost_coverage`]: crate::RepairReport::lost_coverage
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal version-history lock is poisoned.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::scan_since_seqno`].
+    pub fn scan_since_seqno_in_range<K: AsRef<[u8]>, R: RangeBounds<K>>(
+        &self,
+        target_seqno: SeqNo,
+        range: R,
+    ) -> crate::Result<impl Iterator<Item = ScanSinceEvent> + use<K, R>> {
+        let bounds = range_to_user_bounds(&range);
+        self.scan_since_seqno_scoped(
+            target_seqno,
+            true,
+            |_version, _entry| {
+                Err(crate::Error::FeatureUnsupported(
+                    "scan_since_seqno on KV-separated values requires the blob-tree scan path",
+                ))
+            },
+            Some(&bounds),
+        )
     }
 
     /// Update the live [`crate::runtime_config::RuntimeConfig`].
@@ -3246,7 +3782,9 @@ impl Tree {
             log::error!(
                 "It looks like you are trying to open a V1 database - the database needs a manual migration, however a migration tool is not provided, as V1 is extremely outdated."
             );
-            return Err(crate::Error::InvalidVersion(FormatVersion::V1.into()));
+            // Literal discriminant: V1 is a retired format and FormatVersion
+            // carries no legacy variants (V5-only contract).
+            return Err(crate::Error::InvalidVersion(1));
         }
 
         // Decide between recovery and fresh creation atomically by attempting
@@ -3793,8 +4331,14 @@ impl Tree {
             )?;
             let manifest = Manifest::decode_from(&mut archive_reader)?;
 
-            if !matches!(manifest.version, FormatVersion::V5) {
-                return Err(crate::Error::InvalidVersion(manifest.version.into()));
+            // V5 is the only variant `FormatVersion` can decode to (the
+            // engine reads exactly one on-disk format, no legacy paths), so
+            // a pre-V5 manifest already failed decode_from with
+            // InvalidVersion. This match stays as the explicit gate the
+            // format contract documents — and as the compile-time hook that
+            // forces a review of the open path when a new variant is added.
+            match manifest.version {
+                FormatVersion::V5 => {}
             }
 
             let supplied_name = config.comparator.name();
@@ -3838,7 +4382,16 @@ impl Tree {
                     "Tried to open a {requested_tree_type:?}Tree, but the existing tree is of type {:?}Tree. This indicates a misconfiguration or corruption.",
                     version.tree_type(),
                 );
-                return Err(crate::Error::Unrecoverable);
+                // A dedicated error, NOT `Unrecoverable`: the auto-repair path
+                // answers `Unrecoverable` with a manifest rebuild, and a
+                // rebuild under the mismatched type commits the wrong tree
+                // shape (a Standard rebuild of a blob tree strands its blob
+                // files for the orphan sweep). A configuration error must
+                // propagate to the caller instead.
+                return Err(crate::Error::TreeTypeMismatch {
+                    requested: requested_tree_type,
+                    actual: version.tree_type(),
+                });
             }
         }
 
@@ -3896,6 +4449,9 @@ impl Tree {
 
             #[cfg(feature = "metrics")]
             metrics,
+
+            #[cfg(test)]
+            test_hooks: inner::TestHooks::default(),
         };
 
         // Install the pause on every recovered table / blob file so their
@@ -3908,16 +4464,85 @@ impl Tree {
         let recovered_tables: Vec<Table> = version.iter_tables().cloned().collect();
         let recovered_blobs: Vec<BlobFile> = version.blob_files.iter().cloned().collect();
 
-        for table in &recovered_tables {
-            table.install_deletion_pause(Arc::clone(&deletion_pause));
+        let sinks = crate::table::TableSinks {
+            deletion_pause: &deletion_pause,
+            heal_hints: &heal_hints,
             #[cfg(feature = "std")]
-            table.install_background_deleter(Arc::clone(&background_deleter));
-            table.install_heal_hints(Arc::clone(&heal_hints));
+            background_deleter: Some(&background_deleter),
+        };
+        for table in &recovered_tables {
+            table.bind_to_tree(&sinks);
         }
         for blob_file in &recovered_blobs {
-            blob_file.install_deletion_pause(Arc::clone(&deletion_pause));
-            #[cfg(feature = "std")]
-            blob_file.install_background_deleter(Arc::clone(&background_deleter));
+            blob_file.bind_to_tree(&sinks);
+        }
+
+        // Re-arm the tight-space reclaims a previous session could not finish.
+        // A reclaim deferred because a checkpoint still hard-linked the file
+        // lived only in that session's queue, and the unrestricted view that
+        // could re-arm it is gone once the process restarts, so the consumed
+        // prefix would stay allocated for the table's lifetime. Nothing is
+        // persisted for this: the intent is DERIVABLE, and the extent is
+        // exactly the prefix the committed bound cuts away. A prefix already
+        // punched re-punches as a no-op, so a completed reclaim costs one
+        // call, and only on a restricted table.
+        #[cfg(feature = "std")]
+        {
+            for table in &recovered_tables {
+                let Some(bound) = table.restrict_lower_bound() else {
+                    continue;
+                };
+                // Reclaiming frees space; it never decides what the tree
+                // serves. A table that opened cleanly must not be denied to
+                // readers because its punch offset cannot be re-derived, so a
+                // failure here is reported and skipped. An ENVIRONMENTAL fault
+                // still propagates: it says nothing about this table, and a
+                // retry can re-read it.
+                let offset = match table.punch_offset_for(bound) {
+                    Ok(offset) => offset,
+                    Err(e) if e.is_environmental() => return Err(e),
+                    Err(e) => {
+                        log::warn!(
+                            "table {} carries a committed restriction whose punch offset \
+                             could not be re-derived ({e}); its consumed prefix stays \
+                             allocated until the next tight-space compaction",
+                            table.id(),
+                        );
+                        continue;
+                    }
+                };
+                if offset > 0 {
+                    deletion_pause.retain_reclaim(
+                        Arc::clone(&table.fs),
+                        (*table.path).clone(),
+                        alloc::vec![(0, offset)],
+                    );
+                }
+            }
+            // Blob files carry the same deferred intent, in their committed
+            // frontier rather than a restriction bound.
+            for blob in &recovered_blobs {
+                let extent = match blob.committed_reclaimable_prefix() {
+                    Ok(Some(extent)) => extent,
+                    Ok(None) => continue,
+                    Err(e) if e.is_environmental() => return Err(e),
+                    Err(e) => {
+                        log::warn!(
+                            "blob file {:?} carries a committed frontier whose reclaimable \
+                             extent could not be re-derived ({e}); its consumed prefix stays \
+                             allocated until the next relocation",
+                            blob.id(),
+                        );
+                        continue;
+                    }
+                };
+                deletion_pause.retain_reclaim(
+                    Arc::clone(&blob.0.fs),
+                    blob.0.path.clone(),
+                    alloc::vec![extent],
+                );
+            }
+            deletion_pause.retry_pending_reclaims();
         }
 
         Ok(Self(Arc::new(inner)))
@@ -4026,6 +4651,12 @@ impl Tree {
 
         let cnt = table_map.len();
 
+        // Immutable snapshot of every table id the manifest knows. `table_map`
+        // is drained as tables are recovered below, so it cannot answer "is this
+        // id live?" order-independently; this set can. Used to sweep an orphaned
+        // `.heal-attest` sidecar whose SST was retired.
+        let manifest_ids: crate::HashSet<TableId> = table_map.keys().copied().collect();
+
         log::debug!("Recovering {cnt} tables from {}", tree_path.display());
 
         let progress_mod = match cnt {
@@ -4040,10 +4671,60 @@ impl Tree {
         // skipped rather than orphan-deleted.
         let mut recovered_table_ids: crate::HashSet<TableId> = crate::HashSet::default();
         let mut orphaned_tables: Vec<(crate::path::PathBuf, Arc<dyn crate::fs::Fs>)> = vec![];
+        // Copies the digest PROVED stale. Left on disk they are worse than
+        // clutter: once the winning route is removed or temporarily unmounted,
+        // such a file is the only sighting of its id, arbitration is skipped
+        // for want of a duplicate, and the stale generation is served instead
+        // of the missing route being reported. They are swept only after a
+        // winner for that id is established, so a scan that never finds one
+        // keeps every copy it has.
+        let mut rejected_copies: Vec<(TableId, crate::path::PathBuf, Arc<dyn crate::fs::Fs>)> =
+            Vec::new();
+        // Where an ambiguous id was accepted from, so a LATER sighting of it can
+        // be judged against the winner rather than merely skipped.
+        let mut accepted_copies: crate::HashMap<
+            TableId,
+            (crate::path::PathBuf, Arc<dyn crate::fs::Fs>),
+        > = crate::HashMap::default();
+        // First recovery failure per manifest id, kept until a later routed
+        // folder yields a copy that opens. Whatever is left once every folder
+        // is scanned is a table the manifest names and no copy delivers, so
+        // its error is the open's.
+        let mut unrecovered_sightings: crate::HashMap<TableId, crate::Error> =
+            crate::HashMap::default();
+        // Repair replacements whose authority could not be settled against the
+        // damaged original beside them. Held until every folder is scanned: a
+        // later routed copy that opens against the manifest settles it (the temp
+        // is then provably NOT what the manifest names, so it is swept there and
+        // then), and only an id no copy delivers surfaces its ambiguity.
+        // A LIST, not a per-id map: routing can put a temp for the same id in
+        // more than one folder, and each one is a file that has to be settled.
+        let mut deferred_temps: Vec<(
+            TableId,
+            crate::path::PathBuf,
+            Arc<dyn crate::fs::Fs>,
+            crate::Error,
+        )> = Vec::new();
 
         // Scan all configured table folders (primary + level routes).
         let all_folders = config.all_tables_folders();
 
+        // One listing per folder, taken up front. The recovery loop has to know
+        // whether an id is sighted in MORE THAN ONE routed folder BEFORE it
+        // accepts the first sighting, and answering that later would mean
+        // listing every folder a second time.
+        let mut folder_scans: Vec<(
+            &crate::path::PathBuf,
+            &Arc<dyn crate::fs::Fs>,
+            Vec<crate::fs::FsDirEntry>,
+        )> = Vec::with_capacity(all_folders.len());
+        // Ids present in more than one folder. Only these are digest-arbitrated
+        // at open: a post-commit sweep that failed leaves an INTACT stale twin,
+        // and `Table::recover` parses structure without re-deriving the
+        // manifest's digest, so it opens the stale generation just as happily.
+        // Ids sighted once cannot be ambiguous, and hashing them would turn
+        // every open into a full read of the tree.
+        let mut folder_sightings: crate::HashMap<TableId, usize> = crate::HashMap::default();
         for (table_base_folder, folder_fs) in &all_folders {
             if !folder_fs.exists(table_base_folder)? {
                 folder_fs.create_dir_all(table_base_folder)?;
@@ -4056,22 +4737,39 @@ impl Tree {
                 }
             }
 
-            for dirent in folder_fs.read_dir(table_base_folder)? {
+            // Pending repair swaps resolve FIRST: a committed swap's `{id}` file
+            // is the superseded source until the rename lands, so adopting it
+            // before the temp entry is processed would hand this session a
+            // handle onto bytes the finished swap then replaces on disk.
+            let mut dirents = folder_fs.read_dir(table_base_folder)?;
+            dirents.sort_by_key(|e| {
+                !matches!(
+                    crate::file::TableDirEntry::classify(&e.file_name),
+                    crate::file::TableDirEntry::RepairTmp(_)
+                )
+            });
+            for dirent in &dirents {
+                if let crate::file::TableDirEntry::Table(id) =
+                    crate::file::TableDirEntry::classify(&dirent.file_name)
+                {
+                    *folder_sightings.entry(id).or_insert(0) += 1;
+                }
+            }
+            folder_scans.push((table_base_folder, folder_fs, dirents));
+        }
+        let ambiguous_ids: crate::HashSet<TableId> = folder_sightings
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|(id, _)| id)
+            .collect();
+
+        for (table_base_folder, folder_fs, dirents) in folder_scans {
+            for dirent in dirents {
                 let crate::fs::FsDirEntry {
                     path: table_file_path,
                     file_name,
                     is_dir,
                 } = dirent;
-
-                // https://en.wikipedia.org/wiki/.DS_Store
-                if file_name == ".DS_Store" {
-                    continue;
-                }
-
-                // https://en.wikipedia.org/wiki/AppleSingle_and_AppleDouble_formats
-                if file_name.starts_with("._") {
-                    continue;
-                }
 
                 let table_file_name = &file_name;
                 if is_dir {
@@ -4082,46 +4780,363 @@ impl Tree {
                     continue;
                 }
 
-                let table_id = table_file_name.parse::<TableId>().map_err(|e| {
-                    log::error!("invalid table file name {table_file_name:?}: {e:?}");
-                    crate::Error::Unrecoverable
-                })?;
+                // One grammar decides what each name IS (`TableDirEntry`, shared
+                // with the repair scan so the two can never disagree on
+                // ownership); this match is the open's POLICY for each kind.
+                let table_id = match crate::file::TableDirEntry::classify(table_file_name) {
+                    // An in-place heal's detach copy, renamed over the live path
+                    // on success: a survivor is a crash leftover no manifest ever
+                    // references. Sweep it.
+                    crate::file::TableDirEntry::HealTmp(_) => {
+                        log::warn!(
+                            "Removing abandoned heal copy: {}",
+                            table_file_path.display()
+                        );
+                        Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                        continue;
+                    }
+                    // A crashed attestation publish: either the live sidecar it
+                    // would have replaced still bridges the crash window, or the
+                    // heal is re-run. Disposable.
+                    crate::file::TableDirEntry::HealAttestTmp(_) => {
+                        log::warn!(
+                            "Removing abandoned heal-attest temp: {}",
+                            table_file_path.display()
+                        );
+                        Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                        continue;
+                    }
+                    // A LIVE table's pending attestation is preserved (the next
+                    // scrub reconciles a crashed digest refresh through it). One
+                    // whose SST left the manifest is unreconcilable forever:
+                    // sweep the orphan rather than re-process it on every open.
+                    crate::file::TableDirEntry::HealAttest(attest_id) => {
+                        if !manifest_ids.contains(&attest_id) {
+                            log::warn!(
+                                "Removing orphaned heal attestation (its table is gone): {}",
+                                table_file_path.display()
+                            );
+                            Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                        }
+                        continue;
+                    }
+                    // A crashed bound publish. Disposable.
+                    crate::file::TableDirEntry::RestrictBoundTmp(_) => {
+                        log::warn!(
+                            "Removing abandoned restrict-bound temp: {}",
+                            table_file_path.display()
+                        );
+                        Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                        continue;
+                    }
+                    // A LIVE table's restriction bound is preserved (manifest
+                    // repair reads it); an ORPHAN one is swept so a reused id
+                    // cannot later pick up a stale restriction.
+                    crate::file::TableDirEntry::RestrictBound(bound_id) => {
+                        if !manifest_ids.contains(&bound_id) {
+                            log::warn!(
+                                "Removing orphaned restrict-bound sidecar (its table is gone): {}",
+                                table_file_path.display()
+                            );
+                            Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                        }
+                        continue;
+                    }
+                    // A repair's replacement still at its temp name. The manifest
+                    // is the authority on what it is — but it names the id in
+                    // BOTH crash cases (before the commit its entry still
+                    // describes the SOURCE beside the temp), so the entry's
+                    // checksum decides: only a committed repair recorded the
+                    // temp's digest, and it died before the swap — this file is
+                    // what the manifest describes, so the swap is finished.
+                    // Any other temp is an abandoned build (possibly truncated
+                    // mid-write), and swapping it in would destroy the source
+                    // the manifest names: it is garbage. An open resolves this
+                    // exactly as a re-run of the repair would, from the durable
+                    // manifest alone.
+                    crate::file::TableDirEntry::RepairTmp(tmp_id) => {
+                        #[cfg(feature = "std")]
+                        {
+                            let published = match table_map.get(&tmp_id) {
+                                Some(&(_, manifest_checksum, _)) => {
+                                    match crate::repair::repair_tmp_is_published(
+                                        config,
+                                        folder_fs,
+                                        &table_file_path,
+                                        tmp_id,
+                                        manifest_checksum,
+                                        recovery.restrictions.get(&tmp_id),
+                                    ) {
+                                        Ok(published) => published,
+                                        // A refused mount / missing key says
+                                        // nothing about which copy the manifest
+                                        // names: surface it.
+                                        Err(e) if e.is_environmental() => return Err(e),
+                                        // Neither this temp nor the damaged
+                                        // original beside it can prove it is the
+                                        // manifest's copy. A LATER routed folder
+                                        // may still hold that copy, and deciding
+                                        // here would end the open on a leftover a
+                                        // failed post-commit sweep left behind.
+                                        // Defer: leave the temp untouched, keep
+                                        // the ambiguity, and let the end of the
+                                        // scan decide (see `deferred_temps`).
+                                        Err(e) => {
+                                            log::warn!(
+                                                "repair replacement {} is ambiguous ({e}); \
+                                                 deferring until every routed folder is scanned",
+                                                table_file_path.display(),
+                                            );
+                                            deferred_temps.push((
+                                                tmp_id,
+                                                table_file_path,
+                                                Arc::clone(folder_fs),
+                                                e,
+                                            ));
+                                            continue;
+                                        }
+                                    }
+                                }
+                                None => false,
+                            };
+                            if published {
+                                log::warn!(
+                                    "Finishing a repair's pending swap of table {tmp_id}: {}",
+                                    table_file_path.display()
+                                );
+                                crate::repair::commit_repair_tmp(
+                                    folder_fs.as_ref(),
+                                    &table_file_path,
+                                    &table_base_folder.join(tmp_id.to_string()),
+                                    config.sync_mode,
+                                    recovery.restrictions.contains_key(&tmp_id),
+                                )?;
+                            } else {
+                                log::warn!(
+                                    "Removing abandoned repair replacement: {}",
+                                    table_file_path.display()
+                                );
+                                // A RESTRICTED salvage also wrote
+                                // `{temp}.restrict-bound`; that companion must
+                                // go with the temp — its name classifies as
+                                // Foreign and would fail this very open.
+                                let companion =
+                                    crate::restrict_bound::sidecar_path(&table_file_path);
+                                if folder_fs.exists(&companion)? {
+                                    Self::sweep_artifact(folder_fs.as_ref(), &companion)?;
+                                }
+                                Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                            }
+                        }
+                        // Without the repair module nothing here can verify or
+                        // finish a swap the manifest may describe, and sweeping
+                        // the temp could destroy the only copy of what the
+                        // manifest names.
+                        #[cfg(not(feature = "std"))]
+                        {
+                            if manifest_ids.contains(&tmp_id) {
+                                log::error!(
+                                    "Table {tmp_id} exists only as an unpublished repair \
+                                     replacement; run a repair to finish it: {}",
+                                    table_file_path.display()
+                                );
+                                return Err(crate::Error::Unrecoverable);
+                            }
+                            log::warn!(
+                                "Removing abandoned repair replacement: {}",
+                                table_file_path.display()
+                            );
+                            // Same companion rule as the std arm above (the
+                            // `restrict_bound` helper is std-gated, so the
+                            // name is spelled out).
+                            let companion = table_base_folder.join(alloc::format!(
+                                "{tmp_id}{}.restrict-bound",
+                                crate::file::REPAIR_TMP_SUFFIX
+                            ));
+                            if folder_fs.exists(&companion)? {
+                                Self::sweep_artifact(folder_fs.as_ref(), &companion)?;
+                            }
+                            Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                        }
+                        continue;
+                    }
+                    // The companion's fate followed its temp when that entry
+                    // resolved (first, by sort order): a finished swap renamed
+                    // it into place, an abandoned build's sweep removed it. A
+                    // survivor here is an orphan (its temp is gone) — remove
+                    // it rather than reject the whole open over it.
+                    crate::file::TableDirEntry::RepairTmpCompanion(_) => {
+                        if folder_fs.exists(&table_file_path)? {
+                            log::warn!(
+                                "Removing orphaned repair-replacement sidecar: {}",
+                                table_file_path.display()
+                            );
+                            Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                        }
+                        continue;
+                    }
+                    // Not a shape the engine names, so not engine state: passed
+                    // over untouched. Refusing the store here would let any
+                    // stray file (an operator's note, a backup, a desktop
+                    // environment's directory metadata) make it unopenable,
+                    // which is why scanners used to carry a list of foreign
+                    // names to tolerate. The grammar answers it instead.
+                    crate::file::TableDirEntry::Foreign => {
+                        log::debug!(
+                            "Ignoring {table_file_name:?} in the tables folder: not an engine file"
+                        );
+                        continue;
+                    }
+                    crate::file::TableDirEntry::Table(id) => id,
+                };
 
                 // Remove from map to prevent duplicate recovery if the same
                 // table file exists in multiple scanned folders.
-                if let Some((level_idx, checksum, global_seqno)) = table_map.remove(&table_id) {
+                if let Some(entry) = table_map.remove(&table_id) {
+                    let (level_idx, checksum, global_seqno) = entry;
                     let pin_filter = config.filter_block_pinning_policy.get(level_idx.into());
                     let pin_index = config.index_block_pinning_policy.get(level_idx.into());
 
-                    let table = Table::recover(
-                        table_file_path,
-                        checksum,
-                        global_seqno,
-                        tree_id,
-                        table_id,
-                        config.cache.clone(),
-                        config.descriptor_table.clone(),
-                        folder_fs.clone(),
-                        pin_filter,
-                        pin_index,
-                        config.encryption.clone(),
+                    let table = {
+                        let mut params = crate::table::RecoverParams::new(
+                            table_file_path.clone(),
+                            checksum,
+                            table_id,
+                            folder_fs.clone(),
+                            config.comparator.clone(),
+                            config.cache.clone(),
+                        );
+                        params.global_seqno = global_seqno;
+                        params.tree_id = tree_id;
+                        params.descriptor_table.clone_from(&config.descriptor_table);
+                        params.pin_filter = pin_filter;
+                        params.pin_index = pin_index;
+                        params.encryption.clone_from(&config.encryption);
                         #[cfg(zstd_any)]
-                        config.zstd_dictionary.clone(),
-                        config.comparator.clone(),
+                        {
+                            params.zstd_dictionary.clone_from(&config.zstd_dictionary);
+                        }
                         #[cfg(feature = "metrics")]
-                        metrics.clone(),
-                    )?;
+                        {
+                            params.metrics = metrics.clone();
+                        }
+                        match Table::recover(params) {
+                            Ok(table) => table,
+                            Err(e) => {
+                                // A routed tree can hold this id in more than
+                                // one folder, and repair's post-commit sweep of
+                                // the copy it displaced can fail after the
+                                // manifest is already durable. Ending the search
+                                // on the first sighting would then shut the tree
+                                // on a table that is present and intact one
+                                // folder over. Put the id back, remember the
+                                // failure, and keep scanning; if no folder
+                                // yields the manifest's copy, this error is what
+                                // the open reports.
+                                log::warn!(
+                                    "table {table_id} at {} did not recover ({e}); \
+                                     looking for another routed copy",
+                                    table_file_path.display(),
+                                );
+                                table_map.insert(table_id, entry);
+                                unrecovered_sightings.entry(table_id).or_insert(e);
+                                continue;
+                            }
+                        }
+                    };
+
+                    // Opening proves the file is STRUCTURALLY sound, never that
+                    // it is the generation the manifest committed: recover parses
+                    // metadata and loads data blocks lazily. Where two folders
+                    // hold this id, take the digest as the arbiter, exactly as
+                    // repair does, so a stale twin an interrupted sweep left
+                    // behind cannot win on scan order.
+                    if ambiguous_ids.contains(&table_id) {
+                        // The candidate is UNRESTRICTED here: the manifest's
+                        // restrictions are attached when the version is built,
+                        // which is after this scan. Digesting it whole would
+                        // compare against a live-suffix digest and reject every
+                        // copy of a restricted id, so the bound is supplied
+                        // explicitly.
+                        let live =
+                            match table.suffix_checksum_for(recovery.restrictions.get(&table_id)) {
+                                Ok(live) => live,
+                                // A fault in the ENVIRONMENT says nothing about
+                                // these bytes, so it propagates and a retry can
+                                // re-read them.
+                                Err(e) if e.is_environmental() => return Err(e),
+                                // Anything else is damage to THIS copy: metadata
+                                // can parse while a data extent is unreadable, and
+                                // ending the scan on it would let a damaged
+                                // displaced copy permanently block the intact one a
+                                // folder over. Same treatment as a failed recover.
+                                Err(e) => {
+                                    log::warn!(
+                                        "table {table_id} at {} could not be digested ({e}); \
+                                     looking for another routed copy",
+                                        table_file_path.display(),
+                                    );
+                                    table_map.insert(table_id, entry);
+                                    unrecovered_sightings.entry(table_id).or_insert(e);
+                                    continue;
+                                }
+                            };
+                        if live != checksum {
+                            log::warn!(
+                                "table {table_id} at {} is not the generation the manifest \
+                                 committed; looking for another routed copy",
+                                table_file_path.display(),
+                            );
+                            table_map.insert(table_id, entry);
+                            unrecovered_sightings.entry(table_id).or_insert(
+                                crate::Error::ChecksumMismatch {
+                                    got: live,
+                                    expected: checksum,
+                                },
+                            );
+                            rejected_copies.push((
+                                table_id,
+                                table_file_path,
+                                Arc::clone(folder_fs),
+                            ));
+                            continue;
+                        }
+                        accepted_copies
+                            .insert(table_id, (table_file_path.clone(), Arc::clone(folder_fs)));
+                    }
 
                     tables.push(table);
                     recovered_table_ids.insert(table_id);
+                    unrecovered_sightings.remove(&table_id);
 
                     if tables.len() % progress_mod == 0 {
                         log::debug!("Recovered {}/{cnt} tables", tables.len());
                     }
                 } else if recovered_table_ids.contains(&table_id) {
                     // Duplicate sighting of an already-recovered manifest table
-                    // (e.g., via symlink or case-insensitive alias). Skip it —
-                    // do NOT treat as orphan or the live SST will be deleted.
+                    // (e.g., via symlink or case-insensitive alias). Never an
+                    // orphan: that would delete the live SST. But an id the
+                    // digest arbitrated has a KNOWN answer, so a later sighting
+                    // is judged rather than merely skipped, or a stale twin
+                    // scanned after the winner would outlive the open.
+                    let stale = match accepted_copies.get(&table_id) {
+                        Some((winner, winner_fs)) if *winner != table_file_path => {
+                            differs_byte_for_byte(
+                                &**winner_fs,
+                                winner,
+                                folder_fs.as_ref(),
+                                &table_file_path,
+                            )?
+                        }
+                        _ => false,
+                    };
+                    if stale {
+                        rejected_copies.push((
+                            table_id,
+                            table_file_path.clone(),
+                            Arc::clone(folder_fs),
+                        ));
+                    }
                     log::warn!(
                         "Skipping duplicate sighting of manifest table {table_id} in {}",
                         table_file_path.display(),
@@ -4130,6 +5145,41 @@ impl Tree {
                     orphaned_tables.push((table_file_path, folder_fs.clone()));
                 }
             }
+        }
+
+        // Every folder is scanned, so an id that never recovered has no copy
+        // left to try. Report the failure that stopped it — a missing-table
+        // diagnostic would hide the reason the file on disk could not be read.
+        if let Some((_, e)) = unrecovered_sightings
+            .into_iter()
+            .find(|(id, _)| table_map.contains_key(id))
+        {
+            return Err(e);
+        }
+
+        // A deferred replacement whose id RECOVERED from some folder is settled:
+        // that copy matched the manifest, so this temp is provably NOT what the
+        // manifest names — an abandoned build, removed here exactly as the
+        // in-scan branch removes one. One whose id never arrived is still
+        // ambiguous: the temp may be the only copy of what the manifest
+        // describes, so the ambiguity is what the open reports.
+        #[cfg(feature = "std")]
+        for (tmp_id, temp_path, temp_fs, ambiguity) in deferred_temps {
+            if !recovered_table_ids.contains(&tmp_id) {
+                return Err(ambiguity);
+            }
+            log::warn!(
+                "Removing abandoned repair replacement for table {tmp_id} (the copy this open \
+                 recovered is what the manifest names): {}",
+                temp_path.display(),
+            );
+            // The restricted-salvage companion classifies as Foreign and would
+            // fail the next open, so it goes with the temp.
+            let companion = crate::restrict_bound::sidecar_path(&temp_path);
+            if temp_fs.exists(&companion)? {
+                Self::sweep_artifact(temp_fs.as_ref(), &companion)?;
+            }
+            Self::sweep_artifact(temp_fs.as_ref(), &temp_path)?;
         }
 
         if tables.len() < cnt {
@@ -4179,9 +5229,23 @@ impl Tree {
 
         log::debug!("Successfully recovered {} tables", tables.len());
 
+        // Pair each blob file with its live-data frontier: a file whose consumed
+        // prefix was reclaimed in place records a checksum over the suffix only,
+        // so the recovered view must carry the offset that digest starts at.
+        let blob_ids_with_frontier: Vec<(crate::vlog::BlobFileId, crate::Checksum, u64)> = recovery
+            .blob_file_ids
+            .iter()
+            .map(|&(id, checksum)| {
+                (
+                    id,
+                    checksum,
+                    recovery.blob_restrictions.get(&id).copied().unwrap_or(0),
+                )
+            })
+            .collect();
         let (blob_files, orphaned_blob_files) = crate::vlog::recover_blob_files(
             &tree_path.join(crate::file::BLOBS_FOLDER),
-            &recovery.blob_file_ids,
+            &blob_ids_with_frontier,
             tree_id,
             config.descriptor_table.as_ref(),
             &config.fs,
@@ -4189,12 +5253,47 @@ impl Tree {
 
         let version = Version::from_recovery(recovery, &tables, &blob_files)?;
 
+        // Republish any restriction sidecar that never landed. The sidecar is
+        // written AFTER its slice commits, so a failure (or a crash) in that
+        // window leaves a committed restriction with no `.restrict-bound` file.
+        // The manifest still describes it, so a normal open is unaffected — but
+        // a later manifest-loss repair would find an unrestricted input beside
+        // the slice output and publish BOTH histories, applying every merge
+        // operand of the consumed prefix twice (operands are deliberately never
+        // deduplicated across sources). The manifest is the authority for the
+        // bound, so derive the missing sidecar from it here and the window
+        // closes at the next open rather than staying open forever.
+        #[cfg(feature = "std")]
+        Self::republish_missing_restriction_sidecars(&version, config)?;
+
         // NOTE: Cleanup old versions
         // But only after we definitely recovered the latest version.
         // Preserve the snapshot CURRENT references (and its `edits-` log) — the
         // latest version id has no file of its own under the incremental
         // manifest, so cleaning by it would delete the live snapshot.
         Self::cleanup_orphaned_version(tree_path, snapshot_id, &*config.fs)?;
+
+        // A copy the digest rejected goes only once its id has a winner: with
+        // one it is provably superseded, without one it may be all that is
+        // left. Its `.restrict-bound` companion goes with it, or the next scan
+        // classifies that name as foreign and fails the open.
+        for (table_id, path, copy_fs) in rejected_copies {
+            if !recovered_table_ids.contains(&table_id) {
+                continue;
+            }
+            log::warn!(
+                "Removing superseded copy of table {table_id}: {}",
+                path.display()
+            );
+            #[cfg(feature = "std")]
+            {
+                let companion = crate::restrict_bound::sidecar_path(&path);
+                if copy_fs.exists(&companion)? {
+                    Self::sweep_artifact(copy_fs.as_ref(), &companion)?;
+                }
+            }
+            Self::sweep_artifact(copy_fs.as_ref(), &path)?;
+        }
 
         for (table_path, orphan_fs) in orphaned_tables {
             log::debug!("Deleting orphaned table {}", table_path.display());
@@ -4209,7 +5308,70 @@ impl Tree {
         Ok(version)
     }
 
-    /// Removes stale version files left over from a crash during version swap.
+    /// Writes the `.restrict-bound` sidecar of every restricted table in
+    /// `version` that has none, so the bound the manifest holds is recoverable
+    /// without it. An existing sidecar is REREAD rather than assumed good: its
+    /// mere presence proves nothing, and a repair that later trusts a corrupt
+    /// one derives a conservative bound (dropping up to one live block), while
+    /// a valid-but-STALE one — the shape a second slice leaves when its own
+    /// write fails — restricts LESS than reality and resurrects consumed rows.
+    /// A sidecar that already records this table and this bound is left alone,
+    /// so a healthy tree does not churn the file on every open. Failures
+    /// propagate — an unrecoverable restriction is exactly what this closes, so
+    /// silently skipping it would keep the window open.
+    ///
+    /// The sidecar is a filesystem artifact of the tight-space reclaim path, so
+    /// this is a no-op without `std` — a build without it never writes one.
+    #[cfg(feature = "std")]
+    fn republish_missing_restriction_sidecars(
+        version: &Version,
+        config: &Config,
+    ) -> crate::Result<()> {
+        for table in version.iter_tables() {
+            let Some(bound) = table.restrict_lower_bound() else {
+                continue;
+            };
+            let recorded =
+                crate::restrict_bound::read(&*table.fs, &table.path, config.encryption.as_deref())?;
+            let state = match &recorded {
+                crate::restrict_bound::SidecarRead::Present(id, recorded_bound)
+                    if *id == table.metadata.id && recorded_bound.as_slice() == bound.as_ref() =>
+                {
+                    continue;
+                }
+                crate::restrict_bound::SidecarRead::Present(..) => {
+                    "disagrees with the manifest (stale bound or another table)"
+                }
+                crate::restrict_bound::SidecarRead::Corrupt => "unreadable",
+                crate::restrict_bound::SidecarRead::Missing => "absent",
+            };
+            log::warn!(
+                "table {} carries a committed restriction whose sidecar is {state}; \
+                 republishing it from the manifest",
+                table.id(),
+            );
+            table.write_restrict_sidecar(bound, config.sync_mode)?;
+        }
+        Ok(())
+    }
+
+    /// Removes a recovery-swept artifact (an abandoned heal copy / temp / marker),
+    /// treating a concurrent removal (`NotFound`) as success. A benign race (a
+    /// retry, or another scanner that already swept it) must not fail recovery,
+    /// matching [`Self::cleanup_orphaned_version`].
+    fn sweep_artifact(fs: &dyn Fs, path: &Path) -> crate::Result<()> {
+        match fs.remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Removes stale manifest files left by older generations: every `v{id}`
+    /// snapshot except the live one (`v{snapshot_id}`) and every `edits-{id}`
+    /// log except the live snapshot's (`edits-{snapshot_id}`). A crashed
+    /// rotation can leak an old snapshot or its log; this sweeps them on open.
+    /// The live snapshot and log are exactly the generation `CURRENT` points at.
     ///
     /// # Behavior change vs pre-Fs-trait code
     ///
@@ -4219,11 +5381,6 @@ impl Tree {
     /// function now fails fast on non-UTF-8 names. This is intentional: version
     /// files are always `v{u64}` — any non-UTF-8 entry indicates filesystem
     /// corruption and should surface as an error rather than be silently ignored.
-    /// Removes stale manifest files left by older generations: every `v{id}`
-    /// snapshot except the live one (`v{snapshot_id}`) and every `edits-{id}`
-    /// log except the live snapshot's (`edits-{snapshot_id}`). A crashed
-    /// rotation can leak an old snapshot or its log; this sweeps them on open.
-    /// The live snapshot and log are exactly the generation `CURRENT` points at.
     fn cleanup_orphaned_version(
         path: &Path,
         snapshot_id: crate::version::VersionId,
@@ -4285,6 +5442,39 @@ fn has_existing_version_state(folder: &Path, fs: &dyn Fs) -> crate::Result<bool>
     Ok(false)
 }
 
+/// Whether two sightings of one table id PROVABLY hold different bytes.
+///
+/// Used to judge a duplicate scanned after its id was already accepted: the
+/// winner matched the manifest, so a copy whose bytes differ from it cannot
+/// also be the committed generation and is safe to sweep. Identical bytes mean
+/// an alias or an exact copy, which is kept.
+///
+/// Only a completed comparison is proof. A read that fails on the BYTES proves
+/// nothing about which generation this is, so it answers `false` and the file
+/// stays; an ENVIRONMENTAL fault propagates, since a retry can re-read it.
+///
+/// # Errors
+///
+/// Propagates an environmental read failure of either file.
+fn differs_byte_for_byte(
+    winner_fs: &dyn crate::fs::Fs,
+    winner: &Path,
+    candidate_fs: &dyn crate::fs::Fs,
+    candidate: &Path,
+) -> crate::Result<bool> {
+    let digest = |fs: &dyn crate::fs::Fs, path: &Path| -> crate::Result<Option<u128>> {
+        match crate::file::checksum_from_with_overrides(fs, path, 0, &[]) {
+            Ok(d) => Ok(Some(d)),
+            Err(e) if e.is_environmental() => Err(e),
+            Err(_) => Ok(None),
+        }
+    };
+    let (Some(a), Some(b)) = (digest(winner_fs, winner)?, digest(candidate_fs, candidate)?) else {
+        return Ok(false);
+    };
+    Ok(a != b)
+}
+
 /// Raises a query's lower bound to a table's tight-space restriction, if any.
 ///
 /// Keys below `restriction` are the punched-out prefix served by the
@@ -4312,5 +5502,13 @@ fn effective_lower_bound<'a>(
 #[cfg(test)]
 mod cardinality_tests;
 
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "test code")]
+mod scan_since_freeze_tests;
+
 #[cfg(all(test, feature = "metrics"))]
 mod cache_stats_tests;
+
+#[cfg(all(test, feature = "std"))]
+#[expect(clippy::expect_used, reason = "test code")]
+mod restricted_reclaim_tests;

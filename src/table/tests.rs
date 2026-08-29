@@ -14,6 +14,23 @@ use crate::{config::BloomConstructionPolicy, fs::StdFs, hash::hash64};
 use tempfile::tempdir;
 use test_log::test;
 
+/// Recover params for the common test shape: table id 0, `StdFs`, the default
+/// comparator, a small cache, and a pooled descriptor table. Tests tweak the
+/// returned params for whatever they exercise (pinning, encryption, a custom
+/// fs or dictionary).
+fn test_recover_params(file_path: PathBuf, checksum: Checksum) -> RecoverParams {
+    let mut params = RecoverParams::new(
+        file_path,
+        checksum,
+        0,
+        Arc::new(StdFs),
+        crate::comparator::default_comparator(),
+        Arc::new(Cache::with_capacity_bytes(1_000_000)),
+    );
+    params.descriptor_table = Some(Arc::new(DescriptorTable::new(10)));
+    params
+}
+
 fn test_with_table(
     items: &[InternalValue],
     f: impl Fn(Table) -> crate::Result<()>,
@@ -72,24 +89,19 @@ fn test_with_table_impl(
             #[cfg(feature = "metrics")]
             let metrics = Arc::new(Metrics::default());
 
-            let table = Table::recover(
-                file.clone(),
-                checksum,
-                0,
-                0,
-                0,
-                Arc::new(Cache::with_capacity_bytes(1_000_000)),
-                Some(Arc::new(DescriptorTable::new(10))),
-                Arc::new(StdFs),
-                false,
-                false,
-                None,
+            let table = {
+                #[cfg_attr(not(zstd_any), expect(unused_mut))]
+                let mut params = test_recover_params(file.clone(), checksum);
                 #[cfg(zstd_any)]
-                zstd_dictionary.clone(),
-                crate::comparator::default_comparator(),
+                {
+                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                }
                 #[cfg(feature = "metrics")]
-                metrics,
-            )?;
+                {
+                    params.metrics = metrics;
+                }
+                Table::recover(params)?
+            };
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
@@ -108,24 +120,19 @@ fn test_with_table_impl(
             #[cfg(feature = "metrics")]
             let metrics = Arc::new(Metrics::default());
 
-            let table = Table::recover(
-                file.clone(),
-                checksum,
-                0,
-                0,
-                0,
-                Arc::new(Cache::with_capacity_bytes(1_000_000)),
-                Some(Arc::new(DescriptorTable::new(10))),
-                Arc::new(StdFs),
-                true,
-                false,
-                None,
+            let table = {
+                let mut params = test_recover_params(file.clone(), checksum);
+                params.pin_filter = true;
                 #[cfg(zstd_any)]
-                zstd_dictionary.clone(),
-                crate::comparator::default_comparator(),
+                {
+                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                }
                 #[cfg(feature = "metrics")]
-                metrics,
-            )?;
+                {
+                    params.metrics = metrics;
+                }
+                Table::recover(params)?
+            };
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
@@ -144,24 +151,19 @@ fn test_with_table_impl(
             #[cfg(feature = "metrics")]
             let metrics = Arc::new(Metrics::default());
 
-            let table = Table::recover(
-                file.clone(),
-                checksum,
-                0,
-                0,
-                0,
-                Arc::new(Cache::with_capacity_bytes(1_000_000)),
-                Some(Arc::new(DescriptorTable::new(10))),
-                Arc::new(StdFs),
-                false,
-                true,
-                None,
+            let table = {
+                let mut params = test_recover_params(file.clone(), checksum);
+                params.pin_index = true;
                 #[cfg(zstd_any)]
-                zstd_dictionary.clone(),
-                crate::comparator::default_comparator(),
+                {
+                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                }
                 #[cfg(feature = "metrics")]
-                metrics,
-            )?;
+                {
+                    params.metrics = metrics;
+                }
+                Table::recover(params)?
+            };
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
@@ -180,24 +182,20 @@ fn test_with_table_impl(
             #[cfg(feature = "metrics")]
             let metrics = Arc::new(Metrics::default());
 
-            let table = Table::recover(
-                file.clone(),
-                checksum,
-                0,
-                0,
-                0,
-                Arc::new(Cache::with_capacity_bytes(1_000_000)),
-                Some(Arc::new(DescriptorTable::new(10))),
-                Arc::new(StdFs),
-                true,
-                true,
-                None,
+            let table = {
+                let mut params = test_recover_params(file.clone(), checksum);
+                params.pin_filter = true;
+                params.pin_index = true;
                 #[cfg(zstd_any)]
-                zstd_dictionary.clone(),
-                crate::comparator::default_comparator(),
+                {
+                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                }
                 #[cfg(feature = "metrics")]
-                metrics,
-            )?;
+                {
+                    params.metrics = metrics;
+                }
+                Table::recover(params)?
+            };
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
@@ -216,24 +214,21 @@ fn test_with_table_impl(
             #[cfg(feature = "metrics")]
             let metrics = Arc::new(Metrics::default());
 
-            let table = Table::recover(
-                file.clone(),
-                checksum,
-                0,
-                0,
-                0,
-                Arc::new(Cache::with_capacity_bytes(1_000_000)),
-                None,
-                Arc::new(StdFs),
-                true,
-                true,
-                None,
+            let table = {
+                let mut params = test_recover_params(file.clone(), checksum);
+                params.descriptor_table = None;
+                params.pin_filter = true;
+                params.pin_index = true;
                 #[cfg(zstd_any)]
-                zstd_dictionary.clone(),
-                crate::comparator::default_comparator(),
+                {
+                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                }
                 #[cfg(feature = "metrics")]
-                metrics,
-            )?;
+                {
+                    params.metrics = metrics;
+                }
+                Table::recover(params)?
+            };
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
@@ -275,24 +270,19 @@ fn test_with_table_impl(
             #[cfg(feature = "metrics")]
             let metrics = Arc::new(Metrics::default());
 
-            let table = Table::recover(
-                file.clone(),
-                checksum,
-                0,
-                0,
-                0,
-                Arc::new(Cache::with_capacity_bytes(1_000_000)),
-                Some(Arc::new(DescriptorTable::new(10))),
-                Arc::new(StdFs),
-                false,
-                false,
-                None,
+            let table = {
+                #[cfg_attr(not(zstd_any), expect(unused_mut))]
+                let mut params = test_recover_params(file.clone(), checksum);
                 #[cfg(zstd_any)]
-                zstd_dictionary.clone(),
-                crate::comparator::default_comparator(),
+                {
+                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                }
                 #[cfg(feature = "metrics")]
-                metrics,
-            )?;
+                {
+                    params.metrics = metrics;
+                }
+                Table::recover(params)?
+            };
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
@@ -310,24 +300,19 @@ fn test_with_table_impl(
             #[cfg(feature = "metrics")]
             let metrics = Arc::new(Metrics::default());
 
-            let table = Table::recover(
-                file.clone(),
-                checksum,
-                0,
-                0,
-                0,
-                Arc::new(Cache::with_capacity_bytes(1_000_000)),
-                Some(Arc::new(DescriptorTable::new(10))),
-                Arc::new(StdFs),
-                true,
-                false,
-                None,
+            let table = {
+                let mut params = test_recover_params(file.clone(), checksum);
+                params.pin_filter = true;
                 #[cfg(zstd_any)]
-                zstd_dictionary.clone(),
-                crate::comparator::default_comparator(),
+                {
+                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                }
                 #[cfg(feature = "metrics")]
-                metrics,
-            )?;
+                {
+                    params.metrics = metrics;
+                }
+                Table::recover(params)?
+            };
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
@@ -345,24 +330,19 @@ fn test_with_table_impl(
             #[cfg(feature = "metrics")]
             let metrics = Arc::new(Metrics::default());
 
-            let table = Table::recover(
-                file.clone(),
-                checksum,
-                0,
-                0,
-                0,
-                Arc::new(Cache::with_capacity_bytes(1_000_000)),
-                Some(Arc::new(DescriptorTable::new(10))),
-                Arc::new(StdFs),
-                false,
-                true,
-                None,
+            let table = {
+                let mut params = test_recover_params(file.clone(), checksum);
+                params.pin_index = true;
                 #[cfg(zstd_any)]
-                zstd_dictionary.clone(),
-                crate::comparator::default_comparator(),
+                {
+                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                }
                 #[cfg(feature = "metrics")]
-                metrics,
-            )?;
+                {
+                    params.metrics = metrics;
+                }
+                Table::recover(params)?
+            };
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
@@ -381,24 +361,20 @@ fn test_with_table_impl(
             #[cfg(feature = "metrics")]
             let metrics = Arc::new(Metrics::default());
 
-            let table = Table::recover(
-                file.clone(),
-                checksum,
-                0,
-                0,
-                0,
-                Arc::new(Cache::with_capacity_bytes(1_000_000)),
-                Some(Arc::new(DescriptorTable::new(10))),
-                Arc::new(StdFs),
-                true,
-                true,
-                None,
+            let table = {
+                let mut params = test_recover_params(file.clone(), checksum);
+                params.pin_filter = true;
+                params.pin_index = true;
                 #[cfg(zstd_any)]
-                zstd_dictionary.clone(),
-                crate::comparator::default_comparator(),
+                {
+                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                }
                 #[cfg(feature = "metrics")]
-                metrics,
-            )?;
+                {
+                    params.metrics = metrics;
+                }
+                Table::recover(params)?
+            };
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
@@ -417,24 +393,21 @@ fn test_with_table_impl(
             #[cfg(feature = "metrics")]
             let metrics = Arc::new(Metrics::default());
 
-            let table = Table::recover(
-                file,
-                checksum,
-                0,
-                0,
-                0,
-                Arc::new(Cache::with_capacity_bytes(1_000_000)),
-                None,
-                Arc::new(StdFs),
-                true,
-                true,
-                None,
+            let table = {
+                let mut params = test_recover_params(file, checksum);
+                params.descriptor_table = None;
+                params.pin_filter = true;
+                params.pin_index = true;
                 #[cfg(zstd_any)]
-                zstd_dictionary,
-                crate::comparator::default_comparator(),
+                {
+                    params.zstd_dictionary = zstd_dictionary;
+                }
                 #[cfg(feature = "metrics")]
-                metrics,
-            )?;
+                {
+                    params.metrics = metrics;
+                }
+                Table::recover(params)?
+            };
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
@@ -517,31 +490,22 @@ fn block_layout_section_roundtrips_for_large_zstd_blocks() {
 
     #[cfg(feature = "metrics")]
     let metrics = Arc::new(Metrics::default());
-    let table = Table::recover(
-        file,
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(4_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        false,
-        false,
-        None,
-        None,
-        crate::comparator::default_comparator(),
+    let table = {
+        let mut params = test_recover_params(file, checksum);
+        params.cache = Arc::new(Cache::with_capacity_bytes(4_000_000));
         #[cfg(feature = "metrics")]
-        metrics,
-    )
-    .unwrap();
+        {
+            params.metrics = metrics;
+        }
+        Table::recover(params).unwrap()
+    };
 
     assert!(
         table.regions.block_layout.is_some(),
         "large multi-inner-block table must carry a block_layout section",
     );
     assert!(
-        table.block_layout.len() >= 1,
+        !table.block_layout.is_empty(),
         "at least one data block must have a recorded inner-block layout",
     );
     // Every recorded entry must have strictly increasing cumulative ends whose
@@ -576,24 +540,15 @@ fn block_layout_section_roundtrips_for_large_zstd_blocks() {
 
     #[cfg(feature = "metrics")]
     let small_metrics = Arc::new(Metrics::default());
-    let small_table = Table::recover(
-        small_file,
-        small_checksum,
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(4_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        false,
-        false,
-        None,
-        None,
-        crate::comparator::default_comparator(),
+    let small_table = {
+        let mut params = test_recover_params(small_file, small_checksum);
+        params.cache = Arc::new(Cache::with_capacity_bytes(4_000_000));
         #[cfg(feature = "metrics")]
-        small_metrics,
-    )
-    .unwrap();
+        {
+            params.metrics = small_metrics;
+        }
+        Table::recover(params).unwrap()
+    };
 
     assert!(
         small_table.regions.block_layout.is_none(),
@@ -756,6 +711,872 @@ fn reopen_restricted_yields_a_distinct_clamped_view() -> crate::Result<()> {
     )
 }
 
+/// A LEGACY table (written before `descriptor#delete_bitmap_hash` existed)
+/// carrying a delete bitmap must still reconcile on the directly attributable
+/// heal path: there the pre-heal digest matched the manifest, authenticating
+/// the bitmap bytes, so the missing hash proves nothing. Rejecting it strips
+/// the heal attestation and strands the healed table under a stale digest
+/// forever. Repair (no matching digest) must keep failing closed on the same
+/// file.
+///
+/// Columnar-gated like the delete-bitmap authentication gate itself: a
+/// non-columnar build has no positional-delete masking, so the gate (and
+/// this fixture's bitmap) does not exist there.
+#[test]
+#[cfg(feature = "columnar")]
+fn metadata_bounds_accept_a_legacy_bitmap_when_digest_authenticated() -> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("legacy");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    writer.omit_delete_bitmap_hash_for_test = true;
+    for i in 0..16u32 {
+        writer.write(crate::InternalValue::from_components(
+            format!("key{i:03}").into_bytes(),
+            b"v".as_slice(),
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    writer.delete_bitmap_mut().insert(3);
+    assert!(writer.finish()?.is_some(), "legacy SST is non-empty");
+
+    let table = {
+        let mut params = test_recover_params(file, crate::Checksum::from_raw(0));
+        params.fs = Arc::clone(&fs);
+        Table::recover(params)?
+    };
+    assert!(
+        table.verify_metadata_bounds(false).is_err(),
+        "repair (no matching digest) keeps failing closed on the \
+         unauthenticatable legacy bitmap",
+    );
+    table.verify_metadata_bounds(true)?;
+    Ok(())
+}
+
+/// A restricted view's compaction scanner must start at the restriction:
+/// the punched prefix reads as zeros (a raw scan aborts on the first punched
+/// block), and even before the punch runs, the sub-bound rows' authoritative
+/// copies live in the superseding slice output — a serial compaction reading
+/// them through the restricted input would merge every prefix row twice.
+/// The unrestricted view keeps scanning the whole file.
+#[test]
+#[expect(clippy::unwrap_used)]
+fn restricted_view_scan_starts_at_the_bound() -> crate::Result<()> {
+    let items: Vec<_> = (0..40u32)
+        .map(|i| {
+            crate::InternalValue::from_components(
+                format!("key{i:03}").into_bytes(),
+                b"v".as_slice(),
+                0,
+                crate::ValueType::Value,
+            )
+        })
+        .collect();
+    test_with_table(
+        &items,
+        |table| {
+            let restricted = table.reopen_restricted(crate::UserKey::from(&b"key020"[..]))?;
+            let keys: Vec<_> = restricted
+                .scan()?
+                .map(|r| r.unwrap().key.user_key)
+                .collect();
+            let expected: Vec<_> = (20..40u32)
+                .map(|i| crate::UserKey::from(format!("key{i:03}").into_bytes()))
+                .collect();
+            assert_eq!(
+                keys, expected,
+                "the restricted scan must yield only keys at or past the bound",
+            );
+
+            let full = table.scan()?.count();
+            assert_eq!(full, 40, "the unrestricted view scans the whole file");
+            Ok(())
+        },
+        None,
+        // Tiny blocks so the table spans several data blocks and the bound
+        // lands mid-file (skipped whole blocks + a straddling block).
+        Some(|w: Writer| w.use_data_block_size(64)),
+    )
+}
+
+/// A restricted view exposes range tombstones CLAMPED to the live suffix:
+/// a tombstone wholly below the bound is the punched prefix's deletion (the
+/// slice output that superseded the prefix carries its clipped copy), and a
+/// straddling tombstone starts at the bound. Unclamped, `scan_since` would
+/// emit the same deletion twice and cover keys this view no longer owns.
+/// The unrestricted view keeps the full list.
+#[test]
+fn restricted_view_clamps_visible_range_tombstones() -> crate::Result<()> {
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"z", b"v", 0, crate::ValueType::Value),
+    ];
+    let rt = |s: &[u8], e: &[u8], seqno| {
+        crate::range_tombstone::RangeTombstone::new(
+            crate::UserKey::from(s),
+            crate::UserKey::from(e),
+            seqno,
+        )
+    };
+    test_with_table(
+        &items,
+        |table| {
+            let unrestricted: Vec<_> = table.visible_range_tombstones().collect();
+            assert_eq!(
+                unrestricted.len(),
+                3,
+                "the unrestricted view keeps the full list: {unrestricted:?}",
+            );
+
+            let restricted = table.reopen_restricted(crate::UserKey::from(&b"g"[..]))?;
+            let visible: Vec<_> = restricted.visible_range_tombstones().collect();
+            assert_eq!(
+                visible,
+                vec![rt(b"g", b"m", 5), rt(b"p", b"r", 6)],
+                "wholly-below dropped, straddling clamped to the bound, \
+                 above-bound untouched",
+            );
+            Ok(())
+        },
+        None,
+        Some(|mut w: Writer| {
+            w.write_range_tombstone(rt(b"a", b"c", 4)); // wholly below "g"
+            w.write_range_tombstone(rt(b"a", b"m", 5)); // straddles "g"
+            w.write_range_tombstone(rt(b"p", b"r", 6)); // above "g"
+            w
+        }),
+    )
+}
+
+/// A restricted view must still cross-check its `linked_blob_files` section: the
+/// section carries no checksum, so a same-size rot that under-counts (or drops) a
+/// blob id the READABLE SUFFIX still references passes the block walk, and blob GC
+/// could then retire a file the suffix addresses. The whole-table aggregate can't
+/// be matched exactly once the prefix is punched, but every id/count the suffix
+/// derives must be COVERED BY the recorded aggregate. Here id 9 (referenced by the
+/// suffix key `key00009`) is recorded with a too-small byte total, so both the
+/// unrestricted exact check and the restricted containment check must reject it.
+#[cfg(feature = "std")]
+#[test]
+fn verify_blob_links_rejects_an_undercounted_suffix_id_on_a_restricted_view() -> crate::Result<()> {
+    use crate::blob_tree::handle::BlobIndirection;
+
+    use crate::coding::Encode;
+    use crate::table::Writer;
+    use crate::vlog::ValueHandle;
+    use crate::{InternalValue, ValueType};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("0");
+
+    // Ten indirections (ids 0..10), each 1000 logical / 500 on-disk bytes. The
+    // recorded section matches every id EXCEPT id 9, whose byte total is forged
+    // small — the bit-flip a checksum-less section cannot otherwise catch.
+    let checksum = {
+        let mut w = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_data_block_size(128);
+        for i in 0u64..10 {
+            let value = BlobIndirection {
+                size: 1000,
+                vhandle: ValueHandle {
+                    blob_file_id: i,
+                    on_disk_size: 500,
+                    offset: 0,
+                },
+            }
+            .encode_into_vec();
+            w.write(InternalValue::from_components(
+                format!("key{i:05}").into_bytes(),
+                value,
+                i + 1,
+                ValueType::Indirection,
+            ))?;
+        }
+        for i in 0u64..10 {
+            let bytes = if i == 9 { 1 } else { 1000 };
+            w.link_blob_file(i, 1, bytes, 500);
+        }
+        w.finish()?.expect("the SST is non-empty").1
+    };
+
+    let recover =
+        || -> crate::Result<Table> { Table::recover(test_recover_params(file.clone(), checksum)) };
+
+    // Baseline: the unrestricted exact check already rejects the bad section.
+    assert!(
+        recover()?.verify_blob_links().is_err(),
+        "the unrestricted exact check must reject the under-counted id",
+    );
+
+    // The restricted view clamped to key00005 still references id 9 in its live
+    // suffix, so the containment check must reject the under-count too.
+    let restricted = recover()?.reopen_restricted(crate::UserKey::from(&b"key00005"[..]))?;
+    assert!(
+        restricted.verify_blob_links().is_err(),
+        "the restricted containment check must reject a suffix id the section under-counts",
+    );
+    Ok(())
+}
+
+/// An `Fs` that forwards to `MemFs` but reports the CONFIGURED hard-link count
+/// for every file, so the punch path's shared-inode guard can be exercised —
+/// including a checkpoint's link later disappearing (MemFs copies on
+/// `hard_link`, so its real count is always 1, and `StdFs` cannot punch on
+/// non-Linux hosts).
+#[cfg(feature = "std")]
+#[derive(Clone)]
+struct SharedInodeFs(crate::fs::MemFs, Arc<core::sync::atomic::AtomicU64>);
+
+#[cfg(feature = "std")]
+impl crate::fs::Fs for SharedInodeFs {
+    fn open(
+        &self,
+        path: &std::path::Path,
+        options: &crate::fs::FsOpenOptions,
+    ) -> crate::io::Result<Box<dyn crate::fs::FsFile>> {
+        self.0.open(path, options)
+    }
+    fn remove_file(&self, path: &std::path::Path) -> crate::io::Result<()> {
+        self.0.remove_file(path)
+    }
+    fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> crate::io::Result<()> {
+        self.0.rename(from, to)
+    }
+    fn create_dir_all(&self, path: &std::path::Path) -> crate::io::Result<()> {
+        self.0.create_dir_all(path)
+    }
+    fn remove_dir_all(&self, path: &std::path::Path) -> crate::io::Result<()> {
+        self.0.remove_dir_all(path)
+    }
+    fn sync_directory(&self, path: &std::path::Path) -> crate::io::Result<()> {
+        self.0.sync_directory(path)
+    }
+    fn read_dir(&self, path: &std::path::Path) -> crate::io::Result<Vec<crate::fs::FsDirEntry>> {
+        self.0.read_dir(path)
+    }
+    fn metadata(&self, path: &std::path::Path) -> crate::io::Result<crate::fs::FsMetadata> {
+        self.0.metadata(path)
+    }
+    fn exists(&self, path: &std::path::Path) -> crate::io::Result<bool> {
+        self.0.exists(path)
+    }
+    fn capabilities(&self, path: &std::path::Path) -> crate::fs::FsCapabilities {
+        self.0.capabilities(path)
+    }
+    fn punch_hole(&self, path: &std::path::Path, offset: u64, len: u64) -> crate::io::Result<()> {
+        self.0.punch_hole(path, offset, len)
+    }
+    /// The whole point: every file reports the configured link count.
+    fn hard_link_count(&self, _path: &std::path::Path) -> crate::io::Result<u64> {
+        Ok(self.1.load(core::sync::atomic::Ordering::Acquire))
+    }
+}
+
+/// The tight-space prefix punch must FAIL CLOSED on a shared inode: a completed
+/// checkpoint hard-links the SST, so punching the retired view's data blocks
+/// would zero the SAME blocks inside the immutable checkpoint, whose manifest
+/// still records the unrestricted file and its original digest. The delete path
+/// already probes the link count before truncating; the punch must too.
+#[cfg(feature = "std")]
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn punch_on_drop_refuses_a_hard_linked_table() -> crate::Result<()> {
+    use crate::fs::Fs;
+
+    let memfs = crate::fs::MemFs::new();
+    let shared: Arc<dyn Fs> = Arc::new(SharedInodeFs(
+        memfs.clone(),
+        Arc::new(core::sync::atomic::AtomicU64::new(2)),
+    ));
+    let plain: Arc<dyn Fs> = Arc::new(memfs);
+    let root = std::path::absolute("/db")?;
+    shared.create_dir_all(&root)?;
+
+    let build = |fs: &Arc<dyn Fs>, name: &str| -> crate::Result<(std::path::PathBuf, Checksum)> {
+        let path = root.join(name);
+        let mut writer = Writer::new(path.clone(), 0, 0, Arc::clone(fs))?.use_data_block_size(256);
+        for i in 0..256u32 {
+            writer.write(crate::InternalValue::from_components(
+                format!("k{i:04}").into_bytes(),
+                b"v",
+                1,
+                crate::ValueType::Value,
+            ))?;
+        }
+        let (_, checksum) = writer.finish()?.expect("table written");
+        Ok((path, checksum))
+    };
+    let recover = |fs: &Arc<dyn Fs>, path: &std::path::Path, checksum| -> crate::Result<Table> {
+        #[cfg(feature = "metrics")]
+        let metrics = Arc::new(Metrics::default());
+        let mut params = test_recover_params(path.to_path_buf(), checksum);
+        params.descriptor_table = None;
+        params.fs = Arc::clone(fs);
+        #[cfg(feature = "metrics")]
+        {
+            params.metrics = metrics;
+        }
+        Table::recover(params)
+    };
+    let read_all = |fs: &Arc<dyn Fs>, path: &std::path::Path| -> crate::Result<Vec<u8>> {
+        let file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let len = crate::fs::FsFile::metadata(&*file)?.len;
+        Ok(crate::file::read_exact(&*file, 0, usize::try_from(len).unwrap_or(0))?.to_vec())
+    };
+
+    // SHARED inode (a checkpoint hard-linked this SST): the punch must not run.
+    let (shared_path, shared_checksum) = build(&shared, "0")?;
+    let before = read_all(&shared, &shared_path)?;
+    let table = recover(&shared, &shared_path, shared_checksum)?;
+    let punch = table.punch_offset_for(b"k0128")?;
+    assert!(punch > 0, "the fixture has a punchable prefix");
+    table.mark_punch_on_drop(punch);
+    drop(table);
+    assert_eq!(
+        read_all(&shared, &shared_path)?,
+        before,
+        "a hard-linked SST must not be punched: the shared inode is the \
+         checkpoint's data too",
+    );
+
+    // EXCLUSIVE inode: the punch still reclaims, so the guard did not disable
+    // the reclaim path itself.
+    let (plain_path, plain_checksum) = build(&plain, "1")?;
+    let table = recover(&plain, &plain_path, plain_checksum)?;
+    let punch = table.punch_offset_for(b"k0128")?;
+    table.mark_punch_on_drop(punch);
+    drop(table);
+    let after = read_all(&plain, &plain_path)?;
+    assert!(
+        after
+            .get(..64)
+            .is_some_and(|head| head.iter().all(|&b| b == 0)),
+        "an exclusively-owned SST is still reclaimed",
+    );
+
+    // EXCLUSIVE inode but an ACTIVE checkpoint pause: the punch stands down —
+    // the pause covers the checkpoint's whole copy/link pass, so deferring
+    // removes the probe-then-punch window in which the checkpoint could link
+    // the inode after the count read 1. Mirrors the blob-prefix reclaim.
+    let (paused_path, paused_checksum) = build(&plain, "2")?;
+    let before = read_all(&plain, &paused_path)?;
+    let table = recover(&plain, &paused_path, paused_checksum)?;
+    let pause = crate::deletion_pause::DeletionPause::new_shared();
+    table.install_deletion_pause(std::sync::Arc::clone(&pause));
+    let guard = pause.acquire();
+    let punch = table.punch_offset_for(b"k0128")?;
+    table.mark_punch_on_drop(punch);
+    drop(table);
+    assert_eq!(
+        read_all(&plain, &paused_path)?,
+        before,
+        "an active checkpoint pause must defer the SST prefix reclaim",
+    );
+
+    // DEFERRED, not dropped: the view that carried the intent is gone, so the
+    // release must run the reclaim. Losing it would strand the prefix forever
+    // — exactly the space a tight-space compaction was reclaiming.
+    drop(guard);
+    let after = read_all(&plain, &paused_path)?;
+    assert!(
+        after
+            .get(..64)
+            .is_some_and(|head| head.iter().all(|&b| b == 0)),
+        "releasing the pause must run the deferred reclaim",
+    );
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "the deferred reclaim punches, it does not truncate",
+    );
+    Ok(())
+}
+
+/// Proving a punch must ask whether the zeroed run CONTAINS a hole, not
+/// whether each block's own extent wholly IS one: `punch_hole` on an
+/// unaligned block extent zero-fills the edge pages and deallocates only the
+/// wholly-contained ones, so on a real filesystem every punched block keeps
+/// allocated zeros at its boundaries. A whole-extent probe then rejects the
+/// genuine punch, and a manifest-loss repair misclassifies the reclaimed SST
+/// as damage — discarding its intact live suffix or salvaging it without the
+/// required bound.
+#[cfg(feature = "std")]
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn punched_run_with_allocated_edges_still_proves_the_punch() -> crate::Result<()> {
+    use crate::fs::Fs;
+    use std::io::{Seek, SeekFrom, Write};
+
+    let memfs = crate::fs::MemFs::new();
+    let fs: Arc<dyn Fs> = Arc::new(memfs.clone());
+    let root = std::path::absolute("/db")?;
+    fs.create_dir_all(&root)?;
+
+    let path = root.join("0");
+    let mut writer = Writer::new(path.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(256);
+    for i in 0..256u32 {
+        writer.write(crate::InternalValue::from_components(
+            format!("k{i:04}").into_bytes(),
+            b"v",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = {
+        #[cfg(feature = "metrics")]
+        let metrics = Arc::new(Metrics::default());
+        let mut params = test_recover_params(path.clone(), checksum);
+        params.descriptor_table = None;
+        params.fs = Arc::clone(&fs);
+        #[cfg(feature = "metrics")]
+        {
+            params.metrics = metrics;
+        }
+        Table::recover(params)?
+    };
+    let punch_off = table.punch_offset_for(b"k0128")?;
+    assert!(punch_off > 64, "the fixture has a punchable prefix");
+
+    // The reclaim's read-back shape: the whole prefix reads as zeros...
+    {
+        let mut file = fs.open(
+            &path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&vec![
+            0u8;
+            usize::try_from(punch_off).expect("small fixture")
+        ])?;
+    }
+    // ...but zeros alone are damage, not proof (the probe answers, so the
+    // verdict is a definite Unpunched, not an unattributable Unproven).
+    assert!(
+        matches!(
+            table.punch_geometry()?.verdict,
+            crate::table::PunchProbe::Unpunched
+        ),
+        "zeros without a hole are corruption, never a punch",
+    );
+
+    // The filesystem's unaligned-punch behavior: only a small interior range
+    // of the zeroed run is actually deallocated — no data block's own extent
+    // is wholly a hole (its boundary pages stay allocated, zero-filled).
+    let mid = punch_off / 2;
+    memfs.punch_hole(&path, mid - 8, 16)?;
+    assert!(
+        matches!(
+            table.punch_geometry()?.verdict,
+            crate::table::PunchProbe::Punched
+        ),
+        "a hole contained in the zeroed run proves the punch even though no \
+         block's whole extent is one",
+    );
+    Ok(())
+}
+
+/// A reclaim blocked by a COMPLETED checkpoint's surviving hard link must be
+/// RETAINED, not discarded. The pause is no longer active (so the deferred
+/// queue is not an option), yet the dropping view holds the only record of the
+/// reclaim: deleting the checkpoint later frees the link, and only
+/// `retry_pending_reclaims` can finish the punch then — nothing else would
+/// ever free the consumed prefix, which is exactly the space the tight-space
+/// path was reclaiming.
+#[cfg(feature = "std")]
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn punch_on_drop_retains_the_reclaim_while_a_checkpoint_link_survives() -> crate::Result<()> {
+    use crate::fs::Fs;
+
+    let links = Arc::new(core::sync::atomic::AtomicU64::new(2));
+    let fs: Arc<dyn Fs> = Arc::new(SharedInodeFs(crate::fs::MemFs::new(), Arc::clone(&links)));
+    let root = std::path::absolute("/db")?;
+    fs.create_dir_all(&root)?;
+
+    let path = root.join("0");
+    let mut writer = Writer::new(path.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(256);
+    for i in 0..256u32 {
+        writer.write(crate::InternalValue::from_components(
+            format!("k{i:04}").into_bytes(),
+            b"v",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = {
+        #[cfg(feature = "metrics")]
+        let metrics = Arc::new(Metrics::default());
+        let mut params = test_recover_params(path.clone(), checksum);
+        params.descriptor_table = None;
+        params.fs = Arc::clone(&fs);
+        #[cfg(feature = "metrics")]
+        {
+            params.metrics = metrics;
+        }
+        Table::recover(params)?
+    };
+    let pause = crate::deletion_pause::DeletionPause::new_shared();
+    table.install_deletion_pause(Arc::clone(&pause));
+    let punch = table.punch_offset_for(b"k0128")?;
+    assert!(punch > 0, "the fixture has a punchable prefix");
+    table.mark_punch_on_drop(punch);
+    drop(table);
+
+    // The checkpoint's link survives, so no byte may be punched yet — but the
+    // intent must be retained rather than discarded.
+    assert!(
+        pause.has_pending_reclaims(),
+        "a reclaim blocked by a completed checkpoint's link must be retained \
+         for a retry, not discarded",
+    );
+
+    // The checkpoint is deleted: its link disappears, and the retry finishes
+    // the reclaim.
+    links.store(1, core::sync::atomic::Ordering::Release);
+    pause.retry_pending_reclaims();
+    assert!(
+        !pause.has_pending_reclaims(),
+        "an exclusively-owned file's retained reclaim is finished by the retry",
+    );
+    let after = {
+        let file = fs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let len = crate::fs::FsFile::metadata(&*file)?.len;
+        crate::file::read_exact(&*file, 0, usize::try_from(len).unwrap_or(0))?.to_vec()
+    };
+    assert!(
+        after
+            .get(..64)
+            .is_some_and(|head| head.iter().all(|&b| b == 0)),
+        "the retried reclaim punches the consumed prefix",
+    );
+    Ok(())
+}
+
+/// `reopen_restricted` creates a DISTINCT `Inner` for the same table, so it must
+/// PROPAGATE the tree-installed shared gates onto it: the checkpoint deletion
+/// pause and the heal lock. Without them a restricted view skips the checkpoint
+/// mutation window (a checkpoint could link healed bytes under a stale digest)
+/// and serializes heals against a different lock (two patrols could heal +
+/// reconcile the same SST concurrently and leave a clean file mismatched with
+/// the manifest).
+#[cfg(all(feature = "std", feature = "page_ecc"))]
+#[test]
+fn reopen_restricted_propagates_the_shared_heal_and_deletion_gates() -> crate::Result<()> {
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"c", b"v", 0, crate::ValueType::Value),
+    ];
+
+    test_with_table(
+        &items,
+        |table| {
+            let pause = crate::deletion_pause::DeletionPause::new_shared();
+            table.install_deletion_pause(std::sync::Arc::clone(&pause));
+            let lock = table.heal_lock_arc();
+
+            let restricted = table.reopen_restricted(crate::UserKey::from(&b"b"[..]))?;
+
+            let restricted_pause = restricted
+                .0
+                .deletion_pause
+                .get()
+                .expect("the deletion pause is propagated");
+            assert!(
+                std::sync::Arc::ptr_eq(restricted_pause, &pause),
+                "the restricted view shares the ORIGINAL deletion pause",
+            );
+            assert!(
+                std::sync::Arc::ptr_eq(&restricted.heal_lock_arc(), &lock),
+                "the restricted view shares the ORIGINAL heal lock",
+            );
+            Ok(())
+        },
+        None,
+        Some(|x| x),
+    )
+}
+
+/// `raw_block_parity_delta` must reject a frame whose on-disk trailer length
+/// differs from the freshly computed parity: returning `Ok(Some(fresh))` for
+/// a short trailer would make the in-place heal write MORE bytes than the
+/// frame holds at that offset — past the block's end, into the next block's
+/// bytes — violating the size-preserving heal contract. A length mismatch is
+/// an unverifiable frame, not a healable one.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn raw_block_parity_delta_rejects_a_trailer_length_mismatch() -> crate::Result<()> {
+    use crate::coding::Decode;
+
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
+    ];
+
+    test_with_table(
+        &items,
+        |table| {
+            let keyed = table
+                .data_block_handles()
+                .next()
+                .expect("a data block")
+                .expect("index entry decodes");
+            let handle = keyed.as_ref();
+            let file = std::fs::read(&*table.path)?;
+            let start = usize::try_from(handle.offset().0).unwrap_or(usize::MAX);
+            let Some(raw) = file.get(start..start + handle.size() as usize) else {
+                panic!("block frame within the file");
+            };
+            let header = crate::table::block::Header::decode_from(&mut &raw[..])?;
+
+            // Sanity: the intact frame's trailer verifies (no delta).
+            assert!(
+                matches!(table.raw_block_parity_delta(raw, &header), Ok(None)),
+                "the intact frame's parity trailer matches",
+            );
+
+            // A frame one byte SHORT of its trailer must be unverifiable —
+            // not a mismatch whose full-length rebuild the heal would write
+            // past the frame's end.
+            let Some(short) = raw.get(..raw.len() - 1) else {
+                panic!("frame is non-empty");
+            };
+            assert!(
+                table.raw_block_parity_delta(short, &header).is_err(),
+                "a trailer-length mismatch must be unverifiable, not healable",
+            );
+
+            Ok(())
+        },
+        None,
+        Some(|w: Writer| {
+            let Ok(params) = crate::table::block::EccParams::try_new(8, 2) else {
+                panic!("RS(8,2) params are valid");
+            };
+            w.use_ecc(Some(params))
+        }),
+    )
+}
+
+/// `scrub_block` must reject a block whose decoded ROLE differs from the
+/// caller's expected type, mirroring `load_block`'s swap-defence: an index
+/// entry misdirected at another (checksum-valid) block of a different role
+/// passes its payload checksum, so without the role check the scrub reports
+/// "clean" for a handle that no longer points at a data block at all.
+#[test]
+fn scrub_block_rejects_a_block_of_the_wrong_role() -> crate::Result<()> {
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
+    ];
+
+    test_with_table(
+        &items,
+        |table| {
+            // The TLI block is a valid, checksum-clean block of role Index —
+            // exactly what a misdirected data-block handle would land on.
+            let outcome = crate::table::util::scrub_block(
+                table.global_id(),
+                &table.path,
+                &table.file_accessor,
+                &table.regions.tli,
+                crate::table::block::BlockType::Data,
+                table.metadata.data_block_compression,
+                table.encryption.as_deref(),
+                table.metadata.ecc_params,
+                #[cfg(zstd_any)]
+                table.zstd_dictionary.as_deref(),
+                None,
+                #[cfg(feature = "metrics")]
+                &table.metrics,
+            );
+            assert!(
+                matches!(outcome, Err(crate::Error::InvalidTag(("BlockType", _))),),
+                "a checksum-clean block of the WRONG role must fail the \
+                 role check specifically (not scrub clean, and not fail for \
+                 an unrelated reason): {outcome:?}",
+            );
+            Ok(())
+        },
+        None,
+        Some(|x| x),
+    )
+}
+
+/// A frame read through an OVER-SIZED (forged) index handle decodes cleanly —
+/// the payload checksum covers only `data_length` bytes, and the trailing
+/// garbage classifies as an unrecognized ECC trailer (`EccStatus::Unrecognized`)
+/// — but its raw bytes must NOT be marked verbatim-copy-safe: the salvage
+/// writer rejects the overlong frame against the header's on-disk size and the
+/// walk would drop a block whose payload actually verified. The load must fall
+/// back to the re-encode path (`verbatim = None`) instead.
+#[test]
+fn salvage_load_block_reencodes_an_over_read_frame() -> crate::Result<()> {
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
+    ];
+
+    test_with_table(
+        &items,
+        |table| {
+            let keyed = table
+                .data_block_handles()
+                .next()
+                .expect("a data block")
+                .expect("index entry decodes");
+            let handle = keyed.as_ref();
+
+            // Sanity: through the TRUE handle the block is verbatim-copy-safe.
+            let clean = table.salvage_load_block(handle, crate::table::block::BlockType::Data)?;
+            assert!(clean.verbatim.is_some(), "a clean read is verbatim-safe");
+
+            // Forged handle: 8 bytes of the following section leak into the
+            // frame (the index section follows the data blocks, so the file
+            // has bytes there).
+            let over = crate::table::BlockHandle::new(handle.offset(), handle.size() + 8);
+            let sb = table.salvage_load_block(&over, crate::table::block::BlockType::Data)?;
+            assert!(
+                sb.verbatim.is_none(),
+                "an over-read frame with an opaque trailer must fall back to \
+                 the re-encode path, not offer its overlong raw bytes for a \
+                 verbatim copy",
+            );
+
+            Ok(())
+        },
+        None,
+        Some(|x| x),
+    )
+}
+
+/// `reopen_restricted` must carry a REFRESHED full-file checksum (set by an
+/// in-place heal after recovery) into the reopened view: recovering the fresh
+/// `Inner` with the stale pre-heal digest would reinstall that stale digest
+/// into the manifest when a tight-space compaction swaps the restricted view
+/// in, making later integrity scans flag the healed file as corrupt again.
+#[test]
+fn reopen_restricted_carries_the_live_suffix_digest() -> crate::Result<()> {
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
+    ];
+
+    test_with_table(
+        &items,
+        |table| {
+            // The restricted view's manifest digest must cover only its LIVE
+            // SUFFIX `[punch_offset, end)`, not the whole file: the prefix is
+            // hole-punched after install, so a whole-file digest would never
+            // match the punched file. It is computed fresh from the current
+            // bytes (so any heal is folded in).
+            let restricted = table.reopen_restricted(crate::UserKey::from(&b"b"[..]))?;
+            let punch = table.punch_offset_for(b"b")?;
+            let expected = crate::Checksum::from_raw(crate::repair::compute_table_checksum_from(
+                &crate::fs::StdFs,
+                &table.path,
+                punch,
+            )?);
+            assert_eq!(
+                restricted.checksum(),
+                expected,
+                "the restricted view reports its live-suffix digest",
+            );
+            // `rotate_every == Some(1)` puts "b" in a later data block, so the
+            // punch offset is strictly positive and the suffix digest is
+            // genuinely exercised (not the degenerate whole-file case).
+            assert!(
+                punch > 0,
+                "reopening at a later block punches a real prefix"
+            );
+            assert_ne!(
+                restricted.checksum(),
+                table.checksum(),
+                "a non-zero punch offset makes the suffix digest differ from \
+                 the whole-file digest",
+            );
+            Ok(())
+        },
+        Some(1),
+        Some(|x| x),
+    )
+}
+
+/// The twelve single-letter keys the restriction-accounting tests write, four
+/// per data block.
+fn twelve_letter_items() -> Vec<crate::InternalValue> {
+    (b'a'..=b'l')
+        .map(|c| crate::InternalValue::from_components([c], b"v", 0, crate::ValueType::Value))
+        .collect()
+}
+
+/// A restriction landing on a block's LAST key leaves nearly that whole block
+/// dead: the view serves only its keys `>= bound`, and the rows below belong to
+/// the output table that superseded the punched prefix. Counting the straddling
+/// block whole reports those rows twice while both live in one version.
+#[test]
+fn live_item_count_drops_the_straddling_block_rows_below_the_bound() -> crate::Result<()> {
+    // `rotate_every == Some(4)` gives blocks [a..d] [e..h] [i..l]; "h" is the
+    // LAST key of the middle one, so the view serves h..l = 5 of its 12 entries
+    // and only ONE of the straddling block's four.
+    test_with_table(
+        &twelve_letter_items(),
+        |table| {
+            let restricted = table.with_restriction(crate::UserKey::from(&b"h"[..]));
+            assert!(
+                restricted.punch_offset_for(b"h")? > 0,
+                "the fixture must punch a real prefix, not the degenerate whole file",
+            );
+            assert_eq!(
+                5,
+                restricted.live_item_count()?,
+                "a zone-mapped view counts the straddling block's live suffix, \
+                 not its whole row count",
+            );
+            Ok(())
+        },
+        Some(4),
+        Some(|w: Writer| w.use_zone_map(true)),
+    )
+}
+
+/// Without a zone map the count is apportioned over data bytes, but the
+/// straddling block is still counted exactly: apportioning it whole credited
+/// the view with every row below the bound.
+#[test]
+fn live_item_count_apportions_only_the_blocks_above_the_straddling_one() -> crate::Result<()> {
+    test_with_table(
+        &twelve_letter_items(),
+        |table| {
+            let restricted = table.with_restriction(crate::UserKey::from(&b"h"[..]));
+            let live = restricted.live_item_count()?;
+            // Exact for the straddling block (1 entry), apportioned by bytes
+            // above it (~4 entries) — so within a block's granularity of the
+            // true 5, and well below the 8 that counting the straddling block
+            // whole reports.
+            assert!(
+                (4..=6).contains(&live),
+                "apportioning above the straddling block must land near the \
+                 5 live entries, got {live}",
+            );
+            Ok(())
+        },
+        Some(4),
+        Some(|x| x),
+    )
+}
+
 #[test]
 fn punch_offset_for_locates_the_first_block_reaching_a_key() -> crate::Result<()> {
     let items = [
@@ -818,24 +1639,15 @@ fn recover_adaptive_table(
 
     #[cfg(feature = "metrics")]
     let metrics = Arc::new(Metrics::default());
-    let table = Table::recover(
-        path,
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(1_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
+    let table = {
+        #[cfg_attr(not(feature = "metrics"), expect(unused_mut))]
+        let mut params = test_recover_params(path, checksum);
         #[cfg(feature = "metrics")]
-        metrics,
-    )?;
+        {
+            params.metrics = metrics;
+        }
+        Table::recover(params)?
+    };
     Ok((table, dir))
 }
 
@@ -1439,24 +2251,12 @@ fn plan_block_tasks_propagates_a_faulted_bloom_probe() -> crate::Result<()> {
         writer.finish()?.unwrap().1
     };
 
-    let table = Table::recover(
-        file,
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(1_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::clone(&fs),
-        false, // do not pin index
-        false, // do not pin filter: partition blocks read lazily
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::new(Metrics::default()),
-    )?;
+    let table = {
+        let mut params = test_recover_params(file, checksum);
+        // Do not pin: partition blocks read lazily.
+        params.fs = Arc::clone(&fs);
+        Table::recover(params)?
+    };
 
     // Recovery is done (its reads passed cleanly); now fail the NEXT positional
     // read of the table file: the filter partition block `check_bloom` loads.
@@ -1510,24 +2310,14 @@ fn plan_block_tasks_propagates_a_faulted_index_read() -> crate::Result<()> {
         writer.finish()?.unwrap().1
     };
 
-    let table = Table::recover(
-        file,
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(1_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::clone(&fs),
-        true,  // pin filter: keep check_bloom off disk
-        false, // do not pin index: partition blocks read lazily
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::new(Metrics::default()),
-    )?;
+    let table = {
+        let mut params = test_recover_params(file, checksum);
+        params.fs = Arc::clone(&fs);
+        // Pin the filter (keeps check_bloom off disk) but not the index:
+        // partition blocks read lazily.
+        params.pin_filter = true;
+        Table::recover(params)?
+    };
 
     // Recovery is done; fail the next positional read of the table file, which
     // the block-index walk performs.
@@ -1579,24 +2369,11 @@ fn plan_block_tasks_returns_none_for_a_table_above_the_snapshot() -> crate::Resu
         writer.finish()?.unwrap().1
     };
 
-    let table = Table::recover(
-        file,
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(1_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::clone(&fs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::new(Metrics::default()),
-    )?;
+    let table = {
+        let mut params = test_recover_params(file, checksum);
+        params.fs = Arc::clone(&fs);
+        Table::recover(params)?
+    };
 
     // Recovery is done; fail ANY further positional read of the table file. The
     // above-snapshot guard must short-circuit before any bloom or index read, so
@@ -2029,23 +2806,13 @@ fn table_read_fuzz_1() -> crate::Result<()> {
 
     let _trailer = writer.finish().unwrap();
 
-    let table = crate::Table::recover(
-        file,
-        crate::Checksum::from_raw(0),
-        0,
-        0,
-        0,
-        Arc::new(crate::Cache::with_capacity_bytes(0)),
-        Some(Arc::new(crate::DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        true,
-        true,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-    )
-    .unwrap();
+    let table = {
+        let mut params = test_recover_params(file, crate::Checksum::from_raw(0));
+        params.cache = Arc::new(crate::Cache::with_capacity_bytes(0));
+        params.pin_filter = true;
+        params.pin_index = true;
+        crate::Table::recover(params).unwrap()
+    };
 
     let item_count_usize = table.metadata.item_count as usize;
     assert_eq!(item_count_usize, items.len());
@@ -2109,25 +2876,13 @@ fn table_partitioned_index() -> crate::Result<()> {
 
     let _trailer = writer.finish().unwrap();
 
-    let table = crate::Table::recover(
-        file,
-        crate::Checksum::from_raw(0),
-        0,
-        0,
-        0,
-        Arc::new(crate::Cache::with_capacity_bytes(0)),
-        Some(Arc::new(crate::DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        true,
-        true,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::default(),
-    )
-    .unwrap();
+    let table = {
+        let mut params = test_recover_params(file, crate::Checksum::from_raw(0));
+        params.cache = Arc::new(crate::Cache::with_capacity_bytes(0));
+        params.pin_filter = true;
+        params.pin_index = true;
+        crate::Table::recover(params).unwrap()
+    };
 
     assert!(
         table.regions.index.is_some(),
@@ -2177,25 +2932,14 @@ fn table_global_seqno() -> crate::Result<()> {
 
     let _trailer = writer.finish().unwrap();
 
-    let table = crate::Table::recover(
-        file,
-        crate::Checksum::from_raw(0),
-        7,
-        0,
-        0,
-        Arc::new(crate::Cache::with_capacity_bytes(0)),
-        Some(Arc::new(crate::DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        true,
-        true,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::default(),
-    )
-    .unwrap();
+    let table = {
+        let mut params = test_recover_params(file, crate::Checksum::from_raw(0));
+        params.global_seqno = 7;
+        params.cache = Arc::new(crate::Cache::with_capacity_bytes(0));
+        params.pin_filter = true;
+        params.pin_index = true;
+        crate::Table::recover(params).unwrap()
+    };
 
     // global seqno is 7, so a1 is = 8 -> can not be read by snapshot=8
     assert!(table.get(b"a1", 8, hash64(b"a1"))?.is_none());
@@ -2241,24 +2985,14 @@ fn table_return_global_seqno() -> crate::Result<()> {
 
     let _trailer = writer.finish()?;
 
-    let table = crate::Table::recover(
-        file,
-        crate::Checksum::from_raw(0),
-        SEQNO,
-        0,
-        0,
-        Arc::new(crate::Cache::with_capacity_bytes(0)),
-        Some(Arc::new(crate::DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        true,
-        true,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::default(),
-    )?;
+    let table = {
+        let mut params = test_recover_params(file, crate::Checksum::from_raw(0));
+        params.global_seqno = SEQNO;
+        params.cache = Arc::new(crate::Cache::with_capacity_bytes(0));
+        params.pin_filter = true;
+        params.pin_index = true;
+        crate::Table::recover(params)?
+    };
 
     // On disk: seqno = 0. Effective global seqno: 0 + SEQNO = SEQNO.
     // Snapshot = 2 * SEQNO is above the effective seqno, so the read sees the item.
@@ -2269,6 +3003,49 @@ fn table_return_global_seqno() -> crate::Result<()> {
         table.get(b"abc", 2 * SEQNO, hash64(b"abc"))?.unwrap(),
     );
 
+    Ok(())
+}
+
+/// A bulk-ingested table's whole content sits at effective seqno
+/// `global_seqno` (every row is stored at local 0). An upper bound BELOW that
+/// base must therefore return nothing — but both translated bounds saturate
+/// to local 0, and `[0, 0]` is a valid one-seqno window that matches every
+/// stored row, so without an explicit base check the scan returned rows whose
+/// translated-back seqno exceeds the caller's inclusive upper bound.
+#[test]
+fn scan_seqno_range_returns_nothing_below_a_bulk_ingest_base() -> crate::Result<()> {
+    use crate::ValueType::Value;
+    use crate::fs::StdFs;
+
+    const BASE: SeqNo = 100;
+
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("ingested");
+    let mut writer = crate::table::Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    writer.write(InternalValue::from_components("abc", "abc", 0, Value))?;
+    let _trailer = writer.finish()?;
+
+    let table = {
+        let mut params = test_recover_params(file, crate::Checksum::from_raw(0));
+        params.global_seqno = BASE;
+        params.cache = Arc::new(crate::Cache::with_capacity_bytes(0));
+        crate::Table::recover(params)?
+    };
+
+    // The window [0, 50] ends below the base: no effective seqno of this
+    // table can fall inside it.
+    assert_eq!(
+        table.scan_seqno_range(0, BASE / 2, true)?,
+        Vec::new(),
+        "an upper bound below the ingest base must exclude the whole table",
+    );
+    // Sanity: a window that DOES reach the base still returns the row, at its
+    // effective (translated) seqno.
+    assert_eq!(
+        table.scan_seqno_range(0, BASE, true)?,
+        vec![InternalValue::from_components("abc", "abc", BASE, Value)],
+        "a window covering the base returns the row at its effective seqno",
+    );
     Ok(())
 }
 
@@ -2411,7 +3188,6 @@ fn load_block_range_tombstone_metrics() -> crate::Result<()> {
     use crate::{
         CompressionType,
         cache::Cache,
-        descriptor_table::DescriptorTable,
         range_tombstone::RangeTombstone,
         table::{block::BlockType, util::load_block},
     };
@@ -2443,27 +3219,18 @@ fn load_block_range_tombstone_metrics() -> crate::Result<()> {
 
     let metrics = Arc::new(crate::metrics::Metrics::default());
 
-    let table = Table::recover(
-        file,
-        checksum,
-        0,
-        0,
-        0,
+    let table = {
         // Recovery bypasses load_block() (reads via Block::from_file() directly),
         // so it intentionally does NOT increment block-load metrics — consistent
         // with how filter and index recovery reads are handled.
-        Arc::new(Cache::with_capacity_bytes(10_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
+        let mut params = test_recover_params(file, checksum);
+        params.cache = Arc::new(Cache::with_capacity_bytes(10_000_000));
         #[cfg(feature = "metrics")]
-        metrics.clone(),
-    )?;
+        {
+            params.metrics = metrics.clone();
+        }
+        Table::recover(params)?
+    };
 
     let rt_handle = table
         .regions
@@ -2537,7 +3304,6 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
     use crate::{
         CompressionType,
         cache::Cache,
-        descriptor_table::DescriptorTable,
         table::{block::BlockType, util::load_block},
     };
 
@@ -2559,24 +3325,15 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
     #[cfg(feature = "metrics")]
     let metrics = Arc::new(crate::metrics::Metrics::default());
 
-    let table = Table::recover(
-        file,
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(10_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
+    let table = {
+        let mut params = test_recover_params(file, checksum);
+        params.cache = Arc::new(Cache::with_capacity_bytes(10_000_000));
         #[cfg(feature = "metrics")]
-        metrics.clone(),
-    )?;
+        {
+            params.metrics = metrics.clone();
+        }
+        Table::recover(params)?
+    };
 
     let table_id = table.global_id();
 
@@ -2639,7 +3396,6 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
 fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<()> {
     use crate::{
         Cache, InternalValue,
-        descriptor_table::DescriptorTable,
         fs::StdFs,
         heal_hints::HealHints,
         table::{
@@ -2672,24 +3428,15 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
 
     #[cfg(feature = "metrics")]
     let metrics = Arc::new(crate::metrics::Metrics::default());
-    let table = Table::recover(
-        file.clone(),
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(10_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
+    let table = {
+        let mut params = test_recover_params(file.clone(), checksum);
+        params.cache = Arc::new(Cache::with_capacity_bytes(10_000_000));
         #[cfg(feature = "metrics")]
-        metrics.clone(),
-    )?;
+        {
+            params.metrics = metrics.clone();
+        }
+        Table::recover(params)?
+    };
 
     let table_id = table.global_id();
     let compression = table.metadata.data_block_compression;
@@ -2802,6 +3549,429 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
         "auto_heal off must not schedule a rewrite",
     );
 
+    Ok(())
+}
+
+/// Writes a small-block ECC SST of `n` entries under `scheme` through `fs`,
+/// returning its checksum. Shared by the in-place heal tests.
+#[cfg(feature = "page_ecc")]
+fn build_ecc_sst_for_heal(
+    file: &std::path::Path,
+    fs: Arc<dyn crate::fs::Fs>,
+    scheme: crate::table::block::EccParams,
+    n: u32,
+) -> crate::Checksum {
+    #[expect(
+        clippy::expect_used,
+        reason = "test setup; a panic is the failure signal"
+    )]
+    let mut writer = Writer::new(file.to_path_buf(), 0, 0, fs)
+        .expect("open writer")
+        .use_data_block_size(256)
+        .use_ecc(Some(scheme));
+    for i in 0..n {
+        #[expect(clippy::expect_used, reason = "test setup")]
+        writer
+            .write(InternalValue::from_components(
+                format!("key{i:05}").into_bytes(),
+                b"value-payload-bytes".to_vec(),
+                u64::from(i) + 1,
+                crate::ValueType::Value,
+            ))
+            .expect("write");
+    }
+    #[expect(clippy::expect_used, reason = "finish() returns Some after writes")]
+    let (_, checksum) = writer.finish().expect("finish").expect("non-empty");
+    checksum
+}
+
+/// Recovers a `Table` for `file` through `fs` with fresh caches.
+#[cfg(feature = "page_ecc")]
+#[expect(
+    clippy::expect_used,
+    reason = "test setup; a panic is the failure signal"
+)]
+fn recover_table_on(
+    file: &std::path::Path,
+    checksum: crate::Checksum,
+    fs: Arc<dyn crate::fs::Fs>,
+) -> Table {
+    let mut params = test_recover_params(file.to_path_buf(), checksum);
+    params.cache = Arc::new(crate::Cache::with_capacity_bytes(10_000_000));
+    params.fs = fs;
+    Table::recover(params).expect("recover table")
+}
+
+/// The first data block's file offset in `table`.
+#[cfg(feature = "page_ecc")]
+fn first_data_block_offset(table: &Table) -> u64 {
+    use crate::table::block_index::BlockIndex as _;
+    let Some(keyed) = table.block_index.iter().find_map(Result::ok) else {
+        panic!("a non-empty SST has at least one data block");
+    };
+    keyed.offset().0
+}
+
+/// A single-bit fault in a Page-ECC data block is healed in place AND the file
+/// is restored byte-for-byte (RS / SEC-DED reconstruct the original payload, the
+/// parity is recomputed deterministically). Exercises the SEC-DED branch of the
+/// heal primitive.
+#[cfg(feature = "page_ecc")]
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "in-file block offset fits usize; only narrows on 32-bit targets"
+)]
+fn heal_data_blocks_in_place_restores_a_secded_block_byte_for_byte() -> crate::Result<()> {
+    use crate::table::block::{EccParams, Header};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(crate::fs::StdFs);
+    let checksum = build_ecc_sst_for_heal(&file, Arc::clone(&fs), EccParams::Secded, 200);
+
+    let original = std::fs::read(&file)?;
+    let first_off =
+        first_data_block_offset(&recover_table_on(&file, checksum, Arc::clone(&fs))) as usize;
+
+    // Flip a single bit in the first data block's payload — SEC-DED corrects one
+    // bit flip per word.
+    let pos = first_off + Header::MIN_LEN + 3;
+    let mut bytes = original.clone();
+    if let Some(b) = bytes.get_mut(pos) {
+        *b ^= 0x01;
+    }
+    std::fs::write(&file, &bytes)?;
+    assert_ne!(bytes, original, "the seeded fault changed the file");
+
+    let table = recover_table_on(&file, checksum, Arc::clone(&fs));
+    let (report, attributable) =
+        table.heal_data_blocks_in_place(crate::fs::SyncMode::Full, table.checksum());
+    assert_eq!(report.blocks_healed_in_place, 1, "{report:?}");
+    assert_eq!(report.uncorrectable_blocks, 0, "{report:?}");
+    // The manifest digest is the HEALTHY file's, but the seeded fault changed
+    // the bytes before the heal ran: the pre-heal digest cannot match, so the
+    // mismatch is NOT attributable to this pass's writes.
+    assert!(
+        !attributable,
+        "a pre-heal digest differing from the manifest must not attribute",
+    );
+
+    let healed = std::fs::read(&file)?;
+    assert_eq!(
+        healed, original,
+        "SEC-DED in-place heal restores the block byte-for-byte",
+    );
+    Ok(())
+}
+
+/// The heal reports ATTRIBUTION (`true`) when the file's digest right before
+/// its first write-back matches the manifest digest: parity-trailer rot with
+/// the manifest digest recomputed over the ROTTED bytes (the shape a manifest
+/// rebuild leaves behind) makes the post-heal mismatch provably the heal's
+/// own work — the flag that lets the digest reconciliation restamp tables
+/// whose authoritative content (deletion metadata, footer-less values) has
+/// no semantic cross-check.
+#[cfg(feature = "page_ecc")]
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "in-file block offset fits usize; only narrows on 32-bit targets"
+)]
+fn heal_data_blocks_in_place_attributes_a_matching_pre_heal_digest() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::table::block::{EccParams, Header};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(crate::fs::StdFs);
+    let healthy = build_ecc_sst_for_heal(&file, Arc::clone(&fs), EccParams::RS_4_2, 200);
+    let first_off =
+        first_data_block_offset(&recover_table_on(&file, healthy, Arc::clone(&fs))) as usize;
+
+    // Rot one parity-trailer byte of the first data block: the payload stays
+    // checksum-clean, only the heal's trailer verification notices.
+    let mut bytes = std::fs::read(&file)?;
+    let Some(mut cursor) = bytes.get(first_off..) else {
+        panic!("first data block within the file");
+    };
+    let header = Header::decode_from(&mut cursor)?;
+    let trailer_pos =
+        first_off + Header::header_len(header.block_type) + header.data_length as usize;
+    let Some(slot) = bytes.get_mut(trailer_pos) else {
+        panic!("parity trailer within the file");
+    };
+    *slot ^= 0xFF;
+    std::fs::write(&file, &bytes)?;
+
+    // The manifest digest covers the ROTTED bytes (a manifest rebuild admits
+    // the degraded-but-readable file as-is), so the pre-heal probe matches.
+    let rotted = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &file)?);
+    let table = recover_table_on(&file, rotted, Arc::clone(&fs));
+    let (report, attributable) =
+        table.heal_data_blocks_in_place(crate::fs::SyncMode::Full, table.checksum());
+    assert_eq!(
+        report.blocks_healed_in_place, 1,
+        "the rotted trailer is rebuilt in place: {report:?}",
+    );
+    assert_eq!(report.uncorrectable_blocks, 0, "{report:?}");
+    assert!(
+        attributable,
+        "a pre-heal digest matching the manifest attributes the mismatch to \
+         this pass's own verified corrections",
+    );
+    Ok(())
+}
+
+/// The streaming heal-digest prediction must be byte-identical to materializing
+/// every correction and splicing it through
+/// `compute_table_checksum_with_overrides`. The streaming path exists to bound
+/// heap on broadly damaged tables (it never holds more than one corrected frame
+/// at a time); this guards that the memory win did not change the predicted
+/// digest, which the crash-recovery marker binds. The OOM failure mode itself
+/// is not directly testable (it needs a multi-gigabyte damaged table).
+#[cfg(feature = "page_ecc")]
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "in-file block offset fits usize; only narrows on 32-bit targets"
+)]
+fn predict_heal_streams_the_same_digest_as_materializing_corrections() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::table::block::{EccParams, Header};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let healthy = build_ecc_sst_for_heal(&file, Arc::clone(&fs), EccParams::RS_4_2, 200);
+    let first_off =
+        first_data_block_offset(&recover_table_on(&file, healthy, Arc::clone(&fs))) as usize;
+
+    // Rot the first block's parity trailer → exactly one correction to splice.
+    let mut bytes = std::fs::read(&file)?;
+    let Some(mut cursor) = bytes.get(first_off..) else {
+        panic!("first data block within the file");
+    };
+    let header = Header::decode_from(&mut cursor)?;
+    let trailer_pos =
+        first_off + Header::header_len(header.block_type) + header.data_length as usize;
+    let Some(slot) = bytes.get_mut(trailer_pos) else {
+        panic!("parity trailer within the file");
+    };
+    *slot ^= 0xFF;
+    std::fs::write(&file, &bytes)?;
+
+    let rotted = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &file)?);
+    let table = recover_table_on(&file, rotted, Arc::clone(&fs));
+
+    let transform = crate::table::util::build_block_transform(
+        table.metadata.data_block_compression,
+        table.encryption.as_deref(),
+        table.metadata.ecc_params,
+        #[cfg(zstd_any)]
+        table.zstd_dictionary.as_deref(),
+    )?;
+    let fh = fs.open(&file, &crate::fs::FsOpenOptions::new().read(true))?;
+
+    // Streamed prediction (one frame of heap at a time).
+    let (streamed, offsets) = table.predict_heal_digest_and_offsets(fh.as_ref(), &transform, 0)?;
+
+    // Materialized reference: gather every correction and splice them all at once.
+    let mut corrections: Vec<(u64, Vec<u8>)> = Vec::new();
+    for entry in table.block_index.iter() {
+        let keyed = entry?;
+        if let Some(c) = table.heal_correction_for_block(fh.as_ref(), &keyed, &transform)? {
+            corrections.push(c);
+        }
+    }
+    let materialized =
+        crate::repair::compute_table_checksum_with_overrides(&*fs, &file, 0, &corrections)?;
+
+    assert_eq!(
+        streamed, materialized,
+        "the streamed digest must equal the materialized-overrides digest",
+    );
+    assert_eq!(
+        offsets.len(),
+        corrections.len(),
+        "one predicted offset per correction: {corrections:?}",
+    );
+    for (off, _) in &corrections {
+        assert!(
+            offsets.contains(off),
+            "every correction offset ({off}) is in the predicted set",
+        );
+    }
+    // Sanity: the rot did produce exactly the one trailer correction.
+    assert_eq!(corrections.len(), 1, "exactly one block was rotted");
+    Ok(())
+}
+
+/// When the corrected block's write-back fails (a failing `Fs`), the heal does
+/// not count it as healed and records it as an uncorrectable finding so it is
+/// left for block salvage rather than silently lost.
+#[cfg(feature = "page_ecc")]
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "in-file block offset fits usize; only narrows on 32-bit targets"
+)]
+fn heal_data_blocks_in_place_reports_a_block_whose_write_back_fails() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+    use crate::io::ErrorKind;
+    use crate::table::block::{EccParams, Header};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(fault);
+
+    let checksum = build_ecc_sst_for_heal(&file, Arc::clone(&fs), EccParams::RS_4_2, 200);
+
+    let first_off =
+        first_data_block_offset(&recover_table_on(&file, checksum, Arc::clone(&fs))) as usize;
+
+    // RS-recoverable single-byte fault: the read recovers it (so heal returns a
+    // corrected frame), then the write-back is what fails.
+    let pos = first_off + Header::MIN_LEN + 3;
+    let mut bytes = std::fs::read(&file)?;
+    if let Some(b) = bytes.get_mut(pos) {
+        *b ^= 0x80;
+    }
+    std::fs::write(&file, &bytes)?;
+
+    // The rot leaves the file differing from the (healthy) manifest checksum, so
+    // this is the restorative heal path: its FIRST write is the crash-recovery
+    // marker sidecar. Skip that write so the marker lands, then fail every
+    // subsequent write, so the heal reads + recovers the block and its write-back
+    // is what errors.
+    injector.arm(FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::Other)).skip(1));
+
+    let table = recover_table_on(&file, checksum, fs);
+    let (report, _) = table.heal_data_blocks_in_place(crate::fs::SyncMode::Full, table.checksum());
+    assert_eq!(
+        report.blocks_healed_in_place, 0,
+        "a failed write-back heals nothing: {report:?}",
+    );
+    assert!(
+        report.uncorrectable_blocks >= 1,
+        "the failed write-back is reported, not silently dropped: {report:?}",
+    );
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, crate::scrub::ScrubError::UncorrectableBlock { .. })),
+        "the finding is an UncorrectableBlock: {report:?}",
+    );
+    Ok(())
+}
+
+/// A non-ECC SST carries no parity, so an in-place heal finds nothing to
+/// reconstruct: every block reads back as "no recognized parity", nothing is
+/// written, and no block is reported as healed or uncorrectable.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn heal_data_blocks_in_place_is_a_noop_on_a_non_ecc_sst() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(crate::fs::StdFs);
+    // No ECC (no `use_ecc`): blocks carry no parity trailer.
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(256);
+    for i in 0..200u32 {
+        writer.write(InternalValue::from_components(
+            format!("key{i:05}").into_bytes(),
+            b"value-payload-bytes".to_vec(),
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let Some((_, checksum)) = writer.finish()? else {
+        panic!("non-empty SST");
+    };
+
+    let table = recover_table_on(&file, checksum, fs);
+    let (report, _) = table.heal_data_blocks_in_place(crate::fs::SyncMode::Full, table.checksum());
+    assert!(
+        report.blocks_scanned > 0,
+        "the walk inspected blocks: {report:?}"
+    );
+    assert_eq!(
+        report.blocks_healed_in_place, 0,
+        "no parity means nothing to heal: {report:?}",
+    );
+    assert_eq!(report.uncorrectable_blocks, 0, "{report:?}");
+    assert!(report.errors.is_empty(), "{report:?}");
+    Ok(())
+}
+
+/// If the read+write handle for the heal cannot even be opened (a read-only
+/// replica, restrictive permissions, a failing `Fs`), the pass must NOT return
+/// a silent healthy report with zero blocks scanned: it records the failed
+/// open AND falls back to the read-only scrub, so the table's integrity is
+/// still checked and real corruption still surfaces.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn heal_data_blocks_in_place_reports_when_the_file_cannot_be_opened() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+    use crate::io::ErrorKind;
+    use crate::table::block::{EccParams, Header};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(fault);
+
+    let checksum = build_ecc_sst_for_heal(&file, Arc::clone(&fs), EccParams::RS_4_2, 200);
+    let table = recover_table_on(&file, checksum, Arc::clone(&fs));
+
+    // Wreck the first data block's whole payload (header intact, far beyond
+    // the RS(4,2) budget) so the read-only fallback has real corruption to
+    // find and report.
+    {
+        use crate::table::block_index::BlockIndex as _;
+        let Some(keyed) = table.block_index.iter().find_map(Result::ok) else {
+            panic!("the SST has at least one data block");
+        };
+        let base = usize::try_from(keyed.offset().0).unwrap_or(usize::MAX);
+        let mut bytes = std::fs::read(&file)?;
+        let Some(payload) = bytes.get_mut(base + Header::MIN_LEN..base + keyed.size() as usize)
+        else {
+            panic!("block payload range within the file");
+        };
+        for b in payload {
+            *b ^= 0xFF;
+        }
+        std::fs::write(&file, &bytes)?;
+    }
+
+    // Fail exactly the heal's read+write open (the first open after arming);
+    // the read-only fallback may reopen freely afterwards.
+    injector.arm(FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other)).once());
+
+    let (report, _) = table.heal_data_blocks_in_place(crate::fs::SyncMode::Full, table.checksum());
+    assert!(
+        report.blocks_scanned >= 1,
+        "the read-only fallback still scans the table: {report:?}",
+    );
+    assert_eq!(
+        report.blocks_healed_in_place, 0,
+        "nothing is healed without a writable file: {report:?}",
+    );
+    assert!(
+        report.uncorrectable_blocks >= 1,
+        "the fallback scrub reports the seeded corruption: {report:?}",
+    );
+    assert!(!report.is_ok(), "corruption fails the pass: {report:?}");
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, crate::scrub::ScrubError::BlockIndexUnreadable { .. })),
+        "the failed read+write open is still reported: {report:?}",
+    );
     Ok(())
 }
 
@@ -3183,24 +4353,12 @@ fn two_level_index_scan_skips_empty_child_partition() -> crate::Result<()> {
     }
     writer.finish()?;
 
-    let table = crate::Table::recover(
-        file,
-        crate::Checksum::from_raw(0),
-        0,
-        0,
-        0,
-        Arc::new(crate::Cache::with_capacity_bytes(0)),
-        Some(Arc::new(crate::DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        true,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        Arc::default(),
-    )?;
+    let table = {
+        let mut params = test_recover_params(file, crate::Checksum::from_raw(0));
+        params.cache = Arc::new(crate::Cache::with_capacity_bytes(0));
+        params.pin_filter = true;
+        crate::Table::recover(params)?
+    };
 
     assert!(
         table.regions.index.is_some(),
@@ -3631,24 +4789,15 @@ fn build_and_recover(
 
     #[cfg(feature = "metrics")]
     let metrics = Arc::new(Metrics::default());
-    let table = Table::recover(
-        path,
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(1_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
+    let table = {
+        #[cfg_attr(not(feature = "metrics"), expect(unused_mut))]
+        let mut params = test_recover_params(path, checksum);
         #[cfg(feature = "metrics")]
-        metrics,
-    )?;
+        {
+            params.metrics = metrics;
+        }
+        Table::recover(params)?
+    };
     Ok((table, dir))
 }
 
@@ -3782,24 +4931,13 @@ fn zone_map_corrupt_section_falls_back_instead_of_failing_open() -> crate::Resul
     let recover = || -> crate::Result<Table> {
         #[cfg(feature = "metrics")]
         let metrics = Arc::new(Metrics::default());
-        Table::recover(
-            file.clone(),
-            checksum,
-            0,
-            0,
-            0,
-            Arc::new(Cache::with_capacity_bytes(1_000_000)),
-            Some(Arc::new(DescriptorTable::new(10))),
-            Arc::new(StdFs),
-            false,
-            false,
-            None,
-            #[cfg(zstd_any)]
-            None,
-            crate::comparator::default_comparator(),
-            #[cfg(feature = "metrics")]
-            metrics,
-        )
+        #[cfg_attr(not(feature = "metrics"), expect(unused_mut))]
+        let mut params = test_recover_params(file.clone(), checksum);
+        #[cfg(feature = "metrics")]
+        {
+            params.metrics = metrics;
+        }
+        Table::recover(params)
     };
 
     // First open: the zone-map section is present and populated.
@@ -3873,24 +5011,51 @@ fn recover_test_table_with_id(
 ) -> crate::Result<Table> {
     #[cfg(feature = "metrics")]
     let metrics = Arc::new(Metrics::default());
-    Table::recover(
-        file.to_path_buf(),
-        checksum,
-        0,
-        0,
-        table_id,
-        Arc::new(Cache::with_capacity_bytes(1_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
-        Arc::new(StdFs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        metrics,
-    )
+    let mut params = test_recover_params(file.to_path_buf(), checksum);
+    params.table_id = table_id;
+    #[cfg(feature = "metrics")]
+    {
+        params.metrics = metrics;
+    }
+    Table::recover(params)
+}
+
+/// A retired table reclaims its `.restrict-bound` sidecar on drop, so a
+/// tight-space-restricted SST that is later compacted away does not leak an
+/// orphan sidecar beside its deleted file (the recovery scan would eventually
+/// sweep it, but leaving it is a leak until then).
+#[test]
+fn dropping_a_deleted_table_removes_its_restrict_bound_sidecar() -> crate::Result<()> {
+    use crate::fs::Fs;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("0");
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    writer.write(crate::InternalValue::from_components(
+        b"k",
+        b"v",
+        1,
+        crate::ValueType::Value,
+    ))?;
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    // Publish a restrict-bound sidecar beside the SST, as a tight-space slice would.
+    let fs = StdFs;
+    crate::restrict_bound::write(&fs, &file, None, 0, b"k", crate::fs::SyncMode::Normal)?;
+    let sidecar = crate::restrict_bound::sidecar_path(&file);
+    assert!(fs.exists(&sidecar)?, "sidecar present before retirement");
+
+    // Retire the table and drop its last handle.
+    let table = recover_test_table(&file, checksum)?;
+    table.mark_as_deleted();
+    drop(table);
+
+    assert!(
+        !fs.exists(&sidecar)?,
+        "retiring the table must reclaim its restrict-bound sidecar, not leak it",
+    );
+    Ok(())
 }
 
 #[test]
@@ -3958,6 +5123,73 @@ fn delete_bitmap_section_absent_when_no_deletes() -> crate::Result<()> {
     Ok(())
 }
 
+/// A columnar table's zone map records one entry PER stored column (the
+/// user-key column AND the value column), each with its own range, and the
+/// verifier re-derives them from the decoded blocks so the honest table passes
+/// its forgery cross-check. Regression: the writer once stamped a single
+/// synthetic key-range column for every columnar block, hiding the non-key
+/// columns from `can_skip_block` pushdown.
+#[cfg(feature = "columnar")]
+#[test]
+fn columnar_zone_map_records_per_column_stats_and_round_trips() -> crate::Result<()> {
+    use crate::table::columnar::{COL_USER_KEY, COL_VALUE};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+
+    // Distinct keys AND distinct values so the user-key and value columns have
+    // genuinely different ranges: a single synthetic key-range column could not
+    // describe the value column.
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    for i in 0..32u32 {
+        let key = format!("k{i:04}").into_bytes();
+        let value = format!("v{i:04}").into_bytes();
+        writer.write(crate::InternalValue::from_components(
+            key,
+            value,
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    assert!(table.metadata.columnar, "written as a columnar table");
+    assert!(!table.zone_map.is_empty(), "zone map populated");
+
+    // Every data block records BOTH the user-key column (0) and the value
+    // column (3), each with its own range — not a single synthetic column.
+    let mut saw_value_column = false;
+    for handle in table.block_index.iter() {
+        let handle = handle?;
+        let stats = table
+            .zone_map
+            .columns_for(handle.offset().0)
+            .expect("every data block has a zone-map entry");
+        let ids: Vec<u32> = stats.iter().map(|s| s.column_id).collect();
+        assert!(
+            ids.contains(&u32::from(COL_USER_KEY)),
+            "the user-key column is recorded, got ids {ids:?}",
+        );
+        if let Some(v) = stats.iter().find(|s| s.column_id == u32::from(COL_VALUE)) {
+            saw_value_column = true;
+            assert!(v.min <= v.max, "the value column's range is ordered");
+            assert!(!v.min.is_empty(), "the value column carries a real range");
+        }
+    }
+    assert!(
+        saw_value_column,
+        "at least one block records the non-key value column's stats",
+    );
+
+    // The writer's per-column map and the verifier's re-derivation agree, so the
+    // forgery cross-check accepts the honest table.
+    table.verify_zone_map()?;
+    Ok(())
+}
+
 #[cfg(feature = "columnar")]
 #[test]
 fn delete_bitmap_masks_rows_in_columnar_scan() -> crate::Result<()> {
@@ -4007,6 +5239,210 @@ fn delete_bitmap_masks_rows_in_columnar_scan() -> crate::Result<()> {
     assert_eq!(
         got, expected,
         "deleted row positions must be masked out of the columnar scan"
+    );
+    Ok(())
+}
+
+/// A tight-space-restricted columnar SST has its consumed prefix hole-punched
+/// (those data blocks read as zeros). The columnar scan must skip the punched
+/// blocks instead of decoding them, mask the straddling block's sub-bound rows,
+/// and keep positional delete-bitmap mapping intact across the skipped blocks.
+#[cfg(feature = "columnar")]
+#[test]
+#[expect(clippy::unwrap_used)]
+fn restricted_columnar_scan_skips_punched_prefix_and_masks_sub_bound_rows() -> crate::Result<()> {
+    use crate::table::columnar::{
+        COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, column_batch_to_entries,
+    };
+    use std::io::{Seek, SeekFrom, Write as _};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+
+    let n = 256u32;
+    let keys: Vec<Vec<u8>> = (0..n).map(|i| format!("k{i:04}").into_bytes()).collect();
+    // One deleted row inside the (to-be-punched) prefix, one in the live
+    // suffix: the live one only masks correctly if the scan advances the
+    // positional row base across the skipped punched blocks.
+    let deleted_punched = 1u32;
+    let deleted_live = 250u32;
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_data_block_size(256);
+    for key in &keys {
+        writer.write(crate::InternalValue::from_components(
+            key.as_slice(),
+            b"v",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    writer.delete_bitmap_mut().insert(deleted_punched);
+    writer.delete_bitmap_mut().insert(deleted_live);
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    let handles: Vec<_> = table
+        .block_index
+        .iter()
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert!(handles.len() >= 3, "need several blocks to punch a prefix");
+
+    // Bound = two keys past the first block's end, so exactly one block is
+    // punched and the first live block STRADDLES the bound (one sub-bound row).
+    let first_end = handles[0].end_key().to_vec();
+    let j = keys.iter().position(|k| *k == first_end).unwrap();
+    let bound_idx = j + 2;
+    assert!(
+        bound_idx < deleted_live as usize,
+        "the live deleted row must stay above the bound"
+    );
+    let bound = crate::UserKey::from(keys[bound_idx].as_slice());
+
+    let punch_off = table.punch_offset_for(&bound)?;
+    assert_eq!(
+        punch_off,
+        handles[1].offset().0,
+        "exactly the first block is below the bound"
+    );
+
+    let restricted = table.with_restriction(bound);
+
+    // Simulate the tight-space hole punch: the consumed prefix reads as zeros.
+    let mut f = std::fs::OpenOptions::new().write(true).open(&file)?;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(&vec![0u8; usize::try_from(punch_off).unwrap()])?;
+    f.sync_all()?;
+
+    let batches =
+        restricted.columnar_scan(&[COL_USER_KEY, COL_SEQNO, COL_VALUE_TYPE, COL_VALUE], None)?;
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    for batch in &batches {
+        for entry in column_batch_to_entries(batch)? {
+            got.push(entry.key.user_key.to_vec());
+        }
+    }
+
+    let expected: Vec<Vec<u8>> = (bound_idx..n as usize)
+        .filter(|&i| i != deleted_live as usize)
+        .map(|i| keys[i].clone())
+        .collect();
+    assert_eq!(
+        got, expected,
+        "scan must start at the bound, mask the straddling block's sub-bound \
+         rows, and keep delete positions aligned across the punched prefix"
+    );
+    Ok(())
+}
+
+/// The heal unshare copy must reproduce the source's ACTUAL hole pattern, not
+/// the logical restriction: a tight-space slice that committed but failed its
+/// restriction-sidecar write deliberately leaves the restricted SST unpunched
+/// (punching without the sidecar would force a lossy conservative bound on a
+/// later manifest-loss repair). A heal detach of such a table must therefore
+/// copy the intact prefix verbatim — introducing holes below the logical
+/// bound would punch the file without its sidecar. Actually-punched extents
+/// still stay holes (no re-allocation on the near-full tight-space disk).
+#[cfg(feature = "page_ecc")]
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn unshare_for_heal_preserves_unpunched_blocks_of_a_restricted_table() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::table::block_index::BlockIndex;
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    memfs.create_dir_all(&root)?;
+
+    let build = |name: &str| -> crate::Result<Table> {
+        let path = root.join(name);
+        let mut writer = Writer::new(path.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(256);
+        for i in 0..256u32 {
+            writer.write(crate::InternalValue::from_components(
+                format!("k{i:04}").into_bytes(),
+                b"v",
+                1,
+                crate::ValueType::Value,
+            ))?;
+        }
+        let (_, checksum) = writer.finish()?.expect("table written");
+        #[cfg(feature = "metrics")]
+        let metrics = Arc::new(Metrics::default());
+        let mut params = test_recover_params(path, checksum);
+        params.descriptor_table = None;
+        params.fs = Arc::clone(&fs);
+        #[cfg(feature = "metrics")]
+        {
+            params.metrics = metrics;
+        }
+        Table::recover(params)
+    };
+
+    let all_zero = |path: &std::path::Path, off: u64, len: usize| -> crate::Result<bool> {
+        let file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let bytes = crate::file::read_exact(&*file, off, len)?;
+        Ok(bytes.iter().all(|&b| b == 0))
+    };
+
+    // COMMITTED-BUT-UNPUNCHED: restricted view over an intact file. The heal
+    // copy must keep every byte (no new holes).
+    let table = build("0")?;
+    let handles: Vec<_> = table
+        .block_index
+        .iter()
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert!(handles.len() >= 3, "need several blocks to restrict over");
+    let bound = handles.get(1).expect("second block").end_key().clone();
+    let (b0_off, b0_len) = {
+        let h = handles.first().expect("first block");
+        (h.offset().0, h.size() as usize)
+    };
+    let restricted = table.with_restriction(bound.clone());
+    let source = fs.open(
+        &restricted.path,
+        &crate::fs::FsOpenOptions::new().read(true),
+    )?;
+    restricted
+        .unshare_for_heal(&*source, crate::fs::SyncMode::Normal)
+        .expect("unshare succeeds");
+    assert!(
+        !all_zero(&restricted.path, b0_off, b0_len)?,
+        "an unpunched restricted table's prefix blocks must be copied verbatim, \
+         not turned into holes the (missing) sidecar does not cover"
+    );
+
+    // ACTUALLY PUNCHED: the same restriction whose prefix data blocks were
+    // hole-punched. The heal copy must keep those extents as holes.
+    let table = build("1")?;
+    let handles: Vec<_> = table
+        .block_index
+        .iter()
+        .collect::<crate::Result<Vec<_>>>()?;
+    let punch = table.punch_offset_for(&bound)?;
+    for h in &handles {
+        if h.offset().0 < punch {
+            memfs.punch_hole(&table.path, h.offset().0, u64::from(h.size()))?;
+        }
+    }
+    let (p0_off, p0_len) = {
+        let h = handles.first().expect("first block");
+        (h.offset().0, h.size() as usize)
+    };
+    let restricted = table.with_restriction(bound);
+    let source = fs.open(
+        &restricted.path,
+        &crate::fs::FsOpenOptions::new().read(true),
+    )?;
+    restricted
+        .unshare_for_heal(&*source, crate::fs::SyncMode::Normal)
+        .expect("unshare succeeds");
+    assert!(
+        all_zero(&restricted.path, p0_off, p0_len)?,
+        "a genuinely punched extent stays a hole in the heal copy"
     );
     Ok(())
 }
@@ -4361,6 +5797,79 @@ fn write_columnar_batch_accounts_tombstones_seqno_bounds_and_restart_locator() -
     Ok(())
 }
 
+/// `verify_locator` must reject a locator re-stamped to resolve a key to a
+/// block OTHER than the one holding its newest version: every byte-level
+/// check reads clean, but `point_read_inner` trusts the answer and can return
+/// a stale value from the mispointed block without falling back to the index.
+/// An intact locator passes; a redirected one fails.
+#[test]
+fn verify_locator_rejects_a_redirected_key_mapping() -> crate::Result<()> {
+    use crate::config::{LocatorPolicyEntry, LocatorPrecision};
+    use crate::table::locator::{LocatorSpec, build_locator_section};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("t");
+
+    // Small blocks so several data blocks (several block_ids) exist.
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_data_block_size(128)
+        .use_locator(LocatorPolicyEntry::Enabled {
+            precision: LocatorPrecision::Block,
+            block_id_bits: None,
+            slot_bits: None,
+        });
+    for i in 0u64..200 {
+        writer.write(crate::InternalValue::from_components(
+            format!("key-{i:04}").into_bytes(),
+            format!("v{i:04}").into_bytes(),
+            i + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    // Intact locator verifies clean.
+    table.verify_locator()?;
+
+    // Rebuild the SAME ribbon (same key set, same widths → byte-identical
+    // length) but redirect the FIRST key to a DIFFERENT block ordinal.
+    let mut triples: Vec<(u64, u64, u64)> = Vec::new();
+    let block_count = table.block_index.iter().count() as u64;
+    assert!(block_count >= 2, "need multiple blocks to redirect between");
+    let mut seen = crate::HashSet::default();
+    for (ordinal, handle) in table.block_index.iter().enumerate() {
+        let handle = handle?;
+        let block_handle = crate::table::BlockHandle::new(handle.offset(), handle.size());
+        let entries = table.decode_block_entries(&block_handle)?;
+        for e in entries {
+            let uk = e.key.user_key.to_vec();
+            if seen.insert(uk.clone()) {
+                triples.push((crate::hash::hash64(&uk), ordinal as u64, 0));
+            }
+        }
+    }
+    // Redirect the first key to a different existing block.
+    let orig = triples[0].1;
+    triples[0].1 = if orig == 0 { block_count - 1 } else { 0 };
+    let spec = LocatorSpec {
+        precision: LocatorPrecision::Block,
+        block_id_bits: None,
+        slot_bits: None,
+    };
+    let forged = build_locator_section(&triples, spec).expect("forged section builds");
+
+    crate::test_forge::forge_replace_section_payload(&file, b"locator", &forged, None)?;
+
+    let table = recover_test_table(&file, checksum)?;
+    let result = table.verify_locator();
+    assert!(
+        matches!(result, Err(crate::Error::InvalidHeader(_))),
+        "a redirected locator must be rejected, got {result:?}",
+    );
+    Ok(())
+}
+
 #[cfg(feature = "columnar")]
 #[test]
 fn write_columnar_batch_on_an_empty_batch_writes_no_block() -> crate::Result<()> {
@@ -4414,6 +5923,174 @@ fn write_columnar_batch_on_an_empty_batch_writes_no_block() -> crate::Result<()>
     assert!(
         writer.finish()?.is_none(),
         "an empty batch must not produce an SST",
+    );
+    Ok(())
+}
+
+/// A TRANSIENT locator-section read during a SALVAGE open must PROPAGATE, not
+/// degrade the section to `None`. The degradation sets `rebuildable_section_degraded`,
+/// which makes `salvage_attempt` read a delete-free table as possibly hiding
+/// deletion metadata and fail the whole SST (`FeatureUnsupported`), dropping an
+/// otherwise-salvageable table instead of retrying the retryable read. A non-salvage
+/// open keeps the best-effort accelerator behavior (degrade to the sorted-index
+/// path), so this only applies in salvage mode (#80).
+#[test]
+fn recover_salvage_propagates_a_transient_locator_read() -> crate::Result<()> {
+    use crate::config::{LocatorPolicyEntry, LocatorPrecision};
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let sst = dir.path().join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?
+            .use_data_block_size(128)
+            .use_locator(LocatorPolicyEntry::Enabled {
+                precision: LocatorPrecision::Entry,
+                block_id_bits: None,
+                slot_bits: None,
+            });
+        for i in 0..256u32 {
+            w.write(crate::InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                u64::from(i) + 1,
+                crate::ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Resolve the locator section's byte offset from a clean (Live) open.
+    let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &sst)?);
+    let loc_offset = {
+        let live = {
+            let mut params = test_recover_params(sst.clone(), checksum);
+            params.fs = Arc::clone(&fs);
+            Table::recover(params)?
+        };
+        live.regions
+            .locator
+            .expect("the multi-block SST carries a locator section")
+            .offset()
+            .0
+    };
+
+    // Fault ONLY the positioned read at the locator offset, once, with a genuine
+    // transient kind.
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    injector.arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Interrupted))
+            .at_offset(loc_offset)
+            .once(),
+    );
+    let faulted: Arc<dyn crate::fs::Fs> = Arc::new(fault);
+
+    let result = {
+        let mut params = test_recover_params(sst, checksum);
+        params.fs = Arc::clone(&faulted);
+        Table::recover_inner(
+            params,
+            RecoveryMode::Salvage {
+                expected_id: None,
+                prefer_mid_meta: false,
+            },
+        )
+    };
+    injector.clear();
+
+    assert!(
+        matches!(&result, Err(crate::Error::Io(e)) if e.kind() == ErrorKind::Interrupted),
+        "a transient locator read in salvage mode must propagate (not degrade to a \
+         section-degraded open that later fails as FeatureUnsupported): {result:?}",
+    );
+    Ok(())
+}
+
+/// A PERSISTENT (non-retryable) filter-index read during a SALVAGE open must
+/// DEGRADE the rebuildable section, not propagate — the destination writer
+/// re-derives the filter from the recovered keys, so a bad sector under the
+/// partitioned filter's top-level index must not cost the whole recoverable
+/// table. Only a TRANSIENT read propagates (repair retries). Mirrors the
+/// seqno-bounds / zone-map / delete-bitmap / locator loaders.
+#[test]
+fn recover_salvage_degrades_a_persistent_filter_index_read() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let dir = tempdir()?;
+    let sst = dir.path().join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?
+            .use_data_block_size(128)
+            .use_partitioned_filter();
+        for i in 0..256u32 {
+            w.write(crate::InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                u64::from(i) + 1,
+                crate::ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+
+    // Resolve the partitioned filter's top-level-index (`filter_tli`) byte offset
+    // from a clean (Live) open.
+    let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &sst)?);
+    let tli_offset = {
+        let live = {
+            let mut params = test_recover_params(sst.clone(), checksum);
+            params.fs = Arc::clone(&fs);
+            Table::recover(params)?
+        };
+        live.regions
+            .filter_tli
+            .expect("the partitioned-filter SST carries a filter_tli section")
+            .offset()
+            .0
+    };
+
+    // Fault the positioned read at the filter-index offset with a PERSISTENT
+    // (non-retryable) kind.
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    injector.arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other))
+            .at_offset(tli_offset)
+            .once(),
+    );
+    let faulted: Arc<dyn crate::fs::Fs> = Arc::new(fault);
+
+    let result = {
+        let mut params = test_recover_params(sst, checksum);
+        params.fs = Arc::clone(&faulted);
+        Table::recover_inner(
+            params,
+            RecoveryMode::Salvage {
+                expected_id: None,
+                prefer_mid_meta: false,
+            },
+        )
+    };
+    injector.clear();
+
+    let recovered = match result {
+        Ok(table) => table,
+        Err(e) => panic!(
+            "a persistent filter-index read in salvage mode must degrade the rebuildable \
+             section and recover the table, not propagate and drop it: {e:?}",
+        ),
+    };
+    // A bare success would also pass if the injected fault never fired; the
+    // degradation flag proves the faulted filter-index load was actually
+    // routed through the salvage degrade arm.
+    assert!(
+        recovered.salvage_degraded_a_rebuildable_section(),
+        "the recovered table must report the degraded rebuildable section",
     );
     Ok(())
 }

@@ -19,7 +19,10 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      # Pinning policy: first-party actions (actions/*, dependabot/*) track a
+      # MAJOR tag; third-party actions stay pinned to a commit digest with a
+      # version comment. See coordinode-release.yml for the reasoning.
+      - uses: actions/checkout@v7
         with:
           # cargo publish authenticates via OIDC against crates.io
           # (rust-lang/crates-io-auth-action below); no git config

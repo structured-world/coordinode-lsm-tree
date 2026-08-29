@@ -142,17 +142,24 @@ impl ManifestArchiveReader {
     /// # Errors
     ///
     /// - [`crate::Error::Io`] on read / seek / open failure
+    /// - [`crate::Error::Decrypt`] when either footer copy failed
+    ///   AEAD verification: the Block checksum is verified over the
+    ///   ciphertext BEFORE decryption, so a tag failure identifies a
+    ///   missing / wrong encryption provider (a reversible
+    ///   configuration error), never corrupt bytes — it must not be
+    ///   folded into the structural variant below, which
+    ///   `open_or_repair` answers with a destructive rebuild.
     /// - [`crate::Error::ManifestFooterInvalid`] when both the tail
-    ///   and head paths fail to produce a valid footer payload. The
-    ///   underlying per-path failures (Block I/O, XXH3 mismatch,
-    ///   AEAD decryption failure, footer-payload structural error)
-    ///   are logged at `error` level with the path that produced
-    ///   them and then collapsed into this single variant; callers
-    ///   that need to distinguish decrypt-vs-checksum-vs-structural
-    ///   failure should consult the log. The collapse is
-    ///   intentional: callers above this layer treat any
-    ///   double-path failure as "manifest is unreadable, surface
-    ///   recovery options" rather than branching on per-path cause.
+    ///   and head paths fail to produce a valid footer payload for
+    ///   any other reason. The underlying per-path failures (Block
+    ///   I/O, XXH3 mismatch, footer-payload structural error) are
+    ///   logged at `error` level with the path that produced them
+    ///   and then collapsed into this single variant; callers that
+    ///   need to distinguish checksum-vs-structural failure should
+    ///   consult the log. The collapse is intentional: callers
+    ///   above this layer treat any structural double-path failure
+    ///   as "manifest is unreadable, surface recovery options"
+    ///   rather than branching on per-path cause.
     /// - [`crate::Error::Unrecoverable`] when the file is shorter
     ///   than [`HEAD_FOOTER_RESERVED_SIZE`]: with no head mirror to
     ///   fall back to, neither recovery path can produce a footer.
@@ -246,6 +253,20 @@ impl ManifestArchiveReader {
                     path.display(),
                     tail_err,
                 );
+                // An AEAD decryption failure on either copy is a
+                // CONFIGURATION signal (a missing or wrong encryption
+                // provider), not footer corruption: the Block checksum is
+                // verified over the CIPHERTEXT before decryption, so corrupt
+                // bytes fail the checksum, never the tag. Preserve the
+                // decrypt classification — collapsing it into
+                // `ManifestFooterInvalid` would send `open_or_repair` into a
+                // rebuild under the wrong key, excluding every table it
+                // cannot decrypt.
+                for err in [tail_err, head_err] {
+                    if matches!(err, crate::Error::Decrypt(_)) {
+                        return Err(err);
+                    }
+                }
                 Err(crate::Error::ManifestFooterInvalid(
                     "both tail and head mirror failed to produce a valid footer payload",
                 ))

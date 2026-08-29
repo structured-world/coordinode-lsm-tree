@@ -244,10 +244,18 @@ pub struct Aes256GcmProvider {
     /// ([`encrypt_block_aad`](EncryptionProvider::encrypt_block_aad)). The
     /// opaque [`encrypt`](EncryptionProvider::encrypt) (manifest subsystem) uses
     /// `cipher` directly; the block path looks the key up by epoch here.
+    ///
+    /// This and the two fields below form the AAD-bound block state, read only by
+    /// `encrypt_block_aad` / `decrypt_block_aad`. Those entry points are
+    /// `zstd_any`-gated (they wrap the zstd `SkippableFrame`), so without zstd the
+    /// provider cannot do block AAD and these fields are unused — gate them with it.
+    #[cfg(zstd_any)]
     key_chain: crate::encryption::key_chain::StaticKeyChain,
     /// Active key epoch sealed into every block's `MetadataFrame`.
+    #[cfg(zstd_any)]
     key_epoch: u8,
     /// AEAD suite tag (AES-256-GCM) mirrored into the AAD.
+    #[cfg(zstd_any)]
     suite_id: crate::encryption::aad::SuiteId,
 }
 
@@ -274,8 +282,11 @@ impl Aes256GcmProvider {
             cipher: aes_gcm::Aes256Gcm::new(key.into()),
             // Single-epoch shortcut: the one supplied key is epoch 0. Deployments
             // that rotate keys construct a provider over a multi-epoch chain.
+            #[cfg(zstd_any)]
             key_chain: crate::encryption::key_chain::StaticKeyChain::new().with_key(0, *key),
+            #[cfg(zstd_any)]
             key_epoch: 0,
+            #[cfg(zstd_any)]
             suite_id: crate::encryption::aad::SuiteId::Aes256Gcm,
         }
     }

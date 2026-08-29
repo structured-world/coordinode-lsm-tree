@@ -93,7 +93,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
         loop {
             let Some(next) = self.inner.next_if(|kv| {
                 if let Ok(kv) = kv {
-                    kv.key.user_key == *user_key
+                    crate::comparator::same_user_key(&kv.key.user_key, user_key)
                 } else {
                     true
                 }
@@ -235,7 +235,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
         loop {
             let Some(next) = self.inner.next_if(|kv| {
                 if let Ok(kv) = kv {
-                    kv.key.user_key == key
+                    crate::comparator::same_user_key(&kv.key.user_key, key)
                 } else {
                     true
                 }

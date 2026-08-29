@@ -953,6 +953,46 @@ pub struct FilterStats {
     /// upper bound on the actual ribbon parameter `bits_per_key`.
     pub bits_per_key: f64,
 }
+/// Whether `path` is a BLOB file, decided by parsing it rather than by its
+/// name.
+///
+/// A file under `blobs/` whose name happens to parse as an id (an operator's
+/// backup called `0`, say) is not a blob file, and treating it as one leads a
+/// repair to publish a blob manifest over a standard store: every later
+/// standard open then fails with a type mismatch while the committed manifest
+/// looks clean, so no repair will touch it. This asks the same reader the blob
+/// recovery path uses.
+///
+/// # Errors
+///
+/// An ENVIRONMENTAL failure propagates: it says nothing about the file's shape,
+/// and a retry can re-read it. Anything else is a conclusive `false`: whatever
+/// the file is, blob recovery cannot use it.
+///
+/// # Examples
+///
+/// ```
+/// # fn main() -> lsm_tree::Result<()> {
+/// let dir = tempfile::tempdir()?;
+/// let junk = dir.path().join("0");
+/// std::fs::write(&junk, b"not a blob file")?;
+/// assert!(!lsm_tree::inspect::is_blob_file(&junk)?);
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "std")]
+pub fn is_blob_file(path: &Path) -> crate::Result<bool> {
+    let fs: std::sync::Arc<dyn Fs> = std::sync::Arc::new(StdFs);
+    // The id and checksum are not part of the question: recovery stores both
+    // without verifying them, and the caller is asking only whether the bytes
+    // parse as a blob file at all.
+    match crate::vlog::recover_blob_file(path, 0, crate::Checksum::from_raw(0), 0, &fs) {
+        Ok(_) => Ok(true),
+        Err(e) if e.is_environmental() => Err(e),
+        Err(_) => Ok(false),
+    }
+}
+
 /// Reads `path` and returns `BuRR` filter sizing stats for the SST's
 /// `filter` section, or `Ok(None)` if the SST has no filter section
 /// at all (filter-less table).

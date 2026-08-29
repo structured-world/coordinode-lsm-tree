@@ -165,11 +165,14 @@ fn filter_column(col: &Column, rows: usize, mask: &[bool], kept: usize) -> Colum
                 // leaving a missing offset and malformed framing.
                 let value = bytes_row(&col.data, rows, row).unwrap_or(&[]);
                 payload.extend_from_slice(value);
-                // The kept payload is a subset of the original, whose offsets
-                // already fit u32. The caps only guard the unreachable overflow
-                // and keep the offsets monotonically non-decreasing.
+                // `col` is an already-decoded column, so its per-row lengths and
+                // their running total both fit u32 by construction (that is how
+                // the offset table was parsed). The kept payload is a SUBSET of
+                // that original, so `acc` stays within the original total and can
+                // never exceed u32::MAX — plain arithmetic, no cap to hide a
+                // corrupt overrun and no error channel to surface one on.
                 let len = u32::try_from(value.len()).unwrap_or(u32::MAX);
-                acc = acc.saturating_add(len);
+                acc += len;
                 offsets.extend_from_slice(&acc.to_le_bytes());
             }
             offsets.extend_from_slice(&payload);
@@ -217,25 +220,45 @@ fn compact_validity(bits: &[u8], mask: &[bool], kept: usize) -> Vec<u8> {
 /// newest-wins dedup. An out-of-range index contributes an empty (`Bytes`) or
 /// zero-filled (`Fixed`) cell rather than panicking, so a malformed index can
 /// never desync a column's framing from the output row count.
-#[must_use]
-pub(crate) fn take_rows(batch: &ColumnBatch, indices: &[u32]) -> ColumnBatch {
+pub(crate) fn take_rows(batch: &ColumnBatch, indices: &[u32]) -> crate::Result<ColumnBatch> {
     let rows = batch.row_count as usize;
     let columns = batch
         .columns
         .iter()
         .map(|c| take_column(c, rows, indices))
-        .collect();
+        .collect::<crate::Result<_>>()?;
     // `indices.len()` is the output row count; it fits u32 because every index
     // addresses a row of a single block, whose count is itself a u32.
     let row_count = u32::try_from(indices.len()).unwrap_or(u32::MAX);
-    ColumnBatch { row_count, columns }
+    Ok(ColumnBatch { row_count, columns })
 }
 
 /// Gathers one column to the rows listed in `indices` (in that order),
 /// rebuilding its framing (fixed chunks copied, `Bytes` offset table + payload
 /// repacked) and its validity bitmap. Sibling of [`filter_column`] for the
 /// index-driven [`take_rows`] gather.
-fn take_column(col: &Column, rows: usize, indices: &[u32]) -> Column {
+/// Advances the running `Bytes` offset accumulator by one gathered value's
+/// length, returning the new offset. Unlike the mask-driven `filter_column`, a
+/// gather may REPEAT an index (any index list is permitted), so the emitted
+/// payload is not a subset of the original and the running u32 offset can exceed
+/// the original total. A saturating accumulator would peg the offsets at
+/// `u32::MAX` while the payload kept growing, desyncing the offset table from the
+/// payload (later rows mis-sliced on read); instead this returns
+/// [`crate::Error::DecompressedSizeTooLarge`] when either a single value's length
+/// or the accumulated total would exceed the u32 offset-table capacity.
+fn advance_bytes_offset(acc: u32, value_len: usize) -> crate::Result<u32> {
+    let len = u32::try_from(value_len).map_err(|_| crate::Error::DecompressedSizeTooLarge {
+        declared: value_len as u64,
+        limit: u64::from(u32::MAX),
+    })?;
+    acc.checked_add(len)
+        .ok_or_else(|| crate::Error::DecompressedSizeTooLarge {
+            declared: u64::from(acc) + u64::from(len),
+            limit: u64::from(u32::MAX),
+        })
+}
+
+fn take_column(col: &Column, rows: usize, indices: &[u32]) -> crate::Result<Column> {
     let data = match col.type_tag {
         TypeTag::Fixed(width) => {
             let width = width as usize;
@@ -264,9 +287,11 @@ fn take_column(col: &Column, rows: usize, indices: &[u32]) -> Column {
                 // A missing cell degrades to empty (one offset still written), so
                 // the offset table stays in lockstep with the output row count.
                 let value = bytes_row(&col.data, rows, i as usize).unwrap_or(&[]);
+                // Advance the offset accumulator BEFORE appending the value, so a
+                // genuinely oversized gather is a clean error rather than a
+                // silently corrupt batch (see `advance_bytes_offset`).
+                acc = advance_bytes_offset(acc, value.len())?;
                 payload.extend_from_slice(value);
-                let len = u32::try_from(value.len()).unwrap_or(u32::MAX);
-                acc = acc.saturating_add(len);
                 offsets.extend_from_slice(&acc.to_le_bytes());
             }
             offsets.extend_from_slice(&payload);
@@ -277,12 +302,12 @@ fn take_column(col: &Column, rows: usize, indices: &[u32]) -> Column {
         .validity
         .as_ref()
         .map(|bits| take_validity(bits, indices));
-    Column {
+    Ok(Column {
         column_id: col.column_id,
         type_tag: col.type_tag,
         validity,
         data,
-    }
+    })
 }
 
 /// Rebuilds a validity bitmap for the rows listed in `indices`, preserving each

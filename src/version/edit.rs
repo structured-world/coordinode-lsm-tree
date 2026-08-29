@@ -127,6 +127,15 @@ pub struct VersionEdit {
     /// [`Table::with_restriction`](crate::Table::with_restriction). Empty on
     /// every edit that did not run tight-space reclaim.
     pub restrictions: Vec<(u64, UserKey)>,
+    /// Per-blob-file live-data frontiers for tight-space relocation
+    /// (`blob file id → first live byte offset`). A blob file listed here has
+    /// had its consumed prefix punched out after its values were relocated, so
+    /// its recorded checksum covers only `[frontier, end)`; whole-file hashing
+    /// would read the punched (zeroed) prefix and report a healthy file as
+    /// corrupt. The blob analogue of [`Self::restrictions`], carrying a byte
+    /// offset because a blob file has no key index to resolve a bound through.
+    /// Empty on every edit that did not reclaim a blob prefix.
+    pub blob_restrictions: Vec<(u64, u64)>,
 }
 
 /// `checksum_type` byte written for XXH3-128 (matches the snapshot encoder).
@@ -177,6 +186,27 @@ impl VersionEdit {
             out.write_u64::<LittleEndian>(*id)?;
             out.write_u32::<LittleEndian>(u32_len(key.len())?)?;
             out.write_all(key)?;
+        }
+
+        // Omit the appended blob-frontier section entirely when there is nothing
+        // to record, so the overwhelmingly common edit stays byte-identical to
+        // what earlier writers produced (and decodes on them too).
+        //
+        // Deliberately NOT behind a bumped edit/manifest format version. A
+        // non-empty list is written only once a blob file's prefix has been
+        // physically hole-punched, and a binary without blob-restriction
+        // support cannot serve such a database anyway (it would read the
+        // punched region as zeros); its trailing-data rejection on this edit
+        // is the fail-fast that stops it from opening a store it cannot
+        // handle. Rolling back a binary stays possible for every database
+        // that never used tight-space blob reclaim — exactly the databases a
+        // rollback could still serve.
+        if !self.blob_restrictions.is_empty() {
+            out.write_u32::<LittleEndian>(u32_len(self.blob_restrictions.len())?)?;
+            for (id, frontier) in &self.blob_restrictions {
+                out.write_u64::<LittleEndian>(*id)?;
+                out.write_u64::<LittleEndian>(*frontier)?;
+            }
         }
         Ok(())
     }
@@ -277,6 +307,21 @@ impl VersionEdit {
             restrictions.push((id, UserKey::from(head)));
         }
 
+        // Blob frontiers are an APPENDED section: edits written before it existed
+        // end right here. The framing checksum already passed, so a payload that
+        // stops at this boundary is an older-format edit carrying no blob
+        // frontier — not a truncated one — and decodes as an empty list.
+        let mut blob_restrictions = Vec::new();
+        if !r.is_empty() {
+            let blob_restriction_count = r.read_u32::<LittleEndian>().map_err(|_| ERR)?;
+            blob_restrictions.reserve(cap(blob_restriction_count));
+            for _ in 0..blob_restriction_count {
+                let id = r.read_u64::<LittleEndian>().map_err(|_| ERR)?;
+                let frontier = r.read_u64::<LittleEndian>().map_err(|_| ERR)?;
+                blob_restrictions.push((id, frontier));
+            }
+        }
+
         // A well-formed edit consumes its payload exactly. Trailing bytes mean a
         // corrupt / mis-encoded record (format drift, not power loss — the
         // framing checksum already passed), so reject rather than silently
@@ -292,6 +337,7 @@ impl VersionEdit {
             removed_blob_file_ids,
             gc_stats,
             restrictions,
+            blob_restrictions,
         })
     }
 }

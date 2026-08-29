@@ -14,24 +14,20 @@ use crate::metrics::Metrics;
 fn recover_at(file: &Path, checksum: Checksum, table_id: TableId) -> crate::Result<Table> {
     #[cfg(feature = "metrics")]
     let metrics = Arc::new(Metrics::default());
-    Table::recover(
+    let mut params = crate::table::RecoverParams::new(
         file.to_path_buf(),
         checksum,
-        0,
-        0,
         table_id,
-        Arc::new(Cache::with_capacity_bytes(1_000_000)),
-        Some(Arc::new(DescriptorTable::new(10))),
         Arc::new(StdFs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
         crate::comparator::default_comparator(),
-        #[cfg(feature = "metrics")]
-        metrics,
-    )
+        Arc::new(Cache::with_capacity_bytes(1_000_000)),
+    );
+    params.descriptor_table = Some(Arc::new(DescriptorTable::new(10)));
+    #[cfg(feature = "metrics")]
+    {
+        params.metrics = metrics;
+    }
+    Table::recover(params)
 }
 
 #[cfg(feature = "columnar")]
@@ -90,6 +86,147 @@ fn relocate_reuses_blocks_and_masks_deleted_rows() -> crate::Result<()> {
     Ok(())
 }
 
+/// A merge-on-read relocated columnar SST appends a NEW delete bitmap, so its
+/// re-encoded meta must describe THAT bitmap: `verify_metadata_bounds` (the
+/// repair-time forgery cross-check) authenticates `descriptor#delete_bitmap_len`
+/// and `descriptor#delete_bitmap_hash` against the on-disk section. If the
+/// relocation copied the source's (absent-bitmap) descriptors verbatim, the
+/// check would flag the healthy table and `repair_with_salvage` would drop
+/// it. The descriptors must be repointed to the appended bitmap.
+#[cfg(feature = "columnar")]
+#[test]
+fn relocated_mor_table_passes_metadata_bounds_cross_check() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let src_path = dir.path().join("src");
+    let out_path = dir.path().join("out");
+
+    let n = 96u32;
+    let mut writer = Writer::new(src_path.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    for i in 0..n {
+        writer.write(InternalValue::from_components(
+            format!("k{i:04}").into_bytes(),
+            b"val",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, src_checksum) = writer.finish()?.expect("source table written");
+    let source = recover_at(&src_path, src_checksum, 0)?;
+
+    let mut bitmap = DeleteBitmap::new();
+    for &row in &[4u32, 7, 40, 95] {
+        bitmap.insert(row);
+    }
+    let out_checksum =
+        source.relocate_columnar_with_deletes(&out_path, &StdFs, 1, &bitmap, SyncMode::Normal)?;
+    let relocated = recover_at(&out_path, out_checksum, 1)?;
+
+    // The re-encoded meta describes the appended bitmap, so the forgery
+    // cross-check accepts the healthy relocated table.
+    relocated.verify_metadata_bounds(false)?;
+    Ok(())
+}
+
+/// A merge-on-read relocation is a compaction output derived from exactly its
+/// source, and its meta must SAY so: lineage naming the source id, no
+/// `lineage_prev` (the run's head), and `lineage_last` (its closing output) —
+/// a complete single-output run. Copying the source's own (or absent)
+/// lineage verbatim leaves a manifest-loss repair unable to associate the
+/// copy with a still-present source (cleanup can lag the install), so BOTH
+/// are retained — and under a merge operator every operand in the
+/// byte-identical data blocks applies twice. The copy also states its
+/// content recency: its id is allocated at relocation time, so without the
+/// key its own (newer) id would masquerade as its content position.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_relocated_table_carries_a_complete_single_output_lineage() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let src_path = dir.path().join("src");
+    let out_path = dir.path().join("out");
+
+    let mut writer = Writer::new(src_path.clone(), 7, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    for i in 0..96u32 {
+        writer.write(InternalValue::from_components(
+            format!("k{i:04}").into_bytes(),
+            b"val",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, src_checksum) = writer.finish()?.expect("source table written");
+    let source = recover_at(&src_path, src_checksum, 7)?;
+
+    let mut bitmap = DeleteBitmap::new();
+    bitmap.insert(4);
+    let out_checksum =
+        source.relocate_columnar_with_deletes(&out_path, &StdFs, 9, &bitmap, SyncMode::Normal)?;
+    let relocated = recover_at(&out_path, out_checksum, 9)?;
+
+    assert_eq!(
+        relocated.metadata.lineage.as_deref(),
+        Some(&[7u64][..]),
+        "the copy's lineage names exactly its source",
+    );
+    assert_eq!(
+        relocated.metadata.lineage_prev, None,
+        "a single-output run has no previous output",
+    );
+    assert!(
+        relocated.metadata.lineage_last,
+        "the single output closes its run",
+    );
+    assert_eq!(
+        relocated.metadata.recency,
+        Some(7),
+        "the copy's content position is its source's, not its own newer id",
+    );
+    Ok(())
+}
+
+/// A tight-space RESTRICTED view reads its live suffix only: `scan()` starts at
+/// the bound and numbers rows from zero, while the relocation copies the whole
+/// physical data section — punched prefix blocks included — and publishes the
+/// copy WITHOUT the restriction. The bitmap would then mask shifted rows and
+/// reads could reach the copied zero blocks, so block reuse must refuse and let
+/// the caller rewrite copy-on-write.
+#[cfg(feature = "columnar")]
+#[test]
+fn relocate_rejects_a_restricted_view() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let src_path = dir.path().join("src");
+
+    let mut writer = Writer::new(src_path.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    for i in 0..32u32 {
+        writer.write(InternalValue::from_components(
+            format!("k{i:04}").into_bytes(),
+            b"val",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+    let source = recover_at(&src_path, checksum, 0)?;
+    let restricted = source.reopen_restricted(crate::UserKey::from(&b"k0016"[..]))?;
+
+    let out_path = dir.path().join("out");
+    let mut bitmap = DeleteBitmap::new();
+    bitmap.insert(0);
+    let err = restricted
+        .relocate_columnar_with_deletes(&out_path, &StdFs, 1, &bitmap, SyncMode::Normal)
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::Error::FeatureUnsupported(_)),
+        "a restricted view must be rejected, got {err:?}",
+    );
+    Ok(())
+}
+
 #[test]
 fn relocate_rejects_row_major_segment() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -116,5 +253,69 @@ fn relocate_rejects_row_major_segment() -> crate::Result<()> {
         matches!(err, crate::Error::FeatureUnsupported(_)),
         "row-major segment must be rejected, got {err:?}",
     );
+    Ok(())
+}
+
+/// A merge-on-read relocated columnar SST keeps its PHYSICAL rows (the
+/// delete bitmap only masks them) and copies the source `linked_blob_files`
+/// accounting verbatim — so the blob-link cross-check must derive its
+/// accounting from the UNMASKED physical rows. Deriving from the masked
+/// view marks a healthy relocated table corrupt, and repair-with-salvage
+/// would then drop it (its retained range tombstones make it
+/// unsalvageable).
+#[cfg(feature = "columnar")]
+#[test]
+fn relocated_mor_table_passes_the_blob_link_cross_check() -> crate::Result<()> {
+    use crate::blob_tree::handle::BlobIndirection;
+    use crate::coding::Encode;
+    use crate::vlog::ValueHandle;
+
+    let dir = tempfile::tempdir()?;
+    let src_path = dir.path().join("src");
+    let out_path = dir.path().join("out");
+
+    // A columnar segment whose every row is a blob indirection into file 5,
+    // with the blob-link accounting the writer derives from those rows.
+    let n = 8u32;
+    let mut writer = Writer::new(src_path.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    let mut bytes_sum = 0u64;
+    let mut on_disk_sum = 0u64;
+    for i in 0..n {
+        let ind = BlobIndirection {
+            vhandle: ValueHandle {
+                blob_file_id: 5,
+                offset: u64::from(i) * 100,
+                on_disk_size: 40,
+            },
+            size: 80,
+        };
+        bytes_sum += u64::from(ind.size);
+        on_disk_sum += u64::from(ind.vhandle.on_disk_size);
+        let mut val = alloc::vec::Vec::new();
+        ind.encode_into(&mut val)?;
+        writer.write(InternalValue::from_components(
+            format!("k{i:04}").into_bytes(),
+            val,
+            1,
+            crate::ValueType::Indirection,
+        ))?;
+    }
+    writer.link_blob_file(5, n as usize, bytes_sum, on_disk_sum);
+    let (_, src_checksum) = writer.finish()?.expect("source table written");
+    let source = recover_at(&src_path, src_checksum, 0)?;
+
+    // Relocate with one indirection row MASKED: the physical rows (and the
+    // copied accounting) still include it.
+    let mut bitmap = DeleteBitmap::new();
+    bitmap.insert(3);
+    let out_checksum =
+        source.relocate_columnar_with_deletes(&out_path, &StdFs, 1, &bitmap, SyncMode::Normal)?;
+    let relocated = recover_at(&out_path, out_checksum, 1)?;
+
+    relocated
+        .verify_blob_links()
+        .expect("a healthy relocated MoR table passes the blob-link cross-check");
     Ok(())
 }

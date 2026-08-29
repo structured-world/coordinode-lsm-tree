@@ -154,6 +154,11 @@ impl<'a> Ingestion<'a> {
         // tables are columnar too (a row ingest is transposed at spill, a
         // columnar batch is stored directly via `write_columnar_batch`).
         writer = writer.use_columnar(rc.columnar);
+        // Flag every ingested SST: its entries are written at local seqno 0 and
+        // rely on the `global_seqno` allocated at commit, so manifest repair must
+        // recognize the manifest-only offset (and fail closed when it is lost)
+        // rather than mistake the table for a normal flush at seqno 0.
+        writer = writer.use_bulk_ingested(true);
         writer = writer.use_disable_cow_on_sst(rc.disable_cow_on_sst_files);
         writer = writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
         writer = writer.use_locator(tree.config.locator_policy.get(INITIAL_CANONICAL_LEVEL));
@@ -453,26 +458,48 @@ impl<'a> Ingestion<'a> {
         let created_tables = results
             .into_iter()
             .map(|(table_id, checksum)| -> crate::Result<Table> {
-                Table::recover(
+                let mut params = crate::table::RecoverParams::new(
                     self.folder.join(table_id.to_string()),
                     checksum,
-                    global_seqno,
-                    self.tree.id,
                     table_id,
-                    self.tree.config.cache.clone(),
-                    self.tree.config.descriptor_table.clone(),
                     self.level_fs.clone(),
-                    false,
-                    false,
-                    self.tree.config.encryption.clone(),
-                    #[cfg(zstd_any)]
-                    self.tree.config.zstd_dictionary.clone(),
                     self.tree.config.comparator.clone(),
-                    #[cfg(feature = "metrics")]
-                    self.tree.metrics.clone(),
-                )
+                    self.tree.config.cache.clone(),
+                );
+                params.global_seqno = global_seqno;
+                params.tree_id = self.tree.id;
+                params
+                    .descriptor_table
+                    .clone_from(&self.tree.config.descriptor_table);
+                params.encryption.clone_from(&self.tree.config.encryption);
+                #[cfg(zstd_any)]
+                {
+                    params
+                        .zstd_dictionary
+                        .clone_from(&self.tree.config.zstd_dictionary);
+                }
+                #[cfg(feature = "metrics")]
+                {
+                    params.metrics = self.tree.metrics.clone();
+                }
+                Table::recover(params)
             })
             .collect::<crate::Result<Vec<_>>>()?;
+
+        // Bind every ingested table to the tree BEFORE the version edit makes
+        // it reachable. Ingest builds and publishes its tables itself rather
+        // than going through `register_tables`, so without this an ingested
+        // SST could never queue itself for a healing rewrite (its bitrot would
+        // be re-corrected on every read but never repaired on disk) and its
+        // in-place heal could race a checkpoint hard-link.
+        for table in &created_tables {
+            table.bind_to_tree(&crate::table::TableSinks {
+                deletion_pause: &self.tree.deletion_pause,
+                heal_hints: &self.tree.heal_hints,
+                #[cfg(feature = "std")]
+                background_deleter: Some(&self.tree.background_deleter),
+            });
+        }
 
         // Upgrade the version with our ingested tables, using the global_seqno
         // we allocated earlier. This ensures the version and all tables share

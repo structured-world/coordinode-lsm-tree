@@ -29,6 +29,13 @@ dir = "target/nextest"
 [profile.default]
 slow-timeout = { period = "10s", terminate-after = 6 }
 fail-fast = true
+# Process-exit grace before a test is flagged "leaky". The default 100ms
+# occasionally trips on ordinary teardown under a fully parallel run (the
+# flagged test is a different, often trivial one each time — probing with a
+# 1ms timeout marks even pure in-memory unit tests). A genuine leak (a
+# surviving child process holding the output pipes) never closes them, so a
+# longer grace loses no detection.
+leak-timeout = "500ms"
 
 # Property tests default to 32 cases via the shared
 # `common::proptest_config()` helper (PROPTEST_CASES /
@@ -49,6 +56,27 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 filter = "test(partial_decode_) | test(lazy_block) | test(ecc_heal_scheduled) | test(block_layout_section_roundtrips_for_large_zstd) | test(compatibility_matrix_round_trips)"
 slow-timeout = { period = "30s", terminate-after = 4 }
 
+# Wall-clock concurrency stress: 4 writers + 2 readers contend on one
+# encrypted tree for a fixed 2-second window, then exact-equality
+# assertions run over the committed tally. The test's correctness envelope
+# assumes its threads actually get CPU / disk / fds during that window;
+# co-scheduled with the rest of the suite it can starve and flake on
+# resource pressure that has nothing to do with encryption. Claim every
+# scheduler slot so it runs ALONE — the assertions stay at full strength
+# (a real engine race still fires solo), only cross-test contention is
+# removed. Mirrored in the ci profile below.
+[[profile.default.overrides]]
+filter = "test(concurrent_encrypted_no_corruption)"
+threads-required = "num-cpus"
+
+# The single-byte-bitrot heal fuzzer runs for a fixed ~45s wall-clock budget
+# (`#[ignore]`d, so it only runs under `--run-ignored`), well past the 10s
+# ceiling by design. Give it a generous window so a slower runner's corpus
+# build does not push it into a spurious termination.
+[[profile.default.overrides]]
+filter = "test(fuzz_heal_bitrot)"
+slow-timeout = { period = "90s", terminate-after = 2 }
+
 # CI profile: retries for flaky tests, JUnit XML output, longer timeouts.
 [profile.ci]
 retries = 2
@@ -56,6 +84,8 @@ fail-fast = false
 slow-timeout = { period = "120s", terminate-after = 3 }
 status-level = "all"
 final-status-level = "flaky"
+# See the default profile: teardown grace, not a detection trade-off.
+leak-timeout = "500ms"
 
 [profile.ci.junit]
 path = "junit.xml"
@@ -65,3 +95,16 @@ store-failure-output = true
 [[profile.ci.overrides]]
 filter = "test(prop_)"
 slow-timeout = { period = "120s", terminate-after = 4 }
+
+# See the default-profile override of the same filter: the wall-clock
+# stress test claims the whole scheduler so cross-test contention cannot
+# starve its 2-second window.
+[[profile.ci.overrides]]
+filter = "test(concurrent_encrypted_no_corruption)"
+threads-required = "num-cpus"
+
+# The bitrot heal fuzzer's fixed ~45s budget (see the default-profile note); a
+# generous timeout keeps it from a spurious termination on a slow CI runner.
+[[profile.ci.overrides]]
+filter = "test(fuzz_heal_bitrot)"
+slow-timeout = { period = "90s", terminate-after = 2 }

@@ -9,9 +9,15 @@ jobs:
   release-plz:
     runs-on: ubuntu-latest
     steps:
+      # Pinning policy: first-party actions (actions/*, dependabot/*) track a
+      # MAJOR tag. GitHub owns both the org and the runner these steps execute
+      # on, so a commit digest buys no protection a tag does not, while costing
+      # a dependency bump per patch release. Third-party actions stay pinned to
+      # a digest with a version comment - that is where the supply-chain risk
+      # actually is. Applies to this privileged workflow too.
       - name: Generate token (SW Release Bot)
         id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.RELEASER_APP_ID }}
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
@@ -23,7 +29,7 @@ jobs:
           permission-pull-requests: write
 
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           # persist-credentials: false — release-plz reads the token via
@@ -44,7 +50,7 @@ jobs:
 
       # Step 1: Create or update release PR (version bump + changelog)
       - name: Create release PR
-        uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7  # v0.5.130
+        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9  # v0.5.131
         with:
           command: release-pr
           config: .release-plz.toml
@@ -54,7 +60,7 @@ jobs:
       # Step 2: If version in Cargo.toml > latest tag, create GitHub Release + tag
       # This triggers release.yml → cargo publish via OIDC
       - name: Create GitHub Release
-        uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7  # v0.5.130
+        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9  # v0.5.131
         with:
           command: release
           config: .release-plz.toml

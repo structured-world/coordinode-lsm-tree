@@ -22,6 +22,36 @@ pub enum Error {
     /// Some required files could not be recovered from disk
     Unrecoverable,
 
+    /// The operation was aborted on a caller's cooperative cancellation
+    /// request ([`RecoveryProgress::request_cancel`]).
+    ///
+    /// A repair cancelled BEFORE its manifest commit left the directory
+    /// untouched (the scan is read-only), so a retry re-derives everything
+    /// from the same bytes; a cancel requested after the commit is ignored
+    /// rather than reported, since the rebuilt manifest is already durable.
+    ///
+    /// [`RecoveryProgress::request_cancel`]: crate::RecoveryProgress::request_cancel
+    Cancelled,
+
+    /// The read resolved into an extent that was physically EXCISED — a
+    /// hole-punched region that reads back as zeros.
+    ///
+    /// Tight-space reclaim punches consumed extents in place, and manifest
+    /// recovery may keep a table whose surviving blocks are intact around
+    /// such a hole rather than discard the whole file. Reading one of the
+    /// punched blocks is a genuine, permanent loss of exactly those rows, and
+    /// it is reported as such instead of being smuggled out as a checksum
+    /// mismatch (which reads as "the bytes rotted") or, worse, as "no such
+    /// key" — the latter would fall through to a superseded version in a
+    /// lower level and silently resurrect it.
+    ///
+    /// This is the engine's equivalent of a filesystem returning `EIO` for a
+    /// bad extent while the rest of the file keeps reading.
+    Excised {
+        /// Byte offset of the excised block within the file.
+        offset: u64,
+    },
+
     /// Checksum mismatch
     ChecksumMismatch {
         /// Checksum of loaded block
@@ -69,6 +99,46 @@ pub enum Error {
 
         /// The invalid algorithm wire tag read from the node.
         tag: u8,
+    },
+
+    /// A repair COMMITTED its rebuilt manifest, but a later step failed: the
+    /// repair's own post-commit cleanup, or the follow-up open inside
+    /// [`Config::open_or_repair`](crate::Config::open_or_repair).
+    ///
+    /// The report travels WITH the error because it exists only in that call:
+    /// the retry finds a healthy manifest (its open sweeps any cleanup
+    /// leftover itself), runs no repair, and answers `None` — an
+    /// external-WAL consumer would otherwise never learn its replay
+    /// obligation
+    /// ([`RepairReport::wal_replay_scope`](crate::RepairReport::wal_replay_scope))
+    /// and could keep stale or resurrected values. Consume the report exactly
+    /// as a successful repair's, then retry the open (`cause` is typically
+    /// transient).
+    #[cfg(feature = "std")]
+    RepairedButUnopened {
+        /// The completed repair's report — not rederivable on a retry.
+        report: alloc::boxed::Box<crate::RepairReport>,
+
+        /// The follow-up open's failure.
+        cause: alloc::boxed::Box<Self>,
+    },
+
+    /// The on-disk tree's type does not match the type the configuration
+    /// requests: a standard open (no `kv_separation_opts`) of a KV-separated
+    /// (blob) tree, or the reverse.
+    ///
+    /// This is a CONFIGURATION error — fix the options and reopen — not
+    /// damage, so [`Config::open_or_repair`](crate::Config::open_or_repair)
+    /// propagates it instead of repairing: a rebuild under the mismatched
+    /// type would commit a manifest of the wrong tree shape (a `Standard`
+    /// rebuild of a blob tree strands every blob file behind SSTs full of
+    /// indirections, and the orphan sweep then deletes them).
+    TreeTypeMismatch {
+        /// The type the configuration requested.
+        requested: crate::TreeType,
+
+        /// The type the on-disk tree actually has.
+        actual: crate::TreeType,
     },
 
     /// Blob frame header CRC mismatch (V4 format).
@@ -391,6 +461,11 @@ impl core::error::Error for Error {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
+            // The variant is explicitly a causal wrapper: generic error-chain
+            // logging and transient-retry classifiers must be able to reach
+            // the post-commit step's own failure through the standard chain.
+            #[cfg(feature = "std")]
+            Self::RepairedButUnopened { cause, .. } => Some(&**cause),
             _ => None,
         }
     }
@@ -419,6 +494,40 @@ impl From<crate::sfa::Error> for Error {
                 log::error!("Invalid archive checksum type");
                 Self::Unrecoverable
             }
+        }
+    }
+}
+
+impl Error {
+    /// Whether this failure says something about the ENVIRONMENT or the
+    /// CALLER's configuration rather than about the bytes on disk — the class
+    /// every recovery path must PROPAGATE instead of recording as damage.
+    ///
+    /// Recording one of these as damage commits a manifest that omits the file
+    /// and then removes it, turning a fixable mistake into permanent loss;
+    /// propagating lets the operator fix the environment (or supply the right
+    /// key / dictionary) and re-run with everything still on disk.
+    ///
+    /// - [`Self::Io`] of an environmental kind: the interrupted-syscall
+    ///   retryables, plus access failures that do not implicate the bytes
+    ///   (`PermissionDenied`, `StorageFull`, `QuotaExceeded`,
+    ///   `ReadOnlyFilesystem`, `OutOfMemory`).
+    /// - [`Self::Decrypt`]: an AEAD failure is exactly what a missing or wrong
+    ///   key produces on perfectly healthy ciphertext.
+    /// - [`Self::ZstdDictMismatch`]: the persisted descriptor names a
+    ///   dictionary the caller did not supply, or supplied a different one.
+    ///
+    /// A failure that DOES implicate the bytes (a bad sector, a structural
+    /// decode failure) is not in this class: a retry cannot fix it, and the
+    /// recovery paths grade that file instead of aborting over it.
+    #[must_use]
+    pub(crate) fn is_environmental(&self) -> bool {
+        match self {
+            Self::Io(io) => io.kind().is_environmental(),
+            Self::Decrypt(_) => true,
+            #[cfg(zstd_any)]
+            Self::ZstdDictMismatch { .. } => true,
+            _ => false,
         }
     }
 }

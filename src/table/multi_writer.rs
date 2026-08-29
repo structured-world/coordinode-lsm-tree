@@ -119,6 +119,59 @@ pub struct MultiWriter {
     /// flush / compaction uniformly writes columnar (or row-major) data blocks.
     use_columnar: bool,
 
+    /// Preserved across writer rotation so every successor [`Writer`] of one
+    /// bulk ingest is uniformly flagged bulk-ingested (see
+    /// [`Writer::use_bulk_ingested`]).
+    bulk_ingested: bool,
+
+    /// L0 recency key stamped on every successor [`Writer`], preserved across
+    /// rotation (see [`Writer::use_recency`]): a compaction sets its inputs'
+    /// highest recency so manifest repair can place each output where its
+    /// content belongs, not where its id falls. `None` (flush / ingest)
+    /// stamps each output with ITS OWN id — the same value the repair-side
+    /// fallback derives, but persisted, so a missing key positively
+    /// identifies a LEGACY table whose provenance (flush vs compaction
+    /// output) the repair cannot know.
+    recency: Option<TableId>,
+
+    /// Compaction lineage stamped on this and every rotated successor (see
+    /// [`Writer::use_lineage`]): the input ids a compaction merges, identical
+    /// for every output of the run. `None` (flush / ingest) omits the key.
+    lineage: Option<Vec<TableId>>,
+
+    /// Counter of compaction-filter TRANSFORMATIONS (any non-`Keep` verdict),
+    /// shared with the filter adapter. An output whose window saw one is not
+    /// derivable from its inputs, so it is marked transformed before its meta
+    /// is written (see [`Writer::mark_lineage_transformed`]); untouched
+    /// outputs of the same run stay plain. `None` — no filter configured.
+    transform_marker: Option<alloc::sync::Arc<portable_atomic::AtomicU64>>,
+
+    /// The marker's value when the CURRENT output started, so each output is
+    /// judged by the verdicts of its own window alone.
+    transforms_at_output_start: u64,
+
+    /// This writer receives the run's ENTIRE merged stream (a serial
+    /// compaction), so its final output may carry the `lineage_last` marker.
+    /// `false` for parallel sub-compactions and tight-space slices: several
+    /// writers share one lineage there, and a slice's last output closing
+    /// the run would let a surviving slice supersede inputs whose records
+    /// live only in a LOST sibling slice.
+    owns_whole_run: bool,
+
+    /// The id of the writer CURRENTLY receiving records, so rotation can
+    /// stamp the successor's `lineage_prev` adjacency link.
+    current_writer_id: TableId,
+
+    /// The marker's value observed AFTER the last record actually written.
+    /// Rotation happens BEFORE the triggering record is inserted, so at that
+    /// moment the live counter already includes verdicts belonging to the NEW
+    /// output (the triggering record's own, and any removals between the two
+    /// writes — the size threshold is a property of the finished old output,
+    /// so every verdict since its last write belongs to the successor). The
+    /// finishing output is therefore judged by this milestone, never the live
+    /// counter.
+    transforms_after_last_write: u64,
+
     /// Delete strategy applied to every successor [`Writer`], preserved across
     /// rotation. Under copy-on-write the writers persist no delete-bitmap; under
     /// merge-on-read / adaptive a populated bitmap is written.
@@ -159,7 +212,11 @@ impl MultiWriter {
         let current_table_id = table_id_generator.next();
 
         let path = base_path.join(current_table_id.to_string());
-        let writer = Writer::new(path, current_table_id, initial_level, fs.clone())?;
+        // Own-id recency until `use_recency` overrides it (see the `recency`
+        // field): a flush / ingest table's id IS its content recency, and
+        // persisting it keeps the key present on every new table.
+        let writer = Writer::new(path, current_table_id, initial_level, fs.clone())?
+            .use_recency(Some(current_table_id));
 
         Ok(Self {
             fs,
@@ -205,6 +262,14 @@ impl MultiWriter {
             use_seqno_in_index: false,
             use_zone_map: false,
             use_columnar: false,
+            bulk_ingested: false,
+            recency: None,
+            lineage: None,
+            transform_marker: None,
+            transforms_at_output_start: 0,
+            transforms_after_last_write: 0,
+            owns_whole_run: false,
+            current_writer_id: current_table_id,
             delete_strategy: crate::config::DeleteStrategy::default(),
             disable_cow_on_sst: false,
             locator_entry: crate::config::LocatorPolicyEntry::None,
@@ -579,6 +644,65 @@ impl MultiWriter {
         self
     }
 
+    /// Marks every table in this run as bulk-ingested (re-applied to each rotated
+    /// successor), so manifest repair can recognize their manifest-only
+    /// `global_seqno` dependence. See [`Writer::use_bulk_ingested`].
+    #[must_use]
+    pub(crate) fn use_bulk_ingested(mut self, bulk_ingested: bool) -> Self {
+        self.bulk_ingested = bulk_ingested;
+        // A multi-writer only produces flush / compaction / ingest output, whose
+        // provenance is always KNOWN — never the unknown (`None`) case that only
+        // salvage's mirror path yields.
+        self.writer = self.writer.use_bulk_ingested(Some(bulk_ingested));
+        self
+    }
+
+    /// Stamps a FIXED L0 recency key on this and every rotated successor
+    /// writer (see [`Writer::use_recency`]). `None` keeps the default own-id
+    /// stamping (see the `recency` field): the current writer already carries
+    /// its own id, and each successor stamps its own.
+    #[must_use]
+    pub(crate) fn use_recency(mut self, recency: Option<TableId>) -> Self {
+        self.recency = recency;
+        if recency.is_some() {
+            self.writer = self.writer.use_recency(recency);
+        }
+        self
+    }
+
+    /// Stamps the compaction lineage on this and every rotated successor
+    /// writer (see [`Writer::use_lineage`]).
+    #[must_use]
+    pub(crate) fn use_lineage(mut self, lineage: Option<Vec<TableId>>) -> Self {
+        self.lineage.clone_from(&lineage);
+        self.writer = self.writer.use_lineage(lineage);
+        self
+    }
+
+    /// Declares that this writer receives the run's ENTIRE merged stream
+    /// (see the `owns_whole_run` field), allowing its final output to carry
+    /// the `lineage_last` marker. Never set on a parallel sub-compaction or
+    /// tight-space slice.
+    #[must_use]
+    pub(crate) fn use_lineage_whole_run(mut self, whole_run: bool) -> Self {
+        self.owns_whole_run = whole_run;
+        self
+    }
+
+    /// Wires the compaction-filter transform counter (see the
+    /// `transform_marker` field). Call before writing starts.
+    #[must_use]
+    pub(crate) fn use_transform_marker(
+        mut self,
+        marker: alloc::sync::Arc<portable_atomic::AtomicU64>,
+    ) -> Self {
+        let now = marker.load(core::sync::atomic::Ordering::Relaxed);
+        self.transforms_at_output_start = now;
+        self.transforms_after_last_write = now;
+        self.transform_marker = Some(marker);
+        self
+    }
+
     /// Sets the delete strategy for this and every rotated successor writer.
     #[must_use]
     pub fn delete_strategy(mut self, strategy: crate::config::DeleteStrategy) -> Self {
@@ -653,6 +777,13 @@ impl MultiWriter {
         new_writer = new_writer.use_seqno_in_index(self.use_seqno_in_index);
         new_writer = new_writer.use_zone_map(self.use_zone_map);
         new_writer = new_writer.use_columnar(self.use_columnar);
+        new_writer = new_writer.use_bulk_ingested(Some(self.bulk_ingested));
+        new_writer = new_writer.use_recency(Some(self.recency.unwrap_or(new_table_id)));
+        new_writer = new_writer.use_lineage(self.lineage.clone());
+        // The adjacency link: this successor follows the writer being closed,
+        // which is what lets manifest repair union UNBROKEN sibling chains.
+        new_writer = new_writer.use_lineage_prev(Some(self.current_writer_id));
+        self.current_writer_id = new_table_id;
         new_writer = new_writer.delete_strategy(self.delete_strategy);
         new_writer = new_writer.use_disable_cow(self.disable_cow_on_sst);
         new_writer = new_writer.use_locator(self.locator_entry);
@@ -668,6 +799,19 @@ impl MultiWriter {
         }
 
         let mut old_writer = core::mem::replace(&mut self.writer, new_writer);
+        // The finishing output's meta is about to be written: if a compaction
+        // filter transformed a record within ITS window, the output is not
+        // derivable from its inputs — mark the lineage transformed before it
+        // lands, so manifest repair supersedes the inputs it covers instead
+        // of trading it back for them. Judged by the AFTER-LAST-WRITE
+        // milestone, not the live counter: rotation runs before the
+        // triggering record is inserted, so verdicts ticked since the old
+        // output's last write (the trigger's own, and removals in between)
+        // belong to the NEW output.
+        if self.transforms_after_last_write > self.transforms_at_output_start {
+            old_writer.mark_lineage_transformed();
+        }
+        self.transforms_at_output_start = self.transforms_after_last_write;
         old_writer.spill_block()?;
 
         // Write range tombstones to the finishing writer.
@@ -717,6 +861,13 @@ impl MultiWriter {
 
         self.writer.write(item)?;
 
+        // The transform-attribution milestone: verdicts ticked up to a
+        // record that actually LANDED belong to the output holding it (see
+        // the `transforms_after_last_write` field).
+        if let Some(marker) = &self.transform_marker {
+            self.transforms_after_last_write = marker.load(core::sync::atomic::Ordering::Relaxed);
+        }
+
         Ok(())
     }
 
@@ -752,6 +903,27 @@ impl MultiWriter {
     ///
     /// Returns the metadata of created tables
     pub fn finish(mut self) -> crate::Result<Vec<(TableId, Checksum)>> {
+        // Same judgment as `rotate` for the LAST output's window — by the
+        // LIVE counter here: with no successor output, trailing verdicts
+        // (removals after the final write) have nowhere else to land, and a
+        // record they removed would otherwise be resurrected by the dedup
+        // trading this output back for its inputs.
+        if let Some(marker) = &self.transform_marker
+            && marker.load(core::sync::atomic::Ordering::Relaxed) > self.transforms_at_output_start
+        {
+            self.writer.mark_lineage_transformed();
+        }
+        // This output closes the run: together with the run's first output
+        // (no `lineage_prev`) and an unbroken adjacency chain, the marker
+        // proves a surviving set is the COMPLETE output set. Only a writer
+        // that owned the WHOLE merged stream may claim it (see
+        // `owns_whole_run`). Rotation always feeds the successor its
+        // triggering record, so the writer finishing here is the run's last
+        // non-empty output (or the run produced nothing at all and no meta
+        // is written).
+        if self.owns_whole_run {
+            self.writer.mark_lineage_last();
+        }
         self.writer.spill_block()?;
 
         // Write range tombstones to the last writer. No next table exists,

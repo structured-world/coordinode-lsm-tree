@@ -17,7 +17,7 @@ use lsm_tree::inspect::{
     read_filter_stats, read_table_properties, read_top_level_index_entries,
 };
 use lsm_tree::table::block::Header;
-use lsm_tree::verify::{BlockVerifyError, verify_sst_file};
+use lsm_tree::verify::{BlockVerifyError, BlockVerifyWarning, verify_sst_file};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -172,8 +172,10 @@ enum Command {
     /// Uses the default comparator and no encryption: a tree created
     /// with a custom comparator or with encryption must be repaired via
     /// the library `Config::repair` API with the matching config.
-    /// A KV-separated (blob) tree is detected by its `blobs/` folder and
-    /// repaired with KV separation enabled so its blob files are recovered.
+    /// A KV-separated (blob) tree is rebuilt with KV separation enabled so its
+    /// blob files are recovered. Pass `--tree-type` to state which kind the
+    /// store is; without it the type is inferred from `blobs/` holding files,
+    /// which an empty or operator-created directory does not establish.
     Repair {
         /// Block-salvage SSTs that fail whole-file recovery instead of leaving
         /// them out: the corrupt original is quarantined and a fresh SST with
@@ -181,6 +183,20 @@ enum Command {
         /// missing the key ranges of its corrupt blocks (a last-resort option).
         #[arg(long)]
         salvage: bool,
+
+        /// Tree type to rebuild as: `standard` or `blob` (KV-separated).
+        ///
+        /// Repairing under the wrong type is not recoverable by another
+        /// repair: a `blob` manifest over standard SSTs makes every later
+        /// standard open fail, and the manifest it wrote is then clean, so a
+        /// standard repair refuses it. When the manifest still loads, it
+        /// supplies the type and this option is unnecessary. When it does
+        /// not, the type is inferred from `blobs/` holding at least one file
+        /// — an EMPTY `blobs/` proves nothing, and a directory an operator
+        /// created beside a standard tree is not evidence either, so pass
+        /// this explicitly whenever you know which one it is.
+        #[arg(long, value_parser = ["standard", "blob"])]
+        tree_type: Option<String>,
     },
 
     /// Print sizing stats for the SST's BuRR filter: on-disk filter
@@ -246,14 +262,24 @@ enum Command {
     /// Salvage the readable data blocks of a (possibly corrupt) SST into a
     /// fresh SST at `<dest>`. Walks every data block, re-emits the ones that
     /// pass their checksum into a new file with fresh checksums / index /
-    /// filter, and reports the key range of every block it had to drop. A
-    /// columnar segment with a damaged sidecar (delete-bitmap / zone map)
-    /// degrades to a conservative "all rows live" state rather than failing.
-    /// The `<path>` positional is the source SST. Exits non-zero only when the
-    /// source cannot be opened or nothing was recoverable.
+    /// filter, and reports the key range of every block it had to drop. The
+    /// `<path>` positional is the source SST. Exits non-zero when the salvage
+    /// is refused (e.g. delete semantics cannot be preserved) or fails, or
+    /// when nothing was recoverable.
+    ///
+    /// Like `repair`, this uses the DEFAULT comparator, no encryption, and no
+    /// compression dictionary: a custom-comparator, encrypted, or
+    /// dictionary-compressed source is not recovered faithfully here.
     Salvage {
         /// Destination path for the recovered SST (must not already exist).
         dest: PathBuf,
+        /// Salvage a delete-bearing columnar SST whose positional delete
+        /// bitmap cannot be applied (unreadable bitmap, or a bitmap whose
+        /// positioning zone map is unreadable) by emitting EVERY row live.
+        /// Positionally-deleted rows come back in the recovered SST, so this
+        /// degradation is off by default and the salvage fails closed.
+        #[arg(long)]
+        allow_delete_resurrection: bool,
     },
 }
 
@@ -276,18 +302,69 @@ fn main() -> ExitCode {
             keys_only,
         } => run_dump(&cli.path, from.as_deref(), to.as_deref(), max, keys_only),
         Command::FilterStats => run_filter_stats(&cli.path),
-        Command::Repair { salvage } => run_repair(&cli.path, salvage),
+        Command::Repair { salvage, tree_type } => {
+            run_repair(&cli.path, salvage, tree_type.as_deref())
+        }
         Command::DumpBlock {
             offset,
             tree_id,
             table_id,
             reconstruct_aad,
         } => run_dump_block(&cli.path, offset, tree_id, table_id, reconstruct_aad),
-        Command::Salvage { dest } => run_salvage(&cli.path, &dest),
+        Command::Salvage {
+            dest,
+            allow_delete_resurrection,
+        } => run_salvage(&cli.path, &dest, allow_delete_resurrection),
     }
 }
 
-fn run_repair(db_dir: &std::path::Path, salvage: bool) -> ExitCode {
+/// Whether `blobs/` holds something that can actually BE a blob file.
+///
+/// Only a name the recovery path would parse as a blob id counts: an operator's
+/// notes, a backup marker or a `.DS_Store` are regular files too, and treating
+/// them as evidence rebuilds a standard store as a blob one, which no later
+/// repair can undo.
+///
+/// # Errors
+///
+/// A missing `blobs/` answers `false` (conclusive: there is no blob directory).
+/// Every other failure PROPAGATES: an unreadable directory means the scan could
+/// not answer, and guessing publishes a tree type the store is then stuck with.
+fn infer_blob_tree(db_dir: &std::path::Path) -> std::io::Result<bool> {
+    let entries = match std::fs::read_dir(db_dir.join("blobs")) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.path().is_file() {
+            continue;
+        }
+        // The name is not the evidence. Blob recovery parses the NAME as the
+        // id, so a name that does not parse is certainly not a blob file, but
+        // one that does may still be unrelated junk (an operator backup called
+        // `0`). Only a file the blob reader can actually parse proves the tree
+        // is blob-backed.
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.parse::<u64>().is_ok())
+        {
+            continue;
+        }
+        match lsm_tree::inspect::is_blob_file(&entry.path()) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            // An unreadable candidate leaves the scan unable to answer, the
+            // same as an unreadable directory above.
+            Err(e) => return Err(std::io::Error::other(e.to_string())),
+        }
+    }
+    Ok(false)
+}
+
+fn run_repair(db_dir: &std::path::Path, salvage: bool, tree_type: Option<&str>) -> ExitCode {
     use lsm_tree::{Config, KvSeparationOptions, SequenceNumberCounter};
 
     let mut config = Config::new(
@@ -296,23 +373,76 @@ fn run_repair(db_dir: &std::path::Path, salvage: bool) -> ExitCode {
         SequenceNumberCounter::default(),
     );
 
-    // A `blobs/` folder marks a KV-separated (blob) tree. Enable KV separation so
-    // repair rediscovers the blob files and records the matching tree type;
-    // without it, repair would rebuild a standard-tree manifest and drop the
-    // blobs. The separation options only affect future writes, so defaults are
-    // fine for recovery.
-    if db_dir.join("blobs").is_dir() {
+    // Repairing under the wrong tree type traps the store: a blob manifest
+    // over standard SSTs fails every later standard open, and the manifest it
+    // committed is clean, so a standard repair declines to touch it. The
+    // caller's word beats any guess. Without one, `blobs/` is evidence only
+    // when it actually HOLDS blob files — an empty directory (or one an
+    // operator created beside a standard tree) says nothing about what was
+    // persisted. The separation options only affect future writes, so
+    // defaults are fine for recovery.
+    let blob_tree = match tree_type {
+        Some("blob") => true,
+        Some("standard") => false,
+        // `value_parser` restricts the flag to those two, so anything else
+        // here is the absent case.
+        _ => match infer_blob_tree(db_dir) {
+            Ok(inferred) => {
+                if inferred {
+                    println!(
+                        "tree type:     blob (inferred: blobs/ holds a blob file; pass \
+                         --tree-type to override)"
+                    );
+                }
+                inferred
+            }
+            // The scan could not answer. Publishing a tree type on a guess is
+            // not recoverable by another repair, so stop and let the operator
+            // retry once the fault clears, or state the type outright.
+            Err(e) => {
+                eprintln!(
+                    "cannot determine the tree type: reading {}/blobs failed ({e}). \
+                     Fix the access error and retry, or pass --tree-type.",
+                    db_dir.display(),
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    if blob_tree {
         config = config.with_kv_separation(Some(KvSeparationOptions::default()));
     }
 
     let report = match config.repair_with_salvage(salvage) {
         Ok(report) => report,
+        // The manifest IS committed here and this report is its only copy: a
+        // retry finds the healthy manifest, runs no repair and produces no
+        // report at all, so discarding it would leave an external-WAL operator
+        // with no lost-coverage or full-history reconciliation instructions.
+        // Print it exactly as a successful repair's, then report the failure.
+        Err(lsm_tree::Error::RepairedButUnopened { report, cause }) => {
+            print_report(&report, db_dir);
+            println!("status:        manifest rebuilt, but reopening it failed");
+            eprintln!("repair committed the manifest but the follow-up open failed: {cause}");
+            return ExitCode::FAILURE;
+        }
         Err(err) => {
             eprintln!("repair failed: {err}");
             return ExitCode::FAILURE;
         }
     };
 
+    print_report(&report, db_dir);
+    println!("status:        manifest rebuilt");
+
+    ExitCode::SUCCESS
+}
+
+/// Prints everything a completed repair reports, including its write-ahead-log
+/// replay obligation. Shared by the success path and the committed-but-unopened
+/// failure, which carries the same report and owes the operator the same
+/// instructions.
+fn print_report(report: &lsm_tree::RepairReport, db_dir: &std::path::Path) {
     println!("db dir:        {}", db_dir.display());
     println!("method:        {}", report.method);
     println!("recovered:     {}", report.recovered);
@@ -321,19 +451,107 @@ fn run_repair(db_dir: &std::path::Path, salvage: bool) -> ExitCode {
     for (path, reason) in &report.unreadable_files {
         println!("  skipped {} — {reason}", path.display());
     }
+    if !report.blob_files_salvaged.is_empty() {
+        println!("blob salvage:  {}", report.blob_files_salvaged.len());
+        for (path, note) in &report.blob_files_salvaged {
+            println!("  salvaged {} — {note}", path.display());
+        }
+    }
     for warning in &report.warnings {
         println!("warning:       {warning}");
     }
-    println!("status:        manifest rebuilt");
-
-    ExitCode::SUCCESS
+    print_wal_replay_obligation(report);
 }
 
-fn run_salvage(source: &std::path::Path, dest: &std::path::Path) -> ExitCode {
+/// Prints what an external write-ahead log must replay after this repair.
+///
+/// A repair that drops or lossily salvages a table regresses persisted state
+/// BELOW the log's trim watermark, so the usual "replay the tail" is not
+/// enough — and an operator reading only `status: manifest rebuilt` would
+/// stop there and leave superseded or deleted values visible. The obligation
+/// is therefore printed on every repair, including the common case where it
+/// is nothing.
+fn print_wal_replay_obligation(report: &lsm_tree::RepairReport) {
+    use lsm_tree::WalReplayScope;
+
+    match report.wal_replay_scope() {
+        WalReplayScope::TailOnly => {
+            println!("wal replay:    tail only (no coverage was lost)");
+            return;
+        }
+        WalReplayScope::LostUpTo(bound) => {
+            println!(
+                "wal replay:    REQUIRED — besides the usual tail, reconcile every retained \
+                 record with seqno <= {bound} whose key falls in a range below",
+            );
+        }
+        // An unscopable loss has NEITHER a seqno bound NOR a key range: its
+        // metadata never parsed, so nothing localizes the damage. Telling the
+        // operator to work through "the ranges below" would have them replay
+        // the known ranges only — or nothing at all when that list is empty.
+        WalReplayScope::FullHistory if !report.unknowable_losses.is_empty() => {
+            println!(
+                "wal replay:    REQUIRED — a loss could not be localized at all: reconcile \
+                 every retained record across the ENTIRE KEYSPACE, in ONE pass (iterating \
+                 the ranges below on top of it would subtract the same survivors twice)",
+            );
+        }
+        WalReplayScope::FullHistory => {
+            println!(
+                "wal replay:    REQUIRED — a loss could not be scoped by seqno, so reconcile \
+                 the ENTIRE retained history of the ranges below",
+            );
+        }
+    }
+    // "Reconcile", not "replay": a put or a delete may be re-applied blindly,
+    // but a merge OPERAND that survived the repair and is applied again is
+    // FOLDED TWICE and silently changes the value. The surviving operands must
+    // be subtracted first, and folded chains leave a superseded-record floor
+    // that absence from that subtraction does not disprove.
+    println!(
+        "               merge operands are NOT blindly replayable: subtract the survivors \
+         from Tree::scan_since_seqno_in_range and honour the folded-record floor first",
+    );
+    println!("               full procedure: docs/external-wal.md, Replay after repair");
+    for (path, lo, hi, bound) in &report.lost_coverage {
+        let bound = match bound {
+            Some(b) => format!("seqno <= {b}"),
+            None => "seqno bound lost".to_string(),
+        };
+        println!(
+            "  lost {} — {} .. {} ({bound})",
+            path.display(),
+            format_key(lo),
+            format_key(hi),
+        );
+    }
+    for path in &report.unknowable_losses {
+        println!(
+            "  unscopable {} — its metadata never parsed, so neither the affected key range \
+             nor a seqno bound is known",
+            path.display(),
+        );
+    }
+}
+
+fn run_salvage(
+    source: &std::path::Path,
+    dest: &std::path::Path,
+    allow_delete_resurrection: bool,
+) -> ExitCode {
     use std::sync::Arc;
 
     let fs: Arc<dyn lsm_tree::fs::Fs> = Arc::new(lsm_tree::fs::StdFs);
-    let report = match lsm_tree::salvage::salvage_sst(source, dest.to_path_buf(), &fs) {
+    let options = lsm_tree::salvage::SalvageOptions {
+        allow_delete_resurrection,
+        ..lsm_tree::salvage::SalvageOptions::default()
+    };
+    let report = match lsm_tree::salvage::salvage_sst_with_options(
+        source,
+        dest.to_path_buf(),
+        &fs,
+        &options,
+    ) {
         Ok(report) => report,
         Err(err) => {
             eprintln!("salvage failed: {err}");
@@ -367,18 +585,32 @@ fn run_salvage(source: &std::path::Path, dest: &std::path::Path) -> ExitCode {
         );
     }
 
-    if report.is_complete() {
+    // Warn ONLY when the opt-in actually resurrected positionally-deleted rows
+    // (an unappliable delete mask that the flag let through), not merely because
+    // the flag was passed.
+    if report.delete_rows_resurrected {
+        println!(
+            "warning:         --allow-delete-resurrection re-emitted positionally-deleted \
+             rows LIVE (the delete mask could not be applied faithfully)"
+        );
+    }
+
+    // Check the destination FIRST: `is_complete()` (nothing dropped) is true even
+    // when every block was wholly deleted, in which case no file is written and
+    // `<dest>` does not exist. Reporting "fully recovered" then would tell
+    // automation the destination is ready when the command produced none.
+    if report.salvaged_path.is_none() {
+        println!("status:          nothing recoverable");
+        ExitCode::FAILURE
+    } else if report.is_complete() {
         println!("status:          fully recovered");
         ExitCode::SUCCESS
-    } else if report.salvaged_path.is_some() {
+    } else {
         println!(
             "status:          partially recovered ({} block(s) dropped)",
             report.dropped.len(),
         );
         ExitCode::SUCCESS
-    } else {
-        println!("status:          nothing recoverable");
-        ExitCode::FAILURE
     }
 }
 
@@ -388,10 +620,41 @@ fn run_verify(path: &std::path::Path, verbose: bool) -> ExitCode {
     println!("file:           {}", path.display());
     println!("blocks scanned: {}", report.blocks_scanned);
     println!("errors:         {}", report.errors.len());
+    println!("warnings:       {}", report.warnings.len());
+    // Warnings are non-fatal but must never be silent: each one names a
+    // surface the walk could NOT fully check, and a consumer treating a bare
+    // "OK" as "everything verified" would be misled.
+    for warning in &report.warnings {
+        match warning {
+            BlockVerifyWarning::UnrecognizedEcc { table_id, path } => println!(
+                "  [warning] UnrecognizedEcc: table {table_id} at {}: ECC descriptor \
+                 not recognized by this build; ECC verification skipped",
+                path.display(),
+            ),
+            BlockVerifyWarning::ParityUnverifiable { table_id, path } => println!(
+                "  [warning] ParityUnverifiable: table {table_id} at {}: recognized \
+                 ECC scheme but this build carries no ECC codecs; parity not verified",
+                path.display(),
+            ),
+            // `BlockVerifyWarning` is `#[non_exhaustive]` upstream; surface
+            // future variants through their Debug form rather than dropping
+            // them.
+            other => println!("  [warning] {other:?}"),
+        }
+    }
 
     if report.is_ok() {
         println!("status:         OK");
         return ExitCode::SUCCESS;
+    }
+
+    // No per-block errors, yet not OK: a whole section was skipped unwalked
+    // (an unrecognized ECC descriptor forced the walk past its data blocks).
+    // That is not proof of corruption, but it is not a verified file either —
+    // report it as its own non-success verdict.
+    if report.errors.is_empty() && report.incomplete {
+        println!("status:         INCOMPLETE (a section was skipped unverified)");
+        return ExitCode::FAILURE;
     }
 
     println!("status:         CORRUPT");
@@ -401,14 +664,15 @@ fn run_verify(path: &std::path::Path, verbose: bool) -> ExitCode {
     for (idx, err) in report.errors.iter().take(to_show).enumerate() {
         // Show each error with its variant tag so consumers grep'ing
         // for a specific failure mode (HeaderCorrupted, DataCorrupted,
-        // DataReadError, TocCorrupted, SstFileUnreadable) get a stable
-        // anchor. The Display impl includes file path + offset + a
-        // human reason.
+        // DataReadError, EccParityMismatch, TocCorrupted,
+        // SstFileUnreadable) get a stable anchor. The Display impl
+        // includes file path + offset + a human reason.
         let kind = match err {
             BlockVerifyError::SstFileUnreadable { .. } => "SstFileUnreadable",
             BlockVerifyError::HeaderCorrupted { .. } => "HeaderCorrupted",
             BlockVerifyError::DataCorrupted { .. } => "DataCorrupted",
             BlockVerifyError::DataReadError { .. } => "DataReadError",
+            BlockVerifyError::EccParityMismatch { .. } => "EccParityMismatch",
             BlockVerifyError::TocCorrupted { .. } => "TocCorrupted",
             // `BlockVerifyError` is `#[non_exhaustive]` upstream — a
             // future lib release can add new variants without bumping

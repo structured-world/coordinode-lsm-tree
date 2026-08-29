@@ -219,6 +219,17 @@ impl Fs for IoUringFs {
         std::fs::remove_dir_all(path).map_err(crate::io::Error::from)
     }
 
+    fn same_file(&self, a: &Path, b: &Path) -> crate::io::Result<bool> {
+        // Filesystem OBJECT identity (device + inode), same contract as the
+        // std backend: bind-mount aliases keep distinct canonical spellings
+        // over one underlying file, and a probe failure propagates instead
+        // of guessing "distinct".
+        use std::os::unix::fs::MetadataExt;
+        let ma = std::fs::metadata(a).map_err(crate::io::Error::from)?;
+        let mb = std::fs::metadata(b).map_err(crate::io::Error::from)?;
+        Ok(ma.dev() == mb.dev() && ma.ino() == mb.ino())
+    }
+
     fn rename(&self, from: &Path, to: &Path) -> crate::io::Result<()> {
         std::fs::rename(from, to).map_err(crate::io::Error::from)
     }
@@ -236,6 +247,34 @@ impl Fs for IoUringFs {
         // Free-space probe is a cold-path stat; delegate to the shared statvfs
         // helper (this backend is Linux-only, so libc statvfs is available).
         super::statvfs_available_space(path).map_err(crate::io::Error::from)
+    }
+
+    fn allocated_size(&self, path: &Path) -> crate::io::Result<Option<u64>> {
+        // Cold-path stat; the shared unix helper reads `st_blocks` (this backend
+        // is Linux-only, so `std::fs::metadata` is available). A stat failure
+        // propagates as `Err` rather than being masked as `None` (unpunched).
+        Ok(super::unix_allocated_size(path)?)
+    }
+
+    fn extent_is_hole(
+        &self,
+        path: &Path,
+        offset: u64,
+        len: u64,
+    ) -> crate::io::Result<Option<bool>> {
+        // Same kernel, same probe as the std backend: this is a cold diagnostic
+        // path, so it delegates there rather than going through the ring.
+        Fs::extent_is_hole(&super::StdFs, path, offset, len)
+    }
+
+    fn extent_contains_hole(
+        &self,
+        path: &Path,
+        offset: u64,
+        len: u64,
+    ) -> crate::io::Result<Option<bool>> {
+        // Same delegation as `extent_is_hole`, for the same reason.
+        Fs::extent_contains_hole(&super::StdFs, path, offset, len)
     }
 
     fn sync_directory(&self, path: &Path) -> crate::io::Result<()> {
@@ -323,6 +362,11 @@ impl FsFile for IoUringFile {
             is_dir: m.is_dir(),
             is_file: m.is_file(),
         })
+    }
+
+    fn hard_link_count(&self) -> crate::io::Result<u64> {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(self.file.metadata()?.nlink())
     }
 
     fn set_len(&self, size: u64) -> crate::io::Result<()> {

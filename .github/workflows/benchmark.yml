@@ -83,7 +83,10 @@ jobs:
       # token leakage where actions/upload-artifact captures the
       # whole working tree, including the .git/config that the
       # default checkout populated with GITHUB_TOKEN).
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      # Pinning policy: first-party actions (actions/*, dependabot/*) track a
+      # MAJOR tag; third-party actions stay pinned to a commit digest with a
+      # version comment. See coordinode-release.yml for the reasoning.
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -104,7 +107,7 @@ jobs:
           github.event_name == 'workflow_dispatch' ||
           (github.event_name == 'pull_request' &&
            github.event.pull_request.head.repo.full_name == github.repository)
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.RELEASER_APP_ID }}
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}

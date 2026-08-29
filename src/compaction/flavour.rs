@@ -44,7 +44,15 @@ fn drain_blobs<I: Iterator<Item = crate::Result<(ScanEntry, BlobFileId)>>>(
         let (entry, blob_file_id) = blob?;
 
         assert!(entry.key <= key, "vptr was not matched with blob");
-        record_consumed(blob_file_id, entry.frame_end);
+        // A RESYNCED entry's boundary is unproven (see `ScanEntry::resynced`):
+        // advancing the reclaim frontier to its `frame_end` could punch past —
+        // and then skip on resume — a later frame that is actually valid. Drop
+        // the tainted entry WITHOUT advancing the frontier, so a resumed scan
+        // re-reads from the last proven boundary (fail closed). The matched-vptr
+        // relocation path refuses a resynced frame outright for the same reason.
+        if !entry.resynced {
+            record_consumed(blob_file_id, entry.frame_end);
+        }
     }
 
     Ok(())
@@ -59,6 +67,23 @@ pub(super) fn prepare_table_writer(
     // block compression to the same pool from a pool thread would deadlock
     // (the draining thread parks on a worker slot that can't be scheduled).
     block_parallel: bool,
+    // The compaction-filter transform counter shared with the filter adapter
+    // (`Some` iff a filter is instantiated for this run). Lineage is stamped
+    // unconditionally; the writer MARKS it transformed on any output whose
+    // window saw a non-`Keep` verdict — that output is not derivable from
+    // its inputs (Remove / RemoveWeak / ReplaceValue / Destroy are
+    // authoritative transformations), so manifest repair supersedes the
+    // inputs it covers instead of trading it back for them. A `Keep`-only
+    // filtered run stays plain, so the rebuild's duplicate-history dedup is
+    // unaffected.
+    transform_marker: Option<alloc::sync::Arc<portable_atomic::AtomicU64>>,
+    // `true` when this writer receives the run's ENTIRE merged stream (a
+    // serial compaction): its final output then carries the `lineage_last`
+    // marker, proving to manifest repair that a surviving first-to-last
+    // chain is the complete output set. `false` for parallel
+    // sub-compactions and tight-space slices, which share one lineage
+    // across several writers.
+    whole_run: bool,
 ) -> crate::Result<MultiWriter> {
     let (table_base_folder, level_fs) = opts.config.tables_folder_for_level(payload.dest_level);
 
@@ -86,6 +111,17 @@ pub(super) fn prepare_table_writer(
         opts.mvcc_gc_watermark,
     );
 
+    // The outputs' L0 recency key: the newest input's recency. An output's own
+    // id is allocated HERE, at write start, while newer flushes with lower ids
+    // can still install before this compaction commits — so the id must not
+    // stand in for content recency when manifest repair rebuilds L0 from the
+    // files alone.
+    let recency = version
+        .iter_tables()
+        .filter(|t| payload.table_ids.contains(&t.id()))
+        .map(crate::table::Table::l0_recency)
+        .max();
+
     let mut table_writer = MultiWriter::new(
         table_base_folder,
         opts.table_id_generator.clone(),
@@ -94,8 +130,20 @@ pub(super) fn prepare_table_writer(
         level_fs,
     )?
     .set_comparator(opts.config.comparator.clone())
+    .use_recency(recency)
+    // The outputs' compaction lineage: the input ids this run merges. Lets a
+    // manifest-loss rebuild recognize the output as DERIVED and exclude it
+    // when every input survived a crash-before-commit, instead of publishing
+    // both histories and double-applying the merge operands on read. An
+    // output a filter TRANSFORMS is marked so (see `transform_marker`).
+    .use_lineage(Some(payload.table_ids.iter().copied().collect()))
+    .use_lineage_whole_run(whole_run)
     // Compaction consumes input tables, so clip RTs to each output table's key range.
     .use_clip_range_tombstones();
+
+    if let Some(marker) = transform_marker {
+        table_writer = table_writer.use_transform_marker(marker);
+    }
 
     // One runtime-config snapshot for the whole writer setup: reading
     // `load_full()` per field could straddle a concurrent
@@ -347,6 +395,35 @@ pub(super) fn install_merge(
 
     let tables_out = created_tables.len();
 
+    // Install the tree-wide sinks on every output BEFORE the version edit makes
+    // it visible. A flush registers these via `register_tables`; a compaction
+    // installs its outputs here. Without the deletion pause an output's
+    // in-place heal would skip the checkpoint mutation window and could race a
+    // checkpoint hard-link; without the heal-hint sink a confirmed-persistent
+    // ECC correction on a read could never queue the SST for a healing
+    // rewrite, leaving the bitrot on disk.
+    //
+    // The background deleter is deliberately NOT installed here. A compaction
+    // output can be rolled back — and the tight-space slice loop rolls back
+    // precisely when space is scarce — where deferring the unlink defeats the
+    // point: the space must come back now, not when a background pass gets to
+    // it. Flush outputs, which have no such rollback, keep it.
+    let sinks = crate::table::TableSinks {
+        deletion_pause: &opts.deletion_pause,
+        heal_hints: &opts.heal_hints,
+        #[cfg(feature = "std")]
+        background_deleter: None,
+    };
+    for table in &created_tables {
+        table.bind_to_tree(&sinks);
+    }
+    // Blob files this compaction produced need the same binding: they become
+    // reachable through the very same version edit, and an unbound one can be
+    // unlinked out from under a capturing checkpoint.
+    for blob_file in &created_blob_files {
+        blob_file.bind_to_tree(&sinks);
+    }
+
     // Globally-dead blob files are dropped once, from the install-time version.
     let current_version = super_version.latest_version();
     for blob_file in current_version.version.blob_files.iter() {
@@ -524,6 +601,19 @@ impl CompactionFlavour for RelocatingCompaction {
                     "matched blob has different offset than vptr",
                 );
 
+                // A RESYNCHRONIZED frame was reached by a byte-wise scan after
+                // damage: its boundary is unproven (the magic may sit inside a
+                // damaged record's user-controlled bytes, and every frame chained
+                // past it inherits that unanchored start). Relocating it would
+                // rewrite fabricated bytes as a genuine record. `salvage_blob_file`
+                // drops such frames; relocation must fail closed the same way.
+                if blob_entry.resynced {
+                    return Err(crate::Error::InvalidHeader(
+                        "resynchronized blob frame reached after damage; refusing to \
+                         relocate a record whose boundary cannot be proven original",
+                    ));
+                }
+
                 // Advance the consumed frontier past this relocated frame so the
                 // tight-space loop can punch / resume here once the slice installs.
                 self.record_consumed(blob_file_id, blob_entry.frame_end);
@@ -654,24 +744,32 @@ impl StandardCompaction {
             .finish()?
             .into_iter()
             .map(|(table_id, checksum)| -> crate::Result<Table> {
-                Table::recover(
+                let mut params = crate::table::RecoverParams::new(
                     table_base_folder.join(table_id.to_string()),
                     checksum,
-                    0,
-                    opts.tree_id,
                     table_id,
-                    opts.config.cache.clone(),
-                    opts.config.descriptor_table.clone(),
                     level_fs.clone(),
-                    pin_filter,
-                    pin_index,
-                    opts.config.encryption.clone(),
-                    #[cfg(zstd_any)]
-                    opts.config.zstd_dictionary.clone(),
                     opts.config.comparator.clone(),
-                    #[cfg(feature = "metrics")]
-                    opts.metrics.clone(),
-                )
+                    opts.config.cache.clone(),
+                );
+                params.tree_id = opts.tree_id;
+                params
+                    .descriptor_table
+                    .clone_from(&opts.config.descriptor_table);
+                params.pin_filter = pin_filter;
+                params.pin_index = pin_index;
+                params.encryption.clone_from(&opts.config.encryption);
+                #[cfg(zstd_any)]
+                {
+                    params
+                        .zstd_dictionary
+                        .clone_from(&opts.config.zstd_dictionary);
+                }
+                #[cfg(feature = "metrics")]
+                {
+                    params.metrics = opts.metrics.clone();
+                }
+                Table::recover(params)
             })
             .collect::<crate::Result<Vec<_>>>()
     }

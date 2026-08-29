@@ -14,8 +14,11 @@ jobs:
     if: github.event.pull_request.user.login == 'dependabot[bot]'
 
     steps:
+      # Pinning policy: first-party actions (actions/*, dependabot/*) track a
+      # MAJOR tag; third-party actions stay pinned to a commit digest with a
+      # version comment. See coordinode-release.yml for the reasoning.
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@v7
         with:
           # gh CLI authenticates via the GH_TOKEN env var on the merge
           # step; no git config credentials are needed here.
@@ -23,14 +26,20 @@ jobs:
 
       - name: Dependabot metadata
         id: metadata
-        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98  # v3.1.0
+        uses: dependabot/fetch-metadata@v3
         with:
           github-token: "${{ secrets.GITHUB_TOKEN }}"
 
       - name: Generate App Token
         id: app-token
         if: steps.metadata.outputs.update-type == 'version-update:semver-minor' || steps.metadata.outputs.update-type == 'version-update:semver-patch'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        # Major-tag pin BY POLICY, secrets included: first-party orgs
+        # (actions/*, dependabot/*) are GitHub-owned — a compromise of their
+        # release process implies a compromise of the platform hosting every
+        # pinned SHA and secret anyway, so a SHA pin adds no isolation here
+        # (unlike third-party actions, which stay SHA-pinned). Do not "fix"
+        # this back to a commit pin.
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.RELEASER_APP_ID }}
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}

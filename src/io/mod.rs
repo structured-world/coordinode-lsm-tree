@@ -36,22 +36,51 @@ pub type Result<T> = core::result::Result<T, Error>;
 pub enum ErrorKind {
     /// Entity (file, directory, key, etc.) already exists.
     AlreadyExists,
-    /// Broken pipe — the other end of a stream is closed.
+    /// Broken pipe: the other end of a stream is closed.
     BrokenPipe,
+    /// A network backend's connection was reset by the peer (`ECONNRESET`).
+    ConnectionAborted,
+    /// A network backend refused the connection (`ECONNREFUSED`).
+    ConnectionRefused,
+    /// A network backend's connection was reset mid-transfer (`ECONNRESET`).
+    ConnectionReset,
+    /// A network backend's socket is not connected (`ENOTCONN`).
+    NotConnected,
     /// Operation attempted across distinct devices/filesystems.
     CrossesDevices,
+    /// The remote host of a network filesystem is unreachable (`EHOSTUNREACH`).
+    HostUnreachable,
     /// Operation was interrupted (`EINTR`-equivalent); usually retriable.
     Interrupted,
     /// Data being read does not match the expected format/schema.
     InvalidData,
     /// A function argument had an invalid value.
     InvalidInput,
+    /// The network a filesystem depends on is down (`ENETDOWN`).
+    NetworkDown,
+    /// The network a filesystem depends on is unreachable (`ENETUNREACH`).
+    NetworkUnreachable,
     /// Entity was not found.
     NotFound,
     /// Catch-all for errors that don't fit any other variant.
     Other,
+    /// The operation ran out of memory (`ENOMEM` — an oversized read buffer
+    /// or an exhausted host); the bytes on disk are not implicated.
+    OutOfMemory,
     /// Operation denied due to lack of permissions.
     PermissionDenied,
+    /// The filesystem quota was exceeded (`EDQUOT`).
+    QuotaExceeded,
+    /// The filesystem is mounted read-only (`EROFS`).
+    ReadOnlyFilesystem,
+    /// A network file handle went stale (`ESTALE` — the NFS server rebooted
+    /// or re-exported); a re-open after the mount recovers clears it.
+    StaleNetworkFileHandle,
+    /// The storage device is out of space (`ENOSPC`).
+    StorageFull,
+    /// An I/O operation timed out (`ETIMEDOUT` — a slow or wedged network
+    /// filesystem); the data underneath is not implicated.
+    TimedOut,
     /// Reader hit end-of-file before satisfying the request.
     UnexpectedEof,
     /// Operation is not supported on this platform / backend / build.
@@ -67,17 +96,102 @@ pub enum ErrorKind {
 }
 
 impl ErrorKind {
+    /// Whether this kind is a TRANSIENT (retryable) I/O failure — one a retry
+    /// (immediately, or after the environment recovers) genuinely clears, and
+    /// which a corrupt on-disk structure can NEVER produce: the interrupted
+    /// syscalls [`Interrupted`](Self::Interrupted) (EINTR) and
+    /// [`WouldBlock`](Self::WouldBlock) (EAGAIN), plus the network-filesystem
+    /// kinds [`TimedOut`](Self::TimedOut),
+    /// [`HostUnreachable`](Self::HostUnreachable),
+    /// [`NetworkDown`](Self::NetworkDown),
+    /// [`NetworkUnreachable`](Self::NetworkUnreachable) and
+    /// [`StaleNetworkFileHandle`](Self::StaleNetworkFileHandle) an NFS / FUSE
+    /// backend surfaces when the transport (not the data) fails, and the
+    /// connection kinds [`ConnectionAborted`](Self::ConnectionAborted),
+    /// [`ConnectionRefused`](Self::ConnectionRefused),
+    /// [`ConnectionReset`](Self::ConnectionReset),
+    /// [`NotConnected`](Self::NotConnected) and [`BrokenPipe`](Self::BrokenPipe)
+    /// a remote or custom backend surfaces when its transport drops
+    /// mid-request. Everything else, including the
+    /// ambiguous [`Other`](Self::Other) that real `EIO` and platform-specific
+    /// structural errors (e.g. a Windows negative-seek on a corrupt file) both
+    /// map to, is treated as persistent / structural.
+    /// Shared so the repair and integrity-verify paths classify I/O failures
+    /// identically.
+    pub(crate) fn is_transient(self) -> bool {
+        matches!(
+            self,
+            Self::Interrupted
+                | Self::WouldBlock
+                | Self::TimedOut
+                | Self::HostUnreachable
+                | Self::NetworkDown
+                | Self::NetworkUnreachable
+                | Self::StaleNetworkFileHandle
+                // A remote or custom backend's transport dropping mid-request
+                // says nothing about the bytes it was carrying. `BrokenPipe`
+                // belongs with them: EPIPE comes from a pipe or socket whose
+                // peer went away, never from the contents of a regular file.
+                | Self::ConnectionAborted
+                | Self::ConnectionRefused
+                | Self::ConnectionReset
+                | Self::NotConnected
+                | Self::BrokenPipe
+        )
+    }
+
+    /// Whether this kind must PROPAGATE out of recovery grading instead of
+    /// condemning the file it came from: a [transient](Self::is_transient)
+    /// kind (a retry clears it), or an ENVIRONMENTAL failure that does not
+    /// implicate the bytes on disk —
+    /// [`PermissionDenied`](Self::PermissionDenied) (an ACL / ownership
+    /// mistake), and the write-side destination kinds
+    /// [`StorageFull`](Self::StorageFull),
+    /// [`QuotaExceeded`](Self::QuotaExceeded) and
+    /// [`ReadOnlyFilesystem`](Self::ReadOnlyFilesystem) (the salvage OUTPUT
+    /// failed, not the source being salvaged), plus
+    /// [`OutOfMemory`](Self::OutOfMemory) (the HOST ran out, not the file's
+    /// bytes). Grading such a file unreadable
+    /// commits a manifest that excludes it and then removes it, turning a
+    /// recoverable configuration / capacity problem into permanent loss of
+    /// intact data; propagating lets the operator fix the environment and
+    /// retry.
+    pub(crate) fn is_environmental(self) -> bool {
+        self.is_transient()
+            || matches!(
+                self,
+                Self::PermissionDenied
+                    | Self::StorageFull
+                    | Self::QuotaExceeded
+                    | Self::ReadOnlyFilesystem
+                    | Self::OutOfMemory
+            )
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::AlreadyExists => "entity already exists",
             Self::BrokenPipe => "broken pipe",
+            Self::ConnectionAborted => "connection aborted",
+            Self::ConnectionRefused => "connection refused",
+            Self::ConnectionReset => "connection reset",
+            Self::NotConnected => "not connected",
             Self::CrossesDevices => "cross-device link or rename",
+            Self::HostUnreachable => "host unreachable",
             Self::Interrupted => "operation interrupted",
             Self::InvalidData => "invalid data",
             Self::InvalidInput => "invalid input parameter",
+            Self::NetworkDown => "network down",
+            Self::NetworkUnreachable => "network unreachable",
             Self::NotFound => "entity not found",
             Self::Other => "other error",
+            Self::OutOfMemory => "out of memory",
             Self::PermissionDenied => "permission denied",
+            Self::QuotaExceeded => "filesystem quota exceeded",
+            Self::ReadOnlyFilesystem => "read-only filesystem",
+            Self::StaleNetworkFileHandle => "stale network file handle",
+            Self::StorageFull => "storage full",
+            Self::TimedOut => "operation timed out",
             Self::UnexpectedEof => "unexpected end of file",
             Self::Unsupported => "unsupported",
             Self::WouldBlock => "operation would block",
@@ -226,12 +340,25 @@ impl From<std::io::Error> for Error {
         let (kind, kind_is_mapped) = match std_kind {
             std::io::ErrorKind::AlreadyExists => (ErrorKind::AlreadyExists, true),
             std::io::ErrorKind::BrokenPipe => (ErrorKind::BrokenPipe, true),
+            std::io::ErrorKind::ConnectionAborted => (ErrorKind::ConnectionAborted, true),
+            std::io::ErrorKind::ConnectionRefused => (ErrorKind::ConnectionRefused, true),
+            std::io::ErrorKind::ConnectionReset => (ErrorKind::ConnectionReset, true),
+            std::io::ErrorKind::NotConnected => (ErrorKind::NotConnected, true),
             std::io::ErrorKind::CrossesDevices => (ErrorKind::CrossesDevices, true),
+            std::io::ErrorKind::HostUnreachable => (ErrorKind::HostUnreachable, true),
             std::io::ErrorKind::Interrupted => (ErrorKind::Interrupted, true),
             std::io::ErrorKind::InvalidData => (ErrorKind::InvalidData, true),
             std::io::ErrorKind::InvalidInput => (ErrorKind::InvalidInput, true),
+            std::io::ErrorKind::NetworkDown => (ErrorKind::NetworkDown, true),
+            std::io::ErrorKind::NetworkUnreachable => (ErrorKind::NetworkUnreachable, true),
             std::io::ErrorKind::NotFound => (ErrorKind::NotFound, true),
+            std::io::ErrorKind::OutOfMemory => (ErrorKind::OutOfMemory, true),
             std::io::ErrorKind::PermissionDenied => (ErrorKind::PermissionDenied, true),
+            std::io::ErrorKind::QuotaExceeded => (ErrorKind::QuotaExceeded, true),
+            std::io::ErrorKind::ReadOnlyFilesystem => (ErrorKind::ReadOnlyFilesystem, true),
+            std::io::ErrorKind::StaleNetworkFileHandle => (ErrorKind::StaleNetworkFileHandle, true),
+            std::io::ErrorKind::StorageFull => (ErrorKind::StorageFull, true),
+            std::io::ErrorKind::TimedOut => (ErrorKind::TimedOut, true),
             std::io::ErrorKind::UnexpectedEof => (ErrorKind::UnexpectedEof, true),
             std::io::ErrorKind::Unsupported => (ErrorKind::Unsupported, true),
             std::io::ErrorKind::WouldBlock => (ErrorKind::WouldBlock, true),
@@ -287,13 +414,26 @@ impl From<Error> for std::io::Error {
         let kind = match err.kind {
             ErrorKind::AlreadyExists => std::io::ErrorKind::AlreadyExists,
             ErrorKind::BrokenPipe => std::io::ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionAborted => std::io::ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionRefused => std::io::ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset => std::io::ErrorKind::ConnectionReset,
+            ErrorKind::NotConnected => std::io::ErrorKind::NotConnected,
             ErrorKind::CrossesDevices => std::io::ErrorKind::CrossesDevices,
+            ErrorKind::HostUnreachable => std::io::ErrorKind::HostUnreachable,
             ErrorKind::Interrupted => std::io::ErrorKind::Interrupted,
             ErrorKind::InvalidData => std::io::ErrorKind::InvalidData,
             ErrorKind::InvalidInput => std::io::ErrorKind::InvalidInput,
+            ErrorKind::NetworkDown => std::io::ErrorKind::NetworkDown,
+            ErrorKind::NetworkUnreachable => std::io::ErrorKind::NetworkUnreachable,
             ErrorKind::NotFound => std::io::ErrorKind::NotFound,
             ErrorKind::Other => std::io::ErrorKind::Other,
+            ErrorKind::OutOfMemory => std::io::ErrorKind::OutOfMemory,
             ErrorKind::PermissionDenied => std::io::ErrorKind::PermissionDenied,
+            ErrorKind::QuotaExceeded => std::io::ErrorKind::QuotaExceeded,
+            ErrorKind::ReadOnlyFilesystem => std::io::ErrorKind::ReadOnlyFilesystem,
+            ErrorKind::StaleNetworkFileHandle => std::io::ErrorKind::StaleNetworkFileHandle,
+            ErrorKind::StorageFull => std::io::ErrorKind::StorageFull,
+            ErrorKind::TimedOut => std::io::ErrorKind::TimedOut,
             ErrorKind::UnexpectedEof => std::io::ErrorKind::UnexpectedEof,
             ErrorKind::Unsupported => std::io::ErrorKind::Unsupported,
             ErrorKind::WouldBlock => std::io::ErrorKind::WouldBlock,

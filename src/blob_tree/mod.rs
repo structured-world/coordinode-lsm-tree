@@ -9,7 +9,7 @@ pub mod ingest;
 #[doc(hidden)]
 pub use gc::{FragmentationEntry, FragmentationMap};
 
-use crate::path::{Path, PathBuf};
+use crate::path::PathBuf;
 use crate::tree::inner::{FlushGuard, VersionsWriteGuard};
 use crate::{
     Cache, Config, Memtable, ScanSinceEvent, SeqNo, TableId, TreeId, UserKey, UserValue,
@@ -45,7 +45,6 @@ impl IterGuard for Guard {
         if pred(&kv.key.user_key) {
             resolve_value_handle(
                 self.tree.id(),
-                self.tree.blobs_folder.as_path(),
                 &self.tree.index.config.cache,
                 &self.version,
                 kv,
@@ -82,7 +81,6 @@ impl IterGuard for Guard {
     fn into_inner(self) -> crate::Result<(UserKey, UserValue)> {
         resolve_value_handle(
             self.tree.id(),
-            self.tree.blobs_folder.as_path(),
             &self.tree.index.config.cache,
             &self.version,
             self.kv?,
@@ -99,7 +97,6 @@ impl IterGuard for Guard {
 
 fn resolve_value_handle(
     tree_id: TreeId,
-    blobs_folder: &Path,
     cache: &Cache,
     version: &Version,
     item: InternalValue,
@@ -117,13 +114,7 @@ fn resolve_value_handle(
             a
         };
 
-        match accessor.get(
-            tree_id,
-            blobs_folder,
-            &item.key.user_key,
-            &vptr.vhandle,
-            cache,
-        ) {
+        match accessor.get(tree_id, &item.key.user_key, &vptr.vhandle, cache) {
             Ok(Some(v)) => {
                 let k = item.key.user_key;
                 Ok((k, v))
@@ -221,7 +212,6 @@ impl BlobTree {
 
         let (_, v) = resolve_value_handle(
             self.id(),
-            self.blobs_folder.as_path(),
             &self.index.config.cache,
             &super_version.version,
             item,
@@ -263,7 +253,6 @@ impl BlobTree {
                 let seqno = entry.key.seqno;
                 let (key, value) = resolve_value_handle(
                     self.id(),
-                    self.blobs_folder.as_path(),
                     &self.index.config.cache,
                     version,
                     entry,
@@ -276,6 +265,48 @@ impl BlobTree {
                 )?;
                 Ok(ScanSinceEvent::Insert { key, value, seqno })
             })
+    }
+
+    /// Range-scoped variant of [`Self::scan_since_seqno`], with the same
+    /// contract as
+    /// [`Tree::scan_since_seqno_in_range`](crate::Tree::scan_since_seqno_in_range):
+    /// point events only for keys inside `range`, range deletions when their
+    /// span overlaps it, and index SSTs outside the bounds skipped unread.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal version-history lock is poisoned.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::scan_since_seqno`].
+    pub fn scan_since_seqno_in_range<K: AsRef<[u8]>, R: core::ops::RangeBounds<K>>(
+        &self,
+        target_seqno: SeqNo,
+        range: R,
+    ) -> crate::Result<impl Iterator<Item = ScanSinceEvent> + use<K, R>> {
+        let bounds = crate::tree::range_to_user_bounds(&range);
+        self.index.scan_since_seqno_scoped(
+            target_seqno,
+            true,
+            |version, entry| {
+                let seqno = entry.key.seqno;
+                let (key, value) = resolve_value_handle(
+                    self.id(),
+                    &self.index.config.cache,
+                    version,
+                    entry,
+                    #[cfg(zstd_any)]
+                    self.index
+                        .config
+                        .kv_separation_opts
+                        .as_ref()
+                        .and_then(|o| o.zstd_dictionary.as_deref()),
+                )?;
+                Ok(ScanSinceEvent::Insert { key, value, seqno })
+            },
+            Some(&bounds),
+        )
     }
 }
 
@@ -387,6 +418,29 @@ impl AbstractTree for BlobTree {
         self.index.current_version()
     }
 
+    #[cfg(feature = "std")]
+    fn refresh_table_checksum(
+        &self,
+        table_id: crate::TableId,
+        checksum: crate::checksum::Checksum,
+        expected_restriction: Option<&crate::UserKey>,
+    ) -> crate::Result<crate::abstract_tree::ChecksumRefreshOutcome> {
+        // Tables live in the index tree's version; blob files carry no
+        // manifest digest.
+        self.index
+            .refresh_table_checksum(table_id, checksum, expected_restriction)
+    }
+
+    fn sync_mode(&self) -> crate::fs::SyncMode {
+        // SSTs live in the index tree; its durability mode governs them.
+        self.index.sync_mode()
+    }
+
+    fn prefix_extractor(&self) -> Option<alloc::sync::Arc<dyn crate::prefix::PrefixExtractor>> {
+        // The prefix filter is built over the index tree's SST keys.
+        self.index.prefix_extractor()
+    }
+
     fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
         // Forward the index tree's compaction state (the default impl would
         // always report idle), and mark value bytes as NOT user values: large
@@ -431,7 +485,7 @@ impl AbstractTree for BlobTree {
             // the min-volume free) keeps the status from reporting tight when the
             // SST and blob outputs each fit their own volume — see the gate's
             // two-layer model.
-            let sst_need = crate::storage_stats::full_compaction_demand_bytes(&version);
+            let sst_need = crate::storage_stats::full_compaction_demand_bytes(&version)?;
             // `saturating_sub`: `level_count >= 1` always (the clamp only guards a
             // degenerate zero-level config) → the last level index.
             let sst_dest_level = self.index.config.level_count.saturating_sub(1);
@@ -900,24 +954,32 @@ impl AbstractTree for BlobTree {
         let tables = result
             .into_iter()
             .map(|(table_id, checksum)| -> crate::Result<Table> {
-                Table::recover(
+                let mut params = crate::table::RecoverParams::new(
                     table_folder.join(table_id.to_string()),
                     checksum,
-                    0,
-                    self.index.id,
                     table_id,
-                    self.index.config.cache.clone(),
-                    self.index.config.descriptor_table.clone(),
                     level_fs.clone(),
-                    pin_filter,
-                    pin_index,
-                    self.index.config.encryption.clone(),
-                    #[cfg(zstd_any)]
-                    self.index.config.zstd_dictionary.clone(),
                     self.index.config.comparator.clone(),
-                    #[cfg(feature = "metrics")]
-                    self.index.metrics.clone(),
-                )
+                    self.index.config.cache.clone(),
+                );
+                params.tree_id = self.index.id;
+                params
+                    .descriptor_table
+                    .clone_from(&self.index.config.descriptor_table);
+                params.pin_filter = pin_filter;
+                params.pin_index = pin_index;
+                params.encryption.clone_from(&self.index.config.encryption);
+                #[cfg(zstd_any)]
+                {
+                    params
+                        .zstd_dictionary
+                        .clone_from(&self.index.config.zstd_dictionary);
+                }
+                #[cfg(feature = "metrics")]
+                {
+                    params.metrics = self.index.metrics.clone();
+                }
+                Table::recover(params)
             })
             .collect::<crate::Result<Vec<_>>>()?;
 
@@ -1178,7 +1240,6 @@ impl AbstractTree for BlobTree {
                 }
                 let (_, v) = resolve_value_handle(
                     self.id(),
-                    self.blobs_folder.as_path(),
                     &self.index.config.cache,
                     &super_version.version,
                     item,

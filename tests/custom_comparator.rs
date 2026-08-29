@@ -736,3 +736,160 @@ fn u64_comparator_range_scan_multi_table_run() -> lsm_tree::Result<()> {
 
     Ok(())
 }
+
+/// A comparator mismatch is a CONFIGURATION error, not on-disk damage:
+/// `open_or_repair` must return it untouched instead of "repairing" — a
+/// repair under the wrong ordering would re-sort or drop healthy SSTs and
+/// overwrite the manifest that still names the correct comparator.
+#[test]
+fn open_or_repair_propagates_a_comparator_mismatch_without_repairing() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+
+    {
+        let cmp: SharedComparator = Arc::new(ReverseComparator);
+        let tree = Config::new(&folder, Default::default(), Default::default())
+            .comparator(cmp)
+            .open()?;
+        tree.insert("a", "1", 0);
+        tree.flush_active_memtable(1)?;
+    }
+    let manifest_names = || -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&folder)
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with('v') || n == "current")
+            .collect();
+        names.sort();
+        names
+    };
+    let before = manifest_names();
+
+    let cmp: SharedComparator = Arc::new(U64BigEndianComparator);
+    let result = Config::new(&folder, Default::default(), Default::default())
+        .comparator(cmp)
+        .open_or_repair(lsm_tree::RepairPolicy::default().salvage(true));
+    assert!(
+        matches!(result, Err(lsm_tree::Error::ComparatorMismatch { .. })),
+        "the reversible configuration error must propagate, never repair: {:?}",
+        result.map(|_| "opened"),
+    );
+    assert_eq!(
+        before,
+        manifest_names(),
+        "a repair would have rewritten the manifest generation",
+    );
+
+    // The correct configuration still opens the untouched store.
+    let cmp: SharedComparator = Arc::new(ReverseComparator);
+    let tree = Config::new(&folder, Default::default(), Default::default())
+        .comparator(cmp)
+        .open()?;
+    assert_eq!(tree.get("a", 2)?, Some("1".as_bytes().into()));
+    Ok(())
+}
+
+/// The per-block zone map records a column's bounds in BYTE order, which is the
+/// only ordering a value column has. The intrinsic user-key column is different:
+/// its consumer compares those bounds with the tree comparator, so under a
+/// non-lexicographic comparator the recorded minimum is the comparator's
+/// maximum and the range estimate can stop before blocks that overlap the query,
+/// undercounting rows and selectivity.
+#[test]
+fn range_cardinality_is_not_skewed_by_a_reverse_comparator() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let cmp: SharedComparator = Arc::new(ReverseComparator);
+
+    let tree = Config::new(&folder, Default::default(), Default::default())
+        .comparator(cmp)
+        .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(512))
+        .open()?;
+    let lsm_tree::AnyTree::Standard(tree) = tree else {
+        panic!("expected Standard tree");
+    };
+    tree.update_runtime_config(|c| c.zone_map = true)?;
+
+    // Many small blocks, so a mis-ordered bound truncates the walk early.
+    for i in 0..400u32 {
+        tree.insert(format!("k{i:06}"), vec![b'v'; 64], u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+
+    // A BOUNDED range: the early-stop check only fires against a real upper
+    // bound, and under this comparator "k000300" precedes "k000200".
+    let lo = b"k000300".to_vec();
+    let hi = b"k000200".to_vec();
+    let actual = tree
+        .range(lo.clone()..hi.clone(), lsm_tree::SeqNo::MAX, None)
+        .count() as u64;
+    assert!(actual > 50, "test precondition: the range holds rows");
+
+    let est = tree.approximate_range_cardinality(lo..hi, lsm_tree::SeqNo::MAX)?;
+    assert!(
+        est.rows * 2 >= actual,
+        "the estimate must not collapse under a non-lexicographic comparator: \
+         estimated {} against {actual} actual",
+        est.rows,
+    );
+    Ok(())
+}
+
+/// A COLUMNAR block records per-column bounds in BYTE order, which is the only
+/// ordering a value column has. The intrinsic user-key column is different: the
+/// range estimator compares those bounds with the tree comparator, so under a
+/// non-lexicographic comparator the recorded minimum is the comparator's
+/// maximum, the walk stops before blocks that overlap the query, and rows and
+/// selectivity are undercounted.
+#[cfg(feature = "columnar")]
+#[test]
+fn columnar_range_cardinality_is_not_skewed_by_a_reverse_comparator() -> lsm_tree::Result<()> {
+    use lsm_tree::table::columnar::entries_to_column_batch;
+    use lsm_tree::{InternalValue, SeqNo, ValueType};
+
+    let folder = tempfile::tempdir()?;
+    let cmp: SharedComparator = Arc::new(ReverseComparator);
+    let any = Config::new(&folder, Default::default(), Default::default())
+        .comparator(cmp)
+        .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(256))
+        .open()?;
+    let lsm_tree::AnyTree::Standard(tree) = &any else {
+        panic!("expected Standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+    })?;
+
+    // Keys in COMPARATOR order (descending bytes), across several blocks.
+    let entries: Vec<InternalValue> = (0..200u32)
+        .rev()
+        .map(|i| {
+            InternalValue::from_components(
+                format!("k{i:06}").into_bytes(),
+                vec![b'v'; 32],
+                0,
+                ValueType::Value,
+            )
+        })
+        .collect();
+    let batch = entries_to_column_batch(&entries).expect("transpose");
+    let mut ingest = any.ingestion()?;
+    ingest.write_columnar_batch(&batch)?;
+    ingest.finish()?;
+
+    let lo = b"k000150".to_vec();
+    let hi = b"k000050".to_vec();
+    let actual = any.range(lo.clone()..hi.clone(), SeqNo::MAX, None).count() as u64;
+    assert!(
+        actual > 50,
+        "test precondition: the range holds rows, got {actual}"
+    );
+
+    let est = any.approximate_range_cardinality(lo..hi, SeqNo::MAX)?;
+    assert!(
+        est.rows * 2 >= actual,
+        "the estimate must not collapse under a non-lexicographic comparator: \
+         estimated {} against {actual} actual",
+        est.rows,
+    );
+    Ok(())
+}

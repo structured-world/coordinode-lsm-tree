@@ -1340,6 +1340,40 @@ fn point_read_binary_search_multiple_rts() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// An SST's metadata key range covers its POINT keys only, while a range
+/// tombstone it carries can reach past them. Per-table pruning must not skip
+/// such a table by its point-key range, or a deletion covering keys in OTHER
+/// tables silently stops applying.
+#[test]
+fn range_tombstone_reaching_past_the_tables_point_keys_applies() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path());
+
+    // The OLD table holds the to-be-deleted key.
+    tree.insert("m", "old", 1);
+    tree.flush_active_memtable(0)?;
+
+    // The NEW table holds one point key at "a" plus a range deletion
+    // reaching to "z": the tombstone's span covers "m" in the older table.
+    tree.insert("a", "new", 2);
+    tree.remove_range("a", "z", 3);
+    tree.flush_active_memtable(0)?;
+
+    assert_eq!(
+        tree.get("m", u64::MAX)?,
+        None,
+        "the range deletion reaches past its table's point keys and must \
+         still suppress the older table's key",
+    );
+    // Below the deletion the key is visible.
+    assert_eq!(
+        tree.get("m", 3)?.as_deref(),
+        Some(b"old".as_ref()),
+        "a snapshot below the range deletion still sees the key",
+    );
+    Ok(())
+}
+
 #[test]
 fn range_tombstone_disjoint_survives_recovery_for_narrow_scans() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();

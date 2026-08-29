@@ -105,24 +105,14 @@ fn clip_preserves_rt_covering_gap_between_output_tables() -> crate::Result<()> {
     let mut total_rts = 0;
 
     for (table_id, checksum) in &results {
-        let table = crate::Table::recover(
+        let table = crate::Table::recover(crate::table::RecoverParams::new(
             base_path.join(table_id.to_string()),
             *checksum,
-            0,
-            0,
             *table_id,
-            cache.clone(),
-            None,
             Arc::new(StdFs),
-            false,
-            false,
-            None,
-            #[cfg(zstd_any)]
-            None,
             comparator.clone(),
-            #[cfg(feature = "metrics")]
-            Arc::new(crate::Metrics::default()),
-        )?;
+            cache.clone(),
+        ))?;
         total_rts += table.range_tombstones().len();
     }
 
@@ -197,24 +187,14 @@ fn clip_rt_spanning_next_table_does_not_overlap_key_ranges() -> crate::Result<()
 
     let mut tables = Vec::new();
     for (table_id, checksum) in &results {
-        tables.push(crate::Table::recover(
+        tables.push(crate::Table::recover(crate::table::RecoverParams::new(
             base_path.join(table_id.to_string()),
             *checksum,
-            0,
-            0,
             *table_id,
-            cache.clone(),
-            None,
             Arc::new(StdFs),
-            false,
-            false,
-            None,
-            #[cfg(zstd_any)]
-            None,
             comparator.clone(),
-            #[cfg(feature = "metrics")]
-            Arc::new(crate::Metrics::default()),
-        )?);
+            cache.clone(),
+        ))?);
     }
 
     // Key ranges must be disjoint: table1.max < table2.min
@@ -315,24 +295,14 @@ fn locator_section_round_trips_through_writer() -> crate::Result<()> {
             let results = mw.finish()?;
             assert_eq!(results.len(), 1, "single output table expected");
             let (table_id, checksum) = results[0];
-            crate::Table::recover(
+            crate::Table::recover(crate::table::RecoverParams::new(
                 base.join(table_id.to_string()),
                 checksum,
-                0,
-                0,
                 table_id,
-                Arc::new(crate::Cache::with_capacity_bytes(1 << 20)),
-                None,
                 Arc::new(StdFs),
-                false,
-                false,
-                None,
-                #[cfg(zstd_any)]
-                None,
                 Arc::new(crate::DefaultUserComparator),
-                #[cfg(feature = "metrics")]
-                Arc::new(crate::Metrics::default()),
-            )
+                Arc::new(crate::Cache::with_capacity_bytes(1 << 20)),
+            ))
         };
 
     // 1) Enabled (auto widths): section present, every key recovers.
@@ -377,5 +347,91 @@ fn locator_section_round_trips_through_writer() -> crate::Result<()> {
         "disabled policy must emit no locator section",
     );
 
+    Ok(())
+}
+
+/// A filter transformation whose record TRIGGERS the rotation belongs to the
+/// output that would have received it — the NEW one. Rotation runs before
+/// the triggering record is inserted, so at that moment the live counter
+/// already carries its verdict; judging the finishing output by the live
+/// counter would mark the UNTOUCHED old output transformed and leave the
+/// transformed new output plain — after manifest loss, repair could then
+/// discard the transformed output as derived and resurrect the pre-filter
+/// value from its inputs.
+#[test]
+fn a_transform_on_the_rotation_boundary_belongs_to_the_new_output() -> crate::Result<()> {
+    use crate::fs::StdFs;
+    use crate::{InternalValue, UserKey};
+    use std::sync::Arc;
+
+    let folder = tempfile::tempdir()?;
+    let base_path = folder.path().to_path_buf();
+    std::fs::create_dir_all(&base_path)?;
+
+    let id_gen = SequenceNumberCounter::default();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let marker = Arc::new(portable_atomic::AtomicU64::new(0));
+
+    // Tiny target_size: rotation fires on the key AFTER the 4 KiB fillers.
+    let mut mw = super::MultiWriter::new(base_path.clone(), id_gen, 100, 1, fs)?
+        .use_lineage(Some(vec![7, 8]))
+        .use_transform_marker(Arc::clone(&marker));
+
+    // Output 1: untouched keys.
+    for key in [b"a" as &[u8], b"l"] {
+        mw.write(InternalValue::from_components(
+            UserKey::from(key),
+            vec![0u8; 4_000],
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    // The filter TRANSFORMS the next record (a Remove verdict replaces it
+    // with a tombstone) — the adapter ticks the marker BEFORE the write, and
+    // the write's rotation happens before the record is inserted.
+    marker.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    mw.write(InternalValue::from_components(
+        UserKey::from(b"q" as &[u8]),
+        vec![],
+        2,
+        crate::ValueType::Tombstone,
+    ))?;
+    mw.write(InternalValue::from_components(
+        UserKey::from(b"z" as &[u8]),
+        vec![0u8; 100],
+        3,
+        crate::ValueType::Value,
+    ))?;
+
+    let results = mw.finish()?;
+    assert_eq!(
+        results.len(),
+        2,
+        "the boundary transform forces two outputs"
+    );
+
+    let cache = Arc::new(crate::Cache::with_capacity_bytes(64 * 1_024));
+    let comparator: crate::SharedComparator = Arc::new(crate::DefaultUserComparator);
+    let mut lineages = Vec::new();
+    for (table_id, checksum) in &results {
+        let table = crate::Table::recover(crate::table::RecoverParams::new(
+            base_path.join(table_id.to_string()),
+            *checksum,
+            *table_id,
+            Arc::new(StdFs),
+            comparator.clone(),
+            cache.clone(),
+        ))?;
+        lineages.push((
+            table.metadata.lineage.clone(),
+            table.metadata.lineage_transformed,
+        ));
+    }
+    assert_eq!(
+        lineages,
+        vec![(Some(vec![7, 8]), false), (Some(vec![7, 8]), true),],
+        "both outputs keep their lineage; only the output holding the \
+         transformed record carries the transformed marker",
+    );
     Ok(())
 }

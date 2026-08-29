@@ -140,6 +140,106 @@ The strict boundary still covers the crash window in step 1 of
 not yet flushed is, by definition, absent from the SSTs, so its seqno is above
 your trim watermark `W` and the replay step covers it exactly once.
 
+## 4. Replay after repair
+
+A manifest repair (`Config::repair*`, or the one-call
+`Config::open_or_repair`) can REGRESS persisted state below your trim
+watermark `W`: a table the repair had to exclude loses every version it held,
+including versions at or below `W` — while `get_highest_persisted_seqno()`
+stays high because neighbouring tables survived. The standard `seqno > W` tail
+replay from section 3 does not cover such a mid-history hole, and blindly
+widening the replay would double-fold merge operands that DID survive. After
+any repair, derive the obligation from the report instead:
+
+1. **Ask the report.** `RepairReport::wal_replay_scope()` aggregates
+   `lost_coverage` (which covers excluded tables AND kept lossy salvaged
+   copies — a copy that dropped corrupt blocks lost data too, scoped by the
+   damaged SOURCE's coverage, not the shrunken copy's) and
+   `unknowable_losses`:
+   - `TailOnly` — nothing was lost; run the section 3 replay unchanged.
+   - `LostUpTo(b)` — in addition to the tail, replay every RETAINED record
+     whose key falls inside a `lost_coverage` range and whose seqno is at or
+     below `b`.
+   - `FullHistory` — same, with no seqno filter: a loss whose sequence base
+     died with the manifest, or an excluded table whose coverage never
+     parsed (`unknowable_losses`), leaves no bound that scopes the damage.
+     When the trigger is an UNSCOPABLE loss (`unknowable_losses` non-empty),
+     there is no key range either: reconcile retained records across the
+     ENTIRE keyspace in ONE pass — the survivor subtraction of step 3 runs
+     over the whole tree, and iterating `lost_coverage` ranges on top of
+     that pass would subtract the same survivors twice.
+   An operator repairing from the command line does not have to reach for the
+   API: `sst-dump <db> repair` prints the same obligation as a `wal replay:`
+   line, followed by one line per lost range or unscopable file, the
+   merge-operand exception of step 3, and a pointer back to this section.
+2. **Puts and deletes replay blindly.** Re-applying one at its original seqno
+   reproduces the same MVCC version, and a surviving NEWER version still wins
+   by seqno — over-replay inside the lost ranges is harmless for them. This
+   covers EVERY logged write kind: a range deletion is selected by SPAN
+   OVERLAP with a lost range (its half-open `[start, end)` against the
+   inclusive coverage bounds) and replays blindly too, and a batch replays
+   per entry — each entry the lost range covers gets the same treatment its
+   standalone form gets (merge entries go through step 3's presence check).
+3. **Merge operands need a presence check.** An operand that survived the
+   repair and is replayed again is folded twice. Collect the surviving
+   operands inside each lost range with
+   `scan_since_seqno_in_range(0, range)` (it skips every SST outside the
+   range, so this is proportional to the damage, not the store), build the
+   multiset of `(key, seqno, operand bytes)` it delivers, and re-apply only
+   the WAL records NOT covered by that multiset (decrement on match). The
+   scan's event stream mirrors the read path — an operand appears once per
+   application the tree will make — which is exactly the set to subtract.
+4. **Replay order**: tail and lost-range records alike in increasing seqno
+   order, each with its original operation, exactly as in section 3.
+5. **Compaction folding needs a superseded-record floor.** A merge chain a
+   compaction FOLDED leaves a plain surviving value at the chain head's
+   seqno and no operand events, so absence from step 3's multiset does not
+   prove an operand was lost. Track, per key, the highest surviving value /
+   point-tombstone seqno (and the surviving range tombstones) from the same
+   scan, and skip retained records against that floor: an OPERAND at or
+   below it (the fold incorporated operands at and below the chain head's
+   seqno), a put or delete STRICTLY below it. A point record TIED with the
+   floor must replay: equal-seqno point values are resolved by source
+   recency, not by seqno, so the floor cannot decide the tie — replaying
+   every tied WAL record in WAL order does (the memtable overwrites the
+   same internal key, so the last record in WAL order wins, and the
+   memtable is the newest source). A range tombstone covers only records STRICTLY below its
+   seqno (the engine's suppression rule): a record tied with the
+   tombstone's caller-assigned seqno survives a read and must replay. A
+   surviving WEAK (single-delete) tombstone contributes nothing to the
+   floor: it does not incorporate older history — it annihilates exactly
+   its matching put during compaction and can then expose an older value,
+   so the paired put must replay from a lost SST or the weak delete later
+   consumes a different, older value than the source's pair. Symmetrically,
+   an ARCHIVED weak delete replays past the point floor: a newer surviving
+   value does not incorporate a weak delete below it (they coexist
+   physically, and once that value is itself annihilated the tree would
+   expose the put the lost weak delete had consumed); only the
+   bottommost-zeroed unbounded floor, which embodies the whole folded
+   history, suppresses a weak replay. Two coordination rules make the floor decidable:
+   - **WAL seqnos start at 1.** Bottommost compaction ZEROES the seqno of
+     entries below its GC watermark, so a surviving value at seqno `0` is a
+     zeroed survivor embodying the key's whole folded history — treat its
+     floor as unbounded. A deployment that starts its log at seqno 0 cannot
+     tell that survivor from a genuine first write.
+   - **Do not fold or zero history a lost RANGE DELETION may target.** A
+     zeroed survivor's true age is unknowable, so a replayed range deletion
+     from a lost SST cannot decide whether the survivor pre- or post-dates
+     it. Keep the compaction GC watermark (`seqno_threshold`) at or below
+     the seqno up to which the tree is already authoritative — reconciled,
+     or provably not in need of replay — before letting it fold history.
+
+**Retention is what makes this recoverable.** Records at or below `W` were
+trimmable under section 2, and a trimmed record inside a lost range is gone
+from both the engine and the log — that is precisely the loss
+`lost_coverage` reports. A deployment that wants repairs to be lossless must
+ARCHIVE trimmed segments (a retention window) instead of deleting them at the
+watermark, and `wal_replay_scope()` tells it how deep the archive must reach:
+up to `b` for `LostUpTo(b)`, unbounded for `FullHistory`.
+
+Run the replay BEFORE publishing your visible watermark, so readers never
+observe the repaired-but-not-yet-reconciled state.
+
 ## Executable companion
 
 This recipe is not only specified here; it is executed and self-verified in the
@@ -161,7 +261,12 @@ test rather than silently diverge from the prose:
   recovered state is byte-for-byte a non-crashed run's. Its contract guards
   prove a wrong recovery is *detectably* wrong: collapsing ops to `insert`,
   re-applying a merge at or below `W`, or replaying from the raw persisted
-  maximum instead of `W` each make the recovery diverge.
+  maximum instead of `W` each make the recovery diverge. Section 4 has its own
+  pair there: `repair_and_reconciled_replay_recover_identical_state` runs a
+  crash that also destroys a flushed SST through `open_or_repair` plus the
+  documented reconciliation and reproduces the non-crashed state, and
+  `blindly_replaying_lost_range_merges_double_counts` proves that skipping the
+  survivor subtraction double-folds a surviving merge operand.
 
 Keep this spec and that proof in sync: a change to the contract should update
 both.

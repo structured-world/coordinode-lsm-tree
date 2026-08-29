@@ -371,3 +371,127 @@ fn ingested_table_excluded_from_stats_below_its_base_seqno() {
         "the ingested rows contribute cardinality when visible",
     );
 }
+
+/// A table every one of whose entries sits at or above the requested snapshot
+/// is invisible to a read there, so it must not charge rows or bytes to the
+/// estimate either. The seqno translation alone does not catch it: a table with
+/// `global_seqno == 0` passes the subtraction whatever its entries hold.
+#[test]
+fn a_table_wholly_above_the_snapshot_is_not_estimated() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .open()?;
+    let tree = match any {
+        AnyTree::Standard(t) => t,
+        AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+
+    // One flushed SST whose entries all carry seqno 100.
+    for i in 0..200u32 {
+        tree.insert(key(i), vec![0xAB; 32], 100);
+    }
+    tree.flush_active_memtable(0)?;
+
+    let stats = tree.approximate_range_stats(key(0)..key(200), 50)?;
+    assert_eq!(
+        (stats.bytes, stats.key_count),
+        (0, 0),
+        "a query at seqno 50 reads none of a table written at seqno 100",
+    );
+    let cardinality = tree.approximate_range_cardinality(key(0)..key(200), 50)?;
+    assert_eq!(
+        cardinality.rows, 0,
+        "the cardinality estimate must apply the same visibility gate",
+    );
+
+    // Sanity: at a snapshot above the entries the same table IS counted, so the
+    // gate is about visibility, not about dropping the table entirely.
+    let visible = tree.approximate_range_stats(key(0)..key(200), SeqNo::MAX)?;
+    assert!(
+        visible.key_count > 0,
+        "the table must still be estimated at a snapshot that sees it",
+    );
+    Ok(())
+}
+
+/// Selectivity is `rows / total_rows`, so a table no read at the snapshot can
+/// see must be absent from BOTH. Counting it in the denominator while
+/// excluding it from the numerator reports a full-keyspace query as selecting
+/// half the tree, which misleads a cost-based planner.
+#[test]
+fn a_future_table_is_absent_from_the_selectivity_denominator() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .open()?;
+    let tree = match any {
+        AnyTree::Standard(t) => t,
+        AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+
+    // One SST visible at seqno 50, one wholly newer, same key span and size.
+    for i in 0..200u32 {
+        tree.insert(key(i), vec![0xAB; 32], 10);
+    }
+    tree.flush_active_memtable(0)?;
+    for i in 0..200u32 {
+        tree.insert(key(i), vec![0xCD; 32], 100);
+    }
+    tree.flush_active_memtable(0)?;
+
+    let full = tree.approximate_range_cardinality(key(0)..key(200), 50)?;
+    assert!(
+        (full.selectivity - 1.0).abs() < f64::EPSILON,
+        "a full-keyspace query selects every snapshot-visible row \
+         (got selectivity {}, rows {})",
+        full.selectivity,
+        full.rows,
+    );
+    Ok(())
+}
+
+/// The memtable half of the same rule: entries at or above the snapshot are
+/// filtered out of the numerator, so counting them in the denominator reports a
+/// full-keyspace query as selecting only part of what it sees.
+#[test]
+fn future_memtable_rows_are_absent_from_the_selectivity_denominator() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let tree = match any {
+        AnyTree::Standard(t) => t,
+        AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+
+    // Half the memtable is visible at seqno 50, half is newer. Nothing is
+    // flushed, so the whole estimate comes from the memtable.
+    for i in 0..100u32 {
+        tree.insert(key(i), vec![0xAB; 32], 10);
+    }
+    for i in 100..200u32 {
+        tree.insert(key(i), vec![0xCD; 32], 100);
+    }
+
+    let full = tree.approximate_range_cardinality(key(0)..key(200), 50)?;
+    assert!(
+        (full.selectivity - 1.0).abs() < f64::EPSILON,
+        "a full-keyspace query selects every snapshot-visible memtable row \
+         (got selectivity {}, rows {})",
+        full.selectivity,
+        full.rows,
+    );
+    Ok(())
+}

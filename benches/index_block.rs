@@ -115,25 +115,18 @@ fn build_table_for_point_read_inner(restart_interval: u8, partitioned: bool) -> 
         .expect("table should be non-empty");
 
     let key = b"adj:out:vertex-0001:edge-2048:target-0001".to_vec();
-    let table = Table::recover(
-        path,
-        checksum,
-        0,
-        0,
-        0,
-        Arc::new(Cache::with_capacity_bytes(1_000_000)),
-        Some(Arc::new(DescriptorTable::new(8))),
-        Arc::new(lsm_tree::fs::StdFs),
-        false,
-        false,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        default_cmp(),
-        #[cfg(feature = "metrics")]
-        Arc::new(lsm_tree::Metrics::default()),
-    )
-    .expect("table should recover");
+    let table = {
+        let mut params = lsm_tree::table::RecoverParams::new(
+            path,
+            checksum,
+            0,
+            Arc::new(lsm_tree::fs::StdFs),
+            default_cmp(),
+            Arc::new(Cache::with_capacity_bytes(1_000_000)),
+        );
+        params.descriptor_table = Some(Arc::new(DescriptorTable::new(8)));
+        Table::recover(params).expect("table should recover")
+    };
 
     BenchTable {
         _dir: dir,

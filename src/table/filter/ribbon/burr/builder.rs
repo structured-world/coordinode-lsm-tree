@@ -2,12 +2,14 @@
 use alloc::vec::Vec;
 
 use super::super::builder::RibbonBuilder;
+use super::super::error::{BuildError, ConstructionFailure};
+use super::super::filter::RibbonFilter;
 use super::super::hashing::StandardEquation;
 use super::super::params::{Mode, Params};
 use super::error::BurrBuildError;
 use super::filter::{BurrFilter, BurrFilterKind, BurrLayer};
 use super::params::BurrParams;
-use super::threshold::{compute_thresholds, partition_keys_by_threshold};
+use super::threshold::{compute_thresholds, is_bumped, partition_keys_by_threshold};
 
 /// Builds a BuRR filter from a key set.
 ///
@@ -22,16 +24,16 @@ use super::threshold::{compute_thresholds, partition_keys_by_threshold};
 ///   3. Partition keys into `kept` and `bumped` via
 ///      `partition_keys_by_threshold`.
 ///   4. Build a vendored Standard Ribbon over `kept` — the threshold
-///      scheme caps per-block load to ~90%, so this build succeeds with
-///      negligible probability of falling into Ribbon's
-///      retry-with-different-seed path.
+///      scheme caps per-block load to ~90%, so this build almost always
+///      succeeds outright; a key the membership solve still cannot place
+///      is bumped like any other.
 ///   5. Push `BurrLayer { thresholds, ribbon }` onto the layer stack.
 ///   6. Recurse with `remaining = bumped`.
 ///
-/// The last layer cannot bump (there is no next layer), so it forces
+/// The last layer has no next layer to bump into, so it forces
 /// `thresholds[..] = b` (accept everything) and is sized with an enlarged
-/// `m` and generous retry+grow budget so the Ribbon build is guaranteed
-/// to absorb its residual.
+/// `m` so the Ribbon build absorbs its residual. A key it still cannot
+/// place surfaces as `LayerExhaustion` rather than going missing.
 pub struct BurrBuilder {
     params: BurrParams,
 }
@@ -236,10 +238,10 @@ impl BurrBuilder {
             // Partition the layer input into kept (built here) and bumped
             // (forwarded to the next layer). For the retrieval build each
             // locator travels with its key through the partition so the
-            // bumped set carries the right values; build the ribbon over the
-            // kept locators. For the membership build the RHS is the hash
-            // fingerprint, so no values ride along.
-            let (kept_ribbon, bumped_values) = match &remaining_values {
+            // bumped set carries the right values; the ribbon is then built
+            // over the kept locators. For the membership build the RHS is the
+            // hash fingerprint, so no values ride along.
+            let mut partition = match &remaining_values {
                 None => {
                     let (kept, bumped) = partition_keys_by_threshold(
                         &remaining,
@@ -247,14 +249,12 @@ impl BurrBuilder {
                         &thresholds,
                         self.params.b,
                     );
-                    let ribbon = ribbon_builder
-                        .build_with_seed_verbatim_from_hashes(&kept, layer_seed, m)
-                        .map_err(|e| BurrBuildError::RibbonLayerFailed {
-                            layer_index: usize::from(layer_idx),
-                            ribbon_error: e,
-                        })?;
-                    remaining = bumped;
-                    (ribbon, None)
+                    LayerPartition {
+                        kept,
+                        kept_values: None,
+                        bumped,
+                        bumped_values: None,
+                    }
                 }
                 Some(vals) => {
                     let pairs: Vec<(u64, u64)> = remaining
@@ -264,24 +264,27 @@ impl BurrBuilder {
                         .collect();
                     let (kept, bumped) =
                         partition_keys_by_threshold(&pairs, &equations, &thresholds, self.params.b);
-                    let (kept_hashes, kept_values): (Vec<u64>, Vec<u64>) = kept.into_iter().unzip();
-                    let (bumped_hashes, bumped_vals): (Vec<u64>, Vec<u64>) =
-                        bumped.into_iter().unzip();
-                    let ribbon = ribbon_builder
-                        .build_with_seed_verbatim_from_values(
-                            &kept_hashes,
-                            &kept_values,
-                            layer_seed,
-                            m,
-                        )
-                        .map_err(|e| BurrBuildError::RibbonLayerFailed {
-                            layer_index: usize::from(layer_idx),
-                            ribbon_error: e,
-                        })?;
-                    remaining = bumped_hashes;
-                    (ribbon, Some(bumped_vals))
+                    let (kept, kept_values): (Vec<u64>, Vec<u64>) = kept.into_iter().unzip();
+                    let (bumped, bumped_values): (Vec<u64>, Vec<u64>) = bumped.into_iter().unzip();
+                    LayerPartition {
+                        kept,
+                        kept_values: Some(kept_values),
+                        bumped,
+                        bumped_values: Some(bumped_values),
+                    }
                 }
             };
+            let mut thresholds = thresholds;
+            let kept_ribbon = build_layer_ribbon(
+                &ribbon_builder,
+                usize::from(layer_idx),
+                &equation_params,
+                self.params.b,
+                &mut thresholds,
+                &mut partition,
+            )?;
+            remaining = partition.bumped;
+            let bumped_values = partition.bumped_values;
 
             layers.push(BurrLayer {
                 m,
@@ -301,6 +304,127 @@ impl BurrBuilder {
         }
 
         Ok(BurrFilter::from_layers(self.params, kind, layers))
+    }
+}
+
+/// One layer's key split while its ribbon is solved: the keys placed in this
+/// layer, and the keys forwarded to the next one. A solve that cannot place a
+/// key moves it across, so the two sets are only final once the layer is built.
+///
+/// The value vectors are `Some` exactly for a retrieval build, where each
+/// locator has to travel with its key.
+struct LayerPartition {
+    kept: Vec<u64>,
+    kept_values: Option<Vec<u64>>,
+    bumped: Vec<u64>,
+    bumped_values: Option<Vec<u64>>,
+}
+
+/// Builds one layer's ribbon, BUMPING a key the solve cannot place instead of
+/// failing the whole filter.
+///
+/// An unplaceable key is an ordinary outcome of an unlucky band placement, and
+/// BuRR's answer to one is the next layer.
+///
+/// Bumping a key means LOWERING its block's threshold to the key's offset, not
+/// merely moving it across: a probe routes purely on `offset >= threshold`, so
+/// a key removed from a layer whose threshold still claims it would be looked
+/// up in the layer that no longer holds it and read as ABSENT. A filter that
+/// answers absent for a key it holds makes the point read skip existing data,
+/// so the threshold and the partition move together. The lowered threshold
+/// re-classifies every kept key at or above that offset in the same block, and
+/// those are repartitioned in the same pass.
+///
+/// Nothing is hidden by this: a key bumped past the last layer leaves
+/// `remaining` non-empty and surfaces as `LayerExhaustion`, so the cost is
+/// filter density, never a false negative. The loop terminates because every
+/// pass strictly lowers one block's threshold, and at zero the whole block is
+/// bumped.
+///
+/// MEMBERSHIP builds only. A RETRIEVAL build (the point-read locator) can hit
+/// the same failure for a second reason: two keys sharing a hash but mapping
+/// to different values, which no layer can satisfy. Its consumer TRUSTS the
+/// answer and reads the addressed block without re-checking the sorted index,
+/// so quietly bumping one of the pair would answer the other key with the
+/// wrong block and hand back a stale value. There, failing the build is the
+/// correct outcome: the caller skips the section and point reads fall back.
+fn build_layer_ribbon(
+    builder: &RibbonBuilder,
+    layer_index: usize,
+    equation_params: &Params,
+    b: u8,
+    thresholds: &mut [u8],
+    partition: &mut LayerPartition,
+) -> Result<RibbonFilter, BurrBuildError> {
+    let (layer_seed, m) = (equation_params.seed, equation_params.m);
+    // One scratch buffer for the whole helper, refilled per key, mirroring the
+    // layer loop above: the repartition below asks for an equation per kept
+    // key, and allocating one there would be an allocation per key per pass.
+    let mut fingerprint = alloc::vec![0_u64; equation_params.r.div_ceil(64)];
+    let equation_of = |hash: u64, scratch: &mut [u64]| {
+        scratch.fill(0);
+        super::super::hashing::standard_equation_from_hash(
+            hash,
+            layer_seed,
+            equation_params,
+            scratch,
+        )
+    };
+    loop {
+        let ribbon_error = match &partition.kept_values {
+            None => builder.build_with_seed_verbatim_from_hashes(&partition.kept, layer_seed, m),
+            Some(values) => {
+                builder.build_with_seed_verbatim_from_values(&partition.kept, values, layer_seed, m)
+            }
+        };
+        let ribbon_error = match ribbon_error {
+            Ok(ribbon) => return Ok(ribbon),
+            Err(e) => e,
+        };
+        let BuildError::ConstructionFailed {
+            last_failure: ConstructionFailure::InconsistentEquation { key_index, .. },
+            ..
+        } = &ribbon_error
+        else {
+            return Err(BurrBuildError::RibbonLayerFailed {
+                layer_index,
+                ribbon_error,
+            });
+        };
+        let key_index = *key_index;
+        if partition.kept_values.is_some() || key_index >= partition.kept.len() {
+            return Err(BurrBuildError::RibbonLayerFailed {
+                layer_index,
+                ribbon_error,
+            });
+        }
+        let Some(unplaceable) = partition.kept.get(key_index).copied() else {
+            return Err(BurrBuildError::RibbonLayerFailed {
+                layer_index,
+                ribbon_error,
+            });
+        };
+        let equation = equation_of(unplaceable, &mut fingerprint);
+        let block = equation.start / usize::from(b);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the offset is start % b, and b is a u8"
+        )]
+        let offset = (equation.start % usize::from(b)) as u8;
+        let Some(threshold) = thresholds.get_mut(block) else {
+            return Err(BurrBuildError::RibbonLayerFailed {
+                layer_index,
+                ribbon_error,
+            });
+        };
+        // The key was KEPT, so its offset is below this block's threshold and
+        // the assignment strictly lowers it, which is what bounds the loop.
+        *threshold = offset;
+        let (kept, newly_bumped): (Vec<u64>, Vec<u64>) = core::mem::take(&mut partition.kept)
+            .into_iter()
+            .partition(|hash| !is_bumped(&equation_of(*hash, &mut fingerprint), thresholds, b));
+        partition.kept = kept;
+        partition.bumped.extend(newly_bumped);
     }
 }
 

@@ -209,12 +209,12 @@ impl CrashFs {
     /// The source's durable image comes from one of two places: an entry already
     /// in `durable` (synced or captured this run), or, for a source that is
     /// pre-existing and never touched this run, its on-disk baseline (the same
-    /// "current contents are initially durable" rule [`capture_first_touch`]
+    /// "current contents are initially durable" rule [`Self::capture_first_touch`]
     /// applies). A source that is touched but not durable holds un-synced bytes,
     /// so the copy correctly inherits no durable image and a crash removes it.
     ///
     /// Reads the baseline outside the state lock (mirroring
-    /// [`capture_first_touch`]) so backend I/O never runs under the mutex.
+    /// [`Self::capture_first_touch`]) so backend I/O never runs under the mutex.
     fn track_copy(&self, src: &Path, dst: &Path) -> io::Result<()> {
         let (src_durable, src_touched) = {
             let state = self.state.lock();
@@ -281,6 +281,10 @@ impl Fs for CrashFs {
         state.durable.retain(|k, _| !k.starts_with(path));
         state.touched.retain(|k| !k.starts_with(path));
         Ok(())
+    }
+
+    fn same_file(&self, a: &Path, b: &Path) -> io::Result<bool> {
+        self.inner.same_file(a, b)
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
@@ -369,6 +373,18 @@ impl Fs for CrashFs {
     fn available_space(&self, path: &Path) -> io::Result<u64> {
         self.inner.available_space(path)
     }
+
+    fn allocated_size(&self, path: &Path) -> io::Result<Option<u64>> {
+        self.inner.allocated_size(path)
+    }
+
+    fn extent_is_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<Option<bool>> {
+        self.inner.extent_is_hole(path, offset, len)
+    }
+
+    fn extent_contains_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<Option<bool>> {
+        self.inner.extent_contains_hole(path, offset, len)
+    }
 }
 
 /// A file handle that records its durable image on `fsync`.
@@ -441,6 +457,10 @@ impl FsFile for CrashFile {
 
     fn metadata(&self) -> io::Result<FsMetadata> {
         self.inner.metadata()
+    }
+
+    fn hard_link_count(&self) -> io::Result<u64> {
+        self.inner.hard_link_count()
     }
 
     fn set_len(&self, size: u64) -> io::Result<()> {

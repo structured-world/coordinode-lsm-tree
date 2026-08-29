@@ -102,10 +102,7 @@ impl<T: Ranged> Run<T> {
     /// Only correct when the tree uses the default (lexicographic) comparator.
     /// For custom comparators, use [`Self::push_cmp`] instead.
     pub fn push_lexicographic(&mut self, item: T) {
-        self.0.push(item);
-
-        self.0
-            .sort_by(|a, b| a.key_range().min().cmp(b.key_range().min()));
+        self.push_cmp(item, &crate::comparator::DefaultUserComparator);
     }
 
     /// Pushes a table and re-sorts using a custom comparator for key ordering.
@@ -113,7 +110,7 @@ impl<T: Ranged> Run<T> {
     /// Re-sorts the entire run on each call (mirrors [`Self::push_lexicographic`]
     /// behavior). Acceptable for typical run sizes (<100 tables); for bulk
     /// insertion use [`Self::extend`] followed by [`Self::sort_by_cmp`].
-    pub fn push_cmp(&mut self, item: T, cmp: &dyn UserComparator) {
+    pub fn push_cmp<C: UserComparator + ?Sized>(&mut self, item: T, cmp: &C) {
         self.0.push(item);
         self.sort_by_cmp(cmp);
     }
@@ -121,7 +118,7 @@ impl<T: Ranged> Run<T> {
     /// Sorts the run by min key using the provided user comparator.
     ///
     /// Use after [`Self::extend`] to re-establish ordering in a single pass.
-    pub fn sort_by_cmp(&mut self, cmp: &dyn UserComparator) {
+    pub fn sort_by_cmp<C: UserComparator + ?Sized>(&mut self, cmp: &C) {
         self.0
             .sort_by(|a, b| cmp.compare(a.key_range().min(), b.key_range().min()));
     }
@@ -145,9 +142,7 @@ impl<T: Ranged> Run<T> {
 
     /// Returns the table that may possibly contains the given key.
     pub fn get_for_key(&self, key: &[u8]) -> Option<&T> {
-        let idx = self.partition_point(|x| x.key_range().max() < &key);
-
-        self.0.get(idx).filter(|x| x.key_range().min() <= &key)
+        self.get_for_key_cmp(key, &crate::comparator::DefaultUserComparator)
     }
 
     /// Like [`Self::get_for_key`], but uses a custom comparator for key ordering.
@@ -158,11 +153,7 @@ impl<T: Ranged> Run<T> {
     /// This holds because tables are flushed from comparator-sorted memtables
     /// and compaction preserves the ordering. The binary search here must
     /// use the same comparator to maintain the invariant.
-    pub fn get_for_key_cmp(
-        &self,
-        key: &[u8],
-        cmp: &dyn crate::comparator::UserComparator,
-    ) -> Option<&T> {
+    pub fn get_for_key_cmp<C: UserComparator + ?Sized>(&self, key: &[u8], cmp: &C) -> Option<&T> {
         let idx = self.partition_point(|x| {
             cmp.compare(x.key_range().max(), key) == core::cmp::Ordering::Less
         });
@@ -188,26 +179,21 @@ impl<T: Ranged> Run<T> {
     ///
     /// Uses lexicographic ordering. For custom comparators, use [`Self::get_overlapping_cmp`].
     pub fn get_overlapping<'a>(&'a self, key_range: &'a KeyRange) -> &'a [T] {
-        let range = key_range.min()..=key_range.max();
-
-        let Some((lo, hi)) = self.range_overlap_indexes::<crate::Slice, _>(&range) else {
-            return &[];
-        };
-
-        self.get(lo..=hi).unwrap_or_default()
+        self.get_overlapping_cmp(key_range, &crate::comparator::DefaultUserComparator)
     }
 
     /// Like [`Self::get_overlapping`], but uses a custom comparator for key ordering.
     ///
     /// Lifetime on `key_range` mirrors [`Self::get_overlapping`] for API consistency.
-    pub fn get_overlapping_cmp<'a>(
+    pub fn get_overlapping_cmp<'a, C: UserComparator + ?Sized>(
         &'a self,
         key_range: &'a KeyRange,
-        cmp: &dyn UserComparator,
+        cmp: &C,
     ) -> &'a [T] {
         let range = key_range.min()..=key_range.max();
 
-        let Some((lo, hi)) = self.range_overlap_indexes_cmp::<crate::Slice, _>(&range, cmp) else {
+        let Some((lo, hi)) = self.range_overlap_indexes_cmp::<crate::Slice, _, C>(&range, cmp)
+        else {
             return &[];
         };
 
@@ -217,26 +203,19 @@ impl<T: Ranged> Run<T> {
     /// Returns the sub slice of tables of tables in the run that have
     /// a key range fully contained in the input key range.
     pub fn get_contained<'a>(&'a self, key_range: &KeyRange) -> &'a [T] {
-        let range = key_range.min()..=key_range.max();
-
-        let Some((lo, hi)) = self.range_overlap_indexes::<crate::Slice, _>(&range) else {
-            return &[];
-        };
-
-        self.get(lo..=hi)
-            .map(|slice| trim_slice(slice, |x| key_range.contains_range(x.key_range())))
-            .unwrap_or_default()
+        self.get_contained_cmp(key_range, &crate::comparator::DefaultUserComparator)
     }
 
     /// Like [`Self::get_contained`], but uses a custom comparator for key ordering.
-    pub fn get_contained_cmp<'a>(
+    pub fn get_contained_cmp<'a, C: UserComparator + ?Sized>(
         &'a self,
         key_range: &KeyRange,
-        cmp: &dyn UserComparator,
+        cmp: &C,
     ) -> &'a [T] {
         let range = key_range.min()..=key_range.max();
 
-        let Some((lo, hi)) = self.range_overlap_indexes_cmp::<crate::Slice, _>(&range, cmp) else {
+        let Some((lo, hi)) = self.range_overlap_indexes_cmp::<crate::Slice, _, C>(&range, cmp)
+        else {
             return &[];
         };
 
@@ -250,63 +229,18 @@ impl<T: Ranged> Run<T> {
         &self,
         key_range: &R,
     ) -> Option<(usize, usize)> {
-        let level = &self.0;
-
-        let lo = match key_range.start_bound() {
-            Bound::Unbounded => 0,
-            Bound::Included(start_key) => {
-                level.partition_point(|x| x.key_range().max() < start_key)
-            }
-            Bound::Excluded(start_key) => {
-                level.partition_point(|x| x.key_range().max() <= start_key)
-            }
-        };
-
-        if lo >= level.len() {
-            return None;
-        }
-
-        // NOTE: We check for level length above
-        #[expect(clippy::indexing_slicing)]
-        let truncated_level = &level[lo..];
-
-        let hi = match key_range.end_bound() {
-            Bound::Unbounded => level.len() - 1,
-            Bound::Included(end_key) => {
-                // IMPORTANT: We need to add back `lo` because we sliced it off
-                let idx = lo + truncated_level.partition_point(|x| x.key_range().min() <= end_key);
-
-                if idx == 0 {
-                    return None;
-                }
-
-                idx.saturating_sub(1) // To avoid underflow
-            }
-            Bound::Excluded(end_key) => {
-                // IMPORTANT: We need to add back `lo` because we sliced it off
-                let idx = lo + truncated_level.partition_point(|x| x.key_range().min() < end_key);
-
-                if idx == 0 {
-                    return None;
-                }
-
-                idx.saturating_sub(1) // To avoid underflow
-            }
-        };
-
-        if lo > hi {
-            return None;
-        }
-
-        Some((lo, hi))
+        self.range_overlap_indexes_cmp(key_range, &crate::comparator::DefaultUserComparator)
     }
 
     /// Like [`Self::range_overlap_indexes`], but uses a custom comparator for key ordering.
-    pub fn range_overlap_indexes_cmp<K: AsRef<[u8]>, R: RangeBounds<K>>(
+    pub fn range_overlap_indexes_cmp<K: AsRef<[u8]>, R: RangeBounds<K>, C>(
         &self,
         key_range: &R,
-        cmp: &dyn UserComparator,
-    ) -> Option<(usize, usize)> {
+        cmp: &C,
+    ) -> Option<(usize, usize)>
+    where
+        C: UserComparator + ?Sized,
+    {
         use core::cmp::Ordering;
 
         let level = &self.0;

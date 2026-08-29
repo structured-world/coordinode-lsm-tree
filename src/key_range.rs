@@ -66,19 +66,22 @@ impl KeyRange {
     }
 
     /// Returns `true` if the `other` is fully contained in this range.
+    ///
+    /// One generic body serves both this and [`Self::contains_range_cmp`]: the
+    /// default-comparator call monomorphizes to plain byte comparisons, so the
+    /// common path pays nothing for the sharing — and there is exactly one
+    /// implementation a fix can land in.
     #[must_use]
     pub fn contains_range(&self, other: &Self) -> bool {
-        let (start1, end1) = self.as_tuple();
-        let (start2, end2) = other.as_tuple();
-        start1 <= start2 && end1 >= end2
+        self.contains_range_cmp(other, &crate::comparator::DefaultUserComparator)
     }
 
     /// Like [`Self::contains_range`], but uses a custom comparator for key ordering.
     #[must_use]
-    pub fn contains_range_cmp(
+    pub fn contains_range_cmp<C: crate::comparator::UserComparator + ?Sized>(
         &self,
         other: &Self,
-        cmp: &dyn crate::comparator::UserComparator,
+        cmp: &C,
     ) -> bool {
         let (start1, end1) = self.as_tuple();
         let (start2, end2) = other.as_tuple();
@@ -89,17 +92,15 @@ impl KeyRange {
     /// Returns `true` if the `other` overlaps at least partially with this range.
     #[must_use]
     pub fn overlaps_with_key_range(&self, other: &Self) -> bool {
-        let (start1, end1) = self.as_tuple();
-        let (start2, end2) = other.as_tuple();
-        end1 >= start2 && start1 <= end2
+        self.overlaps_with_key_range_cmp(other, &crate::comparator::DefaultUserComparator)
     }
 
     /// Like [`Self::overlaps_with_key_range`], but uses a custom comparator for key ordering.
     #[must_use]
-    pub fn overlaps_with_key_range_cmp(
+    pub fn overlaps_with_key_range_cmp<C: crate::comparator::UserComparator + ?Sized>(
         &self,
         other: &Self,
-        cmp: &dyn crate::comparator::UserComparator,
+        cmp: &C,
     ) -> bool {
         let (start1, end1) = self.as_tuple();
         let (start2, end2) = other.as_tuple();
@@ -109,10 +110,10 @@ impl KeyRange {
 
     /// Like [`Self::overlaps_with_bounds`], but uses a custom comparator for key ordering.
     #[must_use]
-    pub fn overlaps_with_bounds_cmp(
+    pub fn overlaps_with_bounds_cmp<C: crate::comparator::UserComparator + ?Sized>(
         &self,
         bounds: &(Bound<&[u8]>, Bound<&[u8]>),
-        cmp: &dyn crate::comparator::UserComparator,
+        cmp: &C,
     ) -> bool {
         use core::cmp::Ordering;
 
@@ -157,42 +158,7 @@ impl KeyRange {
     /// Returns `true` if the ranges overlap partially or fully.
     #[must_use]
     pub fn overlaps_with_bounds(&self, bounds: &(Bound<&[u8]>, Bound<&[u8]>)) -> bool {
-        let (lo, hi) = bounds;
-        let (my_lo, my_hi) = self.as_tuple();
-
-        if *lo == Bound::Unbounded && *hi == Bound::Unbounded {
-            return true;
-        }
-
-        if *hi == Bound::Unbounded {
-            return match lo {
-                Bound::Included(key) => key <= my_hi,
-                Bound::Excluded(key) => key < my_hi,
-                Bound::Unbounded => unreachable!(),
-            };
-        }
-
-        if *lo == Bound::Unbounded {
-            return match hi {
-                Bound::Included(key) => key >= my_lo,
-                Bound::Excluded(key) => key > my_lo,
-                Bound::Unbounded => unreachable!(),
-            };
-        }
-
-        let lo_included = match lo {
-            Bound::Included(key) => key <= my_hi,
-            Bound::Excluded(key) => key < my_hi,
-            Bound::Unbounded => unreachable!(),
-        };
-
-        let hi_included = match hi {
-            Bound::Included(key) => key >= my_lo,
-            Bound::Excluded(key) => key > my_lo,
-            Bound::Unbounded => unreachable!(),
-        };
-
-        lo_included && hi_included
+        self.overlaps_with_bounds_cmp(bounds, &crate::comparator::DefaultUserComparator)
     }
 
     /// Merges sorted key ranges into disjoint intervals using a custom comparator.
@@ -242,33 +208,14 @@ impl KeyRange {
     }
 
     /// Aggregates a key range.
-    pub fn aggregate<'a>(mut iter: impl Iterator<Item = &'a Self>) -> Self {
-        let Some(first) = iter.next() else {
-            return Self::empty();
-        };
-
-        let mut min = first.min();
-        let mut max = first.max();
-
-        for other in iter {
-            let x = other.min();
-            if x < min {
-                min = x;
-            }
-
-            let x = other.max();
-            if x > max {
-                max = x;
-            }
-        }
-
-        Self(min.clone(), max.clone())
+    pub fn aggregate<'a>(iter: impl Iterator<Item = &'a Self>) -> Self {
+        Self::aggregate_cmp(iter, &crate::comparator::DefaultUserComparator)
     }
 
     /// Like [`Self::aggregate`], but uses a custom comparator for key ordering.
-    pub fn aggregate_cmp<'a>(
+    pub fn aggregate_cmp<'a, C: crate::comparator::UserComparator + ?Sized>(
         mut iter: impl Iterator<Item = &'a Self>,
-        cmp: &dyn crate::comparator::UserComparator,
+        cmp: &C,
     ) -> Self {
         let Some(first) = iter.next() else {
             return Self::empty();

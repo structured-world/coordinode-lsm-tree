@@ -49,7 +49,8 @@ pub enum StorageStatus {
 #[must_use]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct StorageStats {
-    /// Total on-disk bytes of all live SSTs plus blob files: how much is
+    /// Total on-disk bytes of all live SSTs plus blob files (including a
+    /// restricted table's live `.restrict-bound` sidecar): how much is
     /// **occupied**. Pairs with [`Self::capacity_bytes`] / [`Self::available_bytes`]
     /// for an "X of Y used" view in a single call.
     pub used_bytes: u64,
@@ -384,29 +385,95 @@ pub(crate) fn compute_used_bytes(version: &Version) -> crate::Result<u64> {
     // overflow u64; plain arithmetic.
     let mut used_bytes = 0u64;
     for table in version.iter_tables() {
-        used_bytes += table.fs.metadata(&table.path)?.len;
+        used_bytes += table_on_disk_bytes(table)?;
     }
     for blob in version.blob_files.iter() {
-        used_bytes += blob.0.fs.metadata(&blob.0.path)?.len;
+        used_bytes += blob_on_disk_bytes(blob)?;
     }
     Ok(used_bytes)
 }
 
+/// The physical bytes a live blob file occupies.
+///
+/// Blob files are punched in place by the same tight-space reclaim as SSTs, so
+/// they are charged what they still occupy, not their logical length.
+///
+/// This is deliberately a DIFFERENT measure from `CheckpointInfo::total_bytes`,
+/// which counts logical lengths because that is what restoring a snapshot
+/// costs. The two agree for intact files and differ by exactly the punched
+/// holes once a reclaim has run.
+///
+/// # Errors
+///
+/// Propagates the stat failures of the blob file.
+pub(crate) fn blob_on_disk_bytes(blob: &crate::vlog::BlobFile) -> crate::Result<u64> {
+    Ok(crate::file::on_disk_bytes(&*blob.0.fs, &blob.0.path)?)
+}
+
+/// The physical bytes a live table occupies: the SST file plus, for a
+/// tight-space-RESTRICTED table, its `.restrict-bound` sidecar — a live
+/// companion file a checkpoint links and totals too, so both surfaces cover the
+/// same SET of files. A restricted view whose sidecar is missing on disk (a
+/// geometry-derived restriction after a repair) counts the SST alone.
+///
+/// The two surfaces measure that set differently on purpose: this one is
+/// physical (a punched prefix must leave the quota), while
+/// `CheckpointInfo::total_bytes` is logical (that is what a restore costs).
+pub(crate) fn table_on_disk_bytes(table: &crate::table::Table) -> crate::Result<u64> {
+    // Physical bytes: charging the logical length would keep a tight-space
+    // compaction's freed prefix on the quota forever, so under
+    // `storage_limit_bytes` the headroom would never recover and the tree would
+    // stay read-only despite the compaction having succeeded.
+    #[cfg_attr(not(feature = "std"), expect(unused_mut, reason = "no sidecar arm"))]
+    let mut bytes = crate::file::on_disk_bytes(&*table.fs, &table.path)?;
+    // Restrictions are created only by the std-only tight-space / repair
+    // paths, so the sidecar probe is std-gated with them.
+    #[cfg(feature = "std")]
+    if table.restrict_lower_bound().is_some() {
+        match table
+            .fs
+            .metadata(&crate::restrict_bound::sidecar_path(&table.path))
+        {
+            Ok(m) => bytes += m.len,
+            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(bytes)
+}
+
 /// The transient-output bound a full compaction's space check uses: the largest
-/// level's on-disk size (the `full_compaction_bytes` gauge figure), an upper
-/// bound on a single merge's input set. `0` for an empty tree.
+/// level's live size (the `full_compaction_bytes` gauge figure), an upper bound
+/// on a single merge's input set. `0` for an empty tree.
+///
+/// Live, not `Level::size`: a tight-space-RESTRICTED table's `file_size` still
+/// describes the punched original, and charging that superseded prefix to the
+/// output would report the tree as tight — and the gate would stall an ordinary
+/// merge — while the real output fits.
 ///
 /// This is the DEMAND. The destination VOLUME is a separate concern: a full
 /// compaction writes its output to the last configured level
 /// (`level_count - 1`), not to whichever level is currently largest, so callers
 /// pass the last level as the destination to the per-volume space check (the two
 /// differ only under tiered routing, where they can be different filesystems).
-pub(crate) fn full_compaction_demand_bytes(version: &Version) -> u64 {
-    version
-        .iter_levels()
-        .map(crate::version::Level::size)
-        .max()
-        .unwrap_or(0)
+///
+/// # Errors
+///
+/// Propagates a restricted table's punch-offset lookup.
+pub(crate) fn full_compaction_demand_bytes(version: &Version) -> crate::Result<u64> {
+    let mut largest = 0u64;
+    for level in version.iter_levels() {
+        // A level's live size: a sum of on-disk byte counts, bounded by the
+        // filesystem capacity, so it cannot overflow u64.
+        let mut size = 0u64;
+        for run in level.iter() {
+            for table in run.iter() {
+                size += table.live_file_size()?;
+            }
+        }
+        largest = largest.max(size);
+    }
+    Ok(largest)
 }
 
 /// Computes [`StorageStats`] from a live version's table + blob-file metadata.
@@ -422,12 +489,13 @@ pub(crate) fn full_compaction_demand_bytes(version: &Version) -> u64 {
 /// [`StorageStats::avg_value_bytes`] is forced to `None`. Key bytes are never
 /// separated, so [`StorageStats::avg_key_bytes`] stays exact either way.
 ///
-/// `used_bytes` is the true on-disk file size of every live table and blob
-/// file (one metadata stat per file), not the writer's `Metadata::file_size`
-/// or `crate::version::Version::blob_files`' compressed-payload sum: those
-/// undercount the physical file by the meta block / footer / blob trailer.
-/// Statting matches the figure `Tree::create_checkpoint` reports, so the two
-/// agree on disk reality.
+/// `used_bytes` is the true on-disk footprint of every live table and blob file
+/// (one stat per file), not the writer's `Metadata::file_size` or
+/// `crate::version::Version::blob_files`' compressed-payload sum: those
+/// undercount the physical file by the meta block / footer / blob trailer. It
+/// covers the same files `Tree::create_checkpoint` totals, but measures them
+/// physically rather than logically, so the two differ by the holes a
+/// tight-space reclaim punched and agree everywhere else.
 ///
 /// # Errors
 ///
@@ -453,13 +521,31 @@ pub(crate) fn compute_storage_stats(
     // would itself signal a corrupt metadata read).
     for table in version.iter_tables() {
         let m = &table.metadata;
-        // Physical file size, NOT m.file_size (which undercounts — see above).
-        let on_disk = table.fs.metadata(&table.path)?.len;
+        // Physical file size, NOT m.file_size (which undercounts — see above);
+        // a restricted table's live sidecar counts too (same basis as the
+        // checkpoint total, see `table_on_disk_bytes`).
+        let on_disk = table_on_disk_bytes(table)?;
         used_bytes += on_disk;
-        item_count += m.item_count;
+        // A restricted view's metadata still describes the whole original SST;
+        // its consumed prefix belongs to the output that superseded it, and
+        // both live in this version while a slice is in flight. Count what this
+        // view serves, and scale the per-entry aggregates by the same share so
+        // the averages stay consistent with the count.
+        let live_items = table.live_item_count()?;
+        let share = |total: u64| -> u64 {
+            if live_items == m.item_count || m.item_count == 0 {
+                return total;
+            }
+            u64::try_from(u128::from(total) * u128::from(live_items) / u128::from(m.item_count))
+                .unwrap_or(total)
+        };
+        item_count += live_items;
         table_count += 1;
-        reclaimable_entries += m.weak_tombstone_reclaimable;
-        match (m.sum_user_key_bytes, m.sum_value_bytes) {
+        reclaimable_entries += share(m.weak_tombstone_reclaimable);
+        match (
+            m.sum_user_key_bytes.map(share),
+            m.sum_value_bytes.map(share),
+        ) {
             (Some(k), Some(v)) => {
                 sum_key += k;
                 sum_value += v;
@@ -471,7 +557,7 @@ pub(crate) fn compute_storage_stats(
     // Physical blob-file size (metadata + trailer included), NOT
     // BlobFileList::on_disk_size() which sums only the compressed payload.
     for blob in version.blob_files.iter() {
-        used_bytes += blob.0.fs.metadata(&blob.0.path)?.len;
+        used_bytes += blob_on_disk_bytes(blob)?;
     }
 
     let avg_entry_on_disk_bytes = if item_count == 0 {
@@ -493,7 +579,7 @@ pub(crate) fn compute_storage_stats(
     // A full compaction's transient output is bounded by its input set; the
     // largest single merge is bounded by the largest level's on-disk size, so
     // that is the free space a full compaction needs.
-    let full_compaction_bytes = full_compaction_demand_bytes(version);
+    let full_compaction_bytes = full_compaction_demand_bytes(version)?;
     // A minimal (tight) space-reclaiming merge needs only the reserved working
     // floor to make forward progress.
     let tight_compaction_bytes = crate::tree::MIN_RESERVED_HEADROOM;
@@ -544,9 +630,15 @@ pub(crate) fn compute_level_segment_stats(version: &Version) -> crate::Result<Ve
         for run in run_group.iter() {
             for table in run.iter() {
                 // Physical file size, NOT m.file_size (which undercounts), to
-                // reconcile with the tree-level `used_bytes`.
-                let on_disk = table.fs.metadata(&table.path)?.len;
-                let items = table.metadata.item_count;
+                // reconcile with the tree-level `used_bytes` — including a
+                // restricted table's live restriction sidecar (the same basis
+                // as `table_on_disk_bytes`), so summing the levels matches
+                // the documented SST portion of the tree total.
+                let on_disk = table_on_disk_bytes(table)?;
+                // What this VIEW serves, on the same basis as the tree total: a
+                // restricted table's metadata still counts the prefix the
+                // superseding output owns.
+                let items = table.live_item_count()?;
                 let seg_reads = table.read_count.load(Relaxed);
                 let seg_access = table.last_access_secs.load(Relaxed);
                 used_bytes += on_disk;

@@ -57,6 +57,27 @@ pub struct DeletionPause {
 
     /// Paths queued for removal while at least one pause was active.
     queue: Mutex<Vec<QueuedDeletion>>,
+
+    /// Reclaims the drain could not perform because the file was still shared
+    /// (a checkpoint linked it) or the link count could not be read. They are
+    /// RETAINED rather than dropped: unlinking the checkpoint only decrements
+    /// the link count, and the live restricted table keeps holding the inode,
+    /// so nothing else would ever free the consumed prefix — the space would
+    /// stay allocated until an unrelated compaction retires the table, under
+    /// exactly the low-space condition that chose the tight-space path.
+    /// Retried by [`retry_pending_reclaims`](Self::retry_pending_reclaims).
+    pending_reclaims: Mutex<Vec<QueuedDeletion>>,
+
+    /// Excludes a checkpoint's hard-link window from in-place file mutation
+    /// (the ECC autoheal): a checkpoint that links an SST between the heal's
+    /// link-count probe and its write-back would capture bytes the heal is
+    /// about to change, under a digest its immutable manifest already
+    /// recorded. Mutators hold the read side (distinct tables heal in
+    /// parallel), a checkpoint holds the write side for its whole copy/link
+    /// pass. `parking_lot` (not `spin`): both windows are long-lived,
+    /// blocking operations, so spinning would burn a core.
+    #[cfg(feature = "std")]
+    link_gate: parking_lot::RwLock<()>,
 }
 
 #[cfg_attr(
@@ -69,6 +90,26 @@ pub struct DeletionPause {
 struct QueuedDeletion {
     fs: Arc<dyn Fs>,
     path: PathBuf,
+    action: QueuedAction,
+}
+
+/// What the drain does with a queued path.
+#[cfg_attr(
+    not(feature = "std"),
+    allow(
+        dead_code,
+        reason = "no_std-capable deletion gate; only the std-gated checkpoint consumer acquires a pause, so under no_std nothing is ever queued"
+    )
+)]
+enum QueuedAction {
+    /// Unlink the file (an obsolete table or blob file).
+    Remove,
+    /// Punch the listed `(offset, len)` extents, in the given order: a
+    /// tight-space prefix reclaim whose view dropped during the pause. The
+    /// extents are ordered top-down by the producer and the drain stops at the
+    /// first failure, which keeps the resulting hole pattern classifiable for
+    /// a sidecar-less manifest repair.
+    Punch(Vec<(u64, u64)>),
 }
 
 impl core::fmt::Debug for DeletionPause {
@@ -76,7 +117,8 @@ impl core::fmt::Debug for DeletionPause {
         f.debug_struct("DeletionPause")
             .field("active", &self.active.load(Ordering::Relaxed))
             .field("queued", &self.queue.lock().len())
-            .finish()
+            // `link_gate` is omitted: a lock has no meaningful debug state.
+            .finish_non_exhaustive()
     }
 }
 
@@ -111,6 +153,30 @@ impl DeletionPause {
     /// `false` if the pause is currently inactive (caller proceeds with
     /// the deletion as usual).
     pub fn try_enqueue(&self, fs: Arc<dyn Fs>, path: PathBuf) -> bool {
+        self.try_enqueue_action(fs, path, QueuedAction::Remove)
+    }
+
+    /// Tries to defer a tight-space prefix reclaim of `path` until the pause
+    /// releases. Returns `true` if it was queued (the caller must NOT punch),
+    /// `false` if the pause is inactive (the caller punches as usual).
+    ///
+    /// The intent lives in the view that is dropping, so without this the
+    /// reclaim would be lost outright — and the space it was reclaiming is
+    /// exactly what a tight-space compaction is short of. `extents` are punched
+    /// in the order given (top-down) once the checkpoint's window closes, and
+    /// only if the file is still exclusively owned then: a checkpoint that DID
+    /// link it during its window shares the inode, and punching would zero the
+    /// checkpoint's copy too.
+    pub(crate) fn try_enqueue_punch(
+        &self,
+        fs: Arc<dyn Fs>,
+        path: PathBuf,
+        extents: Vec<(u64, u64)>,
+    ) -> bool {
+        self.try_enqueue_action(fs, path, QueuedAction::Punch(extents))
+    }
+
+    fn try_enqueue_action(&self, fs: Arc<dyn Fs>, path: PathBuf, action: QueuedAction) -> bool {
         if !self.is_active() {
             return false;
         }
@@ -122,7 +188,7 @@ impl DeletionPause {
         if !self.is_active() {
             return false;
         }
-        queue.push(QueuedDeletion { fs, path });
+        queue.push(QueuedDeletion { fs, path, action });
         true
     }
 
@@ -140,6 +206,21 @@ impl DeletionPause {
         Pause {
             inner: Arc::clone(self),
         }
+    }
+
+    /// Enters an in-place-mutation window (blocks while a checkpoint's
+    /// link window is open). Mutators of DISTINCT files may hold windows
+    /// concurrently; see the `link_gate` field docs.
+    #[cfg(feature = "std")]
+    pub(crate) fn enter_mutation_window(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
+        self.link_gate.read()
+    }
+
+    /// Enters a checkpoint link window (blocks while any in-place-mutation
+    /// window is open, and excludes new ones until dropped).
+    #[cfg(feature = "std")]
+    pub(crate) fn enter_link_window(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
+        self.link_gate.write()
     }
 }
 
@@ -202,15 +283,128 @@ impl Drop for Pause {
         };
 
         for item in drained {
-            if let Err(e) = item.fs.remove_file(&item.path) {
-                // Match the warning style used by Table/BlobFile Drop
-                // impls so log filters keep working.
-                log::warn!(
-                    "Failed to remove deferred deletion {}: {e:?}",
-                    item.path.display(),
-                );
+            match item.action {
+                QueuedAction::Remove => {
+                    if let Err(e) = item.fs.remove_file(&item.path) {
+                        // Match the warning style used by Table/BlobFile Drop
+                        // impls so log filters keep working.
+                        log::warn!(
+                            "Failed to remove deferred deletion {}: {e:?}",
+                            item.path.display(),
+                        );
+                    }
+                }
+                QueuedAction::Punch(_) => {
+                    self.inner
+                        .reclaim_or_retain(item, &self.inner.pending_reclaims);
+                }
             }
         }
+    }
+}
+
+impl DeletionPause {
+    /// Punches `item`'s extents when the file is exclusively ours, or RETAINS
+    /// the intent for a later retry when it is not.
+    ///
+    /// A checkpoint that hard-linked the file during its window shares the
+    /// inode, and its captured manifest records the file UNRESTRICTED — punching
+    /// would zero the checkpoint's copy. A probe that cannot answer is treated
+    /// the same way. Neither case may DISCARD the reclaim: removing the
+    /// checkpoint only decrements the link count while the live restricted table
+    /// keeps holding the inode, so the consumed prefix would stay allocated with
+    /// nothing left to free it.
+    ///
+    /// The probe and the punch run inside ONE mutation window. A queued reclaim
+    /// holds no live version object, so — unlike a table's or blob file's `Drop`
+    /// — nothing else keeps a checkpoint out of the gap between them: a
+    /// checkpoint starting after the probe read `1` would hard-link the file and
+    /// then watch the punch zero the inode its immutable snapshot shares. The
+    /// window excludes every checkpoint generation across the whole sequence.
+    fn reclaim_or_retain(&self, item: QueuedDeletion, pending: &Mutex<Vec<QueuedDeletion>>) {
+        let QueuedAction::Punch(extents) = &item.action else {
+            return;
+        };
+        #[cfg(feature = "std")]
+        let _mutation = self.enter_mutation_window();
+        match item.fs.hard_link_count(&item.path) {
+            Ok(n) if n <= 1 => {
+                let mut unreclaimed: Option<Vec<(u64, u64)>> = None;
+                for (at, &(offset, len)) in extents.iter().enumerate() {
+                    if let Err(e) = item.fs.punch_hole(&item.path, offset, len) {
+                        log::warn!(
+                            "Failed to punch deferred tight-space extent at {offset} of {}; \
+                             stopping the reclaim to keep the hole pattern classifiable, \
+                             retaining it and the extents below it for a retry: {e:?}",
+                            item.path.display(),
+                        );
+                        // The pass stops here — punching below an unreclaimed
+                        // extent would break the top-down hole pattern a
+                        // sidecar-less repair reads. But the failure is often
+                        // transient, and dropping what is left would strand the
+                        // space with nothing able to free it, so the failed
+                        // extent and the untried remainder are retained.
+                        unreclaimed = extents.get(at..).map(<[(u64, u64)]>::to_vec);
+                        break;
+                    }
+                }
+                if let Some(rest) = unreclaimed {
+                    pending.lock().push(QueuedDeletion {
+                        fs: item.fs,
+                        path: item.path,
+                        action: QueuedAction::Punch(rest),
+                    });
+                }
+            }
+            // The file is gone (the table was retired while the pause was held),
+            // so the space it held is already back: nothing to retain.
+            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+            probe => {
+                log::debug!(
+                    "Deferring the tight-space punch of {} again: the file is hard-linked \
+                     (or the link count is unknown: {probe:?})",
+                    item.path.display(),
+                );
+                pending.lock().push(item);
+            }
+        }
+    }
+
+    /// Retains a reclaim that cannot be punched RIGHT NOW — a COMPLETED
+    /// checkpoint still hard-links the file, or the link probe cannot answer —
+    /// so [`Self::retry_pending_reclaims`] finishes it once the link is gone.
+    ///
+    /// Deliberately a bare queue push, with no probe and no punch: the caller
+    /// is a `Drop` impl, which must not block on the mutation gate (a
+    /// checkpoint dropping its captured version holds the gate's write half,
+    /// and that very drop can be what releases the caller's last `Arc`). The
+    /// retry re-probes under the gate.
+    #[cfg(feature = "std")]
+    pub(crate) fn retain_reclaim(&self, fs: Arc<dyn Fs>, path: PathBuf, extents: Vec<(u64, u64)>) {
+        self.pending_reclaims.lock().push(QueuedDeletion {
+            fs,
+            path,
+            action: QueuedAction::Punch(extents),
+        });
+    }
+
+    /// Re-attempts every reclaim a drain had to retain, keeping the ones whose
+    /// file is still shared.
+    ///
+    /// Call it where the reclaimed space is needed — the tight-space compaction
+    /// path — and after a checkpoint releases, since that is when its links
+    /// usually disappear.
+    pub(crate) fn retry_pending_reclaims(&self) {
+        let retained = core::mem::take(&mut *self.pending_reclaims.lock());
+        for item in retained {
+            self.reclaim_or_retain(item, &self.pending_reclaims);
+        }
+    }
+
+    /// Whether any reclaim is still waiting for its file to stop being shared.
+    #[cfg(test)]
+    pub(crate) fn has_pending_reclaims(&self) -> bool {
+        !self.pending_reclaims.lock().is_empty()
     }
 }
 

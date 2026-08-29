@@ -8,6 +8,34 @@ fn test_blob_file_meta_truncated_returns_err() {
     assert!(Metadata::from_slice(&buf).is_err());
 }
 
+/// A retired-version (3) metadata block serialized through the PRODUCTION
+/// encoder must be rejected by the production decoder: the engine reads
+/// exactly one blob-file format (version 4), so a pre-V5 blob meta is
+/// `InvalidHeader`, never a compat case.
+#[test]
+#[expect(clippy::unwrap_used)]
+fn test_blob_file_meta_retired_version_rejected() {
+    let metadata = Metadata {
+        id: 0,
+        version: 3,
+        created_at: 0,
+        item_count: 1,
+        total_compressed_bytes: 8,
+        total_uncompressed_bytes: 8,
+        key_range: KeyRange::new((b"a"[..].into(), b"z"[..].into())),
+        compression: CompressionType::None,
+    };
+    let mut buf = Vec::new();
+    metadata.encode_into(&mut buf).unwrap();
+
+    let buf = Slice::from(buf);
+    let result = Metadata::from_slice(&buf);
+    assert!(
+        matches!(result, Err(crate::Error::InvalidHeader("BlobFileMeta"))),
+        "expected Err(InvalidHeader(\"BlobFileMeta\")), got {result:?}",
+    );
+}
+
 /// Build a metadata block that is structurally valid but omits a required
 /// property (`compression`).  `from_slice` must return `Err`, not panic.
 #[test]
@@ -66,7 +94,7 @@ fn test_blob_file_meta_missing_field_returns_err() {
 fn test_blob_file_meta_corrupted_trailer_returns_err() {
     let meta = Metadata {
         id: 0,
-        version: 4,
+        version: META_VERSION,
         created_at: 1_234_567_890,
         compression: CompressionType::None,
         item_count: 100,
@@ -104,7 +132,7 @@ fn test_blob_file_meta_corrupted_trailer_returns_err() {
 fn test_blob_file_meta_roundtrip() {
     let meta = Metadata {
         id: 0,
-        version: 4,
+        version: META_VERSION,
         created_at: 1_234_567_890,
         compression: CompressionType::None,
         item_count: 100,

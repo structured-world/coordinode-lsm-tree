@@ -440,7 +440,7 @@ fn lz4_corrupted_uncompressed_length_triggers_decompress_error() {
     let payload: &[u8] = b"hello world";
 
     // Compress with lz4 using the block format
-    let compressed = lz4_flex::compress(payload);
+    let compressed = lz4_flex::block::compress(payload);
 
     // Build a header with corrupted uncompressed_length (1 byte too large)
     let data_length = compressed.len() as u32;
@@ -1849,6 +1849,100 @@ mod page_ecc {
             &BlockTransform::PlainEcc(EccParams::RS_4_2),
         )?;
         assert_eq!(&*block.data, PAYLOAD);
+        Ok(())
+    }
+
+    /// `heal_frame` validates the on-disk trailer before treating a block as
+    /// clean: a handle whose size claims more bytes than `header + data + parity`
+    /// (extra trailing bytes) is rejected — matching the normal read path — rather
+    /// than silently reported clean and left un-healed.
+    #[test]
+    fn heal_frame_with_extra_trailing_bytes_is_rejected() -> crate::Result<()> {
+        let transform = BlockTransform::PlainEcc(EccParams::RS_4_2);
+        let tmp = super::write_block_to_tempfile(
+            PAYLOAD,
+            BlockIdentity::for_test(0, BlockType::Data),
+            &transform,
+        )?;
+        let path = tmp.dir.path().join("block");
+
+        // Append trailing bytes and claim them in the handle: the block still
+        // reads back clean, but its declared size now exceeds header + data +
+        // parity.
+        let mut bytes = std::fs::read(&path)?;
+        let real_size = bytes.len();
+        bytes.extend_from_slice(&[0u8; 16]);
+        std::fs::write(&path, &bytes)?;
+
+        let oversized_size = u32::try_from(real_size + 16)
+            .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
+        let oversized = BlockHandle::new(tmp.handle.offset(), oversized_size);
+        let file = std::fs::File::open(&path)?;
+        let err = Block::heal_frame(&file, oversized, &transform)
+            .expect_err("an over-sized block (extra trailing bytes) must be rejected");
+        assert!(
+            matches!(err, crate::Error::InvalidHeader("Block")),
+            "the trailer-length check rejects the extra bytes as InvalidHeader, got {err:?}",
+        );
+        Ok(())
+    }
+
+    /// `heal_frame` on a block with no recognized parity has nothing to
+    /// reconstruct, so it returns `Ok(None)` (heal is a no-op; a checksum-only
+    /// block that fails is salvage's job).
+    #[test]
+    fn heal_frame_without_parity_returns_none() -> crate::Result<()> {
+        let tmp = super::write_block_to_tempfile(
+            PAYLOAD,
+            BlockIdentity::for_test(0, BlockType::Data),
+            &BlockTransform::PLAIN,
+        )?;
+        assert!(
+            Block::heal_frame(&tmp.file, tmp.handle, &BlockTransform::PLAIN)?.is_none(),
+            "a block without parity is a heal no-op",
+        );
+        Ok(())
+    }
+
+    /// `heal_frame` rejects an absurd on-disk size (a corrupt handle) before
+    /// allocating the read buffer, the same cap the read path applies.
+    #[test]
+    fn heal_frame_with_an_oversized_handle_is_rejected() -> crate::Result<()> {
+        let transform = BlockTransform::PlainEcc(EccParams::RS_4_2);
+        let tmp = super::write_block_to_tempfile(
+            PAYLOAD,
+            BlockIdentity::for_test(0, BlockType::Data),
+            &transform,
+        )?;
+        let oversized = BlockHandle::new(tmp.handle.offset(), u32::MAX);
+        let err = Block::heal_frame(&tmp.file, oversized, &transform)
+            .expect_err("oversized handle must be rejected");
+        assert!(
+            matches!(err, crate::Error::DecompressedSizeTooLarge { .. }),
+            "expected DecompressedSizeTooLarge, got {err:?}",
+        );
+        Ok(())
+    }
+
+    /// `heal_frame` errors when the handle claims more bytes than the file holds
+    /// (a truncated block), rather than acting on a short read.
+    #[test]
+    fn heal_frame_with_a_short_read_errors() -> crate::Result<()> {
+        let transform = BlockTransform::PlainEcc(EccParams::RS_4_2);
+        let tmp = super::write_block_to_tempfile(
+            PAYLOAD,
+            BlockIdentity::for_test(0, BlockType::Data),
+            &transform,
+        )?;
+        // Claim 4 KiB more than the file actually contains: within the size cap,
+        // but the read cannot fill the buffer.
+        let short = BlockHandle::new(tmp.handle.offset(), tmp.handle.size() + 4096);
+        let err = Block::heal_frame(&tmp.file, short, &transform)
+            .expect_err("a handle past EOF must error, not act on a short read");
+        assert!(
+            matches!(&err, crate::Error::Io(e) if e.kind() == crate::io::ErrorKind::UnexpectedEof),
+            "a handle past EOF must surface an UnexpectedEof short-read error, got {err:?}",
+        );
         Ok(())
     }
 

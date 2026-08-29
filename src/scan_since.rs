@@ -70,12 +70,25 @@ pub enum ScanSinceEvent {
         seqno: SeqNo,
     },
 
-    /// A single key was deleted at `seqno`.
-    ///
-    /// Covers both regular and weak (single-delete) tombstones; both reduce to
-    /// "this key is gone as of `seqno`" for replay purposes.
+    /// A single key was deleted at `seqno` with a REGULAR tombstone.
     PointTombstone {
         /// User key that was deleted.
+        key: Slice,
+        /// Sequence number at which the deletion was committed.
+        seqno: SeqNo,
+    },
+
+    /// A single key was WEAK-deleted (single-delete) at `seqno`.
+    ///
+    /// Distinct from [`PointTombstone`](Self::PointTombstone) because the two
+    /// are observably different at the source: a weak tombstone annihilates
+    /// exactly its matching put during compaction and can then expose an
+    /// older value from another run, while a regular tombstone keeps hiding
+    /// it. A consumer replays this with its own weak delete (e.g.
+    /// [`AbstractTree::remove_weak`](crate::AbstractTree::remove_weak)) so
+    /// the replica reproduces the source's operation semantics.
+    WeakTombstone {
+        /// User key that was weak-deleted.
         key: Slice,
         /// Sequence number at which the deletion was committed.
         seqno: SeqNo,
@@ -103,7 +116,65 @@ impl ScanSinceEvent {
             Self::Insert { seqno, .. }
             | Self::MergeOperand { seqno, .. }
             | Self::PointTombstone { seqno, .. }
+            | Self::WeakTombstone { seqno, .. }
             | Self::RangeTombstone { seqno, .. } => *seqno,
         }
+    }
+
+    /// The user key this change applies to — the START key for a range
+    /// deletion, which is where its own ordering is anchored.
+    #[must_use]
+    pub fn key(&self) -> &Slice {
+        match self {
+            Self::Insert { key, .. }
+            | Self::MergeOperand { key, .. }
+            | Self::PointTombstone { key, .. }
+            | Self::WeakTombstone { key, .. } => key,
+            Self::RangeTombstone { start_key, .. } => start_key,
+        }
+    }
+
+    /// Total order that brings byte-identical events ADJACENT so one pass can
+    /// count them: seqno, then kind, then the full payload. Identical copies
+    /// are a real post-repair state — a manifest-loss repair publishes every
+    /// surviving SST, including both the inputs and outputs of a compaction
+    /// that crashed before deleting its inputs — and each copy carries the same
+    /// key, value, and seqno.
+    ///
+    /// This is NOT the emitted order. Events sharing a seqno are emitted oldest
+    /// SOURCE first, so the value the tree serves is replayed last; deciding
+    /// that by payload bytes would hand precedence to byte order.
+    pub(crate) fn grouping_order(&self, other: &Self) -> core::cmp::Ordering {
+        // A RANGE DELETION sorts before everything at its own seqno, and that
+        // ordering survives into the emitted stream: suppression is strictly
+        // `entry.seqno < tombstone.seqno`, so the tree KEEPS an entry written at
+        // the tombstone's own seqno, and a replay that applied the deletion last
+        // would drop it. The remaining kinds only need a stable, deterministic
+        // order — they touch one key each, so their relative position at one
+        // seqno cannot change the state a consumer converges to.
+        fn rank(e: &ScanSinceEvent) -> u8 {
+            match e {
+                ScanSinceEvent::RangeTombstone { .. } => 0,
+                ScanSinceEvent::Insert { .. } => 1,
+                ScanSinceEvent::MergeOperand { .. } => 2,
+                ScanSinceEvent::PointTombstone { .. } => 3,
+                ScanSinceEvent::WeakTombstone { .. } => 4,
+            }
+        }
+        fn payload(e: &ScanSinceEvent) -> (&Slice, Option<&Slice>) {
+            match e {
+                ScanSinceEvent::Insert { key, value, .. } => (key, Some(value)),
+                ScanSinceEvent::MergeOperand { key, operand, .. } => (key, Some(operand)),
+                ScanSinceEvent::PointTombstone { key, .. }
+                | ScanSinceEvent::WeakTombstone { key, .. } => (key, None),
+                ScanSinceEvent::RangeTombstone {
+                    start_key, end_key, ..
+                } => (start_key, Some(end_key)),
+            }
+        }
+        self.seqno()
+            .cmp(&other.seqno())
+            .then_with(|| rank(self).cmp(&rank(other)))
+            .then_with(|| payload(self).cmp(&payload(other)))
     }
 }
