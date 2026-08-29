@@ -418,3 +418,43 @@ fn a_table_wholly_above_the_snapshot_is_not_estimated() -> lsm_tree::Result<()> 
     );
     Ok(())
 }
+
+/// Selectivity is `rows / total_rows`, so a table no read at the snapshot can
+/// see must be absent from BOTH. Counting it in the denominator while
+/// excluding it from the numerator reports a full-keyspace query as selecting
+/// half the tree, which misleads a cost-based planner.
+#[test]
+fn a_future_table_is_absent_from_the_selectivity_denominator() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .open()?;
+    let tree = match any {
+        AnyTree::Standard(t) => t,
+        AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+
+    // One SST visible at seqno 50, one wholly newer, same key span and size.
+    for i in 0..200u32 {
+        tree.insert(key(i), vec![0xAB; 32], 10);
+    }
+    tree.flush_active_memtable(0)?;
+    for i in 0..200u32 {
+        tree.insert(key(i), vec![0xCD; 32], 100);
+    }
+    tree.flush_active_memtable(0)?;
+
+    let full = tree.approximate_range_cardinality(key(0)..key(200), 50)?;
+    assert!(
+        (full.selectivity - 1.0).abs() < f64::EPSILON,
+        "a full-keyspace query selects every snapshot-visible row \
+         (got selectivity {}, rows {})",
+        full.selectivity,
+        full.rows,
+    );
+    Ok(())
+}

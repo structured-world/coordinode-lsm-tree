@@ -1355,22 +1355,29 @@ impl AbstractTree for Tree {
         let mut total_rows: u64 = 0;
 
         for table in super_version.version.iter_tables() {
-            total_rows = total_rows.saturating_add(table.metadata.item_count);
-            if !table
-                .metadata
-                .key_range
-                .overlaps_with_bounds_cmp(&bounds, comparator)
-            {
-                continue;
-            }
-            // A snapshot below the table's base means the table postdates it and
-            // contributes nothing here, so skip it (`checked_sub` yields `None`).
+            // Snapshot visibility is settled BEFORE the denominator grows. A
+            // table no read at `seqno` can see is not part of the dataset the
+            // selectivity describes, and counting it there while excluding it
+            // from `rows` reports a full-keyspace query as selecting half the
+            // tree. Out-of-RANGE tables do belong in the denominator, which is
+            // why that check stays below it.
+            //
+            // A snapshot below the table's base means the table postdates it
+            // (`checked_sub` yields `None`).
             let Some(table_seqno) = seqno.checked_sub(table.global_seqno()) else {
                 continue;
             };
             // Wholly above the snapshot: invisible to a read at `seqno`, so it
             // contributes nothing here either (mirrors approximate_range_stats).
             if table.seqno_visibility(seqno) == crate::table::SeqnoVisibility::None {
+                continue;
+            }
+            total_rows = total_rows.saturating_add(table.metadata.item_count);
+            if !table
+                .metadata
+                .key_range
+                .overlaps_with_bounds_cmp(&bounds, comparator)
+            {
                 continue;
             }
             // Honor a tight-space restricted view: keys below
