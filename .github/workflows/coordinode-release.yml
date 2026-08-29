@@ -9,6 +9,12 @@ jobs:
   release-plz:
     runs-on: ubuntu-latest
     steps:
+      # Pinning policy: first-party actions (actions/*, dependabot/*) track a
+      # MAJOR tag. GitHub owns both the org and the runner these steps execute
+      # on, so a commit digest buys no protection a tag does not, while costing
+      # a dependency bump per patch release. Third-party actions stay pinned to
+      # a digest with a version comment - that is where the supply-chain risk
+      # actually is. Applies to this privileged workflow too.
       - name: Generate token (SW Release Bot)
         id: app-token
         uses: actions/create-github-app-token@v3

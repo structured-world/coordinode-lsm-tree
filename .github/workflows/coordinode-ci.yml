@@ -210,6 +210,9 @@ jobs:
         if: needs.changes.outputs.code == 'false'
         run: |
           echo "::notice::No code paths changed — skipping format + clippy. Required-check name still emitted as success."
+      # Pinning policy: first-party actions (actions/*, dependabot/*) track a
+      # MAJOR tag; third-party actions stay pinned to a commit digest with a
+      # version comment. See coordinode-release.yml for the reasoning.
       - uses: actions/checkout@v7
         if: needs.changes.outputs.code != 'false'
         with:

@@ -14,6 +14,9 @@ jobs:
     if: github.event.pull_request.user.login == 'dependabot[bot]'
 
     steps:
+      # Pinning policy: first-party actions (actions/*, dependabot/*) track a
+      # MAJOR tag; third-party actions stay pinned to a commit digest with a
+      # version comment. See coordinode-release.yml for the reasoning.
       - name: Checkout
         uses: actions/checkout@v7
         with:
