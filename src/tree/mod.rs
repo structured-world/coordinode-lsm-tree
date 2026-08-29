@@ -1390,7 +1390,16 @@ impl AbstractTree for Tree {
                 comparator,
             );
             let zone_map = &table.zone_map;
-            if !zone_map.is_empty() {
+            // A COLUMNAR block's per-column bounds are recorded in BYTE order,
+            // which is the only ordering a value column has. Comparing them
+            // with a non-lexicographic user comparator reads the recorded
+            // minimum as a comparator maximum, so the walk stops before blocks
+            // that overlap the query: the shortcut is skipped for such trees
+            // and the byte-fraction estimate below answers instead. A row
+            // block's bounds are the block's first and last key, already in
+            // comparator order, so the default path is unaffected.
+            let zone_bounds_ordered = comparator.is_lexicographic() || !table.metadata.columnar;
+            if !zone_map.is_empty() && zone_bounds_ordered {
                 // Zone map present: sum the per-block row counts of blocks whose
                 // key range overlaps the query. A block is past the range once its
                 // minimum key is above the upper bound; the boundary block at the
