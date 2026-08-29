@@ -4997,28 +4997,35 @@ impl Tree {
                     // repair does, so a stale twin an interrupted sweep left
                     // behind cannot win on scan order.
                     if ambiguous_ids.contains(&table_id) {
-                        let live = match table.live_region_checksum() {
-                            Ok(live) => live,
-                            // A fault in the ENVIRONMENT says nothing about
-                            // these bytes, so it propagates and a retry can
-                            // re-read them.
-                            Err(e) if e.is_environmental() => return Err(e),
-                            // Anything else is damage to THIS copy: metadata
-                            // can parse while a data extent is unreadable, and
-                            // ending the scan on it would let a damaged
-                            // displaced copy permanently block the intact one a
-                            // folder over. Same treatment as a failed recover.
-                            Err(e) => {
-                                log::warn!(
-                                    "table {table_id} at {} could not be digested ({e}); \
+                        // The candidate is UNRESTRICTED here: the manifest's
+                        // restrictions are attached when the version is built,
+                        // which is after this scan. Digesting it whole would
+                        // compare against a live-suffix digest and reject every
+                        // copy of a restricted id, so the bound is supplied
+                        // explicitly.
+                        let live =
+                            match table.suffix_checksum_for(recovery.restrictions.get(&table_id)) {
+                                Ok(live) => live,
+                                // A fault in the ENVIRONMENT says nothing about
+                                // these bytes, so it propagates and a retry can
+                                // re-read them.
+                                Err(e) if e.is_environmental() => return Err(e),
+                                // Anything else is damage to THIS copy: metadata
+                                // can parse while a data extent is unreadable, and
+                                // ending the scan on it would let a damaged
+                                // displaced copy permanently block the intact one a
+                                // folder over. Same treatment as a failed recover.
+                                Err(e) => {
+                                    log::warn!(
+                                        "table {table_id} at {} could not be digested ({e}); \
                                      looking for another routed copy",
-                                    table_file_path.display(),
-                                );
-                                table_map.insert(table_id, entry);
-                                unrecovered_sightings.entry(table_id).or_insert(e);
-                                continue;
-                            }
-                        };
+                                        table_file_path.display(),
+                                    );
+                                    table_map.insert(table_id, entry);
+                                    unrecovered_sightings.entry(table_id).or_insert(e);
+                                    continue;
+                                }
+                            };
                         if live != checksum {
                             log::warn!(
                                 "table {table_id} at {} is not the generation the manifest \

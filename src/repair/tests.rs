@@ -16908,3 +16908,105 @@ fn the_manifest_digest_picks_a_restricted_table_copy_too() -> crate::Result<()> 
     );
     Ok(())
 }
+
+/// A manifest-RESTRICTED table sighted in two routed folders (the shape a
+/// failed post-commit sweep leaves) is digest-arbitrated at OPEN. `recover`
+/// returns an unrestricted view there, so hashing it whole against the
+/// manifest's live-suffix digest rejects every copy and the tree cannot open
+/// at all.
+#[test]
+fn a_restricted_table_with_a_routed_duplicate_still_opens() -> crate::Result<()> {
+    use crate::config::LevelRoute;
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let live_root = std::path::absolute("/db_restricted_dup_open")?;
+    let cold = std::path::absolute("/cold_restricted_dup_open")?;
+    let tables = live_root.join("tables");
+    let cold_tables = cold.join("tables");
+    memfs.create_dir_all(&tables)?;
+    memfs.create_dir_all(&cold_tables)?;
+
+    let bound: crate::UserKey = b"key000100".to_vec().into();
+    let authoritative = cold_tables.join("0");
+    {
+        let mut w = crate::table::Writer::new(authoritative.clone(), 0, 0, Arc::clone(&fs_dyn))?
+            .use_data_block_size(128);
+        for i in 0..200u32 {
+            w.write(InternalValue::from_components(
+                format!("key{i:06}").into_bytes(),
+                alloc::vec![b'L'; 64],
+                u64::from(i) + 1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the table is non-empty");
+        let probe = Config::new(
+            &live_root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        );
+        let table = crate::table::Table::recover(super::repair_recover_params(
+            &probe,
+            authoritative.clone(),
+            crate::Checksum::from_raw(super::compute_table_checksum(&*fs_dyn, &authoritative)?),
+            0,
+            Arc::clone(&fs_dyn),
+            None,
+        ))?;
+        let offset = table.punch_offset_for(&bound)?;
+        drop(table);
+        memfs.punch_hole(&authoritative, 0, offset)?;
+        crate::restrict_bound::write(
+            &*fs_dyn,
+            &authoritative,
+            None,
+            0,
+            &bound,
+            crate::fs::SyncMode::Normal,
+        )?;
+    }
+
+    let config = || {
+        let route_fs: Arc<dyn Fs> = memfs.clone();
+        Config::new(
+            &live_root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .level_routes(vec![LevelRoute {
+            levels: 0..2,
+            path: cold.clone(),
+            fs: route_fs,
+        }])
+    };
+    config().repair()?;
+
+    // The displaced twin a failed post-commit sweep leaves behind: byte
+    // identical, in the folder scanned FIRST, and never cleaned up.
+    let displaced = tables.join("0");
+    memfs.hard_link(&authoritative, &displaced)?;
+    crate::restrict_bound::write(
+        &*fs_dyn,
+        &displaced,
+        None,
+        0,
+        &bound,
+        crate::fs::SyncMode::Normal,
+    )?;
+
+    let tree = match config().open()? {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    assert_eq!(
+        tree.get(b"key000150", crate::MAX_SEQNO)?.as_deref(),
+        Some(&[b'L'; 64][..]),
+        "the restricted table must still be served with a duplicate present",
+    );
+    Ok(())
+}

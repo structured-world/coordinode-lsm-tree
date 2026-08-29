@@ -578,14 +578,8 @@ fn restricted_suffix_digest(
         Err(e) if is_environmental(&e) => return Err(e),
         Err(_) => return Ok(None),
     };
-    let offset = match table.punch_offset_for(bound.as_ref()) {
-        Ok(offset) => offset,
-        Err(e) if is_environmental(&e) => return Err(e),
-        Err(_) => return Ok(None),
-    };
-    drop(table);
-    match compute_table_checksum_from(&**fs, table_path, offset) {
-        Ok(d) => Ok(Some(crate::Checksum::from_raw(d))),
+    match table.suffix_checksum_for(Some(bound)) {
+        Ok(d) => Ok(Some(d)),
         Err(e) if is_environmental(&e) => Err(e),
         Err(_) => Ok(None),
     }

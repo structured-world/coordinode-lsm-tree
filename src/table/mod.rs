@@ -7915,7 +7915,80 @@ impl Table {
     /// [`reopen_restricted`](Self::reopen_restricted) records and what
     /// verification / heal reconciliation must recompute for a restricted view.
     pub(crate) fn live_region_checksum(&self) -> crate::Result<Checksum> {
-        let start = match self.restrict_lower_bound() {
+        self.suffix_checksum_for(self.restrict_lower_bound())
+    }
+
+    /// The entries this view actually serves.
+    ///
+    /// `metadata.item_count` describes the WHOLE original SST, prefix included,
+    /// so a restricted view reports entries a superseding output now owns.
+    /// While a tight-space slice is in flight the version holds both, and
+    /// summing the raw metadata counts those entries twice.
+    ///
+    /// Exact when the table carries a zone map (per-block row counts); without
+    /// one the count is apportioned by the live data-byte fraction, which is
+    /// the same granularity every other estimate over this table uses.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the index lookup of the restriction bound.
+    pub(crate) fn live_item_count(&self) -> crate::Result<u64> {
+        let Some(bound) = self.restrict_lower_bound() else {
+            return Ok(self.metadata.item_count);
+        };
+        let punch = self.punch_offset_for(bound)?;
+        if punch == 0 {
+            return Ok(self.metadata.item_count);
+        }
+        if !self.zone_map.is_empty() {
+            let mut rows = 0u64;
+            for handle in self.block_index.iter() {
+                let handle = handle?;
+                if *handle.offset() < punch {
+                    continue;
+                }
+                if let Some(col) = self
+                    .zone_map
+                    .columns_for(*handle.offset())
+                    .and_then(<[_]>::first)
+                {
+                    rows += u64::from(col.row_count);
+                }
+            }
+            return Ok(rows);
+        }
+        let Some(last) = self.block_index.iter().next_back() else {
+            return Ok(0);
+        };
+        let data_end = {
+            let last = last?;
+            *last.offset() + u64::from(last.size())
+        };
+        // A punch past the data section cannot be reasoned about; keep the
+        // recorded count rather than inventing a smaller one.
+        let Some(live) = data_end.checked_sub(punch).filter(|_| data_end > 0) else {
+            return Ok(self.metadata.item_count);
+        };
+        Ok(u64::try_from(
+            u128::from(self.metadata.item_count) * u128::from(live) / u128::from(data_end),
+        )
+        .unwrap_or(self.metadata.item_count))
+    }
+
+    /// The same digest for a restriction this VIEW does not carry yet: the
+    /// recovery scan digests a candidate before the manifest's restrictions are
+    /// attached (that happens when the version is built), so a restricted table
+    /// would otherwise be hashed whole and never match its committed
+    /// live-suffix digest.
+    ///
+    /// `None` digests the whole file, which is what an unrestricted table's
+    /// manifest entry records.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the index lookup of `bound` and the read of the file.
+    pub(crate) fn suffix_checksum_for(&self, bound: Option<&UserKey>) -> crate::Result<Checksum> {
+        let start = match bound {
             Some(bound) => self.punch_offset_for(bound)?,
             None => 0,
         };
