@@ -6414,9 +6414,12 @@ fn publish_repaired_manifest(
     // propagate, so a repair that reports success leaves an openable tree.
     if post_commit_error.is_none() {
         for path in unreferenced_blob_files {
-            match config.fs.remove_file(&path) {
+            // Through the shared helper, so the directory entry's removal is
+            // made DURABLE: a power loss after this repair reports success
+            // would otherwise restore the entry and hand the next open the very
+            // orphan this removal exists to prevent.
+            match discard_unreferenced(&*config.fs, &path, config.sync_mode) {
                 Ok(()) => {}
-                Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
                 Err(e) => {
                     log::error!(
                         "repair: cannot remove the unreferenced blob file {} ({e}); \
@@ -6424,7 +6427,7 @@ fn publish_repaired_manifest(
                          open must remove, and that removal would hit the same error",
                         path.display(),
                     );
-                    post_commit_error = Some(e.into());
+                    post_commit_error = Some(e);
                     break;
                 }
             }
