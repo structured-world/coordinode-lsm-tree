@@ -2008,10 +2008,10 @@ fn run_merge_on_read_relocation(
 
     let relocated = {
         let mut params = crate::table::RecoverParams::new(
-            new_path,
+            new_path.clone(),
             checksum,
             new_id,
-            level_fs,
+            Arc::clone(&level_fs),
             opts.config.comparator.clone(),
             opts.config.cache.clone(),
         );
@@ -2032,7 +2032,28 @@ fn run_merge_on_read_relocation(
         {
             params.metrics = opts.metrics.clone();
         }
-        Table::recover(params)?
+        match Table::recover(params) {
+            Ok(table) => table,
+            Err(e) => {
+                // The output is finalized but no manifest names it and no
+                // handle exists to mark it deleted, so nothing else will drop
+                // it before a restart's orphan sweep. Background compaction
+                // retries the same merge, and each attempt would leave another
+                // full-sized copy on the volume this pass was meant to relieve.
+                // The relocation writer already unlinks on a pre-finalization
+                // failure; this closes the window after it.
+                if let Err(rm) = level_fs.remove_file(&new_path)
+                    && rm.kind() != crate::io::ErrorKind::NotFound
+                {
+                    log::error!(
+                        "relocation output {} could not be removed after its reopen failed \
+                         ({rm}); it stays until the next orphan sweep",
+                        new_path.display(),
+                    );
+                }
+                return Err(e);
+            }
+        }
     };
 
     compaction_state
