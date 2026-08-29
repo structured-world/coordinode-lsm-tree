@@ -109,9 +109,10 @@ impl ErrorKind {
     /// backend surfaces when the transport (not the data) fails, and the
     /// connection kinds [`ConnectionAborted`](Self::ConnectionAborted),
     /// [`ConnectionRefused`](Self::ConnectionRefused),
-    /// [`ConnectionReset`](Self::ConnectionReset) and
-    /// [`NotConnected`](Self::NotConnected) a remote or custom backend surfaces
-    /// when its transport drops mid-request. Everything else, including the
+    /// [`ConnectionReset`](Self::ConnectionReset),
+    /// [`NotConnected`](Self::NotConnected) and [`BrokenPipe`](Self::BrokenPipe)
+    /// a remote or custom backend surfaces when its transport drops
+    /// mid-request. Everything else, including the
     /// ambiguous [`Other`](Self::Other) that real `EIO` and platform-specific
     /// structural errors (e.g. a Windows negative-seek on a corrupt file) both
     /// map to, is treated as persistent / structural.
@@ -128,11 +129,14 @@ impl ErrorKind {
                 | Self::NetworkUnreachable
                 | Self::StaleNetworkFileHandle
                 // A remote or custom backend's transport dropping mid-request
-                // says nothing about the bytes it was carrying.
+                // says nothing about the bytes it was carrying. `BrokenPipe`
+                // belongs with them: EPIPE comes from a pipe or socket whose
+                // peer went away, never from the contents of a regular file.
                 | Self::ConnectionAborted
                 | Self::ConnectionRefused
                 | Self::ConnectionReset
                 | Self::NotConnected
+                | Self::BrokenPipe
         )
     }
 

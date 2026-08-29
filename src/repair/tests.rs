@@ -17091,13 +17091,13 @@ fn repair_syncs_the_blobs_directory_after_removing_an_unreferenced_file() -> cra
     Ok(())
 }
 
-/// A remote or custom backend's transport blip surfaces as a connection error.
-/// It says nothing about the bytes on disk, so it must abort the repair for a
-/// retry: grading the healthy file unreadable commits a manifest that excludes
-/// it and then removes it, turning a temporary outage into permanent loss of
-/// intact data.
+/// A remote or custom backend's transport blip surfaces as a connection error
+/// or a broken pipe. It says nothing about the bytes on disk, so it must abort
+/// the repair for a retry: grading the healthy file unreadable commits a
+/// manifest that excludes it and then removes it, turning a temporary outage
+/// into permanent loss of intact data.
 #[test]
-fn repair_propagates_a_connection_failure() -> crate::Result<()> {
+fn repair_propagates_a_transport_failure() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
     use crate::io::ErrorKind;
     use crate::{Config, SequenceNumberCounter};
@@ -17108,6 +17108,9 @@ fn repair_propagates_a_connection_failure() -> crate::Result<()> {
         ErrorKind::ConnectionAborted,
         ErrorKind::ConnectionRefused,
         ErrorKind::NotConnected,
+        // A pipe or socket the peer closed mid-read: never something a
+        // regular file's contents can produce.
+        ErrorKind::BrokenPipe,
     ] {
         let memfs = Arc::new(MemFs::new());
         let root = std::path::absolute("/db")?;
