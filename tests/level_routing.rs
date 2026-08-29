@@ -1020,7 +1020,12 @@ fn a_stale_twin_in_an_earlier_folder_loses_to_the_manifest_digest() -> lsm_tree:
 fn a_damaged_duplicate_does_not_block_the_intact_routed_copy() -> lsm_tree::Result<()> {
     use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
 
-    let base = std::path::Path::new("/db_damaged_duplicate");
+    // The engine canonicalises every configured path (`Config::new` and
+    // `level_routes` alike), so a bare "/…" root names a different key than the
+    // one it creates wherever an absolute path carries a prefix. Canonicalise
+    // here too, so the fixture and the engine address the same directories.
+    let base = std::path::absolute("/db_damaged_duplicate").expect("absolute base");
+    let base = base.as_path();
     let mem = MemFs::new();
     let faulty = Arc::new(FaultFs::new(mem.clone()));
     let injector = faulty.injector();
