@@ -4600,6 +4600,22 @@ impl Tree {
         // Scan all configured table folders (primary + level routes).
         let all_folders = config.all_tables_folders();
 
+        // One listing per folder, taken up front. The recovery loop has to know
+        // whether an id is sighted in MORE THAN ONE routed folder BEFORE it
+        // accepts the first sighting, and answering that later would mean
+        // listing every folder a second time.
+        let mut folder_scans: Vec<(
+            &crate::path::PathBuf,
+            &Arc<dyn crate::fs::Fs>,
+            Vec<crate::fs::FsDirEntry>,
+        )> = Vec::with_capacity(all_folders.len());
+        // Ids present in more than one folder. Only these are digest-arbitrated
+        // at open: a post-commit sweep that failed leaves an INTACT stale twin,
+        // and `Table::recover` parses structure without re-deriving the
+        // manifest's digest, so it opens the stale generation just as happily.
+        // Ids sighted once cannot be ambiguous, and hashing them would turn
+        // every open into a full read of the tree.
+        let mut folder_sightings: crate::HashMap<TableId, usize> = crate::HashMap::default();
         for (table_base_folder, folder_fs) in &all_folders {
             if !folder_fs.exists(table_base_folder)? {
                 folder_fs.create_dir_all(table_base_folder)?;
@@ -4623,6 +4639,22 @@ impl Tree {
                     crate::file::TableDirEntry::RepairTmp(_)
                 )
             });
+            for dirent in &dirents {
+                if let crate::file::TableDirEntry::Table(id) =
+                    crate::file::TableDirEntry::classify(&dirent.file_name)
+                {
+                    *folder_sightings.entry(id).or_insert(0) += 1;
+                }
+            }
+            folder_scans.push((table_base_folder, folder_fs, dirents));
+        }
+        let ambiguous_ids: crate::HashSet<TableId> = folder_sightings
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|(id, _)| id)
+            .collect();
+
+        for (table_base_folder, folder_fs, dirents) in folder_scans {
             for dirent in dirents {
                 let crate::fs::FsDirEntry {
                     path: table_file_path,
@@ -4905,6 +4937,31 @@ impl Tree {
                             }
                         }
                     };
+
+                    // Opening proves the file is STRUCTURALLY sound, never that
+                    // it is the generation the manifest committed: recover parses
+                    // metadata and loads data blocks lazily. Where two folders
+                    // hold this id, take the digest as the arbiter, exactly as
+                    // repair does, so a stale twin an interrupted sweep left
+                    // behind cannot win on scan order.
+                    if ambiguous_ids.contains(&table_id) {
+                        let live = table.live_region_checksum()?;
+                        if live != checksum {
+                            log::warn!(
+                                "table {table_id} at {} is not the generation the manifest \
+                                 committed; looking for another routed copy",
+                                table_file_path.display(),
+                            );
+                            table_map.insert(table_id, entry);
+                            unrecovered_sightings.entry(table_id).or_insert(
+                                crate::Error::ChecksumMismatch {
+                                    got: live,
+                                    expected: checksum,
+                                },
+                            );
+                            continue;
+                        }
+                    }
 
                     tables.push(table);
                     recovered_table_ids.insert(table_id);

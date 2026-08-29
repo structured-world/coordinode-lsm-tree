@@ -7914,13 +7914,12 @@ impl Table {
     /// keeps the checksum stable across the punch, and it is what
     /// [`reopen_restricted`](Self::reopen_restricted) records and what
     /// verification / heal reconciliation must recompute for a restricted view.
-    #[cfg(feature = "std")]
     pub(crate) fn live_region_checksum(&self) -> crate::Result<Checksum> {
         let start = match self.restrict_lower_bound() {
             Some(bound) => self.punch_offset_for(bound)?,
             None => 0,
         };
-        crate::repair::compute_table_checksum_from(&*self.fs, &self.path, start)
+        crate::file::checksum_from_with_overrides(&*self.fs, &self.path, start, &[])
             .map(Checksum::from_raw)
     }
 

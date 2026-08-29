@@ -967,3 +967,47 @@ fn open_or_repair_propagates_a_routed_missing_table() -> lsm_tree::Result<()> {
     );
     Ok(())
 }
+
+/// A failed post-commit sweep can leave an INTACT copy of a routed table's id
+/// in a folder scanned earlier. Opening proves structure, not generation, so
+/// without a digest check the stale twin wins on scan order and normal reads
+/// return superseded values.
+#[test]
+fn a_stale_twin_in_an_earlier_folder_loses_to_the_manifest_digest() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let other = tempfile::tempdir()?;
+
+    {
+        let tree = three_tier_config(dir.path()).open()?;
+        tree.insert("a", "fresh", 1);
+        tree.flush_active_memtable(0)?;
+    }
+    // A same-id table holding a DIFFERENT generation: an independent tree
+    // starts its table counter at the same place.
+    {
+        let tree = three_tier_config(other.path()).open()?;
+        tree.insert("a", "stale", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    let routed = |base: &std::path::Path| -> std::path::PathBuf {
+        std::fs::read_dir(base.join("hot").join("tables"))
+            .expect("read hot tier")
+            .map(|e| e.expect("entry").path())
+            .find(|p| p.is_file())
+            .expect("the flush wrote a routed table")
+    };
+    let twin = routed(other.path());
+    let id = twin.file_name().expect("table file name").to_owned();
+    // The primary folder is scanned BEFORE the routes, so this copy is the
+    // first sighting of the id.
+    std::fs::copy(&twin, dir.path().join("primary").join("tables").join(&id))?;
+
+    let tree = three_tier_config(dir.path()).open()?;
+    assert_eq!(
+        tree.get("a", lsm_tree::SeqNo::MAX)?.as_deref(),
+        Some(&b"fresh"[..]),
+        "the copy the manifest digested must win over scan order",
+    );
+    Ok(())
+}
