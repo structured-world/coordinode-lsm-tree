@@ -377,6 +377,13 @@ pub fn link_tables(
                 bound,
                 sync_mode,
             )?;
+            // The sidecar counts toward the checkpoint total. It is not
+            // tree-level metadata (which this figure excludes): it is per-table
+            // state written beside its own table, it is bytes this checkpoint
+            // materialized rather than hard-linked, and a restore costs them.
+            // `storage_stats` measures the pair on the same basis, so the two
+            // surfaces stay reconcilable — see
+            // `storage_stats_and_checkpoint_agree_on_a_restricted_tree`.
             bytes += target_fs.metadata(&dst_sidecar)?.len;
         }
     }

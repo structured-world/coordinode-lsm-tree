@@ -33,7 +33,18 @@ pub struct CheckpointInfo {
     /// Number of blob (value-log) files captured. Always `0` for a
     /// standard [`Tree`].
     pub blob_files: usize,
-    /// Sum of the logical file sizes of every captured SST + blob.
+    /// Sum of the logical file sizes of every file the checkpoint captured:
+    /// the SSTs, the blob files, and the `.restrict-bound` sidecar that belongs
+    /// to a tight-space-restricted SST (per-table state, written beside its
+    /// table, that a restore needs to recover the exact bound). Tree-level
+    /// metadata — the manifest, the version pointer, the config — is NOT
+    /// counted: this figure describes the captured data, not the whole
+    /// directory.
+    ///
+    /// It measures the same SET of files as
+    /// [`StorageStats::used_bytes`](crate::StorageStats::used_bytes), which
+    /// reports them PHYSICALLY, so the two differ by exactly the bytes a
+    /// tight-space reclaim punched out and agree everywhere else.
     pub total_bytes: u64,
     /// The version ID embedded in the checkpoint's `current` pointer.
     pub version_id: u64,
