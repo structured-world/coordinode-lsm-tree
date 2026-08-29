@@ -4473,7 +4473,25 @@ impl Tree {
                 let Some(bound) = table.restrict_lower_bound() else {
                     continue;
                 };
-                let offset = table.punch_offset_for(bound)?;
+                // Reclaiming frees space; it never decides what the tree
+                // serves. A table that opened cleanly must not be denied to
+                // readers because its punch offset cannot be re-derived, so a
+                // failure here is reported and skipped. An ENVIRONMENTAL fault
+                // still propagates: it says nothing about this table, and a
+                // retry can re-read it.
+                let offset = match table.punch_offset_for(bound) {
+                    Ok(offset) => offset,
+                    Err(e) if e.is_environmental() => return Err(e),
+                    Err(e) => {
+                        log::warn!(
+                            "table {} carries a committed restriction whose punch offset \
+                             could not be re-derived ({e}); its consumed prefix stays \
+                             allocated until the next tight-space compaction",
+                            table.id(),
+                        );
+                        continue;
+                    }
+                };
                 if offset > 0 {
                     deletion_pause.retain_reclaim(
                         Arc::clone(&table.fs),
@@ -4979,7 +4997,28 @@ impl Tree {
                     // repair does, so a stale twin an interrupted sweep left
                     // behind cannot win on scan order.
                     if ambiguous_ids.contains(&table_id) {
-                        let live = table.live_region_checksum()?;
+                        let live = match table.live_region_checksum() {
+                            Ok(live) => live,
+                            // A fault in the ENVIRONMENT says nothing about
+                            // these bytes, so it propagates and a retry can
+                            // re-read them.
+                            Err(e) if e.is_environmental() => return Err(e),
+                            // Anything else is damage to THIS copy: metadata
+                            // can parse while a data extent is unreadable, and
+                            // ending the scan on it would let a damaged
+                            // displaced copy permanently block the intact one a
+                            // folder over. Same treatment as a failed recover.
+                            Err(e) => {
+                                log::warn!(
+                                    "table {table_id} at {} could not be digested ({e}); \
+                                     looking for another routed copy",
+                                    table_file_path.display(),
+                                );
+                                table_map.insert(table_id, entry);
+                                unrecovered_sightings.entry(table_id).or_insert(e);
+                                continue;
+                            }
+                        };
                         if live != checksum {
                             log::warn!(
                                 "table {table_id} at {} is not the generation the manifest \

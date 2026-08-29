@@ -1011,3 +1011,76 @@ fn a_stale_twin_in_an_earlier_folder_loses_to_the_manifest_digest() -> lsm_tree:
     );
     Ok(())
 }
+
+/// A displaced copy can have readable metadata and an unreadable data extent:
+/// it opens, then its digest read fails. Ending the scan there lets a damaged
+/// copy permanently block the intact one a folder over, which is the very
+/// cleanup-failure outage the routed-copy retry exists to survive.
+#[test_log::test]
+fn a_damaged_duplicate_does_not_block_the_intact_routed_copy() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+
+    let base = std::path::Path::new("/db_damaged_duplicate");
+    let mem = MemFs::new();
+    let faulty = Arc::new(FaultFs::new(mem.clone()));
+    let injector = faulty.injector();
+
+    let config = |fs: Arc<dyn Fs>| {
+        Config::new(
+            base,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::None))
+        .index_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::None))
+        .with_shared_fs(Arc::clone(&fs))
+        .level_routes(vec![LevelRoute {
+            levels: 0..2,
+            path: base.join("hot"),
+            fs,
+        }])
+    };
+
+    {
+        let tree = config(Arc::new(mem.clone())).open()?;
+        tree.insert("a", "authoritative", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    // The flush routed the table to the hot tier; plant a byte-identical twin
+    // in the primary folder, which is scanned FIRST.
+    let hot_tables = base.join("hot").join("tables");
+    let twin = mem
+        .read_dir(&hot_tables)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("the flush wrote a routed table")
+        .path;
+    let displaced = base
+        .join("tables")
+        .join(twin.file_name().expect("table file name"));
+    mem.hard_link(&twin, &displaced)?;
+
+    // Metadata still parses, but the copy cannot be read through for its
+    // digest: the shape a localized unreadable extent leaves behind.
+    // The SECOND open of this copy is the digest's: recovery opens it first and
+    // parses cleanly, then the digest reopens it to stream the file. Faulting
+    // the first open instead would exercise the recover-failure path, which is
+    // already covered, and the test would pass without proving anything.
+    injector.arm(
+        FaultRule::new(
+            FaultOp::Open,
+            Fault::Error(lsm_tree::io::ErrorKind::InvalidData),
+        )
+        .on_path(displaced.display().to_string())
+        .skip(1),
+    );
+
+    let tree = config(faulty).open()?;
+    assert_eq!(
+        tree.get("a", lsm_tree::SeqNo::MAX)?.as_deref(),
+        Some(&b"authoritative"[..]),
+        "the intact routed copy must still be found and served",
+    );
+    Ok(())
+}
