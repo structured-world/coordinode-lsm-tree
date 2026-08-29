@@ -261,58 +261,7 @@ pub(crate) fn compute_table_checksum_with_overrides(
     start: u64,
     overrides: &[(u64, Vec<u8>)],
 ) -> crate::Result<u128> {
-    use std::io::{Seek, SeekFrom};
-    let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
-    // Seek + sequential read (see `compute_table_checksum_from`): keeps the
-    // `start == 0` read pattern identical to the plain digest.
-    if start != 0 {
-        file.seek(SeekFrom::Start(start))?;
-    }
-    let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
-    let mut buf = vec![0u8; 256 * 1024];
-    let mut chunk_start = start;
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break; // EOF
-        }
-        let chunk_end = chunk_start + n as u64;
-        let Some(chunk) = buf.get_mut(..n) else { break };
-        // Splice every override overlapping this chunk. Overrides are few (one
-        // per corrupt block), so scanning them per chunk is negligible.
-        for (off, bytes) in overrides {
-            let ov_end = *off + bytes.len() as u64;
-            let lo = (*off).max(chunk_start);
-            let hi = ov_end.min(chunk_end);
-            // Skip a non-overlapping override BEFORE computing relative offsets:
-            // the bound subtractions below are unsigned, and an override ending
-            // before this chunk (or starting after it) would otherwise underflow
-            // (a debug panic). Once `lo < hi` holds, `chunk_start <= lo < hi <=
-            // chunk_end` and `off <= lo < hi <= ov_end`, so all four differences
-            // are non-negative.
-            if lo >= hi {
-                continue;
-            }
-            // The overlap lies inside a `<= 256 KiB` chunk, so every difference
-            // fits `usize`; `try_from` handles the 32-bit target without a cast.
-            let (Ok(dst_lo), Ok(dst_hi), Ok(src_lo), Ok(src_hi)) = (
-                usize::try_from(lo - chunk_start),
-                usize::try_from(hi - chunk_start),
-                usize::try_from(lo - *off),
-                usize::try_from(hi - *off),
-            ) else {
-                continue;
-            };
-            if let (Some(dst), Some(src)) =
-                (chunk.get_mut(dst_lo..dst_hi), bytes.get(src_lo..src_hi))
-            {
-                dst.copy_from_slice(src);
-            }
-        }
-        hasher.update(&*chunk);
-        chunk_start = chunk_end;
-    }
-    Ok(hasher.digest128())
+    crate::file::checksum_from_with_overrides(fs, path, start, overrides)
 }
 
 /// Highest existing `v{N}` manifest id in `folder`, if any. The rebuilt manifest
@@ -3870,6 +3819,12 @@ struct TableScan {
     recovered_by_id: crate::HashMap<TableId, TableCandidate>,
     /// Files the rebuild must report as damaged.
     unreadable_files: Vec<(PathBuf, String)>,
+    /// Damaged files that cost NO coverage: a duplicate of an id whose
+    /// complete copy is retained. They belong in the corruption channel — an
+    /// operator watching for a failing disk must see them — but not in the
+    /// loss accounting, where an unscopable entry would tell an external WAL
+    /// to reconcile the whole keyspace over a tree that lost nothing.
+    redundant_unreadable: crate::HashSet<PathBuf>,
     /// HEALTHY files the rebuild deliberately leaves out.
     excluded_files: Vec<(PathBuf, String)>,
     /// What each scanned table covers, captured while its metadata was
@@ -3907,6 +3862,7 @@ fn scan_table_folders(
     // (and is never added to two L0 runs). See `keep_best_candidate`.
     let mut recovered_by_id: crate::HashMap<TableId, TableCandidate> = crate::HashMap::default();
     let mut unreadable_files: Vec<(PathBuf, String)> = Vec::new();
+    let mut redundant_unreadable: crate::HashSet<PathBuf> = crate::HashSet::default();
     // HEALTHY files the rebuild deliberately leaves out (valid duplicates,
     // lineage-redundant outputs and inputs): reported in the report's
     // `excluded_files`, never in the unreadable counts — they opened and
@@ -4162,6 +4118,22 @@ fn scan_table_folders(
                     // data block unexamined. Walk the blocks, exactly as the
                     // retained copy's keep-decision does.
                     .and_then(|table| {
+                        // A tight-space-punched copy carries the same
+                        // legitimate hole its retained twin does, and the walk
+                        // starts at the view's punch offset — which is zero on
+                        // an unrestricted open. Restrict it first, or its
+                        // reclaimed prefix reads as corruption and a healthy
+                        // duplicate lands in the corruption channel.
+                        let table = match trustworthy_restriction_bound(
+                            config,
+                            &*folder_fs,
+                            &table_path,
+                            table_id,
+                            &manifest_restriction,
+                        )? {
+                            Some(bound) => table.reopen_restricted(bound)?,
+                            None => table,
+                        };
                         match block_verify_verdict(config, &folder_fs, &table_path, &table)? {
                             BlockVerifyVerdict::Clean | BlockVerifyVerdict::DegradedButReadable => {
                                 Ok(())
@@ -4203,6 +4175,9 @@ fn scan_table_folders(
                         let reason = format!(
                             "damaged duplicate of table {table_id} (kept copy is intact): {e}"
                         );
+                        // The corruption signal is real, but the coverage is
+                        // not lost: the complete copy of this id is retained.
+                        redundant_unreadable.insert(table_path.clone());
                         set_aside_path(
                             &folder_fs,
                             &table_path,
@@ -4841,6 +4816,7 @@ fn scan_table_folders(
     Ok(TableScan {
         recovered_by_id,
         unreadable_files,
+        redundant_unreadable,
         excluded_files,
         coverage_by_path,
         discard_after_commit,
@@ -4871,6 +4847,7 @@ fn rebuild_from_scan(
     let TableScan {
         recovered_by_id,
         mut unreadable_files,
+        redundant_unreadable,
         mut excluded_files,
         coverage_by_path,
         mut discard_after_commit,
@@ -5820,6 +5797,7 @@ fn rebuild_from_scan(
             blob_frag,
             published_blob_replacements,
             unreadable_files,
+            redundant_unreadable,
             excluded_files,
             lost_coverage_scoped: (
                 salvaged_coverage,
@@ -5851,6 +5829,9 @@ struct RepairPublication<'a> {
     blob_frag: crate::blob_tree::FragmentationMap,
     published_blob_replacements: PublishedBlobReplacements<'a>,
     unreadable_files: Vec<(PathBuf, String)>,
+    /// Damaged files whose id is covered by a retained complete copy: reported
+    /// as corruption, but contributing no lost coverage.
+    redundant_unreadable: crate::HashSet<PathBuf>,
     excluded_files: Vec<(PathBuf, String)>,
     #[expect(clippy::type_complexity, reason = "the four coverage channels")]
     lost_coverage_scoped: (
@@ -5893,6 +5874,7 @@ fn publish_repaired_manifest(
         blob_frag,
         mut published_blob_replacements,
         unreadable_files,
+        redundant_unreadable,
         excluded_files,
         lost_coverage_scoped:
             (salvaged_coverage, ambiguous_order_coverage, lineage_partial, salvaged_unknowable),
@@ -6258,8 +6240,14 @@ fn publish_repaired_manifest(
     };
     // Redundant exclusions live in `excluded_files` and never reach this
     // loop: their content lives on in the kept tables, so they contribute
-    // no coverage.
+    // no coverage. A DAMAGED duplicate does reach it — the corruption signal
+    // belongs in `unreadable_files` — but its coverage is not lost either, and
+    // an unscopable entry here would send an external WAL over the whole
+    // keyspace for a tree that lost nothing.
     for (path, _) in &unreadable_files {
+        if redundant_unreadable.contains(path) {
+            continue;
+        }
         match coverage_by_path.get(path) {
             Some((lo, hi, seqno)) => {
                 lost_coverage.push((path.clone(), lo.clone(), hi.clone(), *seqno));

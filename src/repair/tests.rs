@@ -10075,6 +10075,18 @@ fn a_routed_duplicate_with_a_rotted_data_block_is_unreadable() -> crate::Result<
         "a duplicate that opens but whose data rotted is still the corruption \
          signal: {report:?}",
     );
+    // The signal must not be mistaken for a LOSS: the id's complete copy is
+    // retained, so nothing needs replaying. Counting it would answer
+    // `FullHistory` and send an external WAL over the whole keyspace.
+    assert!(
+        report.unknowable_losses.is_empty() && report.lost_coverage.is_empty(),
+        "a redundant damaged copy costs no coverage: {report:?}",
+    );
+    assert_eq!(
+        report.wal_replay_scope(),
+        crate::repair::WalReplayScope::TailOnly,
+        "nothing was lost, so the usual tail replay is enough: {report:?}",
+    );
     Ok(())
 }
 
@@ -16267,6 +16279,103 @@ fn open_finishes_a_committed_repair_swap() -> crate::Result<()> {
     assert!(
         tree.get(b"k0004", u64::MAX)?.is_some(),
         "the salvaged content the manifest describes is served",
+    );
+    Ok(())
+}
+
+/// A tight-space-punched table has a legitimate hole in its data prefix, and
+/// the block walk knows to start past it — but only on a view that carries the
+/// restriction. The duplicate verifier recovers the copy UNRESTRICTED, so its
+/// walk began at offset 0, read the reclaimed prefix as corruption, and filed a
+/// perfectly healthy duplicate in the corruption channel.
+#[test]
+fn a_restricted_routed_duplicate_is_not_read_as_corrupt() -> crate::Result<()> {
+    use crate::config::LevelRoute;
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db_restricted_dup")?;
+    let cold = std::path::absolute("/cold_restricted_dup")?;
+    let tables = root.join("tables");
+    let cold_tables = cold.join("tables");
+    memfs.create_dir_all(&tables)?;
+    memfs.create_dir_all(&cold_tables)?;
+
+    let bound = b"key000100".to_vec();
+    // Two byte-identical copies of one id, each punched at the same offset and
+    // each carrying the sidecar that records the bound. This is what a routed
+    // tree looks like after a tight-space compaction plus a failed cleanup.
+    for dir in [&tables, &cold_tables] {
+        let path = dir.join("0");
+        {
+            let mut w = crate::table::Writer::new(path.clone(), 0, 0, Arc::clone(&fs_dyn))?
+                .use_data_block_size(128);
+            for i in 0..200u32 {
+                w.write(InternalValue::from_components(
+                    format!("key{i:06}").into_bytes(),
+                    vec![0xABu8; 64],
+                    u64::from(i) + 1,
+                    ValueType::Value,
+                ))?;
+            }
+            assert!(w.finish()?.is_some(), "the table is non-empty");
+        }
+        // Punch the consumed prefix exactly where the bound falls, so the
+        // zeroed region is the real reclaimed geometry rather than a guess.
+        let probe_config = Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        );
+        let table = crate::table::Table::recover(super::repair_recover_params(
+            &probe_config,
+            path.clone(),
+            crate::Checksum::from_raw(super::compute_table_checksum(&*fs_dyn, &path)?),
+            0,
+            Arc::clone(&fs_dyn),
+            None,
+        ))?;
+        let offset = table.punch_offset_for(&bound)?;
+        drop(table);
+        memfs.punch_hole(&path, 0, offset)?;
+        crate::restrict_bound::write(
+            &*fs_dyn,
+            &path,
+            None,
+            0,
+            &bound,
+            crate::fs::SyncMode::Normal,
+        )?;
+    }
+
+    let route_fs: Arc<dyn Fs> = memfs.clone();
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .level_routes(vec![LevelRoute {
+        levels: 0..2,
+        path: cold,
+        fs: route_fs,
+    }])
+    .repair()?;
+
+    assert_eq!(report.recovered, 1, "one copy is retained: {report:?}");
+    assert_eq!(
+        report.unreadable, 0,
+        "the duplicate's punched prefix is its restriction, not damage: {report:?}",
+    );
+    assert!(
+        report
+            .excluded_files
+            .iter()
+            .any(|(_, reason)| reason.contains("duplicate")),
+        "it is a healthy exclusion: {report:?}",
     );
     Ok(())
 }
