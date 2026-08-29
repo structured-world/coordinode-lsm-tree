@@ -10173,3 +10173,60 @@ fn salvage_drops_a_columnar_boundary_key_when_its_newest_version_is_lost() -> cr
     );
     Ok(())
 }
+
+/// The narrow shape the multi-entry sibling test does not reach: a table whose
+/// ONLY point entry is a real weak tombstone that coincides with the
+/// `(seqno, start)`-minimal range tombstone. `item_count == 1` then holds, so
+/// the sentinel gate fires and the real entry is excluded, leaving NO decoded
+/// seqno to cross-check. A re-stamped `seqno#min` therefore passes unchallenged
+/// and `point_read` skips the table at snapshots below the forged minimum,
+/// exposing an older value from a lower level.
+///
+/// One write batch produces this shape: entries in a batch share one seqno, so
+/// `remove_weak(k)` beside `remove_range(k..)` lands both at the same seqno with
+/// the same start key.
+#[test]
+fn verify_metadata_bounds_keeps_a_lone_weak_tombstone_matching_the_rt_sentinel() -> crate::Result<()>
+{
+    use crate::UserKey;
+    use crate::range_tombstone::RangeTombstone;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    writer.write(InternalValue::new_weak_tombstone(
+        UserKey::from(b"key-002".as_slice()),
+        3,
+    ))?;
+    writer.write_range_tombstone(RangeTombstone::new(
+        UserKey::from(b"key-002".as_slice()),
+        UserKey::from(b"key-005".as_slice()),
+        3,
+    ));
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // An honest one-key table cannot hold this RT: coverage pins the RT inside
+    // the key range, and an empty RT is rejected at decode. But `key#max` lives
+    // in the SAME meta block as `seqno#min`, so the adversary these checks
+    // exist to stop re-stamps both, and the shape becomes reachable.
+    crate::test_forge::forge_meta_value_both_mirrors(&source, b"key#max", b"key-005")?;
+
+    // Raise seqno#min above the real entry's seqno: caught only if that entry
+    // still counts toward the decoded minimum.
+    crate::test_forge::forge_meta_value_both_mirrors(&source, b"seqno#min", &9u64.to_le_bytes())?;
+
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_metadata_bounds(false) else {
+        panic!("a seqno#min above the table's only real entry must be rejected");
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::InvalidHeader("meta seqno#min is above the decoded minimum seqno")
+        ),
+        "the rejection names the seqno#min branch specifically, got {err:?}",
+    );
+    Ok(())
+}

@@ -4699,20 +4699,29 @@ impl Table {
                 last_key = Some(last.key.user_key.clone());
             }
             for entry in &entries {
-                // Exclude the synthetic RT sentinel (once): its RT-derived seqno
-                // is deliberately outside the recorded KV range, so folding it in
-                // would break the KV seqno-bound cross-check for an RT-only table.
+                let s = entry.key.seqno;
+                // The MINIMUM counts every decoded entry, sentinel included.
+                // `seqno#min` is written over range tombstones as well as KV
+                // entries, so a genuine RT-only table's sentinel carries a
+                // seqno the recorded minimum already covers and cannot trip the
+                // check. Excluding it here instead would hand an adversary the
+                // whole cross-check: with `key#max` re-stamped to admit an RT
+                // that starts at a one-entry table's sole key, the table's only
+                // real seqno looks synthetic, drops out, and leaves nothing to
+                // contradict a raised `seqno#min`.
+                seqno_lo = Some(seqno_lo.map_or(s, |lo| lo.min(s)));
+                // The MAXIMUM must still skip the synthetic sentinel (once):
+                // `seqno#kv_max` excludes range tombstones, so an RT-only
+                // table's sentinel seqno legitimately sits above it.
                 if !sentinel_excluded
                     && let Some((sentinel_key, sentinel_seqno)) = &sentinel
-                    && entry.key.seqno == *sentinel_seqno
+                    && s == *sentinel_seqno
                     && entry.key.value_type == crate::ValueType::WeakTombstone
                     && entry.key.user_key.as_ref() == sentinel_key.as_ref()
                 {
                     sentinel_excluded = true;
                     continue;
                 }
-                let s = entry.key.seqno;
-                seqno_lo = Some(seqno_lo.map_or(s, |lo| lo.min(s)));
                 seqno_hi = Some(seqno_hi.map_or(s, |hi| hi.max(s)));
             }
         }
@@ -4743,17 +4752,23 @@ impl Table {
         // to check, while an RT+KV table's real entries are checked. A recorded
         // minimum ABOVE the real minimum, or a recorded KV maximum BELOW the
         // real maximum, is corruption.
-        if let (Some(lo), Some(hi)) = (seqno_lo, seqno_hi) {
-            if meta.seqnos.0 > lo {
-                return Err(crate::Error::InvalidHeader(
-                    "meta seqno#min is above the decoded minimum seqno",
-                ));
-            }
-            if meta.highest_kv_seqno < hi {
-                return Err(crate::Error::InvalidHeader(
-                    "meta seqno#kv_max is below the decoded maximum seqno",
-                ));
-            }
+        // Checked INDEPENDENTLY: an RT-only table decodes a minimum (its
+        // sentinel counts there) but no KV maximum, and pairing the two would
+        // skip the minimum check on exactly the table shape an adversary builds
+        // to escape it.
+        if let Some(lo) = seqno_lo
+            && meta.seqnos.0 > lo
+        {
+            return Err(crate::Error::InvalidHeader(
+                "meta seqno#min is above the decoded minimum seqno",
+            ));
+        }
+        if let Some(hi) = seqno_hi
+            && meta.highest_kv_seqno < hi
+        {
+            return Err(crate::Error::InvalidHeader(
+                "meta seqno#kv_max is below the decoded maximum seqno",
+            ));
         }
         // `Table::scan` hands the recorded count to the compaction scanner,
         // which stops after that many blocks: a count re-stamped SMALLER
