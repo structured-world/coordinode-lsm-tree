@@ -417,6 +417,28 @@ pub(crate) enum PunchProbe {
     Unproven,
 }
 
+/// One live data block, decoded ONCE for every cross-check gate that needs its
+/// contents, from [`Table::for_each_live_block`].
+///
+/// Each gate used to walk the whole table itself, so a single reconcile decoded
+/// every block seven to nine times and the decode dominates a repair's cost.
+/// Materializing the block's row view, its columnar batch and its entries here
+/// hands the SAME decode to all of them.
+#[cfg(feature = "std")]
+pub(crate) struct DecodedBlock {
+    /// Where the block lives, as the block index records it.
+    pub(crate) handle: BlockHandle,
+    /// The row-major view. `None` on a columnar table, whose rows are
+    /// reconstructed from `batch` instead.
+    pub(crate) row: Option<DataBlock>,
+    /// The columnar batch this block decoded to, for the per-column statistics
+    /// only a columnar table records. `None` on a row table.
+    #[cfg(feature = "columnar")]
+    pub(crate) batch: Option<crate::table::columnar::ColumnBatch>,
+    /// The block's entries in block order, materialized once.
+    pub(crate) entries: Vec<InternalValue>,
+}
+
 /// Everything one pass over the data blocks can say about a tight-space
 /// reclaim, from [`Table::punch_geometry`].
 ///
@@ -3343,8 +3365,6 @@ impl Table {
     /// the decoded entries; any I/O / decode error from the full scan.
     #[cfg(feature = "std")]
     pub(crate) fn verify_seqno_bounds(&self) -> crate::Result<()> {
-        use crate::table::block::ParsedItem as _;
-
         // Re-read the section FROM DISK: the in-memory map was loaded at
         // recover time, so an on-disk re-stamp after the open (the very
         // forge this check exists for) would be invisible to it. Unlike the
@@ -3396,67 +3416,47 @@ impl Table {
         // LIVE seqno_bounds entries below so the cross-check covers the suffix.
         let punch = self.punch_offset()?;
         let mut checked = 0usize;
-        for handle in self.block_index.iter() {
-            let handle = handle?;
-            let block_handle = BlockHandle::new(handle.offset(), handle.size());
-            if block_handle.offset().0 < punch {
-                continue;
-            }
-            let Some(recorded) = seqno_bounds.bounds_for(block_handle.offset().0) else {
-                return Err(crate::Error::InvalidHeader(
-                    "seqno_bounds is missing a data block's entry",
-                ));
-            };
-            let derived = {
-                #[cfg(feature = "columnar")]
-                if self.metadata.columnar {
-                    let block = self.load_block_from_disk(&block_handle, BlockType::Columnar)?;
-                    let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
-                    let entries = crate::table::columnar::column_batch_to_entries(&batch)?;
-                    let mut seqnos = entries.iter().map(|e| e.key.seqno);
-                    let Some(first) = seqnos.next() else {
-                        return Err(crate::Error::InvalidHeader(
-                            "columnar data block decodes to zero rows",
-                        ));
-                    };
-                    Some(seqnos.fold((first, first), |(lo, hi), s| (lo.min(s), hi.max(s))))
-                } else {
-                    None
-                }
-                #[cfg(not(feature = "columnar"))]
-                None::<(SeqNo, SeqNo)>
-            };
-            let derived = if let Some(d) = derived {
-                d
-            } else {
-                let block = self.load_block_from_disk(&block_handle, BlockType::Data)?;
-                let data_block =
-                    DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())?;
-                let mut seqnos = data_block
-                    .try_iter(self.comparator.clone())?
-                    .map(|p| p.seqno());
-                let Some(first) = seqnos.next() else {
-                    return Err(crate::Error::InvalidHeader(
-                        "row data block decodes to zero entries",
-                    ));
-                };
-                seqnos.fold((first, first), |(lo, hi), s| (lo.min(s), hi.max(s)))
-            };
-            if derived != recorded {
-                return Err(crate::Error::InvalidHeader(
-                    "seqno_bounds disagrees with the block's decoded entries",
-                ));
-            }
+        self.for_each_live_block(|block| {
+            Self::check_block_seqno_bounds(&seqno_bounds, block)?;
             checked = checked
                 .checked_add(1)
                 .ok_or(crate::Error::InvalidHeader("seqno_bounds"))?;
-        }
+            Ok(())
+        })?;
         // Every recorded entry matched some walked block (offsets are unique
         // on both sides), so equal counts mean the map records EXACTLY the
         // table's blocks — a forged extra entry cannot hide among them.
         if checked != seqno_bounds.live_len(punch) {
             return Err(crate::Error::InvalidHeader(
                 "seqno_bounds carries entries for blocks the index does not hold",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The per-block half of [`Self::verify_seqno_bounds`]: the recorded range
+    /// must equal the one the block's decoded entries span. Split out so the
+    /// combined reconcile pass runs it on the shared decode.
+    #[cfg(feature = "std")]
+    fn check_block_seqno_bounds(
+        recorded_map: &crate::table::seqno_bounds::SeqnoBoundsMap,
+        block: &DecodedBlock,
+    ) -> crate::Result<()> {
+        let Some(recorded) = recorded_map.bounds_for(block.handle.offset().0) else {
+            return Err(crate::Error::InvalidHeader(
+                "seqno_bounds is missing a data block's entry",
+            ));
+        };
+        let mut seqnos = block.entries.iter().map(|e| e.key.seqno);
+        let Some(first) = seqnos.next() else {
+            return Err(crate::Error::InvalidHeader(
+                "data block decodes to zero entries",
+            ));
+        };
+        let derived = seqnos.fold((first, first), |(lo, hi), s| (lo.min(s), hi.max(s)));
+        if derived != recorded {
+            return Err(crate::Error::InvalidHeader(
+                "seqno_bounds disagrees with the block's decoded entries",
             ));
         }
         Ok(())
@@ -3479,39 +3479,31 @@ impl Table {
     /// full scan.
     #[cfg(feature = "std")]
     pub(crate) fn verify_block_entry_counts(&self) -> crate::Result<()> {
-        // A restricted view's punched prefix blocks are dead (read as zeros);
-        // only its live suffix blocks are entry-count-verified.
-        let punch = self.punch_offset()?;
-        for handle in self.block_index.iter() {
-            let handle = handle?;
-            let block_handle = BlockHandle::new(handle.offset(), handle.size());
-            if block_handle.offset().0 < punch {
-                continue;
-            }
-            #[cfg(feature = "columnar")]
-            if self.metadata.columnar {
-                let block = self.load_block_from_disk(&block_handle, BlockType::Columnar)?;
-                // `column_batch_to_entries` fully materializes the rows, so a
-                // malformed batch fails here rather than truncating silently.
-                let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
-                let entries = crate::table::columnar::column_batch_to_entries(&batch)?;
-                if entries.len() != batch.row_count as usize {
-                    return Err(crate::Error::InvalidHeader(
-                        "columnar block decodes to fewer rows than its batch declares",
-                    ));
-                }
-                continue;
-            }
-            let block = self.load_block_from_disk(&block_handle, BlockType::Data)?;
-            let data_block =
-                DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())?;
-            let declared = data_block.len();
-            let decoded = data_block.try_iter(self.comparator.clone())?.count();
-            if decoded != declared {
+        self.for_each_live_block(Self::check_block_entry_count)
+    }
+
+    /// The per-block half of [`Self::verify_block_entry_counts`], so the
+    /// combined reconcile pass runs it on the shared decode.
+    #[cfg(feature = "std")]
+    fn check_block_entry_count(block: &DecodedBlock) -> crate::Result<()> {
+        #[cfg(feature = "columnar")]
+        if let Some(batch) = &block.batch {
+            // The entries were fully materialized by the walk, so a malformed
+            // batch already failed there rather than truncating silently.
+            if block.entries.len() != batch.row_count as usize {
                 return Err(crate::Error::InvalidHeader(
-                    "data block decodes to fewer entries than its trailer declares",
+                    "columnar block decodes to fewer rows than its batch declares",
                 ));
             }
+            return Ok(());
+        }
+        let Some(row) = &block.row else {
+            return Ok(());
+        };
+        if block.entries.len() != row.len() {
+            return Err(crate::Error::InvalidHeader(
+                "data block decodes to fewer entries than its trailer declares",
+            ));
         }
         Ok(())
     }
@@ -3593,53 +3585,52 @@ impl Table {
         // below, so the cross-check authenticates exactly the suffix.
         let punch = self.punch_offset()?;
         let mut checked = 0usize;
-        for handle in self.block_index.iter() {
-            let handle = handle?;
-            let block_handle = BlockHandle::new(handle.offset(), handle.size());
-            if block_handle.offset().0 < punch {
-                continue;
-            }
-            let Some(recorded) = zone_map.columns_for(block_handle.offset().0) else {
-                return Err(crate::Error::InvalidHeader(
-                    "zone_map is missing a data block's entry",
-                ));
-            };
-            // Authenticate the recorded entry against the block's ACTUAL decoded
-            // statistics. A columnar block records one entry per stored column,
-            // re-derived here by the SAME function the writer used, so any
-            // divergence (a re-stamped range, an added / dropped column, a
-            // flipped id) is a forgery. A row block records a single synthetic
-            // whole-block key range (checked in `verify_row_block_zone_entry`).
-            #[cfg(feature = "columnar")]
-            if self.metadata.columnar {
-                let block = self.load_block_from_disk(&block_handle, BlockType::Columnar)?;
-                let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
-                if batch.row_count == 0 {
-                    return Err(crate::Error::InvalidHeader(
-                        "columnar data block decodes to zero rows",
-                    ));
-                }
-                if recorded != batch.zone_stats().as_slice() {
-                    return Err(crate::Error::InvalidHeader(
-                        "zone_map disagrees with the columnar block's per-column statistics",
-                    ));
-                }
-            } else {
-                self.verify_row_block_zone_entry(recorded, &block_handle)?;
-            }
-            #[cfg(not(feature = "columnar"))]
-            self.verify_row_block_zone_entry(recorded, &block_handle)?;
-
+        self.for_each_live_block(|block| {
+            Self::check_block_zone_entry(&zone_map, block)?;
             checked = checked
                 .checked_add(1)
                 .ok_or(crate::Error::InvalidHeader("zone_map"))?;
-        }
+            Ok(())
+        })?;
         if checked != zone_map.live_len(punch) {
             return Err(crate::Error::InvalidHeader(
                 "zone_map carries entries for blocks the index does not hold",
             ));
         }
         Ok(())
+    }
+
+    /// The per-block half of [`Self::verify_zone_map`], so the combined
+    /// reconcile pass runs it on the shared decode. A columnar block records
+    /// one entry per stored column, re-derived by the SAME function the writer
+    /// used, so any divergence (a re-stamped range, an added / dropped column,
+    /// a flipped id) is a forgery; a row block records a single synthetic
+    /// whole-block key range.
+    #[cfg(feature = "std")]
+    fn check_block_zone_entry(
+        recorded_map: &crate::table::zone_map::ZoneMap,
+        block: &DecodedBlock,
+    ) -> crate::Result<()> {
+        let Some(recorded) = recorded_map.columns_for(block.handle.offset().0) else {
+            return Err(crate::Error::InvalidHeader(
+                "zone_map is missing a data block's entry",
+            ));
+        };
+        #[cfg(feature = "columnar")]
+        if let Some(batch) = &block.batch {
+            if batch.row_count == 0 {
+                return Err(crate::Error::InvalidHeader(
+                    "columnar data block decodes to zero rows",
+                ));
+            }
+            if recorded != batch.zone_stats().as_slice() {
+                return Err(crate::Error::InvalidHeader(
+                    "zone_map disagrees with the columnar block's per-column statistics",
+                ));
+            }
+            return Ok(());
+        }
+        Self::verify_row_block_zone_entry(recorded, block)
     }
 
     /// Cross-checks a ROW data block's recorded zone-map entry: it must be
@@ -3652,13 +3643,12 @@ impl Table {
     /// the id to a consumer value-column id would let
     /// [`ColumnRangePredicate::can_skip_block`](crate::table::columnar_predicate::ColumnRangePredicate::can_skip_block)
     /// read those key bounds as value-column statistics and skip blocks holding
-    /// matching rows. Split out of [`Self::verify_zone_map`] so the columnar
-    /// path can authenticate its per-column entry instead.
+    /// matching rows. Split out of [`Self::check_block_zone_entry`] so the
+    /// columnar path can authenticate its per-column entry instead.
     #[cfg(feature = "std")]
     fn verify_row_block_zone_entry(
-        &self,
         recorded: &[crate::table::zone_map::ColumnStats],
-        block_handle: &BlockHandle,
+        block: &DecodedBlock,
     ) -> crate::Result<()> {
         let [col] = recorded else {
             return Err(crate::Error::InvalidHeader(
@@ -3671,39 +3661,20 @@ impl Table {
                  writer's whole-block column (id / type / codec / null)",
             ));
         }
-        let (min_key, max_key, rows) = self.zone_stats_from_row_block(block_handle)?;
-        if col.min != min_key || col.max != max_key || col.row_count as usize != rows {
+        let (Some(first), Some(last)) = (block.entries.first(), block.entries.last()) else {
+            return Err(crate::Error::InvalidHeader(
+                "row data block decodes to zero entries",
+            ));
+        };
+        if col.min != first.key.user_key.as_ref()
+            || col.max != last.key.user_key.as_ref()
+            || col.row_count as usize != block.entries.len()
+        {
             return Err(crate::Error::InvalidHeader(
                 "zone_map disagrees with the block's decoded key range or row count",
             ));
         }
         Ok(())
-    }
-
-    /// Derives `(min_user_key, max_user_key, row_count)` from a decoded ROW
-    /// data block, for the [`Self::verify_zone_map`] cross-check.
-    #[cfg(feature = "std")]
-    fn zone_stats_from_row_block(
-        &self,
-        block_handle: &BlockHandle,
-    ) -> crate::Result<(Vec<u8>, Vec<u8>, usize)> {
-        use crate::table::block::ParsedItem as _;
-        let block = self.load_block_from_disk(block_handle, BlockType::Data)?;
-        let data_block = DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())?;
-        let entries: Vec<_> = data_block
-            .try_iter(self.comparator.clone())?
-            .map(|p| p.materialize(data_block.as_slice()))
-            .collect();
-        let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
-            return Err(crate::Error::InvalidHeader(
-                "row data block decodes to zero entries",
-            ));
-        };
-        Ok((
-            first.key.user_key.to_vec(),
-            last.key.user_key.to_vec(),
-            entries.len(),
-        ))
     }
 
     /// Publishes this table's tight-space restriction lower bound to its
@@ -4041,46 +4012,31 @@ impl Table {
         // expected answer. `seen` dedups across blocks (a key's older
         // versions in later blocks must not overwrite the expectation).
         let mut seen: crate::HashSet<Vec<u8>> = crate::HashSet::default();
-        // A restricted view's punched prefix blocks are dead; skip them. Their
-        // keys are superseded, so a suffix key's newest version is in the suffix,
-        // and reads never consult the locator's prefix answers.
-        let punch = self.punch_offset()?;
-        for handle in self.block_index.iter() {
-            let handle = handle?;
-            let block_handle = BlockHandle::new(handle.offset(), handle.size());
-            if block_handle.offset().0 < punch {
-                continue;
-            }
-            // Load the disk-fresh row block once so a `Restart` / `Entry`
-            // slot hint can be probed against it below. Columnar blocks carry
-            // no in-block slot semantics (rows are reconstructed on load), so
-            // there the locator is per-block and only the block-id is checked.
-            #[cfg(feature = "columnar")]
-            let row_block = if self.metadata.columnar {
-                None
-            } else {
-                Some(DataBlock::from_loaded(
-                    self.load_block_from_disk(&block_handle, BlockType::Data)?,
-                    self.metadata.kv_checksum_algo.is_some(),
-                )?)
-            };
-            #[cfg(not(feature = "columnar"))]
-            let row_block = Some(DataBlock::from_loaded(
-                self.load_block_from_disk(&block_handle, BlockType::Data)?,
-                self.metadata.kv_checksum_algo.is_some(),
-            )?);
-            // Reuse the already-loaded row block for row tables (its entries
-            // are what `decode_block_entries` would re-decode); only the
-            // columnar path needs the separate reconstruction decode.
-            use crate::table::block::ParsedItem as _;
-            let entries: Vec<InternalValue> = match row_block.as_ref() {
-                Some(block) => block
-                    .try_iter(self.comparator.clone())?
-                    .map(|p| p.materialize(block.as_slice()))
-                    .collect(),
-                None => self.decode_block_entries(&block_handle)?,
-            };
-            for entry in entries {
+        // A restricted view's punched prefix blocks are dead; the walk skips
+        // them. Their keys are superseded, so a suffix key's newest version is
+        // in the suffix, and reads never consult the locator's prefix answers.
+        self.for_each_live_block(|block| self.check_block_locator(&locator, &mut seen, block))
+    }
+
+    /// The per-block half of [`Self::verify_locator`], so the combined
+    /// reconcile pass runs it on the shared decode. `seen` carries ACROSS
+    /// blocks: the first block holding a user key holds its newest version, so
+    /// that block is the locator's expected answer and a later block's older
+    /// versions must not overwrite the expectation.
+    #[cfg(feature = "std")]
+    fn check_block_locator(
+        &self,
+        locator: &crate::table::locator::LoadedLocator,
+        seen: &mut crate::HashSet<Vec<u8>>,
+        block: &DecodedBlock,
+    ) -> crate::Result<()> {
+        {
+            let block_handle = block.handle;
+            // Columnar blocks carry no in-block slot semantics (rows are
+            // reconstructed on load), so there the locator is per-block and
+            // only the block-id is checked.
+            let row_block = block.row.as_ref();
+            for entry in &block.entries {
                 let user_key = entry.key.user_key.to_vec();
                 if !seen.insert(user_key.clone()) {
                     continue;
@@ -4114,7 +4070,7 @@ impl Table {
                 // the key, which is `entry` here since `located` == this
                 // block). A `None` hint (per-block precision) has no slot to
                 // validate.
-                if let (Some((slot, is_entry)), Some(block)) = (hint, row_block.as_ref()) {
+                if let (Some((slot, is_entry)), Some(block)) = (hint, row_block) {
                     let found = block.point_read_at_slot(
                         slot,
                         is_entry,
@@ -4161,7 +4117,6 @@ impl Table {
     /// from its block; any I/O / decode error from the full scan.
     #[cfg(feature = "std")]
     pub(crate) fn verify_point_read_reachability(&self) -> crate::Result<()> {
-        use crate::table::block::ParsedItem as _;
         // Columnar blocks carry no in-block key index to probe, but the GLOBAL
         // internal-key sort order (user key ASC, then seqno DESC per key) is still
         // an invariant the read path relies on: `column_batch_match_entries`
@@ -4171,35 +4126,6 @@ impl Table {
         // point reads miss a key or return a stale version. Enforce the order over
         // the live suffix (the punched prefix is dead); there is no point_read to
         // run, so this is the only order gate for a columnar table.
-        #[cfg(feature = "columnar")]
-        if self.metadata.columnar {
-            let punch = self.punch_offset()?;
-            let mut prev_internal: Option<(UserKey, SeqNo)> = None;
-            for handle in self.block_index.iter() {
-                let handle = handle?;
-                let block_handle = BlockHandle::new(handle.offset(), handle.size());
-                if block_handle.offset().0 < punch {
-                    continue;
-                }
-                for entry in self.decode_block_entries(&block_handle)? {
-                    if let Some((pk, ps)) = &prev_internal {
-                        let out_of_order = match self.comparator.compare(&entry.key.user_key, pk) {
-                            core::cmp::Ordering::Greater => false,
-                            core::cmp::Ordering::Less => true,
-                            core::cmp::Ordering::Equal => entry.key.seqno >= *ps,
-                        };
-                        if out_of_order {
-                            return Err(crate::Error::InvalidHeader(
-                                "columnar entries are out of order (a user key decreased, or an \
-                                 equal key's seqno did not strictly decrease) across the walk",
-                            ));
-                        }
-                    }
-                    prev_internal = Some((entry.key.user_key.clone(), entry.key.seqno));
-                }
-            }
-            return Ok(());
-        }
         // The internal-key sort order (user key ASC, then seqno DESC per key) is
         // a GLOBAL invariant across the whole table, not just within a block.
         // Carry the last decoded internal key ACROSS block boundaries so a
@@ -4207,33 +4133,38 @@ impl Table {
         // also ends the preceding block: both blocks would decode and probe
         // cleanly on their own, yet after reopen the index seeks the first block
         // and a later compaction could persist the stale (lower-seqno) version.
-        // A restricted view's punched prefix blocks are dead; skip them. The
-        // global sort order still holds across the LIVE suffix, so `prev_internal`
-        // simply starts at the first live block.
-        let punch = self.punch_offset()?;
+        // A restricted view's punched prefix blocks are dead; the walk skips
+        // them. The global sort order still holds across the LIVE suffix, so
+        // `prev_internal` simply starts at the first live block.
         let mut prev_internal: Option<(UserKey, SeqNo)> = None;
-        for handle in self.block_index.iter() {
-            let handle = handle?;
-            let block_handle = BlockHandle::new(handle.offset(), handle.size());
-            if block_handle.offset().0 < punch {
-                continue;
-            }
-            let block = self.load_block_from_disk(&block_handle, BlockType::Data)?;
-            let data_block =
-                DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())?;
+        self.for_each_live_block(|block| self.check_block_reachability(&mut prev_internal, block))
+    }
+
+    /// The per-block half of [`Self::verify_point_read_reachability`], so the
+    /// combined reconcile pass runs it on the shared decode. `prev_internal`
+    /// carries the last decoded internal key ACROSS blocks, which is what makes
+    /// the sort-order check global rather than per-block.
+    #[cfg(feature = "std")]
+    fn check_block_reachability(
+        &self,
+        prev_internal: &mut Option<(UserKey, SeqNo)>,
+        block: &DecodedBlock,
+    ) -> crate::Result<()> {
+        {
             // A block whose keys all resolve through its HASH index never
             // exercises the binary index in the probes below, yet range
             // seeks still trust it — authenticate the pointers directly.
-            data_block.verify_binary_index()?;
-            let entries: Vec<InternalValue> = data_block
-                .try_iter(self.comparator.clone())?
-                .map(|p| p.materialize(data_block.as_slice()))
-                .collect();
+            // A columnar block has no in-block index to probe: rows are
+            // reconstructed on load, so only the sort order is enforced there.
+            if let Some(data_block) = &block.row {
+                data_block.verify_binary_index()?;
+            }
+            let data_block = block.row.as_ref();
             // A key's versions are adjacent within the block (sorted by key
             // then descending seqno), so the FIRST occurrence is the newest
             // and one probe per distinct key suffices.
             let mut prev_key: Option<UserKey> = None;
-            for entry in entries {
+            for entry in block.entries.iter().cloned() {
                 // Enforce the global sort order on EVERY entry (before the
                 // per-key dedup below), tracking the previous entry across block
                 // boundaries: the user key must strictly increase, or (for the
@@ -4245,14 +4176,26 @@ impl Table {
                         core::cmp::Ordering::Equal => entry.key.seqno >= *ps,
                     };
                     if out_of_order {
-                        return Err(crate::Error::InvalidHeader(
+                        // Same invariant, but the two block layouts report it
+                        // in their own words: a columnar table has no
+                        // point_read to fall back on, so its message names the
+                        // layout that produced the disorder.
+                        return Err(crate::Error::InvalidHeader(if data_block.is_some() {
                             "data-block entries are out of order (a user key decreased, or an \
-                             equal key's seqno did not strictly decrease) across the walk",
-                        ));
+                             equal key's seqno did not strictly decrease) across the walk"
+                        } else {
+                            "columnar entries are out of order (a user key decreased, or an \
+                             equal key's seqno did not strictly decrease) across the walk"
+                        }));
                     }
                 }
-                prev_internal = Some((entry.key.user_key.clone(), entry.key.seqno));
+                *prev_internal = Some((entry.key.user_key.clone(), entry.key.seqno));
 
+                // Columnar blocks have no in-block index, so the sort-order
+                // enforcement above is the whole check for them.
+                let Some(data_block) = data_block else {
+                    continue;
+                };
                 if prev_key
                     .as_ref()
                     .is_some_and(|p| crate::comparator::same_user_key(p, &entry.key.user_key))
@@ -4435,19 +4378,12 @@ impl Table {
             crate::table::filter::block::FilterBlock,
         > = alloc::collections::BTreeMap::new();
 
-        // A restricted view's punched prefix blocks decode to zeros; skip them.
-        // Their keys are superseded, so the live filter is only obligated to
-        // report the suffix keys present.
-        let punch = self.punch_offset()?;
+        // A restricted view's punched prefix blocks decode to zeros; the walk
+        // skips them. Their keys are superseded, so the live filter is only
+        // obligated to report the suffix keys present.
         let mut prev_key: Option<Vec<u8>> = None;
-        for handle in self.block_index.iter() {
-            let handle = handle?;
-            let block_handle = BlockHandle::new(handle.offset(), handle.size());
-            if block_handle.offset().0 < punch {
-                continue;
-            }
-            let entries = self.decode_block_entries(&block_handle)?;
-            for entry in entries {
+        self.for_each_live_block(|block| {
+            for entry in block.entries.iter().cloned() {
                 // Blocks are sorted by key then descending seqno, so a key's
                 // older versions are always adjacent — one probe per key.
                 if prev_key
@@ -4520,8 +4456,8 @@ impl Table {
                 }
                 prev_key = Some(user_key);
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Cross-checks the recorded metadata BOUNDS against the table's decoded
@@ -4695,24 +4631,23 @@ impl Table {
         // without decoding, and aggregate entries / keys / seqnos over the live
         // suffix only. `meta.item_count` describes the whole table, so its
         // exact-equality check relaxes to a subset check for a restricted view.
-        let punch = self.punch_offset()?;
         let restricted = self.restrict_lower_bound().is_some();
         let mut count: u64 = 0;
+        // `data_block_count` describes the WHOLE table, punched prefix
+        // included, so it is counted off the index itself — no decode.
         let mut block_count: u64 = 0;
+        for handle in self.block_index.iter() {
+            handle?;
+            block_count = block_count
+                .checked_add(1)
+                .ok_or(crate::Error::InvalidHeader("meta bounds"))?;
+        }
         let mut first_key: Option<UserKey> = None;
         let mut last_key: Option<UserKey> = None;
         let mut seqno_lo: Option<SeqNo> = None;
         let mut seqno_hi: Option<SeqNo> = None;
-        for handle in self.block_index.iter() {
-            let handle = handle?;
-            let block_handle = BlockHandle::new(handle.offset(), handle.size());
-            block_count = block_count
-                .checked_add(1)
-                .ok_or(crate::Error::InvalidHeader("meta bounds"))?;
-            if block_handle.offset().0 < punch {
-                continue;
-            }
-            let entries = self.decode_block_entries(&block_handle)?;
+        self.for_each_live_block(|block| {
+            let entries = &block.entries;
             count = count
                 .checked_add(entries.len() as u64)
                 .ok_or(crate::Error::InvalidHeader("meta bounds"))?;
@@ -4722,7 +4657,7 @@ impl Table {
             if let Some(last) = entries.last() {
                 last_key = Some(last.key.user_key.clone());
             }
-            for entry in &entries {
+            for entry in entries {
                 let s = entry.key.seqno;
                 // The MINIMUM counts every decoded entry, sentinel included.
                 // `seqno#min` is written over range tombstones as well as KV
@@ -4748,7 +4683,8 @@ impl Table {
                 }
                 seqno_hi = Some(seqno_hi.map_or(s, |hi| hi.max(s)));
             }
-        }
+            Ok(())
+        })?;
         if restricted {
             // The live suffix is a subset of the whole table `meta` describes;
             // it must not decode to MORE entries than the recorded whole-table
@@ -5103,6 +5039,87 @@ impl Table {
                     "block_layout carries entries for blocks the index does not hold",
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// Walks the LIVE data blocks once, decoding each DISK-FRESH, and hands
+    /// every gate the same [`DecodedBlock`].
+    ///
+    /// A restricted view's punched prefix blocks are dead (they read as zeros),
+    /// so the walk starts at the punch offset — every gate skipped them
+    /// individually before, with the same reasoning.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the index walk, the punch-offset lookup, the block read and
+    /// the decode, plus whatever `check` returns.
+    #[cfg(feature = "std")]
+    fn for_each_live_block<F>(&self, mut check: F) -> crate::Result<()>
+    where
+        F: FnMut(&DecodedBlock) -> crate::Result<()>,
+    {
+        use crate::table::block::ParsedItem as _;
+
+        let punch = self.punch_offset()?;
+        for handle in self.block_index.iter() {
+            let handle = handle?;
+            let handle = BlockHandle::new(handle.offset(), handle.size());
+            if handle.offset().0 < punch {
+                continue;
+            }
+
+            #[cfg(feature = "columnar")]
+            let (row, batch) = if self.metadata.columnar {
+                let block = self.load_block_from_disk(&handle, BlockType::Columnar)?;
+                (
+                    None,
+                    Some(crate::table::columnar::ColumnBatch::decode(&block.data)?),
+                )
+            } else {
+                let block = self.load_block_from_disk(&handle, BlockType::Data)?;
+                (
+                    Some(DataBlock::from_loaded(
+                        block,
+                        self.metadata.kv_checksum_algo.is_some(),
+                    )?),
+                    None,
+                )
+            };
+            #[cfg(not(feature = "columnar"))]
+            let row = {
+                let block = self.load_block_from_disk(&handle, BlockType::Data)?;
+                Some(DataBlock::from_loaded(
+                    block,
+                    self.metadata.kv_checksum_algo.is_some(),
+                )?)
+            };
+
+            // Materialize the entries from whichever view this table has. The
+            // columnar reconstruction is the same one `decode_block_entries`
+            // performs, so a malformed batch still fails here rather than
+            // truncating silently.
+            let entries: Vec<InternalValue> = match &row {
+                Some(block) => block
+                    .try_iter(self.comparator.clone())?
+                    .map(|p| p.materialize(block.as_slice()))
+                    .collect(),
+                #[cfg(feature = "columnar")]
+                None => match &batch {
+                    Some(batch) => crate::table::columnar::column_batch_to_entries(batch)?,
+                    None => Vec::new(),
+                },
+                #[cfg(not(feature = "columnar"))]
+                None => Vec::new(),
+            };
+
+            check(&DecodedBlock {
+                handle,
+                row,
+                #[cfg(feature = "columnar")]
+                batch,
+                entries,
+            })?;
         }
         Ok(())
     }
